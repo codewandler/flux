@@ -1,20 +1,24 @@
 ---
 sidebar_position: 3
 title: Concepts
+description: "Core mental model for flux: plan-first execution, symbolized values, and deterministic evidence flow."
 ---
 
 # Concepts
 
+These are the core ideas that make flux different from a normal chat-driven agent. Read this page
+before the agent, language, or security guides; the rest of the docs use this vocabulary.
+
 ## Plan, not transcript
 
-A flux turn is not primarily a chat transcript. The model emits a plan. The runtime executes that plan
-node by node, records evidence, and returns the result.
+A flux turn is not primarily a chat transcript. The model emits a typed plan. The runtime executes
+that plan node by node, records evidence, and returns the result.
 
 ## Symbols, not raw output
 
 Flux-Lang plans refer to symbols such as `$src` or `$tests`. A symbol names an immutable stored value.
-The runtime owns the value store; the model sees summaries, transcripts, and explicit context packs
-rather than repeatedly receiving every raw output.
+The runtime owns the value store. The model sees summaries, transcripts, and explicit context packs
+instead of every raw tool output being replayed into the prompt.
 
 ## One safety envelope
 
@@ -44,5 +48,10 @@ summary rather than dropping history. You can always explain what the agent did 
 
 ## Local-first
 
-flux is designed to run on your machine. Secrets stay local, provider credentials are explicit, and
-plugins receive only the host capabilities declared in their manifests.
+flux is designed to run on your machine first. Secrets stay local, provider credentials are explicit,
+and plugins receive only the host capabilities declared in their manifests.
+
+## Related docs
+
+- [The agent loop](./agent/agent-loop.md) — how a turn orients, gathers, plans, and revises.
+- [Flux-Lang overview](./language/overview.md) — the plan language behind the model boundary.

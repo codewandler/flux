@@ -1,11 +1,12 @@
 ---
 title: CLI
+description: "The public CLI surface for turns, flow execution, app hosting, plugin management, and diagnostics."
 ---
 
 # CLI
 
-The CLI is the reference flux surface. It runs agent turns, executes stored flows, hosts app programs,
-and exposes development utilities.
+The `flux` binary is the reference surface for day-to-day use. It runs agent turns, previews plans,
+executes stored flows, hosts programs, manages providers, and exposes diagnostics.
 
 Common paths:
 
@@ -62,4 +63,10 @@ flux loop show
 flux loop eject
 ```
 
-Use the repository's internal agent-loop guide for contributor-level details.
+Use [The agent loop](./agent-loop.md) for the public model of what those commands reveal.
+
+## Related docs
+
+- [Getting started](../getting-started.md) — the first-run path.
+- [Safety and approvals](./safety.md) — what prompts during CLI execution.
+- [Providers and models](./providers.md) — how `-m` resolves.

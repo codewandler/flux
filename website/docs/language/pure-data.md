@@ -5,9 +5,9 @@ description: Computation without IO — fmt, field access, jq, expr, parse, and 
 
 # Pure data shaping
 
-A family of **pure nodes** covers arithmetic, string formatting, JSON extraction, type
-coercion, and value assembly. They perform no IO, dispatch no operation, and never pause for
-approval — use them wherever you would otherwise shell out to `bash` to massage data.
+Pure nodes handle the data work inside a plan: formatting, field access, JSON extraction, arithmetic,
+type coercion, and value assembly. They perform no IO, dispatch no operation, and never pause for
+approval. Use them anywhere you would otherwise shell out just to reshape data.
 
 In the text form, two of them have first-class spellings (`fmt(…)` and the `$var.path` field
 access); the rest are written with the `@json` escape. All of them are ordinary nodes in the
@@ -130,3 +130,9 @@ flow btc-double
 
 For selecting and budgeting *context* — the other big pure-node use case — see
 [Context packs](./context-packs.md).
+
+## Related docs
+
+- [Context packs](./context-packs.md) — pure nodes for model-visible evidence.
+- [Execution model](./execution-model.md) — symbol values, interpolation, and truthiness.
+- [Flows & syntax](./flows-and-syntax.md) — call, bind, and interpolation syntax.

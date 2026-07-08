@@ -5,9 +5,9 @@ description: How flux keeps you safe — the runtime envelope, credentials, the 
 
 # Security overview
 
-flux runs real tools, real plugins, and real network calls on your behalf. This section explains
-how it does that safely, what guarantees hold **by construction**, and — just as important — what
-flux does *not* do, so you can make an informed decision about running it.
+flux runs real tools, plugins, and network calls on your behalf. This section explains the guarantees
+that hold by construction, the trust boundaries you still own, and the pages to read for each part of
+the model.
 
 There are three directions of trust to keep separate in your head:
 
@@ -53,3 +53,9 @@ you knowing them:
   [Configuration](../reference/config.md).
 
 Everything below is enforced in the runtime, not asked of you as convention.
+
+## Related docs
+
+- [Safety & approvals](../agent/safety.md) — local filesystem/process/network access.
+- [Credentials and secrets](./credentials.md) — outbound tokens and redaction.
+- [Server authentication & tenancy](./server-auth.md) — inbound callers and realm isolation.

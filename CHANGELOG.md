@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Overhauled the public documentation.** Reworked the root README and every public website
+  markdown page with clearer opening guidance, consistent metadata, normalized related-doc links,
+  and tighter navigation across the agent, Flux-Lang, SDK, plugin, reference, and security sections.
+
 ## [0.10.1] - 2026-07-08
 
 ## [0.10.0] - 2026-07-08

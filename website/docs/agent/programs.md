@@ -1,13 +1,15 @@
 ---
 title: Multi-agent programs
+description: "Defining multi-agent program files, channels, and journey composition in a single Flux-Lang source."
 ---
 
 # Multi-agent programs
 
-A single agent is one loop. A **multi-agent program** is a whole application: several agents, the
-channels they are reached on, the data they answer from, and the flows that run when something happens.
-In flux you declare all of that in one native Flux-Lang `.flux` file — no YAML, no glue code, no
-separate config format.
+A single agent is one loop. A multi-agent program is a whole application: agents, channels,
+datasources, triggers, and journeys declared in one Flux-Lang `.flux` file.
+
+Use programs when you want more than one prompt-response turn: a Slack bot, an A2A service, a
+scheduled workflow, or an event-driven assistant that coordinates multiple agents.
 
 ## The file *is* the app
 
@@ -100,3 +102,9 @@ See [Agent-to-agent (A2A)](./a2a.md) for reaching a running program from other a
 - [Language overview](../language/overview.md) and [flows & syntax](../language/flows-and-syntax.md) — the Flux-Lang you write journey bodies in.
 - [Agent-to-agent (A2A)](./a2a.md) — reaching programs over the network.
 - Runnable examples live in the [flux repository](https://github.com/codewandler/flux).
+
+## Related docs
+
+- [Modules, composite ops & programs](../language/modules-and-programs.md) — the language-level declarations.
+- [Agent-to-agent (A2A)](./a2a.md) — exposing a program over the network.
+- [Operations](../language/ops.md) — `emit`, `send`, `ask`, and `spawn`.

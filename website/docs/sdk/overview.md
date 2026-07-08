@@ -1,15 +1,16 @@
 ---
 title: SDK overview
+description: "Entry point for embedding flux in Rust, including loops, providers, tooling, and safety expectations."
 ---
 
 # Embedding flux: the Rust SDK
 
-`flux-sdk` is the high-level library API — embed a tool-enabled, policy-gated agent in your own
-Rust program. You supply a `Provider` (a model backend) and a workspace root; the SDK wires the
-agent loop, the built-in tools, the safety envelope, and a session. It is the same engine the
-`flux` CLI runs, with the same guiding idea: **the LLM is not the runtime**. The model emits a
-Flux-Lang plan, and a deterministic engine executes it through a non-bypassable
-[safety envelope](../agent/safety.md).
+`flux-sdk` embeds the same policy-gated agent engine used by the CLI. You provide a model provider
+and a workspace root; the SDK wires the agent loop, built-in tools, safety envelope, and session
+storage.
+
+Use the SDK when you want flux behavior inside your own Rust application instead of shelling out to
+the `flux` binary.
 
 ## Install
 
@@ -163,3 +164,9 @@ The same cookbook is exposed on the CLI as `flux preset` — `flux preset list` 
 - [FlowClient](./flow-client.md) — the `compile → analyze → execute` lifecycle in detail
 - [Safety & approvals](../agent/safety.md) — the envelope applies identically when embedded
 - [Flux-Lang overview](../language/overview.md) — the plan language your flows compile to
+
+## Related docs
+
+- [FlowClient](./flow-client.md) — deterministic Flux-Lang lifecycle control.
+- [CLI](../agent/cli.md) — the binary surface backed by the same engine.
+- [Safety & approvals](../agent/safety.md) — the runtime envelope embedded applications inherit.

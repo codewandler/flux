@@ -1,11 +1,13 @@
 ---
 title: Configuration
+description: "Permissioning, environment precedence, and runtime settings that shape approval behavior and policy grants."
 ---
 
 # Configuration
 
-flux is local-first and opt-in: `flux` with no configuration is a working agent, and power features
-are available but never required. Configuration lives in `.flux/config.toml`.
+flux works with no project configuration, then lets you add policy, provider, and network settings as
+the workspace needs them. Project configuration lives in `.flux/config.toml`; user defaults live in
+`~/.flux/config.toml`.
 
 **Precedence:** CLI flags > project `.flux/config.toml` > user `~/.flux/config.toml` > built-in
 defaults. "Always-allow" choices you make at an approval prompt are saved back to the project file
@@ -52,3 +54,9 @@ A few environment variables tune behavior without editing config: `FLUX_VERBOSE=
 output, same as `-v`), `FLUX_SHOW_LOOP=1` (reveal the [agent loop](../agent/agent-loop.md)),
 `OLLAMA_HOST` (point at a non-default Ollama), and the provider API-key variables listed under
 [Providers and models](../agent/providers.md).
+
+## Related docs
+
+- [Safety & approvals](../agent/safety.md) — how permissions and policy interact at dispatch time.
+- [Credentials and secrets](../security/credentials.md) — provider tokens and plugin OAuth storage.
+- [Private plugin networking](../security/plugin-sandbox.md#cross-plugin-and-private-network-grants) — manifest and config grants together.

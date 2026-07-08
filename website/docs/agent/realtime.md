@@ -1,16 +1,17 @@
 ---
 title: Realtime voice (experimental)
+description: "Experimental realtime voice model seam, session lifecycle, and safety model for full-duplex sessions."
 ---
 
 # Realtime voice (experimental)
 
-flux has an **experimental** seam for full-duplex, voice-to-voice models: `RealtimeProvider`, a
-sibling of the half-duplex [`Provider`](providers.md) used for text turns. Where a text provider
-answers one request with one stream, a realtime session is a long-lived connection that carries
-input audio and output audio, transcripts, and tool calls concurrently, with the model — not flux —
-driving acoustic turn-taking (server-side VAD) and barge-in. The concrete implementation is
-feature-gated behind the `realtime` cargo feature on `flux-providers`, and the whole surface is
-SDK-level and subject to change.
+Realtime support is an SDK-level experimental surface for full-duplex voice models. It is not the
+normal text agent loop, and it does not turn each utterance into a Flux-Lang plan. It exists for
+embedders that need a long-lived audio session while still routing effectful tool calls through the
+guarded executor.
+
+The public shape is `RealtimeProvider`, a sibling of the half-duplex [`Provider`](./providers.md).
+The concrete OpenAI implementation is behind the `realtime` cargo feature on `flux-providers`.
 
 ## What exists
 
@@ -26,7 +27,7 @@ SDK-level and subject to change.
   `VoiceSink` (your callbacks for audio frames, transcripts, tool events, barge-in).
 - **The same safety envelope.** Every tool call the voice model makes is dispatched through the
   runtime's `Executor::dispatch` — the identical [permission / approval / redaction
-  chain](safety.md) a text turn uses, with no bypass path. Tools are declared to the model once,
+  chain](./safety.md) a text turn uses, with no bypass path. Tools are declared to the model once,
   from the same registry the executor gates. Dispatch runs off the audio loop, so a slow tool never
   stalls audio or barge-in.
 - **Audio helpers** — the dependency-free `flux-audio` crate provides PCM16 encode/decode, stateless
@@ -78,3 +79,8 @@ half; you push caller audio through the session handle.
 - **Audio transport is yours.** flux does no telephony, WebRTC, or device IO; it exchanges
   model-native audio bytes and leaves capture, playout, and resampling to the embedding application
   (with `flux-audio` available as a utility).
+
+## Related docs
+
+- [Providers and models](./providers.md) — text-provider routing and credentials.
+- [Safety and approvals](./safety.md) — the executor envelope realtime tool calls still use.

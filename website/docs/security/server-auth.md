@@ -5,11 +5,9 @@ description: How a networked flux authenticates inbound callers — Open, shared
 
 # Server authentication & tenancy
 
-When you expose flux as a **server** (for example to drive it over HTTP or from an agent-to-agent
-channel), you need to control **who** may call it and keep tenants apart. This page covers that
-inbound direction. Authentication only establishes *who* a caller is; authorization of what they may
-then do stays with the one [safety envelope](../agent/safety.md) — the authenticator never makes a
-policy decision.
+This page covers inbound authentication for a hosted flux server: who may call it, how bearer tokens
+are validated, and how tenants are isolated. Authentication establishes caller identity; authorization
+of what that caller may do remains with the [safety envelope](../agent/safety.md).
 
 ## Authentication modes
 
@@ -69,3 +67,9 @@ For a server holding credentials for many tenants, combine principal mode with t
 and clamped to `Verified`, tenants are isolated into disjoint realms, and per-customer tokens live in
 Vault rather than a file on the pod. Bind and permission settings live in
 [Configuration](../reference/config.md).
+
+## Related docs
+
+- [Safety & approvals](../agent/safety.md) — tool authorization after caller identity is known.
+- [A2A](../agent/a2a.md) — serving a flux agent over the agent-to-agent protocol.
+- [Credentials and secrets](./credentials.md) — hardening hosted credentials with alternate stores.

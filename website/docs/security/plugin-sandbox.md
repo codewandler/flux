@@ -5,10 +5,13 @@ description: How flux confines what a plugin's code can reach — deny-by-defaul
 
 # Plugin capability sandbox
 
-A flux plugin is a subprocess that speaks a framed protocol. This page is about **confinement**:
-what a plugin's code can and cannot reach *through flux* while it runs. For the separate question of
-*which* plugin code is allowed to run at all, see [Plugin trust & signing](./plugin-trust.md). Both
-ride on the one [safety envelope](../agent/safety.md).
+The plugin sandbox is flux's confinement model for plugin capabilities. It governs what a plugin can
+ask the host to do — HTTP, subprocesses, secrets, connections, and private-network access — while the
+plugin is running.
+
+For the separate question of which plugin code is allowed to run at all, see
+[Plugin trust & signing](./plugin-trust.md). Both rely on the same
+[safety envelope](../agent/safety.md).
 
 ## The plugin does no privileged IO
 
@@ -125,3 +128,9 @@ can never point the OAuth flow at a URL of its choosing. The `redirect` is a loc
 listener, so it's outside the outbound allow-list by construction.
 
 For authoring a plugin end to end, see [Plugin authoring](../plugins/authoring.md).
+
+## Related docs
+
+- [Plugin trust & signing](./plugin-trust.md) — identity and integrity of installed binaries.
+- [Using plugins](../plugins/using-plugins.md) — install, pin, and grant access.
+- [Plugin authoring](../plugins/authoring.md) — write manifests that declare capabilities honestly.

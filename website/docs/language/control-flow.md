@@ -5,9 +5,9 @@ description: Branching, iteration, and sequencing in Flux-Lang — when, unless,
 
 # Control flow
 
-Every branch and loop in Flux-Lang is a node in the plan — visible before execution, bounded by
-construction, validated by the analyzer. This page covers the deterministic constructs plus
-`route`, the one place a model gets a (bounded) say.
+Every branch and loop in Flux-Lang is explicit plan structure. The analyzer can inspect it before
+execution, reject unsafe shapes, and keep loops bounded. This page covers deterministic branching and
+iteration plus `route`, the bounded place where a model can choose among declared paths.
 
 ## `when` / `else`
 
@@ -186,3 +186,9 @@ A `seq` without a binding is a plain grouping block.
 Concurrent fan-out (`parallel`) and first-success racing (`race`) are covered in
 [Concurrency](./concurrency.md); failure handling (`try`, `retry`) in
 [Reliability & guard rails](./reliability.md).
+
+## Related docs
+
+- [Concurrency](./concurrency.md) — parallel fan-out and first-success racing.
+- [Reliability & guard rails](./reliability.md) — retries, timeouts, budgets, and approvals.
+- [Execution model](./execution-model.md) — truthiness and failure propagation.

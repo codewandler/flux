@@ -1,11 +1,13 @@
 ---
 sidebar_position: 2
 title: Getting started
+description: "Fast install and first-run path with mock/offline mode, safety behavior, and key CLI entry points."
 ---
 
 # Getting started
 
-flux ships as a single `flux` binary. The fastest way to try it needs no API key at all.
+flux ships as a single `flux` binary. This page gets you from install to a real turn, with an
+offline smoke test first so you can verify the runtime without provider credentials.
 
 ## Install
 
@@ -30,12 +32,13 @@ cargo install --git https://github.com/codewandler/flux flux-cli
 Prebuilt binaries, installers, and checksums are attached to every
 [tagged release](https://github.com/codewandler/flux/releases/latest).
 
-## Try it with no API key
+## Try it without an API key
 
-`-m mock` is an offline provider that drives the full plan/execute pipeline with **canned** output — a
-zero-config way to watch how a turn plans, approves, and executes. It writes a `flux-mock.txt` file and
-prints `Finished.` regardless of the prompt, so it's a wiring smoke test, not a representative agent
-run — for that, use a real provider ([below](#run-a-real-agent-turn)):
+`-m mock` is an offline provider that drives the full plan/execute pipeline with canned output. It is
+a zero-config runtime check: flux plans, approves, executes, writes `flux-mock.txt`, and prints
+`Finished.` regardless of the prompt.
+
+Use it to verify wiring. Use a real provider for representative agent behavior.
 
 ```bash
 flux run --yes -m mock "write a quick note"
@@ -43,8 +46,8 @@ flux run --yes -m mock "write a quick note"
 
 ## Run a real agent turn
 
-Point flux at a provider (see [Providers and models](./agent/providers.md) for the full matrix and
-`flux auth login`), then:
+Point flux at a provider, then run a turn. The full provider matrix and credential paths are in
+[Providers and models](./agent/providers.md).
 
 ```bash
 # Plan + run. Risky steps prompt for approval; --yes auto-approves.
@@ -63,9 +66,9 @@ flux tui
 flux auth status
 ```
 
-Every operation crosses the same [safety envelope](./agent/safety.md): reads are pre-allowed, writes
-and commands prompt for approval, and destructive steps always re-fire the approval gate. Passing
-`--yes` auto-approves every step, destructive ones included — use it only in trusted contexts.
+Every operation crosses the same [safety envelope](./agent/safety.md). Reads are pre-allowed; writes
+and commands prompt; destructive steps always re-fire the approval gate. `--yes` auto-approves every
+step, including destructive ones, so reserve it for trusted automation.
 
 ## Run a stored Flux-Lang flow
 
@@ -102,3 +105,9 @@ cargo test -p flux-codegate
 
 This public site is intentionally lighter than the contributor docs. For implementation work, use the
 repository's internal `docs/` map and `AGENTS.md`.
+
+## Related docs
+
+- [Concepts](./concepts.md) — the plan-first execution model.
+- [CLI](./agent/cli.md) — the command surface after the first run.
+- [Safety and approvals](./agent/safety.md) — what prompts and why.

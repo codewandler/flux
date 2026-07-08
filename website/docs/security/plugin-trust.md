@@ -5,10 +5,12 @@ description: How flux verifies which plugin code runs — a signed index, per-ar
 
 # Plugin trust & signing
 
-This page is about **supply-chain integrity**: proving *which* plugin binary runs on your machine.
-It is a different question from what that binary can reach once it's running — that's the
-[capability sandbox](./plugin-sandbox.md). The everyday install/pin/rollback commands live in
-[Using plugins](../plugins/using-plugins.md); here we explain what makes them trustworthy.
+Plugin trust is the supply-chain side of plugin safety: proving which binary is installed and which
+binary is spawned. It is separate from the capability sandbox, which controls what that binary can
+reach through flux once it is running.
+
+The everyday install, pin, rollback, and uninstall commands live in
+[Using plugins](../plugins/using-plugins.md).
 
 ## The trust ladder
 
@@ -57,3 +59,9 @@ always tell verified pack binaries from your own dev builds.
 The signed pack, the sha256 pinning, and the spawn-time re-check tell you *which* code runs. The
 [manifest gates and cleared-environment spawn](./plugin-sandbox.md) bound what that code can reach.
 Together they are the plugin trust story; neither substitutes for the other.
+
+## Related docs
+
+- [Plugin capability sandbox](./plugin-sandbox.md) — capability confinement after spawn.
+- [Using plugins](../plugins/using-plugins.md) — pack install, pinning, rollback, and local dev install.
+- [Credentials and secrets](./credentials.md) — plugin OAuth tokens and secret redaction.

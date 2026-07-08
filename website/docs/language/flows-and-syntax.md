@@ -5,8 +5,9 @@ description: The core Flux-Lang text syntax — file structure, flow headers, in
 
 # Flows & syntax
 
-This page covers the building blocks every `.flux` file is made of. The
-[node reference](./node-reference.md) documents the same constructs in their JSON wire form.
+This page is the text-syntax reference for `.flux` files: flow headers, indentation, symbols,
+literals, calls, binds, returns, and the `@json` escape. The [node reference](./node-reference.md)
+documents the same constructs in their JSON wire form.
 
 ## File structure
 
@@ -213,3 +214,9 @@ Every AST node can be written in text. Nodes without a native spelling yet use a
 
 Treat `@json` as an escape hatch, not a preferred style. The
 [node reference](./node-reference.md) marks which nodes need it.
+
+## Related docs
+
+- [Control flow](./control-flow.md) — branching, iteration, routing, and fallback.
+- [Pure data shaping](./pure-data.md) — transform values without dispatching IO.
+- [Node reference](./node-reference.md) — JSON shapes for every node kind.

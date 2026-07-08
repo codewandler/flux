@@ -5,9 +5,9 @@ description: Concurrent fan-out with parallel and first-success racing with race
 
 # Concurrency
 
-Two nodes run work concurrently: `parallel` waits for every branch, `race` takes the first
-success. Both keep the audit trail deterministic, and every operation in every branch still
-crosses the runtime safety envelope.
+Flux-Lang has two concurrency nodes. `parallel` fans out work and waits for every branch. `race`
+takes the first successful branch and cancels the rest. Both keep the run trace deterministic, and
+every operation in every branch still crosses the safety envelope.
 
 ## `parallel` — concurrent fan-out
 
@@ -77,3 +77,9 @@ Semantics:
 
 Concurrency does not weaken the envelope: a branch cannot dispatch anything the same plan
 could not dispatch sequentially, and approvals still gate risky steps.
+
+## Related docs
+
+- [Control flow](./control-flow.md) — sequential alternatives and list iteration.
+- [Reliability & guard rails](./reliability.md) — timeouts, retries, and failure handling.
+- [Execution model](./execution-model.md) — cancellation and error behavior.

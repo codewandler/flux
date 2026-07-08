@@ -1,12 +1,13 @@
 ---
 title: Safety & approvals
+description: "The safety chain for every operation, including authorization, permissions, approvals, and guarded IO."
 ---
 
 # Safety & approvals
 
 flux is built so that no tool, plugin, sub-agent, or app surface can reach the real filesystem,
-a process, or the network without traversing **one** mandatory chain. There is no trusted
-shortcut and no side door. This page describes that envelope and how you approve what runs.
+start a process, or use the network without traversing one mandatory chain. This page explains that
+chain, what prompts, and how approval decisions interact with policy.
 
 ## The one envelope
 
@@ -85,3 +86,9 @@ a role declared with `tools: []` gets **zero** tools.
 This is enforced by construction, not by convention — see [Concepts](../concepts.md) for how it fits
 the plan-first model, and the [source on GitHub](https://github.com/codewandler/flux) for the
 runtime that enforces it.
+
+## Related docs
+
+- [Credentials and secrets](../security/credentials.md) — how secret values stay out of model-visible output.
+- [Plugin capability sandbox](../security/plugin-sandbox.md) — how plugin side effects are scoped.
+- [Server authentication & tenancy](../security/server-auth.md) — who can drive a hosted flux server.

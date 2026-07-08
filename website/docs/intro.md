@@ -1,22 +1,24 @@
 ---
 sidebar_position: 1
 title: Overview
+description: "Public entry point for flux docs: what flux is, what is new, and where to learn next."
 ---
 
 # What is flux?
 
-flux is a deterministic agent platform built on one thesis: **the LLM is not the runtime**.
+flux is a deterministic agent platform for building and running tool-using agents without giving the
+model direct control of the machine.
 
-Instead of letting a model schedule tools one call at a time, flux asks the model to compile a request
-into a typed, readable Flux-Lang plan. A deterministic Rust runtime executes that plan through one
-mandatory safety envelope:
+The thesis is simple: **the LLM is not the runtime**. The model compiles a request into a typed,
+readable Flux-Lang plan. A deterministic Rust runtime then executes that plan through one mandatory
+safety envelope:
 
 ```text
 authorization -> approval -> guarded IO
 ```
 
-The result is a plan you can inspect, replay, and reason about. The model proposes work. The runtime
-decides what is allowed and performs the work.
+The result is an agent run you can inspect, replay, and reason about. The model proposes work; the
+runtime decides what is allowed and performs the work.
 
 ## The three pillars
 
@@ -27,12 +29,12 @@ decides what is allowed and performs the work.
 
 ## Public docs vs project docs
 
-This site is the public documentation for users and integrators. It explains stable concepts, getting
-started paths, Flux-Lang syntax, SDK entry points, and plugin authoring rules.
+This site is the public documentation for users and integrators. It covers stable concepts, the CLI,
+Flux-Lang, the SDK, plugins, and the security model.
 
-The repository also has internal contributor docs under `docs/` and crate-level `docs/` directories.
-Those are design records, story boards, roadmap notes, and implementation references. They are useful
-when contributing to flux, but they are intentionally more detailed and more volatile than this site.
+The repository also contains internal contributor docs under `docs/` and crate-level `docs/`
+directories. Those are design records, story boards, roadmap notes, and implementation references.
+They are useful when contributing, but they are more detailed and more volatile than this site.
 
 ## Start here
 
@@ -43,3 +45,8 @@ when contributing to flux, but they are intentionally more detailed and more vol
 - Embedding flux: read the [SDK overview](./sdk/overview.md).
 - Replay, fork, and diff past runs: read [Time Machine](./agent/time-machine.md).
 - Something not working: check [Troubleshooting](./troubleshooting.md).
+
+## Related docs
+
+- [Getting started](./getting-started.md) — install flux and run the mock provider.
+- [Concepts](./concepts.md) — understand plans, symbols, evidence, and the safety envelope.

@@ -1,14 +1,17 @@
 ---
 title: The agent loop
+description: "The turn loop design, including orient-gather-plan behavior and what it is doing at each stage."
 ---
 
 # The agent loop
 
-flux's turn loop **is itself a Flux-Lang program**. When you run `flux run "…"` or type
-into the REPL, the engine doesn't execute a hardcoded loop — it runs a small flow,
-`agent-loop.flux`, through the same safety envelope as every other plan. This is the thesis —
-*the LLM is not the runtime* — taken all the way down: even the loop that orchestrates the model's
-steps is a readable, overridable plan.
+flux's turn loop is itself a Flux-Lang program. When you run `flux run "..."` or type into the REPL,
+the engine does not execute a hardcoded Rust loop; it runs `agent-loop.flux` through the same runtime
+as every other plan.
+
+This is the thesis, *the LLM is not the runtime*, applied to the agent loop itself: the model can
+propose plans, but the deterministic flow controls when those plans are accepted, executed, revised,
+or stopped.
 
 Each turn, the loop calls two reflexive operations. `plan` re-enters the planner, so the model
 compiles your request into a typed [Flux-Lang](../language/overview.md) graph (or answers in prose).
@@ -106,3 +109,9 @@ extra observations, or restructure the control flow entirely — all within the 
 
 See the [CLI](./cli.md) page for related commands, and the
 [flux source](https://github.com/codewandler/flux) for the built-in loop and op reference.
+
+## Related docs
+
+- [Concepts](../concepts.md) — plans, symbols, evidence, and runtime ownership.
+- [Safety and approvals](./safety.md) — the envelope every loop-dispatched operation crosses.
+- [CLI](./cli.md) — commands for inspecting and ejecting the loop.

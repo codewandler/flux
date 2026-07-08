@@ -5,8 +5,9 @@ description: Multi-flow .flux files, reusable composite op declarations, and who
 
 # Modules, composite ops & programs
 
-A `.flux` file scales from one flow to a whole application. This page covers the module-level
-surface: multiple flows, reusable `op` declarations, and program declarations.
+A `.flux` file can hold one flow, a reusable module, or an application declaration. This page covers
+the module-level surface: multiple flows, composite `op` declarations, and the program declarations
+that the app host understands.
 
 ## Multi-flow modules
 
@@ -90,3 +91,9 @@ flux app run program.flux      # or: flux run program.flux (auto-detected)
 The declarations, the app runtime, the event bus, and a runnable example live in
 [Multi-agent programs](../agent/programs.md). The extra operations the app host registers for
 journeys (`emit`, `send`, `ask`, `spawn`) are listed in [Operations](./ops.md).
+
+## Related docs
+
+- [Multi-agent programs](../agent/programs.md) — how program declarations run in the app host.
+- [Flows & syntax](./flows-and-syntax.md) — the base syntax used inside modules.
+- [Operations](./ops.md) — app-host operations such as `emit`, `send`, `ask`, and `spawn`.

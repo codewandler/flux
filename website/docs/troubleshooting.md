@@ -1,13 +1,15 @@
 ---
 title: Troubleshooting
+description: "Fast fixes for provider setup, state, command behavior, permissions, and common runtime failures."
 sidebar_position: 4
 ---
 
 # Troubleshooting
 
-Common symptoms and their fixes. Each answer leads with the command or config to run.
+This page covers the common failures that block a first run or a local development loop. Each entry
+starts with the command or config to check, then explains why flux behaves that way.
 
-## flux says an API key "is not set"
+## flux says an API key is not set
 
 You picked a provider whose credential isn't available. flux surfaces the exact variable it
 looked for — e.g. `ANTHROPIC_API_KEY is not set`, `OPENAI_API_KEY is not set`,
@@ -21,7 +23,7 @@ flux auth status          # shows every provider, what it needs, and where it re
 Set the environment variable, or run `flux auth login claude` / `flux auth login codex` for the
 subscription paths. See [Providers and models](./agent/providers.md) for the full matrix.
 
-## I just want to try flux without any credentials
+## I want to try flux without credentials
 
 Use the offline `mock` provider — it drives the full plan/execute pipeline with no network, returning
 **canned** output (it writes `flux-mock.txt` and prints `Finished.`). It's a wiring smoke test, not a
@@ -143,3 +145,9 @@ unverified local path instead:
 ```
 
 See [Using plugins](./plugins/using-plugins.md).
+
+## Related docs
+
+- [Providers and models](./agent/providers.md) — credential sources and model routing.
+- [Configuration](./reference/config.md) — permissions, private-network grants, and overrides.
+- [Safety and approvals](./agent/safety.md) — approval behavior and destructive-operation checks.

@@ -5,8 +5,9 @@ description: How a Flux-Lang plan runs — the compile/analyze/optimize/execute 
 
 # Execution model
 
-Flux-Lang execution is deterministic except where a plan explicitly calls a model or waits for
-external input. This page covers what happens between "here is a plan" and "here is its result".
+This page explains what happens after flux receives a plan: parsing, analysis, optimization,
+execution, value storage, dispatch, errors, and suspension. Execution is deterministic except where a
+plan explicitly calls a model or waits for external input.
 
 ## Lifecycle
 
@@ -120,3 +121,9 @@ cross-turn story — including `memo`, `once`, `scope`, and `saga` — is in
 - **Auditability.** The value log and run trace record what happened, in order, with inputs.
 - **Replayability.** Deterministic execution over immutable values means a stored flow can be
   re-run — and a suspended one resumed — without guessing at hidden state.
+
+## Related docs
+
+- [Tooling](./tooling.md) — commands that parse, preview, and execute flows.
+- [Types & effects](./types-and-effects.md) — annotations and effect tags the analyzer reads.
+- [Durability & cross-turn state](./durability.md) — nodes that suspend and resume execution.

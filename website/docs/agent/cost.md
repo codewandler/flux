@@ -1,14 +1,17 @@
 ---
 title: Usage & cost
+description: "How flux computes token usage, pricing attribution, and the sources of cost truth across providers."
 ---
 
 # Usage & cost
 
-flux records every model call's token usage in the session event store (`~/.flux/events.db`), stamped
-at write time with the canonical `provider/model` spec that served the call. Dollar costs are computed
-from a built-in, vendor-verified price table — USD per million tokens, with separate tiers for fresh
-input, output, cache writes, and cache reads. When a provider reports the actual charge for a call
-(OpenRouter does, on both wires), that reported figure is authoritative and wins over the table.
+flux records model usage per call and rolls it up by session and provider. Use this page to understand
+what the CLI summary means, where the numbers come from, and how to price models the built-in table
+does not know yet.
+
+Usage is stored in the session event log (`~/.flux/events.db`) with the canonical `provider/model`
+spec that served the call. Dollar costs come from a built-in price table unless the provider reports
+the actual charge; provider-reported cost wins.
 
 ## Per-turn cost
 
@@ -87,3 +90,8 @@ built-ins keep them at `0.0`; set them only for a provider that prices those tok
 by the model id as `flux usage` reports it (a bare id like `claude-opus-4-8`, or an OpenRouter
 `vendor/model` id); lookup also tries the spec with its provider prefix stripped. A missing or
 malformed file is ignored wholesale — a typo never takes cost reporting down, the built-ins stand.
+
+## Related docs
+
+- [Providers and models](./providers.md) — provider routing, subscription paths, and local providers.
+- [CLI](./cli.md) — where turn summaries and `flux usage` appear.

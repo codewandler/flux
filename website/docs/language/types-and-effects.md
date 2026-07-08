@@ -5,9 +5,9 @@ description: Flux-Lang's lightweight type surface — built-in types, effect tag
 
 # Types & effects
 
-Flux-Lang carries a lightweight, structural type surface. Annotations document intent, feed
-the analyzer's signature checks, and are preserved in the AST; they are optional everywhere
-and not runtime-enforced today.
+Flux-Lang has lightweight structural annotations. They document intent, feed analyzer checks, and stay
+visible in the AST. They are optional today; runtime values are still JSON-like values owned by the
+value store.
 
 ## Built-in types
 
@@ -104,3 +104,9 @@ finish returns `Blocked` instead. See [Operations](./ops.md).
 
 Condition positions use uniform JSON truthiness rather than type coercion rules — the table is
 in the [execution model](./execution-model.md#truthiness).
+
+## Related docs
+
+- [Execution model](./execution-model.md) — values, truthiness, and dispatch.
+- [Node reference](./node-reference.md) — where types and effects appear in JSON.
+- [Operations](./ops.md) — ops that produce and consume prelude artifact types.

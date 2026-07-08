@@ -1,12 +1,13 @@
 ---
 title: Using plugins
+description: "Installing and running trusted plugins, including signatures, capability grants, and host-enforced safety."
 ---
 
 # Using plugins
 
-A flux plugin is a subprocess binary (any language) that speaks a framed NDJSON protocol.
-Each operation it declares is projected as a **policy-gated tool** — the same authorization,
-approval, and guarded-IO chain as flux's built-in tools decides whether the agent may call it.
+Plugins are trusted subprocess binaries that extend flux with new operations. Each declared operation
+is projected as a policy-gated tool, so the same authorization, approval, and guarded-IO chain that
+protects built-ins also protects plugin calls.
 
 Plugins do **no privileged IO of their own**. Every side effect — HTTP, a subprocess, a socket, a
 secret read — is a capability callback the host executes on the plugin's behalf, and the plugin
@@ -121,3 +122,9 @@ reach.
 ## Writing your own
 
 See [Plugin authoring](./authoring.md).
+
+## Related docs
+
+- [Plugin authoring](./authoring.md) — write a plugin and manifest.
+- [Plugin trust & signing](../security/plugin-trust.md) — signed index, hashes, and spawn-time checks.
+- [Plugin capability sandbox](../security/plugin-sandbox.md) — what a plugin may reach through flux.

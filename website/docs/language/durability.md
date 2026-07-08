@@ -5,11 +5,12 @@ description: Session caching, suspension, durable resume, at-most-once effects, 
 
 # Durability & cross-turn state
 
-Flows can outlive a single execution: cache expensive work across turns, suspend until an
-external event, resume a long run without repeating side effects, and unwind partial work when
-a step fails. This page covers the seven nodes involved. None of them has a native text
-spelling yet — in `.flux` text they are written with the `@json` escape; in the JSON wire form
-they are ordinary nodes.
+Durability nodes let a flow outlive one straight-line execution. They cache work, suspend for external
+events, resume long runs without repeating side effects, and unwind partial work when a later step
+fails.
+
+None of these nodes has native text syntax yet. In `.flux` files they use the `@json` escape; in the
+JSON wire form they are ordinary nodes.
 
 Two kinds of state are in play:
 
@@ -143,3 +144,9 @@ running the registered undos in **reverse** order, then propagates the original 
 These compose: a long flow checkpoints between phases, wraps irreversible effects in `once`,
 and guards resources with `scope` — and every op inside still crosses the
 [safety envelope](../agent/safety.md).
+
+## Related docs
+
+- [Storage & persistence](../reference/storage.md) — the event stores backing resume and sessions.
+- [Time Machine](../agent/time-machine.md) — replay, fork, and diff recorded runs.
+- [Execution model](./execution-model.md) — suspension, resume, and deterministic prefixes.

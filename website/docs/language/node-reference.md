@@ -5,10 +5,9 @@ description: Every Flux-Lang node kind — the JSON wire shape, fields, semantic
 
 # Node reference
 
-The JSON AST is the wire and storage form of Flux-Lang: what planners emit, what sessions
-store, what SDKs pass around. Text and JSON are semantically identical — every `.flux`
-construct lowers to exactly these nodes, and nodes without a native text spelling are written
-in text via the one-line `@json` escape.
+This is the precise JSON AST reference for Flux-Lang. Planners emit this shape, sessions store it,
+and SDKs pass it around. Text and JSON are semantically identical: every `.flux` construct lowers to
+these nodes, and nodes without native text syntax are written through `@json`.
 
 ## Top-level shape
 
@@ -615,3 +614,9 @@ forms: the `ctx $name` block and `$pack += $more`.
   distinct from a timeout, and losing branches' dispatched steps remain counted and traced.
 - **`await` and `checkpoint` are top-level only** — they need stable resume cursors.
 - **`obj`/`list` are pure templates** — they cannot contain `call` or control-flow leaves.
+
+## Related docs
+
+- [Operations](./ops.md) — operation names a `call` node can target.
+- [Types & effects](./types-and-effects.md) — annotations, effects, and prelude artifact types.
+- [Execution model](./execution-model.md) — lifecycle and runtime behavior.

@@ -5,8 +5,9 @@ description: An example-driven walk through Flux-Lang — flows, calls, pure dat
 
 # A ten-minute tour
 
-This tour builds up the language one feature at a time. Every snippet is real, current syntax —
-you can paste any of them into a `.flux` file and run it with `flux flow run`.
+This tour builds one small Flux-Lang vocabulary at a time: flows, calls, pure values, branches,
+iteration, concurrency, guard rails, and context packs. Every snippet uses current syntax and can be
+pasted into a `.flux` file.
 
 ## A minimal flow
 
@@ -220,3 +221,9 @@ flow repo-report
 
 From here, read [Flows & syntax](./flows-and-syntax.md) for the precise rules, or head straight
 to the [examples cookbook](./examples.md).
+
+## Related docs
+
+- [Flows & syntax](./flows-and-syntax.md) — the full grammar behind the snippets.
+- [Examples](./examples.md) — complete flows you can run directly.
+- [Reliability & guard rails](./reliability.md) — constraints and failure handling.

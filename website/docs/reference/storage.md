@@ -1,14 +1,15 @@
 ---
 title: Storage & persistence
+description: "How flux stores sessions, run traces, and resumability data across SQLite and Postgres backends."
 ---
 
 # Storage & persistence
 
-flux persists everything as facts in **one append-only event log**: conversation messages, the
-flow run-trace, and per-turn telemetry interleave in a single ordered log. Everything you read back
-is a *projection* over that log — the conversations view replays message events, run traces and
-usage metrics replay theirs — and compaction is an append-only snapshot the projection resets to.
-History is never deleted.
+flux stores sessions, run traces, and usage telemetry as append-only events. Conversations, flow
+execution, and per-turn metrics share one ordered log; every user-facing view is a projection over
+that log.
+
+Compaction appends a snapshot for faster projection. It does not rewrite earlier events.
 
 The store lives in the `flux-events` crate behind a backend-independent API: embedded SQLite by
 default, Postgres opt-in.
@@ -91,4 +92,8 @@ construction, is part of the primary key. Full-text search uses a stored generat
 column with a GIN index (`websearch_to_tsquery` + `ts_rank`), and search results are
 shape-identical to the SQLite backend's.
 
-See also: [Configuration](./config.md).
+## Related docs
+
+- [Configuration](./config.md) — runtime settings that affect local sessions.
+- [Time Machine](../agent/time-machine.md) — replay, fork, and diff recorded runs.
+- [FlowClient](../sdk/flow-client.md) — deterministic flow execution over stored state.

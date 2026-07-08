@@ -5,8 +5,8 @@ description: A cookbook of complete, runnable Flux-Lang flows — from a two-lin
 
 # Examples
 
-Complete flows you can copy into a `.flux` file and run with `flux flow run` (see
-[Tooling](./tooling.md)). Every example uses current, native text syntax.
+These examples are complete flows you can paste into a `.flux` file and run with `flux flow run`.
+They are intentionally small: each one highlights one pattern before the final program-scale example.
 
 ## Read and summarize
 
@@ -174,3 +174,9 @@ crossing the safety envelope.
 - A single `.flux` file can also declare agents, channels, and journeys — a whole application.
   See [Multi-agent programs](../agent/programs.md) and
   [Modules, composite ops & programs](./modules-and-programs.md).
+
+## Related docs
+
+- [A ten-minute tour](./tour.md) — learn the examples one construct at a time.
+- [Tooling](./tooling.md) — run, preview, format, and compile flows.
+- [Modules, composite ops & programs](./modules-and-programs.md) — scale a flow into an app.

@@ -5,9 +5,13 @@ description: The Flux-Lang guard-rail nodes — assert, retry, timeout, budget, 
 
 # Reliability & guard rails
 
-In Flux-Lang, reliability constraints are nodes in the plan's AST, not instructions buried in a prompt. A retry policy, a deadline, a dispatch cap, or an approval gate is something you can read in the plan before it runs, diff in review, and find enforced in the run trace. The model may propose these constraints, but the deterministic runtime is what carries them out — the same way every time.
+Reliability constraints are first-class plan nodes, not instructions buried in a prompt. A retry
+policy, deadline, dispatch cap, or approval gate is visible before execution and enforced by the
+runtime during execution.
 
-Five guard rails have native text spellings: `assert`, `retry`, `timeout`, `budget`, and `with_tools`. Five more — `try`, `confirm`, `verify`, `throttle`, and `debounce` — have no native text spelling yet and are written with the `@json` escape (any statement as one line of compact JSON). Each section below shows the form to write. Full field tables live in the [node reference](./node-reference.md).
+Five guard rails have native text spellings: `assert`, `retry`, `timeout`, `budget`, and
+`with_tools`. Five more use the `@json` escape today: `try`, `confirm`, `verify`, `throttle`, and
+`debounce`. Full field tables live in the [node reference](./node-reference.md).
 
 ## `assert` — abort on a falsey condition
 
@@ -157,9 +161,15 @@ The five nodes below have no native text spelling today. In a `.flux` file, writ
 - Re-arrivals inside the window re-arm the timer, so a burst of triggers coalesces into a single body run after things settle.
 - Because the timestamp lives in the session store keyed by `(session, name)`, the settling window spans turns — not just one plan execution.
 
-## Related pages
+## Related docs
 
 - Ordered graceful degradation with `fallback` — [Control flow](./control-flow.md)
 - First-success `race` and fan-out `parallel` — [Concurrency](./concurrency.md)
 - Guaranteed cleanup (`scope`), rollback (`saga`), and at-most-once effects (`once`) — [Durability & cross-turn state](./durability.md)
 - The session policy and approval chain every dispatch passes through — [Safety & approvals](../agent/safety.md)
+
+## Related docs
+
+- [Control flow](./control-flow.md) — `fallback`, loops, and bounded model routing.
+- [Concurrency](./concurrency.md) — first-success `race` and parallel branch behavior.
+- [Safety & approvals](../agent/safety.md) — session-level policy and approval prompts.

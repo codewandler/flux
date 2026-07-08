@@ -1,15 +1,17 @@
 ---
 title: FlowClient
+description: "Lifecycle details for deterministic flow execution: parse/compile/analyze/execute with optional seeded inputs."
 ---
 
 # FlowClient
 
-`FlowClient` is the SDK surface for the Flux-Lang lifecycle. It is the right entry point when you want
-to parse or compile a flow, analyze it, optionally optimize it, and execute it through the flux runtime.
-For the SDK as a whole — install, the other front doors, mock providers, recipes — start at the
+`FlowClient` is the SDK surface for the Flux-Lang lifecycle. Use it when you already have a flow, or
+when your application wants explicit control over compile, parse, analyze, and execute steps.
+
+For the SDK as a whole — install, `Client`, mock providers, recipes, and the Rust DSL — start at the
 [SDK overview](./overview.md).
 
-Typical lifecycle:
+## Typical lifecycle
 
 ```rust
 let client = FlowClient::builder()
@@ -34,3 +36,9 @@ approval path.
 
 Use the agent-facing `Client` when you want a complete conversational turn. Use `FlowClient` when you
 already have a flow or want deterministic lifecycle control.
+
+## Related docs
+
+- [SDK overview](./overview.md) — provider setup and the higher-level `Client`.
+- [Tooling](../language/tooling.md) — CLI equivalents for flow execution.
+- [Safety and approvals](../agent/safety.md) — policy and approval behavior during SDK dispatch.

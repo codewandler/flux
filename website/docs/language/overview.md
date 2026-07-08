@@ -5,10 +5,11 @@ description: What Flux-Lang is, the mental model behind it, and a map of the lan
 
 # Flux-Lang overview
 
-Flux-Lang is the plan language at the center of flux. When you ask the agent for something, the model
-does not schedule tools one call at a time — it compiles your request into a typed Flux-Lang plan, and
-a deterministic Rust runtime executes that plan. The model proposes; the runtime executes. **The LLM is
-not the runtime.**
+Flux-Lang is the plan language at the center of flux. It is the boundary between model judgment and
+runtime authority: the model may propose a typed plan, but the runtime analyzes, approves, and
+executes it.
+
+Start here if you want the mental model before reading syntax or node reference pages.
 
 A plan is a small, readable program over named values:
 
@@ -138,3 +139,9 @@ Risky steps prompt for approval exactly as they do in an agent turn. See [Toolin
 **Examples**:
 
 - [Examples](./examples.md) — a cookbook of small, complete flows.
+
+## Related docs
+
+- [A ten-minute tour](./tour.md) — learn the language by building one flow.
+- [Flows & syntax](./flows-and-syntax.md) — exact text syntax rules.
+- [Execution model](./execution-model.md) — what happens after a plan is parsed.

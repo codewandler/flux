@@ -1,12 +1,15 @@
 ---
 title: Time Machine
+description: "Replay, fork, and diff recorded runs with resumable plans and deterministic re-execution."
 ---
 
 # Time Machine — replay, fork, diff
 
-flux's founding thesis is that **the LLM is not the runtime**: the model compiles each turn into a
-typed Flux-Lang plan, and a deterministic runtime executes it. That makes a flux run a reproducible
-artifact. Two recordings make it travelable:
+Time Machine is the run-history toolkit: replay an old run without live IO, fork from a recorded
+decision point, or diff two executions. It works because flux records accepted plans and leaf-operation
+results as durable artifacts.
+
+Two recordings make a run travelable:
 
 - Every accepted plan is persisted as canonical, re-parseable Flux-Lang text — so re-executing a
   past run **needs no model call**.
@@ -149,7 +152,7 @@ durability markers that pair with this (`await`, `checkpoint`, `once`), see
 - **Divergence is fatal, by design.** If the world leaked into a run in a way the recording cannot
   explain, replay stops with an error instead of improvising.
 
-## See also
+## Related docs
 
 - [CLI](./cli.md) — the full command surface, including `flux sessions` and `flux flow run`.
 - [Durability](../language/durability.md) — `await`, `checkpoint`, `once`, `saga`.

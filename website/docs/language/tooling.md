@@ -5,8 +5,8 @@ description: Running, previewing, and compiling Flux-Lang flows — flux flow ru
 
 # Tooling
 
-Flux-Lang files are runnable artifacts, not just documentation. This page covers the commands
-that execute, preview, and transform them.
+Flux-Lang files are runnable artifacts. This page covers the commands that execute, preview,
+compile, format, and round-trip them.
 
 ## `flux flow run` — execute a stored flow
 
@@ -89,3 +89,9 @@ formatted for review and parsed back without drift.
 Editing conventions: 2-space indentation, no tabs, one statement per line. See
 [Flows & syntax](./flows-and-syntax.md) for the grammar and the
 [examples cookbook](./examples.md) for ready-to-run material.
+
+## Related docs
+
+- [Flows & syntax](./flows-and-syntax.md) — write valid `.flux` text.
+- [Examples](./examples.md) — complete flows to run.
+- [FlowClient](../sdk/flow-client.md) — the SDK lifecycle for parsing and executing flows.

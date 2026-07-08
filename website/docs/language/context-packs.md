@@ -5,10 +5,9 @@ description: Explicit, budgeted context management — the ctx and ctx_append no
 
 # Context packs
 
-Most agent stacks manage model context implicitly: every tool output lands in the transcript,
-and the model sees an ever-growing pile. Flux-Lang makes context a **first-class, budgeted
-artifact**: a plan selects the symbols a model call may see, states why, and caps the size —
-and the runtime enforces the cap.
+Context packs make model-visible evidence explicit. Instead of sending every tool output back through
+the transcript, a plan names the symbols a model call may see, explains why, and sets a budget the
+runtime enforces.
 
 ## Building a pack
 
@@ -87,3 +86,9 @@ version of what the model was allowed to see. Multiple symbols append in one lin
   a broad include set.
 - Rebind with `+=` as evidence accumulates instead of building a second pack — the audit
   chain stays linear.
+
+## Related docs
+
+- [Pure data shaping](./pure-data.md) — the other pure-node family.
+- [Operations](./ops.md) — model-facing cognition ops that consume packs.
+- [Execution model](./execution-model.md) — how symbols and values are stored.

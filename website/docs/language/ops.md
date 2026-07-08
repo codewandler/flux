@@ -5,11 +5,12 @@ description: The registered operations a Flux-Lang call can target — core tool
 
 # Operations
 
-Operations are what a `call` node targets — and they are provided by the **host runtime**, not
-the language. The engine advertises a catalog built from its live tool registry;
-[plugins](../plugins/authoring.md) project additional operations into the same catalog. The
-language only knows the op's name and arguments; the host validates the call and dispatches it
-through the [safety envelope](../agent/safety.md).
+Operations are the callable boundary between Flux-Lang and the host runtime. A `call` node names an
+operation; the host decides whether that operation exists, how arguments are validated, and what
+approval or policy checks apply.
+
+The engine advertises a catalog built from the live tool registry. [Plugins](../plugins/authoring.md)
+project additional operations into the same catalog.
 
 The catalog is also **evidence-gated**: tool groups surface when the workspace shows their
 signal (the `cargo_*` ops appear in Rust workspaces, `go_*` alongside Go modules), and the
@@ -144,3 +145,9 @@ that are never advertised to the model — see [The agent loop](../agent/agent-l
 
 Whatever the op, the rule is the same: **every** call crosses authorization, approval, and
 guarded IO. There is no trusted shortcut for any operation on this page.
+
+## Related docs
+
+- [Node reference](./node-reference.md) — the `call` node and its JSON shape.
+- [Safety & approvals](../agent/safety.md) — the envelope every operation crosses.
+- [Plugin authoring](../plugins/authoring.md) — how plugins project new operations.

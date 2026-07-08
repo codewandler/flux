@@ -1,12 +1,16 @@
 ---
 title: Agent-to-agent (A2A)
+description: "How flux both serves and consumes A2A agents, including CLI usage and server behavior."
 ---
 
 # Agent-to-agent (A2A)
 
-flux speaks the [A2A protocol](https://a2a-protocol.org/) in **both directions**. A2A is an *agent*
-protocol, not a model protocol: one turn is one remote task, and the remote agent runs its own loop
-(model plus tools). flux just speaks the wire and renders the reply.
+flux speaks the [A2A protocol](https://a2a-protocol.org/) in both directions. It can expose a local
+flux agent to other clients, and it can call a remote A2A agent from the CLI.
+
+A2A is an agent protocol, not a model protocol. One request becomes one remote task, and the remote
+agent runs its own loop with its own tools. flux handles the wire, continuity, streaming, and security
+checks around that task.
 
 - **Server** — `flux app run --serve` exposes a flux agent so any A2A client (Claude Code, other
   agents, custom scripts) can call flux as a first-class agent.
@@ -149,10 +153,8 @@ TTL (`[server] a2a_session_ttl_secs`, default 1h). In principal mode continuity 
 same `contextId` under two tenants is two isolated conversations (`contextId` is a grouping key, not
 a security boundary).
 
-## See also
+## Related docs
 
-- [A2A protocol support](./a2a-conformance.md) — which methods, card fields, task states, and error
-  codes are supported / partial / not yet.
-- [CLI](./cli.md) — the reference flux surface.
-- [Concepts](../concepts.md) — plans, symbols, and the safety envelope every operation runs through.
-- [flux on GitHub](https://github.com/codewandler/flux)
+- [A2A protocol support](./a2a-conformance.md) — method, task-state, and error-code support.
+- [CLI](./cli.md) — the local command surface.
+- [Server authentication & tenancy](../security/server-auth.md) — inbound auth modes and realm isolation.

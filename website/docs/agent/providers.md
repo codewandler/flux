@@ -1,13 +1,16 @@
 ---
 title: Providers and models
+description: "Provider/model routing, credentials, and the current model capability matrix for text turns."
 ---
 
 # Providers and models
 
-flux keeps provider transport separate from the agent runtime. A **provider** is a *wire codec ×
-credential* cell — how a request is serialized and how it authenticates — and the runtime stays
-responsible for executing plans and gating IO. Adding a provider is a small composition, never a fork
-of the loop.
+flux keeps model transport separate from the agent runtime. A provider is a wire codec plus a
+credential source: how a request is serialized and how it authenticates. The runtime still owns plans,
+tool dispatch, approval, and guarded IO.
+
+Use this page to choose `-m <provider>/<model>`, configure credentials, and understand which providers
+support prompt caching or subscription credentials.
 
 ## Routing
 
@@ -82,3 +85,9 @@ needed.
 currently only affect the raw `-p` prompt path. Extended-thinking control for full agent turns is
 planned.
 :::
+
+## Related docs
+
+- [Credentials and secrets](../security/credentials.md) — where provider tokens live and how redaction works.
+- [Configuration](../reference/config.md) — set a default model and permission rules.
+- [Usage & cost](./cost.md) — how model usage is reported.

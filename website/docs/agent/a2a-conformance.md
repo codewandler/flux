@@ -1,12 +1,15 @@
 ---
 title: A2A protocol support
+description: "Protocol support matrix for flux's A2A implementation and what each method returns."
 ---
 
 # A2A protocol support
 
-What flux's [A2A protocol](https://a2a-protocol.org/) (v0.3.0) implementation supports today, what's
-partial, and what isn't yet — so you know exactly what you can rely on when you point an A2A client at
-flux or drive a remote agent with `flux a2a`. For how to use it, see [Agent-to-agent (A2A)](./a2a.md).
+This is the compatibility matrix for flux's [A2A protocol](https://a2a-protocol.org/) (v0.3.0)
+implementation. Use it when you need to know which methods, task states, agent-card fields, and error
+paths are stable enough to rely on.
+
+For the operator-facing setup guide, start with [Agent-to-agent (A2A)](./a2a.md).
 
 **Legend:** ✅ Supported · ⚠️ Partial · ❌ Not yet · 🚫 Non-goal
 
@@ -97,6 +100,7 @@ The one remaining lifecycle slice is suspension: surfacing the engine's suspend/
 `tasks/list`. flux keeps to a single JSON-RPC/HTTP binding and a tolerant pass-through for unknown
 fields.
 
-## See also
+## Related docs
 
-- [Agent-to-agent (A2A)](./a2a.md) — using the client and server, security modes, and continuity.
+- [Agent-to-agent (A2A)](./a2a.md) — run flux as an A2A client or server.
+- [Server authentication & tenancy](../security/server-auth.md) — protect exposed endpoints.

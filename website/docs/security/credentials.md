@@ -5,10 +5,12 @@ description: How flux stores provider and plugin OAuth tokens, keeps secret valu
 
 # Credentials & secrets
 
-This page covers **outbound** authentication — how flux holds the credentials it needs to call LLM
-providers and plugin APIs, and how those secret *values* are kept out of the model's context and
-your logs. For the provider-selection table, see [Providers and models](../agent/providers.md); for
-the runtime chain that gates every side effect, see [Safety & approvals](../agent/safety.md).
+This page covers outbound authentication: provider keys, subscription credentials, plugin OAuth
+tokens, secret references, and redaction. It explains where credentials live and how flux keeps secret
+values out of model-visible context and logs.
+
+For provider selection, see [Providers and models](../agent/providers.md). For dispatch gating, see
+[Safety & approvals](../agent/safety.md).
 
 ## References are locations, not values
 
@@ -112,3 +114,9 @@ The host:
 The plugin never touches the `/oauth/token` endpoint and never sees the resulting token — at call
 time the host injects a fresh bearer on the plugin's behalf. The declaration side of this
 (`oauth2` manifest fields) lives on the [Plugin capability sandbox](./plugin-sandbox.md) page.
+
+## Related docs
+
+- [Providers and models](../agent/providers.md) — credential sources by provider.
+- [Plugin capability sandbox](./plugin-sandbox.md) — plugin secret references and OAuth declarations.
+- [Plugin trust & signing](./plugin-trust.md) — installed plugin integrity.
