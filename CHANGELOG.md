@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-08
+
+### Changed
+
+- **Packaged the `flux-sdk` + `flux-providers` closure for crates.io and automated the publish.** The
+  20-crate publish closure is now published under a `codewandler-` vanity prefix (the bare `flux-*` names
+  are squatted on crates.io), while every import path stays unprefixed (`use flux_sdk::…`,
+  `use flux_providers::…`) via a package-name/lib-name split — no source or downstream-manifest change,
+  and the shipped `flux` binary is unaffected. Crates that had joined the closure via later refactors
+  (`flux-markdown`, `flux-orchestrate`, and `flux-pg` — pulled in by `flux-events`' optional `postgres`
+  backend, which crates.io requires be published) gained the version metadata they were missing, and the
+  non-closure `flux-datasource` dropped a stray version. A `vX.Y.Z` tag now publishes the closure via
+  `.github/workflows/crates-io.yml` (`scripts/publish-crates-io.sh`, idempotent/resumable). See
+  `crates/flux-sdk/PUBLISHING.md`.
+
+### Added
+
+- **`scripts/cut-release.sh`** — one command to cut a release: bump every version, re-lock both
+  workspaces, roll the CHANGELOG, run the full gate, then commit + tag (staging only the release files,
+  so concurrent work is never swept in).
+
 ## [0.9.2] - 2026-07-08
 
 ### Fixed
