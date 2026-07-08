@@ -236,9 +236,23 @@ impl Value {
         match self {
             Value::Null => J::Null,
             Value::Bool(b) => J::Bool(*b),
-            Value::Number(n) => serde_json::Number::from_f64(*n)
-                .map(J::Number)
-                .unwrap_or(J::Null),
+            // An integral value renders as a JSON integer (`5`, not `5.0`) — matching the text a
+            // literal `5` carries, so a typed numeric bind compares equal to a literal `match` arm and
+            // displays without a spurious `.0`. Non-integral / out-of-i64-range values keep the float
+            // form; a non-finite number is unrepresentable in JSON and becomes null.
+            Value::Number(n) => {
+                if n.is_finite()
+                    && n.fract() == 0.0
+                    && *n >= i64::MIN as f64
+                    && *n <= i64::MAX as f64
+                {
+                    J::Number((*n as i64).into())
+                } else {
+                    serde_json::Number::from_f64(*n)
+                        .map(J::Number)
+                        .unwrap_or(J::Null)
+                }
+            }
             Value::String(s) => J::String(s.clone()),
             Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Struct(fields) => J::Object(
@@ -1293,11 +1307,17 @@ mod tests {
         assert_eq!(ast, back);
     }
 
-    /// `Value::from_json` is the inverse of `to_json` (round-trips natural JSON through the value model).
+    /// `Value::from_json` is the inverse of `to_json` (round-trips natural JSON through the value
+    /// model). Non-integral numbers round-trip exactly; an integral number canonicalizes to a JSON
+    /// integer (the language has one number model and renders whole numbers without a `.0`).
     #[test]
     fn value_from_json_round_trips() {
-        let j = serde_json::json!({"a": "x", "b": [1.0, true, null]});
+        let j = serde_json::json!({"a": "x", "b": [1.5, true, null]});
         assert_eq!(Value::from_json(&j).to_json(), j);
+        assert_eq!(
+            Value::from_json(&serde_json::json!(1.0)).to_json(),
+            serde_json::json!(1)
+        );
     }
 
     /// `Value::to_json` produces the natural JSON shape (a string is a JSON string, not the tagged
@@ -1308,7 +1328,8 @@ mod tests {
             Value::String("hi".into()).to_json(),
             serde_json::json!("hi")
         );
-        assert_eq!(Value::Number(3.0).to_json(), serde_json::json!(3.0));
+        assert_eq!(Value::Number(3.0).to_json(), serde_json::json!(3)); // integral → JSON integer
+        assert_eq!(Value::Number(2.5).to_json(), serde_json::json!(2.5)); // non-integral keeps float
         assert_eq!(Value::Bool(true).to_json(), serde_json::json!(true));
         assert_eq!(Value::Null.to_json(), serde_json::Value::Null);
 
@@ -1317,7 +1338,7 @@ mod tests {
         fields.insert("b".to_string(), Value::List(vec![Value::Number(1.0)]));
         assert_eq!(
             Value::Struct(fields).to_json(),
-            serde_json::json!({"a": "x", "b": [1.0]})
+            serde_json::json!({"a": "x", "b": [1]})
         );
     }
 

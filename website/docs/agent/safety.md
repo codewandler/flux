@@ -39,10 +39,13 @@ pre-tool hooks
 - **Reads** (`read`, `glob`, `grep`, `search`) are pre-allowed — they run without prompting.
 - **Writes and commands** prompt for approval unless you pass `--yes` or have an allow-rule in your
   config.
-- **Destructive operations** (`rm -rf`, `git push --force`, `mkfs`, …) **always** re-confirm. This
-  holds even with `--yes`, and even inside a plan you already approved: a destructive step that
-  wasn't visible in the approved plan re-fires the gate when it's dispatched. It cannot be bypassed
-  by the plan.
+- **Destructive operations** (`rm -rf`, `git push --force`, `mkfs`, …) **always re-fire the approval
+  gate** — even inside a plan you already approved: a destructive step that wasn't visible in the
+  approved plan re-fires the gate when it's dispatched, so it can never slip through unapproved. What
+  the gate *does* then depends on the approver in force: the interactive approver prompts you, a
+  sub-agent's approver denies outright, and `--yes` (a headless allow-all approver) approves it
+  automatically. So `--yes` does **not** exempt destructive ops from the gate — it answers the gate
+  "yes" for them too, along with everything else. Use `--yes` only in trusted, unattended contexts.
 
 ## Approving a prompt
 
@@ -52,9 +55,12 @@ When flux prompts, you have three choices:
 - **`a`** — always approve operations like this; the choice is persisted to `.flux/config.toml`.
 - **`N`** — deny (the default). The operation does not run.
 
-Unattended runs use `--yes` to auto-approve routine steps — but destructive steps still stop and
-ask. See the [CLI reference](./cli.md) for the flags and [config reference](../reference/config.md)
-for the persisted `[permissions]` allow/deny lists.
+Unattended runs use `--yes` to auto-approve **every** step — routine and destructive alike (it
+installs a headless allow-all approver). Reserve it for trusted contexts. When you want routine steps
+to flow but destructive ones to still stop and ask, don't use `--yes`: run interactively with
+allow-rules for the routine tools — the destructive gate re-fires past an allow-rule, so those steps
+still prompt. See the [CLI reference](./cli.md) for the flags and
+[config reference](../reference/config.md) for the persisted `[permissions]` allow/deny lists.
 
 ## Secrets stay invisible to the model
 

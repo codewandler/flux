@@ -2,7 +2,7 @@
 
 **Status:** Tiers 1–3 implemented (Tier 3 core 2026-07-08; the `input-required` suspension slice remains open) · **Pillar:** Agent · **Epic slug:** `a2a-conformance`
 
-Tracks the gap between the [A2A protocol](https://a2a-protocol.org/) (v1.0) and flux's
+Tracks the gap between the [A2A protocol](https://a2a-protocol.org/) (v0.3.0) and flux's
 implementation, and sequences the work to close it. The living support matrix lives in
 [`../a2a-conformance.md`](../a2a-conformance.md) (contributor copy) and
 [`website/docs/agent/a2a-conformance.md`](../../website/docs/agent/a2a-conformance.md) (public copy);

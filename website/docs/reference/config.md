@@ -35,7 +35,8 @@ actions   = ["workspace.write"]
 `[permissions]` is the ergonomic layer over the authorization policy: `deny` is evaluated first, then
 `allow`, otherwise flux prompts. Entries are tool names (`read`, `glob`, `search`) or scoped command
 rules like `Bash(git:*)` / `Bash(rm:*)`. Reads are pre-allowed by default. Permission rules can never
-widen past the policy floor, and destructive operations always re-confirm regardless — see
+widen past the policy floor, and destructive operations always re-fire the approval gate regardless
+(an interactive run prompts for them; `--yes` auto-approves them along with everything else) — see
 [Safety & approvals](../agent/safety.md).
 
 ## Private-network egress

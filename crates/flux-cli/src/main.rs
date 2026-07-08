@@ -468,6 +468,13 @@ enum FlowAction {
         /// rehydrated), and executes from the first changed statement.
         #[arg(long, value_name = "SESSION|last")]
         resume: Option<String>,
+        /// The payload to bind to a resumed top-level `await` (`$reply = await …`). Parsed as JSON, so
+        /// a bare word is a JSON string (`--resume-value hi` binds `"hi"`) and `--resume-value 42`
+        /// binds the number. Required when `--resume`-ing a session that halted awaiting a value; omit
+        /// it for a plain checkpoint/failure resume. Without it, resuming past an unbound await refuses
+        /// with a clear error instead of failing later on `unbound symbol`.
+        #[arg(long, value_name = "JSON")]
+        resume_value: Option<String>,
     },
 }
 
@@ -2671,6 +2678,7 @@ async fn run_flow(
     yes: bool,
     resumable: bool,
     resume: Option<String>,
+    resume_value: Option<String>,
 ) -> Result<()> {
     // Build the agent flags from the command's own model/`--yes` (reuses the shared agent wiring).
     let flags = AgentFlags::from_model_yes(model.as_deref(), yes);
@@ -2705,7 +2713,15 @@ async fn run_flow(
         }
     };
 
-    run_draft_ast_with_composites_resumable(&flags, &ast, &composites, resumable, resume).await
+    run_draft_ast_with_composites_resumable(
+        &flags,
+        &ast,
+        &composites,
+        resumable,
+        resume,
+        resume_value,
+    )
+    .await
 }
 
 /// Execute a pre-built `DraftAst` through the full envelope — the shared core behind both
@@ -2724,7 +2740,7 @@ pub(crate) async fn run_draft_ast_with_composites(
     ast: &flux_flow::ast::DraftAst,
     composites: &[flux_lang::program::CompositeOpDecl],
 ) -> Result<()> {
-    run_draft_ast_with_composites_resumable(flags, ast, composites, false, None).await
+    run_draft_ast_with_composites_resumable(flags, ast, composites, false, None, None).await
 }
 
 /// [`run_draft_ast_with_composites`] plus L-25's opt-in resumable mode for `flux flow run`.
@@ -2742,6 +2758,7 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     composites: &[flux_lang::program::CompositeOpDecl],
     resumable: bool,
     resume: Option<String>,
+    resume_value: Option<String>,
 ) -> Result<()> {
     let resumable = resumable || resume.is_some();
 
@@ -2839,6 +2856,40 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     };
     if resume.is_some() && open_halt.is_none() {
         bail!("session {session_id} has no open halt to resume — nothing to fast-forward");
+    }
+
+    // A-58 / F-015: a resume that lands on a value-awaiting `await` (`$reply = await …`) must supply
+    // its payload. The resumable driver fast-forwards *past* the await, so bind `--resume-value` into
+    // the awaited symbol first — otherwise post-await statements die on `unbound symbol`. When a
+    // value-await gets no payload, refuse clearly (naming the symbol) instead of advancing into that
+    // failure. A bare `await` binds nothing, so it needs no value.
+    if let Some(open) = &open_halt {
+        let awaited = flux_lang::runtime::awaited_binding(&ast.body, open.halt.node);
+        match (&resume_value, awaited) {
+            (Some(raw), _) => {
+                // Parse as JSON so `42`/`true`/`"x"`/`{…}` keep their type; a bare word is a string.
+                let value = serde_json::from_str::<serde_json::Value>(raw.trim())
+                    .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+                let bound = flux_lang::runtime::bind_resume_value(
+                    engine.flow.as_ref(),
+                    &session_id,
+                    &ast.body,
+                    open.halt.node,
+                    value,
+                )
+                .map_err(|e| anyhow::anyhow!("bind resume value: {e}"))?;
+                if let Some(sym) = bound {
+                    eprintln!("{}", style::dim(&format!("resume: bound ${sym} = {raw}")));
+                }
+            }
+            (None, Some(sym)) => {
+                bail!(
+                    "session {session_id} halted awaiting a value for `${sym}` — pass \
+                     --resume-value <json> (e.g. --resume-value '\"hello\"', --resume-value 42)"
+                );
+            }
+            (None, None) => {}
+        }
     }
 
     // Denial re-emission guard (design Part 2 / A-16): a statement policy or the user already
@@ -3104,10 +3155,12 @@ async fn run_plan(
     );
     if !compiled.diagnostics.is_empty() {
         print_diagnostics(&compiled.diagnostics);
-        eprintln!(
-            "{}",
-            style::yellow("plan references unknown operations — not running")
-        );
+        let refusal = if diagnostics_all_unknown_op(&compiled.diagnostics) {
+            "plan references unknown operations — not running"
+        } else {
+            "plan failed validation — not running"
+        };
+        eprintln!("{}", style::yellow(refusal));
         return Ok(());
     }
     if risk.ops.is_empty() {
@@ -3149,15 +3202,29 @@ async fn run_plan(
     Ok(())
 }
 
-/// Print analyzer diagnostics (unknown ops referenced by a plan) to stderr, if any.
+/// Whether *every* analyzer diagnostic is an unknown-op error (message shape `unknown operation: …`).
+/// Picks an accurate header: a validation failure of another class (bad arg, arity, type/shape,
+/// composability, unbound symbol, …) must not be filed under "references unknown operations" (A-62 /
+/// F-010) — that header misleads both the reader and the planner, which reads diagnostics back to
+/// repair. Empty ⇒ false (no header is printed for an empty set).
+fn diagnostics_all_unknown_op(diags: &[flux_flow::analyze::Diagnostic]) -> bool {
+    !diags.is_empty()
+        && diags
+            .iter()
+            .all(|d| d.message.starts_with("unknown operation"))
+}
+
+/// Print analyzer diagnostics to stderr, if any, under a header matching their actual failure class.
 fn print_diagnostics(diags: &[flux_flow::analyze::Diagnostic]) {
     if diags.is_empty() {
         return;
     }
-    eprintln!(
-        "{}",
-        style::yellow("diagnostics — the plan references unknown operations")
-    );
+    let header = if diagnostics_all_unknown_op(diags) {
+        "diagnostics — the plan references unknown operations"
+    } else {
+        "diagnostics — the plan failed validation"
+    };
+    eprintln!("{}", style::yellow(header));
     for d in diags {
         eprintln!("{}", style::dim(&format!("  - {}", d.message)));
     }
@@ -4625,6 +4692,15 @@ impl AgentSink for CliSink {
                 "{}",
                 style::dim(&format!("⊙ context compacted ({from} → {to} messages)"))
             );
+        } else if o.kind == "context.shrunk" {
+            // A-63 / F-011: a context pack dropped members to fit its budget — surface it once so a
+            // plain run shows the eviction (the model-facing transcript line alone never did).
+            let dropped = o.data.get("dropped").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = o.data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+            eprintln!(
+                "{}",
+                style::dim(&format!("⊙ context: dropped {dropped} of {total} members"))
+            );
         } else if o.kind == "turn.cancelled" {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
         } else if o.kind == "loop.phase" {
@@ -5410,8 +5486,27 @@ fn apply_workspace_access_env(cli: &Cli) {
     }
 }
 
+/// Restore the default `SIGPIPE` disposition (`SIG_DFL`) that Rust's std overrides to `SIG_IGN` at
+/// startup, so a broken pipe ends the process the conventional Unix way instead of panicking on EPIPE
+/// (A-61 / F-006). Called once at the top of `main`.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: setting a signal disposition to SIG_DFL is a process-global libc call with no data race,
+    // and SIG_DFL installs no handler, so there is no async-signal-safety concern.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // A-61 / F-006: Rust's std sets SIGPIPE to SIG_IGN at startup, so writing to a closed pipe returns
+    // EPIPE and `println!`/`writeln!` panic ("failed printing to stdout: Broken pipe"). Piping a
+    // streaming subcommand into `head`/`less`/`grep -q` is routine, so restore the default disposition
+    // — the OS then ends the process the conventional Unix way on a broken pipe instead of a panic +
+    // backtrace. Genuine write errors to a real file/terminal are unaffected.
+    #[cfg(unix)]
+    reset_sigpipe();
     // With the `slack` feature the dependency tree pulls rustls with BOTH crypto providers
     // (slack-morphism's hyper-rustls brings aws-lc-rs; reqwest/tungstenite bring ring), so rustls
     // cannot pick a process-level default on its own and panics on first TLS use. Install one
@@ -5509,8 +5604,9 @@ async fn main() -> Result<()> {
                         yes,
                         resumable,
                         resume,
+                        resume_value,
                     },
-            }) => run_flow(&file, model, yes, resumable, resume).await,
+            }) => run_flow(&file, model, yes, resumable, resume, resume_value).await,
             Some(Commands::Review {
                 agent,
                 files,
@@ -5651,6 +5747,38 @@ fn app_plugin_caps(
 /// `serve` exposes an agent over the HTTP/A2A API. With a `path`, it adds a synthetic `a2a` channel
 /// bound to the program's sole agent. With **no** `path`, it serves flux's built-in coding agent
 /// directly — the former `flux serve` (requires `--yes`; non-loopback needs `FLUX_SERVER_TOKEN`).
+/// Resolve the provider for a served/app program from a model spec. Honors `-m mock` the same way the
+/// non-served CLI paths (`build_agent`/`provider_for`/REPL) do — A-60 / F-014: without the mock guard
+/// `mock` falls into `build_provider`'s Anthropic short-alias arm, so `app run --serve -m mock`
+/// silently used the Anthropic path (failing on low credits) instead of the offline mock. Returns the
+/// provider (`None` if unbuildable, e.g. missing credentials — model-backed ops then unavailable) and
+/// the resolved model label.
+fn app_provider_for(spec: &str) -> (Option<std::sync::Arc<dyn Provider>>, String) {
+    if spec == "mock" || spec.starts_with("mock/") {
+        return (
+            Some(std::sync::Arc::new(MockCliProvider::default()) as std::sync::Arc<dyn Provider>),
+            "mock".to_string(),
+        );
+    }
+    match build_provider(spec) {
+        Ok((native, _provider_name, resolved)) => (Some(std::sync::Arc::new(native)), resolved),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "(no provider for `{spec}`: {e}; model-backed cognition ops will be unavailable)"
+                ))
+            );
+            let m = spec
+                .split_once('/')
+                .map(|(_, m)| m)
+                .unwrap_or(spec)
+                .to_string();
+            (None, m)
+        }
+    }
+}
+
 async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) -> Result<()> {
     use flux_lang::program::{ChannelDecl, Module, Program};
 
@@ -5688,25 +5816,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         .model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
-    let (provider, model): (Option<std::sync::Arc<dyn Provider>>, String) = match build_provider(
-        &spec,
-    ) {
-        Ok((native, _provider_name, resolved)) => (Some(std::sync::Arc::new(native)), resolved),
-        Err(e) => {
-            eprintln!(
-                    "{}",
-                    style::dim(&format!(
-                        "(no provider for `{spec}`: {e}; model-backed cognition ops will be unavailable)"
-                    ))
-                );
-            let m = spec
-                .split_once('/')
-                .map(|(_, m)| m)
-                .unwrap_or(&spec)
-                .to_string();
-            (None, m)
-        }
-    };
+    let (provider, model) = app_provider_for(&spec);
 
     // `strict-review` is a built-in program name (no file): the L-13 `review_code` journey, wrapping
     // the ONE checked-in `examples/strict_review.flux` protocol as a composite op
@@ -7416,6 +7526,60 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    #[test]
+    fn app_serve_provider_honors_mock() {
+        // A-60 / F-014: a served program under `--serve -m mock` must resolve to the offline mock
+        // provider, not fall through to the Anthropic path (which fails on low credits).
+        let (provider, model) = super::app_provider_for("mock");
+        assert_eq!(model, "mock");
+        assert_eq!(
+            provider.expect("mock provider built").name(),
+            "mock",
+            "served -m mock resolves to the offline mock, not Anthropic"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_sigpipe_installs_sig_dfl() {
+        // A-61 / F-006: after the reset, SIGPIPE must be SIG_DFL — Rust's std defaults it to SIG_IGN,
+        // which is exactly what makes `println!` panic on a broken pipe. `signal()` returns the
+        // PREVIOUS disposition, so reading it back right after the reset proves it installed SIG_DFL
+        // (a no-op reset would read back SIG_IGN and fail this).
+        super::reset_sigpipe();
+        let prev = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        assert_eq!(prev, libc::SIG_DFL, "reset_sigpipe installs SIG_DFL");
+    }
+
+    #[test]
+    fn diagnostics_header_matches_the_failure_class() {
+        // A-62 / F-010: the "references unknown operations" header/refusal must appear ONLY when every
+        // diagnostic is genuinely an unknown-op error — a non-unknown-op failure under that header
+        // misleads both the reader and the repair-reading planner.
+        use flux_flow::analyze::Diagnostic;
+        let unknown = vec![Diagnostic::new("unknown operation: `foo`")];
+        assert!(super::diagnostics_all_unknown_op(&unknown));
+        let other = vec![Diagnostic::new(
+            "a value template (`obj`/`list`) may only contain pure value leaves",
+        )];
+        assert!(
+            !super::diagnostics_all_unknown_op(&other),
+            "a non-unknown-op failure is not labeled 'unknown operations'"
+        );
+        let mixed = vec![
+            Diagnostic::new("unknown operation: `foo`"),
+            Diagnostic::new("`return` is not allowed inside a `parallel` branch"),
+        ];
+        assert!(
+            !super::diagnostics_all_unknown_op(&mixed),
+            "a mixed set is not all-unknown-op"
+        );
+        assert!(
+            !super::diagnostics_all_unknown_op(&[]),
+            "empty is not unknown-op"
+        );
     }
 
     /// L-02: skill discovery layers CLI `--skill-dir` above `[skills] dirs` from config, above the

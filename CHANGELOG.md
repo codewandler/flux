@@ -6,8 +6,55 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**v0.6.0 beta hardening** (the `beta-hardening` epic — triaged from the first external beta test of a
+shipped release). Targeted fixes and docs alignment across the CLI, Flux-Lang, and the
+served/program surfaces; no redesign.
+
+### Added
+
+- **`flux flow run --resume-value <json>`** (beta A-58 / F-015). A resumable flow halted on a
+  top-level `await` (`$reply = await …`) can now be resumed with a payload: it is coerced to the
+  await's type and bound to the awaited symbol before the fast-forward, so post-await statements run
+  with it bound. Resuming a value-await with no `--resume-value` refuses with a clear error naming the
+  symbol instead of failing later on `unbound symbol`.
+- **`peek` is now bindable** (beta F-009). `$prev = peek(name)` reads a symbol softly (its value when
+  bound, empty when not) and binds the result — previously `peek` was statement-only.
+- **Context-pack shrinkage is surfaced** (beta A-63 / F-011). When a `ctx` pack drops members to fit
+  its budget, the CLI prints `⊙ context: dropped N of M members` (once, from existing metadata) so a
+  plain run can tell context was evicted.
+
+### Fixed
+
+- **Scalar text binds keep their JSON type** (beta L-43 / F-008). `$n = 1` / `$ok = false` bind the
+  number/boolean, not the strings `"1"`/`"false"`, so `match` arms and structured output see the typed
+  value; integral numbers also render as `5`, not `5.0`.
+- **`parse` composes like other pure nodes** (beta L-44 / F-012) — accepted as an object-template leaf
+  (`{ data: parse($x) }`) and as a direct return, not only in bind position.
+- **`fluxlang compile` accepts a module with a leading `op`** (beta L-45 / F-013) — it now shares the
+  module parse entry with `flux flow run`.
+- **Direct `flow run` sub-agents correlate to the parent** (beta A-59 / F-016). A `task(...)` child
+  under `flux flow run` records `correlation_id = parent session`, so `replay --sub-agents` recurses
+  (parity with normal `flux run` turns).
+- **`app run --serve -m mock` uses the mock provider** (beta A-60 / F-014) instead of silently taking
+  the Anthropic path.
+- **No panic on a broken pipe** (beta A-61 / F-006). Piping a streaming subcommand into `head`/`less`
+  ends the process quietly (default SIGPIPE disposition restored) instead of a Rust panic + backtrace.
+- **Accurate validation diagnostic headers** (beta A-62 / F-010). The "references unknown operations"
+  header/refusal appears only when every diagnostic is genuinely an unknown-op error; other validation
+  failures are headed "failed validation".
+- **Weak-model repeat-read stall guard** (beta A-64 / F-004). A repeated, already-succeeded network
+  read (`websearch.search`) is now counted by the loop's stall guards, which escalate then stop with
+  an honest "could not make progress" instead of looping.
+
 ### Documentation
 
+- **Beta docs-truth pass** (beta C-45 / C-46 — F-001/F-003/F-005/F-007). Reconciled the `--yes`
+  destructive-op contract (it is a documented allow-all; the safety docs no longer claim destructive
+  ops "always re-confirm" under `--yes`); reframed `-m mock` as a canned offline smoke test (writes
+  `flux-mock.txt`, prints `Finished.`), not a representative agent run; aligned every A2A
+  protocol-version mention to the card's `0.3.0`; fixed the Flux-Lang top-level-shape `TypeRef` JSON
+  examples; and documented a planner **model capability floor** (weak models can fail the `emit_plan`
+  contract).
 - **Public docs coverage for shipped features.** Added seven pages to the public documentation
   site (`codewandler.github.io/flux`) that previously had no user-facing coverage: the Time Machine
   (`flux replay`/`fork`/`diff`, cassettes, resumable flows), storage & persistence (the append-only

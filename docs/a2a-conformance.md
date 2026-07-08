@@ -1,6 +1,6 @@
 # A2A protocol support
 
-**What flux's [A2A](https://a2a-protocol.org/) (v1.0) implementation supports today, what's partial,
+**What flux's [A2A](https://a2a-protocol.org/) (v0.3.0) implementation supports today, what's partial,
 and what isn't yet.** This is the contributor copy (it links the backlog); the integrator-facing copy
 is [`website/docs/agent/a2a-conformance.md`](../website/docs/agent/a2a-conformance.md). For *how to
 use* A2A see [a2a.md](a2a.md); for the *why and in what order* of the gaps see the epic design

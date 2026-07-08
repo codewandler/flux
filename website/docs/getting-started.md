@@ -32,11 +32,13 @@ Prebuilt binaries, installers, and checksums are attached to every
 
 ## Try it with no API key
 
-`-m mock` runs an offline provider through the full pipeline — a zero-config way to see how a turn
-plans and executes:
+`-m mock` is an offline provider that drives the full plan/execute pipeline with **canned** output — a
+zero-config way to watch how a turn plans, approves, and executes. It writes a `flux-mock.txt` file and
+prints `Finished.` regardless of the prompt, so it's a wiring smoke test, not a representative agent
+run — for that, use a real provider ([below](#run-a-real-agent-turn)):
 
 ```bash
-flux run --yes -m mock "summarise this repo"
+flux run --yes -m mock "write a quick note"
 ```
 
 ## Run a real agent turn
@@ -62,7 +64,8 @@ flux auth status
 ```
 
 Every operation crosses the same [safety envelope](./agent/safety.md): reads are pre-allowed, writes
-and commands prompt for approval, and destructive steps always re-confirm.
+and commands prompt for approval, and destructive steps always re-fire the approval gate. Passing
+`--yes` auto-approves every step, destructive ones included — use it only in trusted contexts.
 
 ## Run a stored Flux-Lang flow
 

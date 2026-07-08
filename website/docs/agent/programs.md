@@ -82,9 +82,11 @@ rather than one loop doing everything.
 flux run app.flux        # or: flux app run app.flux
 ```
 
-Programs are **deny-destructive by default** — any operation that changes the world re-confirms before
-it runs. Pass `--yes` to run unattended (destructive steps still re-confirm). To expose the program as
-a long-running HTTP/A2A daemon instead of a one-shot run:
+Programs run headless, so they are **deny-by-default**: the orchestration verbs (`emit`/`send`/`ask`/
+`spawn`) and read-only builtins are pre-allowed, but anything that changes the world (`write`, `bash`,
+`git_*`, …) is **denied** outright — there is no human at a prompt to approve it. Pass `--yes` to run a
+trusted, pre-authored program under an allow-all approver instead — it approves every step, destructive
+ones included. To expose the program as a long-running HTTP/A2A daemon instead of a one-shot run:
 
 ```bash
 flux app run --serve 127.0.0.1:8787 --yes

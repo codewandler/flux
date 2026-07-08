@@ -1959,6 +1959,30 @@ mod tests {
         assert!(ev.by_kind("tool_call").count() >= 1);
     }
 
+    /// Locks the documented `flux run --yes` contract (C-45 / beta F-003): the headless allow-all
+    /// approver that `--yes` installs approves destructive ops too. The point is that the destructive
+    /// gate still *fires* (the intent is escalated and recorded as `KIND_DESTRUCTIVE`) — it is answered
+    /// `Allow`, not bypassed. The safety docs describe exactly this: `--yes` does not exempt destructive
+    /// ops from the gate; it answers the gate "yes" for them.
+    #[tokio::test]
+    async fn allow_approver_auto_approves_a_destructive_op_but_still_escalates_it() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DestructiveTool));
+        // Even a bare allow-rule would force the destructive gate; `--yes` answers it allow-all.
+        let perms = PermissionManager::from_rules(&["danger".into()], &[]);
+        let ex = Executor::new(reg, perms, Arc::new(AllowApprover), test_ctx());
+
+        let r = ex.dispatch("danger", json!({})).await;
+        assert!(
+            !r.is_error,
+            "--yes (AllowApprover) approves the destructive op"
+        );
+        assert_eq!(r.content, "ran");
+        // The gate still fired and recorded the escalation — allow-all is an approval, not a bypass.
+        let ev = ex.evidence();
+        assert_eq!(ev.by_kind(KIND_DESTRUCTIVE).count(), 1);
+    }
+
     /// A tool that declares a filesystem-write effect (used to test the policy floor).
     struct WriteishTool;
     #[async_trait]

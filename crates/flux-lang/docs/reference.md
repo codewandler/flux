@@ -19,8 +19,8 @@ A flow is a JSON object:
 ```json
 {
   "name": "optional-name",
-  "params": [{"name": "ticket", "ty": "Ticket"}],
-  "returns": "Result",
+  "params": [{"name": "ticket", "ty": {"named": "Ticket"}}],
+  "returns": {"named": "Result"},
   "body": [Node, ...]
 }
 ```

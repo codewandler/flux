@@ -43,6 +43,20 @@ Because flux's loop is tool-driven, prefer models with reliable function/tool ca
 and Ollama, the `*-anthropic` variants return structured `tool_use` blocks instead of risking inline
 text-leaked tool calls.
 
+## Model capability floor
+
+flux's planner asks the model to emit a typed Flux-Lang plan (the `emit_plan` tool) that passes a
+strict validator, with a bounded repair loop when a first attempt is rejected. Frontier and mid-tier
+models (Claude, GPT-5-class, Codex, and the stronger OpenRouter models) clear this reliably;
+**small/weak models can fail the planner contract even on trivial requests** — the repair loop
+exhausts its budget on malformed tool-call JSON or an invalid plan and the run errors rather than
+silently degrading. Routing is per-`-m`, so if a model can't produce a valid plan, point a capable
+model at the planning turn (and, if you like, cheaper models at sub-agents).
+
+The runtime also guards a related weak-model failure mode: a model that calls a read/search op and
+then *repeats the same call* instead of making progress is caught by the loop's stall guards, which
+escalate and then stop with an honest "could not make progress" instead of looping indefinitely.
+
 ## Credentials
 
 ```bash

@@ -54,6 +54,9 @@ serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
 reedline = "0.48.0"
+# Restore the default SIGPIPE disposition at startup so piping into `head`/`less` ends the process
+# quietly instead of panicking on EPIPE (A-61). A no-op on non-unix; usage is `#[cfg(unix)]`-gated.
+libc = "0.2"
 flux-markdown = { workspace = true, features = ["terminal"] }
 # Only pulled in with the `slack` feature, to install a process-level rustls crypto provider in `main`
 # (the slack dep tree enables BOTH aws-lc-rs and ring, so rustls can't auto-pick one on its own).

@@ -75,8 +75,15 @@ fn classify_spec(spec: &flux_spec::ToolSpec) -> ReadClass {
             .iter()
             .all(|e| matches!(e, Effect::Read | Effect::Filesystem));
     if !read_scoped {
-        // Network reads (remote state changes on its own), pure/empty-effect ops (`run_plan`,
-        // cognition ops) — legitimate to repeat, never local-state hazards.
+        // A **network** read reaches remote state that legitimately changes on its own, so it is never
+        // cache-served — but an *identical* repeat that already succeeded is a stall signal (F-004: a
+        // weak model called `websearch.search`, then re-issued the same query instead of answering).
+        // Count it as a `TrackedRead` so the no-new-evidence / read-breadth guards (A-28/A-29) trip on
+        // the unproductive repeat instead of letting it loop. Pure / empty-effect ops (`run_plan`,
+        // cognition ops) stay `Neutral` — repeating the loop's own machinery is not a stall.
+        if spec.effects.contains(&Effect::Network) {
+            return ReadClass::TrackedRead;
+        }
         return ReadClass::Neutral;
     }
     let fs_access_only = !spec.access.is_empty()
@@ -686,6 +693,12 @@ pub async fn execute_flow_with_composites(
     composites: &[CompositeOpDecl],
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
+    // A-59 / F-016: install the run's session on the executor context so a `task(...)` sub-agent
+    // spawned during this flow correlates to the parent (its `SpawnRequest.parent_session` reads
+    // `ctx.session_id()`). The `flux run` agent loop sets this via `FlowEngine::run_turn`; the direct
+    // `flow run` entry point reaches the executor only here, so set it here for parity — without it,
+    // direct-flow-run children record `correlation_id: null` and `replay --sub-agents` can't recurse.
+    executor.context().set_session(session_id);
     let mut host = ExecutorHost::new_with_composites(executor, composites);
     // C-43: plan execution self-wires the store's active cassette scope (record or replay).
     host.cassette = store.cassette();
@@ -715,6 +728,11 @@ pub async fn execute_flow_resumable_with_composites(
     reads: Option<Arc<ReadTracker>>,
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
+    // A-59 / F-016: install the run's session on the executor context so a `task(...)` sub-agent
+    // correlates to the parent (see `execute_flow_with_composites`). In the agent loop `run_turn`
+    // already set the same value, so this is a no-op there; for the direct `flow run --resume(able)`
+    // path it is the fix that stops children from recording `correlation_id: null`.
+    executor.context().set_session(session_id);
     let mut host = ExecutorHost::new_with_composites(executor, composites);
     // A-20: the loop host's per-turn read-resource ledger rides along so every inner dispatch is
     // classified/tracked (and an exact-repeat cacheable read is served with a reuse note).
@@ -1595,6 +1613,63 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| matches!(e, RunEvent::FlowReturned { .. })));
+    }
+
+    #[tokio::test]
+    async fn execute_flow_with_composites_sets_the_session_for_subagent_correlation() {
+        // A-59 / F-016: the direct flow-run entry must install the run's session on the executor
+        // context, so a `task(...)` child spawned during the flow correlates to the parent (its
+        // `SpawnRequest.parent_session` reads `ctx.session_id()`). Before the fix this stayed `None`,
+        // so direct-flow-run children recorded `correlation_id: null` and `replay --sub-agents` could
+        // not recurse into them.
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor(true);
+        assert_eq!(
+            ex.context().session_id(),
+            None,
+            "a fresh executor context has no session"
+        );
+        let ast = DraftAst {
+            body: vec![Node::Return {
+                value: Box::new(flow_lit(json!("ok"))),
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        execute_flow_with_composites(&store, &ex, "sess-123", &ast, &[], &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            ex.context().session_id().as_deref(),
+            Some("sess-123"),
+            "the run session is installed on the executor context for task() correlation"
+        );
+    }
+
+    #[test]
+    fn network_reads_are_tracked_not_neutral() {
+        // F-004 / A-64: a network read (e.g. `websearch.search`) must be TRACKED — counted against the
+        // no-new-evidence / read-breadth guards (A-28/A-29) — so an unproductive identical repeat trips
+        // a stall guard, instead of `Neutral` (invisible to the ledger), which let a weak model loop
+        // re-issuing the same query forever. Pure / empty-effect ops (`run_plan`, cognition) stay
+        // Neutral: repeating the loop's own machinery is not a stall.
+        use flux_spec::{Effect, ToolSpec};
+        let websearch = ToolSpec::read_only(
+            "websearch.search",
+            "search the web",
+            serde_json::json!({"type":"object"}),
+        )
+        .with_effects(vec![Effect::Network]);
+        assert_eq!(classify_spec(&websearch), ReadClass::TrackedRead);
+
+        // A reflexive op with an empty effect set (`run_plan`, cognition ops) stays Neutral.
+        let reflexive = ToolSpec::read_only(
+            "run_plan",
+            "reflexive",
+            serde_json::json!({"type":"object"}),
+        )
+        .with_effects(vec![]);
+        assert_eq!(classify_spec(&reflexive), ReadClass::Neutral);
     }
 
     /// A-39: `execute_flow` never emits structural-trace `loop.*` observations (the outer loop opts

@@ -98,13 +98,29 @@ fn render_ast(file: Option<PathBuf>) -> Result<String> {
     })
 }
 
-/// Read Flux-Lang text from `file` (or stdin), parse it, and emit the `DraftAst` as pretty JSON. The
+/// Compile Flux-Lang text to a pretty-JSON AST. Parses via the **same module entry** `flux flow run`
+/// uses (`Module::parse_str` → `parse_program`), so a module whose first declaration is an `op` (or
+/// any program declaration) compiles here too — not only in the runner (F-013). A bare flow
+/// serializes to its `DraftAst` (byte-identical to the old flow-only path, preserving the
+/// `compile(format(ast))` round-trip); a program serializes to its `Program`.
+fn compile_src(src: &str) -> Result<String> {
+    match flux_lang::program::Module::parse_str(src)
+        .map_err(|e| Error::Other(format!("parse error: {e}")))?
+    {
+        flux_lang::program::Module::Flow(ast) => {
+            serde_json::to_string_pretty(&ast).map_err(|e| Error::Other(e.to_string()))
+        }
+        flux_lang::program::Module::Program(prog) => {
+            serde_json::to_string_pretty(&prog).map_err(|e| Error::Other(e.to_string()))
+        }
+    }
+}
+
+/// Read Flux-Lang text from `file` (or stdin), parse it, and emit the AST as pretty JSON. The
 /// inverse of `format` — `compile(format(ast))` round-trips back to the same AST.
 fn compile_text(file: Option<PathBuf>) -> Result<String> {
     let src = read_source(file)?;
-    let ast =
-        flux_lang::parse::parse(&src).map_err(|e| Error::Other(format!("parse error: {e}")))?;
-    serde_json::to_string_pretty(&ast).map_err(|e| Error::Other(e.to_string()))
+    compile_src(&src)
 }
 
 /// A small ANSI palette for terminal rendering.
@@ -154,6 +170,16 @@ mod tests {
         assert!(compile_str("= = = not flux = = =").is_err());
     }
 
+    #[test]
+    fn compiles_a_module_with_a_leading_op() {
+        // A module whose first declaration is `op` compiles here just as `flux flow run` executes it.
+        // The dev CLI used to reject it because `compile` parsed flow-only text (F-013); it now shares
+        // the module parse entry with the runner.
+        let src = "op noop() -> string\n  return \"ok\"\n";
+        let json = compile_str(src).unwrap();
+        assert!(json.contains("noop"), "op survived the compile: {json}");
+    }
+
     /// Render from an in-memory string (test helper mirroring `render_ast`'s parse+render).
     fn render_ast_str(raw: &str) -> Result<String> {
         let ast: DraftAst = serde_json::from_str(raw)
@@ -161,10 +187,8 @@ mod tests {
         Ok(flux_lang::render::render_pretty(&ast))
     }
 
-    /// Compile from an in-memory string (test helper mirroring `compile_text`'s parse+serialize).
+    /// Compile from an in-memory string (test helper over the shared `compile_src` path).
     fn compile_str(src: &str) -> Result<String> {
-        let ast =
-            flux_lang::parse::parse(src).map_err(|e| Error::Other(format!("parse error: {e}")))?;
-        serde_json::to_string_pretty(&ast).map_err(|e| Error::Other(e.to_string()))
+        compile_src(src)
     }
 }

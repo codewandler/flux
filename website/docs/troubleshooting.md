@@ -23,10 +23,12 @@ subscription paths. See [Providers and models](./agent/providers.md) for the ful
 
 ## I just want to try flux without any credentials
 
-Use the offline `mock` provider — it drives the full plan/execute pipeline with no network:
+Use the offline `mock` provider — it drives the full plan/execute pipeline with no network, returning
+**canned** output (it writes `flux-mock.txt` and prints `Finished.`). It's a wiring smoke test, not a
+real agent response:
 
 ```bash
-flux run --yes -m mock "summarise this repo"
+flux run --yes -m mock "write a quick note"
 ```
 
 Any flow that never reaches a model op also runs without credentials.

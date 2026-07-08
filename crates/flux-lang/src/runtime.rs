@@ -898,6 +898,59 @@ pub async fn execute_flow_resumable(
     run_top_level_resumable(store, executor, session_id, &ast.body, &fk, ledger, sink).await
 }
 
+/// The binding symbol of the top-level `await` at `halt_node`, if it binds one — so a resumable
+/// resume (`flow run --resume`) knows whether it must supply a value before advancing. `None` for a
+/// bare `await` (no `$x =`) or a non-await node. (A-58 / F-015.)
+pub fn awaited_binding(body: &[Node], halt_node: NodeId) -> Option<String> {
+    match body.get(halt_node.0 as usize) {
+        Some(Node::Await {
+            binding: Some(b), ..
+        }) => Some(b.0.clone()),
+        _ => None,
+    }
+}
+
+/// Bind a caller-supplied resume value to the halted top-level `await`'s binding, so a resumable
+/// re-run — which fast-forwards *past* the await — finds the awaited symbol bound instead of failing
+/// downstream with `unbound symbol` (A-58 / F-015). The value is coerced to the await's declared type
+/// exactly as [`resume_flow`] does, then durably bound; the subsequent resumable run's fast-forward
+/// leaves it in place. Returns the bound symbol name, or `None` if the await binds nothing (a bare
+/// `await` needs no value). Errors if `halt_node` is not an `await`.
+pub fn bind_resume_value(
+    store: &dyn ValueStore,
+    session_id: &str,
+    body: &[Node],
+    halt_node: NodeId,
+    value: serde_json::Value,
+) -> Result<Option<String>> {
+    let Some(Node::Await {
+        binding, as_type, ..
+    }) = body.get(halt_node.0 as usize)
+    else {
+        return Err(FlowError::Runtime(format!(
+            "resume value supplied but node {} is not an `await`",
+            halt_node.0
+        )));
+    };
+    let coerced = coerce_await_input(Value::from_json(&value), as_type);
+    let vid = store.put_value(session_id, &coerced)?;
+    match binding {
+        Some(b) => {
+            let ty_label = as_type.as_ref().map(TypeRef::label);
+            store.bind(
+                session_id,
+                b,
+                &vid,
+                ty_label.as_deref(),
+                &summarize(&value_text(&coerced)),
+                Visibility::Visible,
+            )?;
+            Ok(Some(b.0.clone()))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Resume a flow suspended on a top-level `await` (see [`FlowOutcome::suspension`]). Binds `input` to
 /// the `await` at index `at` (the suspended node) and continues from the *next* top-level statement —
 /// the already-executed prefix and its side effects are not re-run, because the earlier symbols are
@@ -1602,7 +1655,7 @@ fn exec_body<'a>(
                     }
                     let Node::Call { op, args } = value.as_ref() else {
                         return Err(crate::FlowError::Runtime(
-                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, `parse`, `var` ($symbol), `lit`, or a `thing` reference".to_string(),
+                            "execution can only bind the result of a `call`, `expr`, `fmt`, `jq`, `parse`, `peek`, `var` ($symbol), `lit`, or a `thing` reference".to_string(),
                         ));
                     };
                     let ty_label = ty.as_ref().map(TypeRef::label);
@@ -1667,13 +1720,13 @@ fn exec_body<'a>(
                         .cloned()
                         .collect();
                     let vid = build_ctx(
-                        store, session_id, name, purpose, &members, *budget, transcript,
+                        store, session_id, name, purpose, &members, *budget, transcript, sink,
                     )?;
                     last = format!("ctx {}", name.0);
                     last_value = Some(vid);
                 }
                 Node::CtxAppend { ctx, add } => {
-                    let vid = append_ctx(store, session_id, ctx, add, transcript)?;
+                    let vid = append_ctx(store, session_id, ctx, add, transcript, sink)?;
                     last = format!("ctx += {}", ctx.0);
                     last_value = Some(vid);
                 }
@@ -3249,12 +3302,38 @@ fn eval_pure_node(
                 .unwrap_or_default();
             (format!("${}", src.0), text, Some(vid))
         }
+        Node::Peek { name } => {
+            // A **soft** read of a named symbol — like `var`, but tolerates an unbound name (→ empty
+            // string) instead of erroring, so a flow can probe durable state and bind the result
+            // (F-009: `$prev = peek(last_result)`). Shares the resolved value id when the symbol is
+            // bound; an unbound peek falls through to a fresh empty-string value below.
+            match store.resolve(session_id, name)? {
+                Some(vid) => {
+                    let text = store
+                        .get_value(&vid)?
+                        .map(|v| value_text(&v))
+                        .unwrap_or_default();
+                    (format!("peek ${}", name.0), text, Some(vid))
+                }
+                None => ("peek".to_string(), String::new(), None),
+            }
+        }
         Node::Lit { value } => {
-            // A literal: `5`, `"hi"`, `[1,2,3]`, `{"a":1}`. Stored as the canonical
-            // JSON-as-string `Value::String` (same shape op results take), with `{{sym}}`
-            // interpolation honored to match `eval_arg`.
+            // A literal: `5`, `"hi"`, `[1,2,3]`, `{"a":1}`, with `{{sym}}` interpolation honored to
+            // match `eval_arg`. A bare scalar **number or boolean** binds its natural JSON type
+            // (`$n = 1` → the number 1, `$ok = false` → the boolean) so `match` arms and structured
+            // output see the typed value, not `"1"`/`"false"` (F-008). Strings, `null`, and
+            // object/array literals keep the canonical JSON-as-string `Value::String` — the shape op
+            // results take, that op-arg marshaling depends on (see `lit_value`) and that the null→`""`
+            // truthiness idiom relies on.
             let jv = interpolate(value, store, session_id);
-            ("lit".to_string(), lit_text(&jv), None)
+            let existing_vid = match &jv {
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                    Some(store.put_value(session_id, &Value::from_json(&jv))?)
+                }
+                _ => None,
+            };
+            ("lit".to_string(), lit_text(&jv), existing_vid)
         }
         Node::Obj { .. } | Node::List { .. } => {
             // Record/list constructor — assembles a JSON value from its sub-expressions (the
@@ -3341,6 +3420,22 @@ fn eval_template(
             })
         }
         Node::Fmt { template } => Ok(J::String(interpolate_str(template, store, session_id))),
+        Node::Parse {
+            value: inner,
+            as_type,
+        } => {
+            // `parse` is a pure coercion, so it composes as a template leaf too (F-012). Recover its
+            // typed result so a numeric/bool/json coercion nests as its JSON scalar/shape (like the
+            // `jq` arm keeps raw JSON), while a `string` coercion stays a string.
+            let jv = eval_arg(inner, store, session_id)?;
+            let text = coerce_parse(&jv, as_type)?;
+            match as_type.as_str() {
+                "f64" | "i64" | "bool" | "json" => {
+                    Ok(serde_json::from_str(&text).unwrap_or(J::String(text)))
+                }
+                _ => Ok(J::String(text)),
+            }
+        }
         // `var`/`lit` resolve through eval_arg; any other (impure) node errors there too. A symbol
         // holding a JSON object/array (stored as its JSON *string*) is re-parsed so it nests as a
         // structure rather than a quoted string; scalars (incl. strings) pass through unchanged.
@@ -3533,18 +3628,6 @@ async fn eval_return(
                 .ok_or_else(|| Error::Other(format!("dangling value for ${}", name.0)))?;
             Ok((value_text(&value), Some(vid)))
         }
-        Node::Lit { value } => {
-            let text = lit_text(value);
-            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-            Ok((text, Some(vid)))
-        }
-        Node::Obj { .. } | Node::List { .. } => {
-            // `return { … }` / `return [ … ]` — assemble the result value from sub-expressions.
-            let jv = eval_template(value, store, session_id)?;
-            let text = lit_text(&jv);
-            let vid = store.put_value(session_id, &Value::String(text.clone()))?;
-            Ok((text, Some(vid)))
-        }
         Node::Call { op, args } => {
             let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
             *steps += 1;
@@ -3553,10 +3636,17 @@ async fn eval_return(
             }
             Ok((outcome.content, outcome.value_id))
         }
-        other => Err(FlowError::Runtime(format!(
-            "unsupported return expression `{}`",
-            node_kind(other)
-        ))),
+        // Any other pure value node — `lit`, `obj`/`list` templates, and now `parse`/`jq`/`expr`/`fmt`
+        // — composes as a direct return exactly as it does in bind position (F-012). Delegating to the
+        // shared pure-node evaluator keeps the two positions consistent and gives `return`s the F-008
+        // scalar typing for free.
+        other => match eval_pure_node(other, store, session_id)? {
+            Some(pe) => Ok((pe.text, Some(pe.vid))),
+            None => Err(FlowError::Runtime(format!(
+                "unsupported return expression `{}`",
+                node_kind(other)
+            ))),
+        },
     }
 }
 
@@ -4313,6 +4403,7 @@ fn vis_keep_rank(v: Visibility) -> u8 {
 /// continues with the next, so a single oversized early member never evicts the smaller members after
 /// it (the s_251 death spiral). The interpreter stays op-agnostic — consuming ops just read the
 /// already-bounded member list.
+#[allow(clippy::too_many_arguments)] // the sink (A-63) rides alongside the existing packing inputs
 fn build_ctx(
     store: &dyn ValueStore,
     session_id: &str,
@@ -4321,6 +4412,7 @@ fn build_ctx(
     members: &[SymbolName],
     budget: Option<u64>,
     transcript: &mut Vec<String>,
+    sink: &mut dyn FlowSink,
 ) -> Result<ValueId> {
     // Dedup members (first-seen order): a symbol listed twice must not double-charge the budget.
     let members: Vec<SymbolName> = {
@@ -4408,6 +4500,18 @@ fn build_ctx(
                 "[ctx {}] budget {b} chars — kept {:?}, dropped {:?}",
                 name.0, kept, dropped
             ));
+            // Surface the shrinkage on the live sink too (A-63) — the transcript line above is
+            // model-facing only, so a plain CLI run never saw that context was dropped. One
+            // observation per shrink event; silent when nothing is dropped.
+            sink.observation(&flux_evidence::Observation::new(
+                "context.shrunk",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({
+                    "ctx": name.0,
+                    "dropped": dropped.len(),
+                    "total": kept.len() + dropped.len(),
+                }),
+            ));
         }
     }
 
@@ -4447,6 +4551,7 @@ fn append_ctx(
     ctx: &SymbolName,
     add: &[SymbolName],
     transcript: &mut Vec<String>,
+    sink: &mut dyn FlowSink,
 ) -> Result<ValueId> {
     let vid = store.resolve(session_id, ctx)?.ok_or_else(|| {
         crate::FlowError::Runtime(format!("ctx_append: unknown context pack `{}`", ctx.0))
@@ -4481,7 +4586,7 @@ fn append_ctx(
         }
     }
     build_ctx(
-        store, session_id, ctx, &purpose, &members, budget, transcript,
+        store, session_id, ctx, &purpose, &members, budget, transcript, sink,
     )
 }
 
@@ -4631,6 +4736,7 @@ mod tests {
             &members,
             Some(100),
             &mut transcript,
+            &mut BufferSink::default(),
         )
         .unwrap();
 
@@ -4673,6 +4779,7 @@ mod tests {
             &SymbolName("pack".into()),
             &[SymbolName("d".into())],
             &mut transcript,
+            &mut BufferSink::default(),
         )
         .unwrap();
         assert_ne!(vid, vid2, "append rebinds to a new value id");
@@ -4718,6 +4825,7 @@ mod tests {
             &members,
             None,
             &mut transcript,
+            &mut BufferSink::default(),
         )
         .unwrap();
         let Some(Value::Struct(fields)) = store.get_value(&cvid).unwrap() else {
@@ -4765,6 +4873,7 @@ mod tests {
             &members,
             Some(100),
             &mut t,
+            &mut BufferSink::default(),
         )
         .unwrap();
 
@@ -4776,6 +4885,7 @@ mod tests {
             &SymbolName("p".into()),
             &[SymbolName("big".into())],
             &mut t,
+            &mut BufferSink::default(),
         )
         .unwrap();
         let Some(Value::Struct(f2)) = store.get_value(&v2).unwrap() else {
@@ -4847,6 +4957,7 @@ mod tests {
             &members,
             Some(100),
             &mut t,
+            &mut BufferSink::default(),
         )
         .unwrap();
         let Some(Value::Struct(fields)) = store.get_value(&vid).unwrap() else {
@@ -5347,8 +5458,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_literal_value_can_be_bound_directly() {
-        // `$x = 5 / "hi" / [1,2,3] / {"a":1}` — a `Lit` is now a legal bind value (was rejected with
-        // "execution can only bind the result of a `call`…"). Stored as canonical JSON-as-string.
+        // `$x = 5 / "hi" / [1,2,3] / {"a":1}` — a `Lit` is a legal bind value. Scalar number/boolean
+        // literals bind their natural JSON type (F-008); strings and object/array literals keep the
+        // canonical JSON-as-string form.
         let host = CfHost::new();
         let store = MemStore::new();
         let ast = DraftAst {
@@ -5617,6 +5729,164 @@ mod tests {
         assert!(
             host.marks().is_empty(),
             "no branch ran on an unmatched match"
+        );
+    }
+
+    #[tokio::test]
+    async fn scalar_binds_keep_their_json_type_for_match_and_output() {
+        // F-008: `$n = 1` / `$ok = false` bind the typed number/boolean (not `"1"`/`"false"`), so a
+        // `match` over them hits the typed arm and structured output carries the scalar type; `$s = "1"`
+        // (explicit quotes) stays a string. Before the fix every scalar bind stringified and the typed
+        // arms fell through to `default`.
+        let match_on = |subj: &str, case: serde_json::Value, hit: &str, miss: &str| Node::Match {
+            subject: Box::new(flow_var(subj)),
+            cases: vec![MatchCase {
+                value: flow_lit(case),
+                body: vec![echo(hit)],
+            }],
+            default: vec![echo(miss)],
+        };
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("n", flow_lit(json!(1))),
+                flow_bind("ok", flow_lit(json!(false))),
+                flow_bind("s", flow_lit(json!("1"))),
+                match_on("n", json!(1), "num-1", "num-default"),
+                match_on("ok", json!(false), "bool-false", "bool-default"),
+                // `$s = "1"` is a string, so it does NOT equal the numeric case → default.
+                match_on("s", json!(1), "s-is-number", "s-is-string"),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            host.marks(),
+            vec!["num-1", "bool-false", "s-is-string"],
+            "typed scalar binds hit the typed match arms; an explicit-quote string stays a string"
+        );
+
+        let val = |name: &str| {
+            let vid = store
+                .resolve("s", &SymbolName(name.into()))
+                .unwrap()
+                .unwrap();
+            store.get_value(&vid).unwrap().unwrap()
+        };
+        assert!(
+            matches!(val("n"), Value::Number(_)),
+            "$n = 1 binds a number"
+        );
+        assert!(
+            matches!(val("ok"), Value::Bool(false)),
+            "$ok = false binds a boolean"
+        );
+        assert!(
+            matches!(val("s"), Value::String(_)),
+            "$s = \"1\" stays a string"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_composes_as_a_direct_return() {
+        // F-012: `parse` works in bind position; it now also composes as a direct return, like every
+        // other pure node — previously this errored with "unsupported return expression `parse`".
+        let host = CfHost::new();
+        let body = vec![Node::Return {
+            value: Box::new(Node::Parse {
+                value: Box::new(flow_lit(json!("42"))),
+                as_type: "i64".into(),
+            }),
+        }];
+        let out = run(&host, body).await.unwrap();
+        assert_eq!(out.result, "42");
+    }
+
+    #[tokio::test]
+    async fn peek_is_bindable_as_a_soft_read() {
+        // F-009: `$prev = peek(other)` reads the symbol softly — its value when bound, empty when not
+        // — and binds it. Previously peek was statement-only and a peek-valued bind errored with
+        // "execution can only bind the result of a `call`…".
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("x", flow_lit(json!("hello"))),
+                Node::Bind {
+                    name: SymbolName("seen".into()),
+                    value: Box::new(Node::Peek {
+                        name: SymbolName("x".into()),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: SymbolName("missing".into()),
+                    value: Box::new(Node::Peek {
+                        name: SymbolName("nope".into()),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Return {
+                    value: Box::new(flow_var("seen")),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let out = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.result, "hello",
+            "peek binds the current value of the symbol"
+        );
+        let missing = store
+            .resolve("s", &SymbolName("missing".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            value_text(&store.get_value(&missing).unwrap().unwrap()),
+            "",
+            "an unbound peek binds an empty string, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctx_shrink_emits_an_observation_for_the_cli() {
+        // A-63: when a budgeted context pack drops members, a `context.shrunk` observation is emitted
+        // on the sink so a plain CLI run can surface it — the transcript line alone was model-facing.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![
+                flow_bind("a", flow_lit(json!("x".repeat(40)))),
+                flow_bind("b", flow_lit(json!("y".repeat(40)))),
+                Node::Ctx {
+                    name: SymbolName("pack".into()),
+                    purpose: Some("demo".into()),
+                    include: vec![SymbolName("a".into()), SymbolName("b".into())],
+                    exclude: vec![],
+                    budget: Some(60), // one ~42-char member fits; the second is dropped
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap();
+        let obs = observations(sink);
+        assert!(
+            obs.iter().any(|(k, v)| k == "context.shrunk"
+                && v["dropped"] == serde_json::json!(1)
+                && v["total"] == serde_json::json!(2)),
+            "a budgeted shrink emits a context.shrunk observation: {obs:?}"
         );
     }
 
@@ -6672,6 +6942,72 @@ mod tests {
             Some(Value::String("hi".into())),
             "awaited value bound"
         );
+    }
+
+    #[tokio::test]
+    async fn resumable_binds_a_supplied_await_value_and_completes() {
+        // F-015 / A-58: the resumable driver (behind `flow run --resume`) fast-forwards *past* the
+        // halted await. Without a bound value the post-await statement dies with `unbound symbol
+        // $reply`; `bind_resume_value` supplying the payload lets it complete.
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let body = vec![
+            echo("a"),
+            await_node(Some("reply"), "user_input", None),
+            Node::Bind {
+                name: SymbolName("greeting".into()),
+                value: Box::new(Node::Fmt {
+                    template: "hi {reply}".into(),
+                }),
+                ty: None,
+                effect: None,
+            },
+            Node::Return {
+                value: Box::new(flow_var("greeting")),
+            },
+        ];
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+
+        // First run halts on the await (resumable reifies it onto `failure`, kind Awaiting).
+        let mut sink = BufferSink::default();
+        let halted = execute_flow_resumable(&store, &host, "s", &ast, &mut sink, None)
+            .await
+            .unwrap();
+        let susp = halted.suspension.expect("suspended on the await");
+        assert_eq!(susp.node, crate::ast::NodeId(1));
+
+        // Supply the awaited payload, then resume through the SAME resumable driver with the ledger.
+        let bound =
+            bind_resume_value(&store, "s", &body, susp.node, serde_json::json!("Ada")).unwrap();
+        assert_eq!(bound.as_deref(), Some("reply"));
+        let ledger = ResumeLedger::fold(&store.events("s")).expect("an open halt latch exists");
+        let mut sink2 = BufferSink::default();
+        let out = execute_flow_resumable(&store, &host, "s", &ast, &mut sink2, Some(&ledger))
+            .await
+            .unwrap();
+        assert!(
+            out.suspension.is_none() && out.failure.is_none(),
+            "the resumed run completed"
+        );
+        assert_eq!(
+            out.result, "hi Ada",
+            "the post-await statement saw the bound reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn awaited_binding_reports_the_symbol_a_resume_must_supply() {
+        // A-58: `awaited_binding` lets the CLI refuse a value-less resume, naming the symbol.
+        let value_await = vec![await_node(Some("reply"), "user_input", None)];
+        assert_eq!(
+            awaited_binding(&value_await, crate::ast::NodeId(0)).as_deref(),
+            Some("reply")
+        );
+        let bare_await = vec![await_node(None, "signal", None)];
+        assert_eq!(awaited_binding(&bare_await, crate::ast::NodeId(0)), None);
     }
 
     #[tokio::test]

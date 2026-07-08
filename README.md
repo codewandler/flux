@@ -103,10 +103,12 @@ flux tui
 flux app run --serve 127.0.0.1:8787 --yes
 ```
 
-No API key needed to try the engine: `-m mock` runs an offline provider through the full pipeline.
+No API key needed to smoke-test the engine: `-m mock` is an offline provider that drives the full
+plan → approve → execute pipeline with **canned** output — it writes a `flux-mock.txt` file and prints
+`Finished.` regardless of the prompt. It's a zero-config wiring check, not a representative agent run.
 
 ```bash
-flux run --yes -m mock "summarise this repo"
+flux run --yes -m mock "write a quick note"
 ```
 
 See [`docs/usage.md`](docs/usage.md) for the full CLI/TUI/SDK/server guide.

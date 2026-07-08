@@ -3,7 +3,7 @@ id: D-62
 title: Async paged live-backend datasource seam
 pillar: Agent
 status: ready
-priority: 2
+priority: 6
 note: "design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection"
 ---
 

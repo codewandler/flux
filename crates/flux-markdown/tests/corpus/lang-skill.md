@@ -17,7 +17,7 @@ runtime — they are not part of the language. This reference covers the languag
 ## Top-level shape
 
 ```json
-{"name": "optional-name", "params": [{"name": "x", "ty": "String"}], "returns": "Result", "body": [Node, ...]}
+{"name": "optional-name", "params": [{"name": "x", "ty": "string"}], "returns": {"named": "Result"}, "body": [Node, ...]}
 ```
 
 `name`, `params`, and `returns` are optional; `body` is the ordered list of nodes the runtime runs

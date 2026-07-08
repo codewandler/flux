@@ -4,7 +4,7 @@ title: A2A protocol support
 
 # A2A protocol support
 
-What flux's [A2A protocol](https://a2a-protocol.org/) (v1.0) implementation supports today, what's
+What flux's [A2A protocol](https://a2a-protocol.org/) (v0.3.0) implementation supports today, what's
 partial, and what isn't yet — so you know exactly what you can rely on when you point an A2A client at
 flux or drive a remote agent with `flux a2a`. For how to use it, see [Agent-to-agent (A2A)](./a2a.md).
 
@@ -46,7 +46,7 @@ flux's own client/CLI are unaffected (they always sent `blocking: true`).
 | `defaultInputModes`, `defaultOutputModes` | ✅ | `text/plain`. |
 | `skills` | ✅ | |
 | `securitySchemes`, `security` | ✅ | Declared whenever the server enforces auth. |
-| `protocolVersion` | ✅ | Emitted (spec-required). |
+| `protocolVersion` | ✅ | Emitted as `0.3.0` (spec-required). |
 | `preferredTransport`, `interfaces` | ✅ | The card declares its JSON-RPC interface (`preferredTransport: "JSONRPC"` + one `interfaces` entry at `url`). |
 | `provider`, `documentationUrl`, `iconUrl` | ✅ | Optional; emitted when configured for the served agent, otherwise omitted. |
 | `supportsAuthenticatedExtendedCard` | ✅ | Emitted `false` (no extended-card method yet). |

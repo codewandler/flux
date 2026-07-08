@@ -19,7 +19,7 @@ authenticates every request against **one static shared secret** (`require_auth`
 app-specific except claim names. Meanwhile [docs/a2a.md](../a2a.md) already promises "per-principal
 isolation arrives with the request-auth seam (D-64)".
 
-The A2A spec (v1.0.0) makes three of this design's obligations explicit:
+The A2A spec (v0.3.0) makes three of this design's obligations explicit:
 
 - Clients "MUST authenticate the request using one of the schemes declared in the public
   `AgentCard.securitySchemes` and `AgentCard.security` fields" — so a bearer-requiring server whose

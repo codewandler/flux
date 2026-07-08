@@ -78,10 +78,39 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### v0.6.0 beta hardening (epic) — ✅ **done 2026-07-08 (external beta test)**
+
+The first external beta test of a shipped release (Codex, clean `/tmp` workspace vs. the published
+`0.6.0` binary + source) exercised the product end-to-end and reported: *"Flux v0.6.0 is credible as
+a beta — the architectural foundations are visible in real behavior, not just docs … The release
+needs a focused hardening pass before broad beta use. Most issues are fixable with targeted
+docs/runtime alignment and surface parity work rather than a redesign."* The core thesis held (visible
+plans, real guardrails, offline replay, host-mediated plugin calls, bounded sub-agent scopes); the 16
+findings cluster into docs/runtime mismatches and a few surface-specific gaps. Triaged into 12
+stories under [beta-hardening](designs/beta-hardening.md) (the source report lived in an ephemeral
+`/tmp` workspace, so its findings + repro essence are embedded in the design doc). **All 12 stories
+are now done (2026-07-08) — implemented in the report's recommended fix order, each with a
+failing-first/behavior-lock test, full gate green. Top five (fixed first):**
+[C-45](stories/C-45-yes-destructive-approver-truth.md) (reconcile the `--yes` destructive-op safety
+docs vs. the allow-all approver), [A-58](stories/A-58-flow-resume-await-payload.md) (`flow run
+--resume` must bind the top-level `await` payload), [A-59](stories/A-59-flow-run-subagent-correlation.md)
+(correlate direct `flow run` sub-agent children so `replay --sub-agents` recurses),
+[A-60](stories/A-60-serve-mock-provider-parity.md) (program `--serve -m mock` provider parity), and
+[A-61](stories/A-61-cli-broken-pipe-no-panic.md) (no SIGPIPE panic on a closed pipe). **Then:**
+Flux-Lang fixes [L-43](stories/L-43-text-scalar-bind-types.md) (scalar bind types),
+[L-44](stories/L-44-parse-node-composability.md) (`parse` composability),
+[L-45](stories/L-45-fluxlang-compile-leading-op.md) (`fluxlang compile` leading-`op` parity);
+diagnostics/UX [A-62](stories/A-62-validation-diagnostic-headers.md) (accurate diagnostic headers) and
+[A-63](stories/A-63-context-pack-shrinkage-surface.md) (surface context-pack shrinkage); the
+[C-46](stories/C-46-beta-docs-truth-pass.md) docs-truth pass (mock mode, A2A `protocolVersion`,
+Flux-Lang examples, `peek`); and [A-64](stories/A-64-weak-model-planner-robustness.md) (weak-model
+planner/loop robustness — guardrail, not a hard guarantee). Design + embedded findings:
+[designs/beta-hardening.md](designs/beta-hardening.md).
+
 ### A2A protocol conformance (epic) — **proposed 2026-07-07**
 
 After v0.4.0 (multi-tenant principal auth + multi-agent mount) the A2A wire surface is stable enough
-to measure against the [spec](https://a2a-protocol.org/) (v1.0), so the gaps become a ranked backlog.
+to measure against the [spec](https://a2a-protocol.org/) (v0.3.0), so the gaps become a ranked backlog.
 The root of most gaps is one deliberate choice: **flux runs an A2A request as one synchronous turn and
 returns a `completed` Task** — there is no retained, addressable async task, so the whole
 task-management half of the spec is out of reach until that changes. The gaps therefore split into

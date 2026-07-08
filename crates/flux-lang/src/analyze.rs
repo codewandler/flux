@@ -1534,9 +1534,9 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
 }
 
 /// A value template (`obj`/`list`) assembles a value with no dispatch, so each leaf must be a **pure
-/// value node** (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`). A `call` or control-flow leaf would
-/// smuggle side effects into a notionally-pure template, so it is rejected — bind it to a symbol
-/// first, then reference `$name`. Recurses so nested templates are checked too.
+/// value node** (`var`/`lit`/`jq`/`expr`/`fmt`/`parse`/`obj`/`list`). A `call` or control-flow leaf
+/// would smuggle side effects into a notionally-pure template, so it is rejected — bind it to a
+/// symbol first, then reference `$name`. Recurses so nested templates are checked too.
 fn check_template_leaf(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut Diags) {
     if !matches!(
         node,
@@ -1545,13 +1545,14 @@ fn check_template_leaf(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>
             | Node::Jq { .. }
             | Node::Expr { .. }
             | Node::Fmt { .. }
+            | Node::Parse { .. }
             | Node::Obj { .. }
             | Node::List { .. }
     ) {
         d.add(
             "a value template (`obj`/`list`) may only contain pure value leaves \
-             (`var`/`lit`/`jq`/`expr`/`fmt`/`obj`/`list`); bind a call or control-flow result to a \
-             symbol first, then reference it as `$name`",
+             (`var`/`lit`/`jq`/`expr`/`fmt`/`parse`/`obj`/`list`); bind a call or control-flow result \
+             to a symbol first, then reference it as `$name`",
         );
     }
     // Recurse regardless, so a nested issue (e.g. an unknown op inside the offending call) also surfaces.
@@ -2323,6 +2324,42 @@ mod tests {
             ..Default::default()
         };
         assert!(analyze_flow(&good_ast, &ops, &HashSet::new()).is_ok());
+    }
+
+    #[test]
+    fn analyze_accepts_parse_as_a_template_leaf() {
+        use crate::ast::{DraftAst, Node};
+        let ops = catalog();
+        // `{ data: parse($x, "json") }` — `parse` is a pure coercion, so it composes as a template
+        // leaf like the other pure nodes (F-012); before the fix the whitelist rejected it.
+        let tmpl: Node = serde_json::from_value(serde_json::json!({
+            "kind": "obj",
+            "fields": { "data": {"kind": "parse", "value": {"kind": "var", "name": "x"}, "as": "json"} }
+        }))
+        .unwrap();
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "x".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!("{\"a\":1}"),
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: "r".into(),
+                    value: Box::new(tmpl),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            analyze_flow(&ast, &ops, &HashSet::new()).is_ok(),
+            "parse is a valid pure template leaf"
+        );
     }
 
     #[test]
