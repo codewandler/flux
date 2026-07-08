@@ -268,6 +268,11 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
+          # Scoped release token: a fine-grained PAT (this repo only, Contents: write) stored as the
+          # `RELEASE_TOKEN` secret, so the release object is created even when the org restricts the
+          # default GITHUB_TOKEN to read-only. Falls back to GITHUB_TOKEN if the secret is unset.
+          # NOTE: release.yml is cargo-dist-generated — re-apply this override after `dist generate`.
+          GH_TOKEN: "${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}"
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
