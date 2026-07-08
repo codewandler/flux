@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-08
+
 ### Added
 
 - **`regex_match` and `regex_extract` cognition ops.** Two new pure operations bring
