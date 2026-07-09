@@ -22,7 +22,7 @@ name = "alertmanager"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -32,7 +32,7 @@ name = "asterisk"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -59,7 +59,7 @@ name = "aws"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -247,7 +247,7 @@ dependencies = [
 name = "codewandler-flux-spec"
 version = "0.12.0"
 dependencies = [
- "schemars 1.2.1",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -270,7 +270,7 @@ dependencies = [
  "codewandler-flux-datasource",
  "codewandler-flux-plugin",
  "codewandler-flux-spec",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -283,7 +283,7 @@ dependencies = [
  "codewandler-host-kit",
  "pulldown-cmark",
  "quick-xml",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -364,7 +364,7 @@ name = "docker"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -422,7 +422,7 @@ name = "flux-plugin-onepassword"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -432,7 +432,7 @@ name = "flux-plugin-vault"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -577,7 +577,7 @@ version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
  "regex",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -588,7 +588,7 @@ version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
  "hex",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sha1",
@@ -620,7 +620,7 @@ name = "homer"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -669,7 +669,7 @@ name = "huggingface"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -864,7 +864,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -885,7 +885,7 @@ name = "kubernetes"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -928,7 +928,7 @@ name = "loki"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sha1",
@@ -1001,7 +1001,7 @@ name = "opsgenie"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -1088,7 +1088,7 @@ name = "prometheus"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -1450,39 +1450,15 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "dyn-clone",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.1",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn",
 ]
 
 [[package]]
@@ -1634,7 +1610,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -1660,7 +1636,7 @@ name = "sql"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]
@@ -2148,7 +2124,7 @@ name = "websearch"
 version = "0.1.0"
 dependencies = [
  "codewandler-host-kit",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
 ]

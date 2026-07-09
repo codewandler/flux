@@ -58,10 +58,7 @@ impl RangeMap {
             if let Some(r) = self.map.get(p) {
                 return Some(*r);
             }
-            match p.rfind('.') {
-                Some(i) => p = &p[..i],
-                None => return None,
-            }
+            p = &p[..p.rfind('.')?];
         }
     }
 

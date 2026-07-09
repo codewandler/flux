@@ -914,7 +914,11 @@ mod schema_contract {
     fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
         if let Some(obj) = node.as_object() {
             if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
-                if let Some(name) = r.strip_prefix("#/definitions/") {
+                // schemars 0.8 keyed subschemas under `#/definitions/`; 1.x uses `#/$defs/`.
+                if let Some(name) = r
+                    .strip_prefix("#/definitions/")
+                    .or_else(|| r.strip_prefix("#/$defs/"))
+                {
                     return defs.get(name).unwrap_or(node);
                 }
             }
@@ -963,7 +967,11 @@ mod schema_contract {
     }
 
     fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
-        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let defs = schema
+            .get("definitions")
+            .or_else(|| schema.get("$defs"))
+            .cloned()
+            .unwrap_or(json!({}));
         assert_eq!(schema["type"], "object", "{op_name}: root type");
 
         let props_obj = schema.get("properties").and_then(|v| v.as_object());

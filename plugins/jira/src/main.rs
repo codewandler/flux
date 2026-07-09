@@ -3586,7 +3586,10 @@ mod schema_contract {
     fn resolve<'a>(node: &'a Value, defs: &'a Value) -> &'a Value {
         if let Some(obj) = node.as_object() {
             if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
-                if let Some(name) = r.strip_prefix("#/definitions/") {
+                if let Some(name) = r
+                    .strip_prefix("#/definitions/")
+                    .or_else(|| r.strip_prefix("#/$defs/"))
+                {
                     return defs.get(name).unwrap_or(node);
                 }
             }
@@ -3603,20 +3606,25 @@ mod schema_contract {
 
     fn kind_of(node: &Value) -> Kind {
         if let Some(one) = node.get("oneOf").and_then(|v| v.as_array()) {
-            let vals: Vec<String> = one
+            // A doc-commented enum: schemars 0.8 emitted per-variant `{"type":"string","enum":
+            // ["x"],…}`, 1.x emits `{"const":"x",…}` — accept both, and sort (0.8 ordered
+            // alphabetically, 1.x by declaration; the contract is a set).
+            let mut vals: Vec<String> = one
                 .iter()
                 .filter_map(|v| {
-                    if v.get("type").and_then(|t| t.as_str()) == Some("string") {
-                        v.get("enum")
-                            .and_then(|e| e.as_array())
-                            .and_then(|arr| arr.iter().next())
-                            .and_then(|x| x.as_str())
-                            .map(String::from)
-                    } else {
-                        None
-                    }
+                    v.get("const")
+                        .and_then(|c| c.as_str())
+                        .map(String::from)
+                        .or_else(|| {
+                            v.get("enum")
+                                .and_then(|e| e.as_array())
+                                .and_then(|arr| arr.iter().next())
+                                .and_then(|x| x.as_str())
+                                .map(String::from)
+                        })
                 })
                 .collect();
+            vals.sort();
             if !vals.is_empty() {
                 return Kind::Enum(vals);
             }
@@ -3674,7 +3682,11 @@ mod schema_contract {
 
     fn assert_contract(op_name: &str, schema: &Value, contract: &OpContract) {
         assert_eq!(schema["type"], "object", "{op_name}: root type");
-        let defs = schema.get("definitions").cloned().unwrap_or(json!({}));
+        let defs = schema
+            .get("definitions")
+            .or_else(|| schema.get("$defs"))
+            .cloned()
+            .unwrap_or(json!({}));
         let props_obj = schema.get("properties").and_then(|v| v.as_object());
         let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
         if let Some(props) = props_obj {

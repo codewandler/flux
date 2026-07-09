@@ -1109,8 +1109,24 @@ fn parse_ref(v: Option<&Value>) -> Option<u32> {
     }
 }
 
+/// Non-Unix stub: the CDP transport is a Unix seam (fd-3/4 debug pipe via async-signal-safe
+/// `dup2` in `flux_system::spawn_debug_pipe`), so other platforms get a clean runtime error.
+/// The browser group is never *surfaced* off-Unix anyway (no Chromium signal), but the code must
+/// still compile — the v0.12.0 Windows dist build broke on the unconditional reference
+/// (2026-07-09).
+#[cfg(not(unix))]
+async fn launch_session(
+    _system: &flux_system::System,
+    _config: &BrowserConfig,
+) -> Result<BrowserSession> {
+    Err(Error::Other(
+        "browser ops are not supported on this platform yet (Unix-only CDP pipe spawn)".into(),
+    ))
+}
+
 /// Launch a real Chromium session (the guarded fd-3/4 spawn + CDP attach lives here, off the
 /// unreachable `BrowserSession::launch` stub, so the transport plumbing stays in one place).
+#[cfg(unix)]
 async fn launch_session(
     system: &flux_system::System,
     config: &BrowserConfig,
@@ -1130,8 +1146,7 @@ async fn launch_session(
         format!("--user-data-dir={}", profile.display()),
         "about:blank".into(),
     ];
-    let pipe = system.spawn_debug_pipe(&argv, &[])?;
-    let flux_system::PipeChild { child, pipe } = pipe;
+    let flux_system::PipeChild { child, pipe } = system.spawn_debug_pipe(&argv, &[])?;
     let (r, w) = tokio::io::split(pipe);
     let (client, events) = CdpClient::connect(r, w);
 
