@@ -784,9 +784,13 @@ pub struct Pkce {
 
 /// Generate a PKCE pair (verifier = base64url(32 random bytes), challenge = base64url(sha256)).
 pub fn generate_pkce() -> Pkce {
-    use rand::RngCore;
+    // rand 0.10 renamed `OsRng` to `SysRng` behind the fallible `TryRng`; rand 0.8's
+    // `OsRng::fill_bytes` panicked on OS-entropy failure, so `expect` preserves behavior.
+    use rand::{rngs::SysRng, TryRng};
     let mut buf = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    SysRng
+        .try_fill_bytes(&mut buf)
+        .expect("OS entropy unavailable");
     let verifier = b64().encode(buf);
     let challenge = b64().encode(Sha256::digest(verifier.as_bytes()));
     Pkce {
@@ -797,9 +801,11 @@ pub fn generate_pkce() -> Pkce {
 
 /// Random URL-safe state value.
 pub fn generate_state() -> String {
-    use rand::RngCore;
+    use rand::{rngs::SysRng, TryRng};
     let mut buf = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    SysRng
+        .try_fill_bytes(&mut buf)
+        .expect("OS entropy unavailable");
     b64().encode(buf)
 }
 

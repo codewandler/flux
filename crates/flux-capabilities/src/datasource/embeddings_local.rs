@@ -10,6 +10,8 @@
 //! the [`SemanticIndex`](super::SemanticIndex) rerank logic is verified with a stub embedder instead. This
 //! is the same pattern as the remote `OpenAiEmbedder` behind `embeddings`.
 
+use std::sync::Mutex;
+
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use flux_core::{Error, Result};
@@ -18,7 +20,9 @@ use super::Embedder;
 
 /// A local CPU embedder over an ONNX text-embedding model (bge-small-en-v1.5, 384-dim, by default).
 pub struct FastEmbedEmbedder {
-    model: TextEmbedding,
+    /// fastembed 5's `TextEmbedding::embed` takes `&mut self`, while the [`Embedder`] seam is
+    /// `&self` (shared as `Arc<dyn Embedder>`) — so the model sits behind a mutex.
+    model: Mutex<TextEmbedding>,
     dim: usize,
 }
 
@@ -34,7 +38,10 @@ impl FastEmbedEmbedder {
         let model =
             TextEmbedding::try_new(InitOptions::new(model).with_show_download_progress(false))
                 .map_err(|e| Error::Other(format!("fastembed init: {e}")))?;
-        Ok(Self { model, dim })
+        Ok(Self {
+            model: Mutex::new(model),
+            dim,
+        })
     }
 
     /// The embedding dimensionality this model produces.
@@ -49,7 +56,9 @@ impl Embedder for FastEmbedEmbedder {
             return Ok(Vec::new());
         }
         self.model
-            .embed(texts.to_vec(), None)
+            .lock()
+            .expect("fastembed model poisoned")
+            .embed(texts, None)
             .map_err(|e| Error::Other(format!("fastembed embed: {e}")))
     }
 }

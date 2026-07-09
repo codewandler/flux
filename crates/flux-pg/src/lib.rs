@@ -149,11 +149,17 @@ impl PgHandle {
                             // the pg_namespace insert and the loser errors without it.
                             let mut tx = conn.begin().await?;
                             sqlx::query(DDL_LOCK_SQL).execute(&mut *tx).await?;
+                            // sqlx 0.9 rejects non-literal SQL unless explicitly audited: the only
+                            // dynamic piece is `schema`, validated as a bare identifier above.
                             let ddl = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"");
-                            sqlx::query(&ddl).execute(&mut *tx).await?;
+                            sqlx::query(sqlx::AssertSqlSafe(ddl))
+                                .execute(&mut *tx)
+                                .await?;
                             tx.commit().await?;
                             let set = format!("SET search_path TO \"{schema}\"");
-                            sqlx::query(&set).execute(&mut *conn).await?;
+                            sqlx::query(sqlx::AssertSqlSafe(set))
+                                .execute(&mut *conn)
+                                .await?;
                         }
                         Ok(())
                     })
@@ -598,7 +604,7 @@ mod tests {
         let pool = h.pool().clone();
         let drop = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
         h.block_on(async move {
-            let _ = sqlx::query(&drop).execute(&pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(drop)).execute(&pool).await;
         });
 
         for r in results {
@@ -636,6 +642,11 @@ mod tests {
         // Clean up the throwaway schema.
         let pool = h.pool().clone();
         let drop = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
-        h.block_on(async move { sqlx::query(&drop).execute(&pool).await.unwrap() });
+        h.block_on(async move {
+            sqlx::query(sqlx::AssertSqlSafe(drop))
+                .execute(&pool)
+                .await
+                .unwrap()
+        });
     }
 }

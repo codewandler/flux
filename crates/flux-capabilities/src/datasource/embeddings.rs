@@ -50,12 +50,13 @@ impl Embedder for OpenAiEmbedder {
         let url = flux_system::net::guard_url(&self.endpoint, false)
             .map_err(|e| Error::Other(format!("embeddings endpoint: {e}")))?;
         let body = serde_json::json!({ "model": self.model, "input": texts });
-        let resp = ureq::post(url.as_str())
-            .set("Authorization", &format!("Bearer {}", self.api_key))
+        let mut resp = ureq::post(url.as_str())
+            .header("Authorization", format!("Bearer {}", self.api_key))
             .send_json(body)
             .map_err(|e| Error::Other(format!("embeddings request: {e}")))?;
-        let v: serde_json::Value = resp
-            .into_json()
+        // ureq 3's `read_json` caps bodies at 10MB; large ingest batches can exceed that, so parse
+        // from the (unlimited) reader — the same behavior as ureq 2's `into_json`.
+        let v: serde_json::Value = serde_json::from_reader(resp.body_mut().as_reader())
             .map_err(|e| Error::Other(format!("embeddings response: {e}")))?;
         let data = v
             .get("data")

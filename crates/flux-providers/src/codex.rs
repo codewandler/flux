@@ -257,7 +257,7 @@ impl StreamTransport for CodexWsTransport {
                 serde_json::Value::String("response.create".to_string()),
             );
         }
-        ws.send(Message::Text(create.to_string()))
+        ws.send(Message::Text(create.to_string().into()))
             .await
             .map_err(|e| Error::Http(format!("ws send: {e}")))?;
 
@@ -286,7 +286,8 @@ impl StreamTransport for CodexWsTransport {
                                     truncate_char_boundary(&t, 300)
                                 )));
                             }
-                            _ => break t,
+                            // tungstenite 0.29: `Message::Text` carries `Utf8Bytes`, not `String`.
+                            _ => break t.to_string(),
                         }
                     }
                     Some(Ok(Message::Close(frame))) => {
@@ -486,10 +487,10 @@ mod tests {
                 };
                 // The client's request message (live contract: a `response.create` event).
                 if let Some(Ok(WsMessage::Text(t))) = ws.next().await {
-                    *request2.lock().unwrap() = Some(t);
+                    *request2.lock().unwrap() = Some(t.to_string());
                 }
                 for f in &frames {
-                    if ws.send(WsMessage::Text(f.clone())).await.is_err() {
+                    if ws.send(WsMessage::Text(f.clone().into())).await.is_err() {
                         break;
                     }
                 }
@@ -522,7 +523,7 @@ mod tests {
                 };
                 let _ = ws.next().await; // request frame
                 for f in &frames {
-                    if ws.send(WsMessage::Text(f.clone())).await.is_err() {
+                    if ws.send(WsMessage::Text(f.clone().into())).await.is_err() {
                         break;
                     }
                 }
@@ -609,7 +610,7 @@ mod tests {
                 };
                 let _ = ws.next().await; // request frame
                 for f in &frames {
-                    if ws.send(WsMessage::Text(f.clone())).await.is_err() {
+                    if ws.send(WsMessage::Text(f.clone().into())).await.is_err() {
                         break;
                     }
                 }

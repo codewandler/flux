@@ -107,41 +107,50 @@ thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 futures-util = "0.3"
 bytes = "1"
 async-trait = "0.1"
 async-stream = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# reqwest 0.13 split the old `rustls-tls` alias: `rustls` selects the TLS backend, `webpki-roots`
+# keeps the bundled trust store (same behavior as 0.12's `rustls-tls` = rustls + webpki roots).
+# 0.13 also moved `RequestBuilder::form` behind the new `form` feature (flux-credentials/flux-auth
+# post OAuth token/introspection requests as form bodies).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "rustls", "webpki-roots"] }
 eventsource-stream = "0.2"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-ratatui = "0.29"
-crossterm = "0.28"
-toml = "0.8"
+# Held at 0.29/0.28 (range reqs so `task deps:upgrade` skips them): markdown-ratatui
+# (codewandler/markdown, git-pinned below in flux-markdown) requires ratatui ^0.29 — bumping here
+# would split ratatui into two incompatible versions at the flux-markdown seam. crossterm must
+# match ratatui's backend, and flux-tui's ansi-to-tui 7 tracks ratatui 0.29. Lift all three
+# together once codewandler/markdown moves to ratatui 0.30.
+ratatui = ">=0.29, <0.30"
+crossterm = ">=0.28, <0.29"
+toml = "1.1"
 base64 = "0.22"
-sha2 = "0.10"
-sha1 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
 hex = "0.4"
 regex = "1"
-similar = "2"
-rand = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+similar = "3"
+rand = "0.10"
+rusqlite = { version = "0.40", features = ["bundled"] }
 ulid = "1"
 # Postgres backend (`flux-pg`, opt-in behind `postgres` features): the default build stays
 # rusqlite-only and DB-free. `default-features = false` + no sqlx macros so a build never needs a
 # live database; `tls-rustls` avoids an OpenSSL system dep. `percent-encoding` decodes DSN userinfo.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 percent-encoding = "2"
-rquickjs = "0.6"
-axum = "0.7"
-cron = "0.12"
+rquickjs = "0.12"
+axum = "0.8"
+cron = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Capped below 2.18: 2.18+ require `signal-hook-tokio ^0.4`, which does not exist on crates.io (max is
-# 0.3.1), so their socket-mode (`hyper`) feature is unbuildable. 2.17 is the newest resolvable release.
-slack-morphism = ">=2.10, <2.18"
+# The historical `<2.18` cap (2.18+ needed a then-unpublished `signal-hook-tokio ^0.4`) is lifted:
+# signal-hook-tokio 0.4.0 shipped, so the socket-mode (`hyper`) feature resolves again on latest.
+slack-morphism = "2.22"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -8,8 +8,8 @@
 //! - `GET  /.well-known/agent-card.json`  → A2A agent card (discovery; `…/agent.json` is an alias)
 //! - `POST /a2a`                          → A2A JSON-RPC 2.0 (`message/send`, `message/stream`)
 //! - `POST /sessions`                     → `{ id, model }`
-//! - `GET  /sessions/:id`                 → session info
-//! - `POST /sessions/:id/messages`        → `{ text, tool_calls, usage }`
+//! - `GET  /sessions/{id}`                 → session info
+//! - `POST /sessions/{id}/messages`        → `{ text, tool_calls, usage }`
 //!
 //! The agent runs tools through the same safety envelope as the CLI; build it with auto-approve
 //! since HTTP requests have no interactive approver.
@@ -576,15 +576,15 @@ fn router_with_ttl(
         .route("/.well-known/agent-card.json", get(a2a::agent_card))
         .route("/.well-known/agent.json", get(a2a::agent_card));
 
-    // Session-addressed routes: ONE structural realm guard wraps the whole `/sessions/:id/*`
+    // Session-addressed routes: ONE structural realm guard wraps the whole `/sessions/{id}/*`
     // subtree — including the write path (`POST …/messages`) — so a route added here later is
     // realm-guarded by construction, never by per-handler enumeration. (Session ids are guessable
     // `s_<n>`; guarding reads while leaving a write route open would be cross-tenant read+write.)
     let sessions = Router::new()
-        .route("/sessions/:id", get(get_session))
-        .route("/sessions/:id/messages", post(post_message))
-        .route("/sessions/:id/stream", get(stream_message))
-        .route("/sessions/:id/usage", get(get_session_usage))
+        .route("/sessions/{id}", get(get_session))
+        .route("/sessions/{id}/messages", post(post_message))
+        .route("/sessions/{id}/stream", get(stream_message))
+        .route("/sessions/{id}/usage", get(get_session_usage))
         .route_layer(middleware::from_fn_with_state(state.clone(), realm_guard));
 
     // Every other route requires auth per the configured mode. `require_auth` (the outer
@@ -758,15 +758,15 @@ fn router_multi_with_ttl(
     let exempt = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route(
-            "/:agent_id/.well-known/agent-card.json",
+            "/{agent_id}/.well-known/agent-card.json",
             get(a2a::agent_card_multi),
         )
         .route(
-            "/:agent_id/.well-known/agent.json",
+            "/{agent_id}/.well-known/agent.json",
             get(a2a::agent_card_multi),
         );
     let protected = Router::new()
-        .route("/:agent_id/a2a", post(a2a::a2a_handler_multi))
+        .route("/{agent_id}/a2a", post(a2a::a2a_handler_multi))
         .route_layer(middleware::from_fn_with_state(auth, require_auth));
     exempt.merge(protected).with_state(state)
 }
@@ -839,7 +839,7 @@ fn single_auth_header(req: &Request) -> Result<Option<&str>, Box<Response>> {
     Ok(first.and_then(|v| v.to_str().ok()))
 }
 
-/// Realm guard for every `/sessions/:id/*` route (principal mode only; other modes pass through
+/// Realm guard for every `/sessions/{id}/*` route (principal mode only; other modes pass through
 /// untouched). A session that does not exist and a session owned by another realm produce the
 /// same constant 404 ([`realm_not_found`]) — indistinguishable by status, body, or headers.
 async fn realm_guard(State(state): State<ServerState>, mut req: Request, next: Next) -> Response {
@@ -985,7 +985,7 @@ fn model_cost_json(row: &flux_events::ModelCost) -> Value {
     })
 }
 
-/// `GET /sessions/:id/usage` — per-model token tiers + cost for one session (C-06).
+/// `GET /sessions/{id}/usage` — per-model token tiers + cost for one session (C-06).
 async fn get_session_usage(
     State(agent): State<Shared>,
     Path(id): Path<String>,
@@ -1033,7 +1033,7 @@ struct StreamQuery {
     input: String,
 }
 
-/// `GET /sessions/:id/stream?input=…` → Server-Sent Events. Emits `text` events as tokens arrive,
+/// `GET /sessions/{id}/stream?input=…` → Server-Sent Events. Emits `text` events as tokens arrive,
 /// `tool` events as tools run, and a final `done` event. The turn runs on a spawned task feeding an
 /// mpsc channel that backs the SSE stream.
 async fn stream_message(
@@ -1328,7 +1328,7 @@ mod tests {
         (status, body)
     }
 
-    /// C-06 server endpoint: `GET /sessions/:id/usage` returns cache tiers + cost, and `GET /usage`
+    /// C-06 server endpoint: `GET /sessions/{id}/usage` returns cache tiers + cost, and `GET /usage`
     /// rolls the same rows up across sessions — the story's named failing-first test.
     #[tokio::test]
     async fn usage_endpoint_returns_cache_tiers_and_cost() {

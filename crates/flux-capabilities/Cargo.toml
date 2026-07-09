@@ -26,10 +26,10 @@ toml.workspace = true
 tokio.workspace = true
 # Embeddings (optional): a runtime-free blocking HTTP client for the synchronous `Embedder` seam — NOT
 # reqwest::blocking, which spins its own runtime and panics when called from within tokio.
-ureq = { version = "2", optional = true, features = ["json"] }
+ureq = { version = "3", optional = true, features = ["json"] }
 # Local CPU embeddings (optional, D-51): an in-process ONNX text-embedding model (bge-small, 384-dim).
 # Off by default — pulls ONNX Runtime; enable only where local semantic search is wanted.
-fastembed = { version = "4", optional = true }
+fastembed = { version = "5", optional = true }
 # Durable vector store (optional, D-51): the sqlite-vec loadable extension, so vectors persist in a
 # SQLite `vec0` table co-located with the records (no external DB).
 sqlite-vec = { version = "0.1", optional = true }

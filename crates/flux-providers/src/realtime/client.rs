@@ -145,7 +145,7 @@ pub async fn connect_ws(
                     }
                     msg = out_rx.recv() => match msg {
                         Some(text) => {
-                            if sink.send(Message::Text(text)).await.is_err() {
+                            if sink.send(Message::Text(text.into())).await.is_err() {
                                 break;
                             }
                         }

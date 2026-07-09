@@ -25,7 +25,7 @@ slack-morphism = { workspace = true, optional = true }
 
 [features]
 # The Slack socket-mode adapter. slack-morphism's `hyper` feature pulls its hyper/tungstenite connector
-# (and avoids its optional axum 0.8, so there is no clash with our axum 0.7).
+# only — its optional axum integration stays off (harmless either way: its axum is 0.8, same as ours).
 slack = ["dep:slack-morphism", "slack-morphism/hyper"]
 
 [dev-dependencies]

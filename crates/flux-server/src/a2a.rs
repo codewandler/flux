@@ -46,7 +46,7 @@ use std::pin::Pin;
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::Stream;
@@ -1207,8 +1207,9 @@ async fn tasks_cancel(
 }
 
 /// The boxed SSE type `tasks/resubscribe` returns — its two arms (live follow vs. terminal
-/// replay) build different stream shapes.
-type BoxedSse = Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>;
+/// replay) build different stream shapes. axum 0.8's `keep_alive` wraps the stream in
+/// `KeepAliveStream`, so the wrapper is part of the named type now.
+type BoxedSse = Sse<KeepAliveStream<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>>;
 
 /// `tasks/resubscribe` (A-56): re-attach an SSE stream to a task. A **live** task yields a
 /// snapshot frame of its current state and then follows the run's broadcast to the terminal

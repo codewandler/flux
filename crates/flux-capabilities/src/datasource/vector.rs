@@ -111,11 +111,23 @@ mod sqlite_vec_store {
         format!("{source}\u{1f}{entity}\u{1f}{id}")
     }
 
+    /// The signature `sqlite3_auto_extension` expects of an extension entry point. `sqlite-vec`
+    /// declares `sqlite3_vec_init` without one (bare `pub fn ...()`), so the pointer is transmuted
+    /// to this — the type clippy requires spelled out (`missing_transmute_annotations`).
+    type ExtensionInit = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::os::raw::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int;
+
     /// Register the sqlite-vec extension entry point for every subsequently-opened connection (once).
     fn register_extension() {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                ExtensionInit,
+            >(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
         });
@@ -252,6 +264,20 @@ mod tests {
             s.delete("local", "file.document", &["x".into()]).unwrap(),
             1
         );
+        assert_eq!(s.get(&a).unwrap(), None);
+    }
+
+    /// Feature-gated: proves the vendored sqlite-vec extension still registers and round-trips
+    /// against the linked rusqlite/libsqlite3-sys (the `vec0` table is created at open, so this is
+    /// a real ABI check, not just a link check).
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn sqlite_vec_store_round_trips_in_memory() {
+        let s = SqliteVecStore::in_memory(2).unwrap();
+        let a: VectorAddr = ("local".into(), "file.document".into(), "x".into());
+        s.upsert(a.clone(), vec![0.25, -1.0]).unwrap();
+        assert_eq!(s.get(&a).unwrap(), Some(vec![0.25, -1.0]));
+        assert_eq!(s.delete_source("local").unwrap(), 1);
         assert_eq!(s.get(&a).unwrap(), None);
     }
 

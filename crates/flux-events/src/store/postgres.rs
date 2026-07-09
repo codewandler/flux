@@ -38,7 +38,7 @@ use std::sync::Arc;
 use flux_core::{Error, Result};
 use flux_pg::{sqlx, PgHandle};
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool, Row};
 
 use super::{decode_all, now_ms, parse_id, EventBackend, RawEvent, SessionInfo, SessionSummary};
 use crate::context::EventContext;
@@ -379,9 +379,10 @@ impl EventBackend for PgEvents {
     fn list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
         let pool = self.handle.pool().clone();
         self.handle.block_on(async move {
-            let rows = sqlx::query(&format!(
+            // SqlSafeStr (sqlx 0.9): the only dynamic part is the const [`SUMMARY_COLS`] list.
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 "SELECT {SUMMARY_COLS} FROM streams ORDER BY updated_at DESC, n DESC LIMIT $1"
-            ))
+            )))
             .bind(limit as i64)
             .fetch_all(&pool)
             .await
@@ -394,10 +395,11 @@ impl EventBackend for PgEvents {
         let pool = self.handle.pool().clone();
         let account = account.to_string();
         self.handle.block_on(async move {
-            let rows = sqlx::query(&format!(
+            // SqlSafeStr (sqlx 0.9): the only dynamic part is the const [`SUMMARY_COLS`] list.
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 "SELECT {SUMMARY_COLS} FROM streams \
                  WHERE account = $1 ORDER BY updated_at DESC, n DESC LIMIT $2"
-            ))
+            )))
             .bind(account)
             .bind(limit as i64)
             .fetch_all(&pool)

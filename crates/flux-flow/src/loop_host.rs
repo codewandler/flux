@@ -139,9 +139,16 @@ pub(crate) fn cap_loop_feedback(transcript: String) -> String {
 }
 
 fn transcript_hash(transcript: &str) -> String {
+    use std::fmt::Write;
     let mut h = Sha256::new();
     h.update(transcript.as_bytes());
-    format!("{:x}", h.finalize())
+    // digest 0.11 dropped `LowerHex` on the output array; hand-encode the same lowercase hex.
+    h.finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Render the host-carried [`Brief`] as the text prepended to a planner feedback message (design

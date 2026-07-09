@@ -23,7 +23,7 @@ use flux_datasource::{
     BatchGetInput, GetInput, Link, ListInput, Match, Record, RelationInput, SearchInput, Source,
     SourceSummary,
 };
-use flux_pg::sqlx::{self, postgres::PgRow, Row};
+use flux_pg::sqlx::{self, postgres::PgRow, AssertSqlSafe, Row};
 use flux_pg::PgHandle;
 
 use super::text::{matched_fields, snippet};
@@ -310,7 +310,9 @@ impl DatasourceBackend for PostgresBackend {
         sql.push_str(&format!(" ORDER BY score DESC, r.id ASC LIMIT ${idx}"));
 
         self.handle.block_on(async move {
-            let mut q = sqlx::query(&sql)
+            // SqlSafeStr (sqlx 0.9): the dynamic parts are only `${idx}` placeholder numbers —
+            // every value rides in a bind below.
+            let mut q = sqlx::query(AssertSqlSafe(sql))
                 .bind(match_expr.as_str())
                 .bind(ns.as_str());
             if let Some(s) = &source {
@@ -383,7 +385,11 @@ impl DatasourceBackend for PostgresBackend {
         sql.push_str(&format!(" OFFSET ${idx}"));
 
         self.handle.block_on(async move {
-            let mut q = sqlx::query(&sql).bind(ns.as_str()).bind(source.as_str());
+            // SqlSafeStr (sqlx 0.9): the dynamic parts are only `${idx}` placeholder numbers —
+            // every value rides in a bind below.
+            let mut q = sqlx::query(AssertSqlSafe(sql))
+                .bind(ns.as_str())
+                .bind(source.as_str());
             if let Some(e) = &entity {
                 q = q.bind(e.as_str());
             }
@@ -569,7 +575,8 @@ mod tests {
         let pool = handle.pool().clone();
         let sql = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
         handle.block_on(async move {
-            let _ = sqlx::query(&sql).execute(&pool).await;
+            // SqlSafeStr: the schema identifier is minted from a ULID by `test_env`, not user input.
+            let _ = sqlx::query(AssertSqlSafe(sql)).execute(&pool).await;
         });
     }
 

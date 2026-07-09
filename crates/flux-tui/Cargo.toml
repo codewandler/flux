@@ -25,5 +25,7 @@ async-trait.workspace = true
 # markdown-stream (parse) + markdown-ratatui (render natively to ratatui `Text`, no ANSI round-trip).
 # ansi-to-tui now only converts the flux-flow plan-tree ANSI (see plan.rs).
 flux-markdown = { workspace = true, features = ["ratatui"] }
-ansi-to-tui = "7"
+# ansi-to-tui 8 targets ratatui 0.30; the workspace holds ratatui at 0.29 (see the root
+# Cargo.toml comment). Range req so `task deps:upgrade` skips it; lift together with ratatui.
+ansi-to-tui = ">=7, <8"
 tui-textarea = "0.7"

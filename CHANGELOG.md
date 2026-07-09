@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh (BREAKING): every dependency upgraded to latest across BOTH workspaces
+  (root + `plugins/`), plus a new `task deps:upgrade` step.** **BREAKING for `flux-pg` consumers**:
+  its `pub use sqlx` re-export moves 0.8 → 0.9 — sqlx 0.9 requires dynamic SQL strings to be
+  wrapped in `sqlx::AssertSqlSafe` (an injection-audit gate), so any downstream code building
+  `sqlx::query`/`raw_sql` from a non-literal string against `flux_pg::sqlx` types needs the same
+  wrap. All other bumps are internal (no other published crate's public API changed) but are
+  listed here for completeness: reqwest 0.13 (the `rustls-tls` alias split into `rustls` +
+  `webpki-roots`, `form` became a feature), tokio-tungstenite 0.29 (`Message::Text` now carries
+  `Utf8Bytes`), sha1/sha2 0.11 + hmac 0.13 (digest 0.11: hex output hand-encoded — byte-identical,
+  so cassette/checkpoint keys are unchanged; `new_from_slice` via `KeyInit`), rand 0.10
+  (`OsRng`→`SysRng`, `thread_rng`/`gen_range`→`rng`/`random_range`), axum 0.8 (`/:param`→`/{param}`
+  routes, `keep_alive` wraps the SSE stream type), rusqlite 0.40, toml 1.1, similar 3, rquickjs
+  0.12, cron 0.17, scraper 0.27, ureq 3, fastembed 5, reedline 0.49, slack-morphism 2.22 (the
+  `<2.18` cap is obsolete — its missing `signal-hook-tokio 0.4` now exists on crates.io).
+  **Deliberately held**: ratatui 0.29 / crossterm 0.28 / ansi-to-tui 7 — markdown-ratatui
+  (codewandler/markdown) requires ratatui ^0.29, and a bump would split ratatui into two
+  incompatible versions at the flux-markdown seam; the holds are expressed as range requirements
+  (`">=0.29, <0.30"`) which `cargo upgrade` skips, with pointers at the declarations. The new
+  Taskfile task runs `cargo upgrade --incompatible allow` + `cargo update` in both workspaces.
+
 ### Added
 
 - **L-74 — `flux_lang::highlight`: CST-classified highlight spans (L0 substrate).** New pure

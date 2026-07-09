@@ -28,7 +28,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use hmac::{Hmac, Mac};
+// hmac 0.13 (digest 0.11): `new_from_slice` moved off `Mac` onto the re-exported `KeyInit`.
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 

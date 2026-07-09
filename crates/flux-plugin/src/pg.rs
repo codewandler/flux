@@ -18,7 +18,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+// hmac 0.13 (digest 0.11): `new_from_slice` moved off `Mac` onto the re-exported `KeyInit`.
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use flux_system::net::DialStream;
@@ -532,11 +533,13 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
 
 /// A 24-char alphanumeric client nonce (SCRAM forbids `,` and `=`; alphanumerics are always safe).
 fn gen_nonce() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
+    // rand 0.10: `thread_rng()`/`Rng::gen_range` became `rng()`/`RngExt::random_range`
+    // (same generator underneath).
+    let mut rng = rand::rng();
     (0..24)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
 }
 

@@ -72,9 +72,17 @@ fn call_failure(label: &str, outcome: &CallOutcome) -> FlowError {
 /// on `StepStarted.input_hash` — one shared derivation, never a host-layer reimplementation (the
 /// same rationale that made [`stmt_hash16`] public for A-16).
 pub fn sha256_hex(s: &str) -> String {
+    use std::fmt::Write;
     let mut h = Sha256::new();
     h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
+    // digest 0.11 dropped the `LowerHex` impl on the output array; encode by hand (same bytes,
+    // same lowercase hex as the old `{:x}` — recorded cassette/checkpoint keys stay valid).
+    h.finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// The durable identity of a flow for `checkpoint` scoping: the declared name (when present) **plus**

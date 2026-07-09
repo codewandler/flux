@@ -25,3 +25,15 @@ tasks:
       - task: plugins:build
       - flux plugin install "{{.TASKFILE_DIR}}/plugins/target/release"
       - flux plugin ls
+
+  deps:upgrade:
+    desc: Upgrade every dependency to latest (incl. major bumps) in the root AND plugins workspaces, then refresh both lockfiles
+    # Needs cargo-edit (`cargo install cargo-edit`). Deliberate holds are expressed as explicit
+    # range requirements (e.g. `ratatui = ">=0.29, <0.30"`) with a comment at the declaration —
+    # `cargo upgrade` treats ranges as pinned and skips them. After running, expect code fixes for
+    # major bumps: build/test/clippy/fmt must be green in BOTH workspaces before the result ships.
+    cmds:
+      - cargo upgrade --incompatible allow
+      - cargo update
+      - cargo upgrade --incompatible allow --manifest-path plugins/Cargo.toml
+      - cargo update --manifest-path plugins/Cargo.toml
