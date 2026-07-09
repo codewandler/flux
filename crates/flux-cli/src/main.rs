@@ -1467,7 +1467,7 @@ fn run_diff_cmd(a_arg: &str, b_arg: &str, json: bool) -> Result<()> {
             end -= 1;
         }
         if end < s.len() {
-            format!("{}…", &s[..end].replace('\n', " "))
+            format!("{}…", s[..end].replace('\n', " "))
         } else {
             s.replace('\n', " ")
         }
