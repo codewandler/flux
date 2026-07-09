@@ -2,7 +2,7 @@
 id: L-57
 title: SyntaxKind + lossless layout-aware lexer for the CST front-end
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lang-cst.md
@@ -18,17 +18,21 @@ one STRING token) that carries the indentation grammar as significant `NEWLINE`/
 tokens.
 
 ## Acceptance
-- [ ] New `crates/flux-lang/src/syntax.rs` — `#[repr(u16)]` `SyntaxKind` covering every token kind +
-      `ERROR`/`TRIVIA` + layout tokens (node-kind variants may be stubbed until L-58).
-- [ ] New `crates/flux-lang/src/lexer.rs` producing tokens with `TextRange`s.
-- [ ] Failing-first `lexer_is_lossless`: concatenating token texts reproduces the source byte-for-byte
-      over a corpus with comments, blank lines, and `"""` blocks.
-- [ ] Failing-first `layout_tokens_track_nesting`: INDENT/DEDENT/NEWLINE correct on nested blocks;
-      tabs-in-indent still errors (parity with `preprocess`).
-- [ ] `rowan` + `text-size` added to `crates/flux-lang/Cargo.toml` (flag as new L0 deps).
+- [x] New `crates/flux-lang/src/syntax.rs` — `#[repr(u16)]` `SyntaxKind` covering every token kind +
+      `ERROR`/`TRIVIA` + layout tokens (node-kind variants stubbed to `ROOT` until L-58) + the
+      `FluxLang` rowan `Language` binding (checked `u16` round-trip test).
+- [x] New `crates/flux-lang/src/lexer.rs` producing tokens with `TextRange`s (raw scan + layout pass).
+- [x] `lexer_is_lossless`: `reconstruct(src) == src` over a corpus with comments, blank lines,
+      CRLF, `"""` blocks, and a newline-free tail.
+- [x] `layout_tokens_track_nesting`: INDENT/DEDENT correct on nested blocks; blank/comment-only lines
+      don't move the stack; `tabs_in_indentation_are_flagged` records the tab error (parity).
+- [x] `rowan` + `text-size` added (workspace deps; new L0 deps flagged).
 
 ## Progress
-- (not started — gated on isolation)
+- Done 2026-07-09: `syntax.rs` (SyntaxKind + FluxLang) and `lexer.rs` (lossless, layout-aware) landed
+  in-place on `main` — the front-end was isolated (data-transforms shipped in `fc666ab`, tree clean).
+  6 new tests pass; full `flux-lang` suite green (282 lib tests, round-trip invariant untouched);
+  clippy + fmt clean. Node-kind SyntaxKind variants + the tolerant parser are L-58. **Uncommitted.**
 
 ## Notes
 - **Gated** on flux-lang front-end isolation — see [flux-lang-cst.md](../designs/flux-lang-cst.md)

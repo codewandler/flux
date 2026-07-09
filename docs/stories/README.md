@@ -43,7 +43,6 @@ _None._
 
 ### flux-lsp — a Language Server for Flux-Lang, wired into Helix
 _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compile`; the IntelliJ_
-- [L-57 — SyntaxKind + lossless layout-aware lexer for the CST front-end](L-57-cst-syntaxkind-lossless-lexer.md) · Language · CST foundation — GATED on flux-lang front-end isolation (no worktree). Lossless token stream: comments/newlines as trivia, `\"\"\"` one STRING token, significant NEWLINE/INDENT/DEDENT.
 - [L-58 — Tolerant event parser + rowan green tree with ERROR-node recovery](L-58-cst-tolerant-parser-rowan-tree.md) · Language · CST foundation — GATED on isolation. The error-recovery core: a hand-written event parser that always completes a tree, wrapping unexpected input in ERROR nodes and resyncing at NEWLINE/DEDENT.
 - [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
 - [L-60 — Native syntax — Memo / Once / Checkpoint / Await (durability & idempotency)](L-60-native-syntax-durability-nodes.md) · Language · @json coverage 1/4 — GATED on isolation. Native text for the single-header durability/idempotency nodes so they stop round-tripping via @json.
@@ -330,6 +329,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-50 — Regex ops — `regex_match`, `regex_extract` (ReDoS-free via Rust `regex`)](L-50-regex-ops.md) · Language · regex was only accessible inside the `grep` file tool; ship two pure ops so plans can classify or extract from any string result
 - [L-51 — Native expr in conditions and bind RHS — `when $count > 3`, `$ok = $score >= 0.8`](L-51-native-expr-conditions.md) · Language · the ergonomic pass: authors can finally write `when $x > 3` instead of `@json {\"kind\":\"expr\",...}`; the runtime seam already exists — this is pure parser/format work
 - [L-52 — Data-transforms docs pass + rewrite deterministic LLM-as-mapper patterns + final gate](L-52-transforms-docs-examples-pass.md) · Language · the epic's closing story: public docs get the new vocabulary + native-text examples the user asked for; the LLM-as-mapper anti-patterns in-repo get replaced where honest
+- [L-57 — SyntaxKind + lossless layout-aware lexer for the CST front-end](L-57-cst-syntaxkind-lossless-lexer.md) · Language · CST foundation — GATED on flux-lang front-end isolation (no worktree). Lossless token stream: comments/newlines as trivia, `\"\"\"` one STRING token, significant NEWLINE/INDENT/DEDENT.
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

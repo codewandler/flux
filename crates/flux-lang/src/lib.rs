@@ -32,6 +32,7 @@ pub mod error;
 pub mod expr;
 pub mod format;
 pub mod host;
+pub mod lexer;
 pub mod opspec;
 pub mod optimize;
 pub mod parse;
@@ -43,5 +44,6 @@ pub mod schema;
 pub mod sink;
 pub mod skill;
 pub mod store;
+pub mod syntax;
 
 pub use error::{FlowError, Result};
