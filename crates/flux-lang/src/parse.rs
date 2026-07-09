@@ -1095,6 +1095,18 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "assert") {
         return parse_assert(rest);
     }
+    if let Some(rest) = kw(t, "memo") {
+        return parse_memo(rest);
+    }
+    if let Some(rest) = kw(t, "once") {
+        return parse_once(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "checkpoint") {
+        return parse_checkpoint(rest);
+    }
+    if let Some(rest) = kw(t, "await") {
+        return parse_await(rest);
+    }
 
     if t.starts_with('$') {
         return parse_dollar(t);
@@ -1807,6 +1819,106 @@ fn parse_do_call(rest: &str) -> Result<(Node, usize)> {
     ))
 }
 
+/// `memo $x[: T] = <expr>` — a bind pinned across turns (an `@effect(tag)` on the line above is
+/// re-attached by [`set_effect`], exactly like a plain bind).
+fn parse_memo(rest: &str) -> Result<(Node, usize)> {
+    let rest = rest.trim_start();
+    let nm = rest
+        .strip_prefix('$')
+        .ok_or_else(|| perr("`memo` expects `$name`"))?;
+    let (name, after) = take_while(nm, is_ident_char);
+    if name.is_empty() {
+        return Err(perr("`memo` has an empty name"));
+    }
+    let after = after.trim_start();
+    let (ty, rhs) = if let Some(a) = after.strip_prefix(':') {
+        let a = a.trim_start();
+        let eq = a
+            .find('=')
+            .ok_or_else(|| perr("expected `=` in typed `memo`"))?;
+        (Some(parse_type(a[..eq].trim())), &a[eq + 1..])
+    } else if let Some(a) = after.strip_prefix('=') {
+        (None, a)
+    } else {
+        return Err(perr("expected `=` or `:` after `memo $name`"));
+    };
+    let value = parse_condition_expr(rhs, "memo value")?;
+    Ok((
+        Node::Memo {
+            name: name.into(),
+            value: Box::new(value),
+            ty,
+            effect: None,
+        },
+        1,
+    ))
+}
+
+/// `once "label" [-> $bind]` + indented body — an at-most-once side effect.
+fn parse_once(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (label, r) = take_string(rest.trim_start(), "once")?;
+    let bind = parse_optional_arrow_bind(r, "once")?;
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((Node::Once { label, body, bind }, 1 + region.len()))
+}
+
+/// `checkpoint "label"` — a durable resume marker (top-level, no body).
+fn parse_checkpoint(rest: &str) -> Result<(Node, usize)> {
+    let (label, tail) = take_string(rest.trim_start(), "checkpoint")?;
+    if !tail.trim().is_empty() {
+        return Err(perr("trailing text after `checkpoint \"label\"`"));
+    }
+    Ok((Node::Checkpoint { label }, 1))
+}
+
+/// `await [$b[: T] =] "source"` — pause for an external event, optionally binding its payload.
+fn parse_await(rest: &str) -> Result<(Node, usize)> {
+    let rest = rest.trim_start();
+    let (binding, as_type, src) = if let Some(r) = rest.strip_prefix('$') {
+        let (nm, after) = take_while(r, is_ident_char);
+        if nm.is_empty() {
+            return Err(perr("`await` has an empty binding name"));
+        }
+        let after = after.trim_start();
+        let (ty, rhs) = if let Some(a) = after.strip_prefix(':') {
+            let a = a.trim_start();
+            let eq = a
+                .find('=')
+                .ok_or_else(|| perr("expected `=` in typed `await`"))?;
+            (Some(parse_type(a[..eq].trim())), &a[eq + 1..])
+        } else if let Some(a) = after.strip_prefix('=') {
+            (None, a)
+        } else {
+            return Err(perr("expected `=` after `await $name`"));
+        };
+        (Some(SymbolName::from(nm)), ty, rhs)
+    } else {
+        (None, None, rest)
+    };
+    let (source, tail) = take_string(src.trim_start(), "await")?;
+    if !tail.trim().is_empty() {
+        return Err(perr("trailing text after `await` source"));
+    }
+    Ok((
+        Node::Await {
+            binding,
+            source,
+            as_type,
+        },
+        1,
+    ))
+}
+
+/// Take a leading JSON string literal, returning its unescaped value and the remainder.
+fn take_string<'a>(s: &'a str, ctx: &str) -> Result<(String, &'a str)> {
+    let (v, tail) = take_json(s)?;
+    match v {
+        serde_json::Value::String(x) => Ok((x, tail)),
+        _ => Err(perr(&format!("`{ctx}` expects a quoted string"))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -2293,6 +2405,59 @@ mod tests {
     }
     fn s(v: &str) -> serde_json::Value {
         serde_json::Value::String(v.into())
+    }
+
+    #[test]
+    fn durability_nodes_round_trip_natively() {
+        // memo / once / checkpoint / await — formerly @json-only (L-60).
+        let ast = DraftAst {
+            body: vec![
+                Node::Memo {
+                    name: "x".into(),
+                    value: Box::new(var("y")),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Memo {
+                    name: "n".into(),
+                    value: Box::new(lit(s("hi"))),
+                    ty: Some(TypeRef::String),
+                    effect: Some(FlowEffect::Read),
+                },
+                Node::Once {
+                    label: "charge".into(),
+                    body: vec![call("pay", vec![])],
+                    bind: Some("receipt".into()),
+                },
+                Node::Checkpoint {
+                    label: "phase-1".into(),
+                },
+                Node::Await {
+                    binding: Some("reply".into()),
+                    source: "user_input".into(),
+                    as_type: None,
+                },
+                Node::Await {
+                    binding: None,
+                    source: "webhook".into(),
+                    as_type: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            !text.contains("@json"),
+            "durability nodes should render natively:\n{text}"
+        );
+        assert!(text.contains("memo $x = $y"), "{text}");
+        assert!(text.contains("@effect(read)"), "{text}");
+        assert!(text.contains("memo $n: String = \"hi\""), "{text}");
+        assert!(text.contains("once \"charge\" -> $receipt"), "{text}");
+        assert!(text.contains("checkpoint \"phase-1\""), "{text}");
+        assert!(text.contains("await $reply = \"user_input\""), "{text}");
+        assert!(text.contains("await \"webhook\""), "{text}");
+        assert_round_trips(&ast);
     }
 
     // ---- P6: new native text forms ----
@@ -2941,17 +3106,15 @@ mod tests {
     fn json_fallback_round_trips_statement_and_inline() {
         let ast = DraftAst {
             body: vec![
-                // Unsupported nodes as statements -> @json lines.
-                Node::Once {
-                    label: "charge-once".into(),
-                    body: vec![call("charge", vec![])],
-                    bind: None,
-                },
-                Node::Thing {
-                    thing: ThingRef {
-                        kind: ThingKind::Person,
-                        selector: Selector::Name("john".into()),
-                    },
+                // Permanently-@json shapes at statement position: unspellable (dotted) names can
+                // never be spelled natively, so they exercise the statement-position escape
+                // regardless of which node kinds gain native syntax (memo/once/checkpoint/await/…).
+                Node::Var { name: "a.b".into() },
+                Node::Bind {
+                    name: "c.d".into(),
+                    value: Box::new(lit(s("x"))),
+                    ty: None,
+                    effect: None,
                 },
                 // `jq(".bitcoin.usd", $raw)` inline is *native* field-access sugar; a bracket path
                 // is not, so it uses the inline @json escape.

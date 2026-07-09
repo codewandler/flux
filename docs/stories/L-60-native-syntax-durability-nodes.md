@@ -2,7 +2,7 @@
 id: L-60
 title: Native syntax — Memo / Once / Checkpoint / Await (durability & idempotency)
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lang-cst.md
@@ -26,7 +26,13 @@ lowering.
 - [ ] `@json` guard tests migrated off `Once` (to a degenerate-shape example).
 
 ## Progress
-- (not started — gated on isolation; depends on L-59)
+- Done 2026-07-09: native syntax landed in the semantic parser (`parse.rs` + `format.rs`) — the
+  proven path where the AST/analyzer/round-trip harness already live (the CST powers the LSP).
+  `memo $x[: T] = expr` (with `@effect` via `set_effect`), `once "label" [-> $bind]` + body,
+  `checkpoint "label"`, `await [$b[: T] =] "source"`. Guard: an `await` `as_type` without a binding
+  has no native spelling → stays `@json`. `durability_nodes_round_trip_natively` + the random
+  round-trip **property test** pass; the `json_fallback` guard test migrated to dotted (permanently
+  `@json`) names. Full flux-lang suite green; clippy + fmt clean.
 
 ## Notes
 - **Gated** on isolation. Depends on **L-59**. Surfaces are proposals — confirm against

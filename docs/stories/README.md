@@ -44,7 +44,6 @@ _None._
 ### flux-lsp — a Language Server for Flux-Lang, wired into Helix
 _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compile`; the IntelliJ_
 - [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
-- [L-60 — Native syntax — Memo / Once / Checkpoint / Await (durability & idempotency)](L-60-native-syntax-durability-nodes.md) · Language · @json coverage 1/4 — GATED on isolation. Native text for the single-header durability/idempotency nodes so they stop round-tripping via @json.
 - [L-61 — Native syntax — Confirm / Throttle / Debounce / Verify + Peek / Parse](L-61-native-syntax-guardrails-and-sugar.md) · Language · @json coverage 2/4 — GATED on isolation. Native text for the guard-rail nodes plus the peek/parse expression sugar (parse( needs a fmt(-style special-case).
 - [L-62 — Native syntax — Try / Race / Scope / Saga / Pipe (arm/body control-flow)](L-62-native-syntax-arm-body-control-flow.md) · Language · @json coverage 3/4 — GATED on isolation. Native text for the arm/body control-flow nodes, reusing the match/case/branch parser machinery.
 - [L-63 — Native syntax — Thing (kind + selector grammar)](L-63-native-syntax-thing.md) · Language · @json coverage 4/4 — GATED on isolation. The heaviest/most structural node (kind-enum + selector); cleanly deferrable if scope needs trimming.
@@ -330,6 +329,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-52 — Data-transforms docs pass + rewrite deterministic LLM-as-mapper patterns + final gate](L-52-transforms-docs-examples-pass.md) · Language · the epic's closing story: public docs get the new vocabulary + native-text examples the user asked for; the LLM-as-mapper anti-patterns in-repo get replaced where honest
 - [L-57 — SyntaxKind + lossless layout-aware lexer for the CST front-end](L-57-cst-syntaxkind-lossless-lexer.md) · Language · CST foundation — GATED on flux-lang front-end isolation (no worktree). Lossless token stream: comments/newlines as trivia, `\"\"\"` one STRING token, significant NEWLINE/INDENT/DEDENT.
 - [L-58 — Tolerant event parser + rowan green tree with ERROR-node recovery](L-58-cst-tolerant-parser-rowan-tree.md) · Language · CST foundation — GATED on isolation. The error-recovery core: a hand-written event parser that always completes a tree, wrapping unexpected input in ERROR nodes and resyncing at NEWLINE/DEDENT.
+- [L-60 — Native syntax — Memo / Once / Checkpoint / Await (durability & idempotency)](L-60-native-syntax-durability-nodes.md) · Language · @json coverage 1/4 — GATED on isolation. Native text for the single-header durability/idempotency nodes so they stop round-tripping via @json.
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

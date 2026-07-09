@@ -848,6 +848,70 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             }
             out.push('\n');
         }
+        Node::Memo {
+            name,
+            value,
+            ty,
+            effect,
+        } if name.is_identifier() && opt_spellable_type(ty) => {
+            if let Some(e) = effect {
+                out.push_str(&ind);
+                out.push_str("@effect(");
+                out.push_str(effect_tag(*e));
+                out.push_str(")\n");
+            }
+            out.push_str(&ind);
+            out.push_str("memo $");
+            out.push_str(&name.0);
+            if let Some(t) = ty {
+                out.push_str(": ");
+                out.push_str(&t.label());
+            }
+            out.push_str(" = ");
+            out.push_str(&fmt_expr(value, multiline));
+            out.push('\n');
+        }
+        Node::Once { label, body, bind } if opt_ident(bind) => {
+            out.push_str(&ind);
+            out.push_str("once ");
+            out.push_str(&compact_str(label, multiline));
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, multiline, out);
+        }
+        Node::Checkpoint { label } => {
+            out.push_str(&ind);
+            out.push_str("checkpoint ");
+            out.push_str(&compact_str(label, multiline));
+            out.push('\n');
+        }
+        Node::Await {
+            binding,
+            source,
+            as_type,
+        } if opt_ident(binding)
+            && opt_spellable_type(as_type)
+            // The coercion type is spelled in the binding clause (`await $b: T = …`), so an
+            // as_type without a binding has no native form — fall back to @json for that shape.
+            && (binding.is_some() || as_type.is_none()) =>
+        {
+            out.push_str(&ind);
+            out.push_str("await ");
+            if let Some(b) = binding {
+                out.push('$');
+                out.push_str(&b.0);
+                if let Some(t) = as_type {
+                    out.push_str(": ");
+                    out.push_str(&t.label());
+                }
+                out.push_str(" = ");
+            }
+            out.push_str(&compact_str(source, multiline));
+            out.push('\n');
+        }
         // Every other node kind round-trips through the single-line `@json` escape.
         other => {
             out.push_str(&ind);
