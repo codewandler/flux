@@ -2184,6 +2184,10 @@ async fn build_agent_with(
     // discover and run authored flows.
     flux_tools::register_flows(&mut registry);
 
+    // `flow_render`: Flux-Lang source/plan → syntax-highlighted SVG (source + tree views), for
+    // surfaces that can't highlight .flux themselves (READMEs, Slack, docs, chat panels).
+    flux_tools::register_render(&mut registry);
+
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`). The backend is also
     // the sink `web_fetch` contributes `web.page` records to (below), so read pages are groundable.

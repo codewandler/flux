@@ -40,8 +40,9 @@ fn loop_host(ctx: &ToolContext) -> Result<&dyn LoopHost> {
 }
 
 /// Every `.flux` file under the flow dirs as `(workspace_path, source)`, in `FLOW_DIRS`
-/// precedence order. Missing dirs and unregistered named roots are skipped.
-fn flow_files(ctx: &ToolContext) -> Vec<(String, String)> {
+/// precedence order. Missing dirs and unregistered named roots are skipped. Crate-visible so
+/// `flow_render` resolves stored flows through the same dirs.
+pub(crate) fn flow_files(ctx: &ToolContext) -> Vec<(String, String)> {
     let ws = ctx.system.workspace();
     let mut out = Vec::new();
     for dir in FLOW_DIRS {
@@ -57,7 +58,7 @@ fn flow_files(ctx: &ToolContext) -> Vec<(String, String)> {
     out
 }
 
-fn basename(path: &str) -> String {
+pub(crate) fn basename(path: &str) -> String {
     path.rsplit('/')
         .next()
         .unwrap_or(path)

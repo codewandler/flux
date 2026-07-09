@@ -26,6 +26,19 @@ All notable changes to this project are documented in this file. The format is b
   pre-refactor renderer — so `flux-tui` (ANSI) and the `flow_render` SVG tree view (L-76) share
   one walk instead of a "render to ANSI then parse it back" round-trip. No new deps.
 
+- **L-76 — `flow_render`: Flux-Lang source/plan → syntax-highlighted SVG.** New model-facing
+  built-in tool beside `flow_list`/`flow_run` (new `flux_tools::render`, registered in the CLI):
+  pass inline `source` or the `name` of a stored flow (resolved through the same
+  `.flux/flows`/`~/.flux/flows` dirs as `flow_run`), and `view: "source"` (default) or `"tree"`.
+  The source view colours the code via `flux_lang::highlight` (L-74) with a char-indexed grid —
+  multi-line `"""strings"""` colour on every line, multi-byte glyphs don't smear — and is total
+  (malformed source still renders); the tree view colours `render_styled_spans` (L-75) roles,
+  renders `Program.flows` as trees and composite ops as best-effort statement-head lists, and
+  returns an error result on unparseable source. Theme ported verbatim from the tree-sitter
+  README script (One Dark) so images match; SVG returned inline via `ok_view` with a compact
+  `rendered <name> (<view> view) → SVG WxH, N lines` summary — read-only, SVG-only (file
+  output/PNG are L-77/L-78). Pure core `render_flux_svg` is directly reusable by the `flux
+  render` CLI subcommand (L-77). No new deps.
 ## [0.12.0] - 2026-07-09
 
 ### Fixed
