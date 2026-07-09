@@ -127,7 +127,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "codewandler-flux-core"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-credentials"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-datasource"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-evidence"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-plugin"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -199,14 +199,14 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-policy"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "codewandler-flux-provider"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-runtime"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -238,14 +238,14 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-secret"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "codewandler-flux-spec"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "schemars",
  "serde",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-system"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "codewandler-flux-core",
  "tokio",

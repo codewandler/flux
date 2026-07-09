@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-07-09
+
 ### Fixed
 
 - **Allowed intentional cargo-dist workflow overrides.** The release workflow now passes
