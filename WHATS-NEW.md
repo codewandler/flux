@@ -49,6 +49,11 @@
 - When a plan needs a small correction, the model can now send just the fix instead of
   re-writing the whole plan — repairs get faster and cheaper, with the same safety checks
   on the final plan.
+- A `fable` model shorthand: `-m fable` (or `-m claude/fable` on a Claude subscription) runs
+  Claude Fable 5, Anthropic's most capable model. And plain `-m claude` now works — it's
+  shorthand for the subscription's default model.
+- A new docs page covers running flux on a Claude Code / Claude Max subscription: which
+  models you get, how they're billed, and the exact request guarantees flux gives each one.
 
 ### Improved
 
@@ -59,11 +64,24 @@
   names, blank lines and comments between a header and its body, single-quoted strings in
   conditions, and scientific-notation numbers.
 
+### Fixed
+
+- Claude Haiku works again everywhere it's offered (`-m claude/haiku`, `anthropic/haiku`,
+  `aws/haiku`, and via OpenRouter). Runs used to fail with an "adaptive thinking is not
+  supported" error; flux now tailors each request to what the chosen model actually
+  accepts, so every documented model just works — including future ones on day one.
+- A mistyped model spec (like `claude/` with nothing after the slash) now fails instantly
+  with a hint about what to write, instead of a confusing error from the API.
+
 ### Action needed
 
 - If you granted `web_fetch` access to private/internal hosts in `config.toml` under
   `[private_net] web_fetch = …`, rename that key to `web`. The web tools now share one
   `[private_net] web` grant; an old `web_fetch` entry is ignored (public-only by default).
+- flux's default model is now **Claude Sonnet 5** (the current Sonnet): the `sonnet`
+  shorthand — and any run without `-m` — picks it up automatically. It's stronger at
+  coding and currently cheaper. To stay on the previous model, set
+  `model = "anthropic/claude-sonnet-4-6"` in `.flux/config.toml` or pass it via `-m`.
 
 ## [0.11.6] - 2026-07-09
 
