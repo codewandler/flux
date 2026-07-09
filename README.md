@@ -28,7 +28,10 @@ and integrations.
 Flux is one platform with three co-equal pillars:
 
 - **Agent**: local CLI/TUI, Rust SDK, HTTP server, and A2A support.
-- **Flux-Lang**: typed plans for orchestration and structure.
+- **Flux-Lang**: typed plans for orchestration and structure, with editor support — the in-repo
+  `flux-lsp` language server (diagnostics, completion, hover, formatting) and a
+  [tree-sitter grammar](https://github.com/codewandler/flux-tree-sitter) for Helix/Neovim/Zed
+  highlighting.
 - **Improvement loop**: evidence-driven eval and self-improvement tooling.
 
 Use flux when you want:
@@ -222,6 +225,7 @@ The plugin release index is minisign-checked and each archive hash is verified b
 - Getting started: [Getting started](https://codewandler.github.io/flux/docs/getting-started)
 - Agent loop: [The agent loop](https://codewandler.github.io/flux/docs/agent/agent-loop)
 - Language guide: [Flux-Lang overview](https://codewandler.github.io/flux/docs/language/overview)
+- Editor support: [Tooling — editor support](https://codewandler.github.io/flux/docs/language/tooling#editor-support)
 - SDK: [SDK overview](https://codewandler.github.io/flux/docs/sdk/overview)
 - Plugins: [Using plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins)
 

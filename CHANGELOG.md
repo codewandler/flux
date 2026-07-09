@@ -13,7 +13,10 @@ All notable changes to this project are documented in this file. The format is b
   `.helix/languages.toml` now declares the grammar (Helix colours via tree-sitter only — it does
   not render LSP semantic tokens), the website tooling page gained an Editor support section
   covering flux-lsp + the grammar + flux-editors, and the flux-lsp design/L-69 story are re-scoped
-  accordingly (semantic tokens are for clients that render them, not a Helix path).
+  accordingly (semantic tokens are for clients that render them, not a Helix path). README now
+  surfaces editor support on the Flux-Lang pillar, and AGENTS.md classifies `flux-lsp` in the L6
+  surfaces row and documents the hand-maintained highlighting-grammar mirrors (Prism,
+  flux-tree-sitter, flux-editors) that syntax changes must propagate to.
 
 ### Fixed
 

@@ -74,7 +74,7 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
 | **L5 capabilities** | `flux-capabilities` `flux-auth` | web + datasource/RAG tools (`browser`/`datasource` modules); caller identity (kept separate) |
-| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack) |
+| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` `flux-lsp` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack), the Flux-Lang language server (`flux-lsp` binary; diagnostics/completion/hover/formatting) |
 
 Key rules:
 - **`flux-runtime` (L2) must not depend on `flux-auth` (L5).** Surfaces resolve identity (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)` and inject it via `Executor::with_identity`.
@@ -173,6 +173,16 @@ What still needs manual updates in the same commit:
 
 - **New node kind** → write its doc-comment on the `Node` variant (the summary tables regenerate), and add a detailed hand-written section under the appropriate group in `crates/flux-lang/docs/reference.md` (primitive, control-flow, …) plus an example in the skill if helpful.
 - **Changed semantics** → update the relevant prose section and the Key invariants list in `crates/flux-lang/docs/reference.md`.
+
+**Editor-tooling mirrors of the text syntax are manual.** `crates/flux-lsp` derives its completion
+keywords/docs from `flux_lang::schema` at build time so it tracks automatically, but three
+highlighting grammars are hand-maintained mirrors that a **new keyword or spelling change** must be
+propagated to: the website's Prism grammar
+(`website/src/theme/prism-include-languages.js`), the external tree-sitter grammar
+([`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) — Helix/Neovim/
+Zed colour; also declared in the repo-local `.helix/languages.toml`), and the TextMate/IntelliJ
+grammars in [`codewandler/flux-editors`](https://github.com/codewandler/flux-editors). None have
+drift guards — grep them after syntax work.
 - **New built-in tool in `flux-tools`** → the op catalog the model sees is built dynamically from the live `ToolRegistry`, so the prompt needs nothing; but update the hand-written tables in `crates/flux-flow/docs/ops-reference.md` and the engine skill's "Registered ops" table.
 
 ---
