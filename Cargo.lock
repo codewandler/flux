@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-a2a"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-agent"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-core",
  "codewandler-flux-events",
@@ -621,11 +621,11 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-audio"
-version = "0.12.0"
+version = "0.12.1"
 
 [[package]]
 name = "codewandler-flux-capabilities"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-cognition"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-core"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-credentials"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-datasource"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-events"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-core",
  "codewandler-flux-evidence",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-evidence"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-flow"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-lang"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-markdown"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-markdown",
  "markdown-ratatui",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-orchestrate"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-agent",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-pg"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-core",
  "percent-encoding",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-plugin"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -850,14 +850,14 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-policy"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "codewandler-flux-provider"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-providers"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-runtime"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-sdk"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-agent",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-secret"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-skill"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-markdown",
  "serde",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-spec"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-system"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-core",
  "libc",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-tools"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-web"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "flux-app"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-agent",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "flux-auth"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "flux-channels"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "flux-cli"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1895,14 +1895,14 @@ dependencies = [
 
 [[package]]
 name = "flux-codegate"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "toml",
 ]
 
 [[package]]
 name = "flux-config"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-core",
  "codewandler-flux-evidence",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "flux-eval"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-cognition",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "flux-lsp"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "codewandler-flux-flow",
  "codewandler-flux-lang",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "flux-server"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "flux-tui"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
