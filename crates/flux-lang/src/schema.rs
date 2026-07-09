@@ -23,7 +23,8 @@ pub fn ast_schema() -> serde_json::Value {
 /// 43-variant `oneOf` collapsed into ONE object schema via [`merge_node_schema`]. Same wire format
 /// (the internally-tagged `{"kind": …, …}` objects serde already speaks), a fraction of the tokens
 /// — per-kind field/semantics documentation stays in [`node_kind_catalog`], which the planner
-/// prompt carries anyway. Memoized like [`ast_schema`].
+/// prompt carries anyway. The planner's default emission surface since the measured L-71 cutover
+/// (`docs/designs/flux-lang-emission-ab.md`). Memoized like [`ast_schema`].
 pub fn model_schema() -> serde_json::Value {
     static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {

@@ -16,10 +16,11 @@
 //!
 //!   `FLUX_EMISSION_AB_MODEL` picks the model. `codex/<model>` (e.g. `codex/gpt-5.5`) runs the
 //!   ChatGPT/Codex subscription provider (OAuth via flux-credentials — `flux auth login codex`);
-//!   any other value is an OpenRouter model id on the Anthropic-Messages wire and needs
-//!   `OPENROUTER_API_KEY` (default `anthropic/claude-sonnet-4.6` — the working default from
-//!   the L-20 story). Metrics per arm: first-emission acceptance, repair rounds, tokens
-//!   (uncached-in / cache / out, straight from the planner's [`flux_core::Usage`]), and wall time.
+//!   anything else is an OpenRouter model id on the Anthropic-Messages wire — with or without the
+//!   CLI's `openrouter-anthropic/` provider prefix — and needs `OPENROUTER_API_KEY` (default
+//!   `anthropic/claude-sonnet-4.6` — the working default from the L-20 story). Metrics per arm:
+//!   first-emission acceptance, repair rounds, tokens (uncached-in / cache / out, straight from
+//!   the planner's [`flux_core::Usage`]), and wall time.
 
 use std::time::Instant;
 
@@ -284,9 +285,11 @@ async fn emission_ab_live() {
     let spec = std::env::var("FLUX_EMISSION_AB_MODEL")
         .unwrap_or_else(|_| "anthropic/claude-sonnet-4.6".to_string());
     // Harness-local spec resolution, deliberately smaller than the CLI's `build_provider`:
-    // `codex/<model>` runs the subscription provider; EVERYTHING else stays an OpenRouter model id
+    // `codex/<model>` runs the subscription provider; everything else is an OpenRouter model id
     // on the Anthropic-Messages wire, so the L-20 default `anthropic/claude-sonnet-4.6` keeps
     // meaning the OpenRouter route (there, `anthropic/` is part of the model id, not a provider).
+    // A CLI-style `openrouter-anthropic/` provider prefix is stripped rather than sent upstream —
+    // pasting the fully-qualified spec the rest of flux uses must not 404 on a literal model id.
     let (provider, model, model_spec) = match spec.split_once('/') {
         Some(("codex", m)) => {
             let tokens = match flux_credentials::codex_token_source() {
@@ -308,8 +311,12 @@ async fn emission_ab_live() {
                     );
                 }
             };
-            let model_spec = format!("openrouter-anthropic/{spec}");
-            (provider, spec.clone(), model_spec)
+            let model = spec
+                .strip_prefix("openrouter-anthropic/")
+                .unwrap_or(&spec)
+                .to_string();
+            let model_spec = format!("openrouter-anthropic/{model}");
+            (provider, model, model_spec)
         }
     };
 
