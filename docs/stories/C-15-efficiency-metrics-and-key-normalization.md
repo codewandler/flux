@@ -3,7 +3,7 @@ id: C-15
 title: Per-turn efficiency metrics + canonical usage attribution keys
 pillar: Core
 status: done
-priority: 9
+priority:
 note: TurnSummary now folds per-turn calls + call_usage, efficiency_summary()/flux usage report calls/turn + iters/turn + cache-read share + uncached-in/out per turn, and usage keys are stamped canonically at write time (canonical_model_spec) with an unambiguous read-side merge for legacy variants
 ---
 

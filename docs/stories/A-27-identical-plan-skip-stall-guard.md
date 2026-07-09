@@ -3,7 +3,7 @@ id: A-27
 title: "Route the identical-plan skip transcript through the stall guard"
 pillar: Agent
 status: done
-priority: 7
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "the A-05 identical-plan skip returns its informational transcript directly, bypassing guard_transcript, so the transcript-stall counter/force-stop never advances — a model re-emitting the byte-identical succeeded plan spins the full 25-round repeat budget (a planner call per round) instead of force-stopping"

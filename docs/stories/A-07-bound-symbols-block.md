@@ -3,7 +3,7 @@ id: A-07
 title: Bound the symbols block — cap the one context segment that grows without eviction
 pillar: Agent
 status: done
-priority: 4
+priority:
 note: the symbols digest is now bounded in the renderer (64 lines / 10k chars, Pinned > Visible newest-first, drop-and-continue, omission marker, FLUX_SYMBOLS_CAP override with 0=off) — FlowStore::view stays uncapped for resolution/budgeting
 ---
 

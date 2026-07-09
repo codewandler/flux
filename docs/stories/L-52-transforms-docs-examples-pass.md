@@ -3,7 +3,7 @@ id: L-52
 title: Data-transforms docs pass + rewrite deterministic LLM-as-mapper patterns + final gate
 pillar: Language
 status: done
-priority: 8
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "the epic's closing story: public docs get the new vocabulary + native-text examples the user asked for; the LLM-as-mapper anti-patterns in-repo get replaced where honest"

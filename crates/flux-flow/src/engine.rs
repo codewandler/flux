@@ -603,6 +603,10 @@ impl FlowEngine {
     ) -> Result<Option<DraftAst>> {
         self.events
             .record_message(session_id, &Message::user_text(user_input))?;
+        // Same turn boundary as `run_turn_cancellable`: without this, repeated `/plan` turns
+        // (whose gather is read-only, so no write ever invalidates) would reuse cached reads
+        // across the whole editing session (L-54 review, 2026-07-09).
+        self.executor.begin_cache_turn();
         let base_system = self.base_system_with_skills(user_input, sink);
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;

@@ -3,7 +3,7 @@ id: C-12
 title: Thread plan intents into plan approval — close the sub-agent destructive bypass
 pillar: Core
 status: done
-priority: 1
+priority:
 note: plan approval now sees the plan's real aggregate IntentSet — SubAgentApprover denies destructive plans on the emit_plan path, and an undisclosed destructive op re-fires the approval gate even inside an approved scope
 ---
 

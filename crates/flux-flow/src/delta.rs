@@ -12,8 +12,6 @@
 //! level down from whatever the previous segment resolved to, with no per-`Node`-variant case
 //! analysis needed.
 
-use sha2::{Digest, Sha256};
-
 use crate::ast::DraftAst;
 
 /// The only delta wire version understood today. Future-proofing per the design: an incompatible
@@ -60,10 +58,11 @@ pub enum DeltaAction {
 /// `fields`, `Node::Expr`'s `vars` — sorted lexicographically), never a `HashMap`, so semantically
 /// identical ASTs always hash identically regardless of how they were built.
 pub fn ast_content_hash(ast: &DraftAst) -> String {
+    // One shared derivation (flux-lang's `sha256_hex`) — the loop guard and events layer hash
+    // plan identity the same way, and an independent copy here could silently drift from the
+    // `base` the model is told to echo back (review, 2026-07-09).
     let canonical = serde_json::to_string(ast).unwrap_or_default();
-    let mut h = Sha256::new();
-    h.update(canonical.as_bytes());
-    format!("{:x}", h.finalize())
+    flux_lang::runtime::sha256_hex(&canonical)
 }
 
 /// Parse the raw `emit_plan_delta` tool input into a [`Delta`]. Tolerant like the rest of
@@ -139,6 +138,10 @@ pub fn parse_delta(input: &serde_json::Value) -> Result<Delta, String> {
 /// rejected full plan; the previous accepted/rejected state is never mutated on any of these
 /// paths.
 pub fn apply_delta(base: &DraftAst, delta: &Delta) -> Result<DraftAst, String> {
+    // NOTE: hash from `ast_content_hash` (struct serializer, field-declaration order), never
+    // from the `Value` working copy below — `Value`'s BTreeMap re-orders object keys, so the two
+    // canonical strings DIFFER. Hashing the Value here broke every base match (caught by tests,
+    // 2026-07-09); the double serialization is the price of one hash derivation.
     let actual = ast_content_hash(base);
     if actual != delta.base {
         return Err(format!(
@@ -168,34 +171,18 @@ fn apply_op(root: &mut serde_json::Value, op: &DeltaOp) -> Result<(), String> {
         DeltaAction::Replace => {
             let node = op.node.clone().expect("validated by parse_delta");
             let (arr, idx) = resolve_container_mut(root, &op.path)?;
-            if idx >= arr.len() {
-                return Err(format!(
-                    "index {idx} out of range ({} node(s) at this path)",
-                    arr.len()
-                ));
-            }
+            check_bounds(idx, arr.len(), false)?;
             arr[idx] = node;
         }
         DeltaAction::Insert => {
             let node = op.node.clone().expect("validated by parse_delta");
             let (arr, idx) = resolve_container_mut(root, &op.path)?;
-            if idx > arr.len() {
-                return Err(format!(
-                    "index {idx} out of range for insert (at most {} — {} node(s) at this path)",
-                    arr.len(),
-                    arr.len()
-                ));
-            }
+            check_bounds(idx, arr.len(), true)?;
             arr.insert(idx, node);
         }
         DeltaAction::Delete => {
             let (arr, idx) = resolve_container_mut(root, &op.path)?;
-            if idx >= arr.len() {
-                return Err(format!(
-                    "index {idx} out of range ({} node(s) at this path)",
-                    arr.len()
-                ));
-            }
+            check_bounds(idx, arr.len(), false)?;
             arr.remove(idx);
         }
     }
@@ -203,6 +190,18 @@ fn apply_op(root: &mut serde_json::Value, op: &DeltaOp) -> Result<(), String> {
 }
 
 /// Split one dot-separated path segment (`"body[3]"`, `"then[1]"`) into its field name and index.
+/// Shared bounds check for delta list operations. `insert` allows `idx == len` (append) —
+/// one error text for every arm, so model-facing repair feedback never drifts per action.
+fn check_bounds(idx: usize, len: usize, insert: bool) -> std::result::Result<(), String> {
+    let max = if insert { len } else { len.saturating_sub(1) };
+    if (insert && idx > len) || (!insert && idx >= len) {
+        return Err(format!(
+            "index {idx} out of range (max {max} — {len} node(s) at this path)"
+        ));
+    }
+    Ok(())
+}
+
 fn split_segment(seg: &str) -> Result<(&str, usize), String> {
     let open = seg
         .find('[')

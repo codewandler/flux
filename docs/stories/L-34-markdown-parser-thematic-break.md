@@ -3,7 +3,7 @@ id: L-34
 title: "Terminate a list on a spaced thematic break instead of nesting an empty list"
 pillar: Language
 status: done
-priority: 12
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "parse_list's next-item check consults only list_marker and never is_thematic_break, so `- - -` after a `-` item is consumed as another list item (an empty nested list) instead of terminating the list with a ThematicBreak — stray empty bullets in the CLI/TUI renderers and wrong re-emitted markdown"

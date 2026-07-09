@@ -3,7 +3,7 @@ id: L-55
 title: Plan-delta emission for cheap safe repairs
 pillar: Language
 status: done
-priority: 11
+priority:
 epic: flux-lang-agent-speed
 design: docs/designs/flux-lang-agent-speed.md
 note: "KF3: let repair turns patch the previous AST, then materialize and validate the full plan before execution"
@@ -30,6 +30,11 @@ policy, and audit gates.
       rejection, and an attempted hidden/denied op that remains gated after patching.
 
 ## Progress
+- 2026-07-09 review fix: rejection feedback now carries the rejected plan's content hash (the
+  `base` the tool schema promised - a model's first delta previously always failed stale-base);
+  verdict bookkeeping shared via `apply_plan_gate`; hash derivation reuses `sha256_hex`; bounds
+  errors folded into one helper. NOTE: hash MUST come from the struct serializer, never the
+  `Value` copy (BTreeMap re-orders keys - caught live by the delta tests).
 - 2026-07-09: Implemented end-to-end. New `flux_flow::delta` module (`crates/flux-flow/src/delta.rs`)
   materializes a versioned `{version, base, ops[]}` patch against a `DraftAst`'s JSON wire form: a
   single generic path walker (`resolve_container_mut`) resolves `body[i]`, `.then[i]`,

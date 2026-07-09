@@ -3,7 +3,7 @@ id: C-19
 title: Subscription-provider legs in the live smoke gate (claude + codex WS)
 pillar: Core
 status: done
-priority: 2
+priority:
 note: smoke-live.sh now has claude + codex legs (SKIP when the credential is absent) and the codex leg runs under FLUX_TRANSPORT_DEBUG=1 grepping the new env-gated fallback marker — WS regression FAILS LOUDLY instead of hiding behind the transparent HTTP fallback; both legs validated LIVE (claude PASS, codex PASS over WS); found+recorded: steps 1-5 of the script are stale against the subcommand CLI
 ---
 

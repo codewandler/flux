@@ -67,6 +67,18 @@ if grep -q '^## \[Unreleased\]' CHANGELOG.md; then
 else
   echo "   !! no [Unreleased] header in CHANGELOG.md — add the [$NEW] section by hand" >&2
 fi
+# 3b) roll the CUSTOMER changelog the same way. An empty [Unreleased] is legal (a release with
+#     no user-visible changes) but loudly flagged — usually it means someone forgot the entry.
+if grep -q '^## \[Unreleased\]' WHATS-NEW.md; then
+  if ! sed -n '/^## \[Unreleased\]/,/^## \[/p' WHATS-NEW.md | sed '1d;$d' | grep -q '[^[:space:]]'; then
+    echo "   !! WHATS-NEW.md [Unreleased] is EMPTY — no customer-visible notes for $NEW?" >&2
+    echo "   !! (fine for internal-only releases; otherwise add them before pushing)" >&2
+  fi
+  perl -0pi -e "s/## \[Unreleased\]/## [Unreleased]\n\n## [$NEW] - $DATE/" WHATS-NEW.md
+  echo "   rolled WHATS-NEW: [Unreleased] -> [$NEW] - $DATE"
+else
+  echo "   !! no [Unreleased] header in WHATS-NEW.md — add the [$NEW] section by hand" >&2
+fi
 
 # 4) the gate (skippable). Mirrors AGENTS.md's dev-loop gate + both-workspace fmt + codegate.
 if [ "$NO_GATE" -eq 0 ]; then
@@ -83,7 +95,7 @@ else
 fi
 
 # 5) commit ONLY the release files, then tag. Never `git add -A` (protects concurrent work).
-git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md
+git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md WHATS-NEW.md
 git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock both workspaces.
 - Roll CHANGELOG [Unreleased] -> [$NEW]."
 # Annotated, not lightweight: `git push --follow-tags` only pushes annotated tags (a lightweight

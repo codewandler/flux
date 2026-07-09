@@ -3,7 +3,7 @@ id: C-32
 title: "read() on a directory returns recoverable guidance, not a plan-halting raw io error"
 pillar: Core
 status: done
-priority: 3
+priority:
 epic: flux-lang-evolution
 note: "s_362: six `read(\"crates/flux-policy/src\")`-style calls halted the orient plan with `io error: Is a directory (os error 21)` — a weak-model guardrail: return a ToolResult::error with 'is a directory — glob it first' guidance the planner can react to in-turn"
 ---

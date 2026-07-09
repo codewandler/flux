@@ -3,7 +3,7 @@ id: A-13
 title: Phase-aware planner protocol — emit_plan gather/brief + compile_turn phase segments
 pillar: Agent
 status: done
-priority: 3
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: the protocol half of the phased loop — gather plans are compile-enforced read-only (effect metadata incl. transitive composites), ~12-node cap, gather-tag rejected once the budget is spent

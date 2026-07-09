@@ -3,7 +3,7 @@ id: L-50
 title: Regex ops — `regex_match`, `regex_extract` (ReDoS-free via Rust `regex`)
 pillar: Language
 status: done
-priority: 6
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "regex was only accessible inside the `grep` file tool; ship two pure ops so plans can classify or extract from any string result"

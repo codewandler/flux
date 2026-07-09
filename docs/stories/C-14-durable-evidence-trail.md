@@ -3,7 +3,7 @@ id: C-14
 title: Durable evidence trail — persist observations, record plan attempts, carry signal provenance
 pillar: Core
 status: done
-priority: 6
+priority:
 note: observations flush durably to events.db at every turn end (watermark batch), every planning attempt is recorded with the accepted plan's fingerprint + readable rendered graph, and groups.active now carries the justifying workspace signals — projection::observations serves offline reads
 ---
 

@@ -948,32 +948,17 @@ async fn compile_turn_inner(
                         },
                     };
                     match decoded {
-                        Ok(ast) => {
-                            match gate_candidate_plan(
+                        Ok(ast) => apply_plan_gate(
+                            gate_candidate_plan(
                                 ast, ops, view, phase, step, complete, gather, brief,
-                            ) {
-                                PlanGate::Accepted(c) => {
-                                    results.push(ContentBlock::tool_result_text(
-                                        id,
-                                        "plan accepted".to_string(),
-                                        false,
-                                    ));
-                                    done = Some(c);
-                                }
-                                PlanGate::Rejected(msg, ast) => {
-                                    last_reject = msg;
-                                    results.push(ContentBlock::tool_result_text(
-                                        id,
-                                        last_reject.clone(),
-                                        true,
-                                    ));
-                                    // KF3/L-55: this decoded-but-rejected ast becomes the base a
-                                    // follow-up `emit_plan_delta` may patch (advertised from the
-                                    // next step onward).
-                                    last_rejected_ast = Some(ast);
-                                }
-                            }
-                        }
+                            ),
+                            &id,
+                            None,
+                            &mut results,
+                            &mut last_reject,
+                            &mut last_rejected_ast,
+                            &mut done,
+                        ),
                         // A decode failure is repair feedback like any other rejection — record it
                         // (A-31) so the exhausted-budget error names the actual cause instead of
                         // the bare "did not produce a plan" that made s_360 undiagnosable. There is
@@ -1016,28 +1001,17 @@ async fn compile_turn_inner(
                             // reconstruct the patch that was sent, not just what it materialized
                             // into (`plan_source` already carries the materialized plan).
                             let delta_source = serde_json::to_string(&input).ok();
-                            match gate_candidate_plan(
-                                ast, ops, view, phase, step, complete, gather, brief,
-                            ) {
-                                PlanGate::Accepted(mut c) => {
-                                    c.delta_source = delta_source;
-                                    results.push(ContentBlock::tool_result_text(
-                                        id,
-                                        "plan accepted".to_string(),
-                                        false,
-                                    ));
-                                    done = Some(c);
-                                }
-                                PlanGate::Rejected(msg, ast) => {
-                                    last_reject = msg;
-                                    results.push(ContentBlock::tool_result_text(
-                                        id,
-                                        last_reject.clone(),
-                                        true,
-                                    ));
-                                    last_rejected_ast = Some(ast);
-                                }
-                            }
+                            apply_plan_gate(
+                                gate_candidate_plan(
+                                    ast, ops, view, phase, step, complete, gather, brief,
+                                ),
+                                &id,
+                                delta_source,
+                                &mut results,
+                                &mut last_reject,
+                                &mut last_rejected_ast,
+                                &mut done,
+                            )
                         }
                         // A malformed delta (bad JSON shape, stale base, bad path, out-of-range
                         // index, an unparseable `node`) is repair feedback like any other rejection
@@ -2020,6 +1994,49 @@ fn gather_violation(ast: &DraftAst, ops: &OpRegistry) -> Option<String> {
 enum PlanGate {
     Accepted(Compiled),
     Rejected(String, DraftAst),
+}
+
+/// Shared verdict bookkeeping for a gated candidate plan — identical for full emissions and
+/// deltas (only `delta_source` differs), so full-plan and delta rejections can never drift apart
+/// (review, 2026-07-09). A rejection surfaces the rejected plan's content hash: that is the
+/// `base` a follow-up `emit_plan_delta` must pass, and the tool schema promises the model it
+/// appears in this feedback — without it, every first delta failed stale-base.
+#[allow(clippy::too_many_arguments)]
+fn apply_plan_gate(
+    gate: PlanGate,
+    id: &str,
+    delta_source: Option<String>,
+    results: &mut Vec<ContentBlock>,
+    last_reject: &mut String,
+    last_rejected_ast: &mut Option<DraftAst>,
+    done: &mut Option<Compiled>,
+) {
+    match gate {
+        PlanGate::Accepted(mut c) => {
+            c.delta_source = delta_source;
+            results.push(ContentBlock::tool_result_text(
+                id.to_string(),
+                "plan accepted".to_string(),
+                false,
+            ));
+            *done = Some(c);
+        }
+        PlanGate::Rejected(msg, ast) => {
+            let base = crate::delta::ast_content_hash(&ast);
+            *last_reject = format!(
+                "{msg}\n\nTo repair with a small patch instead of a full re-emission, call \
+                 `emit_plan_delta` with base=\"{base}\" (this rejected plan's content hash)."
+            );
+            results.push(ContentBlock::tool_result_text(
+                id.to_string(),
+                last_reject.clone(),
+                true,
+            ));
+            // KF3/L-55: this decoded-but-rejected ast becomes the base a follow-up
+            // `emit_plan_delta` may patch (advertised from the next step onward).
+            *last_rejected_ast = Some(ast);
+        }
+    }
 }
 
 /// Run a decoded plan `ast` through EXACTLY the gates a full `emit_plan` always ran — hidden-ops

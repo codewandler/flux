@@ -3,7 +3,7 @@ id: A-15
 title: Phase-aware surface — loop.phase spinner labels, brief render, compact gather render
 pillar: Agent
 status: done
-priority: 5
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: CLI + TUI parity; observations already pass drain_event unfiltered so no plumbing change — pure rendering

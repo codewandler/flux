@@ -3,7 +3,7 @@ id: L-48
 title: Aggregation & predicate ops — `sum`, `count_by`, `group_by`, `any`, `all`, `has`
 pillar: Language
 status: done
-priority: 4
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "kills the bespoke Rust boolean-emitters (candidates_empty/score_compare/grade) that only exist because expr has no text spelling — `any`/`all`/`has` compose with `when`/`until` today"

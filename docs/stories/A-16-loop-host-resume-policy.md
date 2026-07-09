@@ -3,7 +3,7 @@ id: A-16
 title: Loop-host resume policy + structured feedback contract (latch fold, denial guard, suffix-scoped approval)
 pillar: Agent
 status: done
-priority: 4
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: run_plan consumes the halt latch (fold over events.db, no new table), refuses hash-identical re-emission of denied statements, scopes approval to the suffix that will actually run, and feeds ✓/✗/· markers + machine-readable failure back to the planner

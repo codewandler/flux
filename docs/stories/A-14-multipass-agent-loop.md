@@ -3,7 +3,7 @@ id: A-14
 title: Multi-pass agent-loop.flux — orient → bounded gather → execute, with host threading
 pillar: Agent
 status: done
-priority: 4
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: the loop text itself becomes phased (orient / repeat-3 gather / repeat-25 execute); plan op gains phase; brief is host-carried per turn; PlanAttempt gains phase; clean cutover — no flags

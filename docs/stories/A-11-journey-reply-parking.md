@@ -3,7 +3,7 @@ id: A-11
 title: Reply-parking for `ask` — journeys suspend until the correlated reply arrives
 pillar: Agent
 status: done
-priority: 5
+priority:
 note: a top-level `$reply = ask(...)` is lowered at journey-run time into ask + `await` (source ask.reply) — the flow suspends on the EXISTING seam, the App parks it keyed by asked channel, and a correlated inbound message (channel name, or user_input for CLI channels) is CONSUMED to resume the oldest matching park via resume_flow with the reply bound; zero flux-flow/flux-lang changes, envelope invariant intact
 ---
 

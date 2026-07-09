@@ -3,7 +3,7 @@ id: A-26
 title: "Measure the per-turn token budget against cumulative billed tokens"
 pillar: Agent
 status: done
-priority: 6
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "the A-10 turn budget compares against replace-style usage (only outputs sum; input/cache are overwritten each call), so `used` tracks last-call context occupancy, not the turn's cumulative billed tokens — a runaway 20-call loop re-paying ~90k input each time never trips the ceiling it exists to enforce"

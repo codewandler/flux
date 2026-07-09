@@ -28,6 +28,11 @@ the message-only `analyze::Diagnostic` resolves to real LSP ranges. This is the 
       `TextRange` via the side-map.
 
 ## Progress
+- 2026-07-09 review fix: `parse`/`parse_program` are single-pass legacy again - the CST+RangeMap
+  runs only in `parse_with_ranges` (LSP); per-parse acceptance debug-asserts removed (they aborted
+  debug builds on untrusted model text; agreement enforcement lives in the cst_agreement + property
+  guards); LSP parses once per keystroke and marks unresolvable diagnostic paths "(unlocated)";
+  Match/Route lowering shares `pair_cases`.
 - 2026-07-09 in-progress. Architecture decided after reading parser.rs/analyze.rs/parse.rs:
   the CST models statement STRUCTURE fully but headers are token-runs (fine for LSP, too coarse
   to reproduce DraftAst + pinned error texts from the tree alone). So: `lower_cst.rs` hosts the

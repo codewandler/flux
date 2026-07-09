@@ -3,7 +3,7 @@ id: L-33
 title: "Size a tilde code fence by its tilde runs, not backtick runs"
 pillar: Language
 status: done
-priority: 4
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "the markdown writer computes fence length from the longest backtick run even when it emits a TILDE fence (info string contains a backtick), so a body with a `~~~` run closes the fence early — parse(to_markdown(parse(src))) != parse(src), silently corrupting any document round-tripped through the writer"

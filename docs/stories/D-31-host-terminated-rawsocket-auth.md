@@ -3,7 +3,7 @@ id: D-31
 title: Host-terminated raw-socket auth (no credential to the plugin)
 pillar: Core
 status: done
-priority: 10
+priority:
 epic: endpoint-discovery
 design: docs/designs/endpoint-discovery.md
 note: the endpoint epic is COMPLETE — the host now terminates the Postgres v3 handshake (full RFC 5802/7677 SCRAM-SHA-256 incl. server-signature verification, + MD5/cleartext) via the new conn.authenticate capability and hands sql a post-auth connection; sql's manifest grants NO credential and NO secrets (both removed), its SCRAM/MD5/crypto code is deleted, and MockHost call-log tests prove no password ever crosses a plugin frame; mysql/AMI follow-ons have a clear seam

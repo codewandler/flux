@@ -3,7 +3,7 @@ id: L-51
 title: Native expr in conditions and bind RHS — `when $count > 3`, `$ok = $score >= 0.8`
 pillar: Language
 status: done
-priority: 7
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "the ergonomic pass: authors can finally write `when $x > 3` instead of `@json {\"kind\":\"expr\",...}`; the runtime seam already exists — this is pure parser/format work"

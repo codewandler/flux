@@ -29,6 +29,9 @@ shape, approval ordering, and policy behavior as sequential execution.
       force sequential execution.
 
 ## Progress
+- 2026-07-09 review fix: throttle/debounce are hard fences (name-keyed durable buckets invisible
+  to the symbol hazard model; new `throttle_and_debounce_are_hard_fences` test); binder-write
+  collector made exhaustive (no `_ =>`); summaries gathered in one visitor pass.
 - 2026-07-09 DONE. The scheduler now builds a whole-node symbol dependency graph: `summarize`
   walks each top-level statement's entire subtree (via the analyzer's exhaustive visitor) into
   (reads, writes, class) — class ReadOnly (all reachable ops registered + Read-only, no

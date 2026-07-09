@@ -3,7 +3,7 @@ id: L-30
 title: "Make op-surfacing enforcement recurse through composite bodies"
 pillar: Language
 status: done
-priority: 9
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "hidden_ops_in exempts composite calls and never walks their bodies, and composite registration validates bodies against the FULL registry (advertised=None) — so a turn-registered composite can name a non-advertised op, denting A-04's stated 'the compiler rejects plans calling hidden ops'. Legibility/hygiene only: the op still hits approval+guarded IO and the gather gate is honored transitively"

@@ -3,7 +3,7 @@ id: C-18
 title: A2A task sessions are never pruned — TTL-based cleanup
 pillar: Core
 status: done
-priority: 1
+priority:
 note: A2A sessions are now minted tagged (agent_id "a2a", contextId as correlation_id) and swept lazily at each mint — whole expired streams (age = last activity, TTL [server] a2a_session_ttl_secs default 3600, 0 = never) are DELETED via the new EventStore::prune_inactive; covers both the standalone server and the flux-channels a2a mount with no caller changes
 ---
 

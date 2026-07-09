@@ -3,7 +3,7 @@ id: A-06
 title: Wire the dead `complete` fast-path — stop paying a full second planner round per turn
 pillar: Agent
 status: done
-priority: 5
+priority:
 note: a completion-carrying plan that runs to success now ends the turn with ONE toolless catalog-less render instead of a full second planner round — armed only on success (rejection/error/suspension/identical-skip all fall through to normal re-planning), render usage counted, render failure never aborts the turn
 ---
 

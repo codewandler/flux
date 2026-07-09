@@ -13,8 +13,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - **Released:** v0.11.6 (2026-07-09) — the `flow_list` / `flow_run` tools + the `~/.flux/flows`
   unified flows/ops home (L-72), the L-71 merged-Node-schema planner emission default, and the
   bare-`@name` named-root fix. **In flight (`[Unreleased]`):** `task install` now also installs
-  `flux-lsp`. **Focus:** the Language pillar — the `data-transforms` epic (L-46–L-52) is shipped;
-  `flux-lang-agent-speed` (L-53–L-56) leads the ready queue. See [CHANGELOG](../../CHANGELOG.md).
+  `flux-lsp`. **Focus:** the Language pillar — the `data-transforms` epic (L-46–L-52) and
+  `flux-lang-agent-speed` (L-53–L-56, plus the L-59 CST keystone) are shipped; next up per the
+  generated board below. See [CHANGELOG](../../CHANGELOG.md).
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 <!-- BEGIN track:board -->
@@ -200,6 +201,7 @@ _flux's web surface grew bottom-up and it shows. Today there are exactly two mod
 - [C-44 — Run-diff + `flux diff` — align two runs, show where the plan or the world diverged](C-44-run-diff.md) · Core · Time Machine Phase 3 SHIPPED 2026-07-07 — `flux diff <A> <B>` classifies plan-changed vs same-plan-different-world per aligned statement, humanized via plan_source; exit 1 on divergence
 - [C-45 — Reconcile `--yes` destructive-op behavior with the safety docs](C-45-yes-destructive-approver-truth.md) · Core · F-003 (beta rec #1): public safety docs say destructive ops always re-confirm even with --yes; README/source show --yes installs a headless allow-all approver INCLUDING destructive ops — one of these is wrong; decide the intended contract, then align
 - [C-46 — Beta docs-truth pass — mock mode, A2A protocol version, Flux-Lang syntax examples, `peek`](C-46-beta-docs-truth-pass.md) · Core · F-001 + F-005 + F-007 + F-009: align public docs to observed v0.6.0 behavior — mock mode returns canned output (not a representative demo); docs say A2A v1.0 while the card reports protocolVersion 0.3.0; Flux-Lang examples with text expr()/JSON returns:Object/non-writable expr trees don't round-trip; `peek` shown as bindable but the tested bind shape is rejected
+- [C-48 — Customer-centric changelog (WHATS-NEW.md) + `flux changelog`](C-48-customer-changelog-flux-changelog.md) · Agent · plain-language 'what has changed' shipped in the binary; CHANGELOG.md stays the engineering log
 - [C-49 — Claude provider hardening — model-gated quirks, fable alias, spec parsing](C-49-claude-provider-model-hardening.md) · Core · e2e sweep 2026-07-09 found haiku 400s (adaptive thinking), `claude/fable` 404s, `claude/` reaches the wire
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)

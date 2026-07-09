@@ -1346,7 +1346,14 @@ impl Executor {
             h.finish()
         });
         if let Some(key) = cache_key {
-            if let Some(hit) = self.op_cache.lock().unwrap().get(&key).cloned() {
+            // Bind the hit FIRST so the op_cache guard drops before the evidence lock below —
+            // holding both pinned a lock order and serialized hits (review, 2026-07-09).
+            let hit = self.op_cache.lock().unwrap().get(&key).cloned();
+            if let Some(mut hit) = hit {
+                // Re-redact against the CURRENT secret set: a secret registered after this
+                // result was stored must not replay in cleartext (review, 2026-07-09).
+                hit.content = self.ctx.redactor.redact(&hit.content);
+                hit.view = hit.view.map(|v| self.ctx.redactor.redact(&v));
                 // Audit-distinguishable from a fresh execution: the `tool_call` observation above
                 // fired as usual, and this marker says the result was replayed, not re-fetched.
                 self.ctx.evidence.lock().unwrap().record(Observation::new(
@@ -1359,6 +1366,16 @@ impl Executor {
                     denied: false,
                 };
             }
+        }
+
+        // 4¾. A mutating dispatch starts a new invalidation generation BEFORE its IO runs (and
+        //    clears again after, step 7): pre-bumping closes the window where a concurrent read
+        //    could be served a pre-write value after the write's IO already landed (review,
+        //    2026-07-09). A failed write invalidates too — conservative and sound.
+        let mutating = spec.effects.iter().any(|e| !matches!(e, Effect::Read));
+        if mutating {
+            self.cache_gen.fetch_add(1, Ordering::SeqCst);
+            self.op_cache.lock().unwrap().clear();
         }
 
         // 5. System boundary: the only place real IO happens. Redact secrets from the result —
@@ -1382,11 +1399,11 @@ impl Executor {
                 json!({ "tool": name }),
             ));
         }
-        // 7. Cache maintenance (L-54). A dispatch carrying any non-`Read` effect may have changed
-        //    what a read would observe (workspace tree, filesystem, a remote datasource) — start a
-        //    new invalidation generation and drop the now-unreachable entries. A cacheable success
-        //    is stored (already redacted) for replay within this generation.
-        if spec.effects.iter().any(|e| !matches!(e, Effect::Read)) {
+        // 7. Cache maintenance (L-54). A mutating dispatch invalidated BEFORE its IO (step 4¾);
+        //    clear once more now that the IO landed so anything cached concurrently during the
+        //    write is dropped too. A cacheable success is stored (already redacted) for replay
+        //    within this generation.
+        if mutating {
             self.cache_gen.fetch_add(1, Ordering::SeqCst);
             self.op_cache.lock().unwrap().clear();
         } else if let Some(key) = cache_key {

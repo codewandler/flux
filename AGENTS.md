@@ -168,9 +168,17 @@ Each invariant below was established (and several re-learned the hard way) durin
   shipped a breaking realtime-seam change and had to be re-cut as v0.3.0.)
 - Release mechanics: bump every `version = "..."` occurrence in the root `Cargo.toml`, run
   `cargo update --workspace` in **both** workspaces (root and `plugins/`), roll `[Unreleased]` into
-  a dated version section in `CHANGELOG.md`, run the full dev-loop gate, then commit
-  `chore(release): cut X.Y.Z`, tag `vX.Y.Z`, and push the branch **and** the tag — the tag triggers
-  the Release workflow (verify it completes with all assets).
+  a dated version section in `CHANGELOG.md` **and in `WHATS-NEW.md`**, run the full dev-loop gate,
+  then commit `chore(release): cut X.Y.Z`, tag `vX.Y.Z`, and push the branch **and** the tag — the
+  tag triggers the Release workflow (verify it completes with all assets).
+- **Two changelogs, two audiences.** `CHANGELOG.md` is the engineering log (story IDs, crates,
+  invariants). `WHATS-NEW.md` at the repo root is the CUSTOMER changelog: every **user-visible**
+  change adds a plain-language entry to its `[Unreleased]` section alongside the CHANGELOG entry —
+  feature-first wording, no story IDs, no crate names (`### New/Improved/Fixed/Action needed`).
+  Internal-only changes (refactors, CI, test fixtures) skip it. **Before cutting a release, review
+  `WHATS-NEW.md [Unreleased]`**: `scripts/cut-release.sh` rolls and stages both files and warns
+  loudly when the customer section is empty — an empty section is legal only for internal-only
+  releases. The file is embedded in the binary and shown by `flux changelog`.
 - Breaking changes must be flagged in the CHANGELOG entry and the commit title (`type(scope)!:`).
 
 ---

@@ -3,7 +3,7 @@ id: L-21
 title: flux-lang v1 hardening — residual burn-down (resume key, denial fatality, analyzer gaps)
 pillar: Language
 status: done
-priority: 4
+priority:
 epic: flux-lang-v1-hardening
 design: docs/designs/flux-lang-v1-hardening.md
 note: all four closed — suspensions persist flow_name (guarded migration) so named-flow resume checkpoints name+hash like the run; FlowError::Denied is fatal (host-marked via OpOutcome.denied, executor's canonical op-anchored denial shape pinned by test; hook denials stay retryable by design); each/jq/parse eval_arg positions reject calls; type diagnostics carry node paths
