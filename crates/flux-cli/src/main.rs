@@ -2296,7 +2296,9 @@ async fn build_agent_with(
             broker.clone(),
             endpoint_registry.clone(),
         );
-        for p in flux_plugin::discover(&dir) {
+        let (plugins, stale) = split_stale_plugins(flux_plugin::discover(&dir));
+        warn_stale_plugins(&stale);
+        for p in plugins {
             // Build host capabilities from the plugin's own manifest declaration, so each plugin
             // gets only the process/secret/http access it asked for (and nothing by default).
             let system = system.clone();
@@ -6065,7 +6067,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
             broker.clone(),
             endpoint_registry.clone(),
         ));
-        for p in flux_plugin::discover(&dir) {
+        let (plugins, stale) = split_stale_plugins(flux_plugin::discover(&dir));
+        warn_stale_plugins(&stale);
+        for p in plugins {
             let system = system.clone();
             let backend = backend.clone();
             let caps_system = system.clone();
@@ -7523,6 +7527,38 @@ fn plugin_binaries_in(dir: &std::path::Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Split discovered plugins into loadable descriptors and STALE registrations — path-shaped
+/// `program`s whose binary no longer exists on disk (a deleted checkout, a pruned pack store).
+/// Stale ones are skipped before any spawn attempt and reported by [`warn_stale_plugins`] as ONE
+/// aggregated line, so a pile of dead descriptors doesn't print a warning per plugin on every
+/// command. A bare command name has no checkable path and stays loadable — the spawn resolves it
+/// against PATH and a real failure there still gets its own detailed line.
+fn split_stale_plugins(
+    discovered: Vec<flux_plugin::DiscoveredPlugin>,
+) -> (Vec<flux_plugin::DiscoveredPlugin>, Vec<String>) {
+    let (loadable, stale): (Vec<_>, Vec<_>) = discovered.into_iter().partition(|p| {
+        !(p.descriptor.program.contains(['/', '\\'])
+            && !std::path::Path::new(&p.descriptor.program).exists())
+    });
+    (loadable, stale.into_iter().map(|p| p.name).collect())
+}
+
+/// One dim stderr line covering every stale plugin registration (empty → silence), with the
+/// remedy: rebuild/reinstall the binary, or unregister the plugin.
+fn warn_stale_plugins(stale: &[String]) {
+    if stale.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        style::dim(&format!(
+            "({} plugin registration(s) skipped — binary missing: {}; rebuild/reinstall, or `flux plugin uninstall <name>` to unregister)",
+            stale.len(),
+            stale.join(", ")
+        ))
+    );
+}
+
 /// `flux auth status | login <provider>`.
 /// Map a resolved `provider/model` spec to the `flux auth status` row it authenticates against, so
 /// the status view can flag the active default provider. Returns `None` for specs that need no
@@ -8045,6 +8081,47 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    /// A registered plugin whose recorded binary is gone (a deleted checkout, a pruned pack
+    /// store) is a STALE registration: it is skipped up front and reported as one aggregated
+    /// warning line, not spawn-failed with a dim line per plugin on every command. Path-shaped
+    /// programs that exist stay loadable, and bare command names are left for the spawn to
+    /// resolve against PATH.
+    #[test]
+    fn split_stale_plugins_partitions_missing_binaries() {
+        let dir = std::env::temp_dir().join(format!("flux-stale-plugins-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("flux-plugin-live");
+        std::fs::write(&live, b"#!/bin/sh\n").unwrap();
+        let plugin = |name: &str, program: String| flux_plugin::DiscoveredPlugin {
+            name: name.to_string(),
+            descriptor: flux_plugin::PluginDescriptor {
+                program,
+                ..Default::default()
+            },
+        };
+        let discovered = vec![
+            plugin("live", live.to_string_lossy().into_owned()),
+            plugin(
+                "gone",
+                dir.join("flux-plugin-gone").to_string_lossy().into_owned(),
+            ),
+            plugin("bare", "some-command-resolved-on-path".to_string()),
+        ];
+        let (loadable, stale) = super::split_stale_plugins(discovered);
+        let names: Vec<&str> = loadable.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["live", "bare"],
+            "existing paths and bare PATH names stay loadable"
+        );
+        assert_eq!(
+            stale,
+            ["gone"],
+            "a path-shaped program that no longer exists is stale"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// F6: `flux plugin list` is accepted as an alias of the terse `ls` default.

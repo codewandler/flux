@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- Stale plugin registrations (a descriptor whose recorded binary no longer exists — e.g. a
+  deleted checkout) no longer print one "failed to load" warning per plugin on every command.
+  They are skipped up front and reported as a single aggregated line naming the plugins and the
+  remedy (rebuild/reinstall, or `flux plugin uninstall <name>`). A real load failure of a
+  present binary still gets its own detailed line.
+
 ## [0.13.0] - 2026-07-09
 
 ### Changed
