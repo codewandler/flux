@@ -65,7 +65,7 @@ All notable changes to this project are documented in this file. The format is b
   reads any fetched HTML. The condenser lives in `flux-web::condense` (the html5ever family lands
   here, not in flux-markdown, which stays a pure markdown engine consumed for its AST + writer).
   Fetched pages contribute `web.page` datasource records (title/url/content) so read content is
-  groundable. **Clean cutover** to the family-wide `web` egress scope: the per-tool
+  groundable. **BREAKING — clean cutover** to the family-wide `web` egress scope: the per-tool
   `effective_web_fetch_private_hosts` path and the `[private_net] web_fetch` config key are deleted
   (a legacy `web_fetch = …` entry is now silently ignored — migrate it to `web`); admissions audit as
   `PrivateNetAdmit { caller: "web:web_fetch" }`. `flux-capabilities::browser` retired.
@@ -156,6 +156,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Docs truth pass across the release.** The flows docs cover `flow_list`/`flow_run` + the
+  unified `~/.flux/flows` home; a new website datasources concept page explains how datasources
+  relate to operations; `examples/advanced-code-review.flux` and the SDK doc fixtures use the
+  native spellings instead of stale `@json` escapes; AGENTS.md documents the repo's binary
+  inventory and the dual-changelog rule.
 - **`task install` now also installs `flux-lsp`.** The install task puts both the `flux` CLI and
   the `flux-lsp` language server on `~/.cargo/bin`, and the install docs (README, the website
   tooling page, and the repo-local `.helix/languages.toml`) now show the `cargo install` route to
@@ -163,6 +168,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **`flux eval` A/B harness accepts the CLI's provider prefix in the emission model spec** — a
+  `FLUX_EMISSION_AB_MODEL=codex/gpt-5.5`-style spec no longer has to be spelled differently from
+  the `-m` flag's form.
 - **Review-hardening pass over the agent-speed epic (xhigh code review, 2026-07-09).** Op cache:
   `now`, `evidence`, and `metrics` are now declared non-idempotent (a cached clock froze time
   within a turn; cached metrics froze the agent's own progress signals), sub-agent `task`

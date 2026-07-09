@@ -73,7 +73,7 @@ Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfac
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store (embedded SQLite by default; opt-in Postgres) |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
-| **L5 capabilities** | `flux-capabilities` `flux-auth` | web + datasource/RAG tools (`browser`/`datasource` modules); caller identity (kept separate) |
+| **L5 capabilities** | `flux-capabilities` `flux-auth` `flux-web` | web + datasource/RAG tools; native web request/read/browse (`flux-web`); caller identity (kept separate) |
 | **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` `flux-lsp` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack), the Flux-Lang language server (`flux-lsp` binary; diagnostics/completion/hover/formatting) |
 
 Key rules:

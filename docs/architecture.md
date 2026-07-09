@@ -25,7 +25,7 @@ the *surfaces* (CLI/TUI/server/SDK).
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store (embedded SQLite by default; opt-in Postgres) |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
-| **L5 capabilities** | `flux-capabilities` `flux-auth` | web egress + datasource/RAG tools (`browser`/`datasource` modules); caller identity (separate) |
+| **L5 capabilities** | `flux-capabilities` `flux-auth` `flux-web` | datasource/RAG tools; native web request/read/browse under the `web` egress scope (`flux-web`); caller identity (separate) |
 | **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` `flux-lsp` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack), the Flux-Lang language server |
 
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
@@ -99,7 +99,8 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-channels` | L6 | event-trigger channels: cron / webhook / Slack adapters that wake a `flux-app` program's journeys | — |
 | `flux-lsp` | L6 | Flux-Lang language server (`flux-lsp` binary): CST-driven diagnostics, completion, hover, formatting; wired into Helix config-only | — |
 | `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
-| `flux-capabilities` | L5 | `browser` (`web_fetch`, SSRF-guarded; CDP deferred) + `datasource` (keyword index + search; RAG deferred) modules | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
+| `flux-capabilities` | L5 | `datasource` (keyword index + search; RAG deferred) module | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
+| `flux-web` | L5 | native web capabilities: `http.request`, `web_fetch` (HTML→readable markdown via `condense`), and the non-visual CDP browser ops — all under the family-wide `[private_net] web` egress scope (SSRF guard on every call) | new 2026-07-09 (D-98, D-120…D-124); `web_fetch` moved here from `flux-capabilities` |
 | `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |
 
 ## The safety envelope (the execution substrate)

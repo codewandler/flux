@@ -78,7 +78,7 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
-### Web capabilities — request · read · browse (epic) — **proposed 2026-07-09 (D-98 + D-120…D-124)**
+### Web capabilities — request · read · browse (epic) — **SHIPPED 2026-07-09 (D-98 + D-120…D-124 all done, in `[Unreleased]`)**
 
 Working with the web is **three fundamentally different capabilities** — distinguished by what the
 model *sees* and what can go wrong — and flux ships them as three deliberately separate surfaces,
