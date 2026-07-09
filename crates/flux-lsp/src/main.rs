@@ -276,10 +276,6 @@ impl flux_lang::opspec::OpCatalog for SliceCatalog<'_> {
     }
 }
 
-fn diagnostics(text: &str) -> Vec<Diagnostic> {
-    cst_diagnostics(&flux_lang::parser::parse_cst(text), text)
-}
-
 /// Tolerant-parse errors from an already-built CST, as positioned LSP diagnostics.
 fn cst_diagnostics(parsed: &flux_lang::parser::Parse, text: &str) -> Vec<Diagnostic> {
     let index = LineIndex::new(text);
@@ -427,6 +423,12 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse + diagnose in one step — only tests need this composition; the server
+    /// diagnoses an already-built CST via [`cst_diagnostics`].
+    fn diagnostics(text: &str) -> Vec<Diagnostic> {
+        cst_diagnostics(&flux_lang::parser::parse_cst(text), text)
+    }
 
     #[test]
     fn diagnostics_have_positioned_ranges() {
