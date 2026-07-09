@@ -2,7 +2,7 @@
 id: L-61
 title: Native syntax — Confirm / Throttle / Debounce / Verify + Peek / Parse
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lang-cst.md
@@ -24,7 +24,14 @@ reviewed CST proposals, each across CST production + `format` arm + `cst_to_draf
       `parse_does_not_collide_with_op_call` test pins the special-case.
 
 ## Progress
-- (not started — gated on isolation; depends on L-59)
+- Done 2026-07-09 (parse.rs + format.rs): `confirm "msg" [risk <level>]` + body,
+  `throttle "name" <max> per <window>` + body, `debounce "name" <ms>` + body,
+  `verify <cmd> contains <expect> [: "msg"]`, and the expression sugar `peek $x` +
+  `parse(v, as: "T")` (special-cased in the atom parser like `fmt(`). Guards keep round-trip total:
+  `confirm` renders `risk` only when it's a bare word; `verify` escapes to `@json` when an operand is
+  a native-`Expr` or itself `@json`; `parse`/`peek` guard on `@json`/identifier. `guardrail_and_sugar_
+  nodes_round_trip_natively` + the random property test pass; the `json_escape_line…` guard test moved
+  to a permanently-`@json` newline name. Full suite green; clippy + fmt clean.
 
 ## Notes
 - **Gated** on isolation. Depends on **L-59**. Confirm surfaces against

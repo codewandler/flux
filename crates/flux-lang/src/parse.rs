@@ -1107,6 +1107,18 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "await") {
         return parse_await(rest);
     }
+    if let Some(rest) = kw(t, "confirm") {
+        return parse_confirm(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "throttle") {
+        return parse_throttle(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "debounce") {
+        return parse_debounce(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "verify") {
+        return parse_verify(rest);
+    }
 
     if t.starts_with('$') {
         return parse_dollar(t);
@@ -1919,6 +1931,141 @@ fn take_string<'a>(s: &'a str, ctx: &str) -> Result<(String, &'a str)> {
     }
 }
 
+/// `confirm "message" [risk <level>]` + indented body — the human-in-the-loop gate.
+fn parse_confirm(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (message, r) = take_string(rest.trim_start(), "confirm")?;
+    let r = r.trim_start();
+    let risk = if let Some(after) = kw(r, "risk") {
+        let (level, tail) = take_while(after.trim_start(), is_name_char);
+        if level.is_empty() {
+            return Err(perr(
+                "`confirm risk` expects a level (e.g. low/medium/high/critical)",
+            ));
+        }
+        if !tail.trim().is_empty() {
+            return Err(perr("trailing text after `confirm … risk <level>`"));
+        }
+        Some(level.to_string())
+    } else if r.is_empty() {
+        None
+    } else {
+        return Err(perr(&format!("unexpected text in `confirm` header: `{r}`")));
+    };
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((
+        Node::Confirm {
+            message,
+            risk,
+            body,
+        },
+        1 + region.len(),
+    ))
+}
+
+/// `throttle "name" <max> per <window_ms>` + indented body — the rate-limit guard-rail.
+fn parse_throttle(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (name, r) = take_string(rest.trim_start(), "throttle")?;
+    let (digits, r) = take_while(r.trim_start(), |c| c.is_ascii_digit());
+    let max: u32 = digits
+        .parse()
+        .map_err(|_| perr("`throttle` expects a numeric max"))?;
+    let after_per =
+        kw(r.trim_start(), "per").ok_or_else(|| perr("`throttle` expects `per <window_ms>`"))?;
+    let (window_ms, tail) = take_u64(after_per.trim_start())?;
+    if !tail.trim().is_empty() {
+        return Err(perr("trailing text after `throttle` header"));
+    }
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((
+        Node::Throttle {
+            name,
+            max,
+            window_ms,
+            body,
+        },
+        1 + region.len(),
+    ))
+}
+
+/// `debounce "name" <wait_ms>` + indented body — coalesce rapid re-invocations.
+fn parse_debounce(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (name, r) = take_string(rest.trim_start(), "debounce")?;
+    let (wait_ms, tail) = take_u64(r.trim_start())?;
+    if !tail.trim().is_empty() {
+        return Err(perr("trailing text after `debounce` header"));
+    }
+    let region = child_region(lines, indent);
+    let (body, _) = parse_stmts(region, indent)?;
+    Ok((
+        Node::Debounce {
+            name,
+            wait_ms,
+            body,
+        },
+        1 + region.len(),
+    ))
+}
+
+/// `verify <cmd> contains <expect> [: "message"]` — run a command, assert its output contains a
+/// substring. `cmd`/`expect` are expressions (typically a `bash(…)` call and a string).
+fn parse_verify(rest: &str) -> Result<(Node, usize)> {
+    let (cmd, r) = parse_expr(rest.trim_start())?;
+    let after = kw(r.trim_start(), "contains")
+        .ok_or_else(|| perr("`verify` expects `<cmd> contains <expected>`"))?;
+    let (expect, r2) = parse_expr(after.trim_start())?;
+    let r2 = r2.trim_start();
+    let message = if let Some(m) = r2.strip_prefix(':') {
+        let (msg, tail) = take_string(m.trim_start(), "verify message")?;
+        if !tail.trim().is_empty() {
+            return Err(perr("trailing text after `verify` message"));
+        }
+        Some(msg)
+    } else if r2.is_empty() {
+        None
+    } else {
+        return Err(perr(&format!("unexpected text in `verify`: `{r2}`")));
+    };
+    Ok((
+        Node::Verify {
+            cmd: Box::new(cmd),
+            expect: Box::new(expect),
+            message,
+        },
+        1,
+    ))
+}
+
+/// `parse(<value>, as: "<type>")` — the coercion node. `args_str` is the text just after `(`.
+fn parse_parse_node(args_str: &str) -> Result<(Node, &str)> {
+    let (value, r) = parse_delimited_expr(args_str.trim_start())?;
+    let r = r
+        .trim_start()
+        .strip_prefix(',')
+        .ok_or_else(|| perr("`parse(…)` expects `, as: \"type\"`"))?;
+    let r = r
+        .trim_start()
+        .strip_prefix("as")
+        .ok_or_else(|| perr("`parse(…)` expects an `as:` argument"))?;
+    let r = r
+        .trim_start()
+        .strip_prefix(':')
+        .ok_or_else(|| perr("`parse(…)` expects `as: \"type\"`"))?;
+    let (as_type, r) = take_string(r.trim_start(), "parse as")?;
+    let r = r
+        .trim_start()
+        .strip_prefix(')')
+        .ok_or_else(|| perr("expected `)` to close `parse(…)`"))?;
+    Ok((
+        Node::Parse {
+            value: Box::new(value),
+            as_type,
+        },
+        r,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -2097,6 +2244,10 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
             let (ident, rest) = take_while(s, is_op_char);
             let rest_trim = rest.trim_start();
             if let Some(args_str) = rest_trim.strip_prefix('(') {
+                // `parse(v, as: "T")` is the coercion node (a named `as:` arg), not an op call.
+                if ident == "parse" {
+                    return parse_parse_node(args_str);
+                }
                 let (args, rest2) = parse_call_args(args_str)?;
                 // `fmt("template")` is the `Fmt` node, not a call to an op named `fmt` (there is none).
                 if ident == "fmt" {
@@ -2129,6 +2280,18 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
                         },
                         rest,
                     )),
+                    // `peek $sym` reads a symbol's current value (an expression, not `peek(…)`).
+                    "peek" => {
+                        let after = rest.trim_start();
+                        let nm = after
+                            .strip_prefix('$')
+                            .ok_or_else(|| perr("`peek` expects `$name`"))?;
+                        let (name, tail) = take_while(nm, is_ident_char);
+                        if name.is_empty() {
+                            return Err(perr("`peek` has an empty name"));
+                        }
+                        Ok((Node::Peek { name: name.into() }, tail))
+                    }
                     _ => Err(perr(&format!("unexpected token: `{ident}`"))),
                 }
             }
@@ -2457,6 +2620,71 @@ mod tests {
         assert!(text.contains("checkpoint \"phase-1\""), "{text}");
         assert!(text.contains("await $reply = \"user_input\""), "{text}");
         assert!(text.contains("await \"webhook\""), "{text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn guardrail_and_sugar_nodes_round_trip_natively() {
+        // confirm / throttle / debounce / verify + peek / parse — formerly @json-only (L-61).
+        let ast = DraftAst {
+            body: vec![
+                Node::Confirm {
+                    message: "delete prod?".into(),
+                    risk: Some("high".into()),
+                    body: vec![call("delete", vec![])],
+                },
+                Node::Confirm {
+                    message: "ok?".into(),
+                    risk: None,
+                    body: vec![],
+                },
+                Node::Throttle {
+                    name: "api".into(),
+                    max: 5,
+                    window_ms: 1000,
+                    body: vec![call("fetch", vec![])],
+                },
+                Node::Debounce {
+                    name: "save".into(),
+                    wait_ms: 250,
+                    body: vec![call("persist", vec![])],
+                },
+                Node::Verify {
+                    cmd: Box::new(call("bash", vec![lit(s("echo hi"))])),
+                    expect: Box::new(lit(s("hi"))),
+                    message: Some("must greet".into()),
+                },
+                bind("v", Node::Peek { name: "x".into() }),
+                bind(
+                    "n",
+                    Node::Parse {
+                        value: Box::new(jq(".price", var("raw"))),
+                        as_type: "f64".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            !text.contains("@json"),
+            "batch-2 nodes should render natively:\n{text}"
+        );
+        assert!(
+            text.contains("confirm \"delete prod?\" risk high"),
+            "{text}"
+        );
+        assert!(text.contains("throttle \"api\" 5 per 1000"), "{text}");
+        assert!(text.contains("debounce \"save\" 250"), "{text}");
+        assert!(
+            text.contains("verify bash(\"echo hi\") contains \"hi\": \"must greet\""),
+            "{text}"
+        );
+        assert!(text.contains("$v = peek $x"), "{text}");
+        assert!(
+            text.contains("$n = parse($raw.price, as: \"f64\")"),
+            "{text}"
+        );
         assert_round_trips(&ast);
     }
 

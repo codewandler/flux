@@ -348,6 +348,17 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
             }
             result
         }
+        // `peek $sym` reads a symbol's current value.
+        Node::Peek { name } if name.is_identifier() => format!("peek ${}", name.0),
+        // `parse(<value>, as: "T")` — coercion. The value goes through `parse_condition_expr` on the
+        // way back, so a native-expr value is fine; only an @json-rendered value forces the escape.
+        Node::Parse { value, as_type } if !fmt_expr(value, multiline).starts_with("@json ") => {
+            format!(
+                "parse({}, as: {})",
+                fmt_expr(value, multiline),
+                compact_str(as_type, multiline)
+            )
+        }
         other => format!("@json {}", compact(other)),
     }
 }
@@ -488,6 +499,13 @@ fn join_syms(syms: &[SymbolName]) -> String {
         .map(|s| format!("${}", s.0))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// True if `n` renders as an inline expression that `parse_expr` (not the native-expr or @json
+/// paths) can re-read — used to decide whether a node whose operand is an expression (`verify`) can
+/// be spelled natively rather than escaped. `Expr` needs `parse_condition_expr`, so it is excluded.
+fn call_like_operand(n: &Node, multiline: bool) -> bool {
+    !matches!(n, Node::Expr { .. }) && !fmt_expr(n, multiline).starts_with("@json ")
 }
 
 fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut String) {
@@ -844,6 +862,60 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             out.push_str(&fmt_expr(cond, multiline));
             if let Some(m) = message {
                 out.push_str(", ");
+                out.push_str(&compact_str(m, multiline));
+            }
+            out.push('\n');
+        }
+        Node::Confirm {
+            message,
+            risk,
+            body,
+        } if risk.as_deref().is_none_or(is_word_token) => {
+            out.push_str(&ind);
+            out.push_str("confirm ");
+            out.push_str(&compact_str(message, multiline));
+            if let Some(r) = risk {
+                out.push_str(" risk ");
+                out.push_str(r);
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, multiline, out);
+        }
+        Node::Throttle {
+            name,
+            max,
+            window_ms,
+            body,
+        } => {
+            out.push_str(&ind);
+            out.push_str("throttle ");
+            out.push_str(&compact_str(name, multiline));
+            out.push_str(&format!(" {max} per {window_ms}\n"));
+            fmt_body(body, level + 1, indent, multiline, out);
+        }
+        Node::Debounce {
+            name,
+            wait_ms,
+            body,
+        } => {
+            out.push_str(&ind);
+            out.push_str("debounce ");
+            out.push_str(&compact_str(name, multiline));
+            out.push_str(&format!(" {wait_ms}\n"));
+            fmt_body(body, level + 1, indent, multiline, out);
+        }
+        Node::Verify {
+            cmd,
+            expect,
+            message,
+        } if call_like_operand(cmd, multiline) && call_like_operand(expect, multiline) => {
+            out.push_str(&ind);
+            out.push_str("verify ");
+            out.push_str(&fmt_expr(cmd, multiline));
+            out.push_str(" contains ");
+            out.push_str(&fmt_expr(expect, multiline));
+            if let Some(m) = message {
+                out.push_str(": ");
                 out.push_str(&compact_str(m, multiline));
             }
             out.push('\n');
@@ -1333,11 +1405,12 @@ mod tests {
     /// get the new spelling; a node with no native form is out of scope.)
     #[test]
     fn json_escape_line_never_uses_the_multiline_spelling() {
+        // A non-identifier (newline-bearing) name has no native spelling, so it always uses the
+        // @json escape — a stable carrier for this invariant regardless of which node kinds gain
+        // native syntax.
         let ast = DraftAst {
-            body: vec![Node::Confirm {
-                message: "are you\nsure?".into(),
-                risk: None,
-                body: vec![],
+            body: vec![Node::Var {
+                name: "line1\nline2".into(),
             }],
             ..Default::default()
         };
