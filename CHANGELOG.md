@@ -6,6 +6,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`flow_list` / `flow_run` tools — the agent can discover and run stored flows.** Reusable
+  `.flux` definitions now live under `.flux/flows` (project) and `~/.flux/flows` (global, the new
+  `@global_flows` root), with the legacy `.flux/ops` / `@global_ops` dirs still read during the
+  ops→flows unification. `flow_list` enumerates every flow and composite op with its description
+  and params; `flow_run(name, inputs?)` seeds `inputs` as literal binds and runs the flow in the
+  current session through the same depth-guarded `run_plan` reentry — inheriting the provider,
+  session, and approval/IO envelope. Composite-op loading also reads the flows dirs leniently, so
+  an `op` dropped in `~/.flux/flows` auto-loads as a callable op regardless of file shape.
+
 ### Changed
 
 - **The merged Node schema is now the planner's default emission arm (L-71 cutover).** The L-71
@@ -17,6 +28,14 @@ All notable changes to this project are documented in this file. The format is b
   harness now also takes `FLUX_EMISSION_AB_MODEL=codex/<model>` to run arms against the
   ChatGPT/Codex subscription provider. Tables + decision in
   `docs/designs/flux-lang-emission-ab.md`.
+
+### Fixed
+
+- **A bare `@name` now resolves to its named workspace root.** `Workspace::base_for` only mapped
+  `@name/subpath`; a bare `@name` fell through to `<primary_root>/@name`, so directory reads of a
+  named root (e.g. enumerating `@global_ops`) silently resolved to a non-existent path and
+  returned nothing — which is why global composite-op loading from `~/.flux/ops` had quietly never
+  loaded anything.
 
 ## [0.11.5] - 2026-07-09
 
