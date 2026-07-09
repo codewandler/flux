@@ -74,12 +74,20 @@ pub struct DynamicComposites {
 
 impl DynamicComposites {
     pub fn load(system: &System) -> Result<Self> {
-        let global = if system.workspace().has_named_root("global_ops") {
-            load_dir(system, "@global_ops")?
-        } else {
-            BTreeMap::new()
-        };
-        let project = load_dir(system, ".flux/ops")?;
+        let ws = system.workspace();
+        // `.flux/flows` (+ the `@global_flows` root) is the unified home: files there may hold a
+        // flow, an op, or a whole module — we leniently pull every composite `op` out of them. The
+        // legacy `.flux/ops` / `@global_ops` dirs keep their strict single-op-per-file loading.
+        // Flows-dir definitions take precedence (loaded first; `merge_entries` keeps the first seen).
+        let mut global = BTreeMap::new();
+        if ws.has_named_root("global_flows") {
+            merge_entries(&mut global, load_flows_dir(system, "@global_flows")?);
+        }
+        if ws.has_named_root("global_ops") {
+            merge_entries(&mut global, load_dir(system, "@global_ops")?);
+        }
+        let mut project = load_flows_dir(system, ".flux/flows")?;
+        merge_entries(&mut project, load_dir(system, ".flux/ops")?);
         Ok(Self {
             state: Mutex::new(State {
                 global,
@@ -207,6 +215,30 @@ fn load_dir(system: &System, dir: &str) -> Result<BTreeMap<String, Entry>> {
             )));
         }
         out.insert(decl.name.clone(), Entry { decl });
+    }
+    Ok(out)
+}
+
+/// Merge `more` into `out`, keeping the entry already present (first-seen wins → precedence order).
+fn merge_entries(out: &mut BTreeMap<String, Entry>, more: BTreeMap<String, Entry>) {
+    for (name, entry) in more {
+        out.entry(name).or_insert(entry);
+    }
+}
+
+/// Lenient loader for the unified `.flux/flows` home: a file may hold a bare flow, one op, or a
+/// whole module — register every top-level `op` and ignore flows/other declarations. Unparseable
+/// files are skipped (they stay runnable via `flow_run`, which surfaces the parse error), so a
+/// single malformed file never breaks startup.
+fn load_flows_dir(system: &System, dir: &str) -> Result<BTreeMap<String, Entry>> {
+    let mut out = BTreeMap::new();
+    for (_path, source) in system.read_dir_text_files(dir, "flux")? {
+        let Ok(Module::Program(program)) = Module::parse_str(&source) else {
+            continue;
+        };
+        for decl in program.ops {
+            out.entry(decl.name.clone()).or_insert(Entry { decl });
+        }
     }
     Ok(out)
 }

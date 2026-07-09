@@ -308,6 +308,11 @@ enum Commands {
         action: AppAction,
     },
     /// Run a single behavioral loop (a Flux-Lang flow — native text, or a pre-compiled DraftAst JSON file).
+    ///
+    /// Reusable flows and composite ops live as `.flux` files under `.flux/flows` (project) and
+    /// `~/.flux/flows` (global): the agent discovers them with the `flow_list` tool and runs them
+    /// with `flow_run`, and composite `op`s placed there auto-load as callable ops. (The legacy
+    /// `~/.flux/ops` / `.flux/ops` dirs are still read.)
     Flow {
         #[command(subcommand)]
         action: FlowAction,
@@ -2023,12 +2028,18 @@ async fn build_agent_with(
 
     let mut workspace = Workspace::from_env(&cwd).context("workspace")?;
     if let Some(home) = std::env::var_os("HOME") {
-        let global_ops = std::path::PathBuf::from(home).join(".flux").join("ops");
-        std::fs::create_dir_all(&global_ops)
-            .with_context(|| format!("create {}", global_ops.display()))?;
-        workspace
-            .add_named_root("global_ops", &global_ops)
-            .with_context(|| format!("register {}", global_ops.display()))?;
+        let flux_dir = std::path::PathBuf::from(home).join(".flux");
+        // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
+        // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
+        // is the legacy location, still read during the ops→flows unification.
+        for (name, sub) in [("global_flows", "flows"), ("global_ops", "ops")] {
+            let dir = flux_dir.join(sub);
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            workspace
+                .add_named_root(name, &dir)
+                .with_context(|| format!("register {}", dir.display()))?;
+        }
     }
     let system = Arc::new(System::new(workspace));
 
@@ -2115,6 +2126,11 @@ async fn build_agent_with(
     // they stay OUT of the model-facing catalog in ordinary turns. `op.register` is model-facing and
     // delegates to the engine-installed composite registrar.
     flux_tools::register_reflect(&mut registry);
+
+    // Flow discovery/run: `flow_list` (enumerate .flux/flows + ~/.flux/flows) and `flow_run`
+    // (run a stored flow by name in the current session). Model-facing, so the agent can
+    // discover and run authored flows.
+    flux_tools::register_flows(&mut registry);
 
     // Guarded web access (policy-gated as network egress; private/loopback scoped to web_fetch).
     registry.register(Arc::new(

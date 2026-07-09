@@ -11,12 +11,14 @@ pub mod cargo;
 pub mod cognition;
 pub mod evidence;
 pub mod extra;
+pub mod flows;
 pub mod groups;
 pub mod reflect;
 pub mod toolchains;
 pub mod transform;
 
 pub use evidence::register_evidence;
+pub use flows::register_flows;
 pub use reflect::register_reflect;
 
 use async_trait::async_trait;
