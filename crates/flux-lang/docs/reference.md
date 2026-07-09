@@ -69,7 +69,7 @@ follow are hand-written.
 | `var` | Reference a bound symbol. |
 | `lit` | A literal value (raw JSON, as written in the AST by the compiler front-end). |
 | `thing` | A reference to an external thing. |
-| `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat`), and string literals (`'…'`/`"…"`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("status == 'ok' && n > 0", …)`. |
+| `expr` | Pure inline computation. `formula` is a safe whitelist expression over named variables: arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min`, `max`, `sum`), comparison (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`, `any`, `all`, `has`), string functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat/join/split`), list helpers (`first`/`last`), string literals (`'…'`/`"…"`), lists, and objects. Dotted names such as `it.author.name` descend object fields leniently (missing/null/non-object hops read as `""`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("it.state == 'ok' && len(tags) > 0", …)`. |
 | `fmt` | Pure string interpolation. `template` is a string with `{name}` placeholders substituted from already-bound session symbols (same `{name}`/`{{name}}` syntax as `Lit` interpolation). No IO, no approval gate. Example: `fmt("BTC: {price} | Double: {doubled}")`. |
 | `jq` | Pure JSON path extraction. `path` is a dot-path string (e.g. `".bitcoin.usd"` or `"results[0].value"`) applied to the JSON content of `input` (a `Var` or `Lit` node). No IO, no approval gate. Example: `jq(".bitcoin.usd", $raw)`.  `optional` selects the traversal-through-missing-data policy. When `false` — the default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field access on a non-object is a loud error, so a typo'd field name fails fast instead of silently reading empty. When `true` — native `$x.field?` sugar, and the default for a model- or host-emitted `jq` (so real agent turns keep the battle-tested "absent means empty" leniency) — such a miss yields `null`. A present-but-`null` field is never an error in either mode. |
 | `parse` | Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`. No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`. |
@@ -185,6 +185,40 @@ any side-effecting node runs.
 |---|---|---|---|
 | `thing.kind` | ThingKind | yes | `context` / `file` / `person` / `ticket` / `email` / `repo` / `dataset` / `calendar_event` / `url` / `secret` / `custom(...)` |
 | `thing.selector` | Selector | yes | `id` / `name` / `path` / `query` / `key` — how the thing is addressed |
+
+---
+
+### `expr`
+
+A side-effect-free formula over declared variables. The runtime and analyzer share the
+same `flux_lang::expr` evaluator, so malformed formulas, unknown functions, and
+undeclared variables are caught before execution when the analyzer can see the formula.
+
+```json
+{"kind": "expr", "formula": "it.state == 'opened' && has(labels, 'bug')",
+ "vars": {
+   "it": {"kind": "var", "name": "issue"},
+   "labels": {"kind": "var", "name": "labels"}
+ }}
+```
+
+Formulas support arithmetic, comparisons, boolean operators, string helpers, and the
+list-aware helpers `sum`, `any`, `all`, `has`, `join`, `split`, `first`, and `last`.
+`min(xs)` and `max(xs)` accept either two scalar values or one list. `len(xs)` counts
+list elements; `len(obj)` counts object keys.
+
+Dotted identifiers descend objects: `it.author.username` reads `username` under
+`author`. Missing keys, `null`, and non-object hops resolve to `""`, matching the
+existing null-to-empty-string rule for expressions. Object values stay structured inside
+the evaluator, are truthy iff non-empty, and render as compact JSON when converted to
+text.
+
+**Fields**
+
+| field | type | required | description |
+|---|---|---|---|
+| `formula` | string | yes | side-effect-free formula string |
+| `vars` | object map | no | variable bindings; each value must be `lit` or `var` |
 
 ---
 
@@ -1053,9 +1087,11 @@ Supported, by precedence (lowest to highest):
 | `formula` | string | yes | the expression |
 | `vars` | object | no | map of variable name → node (`Lit` or `Var`) |
 
-Every variable referenced in `formula` must appear in `vars`. The result is a number, string, or
-bool; when used as a `when` / `unless` / `until` / `assert` condition it is taken as truthy/falsey
-(empty string, `"false"`, `"0"`, `0`, and `false` are falsey).
+Every variable referenced in `formula` must appear in `vars`. In native text, invertible formulas in
+bind RHS and condition positions can be written directly (`$ok = $score >= 0.8`,
+`when $count > 3`); the parser builds `vars` from the `$name` references. The result is a number,
+string, or bool; when used as a `when` / `unless` / `until` / `assert` condition it is taken as
+truthy/falsey (empty string, `"false"`, `"0"`, `0`, and `false` are falsey).
 
 ---
 

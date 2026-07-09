@@ -146,10 +146,12 @@ pub fn validate_expr_formula(formula: &str, var_keys: &BTreeSet<&str>) -> Vec<St
         }
         // L-46: dotted identifiers — check only the root part against var_keys, and seed the dummy
         // under the ROOT (what `expr_atom` looks up before descending fields), not the full dotted
-        // name — otherwise a valid dotted comparison like `$x.field == y` is wrongly flagged
-        // "malformed" because `eval_expr_value` can't resolve the root against the dummy.
-        let root = name.split('.').next().unwrap_or(name);
-        dummy.insert(root.to_string(), ExprVal::Num(1.0));
+        // name. Seed dotted reads as nested objects so arithmetic like `it.score * scale` validates
+        // with the same shape it will see at runtime.
+        let mut parts = name.split('.');
+        let root = parts.next().unwrap_or(name);
+        let fields: Vec<&str> = parts.collect();
+        seed_dummy_ident(&mut dummy, root, &fields);
         if !var_keys.contains(root) {
             diags.push(format!(
                 "`expr` formula references `{root}` which is not declared in `vars` — add it to \
@@ -165,6 +167,42 @@ pub fn validate_expr_formula(formula: &str, var_keys: &BTreeSet<&str>) -> Vec<St
         ));
     }
     diags
+}
+
+fn seed_dummy_ident(dummy: &mut BTreeMap<String, ExprVal>, root: &str, fields: &[&str]) {
+    if fields.is_empty() {
+        dummy.entry(root.to_string()).or_insert(ExprVal::Num(1.0));
+        return;
+    }
+
+    let entry = dummy
+        .entry(root.to_string())
+        .or_insert_with(|| ExprVal::Obj(serde_json::Map::new()));
+    if !matches!(entry, ExprVal::Obj(_)) {
+        *entry = ExprVal::Obj(serde_json::Map::new());
+    }
+    let ExprVal::Obj(map) = entry else { return };
+    seed_dummy_field(map, fields);
+}
+
+fn seed_dummy_field(map: &mut serde_json::Map<String, serde_json::Value>, fields: &[&str]) {
+    let Some((field, rest)) = fields.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        map.entry((*field).to_string())
+            .or_insert_with(|| serde_json::Value::Number(serde_json::Number::from(1)));
+        return;
+    }
+    let entry = map
+        .entry((*field).to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let serde_json::Value::Object(child) = entry {
+        seed_dummy_field(child, rest);
+    }
 }
 
 /// A lexical token of an `expr` formula.
@@ -714,6 +752,11 @@ mod tests {
             validate_expr_formula("rec.a == 1", &var_keys).is_empty(),
             "a dotted comparison must validate: {:?}",
             validate_expr_formula("rec.a == 1", &var_keys)
+        );
+        assert!(
+            validate_expr_formula("rec.a * 2 > 1", &var_keys).is_empty(),
+            "dotted arithmetic must validate: {:?}",
+            validate_expr_formula("rec.a * 2 > 1", &var_keys)
         );
         assert!(
             validate_expr_formula("rec.missing? == \"z\"", &var_keys).is_empty(),

@@ -2,8 +2,8 @@
 id: C-47
 title: Release-publication reliability — a tag must yield a downloadable GitHub Release
 pillar: Core
-status: backlog
-priority:
+status: blocked
+priority: 2
 epic:
 design:
 note: "N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)"
@@ -24,17 +24,27 @@ crates.io publish workflow now also fires on the same tag, so tag → published-
 matters on both the binary and crate paths.
 
 ## Acceptance
-- [ ] Root-cause why recent tags did not produce a GitHub Release object (cargo-dist `release.yml`
+- [x] Root-cause why recent tags did not produce a GitHub Release object (cargo-dist `release.yml`
       upload/announce step failing or being skipped) and fix or add a retry so a tagged version
       reliably yields a Release with assets.
-- [ ] A post-tag check (CI step or a `scripts/` verification) confirms a Release object exists for
+- [x] A post-tag check (CI step or a `scripts/` verification) confirms a Release object exists for
       the tag and fails the pipeline if it does not — no silent "tag but no Release".
 - [ ] Backfill the missing Release object(s) for the affected recent tag(s) so `/releases/latest`
       matches the newest shipped version.
-- [ ] Documented in the release runbook alongside the crates.io publish flow.
+- [x] Documented in the release runbook alongside the crates.io publish flow.
 
 ## Progress
-- Not started.
+- 2026-07-09: Root cause confirmed from failed Release run logs for `v0.9.3` and `v0.11.0`: the
+  hand-written `gh release create` step returned `HTTP 403: Resource not accessible by integration`
+  when it fell back to `GITHUB_TOKEN`. `v0.9.3` still has a tag and no GitHub Release; `v0.11.0` was
+  already manually backfilled and verifies with 16 assets.
+- 2026-07-09: Workflow fix landed locally: tag publishes now require `RELEASE_TOKEN`, release
+  creation is retry/idempotent, and `scripts/verify-github-release.sh` verifies installer,
+  checksum, and platform archive assets. Runbook updated in `crates/flux-sdk/PUBLISHING.md`.
+- 2026-07-09 BLOCKED: attempted to backfill `v0.9.3` from failed-run artifacts (`28933549554`), but
+  local `gh release create` failed with `workflow` scope required. Active account token has
+  `repo` but not `workflow`; a maintainer token with `workflow` scope must run the documented
+  backfill command.
 
 ## Notes
 - Release-ops, not part of the gitlab-plugin-hardening epic — filed standalone.

@@ -107,18 +107,18 @@ Flux-Lang examples, `peek`); and [A-64](stories/A-64-weak-model-planner-robustne
 planner/loop robustness — guardrail, not a hard guarantee). Design + embedded findings:
 [designs/beta-hardening.md](designs/beta-hardening.md).
 
-### Data transforms (epic) — **proposed 2026-07-08**
+### Data transforms (epic) — **SHIPPED 2026-07-09 (L-46…L-52)**
 
-The missing data-shaping surface: `map`, predicate-`filter`, aggregations (`sum`/`count_by`/
+The missing data-shaping surface shipped: `map`, predicate-`filter`, aggregations (`sum`/`count_by`/
 `group_by`/`any`/`all`/`has`), `flatten`/`skip`, `join`/`split`, object `pick`/`omit`/
 `merge_obj`/`coalesce`/`keys`/`values`, and `regex_match`/`regex_extract` — all as pure ops
 (per the evolution-doc precedent), powered by one shared predicate mini-language: the existing
 `expr` engine extracted into `flux_lang::expr` with dotted access and list-aware builtins.
-Plus one parser story so native text can say `when $count > 3` without `@json`. Kills two
+Native text can now say `when $count > 3` and `$ok = $score >= 0.8` without `@json`. Kills two
 anti-patterns: (a) LLM cells prompted "Return ONLY a JSON array" as stand-ins for
 deterministic map/filter, and (b) bespoke Rust boolean-emitter ops that only exist because
-`expr` has no text spelling. Seven stories (L-46 foundation → L-47/48/49/50 parallel ops →
-L-51 native conditions → L-52 docs/examples). Design:
+`expr` had no text spelling. Seven stories shipped in order: L-46 foundation → L-47/48/49/50 ops →
+L-51 native conditions → L-52 docs/examples. Design:
 [designs/data-transforms.md](designs/data-transforms.md).
 
 ### A2A protocol conformance (epic) — **proposed 2026-07-07**

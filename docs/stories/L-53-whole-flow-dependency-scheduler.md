@@ -2,7 +2,8 @@
 id: L-53
 title: Whole-flow dependency scheduler for nested read parallelism
 pillar: Language
-status: backlog
+status: ready
+priority: 9
 epic: flux-lang-agent-speed
 design: docs/designs/flux-lang-agent-speed.md
 note: "KF1: extend optimization from local read batching to a whole-HIR symbol DAG with effect and approval fences"

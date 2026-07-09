@@ -80,11 +80,27 @@ Pure:
 | `need` | `ask, require[, done_when]` | Build a `Need` artifact — an explicit statement of missing info |
 | `gaps` | `claims, need` | Report a `Need`'s still-unmet required fields |
 | `compare` | `a, b` | `{added, removed, common}` over two arrays |
-| `dedupe` | `items[, by]` | Remove duplicates, first-seen order |
-| `sort` | `items[, by, order]` | Stable sort by a field, `asc`/`desc` |
+| `dedupe` | `items[, by]` | Remove duplicates, first-seen order; `by` accepts dotted paths |
+| `sort` | `items[, by, order]` | Stable sort by a field or dotted path, `asc`/`desc` |
 | `top` | `items, n` | First `n` items |
+| `skip` | `items, n` | Drop the first `n` items |
 | `merge` | `lists` | Concatenate an array of arrays |
-| `filter` | `items[, by, equals]` | Keep items where a field is truthy or equals a value |
+| `map` | `items, path|expr[, vars]` | Project each item by dotted path or an expression with `it` bound |
+| `filter` | `items[, where, vars, by, equals]` | Keep items by expression predicate or dotted field/equality |
+| `flatten` | `items[, depth]` | Flatten nested arrays up to `depth` levels |
+| `join` | `items[, sep]` | Join stringified items into plain text |
+| `split` | `s[, sep, trim]` | Split text into a JSON array of strings |
+| `sum` | `items[, path]` | Sum numbers, optionally plucked from a dotted path |
+| `count_by` | `items, path` | Count items by dotted path, sorted by count desc then key |
+| `group_by` | `items, path` | Group items by dotted path in first-seen key order |
+| `any` | `items[, where, vars]` | `"true"` when any item is truthy or matches an expression |
+| `all` | `items[, where, vars]` | `"true"` when all items match; empty lists are vacuously true |
+| `has` | `items, value` | `"true"` when the array contains `value` by JSON equality |
+| `pick` | `items, keys` | Keep only listed object keys; accepts one object or an array of objects |
+| `omit` | `items, keys` | Remove listed object keys; accepts one object or an array of objects |
+| `merge_obj` | `objects` | Shallow-merge objects left to right; later keys win |
+| `coalesce` | `values[, default]` | First value that is neither `null` nor `""`; otherwise `default` or `null` |
+| `keys` / `values` | `item` | Object keys or values in deterministic order |
 | `len` / `first` / `last` | `items` | Count, first item, last item |
 | `regex_match` | `s, pattern` | Returns `"true"` or `"false"` if `s` matches the regex pattern (ReDoS-free) |
 | `regex_extract` | `s, pattern[, group, all]` | Extract text matching pattern; returns first match or null, or all matches with `all: true` |
@@ -93,6 +109,25 @@ Pure:
 **Examples:**
 
 ```flux
+// Deterministic list transforms
+let authors = map { items: issues, path: "author.username" };
+let open = filter { items: issues, where: "it.state == 'opened' && it.upvotes > min", vars: { min: 2 } };
+let all_pages = flatten { items: pages };
+let rest = skip { items: candidates, n: 1 };
+let report = join { items: lines, sep: "\n" };
+let hosts = split { s: raw_hosts, sep: ",", trim: true };
+let total = sum { items: invoices, path: "amount" };
+let by_status = count_by { items: issues, path: "state" };
+let grouped = group_by { items: issues, path: "author.username" };
+let has_bug = has { items: labels, value: "bug" };
+let all_green = all { items: checks, where: "it.status == 'ok'" };
+let slim_issues = pick { items: issues, keys: ["iid", "title", "state", "web_url"] };
+let public_issue = omit { items: issue, keys: ["author_email", "raw_payload"] };
+let merged = merge_obj { objects: [defaults, overrides] };
+let assignee = coalesce { values: [issue.assignee.username?, issue.author.username?], default: "unassigned" };
+let field_names = keys { item: issue };
+let field_values = values { item: issue };
+
 // Check if a log line contains ERROR
 let has_error = regex_match { s: log_line, pattern: "ERROR" };
 when { cond: has_error } call { op: "alert", msg: "Error detected" };

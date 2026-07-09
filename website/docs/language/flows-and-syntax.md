@@ -161,9 +161,30 @@ another symbol, or a literal. An optional type annotation documents the expected
 
 ```flux
 $tests: TestResult = cargo_test({args: ["--workspace"]})
+$ok = $score >= 0.8
+$scaled = round($base * 1.2, 2)
 ```
 
-Annotations are preserved in the AST and used by analysis; they are optional everywhere.
+Operator formulas in bind RHS positions lower to pure `expr` nodes. `$name` references become the
+`expr.vars` map automatically, and dotted `$issue.state` reads object fields leniently inside the
+formula. Annotations are preserved in the AST and used by analysis; they are optional everywhere.
+
+## Native Conditions
+
+Condition positions accept the same native expression syntax:
+
+```flux
+when $count > 3
+  return "enough"
+
+repeat 10
+  until all({items: $checks, where: "it.status == 'ok'"})
+  do poll
+```
+
+For structured arrays, prefer pure `map`/`filter` projection over an `each` loop when no per-item IO
+is needed. Keep `each` for work that dispatches calls per item, such as reading files or spawning
+sub-agents.
 
 ### Effect annotations
 

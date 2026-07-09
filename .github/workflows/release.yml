@@ -60,6 +60,15 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Check release token is configured
+        if: ${{ !github.event.pull_request }}
+        env:
+          RELEASE_TOKEN_CONFIGURED: ${{ secrets.RELEASE_TOKEN != '' }}
+        run: |
+          if [ "$RELEASE_TOKEN_CONFIGURED" != "true" ]; then
+            echo "::error::RELEASE_TOKEN is required for tag publishes. Configure a fine-grained PAT for this repo with Contents: write; GITHUB_TOKEN has produced HTTP 403 on release creation."
+            exit 1
+          fi
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -270,9 +279,9 @@ jobs:
         env:
           # Scoped release token: a fine-grained PAT (this repo only, Contents: write) stored as the
           # `RELEASE_TOKEN` secret, so the release object is created even when the org restricts the
-          # default GITHUB_TOKEN to read-only. Falls back to GITHUB_TOKEN if the secret is unset.
+          # default GITHUB_TOKEN or GitHub App integration from creating releases.
           # NOTE: release.yml is cargo-dist-generated — re-apply this override after `dist generate`.
-          GH_TOKEN: "${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}"
+          GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
@@ -281,7 +290,31 @@ jobs:
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          tag="${{ needs.plan.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refreshing assets with --clobber"
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            for attempt in 1 2 3; do
+              if gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*; then
+                break
+              fi
+              if gh release view "$tag" >/dev/null 2>&1; then
+                echo "Release $tag exists after create failure; refreshing assets with --clobber"
+                gh release upload "$tag" artifacts/* --clobber
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::failed to create GitHub Release $tag after $attempt attempts"
+                exit 1
+              fi
+              sleep $((attempt * 15))
+            done
+          fi
+      - name: Verify GitHub Release
+        env:
+          GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
+        run: scripts/verify-github-release.sh "${{ needs.plan.outputs.tag }}"
 
   announce:
     needs:

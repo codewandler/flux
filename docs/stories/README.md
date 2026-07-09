@@ -10,12 +10,12 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.3.0 (2026-07-07) — the consumer-gaps release (breaking realtime usage-capture
-  seam C-38, plus D-55..D-61; supersedes the mis-versioned v0.2.24). **In flight
-  (`[Unreleased]`):** the hardening/docs/cleanup push — live-smoke-gate repair, docs truth,
-  drift guards for checked-in examples + website language tables, flux-flow/flux-server
-  hardening, app-path redaction/audit parity, and the schema-SSoT increment. See
-  [CHANGELOG](../../CHANGELOG.md).
+- **Released:** v0.11.0 (2026-07-09) — enriched `flux usage` reporting + pricing, plus the strict
+  field-access / model-ingress normalization pass. **In flight (`[Unreleased]`):** the Flux-Lang
+  agent-speed epic is now tracked (L-53–L-56); `flux usage` gains time-window metrics and
+  unpriced-reason surfacing; planner field-access ingress is consistently lenient. **Focus:** the
+  Language pillar — the `data-transforms` epic (L-46–L-52) is shipped; `flux-lang-agent-speed`
+  (L-53–L-56) now leads the ready queue. See [CHANGELOG](../../CHANGELOG.md).
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 <!-- BEGIN track:board -->
@@ -25,22 +25,19 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection
-
-### flux-lang data transforms (epic)
-- [L-46 — Extract `flux_lang::expr` module + list-aware builtins + dotted variable access](L-46-expr-engine-module-and-list-builtins.md) · Language · epic foundation: extract the expr engine so ops (L-47..L-50) can reuse the same predicate language the runtime and analyzer already share
-- [L-47 — Core transform ops — `map`, `filter.where`, `flatten`, `skip`, `join`, `split`](L-47-core-transform-ops.md) · Language · closes the biggest anti-pattern — plans using `ai.extract` (\"Return ONLY a JSON array\") as a stand-in for deterministic map/filter
-- [L-48 — Aggregation & predicate ops — `sum`, `count_by`, `group_by`, `any`, `all`, `has`](L-48-aggregation-predicate-ops.md) · Language · kills the bespoke Rust boolean-emitters (candidates_empty/score_compare/grade) that only exist because expr has no text spelling — `any`/`all`/`has` compose with `when`/`until` today
-- [L-49 — Object & null-kit ops — `pick`, `omit`, `merge_obj`, `coalesce`, `keys`, `values`](L-49-object-null-kit-ops.md) · Language · gitlab-plugin payload trimming (D-94 residual): today you rebuild issue objects field-by-field with `obj` templates; `pick` + `coalesce` make it one line
-- [L-50 — Regex ops — `regex_match`, `regex_extract` (ReDoS-free via Rust `regex`)](L-50-regex-ops.md) · Language · regex was only accessible inside the `grep` file tool; ship two pure ops so plans can classify or extract from any string result
-- [L-51 — Native expr in conditions and bind RHS — `when $count > 3`, `$ok = $score >= 0.8`](L-51-native-expr-conditions.md) · Language · the ergonomic pass: authors can finally write `when $x > 3` instead of `@json {\"kind\":\"expr\",...}`; the runtime seam already exists — this is pure parser/format work
-- [L-52 — Data-transforms docs pass + rewrite deterministic LLM-as-mapper patterns + final gate](L-52-transforms-docs-examples-pass.md) · Language · the epic's closing story: public docs get the new vocabulary + native-text examples the user asked for; the LLM-as-mapper anti-patterns in-repo get replaced where honest
-
-## Blocked
 _None._
 
+### Flux-Lang agent speed (epic)
+- [L-53 — Whole-flow dependency scheduler for nested read parallelism](L-53-whole-flow-dependency-scheduler.md) · Language · KF1: extend optimization from local read batching to a whole-HIR symbol DAG with effect and approval fences
+- [L-54 — Content-addressed cache for deterministic read-only ops](L-54-content-addressed-op-cache.md) · Language · KF2: reuse deterministic read-only op results across turns, repairs, forks, and sub-agents when the input snapshot is unchanged
+- [L-55 — Plan-delta emission for cheap safe repairs](L-55-plan-delta-emission.md) · Language · KF3: let repair turns patch the previous AST, then materialize and validate the full plan before execution
+- [L-56 — Automatic context slicing for planner and model ops](L-56-automatic-context-slicing.md) · Language · KF4: derive the minimum model-visible context from HIR symbol reads, op schemas, and policy-visible evidence boundaries
+
+## Blocked
+- [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · code/runbook fix is in place, but backfilling missing `v0.9.3` requires a GitHub token with `workflow` scope
+
 ## Backlog
-- [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
+- [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection
 - [D-98 — flux-web plugin + http.request op (re-home native web_fetch)](D-98-flux-web-plugin-and-http-request-op.md) · Core · future: a flux-web plugin (download a URL → markdown) + a plain http.request op, both under normal plugin host-caps (declared hosts, private-net grant, redaction); once they exist, retire web_fetch's special native private-net path (cf. D-96)
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
@@ -67,6 +64,13 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
 
 ## Done
+- [L-52 — Data-transforms docs pass + rewrite deterministic LLM-as-mapper patterns + final gate](L-52-transforms-docs-examples-pass.md) · Language · public transform docs, the hermetic data-transforms example, honest example rewrites, roadmap/changelog close-out, and the full gate are complete
+- [L-51 — Native expr in conditions and bind RHS — `when $count > 3`, `$ok = $score >= 0.8`](L-51-native-expr-conditions.md) · Language · native condition/bind expressions round-trip, and literal flux-expr tool params are analyzer-validated before dispatch
+- [L-50 — Regex ops — `regex_match`, `regex_extract` (ReDoS-free via Rust `regex`)](L-50-regex-ops.md) · Language · deterministic bounded regex matching/extraction is registered, documented, and covered by acceptance tests
+- [L-49 — Object & null-kit ops — `pick`, `omit`, `merge_obj`, `coalesce`, `keys`, `values`](L-49-object-null-kit-ops.md) · Language · object shaping and null fallback ops are registered, documented, and covered by acceptance tests
+- [L-48 — Aggregation & predicate ops — `sum`, `count_by`, `group_by`, `any`, `all`, `has`](L-48-aggregation-predicate-ops.md) · Language · deterministic aggregation and boolean-emitter ops are registered, documented, and pinned against expr builtins plus a call-condition flow test
+- [L-47 — Core transform ops — `map`, `filter.where`, `flatten`, `skip`, `join`, `split`](L-47-core-transform-ops.md) · Language · deterministic transform ops live in `flux_tools::transform`; `filter` predicates reuse `flux_lang::expr`, and `filter`/`sort`/`dedupe` accept dotted paths
+- [L-46 — Extract `flux_lang::expr` module + list-aware builtins + dotted variable access](L-46-expr-engine-module-and-list-builtins.md) · Language · `flux_lang::expr` is public and shared by runtime/analyzer; dotted object access, `ExprVal::Obj`, and list builtins are available for the data-transform epic
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
 - [A-02 — A2A client — talk to a remote agent like a local one (flux a2a <URL>)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
 - [A-03 — Cache-stable prompt layout — stop re-writing the ~34k prefix on every call](A-03-cache-stable-prompt-layout.md) · Agent · FIXED — name-sorted registry/catalog + segmented cache-first system prompt (`SystemSegment` on `Request`; planner catalog/grammar and identity blocks carry breakpoints, per-turn symbols ride uncached after them); live-verified 99% cross-process cache hit ($0.1199 → $0.0106, 11.3×) and 96% in-session hit on a 12-step turn

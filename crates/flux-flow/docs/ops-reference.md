@@ -69,15 +69,34 @@ registry.
 | `need` | pure | `ask, require[, done_when]` | Build a `Need` artifact (an explicit statement of missing info) |
 | `gaps` | pure | `claims, need` | Report a `Need`'s still-unmet `require` fields given some claims |
 | `compare` | pure | `a, b` | `{ added, removed, common }` over two arrays |
-| `dedupe` | pure | `items[, by]` | Remove duplicates (whole-value, or by a field), first-seen order |
-| `sort` | pure | `items[, by, order]` | Stable sort by a field (or natural); `order` = `asc`/`desc` |
+| `dedupe` | pure | `items[, by]` | Remove duplicates (whole-value, or by a dotted field path), first-seen order |
+| `sort` | pure | `items[, by, order]` | Stable sort by a dotted field path (or natural); `order` = `asc`/`desc` |
 | `top` | pure | `items, n` | The first `n` items |
+| `skip` | pure | `items, n` | Drop the first `n` items |
 | `merge` | pure | `lists` | Concatenate an array-of-arrays into one array |
+| `map` | pure | `items, path|expr[, vars]` | Project each item by dotted path or an `expr` formula with `it` bound |
+| `filter` | pure | `items[, where, vars, by, equals]` | Keep items by an `expr` predicate or by dotted field/equality |
+| `flatten` | pure | `items[, depth]` | Flatten nested arrays up to `depth` levels |
+| `join` | pure | `items[, sep]` | Stringify and join items into plain text |
+| `split` | pure | `s[, sep, trim]` | Split text into a JSON array of strings |
+| `sum` | pure | `items[, path]` | Sum numbers, optionally plucked from a dotted path |
+| `count_by` | pure | `items, path` | Count items by dotted path, sorted by count desc then key |
+| `group_by` | pure | `items, path` | Group items by dotted path in first-seen key order |
+| `any` | pure | `items[, where, vars]` | `"true"` when any item is truthy or matches an `expr` predicate |
+| `all` | pure | `items[, where, vars]` | `"true"` when all items match; empty lists are vacuously true |
+| `has` | pure | `items, value` | `"true"` when the array contains `value` by JSON equality |
+| `pick` | pure | `items, keys` | Keep only listed object keys; accepts one object or an array of objects |
+| `omit` | pure | `items, keys` | Remove listed object keys; accepts one object or an array of objects |
+| `merge_obj` | pure | `objects` | Shallow-merge objects left to right; later keys win |
+| `coalesce` | pure | `values[, default]` | First value that is neither `null` nor `""`; otherwise `default` or `null` |
+| `keys` | pure | `item` | Object keys in deterministic order |
+| `values` | pure | `item` | Object values in deterministic key order |
+| `regex_match` | pure | `s, pattern` | `"true"`/`"false"` for a bounded, ReDoS-free Rust regex match |
+| `regex_extract` | pure | `s, pattern[, group, all]` | First regex match, `null`, or all requested captures as a JSON array |
 | `cite` | pure | `claims` | A markdown citation list, one line per claim |
 | `len` | pure | `items` | Count of an array's items (or a string's characters) |
 | `first` | pure | `items` | The first item of an array (or `null`) |
 | `last` | pure | `items` | The last item of an array (or `null`) |
-| `filter` | pure | `items[, by, equals]` | Keep items where a field/value is truthy (or equals a value) |
 | `ai.extract` | model | `from[, ask, schema]` | Extract typed items (e.g. `Claim[]`) from free text |
 | `ai.rank` | model | `items[, by]` | Reorder items by a natural-language criterion |
 | `ai.judge` | model | `claim[, evidence]` | Adjudicate a claim → `Verdict` `{ choice, reasons }` |

@@ -89,6 +89,19 @@ All condition positions — `when`, `unless`, `assert`, and the `until` guards o
 A tool that returns the string `"false"` reads as falsey, so branching on a shell wrapper's or
 boolean tool's textual output works as expected.
 
+Conditions can be a symbol, literal, call, or native expression:
+
+```flux
+when $count > 3 && $state == "ready"
+  return "go"
+
+repeat 10
+  until len($queue) == 0
+  do poll
+```
+
+Native expression conditions lower to pure `expr` nodes; no tool is dispatched to evaluate them.
+
 ## Errors
 
 An errored call aborts the flow: nothing is bound, execution stops, and the error propagates —

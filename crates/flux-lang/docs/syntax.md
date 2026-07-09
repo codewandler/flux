@@ -26,12 +26,14 @@ accept today; everything unmarked is implemented.
   **`loop`**, **`timeout`**, **`budget`**, the capability scope **`with_tools`**,
   the inline **`fmt("…")`** node, and **`$var.path`** field-access sugar (lowers to a `jq` node); and
   (added P8) the value-template constructors **`obj`** (`{ k: expr }`) / **`list`** (`[ expr ]`) plus the
-  **`assert`**, **`retry`**, and **`parallel`** blocks. Flow header carries optional
+  **`assert`**, **`retry`**, and **`parallel`** blocks. Native operator formulas are accepted in bind
+  RHS and condition positions (`when $count > 3`, `$ok = $score >= 0.8`) and lower to `expr` nodes.
+  Flow header carries optional
   `name`/`params`/`returns`; a leading `goal "…"` line is accepted and ignored (not part of the
   AST/round-trip). The actual P6/P8 spellings are documented in
   [§ Native control-flow forms (P6)](#native-control-flow-forms-p6) below.
 - **`@json` escape** (everything else, today): `race`, `try`, `confirm`, `throttle`, `debounce`,
-  `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, `expr`, `parse`, `scope`, `saga`, `once`,
+  `verify`, `pipe`, `memo`, `await`, `peek`, `thing`, non-invertible `expr`, `parse`, `scope`, `saga`, `once`,
   `checkpoint`, and any `jq` whose input is not a plain `$var` or whose path uses an array index
   (`.items[0]`) — those round-trip through `@json`. Beware: writing `expr(…)`, `peek(…)`, or
   `jq(…)` call-style in text parses as an ordinary **op call** named `expr`/`peek`/`jq`, *not* the
@@ -606,6 +608,7 @@ template has no native form and round-trips via `@json`.
 ```flux
 assert $hits, "grep returned no results"
 assert ok($a, $b)
+assert $score >= 0.8, "score too low"
 ```
 
 **`retry <max> [backoff <ident>] [delay <ms>] [-> $bind]`** + body — space-keyword tokens in fixed
@@ -828,15 +831,30 @@ The optional `message` overrides the default error text.
 
 ## Pure (no-IO) expressions
 
-### expr — arithmetic — *no native text spelling; `@json` only*
+### expr — arithmetic and predicates
 
-The call-style spelling below is **aspirational**: in text, `expr(…)` parses as an ordinary op
-call named `expr` (and the `name: $sym` argument form doesn't parse at all). Write the pure `expr`
-node via the `@json` escape:
+Native text accepts operator formulas in bind RHS and condition positions. `$name` references are
+lowered into the `expr.vars` map, and dotted `$issue.state` becomes lenient dotted access on the
+`issue` variable inside the formula:
+
+```flux
+$ok = $score >= 0.8
+when $issue.state == "opened" && $issue.upvotes > 2
+  return true
+repeat 10
+  until len($queue) == 0
+  do poll
+```
+
+`format` renders an `expr` natively only when that lowering is invertible: every formula variable
+maps directly to the same `$name` (or dotted reads from it). Otherwise it keeps the `@json` escape:
 
 ```flux
 @json {"kind": "bind", "name": "total", "value": {"kind": "expr", "formula": "price * qty", "vars": {"price": {"kind": "var", "name": "price"}, "qty": {"kind": "var", "name": "qty"}}}}
 ```
+
+The call-style spelling below remains **aspirational**: in text, `expr(…)` parses as an ordinary op
+call named `expr` (and the `name: $sym` argument form doesn't parse at all).
 
 ```flux
 # ASPIRATIONAL — does not parse today

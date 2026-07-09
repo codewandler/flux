@@ -2,7 +2,7 @@
 id: L-49
 title: Object & null-kit ops — `pick`, `omit`, `merge_obj`, `coalesce`, `keys`, `values`
 pillar: Language
-status: ready
+status: done
 priority: 5
 epic: data-transforms
 design: docs/designs/data-transforms.md
@@ -19,28 +19,31 @@ day 1 of the epic. Motivating case: the gitlab plugin returns raw ~50-key issue/
 objects; plans want a slim projection.
 
 ## Acceptance
-- [ ] `pick({items, keys})` — keep only listed keys; **`items` may be one object or an
+- [x] `pick({items, keys})` — keep only listed keys; **`items` may be one object or an
       array of objects** (applied per element). Missing keys are simply absent (no error).
       Failing-first tests: `pick_single_object`, `pick_over_array_of_objects`.
-- [ ] `omit({items, keys})` — complement of `pick`; same single-object-or-array shape.
+- [x] `omit({items, keys})` — complement of `pick`; same single-object-or-array shape.
       Failing-first test: `omit_removes_keys_leaves_others`.
-- [ ] `merge_obj({objects})` — shallow merge an array of objects, later keys win. Named
+- [x] `merge_obj({objects})` — shallow merge an array of objects, later keys win. Named
       to avoid collision with the existing list-concat `merge`. Non-object element →
       clear error. Failing-first test: `merge_obj_shallow_later_wins`.
-- [ ] `coalesce({values, default?})` — first value that is not `null` and not `""`; else
+- [x] `coalesce({values, default?})` — first value that is not `null` and not `""`; else
       `default`; else `null`. `0` and `false` are **kept** values. Failing-first tests:
       `coalesce_returns_first_non_empty`, `coalesce_keeps_zero_and_false`.
-- [ ] `keys({item})` / `values({item})` — return an array of the object's keys / values
+- [x] `keys({item})` / `values({item})` — return an array of the object's keys / values
       in deterministic (`serde_json::Map`) order. Non-object → clear error. Failing-first
       test: `keys_and_values_deterministic_order`.
-- [ ] All six new ops registered in `register_cognition` and the `cognition` group; group
+- [x] All six new ops registered in `register_cognition` and the `cognition` group; group
       description updated.
-- [ ] `website/docs/language/ops.md` cognition-tools table gains a row per new op with
+- [x] `website/docs/language/ops.md` cognition-tools table gains a row per new op with
       one native-text example.
-- [ ] CHANGELOG entry under `[Unreleased]`.
+- [x] CHANGELOG entry under `[Unreleased]`.
 
 ## Progress
-- (implementation not yet started)
+- Implemented in `flux-tools` cognition ops with acceptance tests for single-object and array
+  `pick`, `omit`, shallow `merge_obj`, `coalesce`, and deterministic `keys`/`values`.
+- Documented in the website operations page and engine ops reference, with a CHANGELOG entry under
+  `[Unreleased]`.
 
 ## Notes
 - Distinct from list-concat `merge` — the name `merge_obj` is deliberate; do not overload.

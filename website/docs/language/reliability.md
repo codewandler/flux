@@ -18,9 +18,10 @@ Five guard rails have native text spellings: `assert`, `retry`, `timeout`, `budg
 ```flux
 $hits = grep({pattern: "ERROR", glob: "*.log"})
 assert $hits, "no ERROR lines found"
+assert len($hits) > 0, "no ERROR lines found"
 ```
 
-`assert <cond>` aborts the flow with an error when the condition is falsey; execution never continues past a failed assert. The optional message follows the first top-level comma and becomes the error detail. The condition may be a symbol, a call, or a literal, and it uses the same truthiness rules as `when` — see the [execution model](./execution-model.md). Use it to fail fast instead of writing a `when` around a manual error return.
+`assert <cond>` aborts the flow with an error when the condition is falsey; execution never continues past a failed assert. The optional message follows the first top-level comma and becomes the error detail. The condition may be a symbol, a call, a literal, or a native expression such as `$score >= 0.8`, and it uses the same truthiness rules as `when` — see the [execution model](./execution-model.md). Use it to fail fast instead of writing a `when` around a manual error return.
 
 ## `retry` — retry transient failures
 

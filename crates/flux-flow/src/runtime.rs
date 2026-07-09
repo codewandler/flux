@@ -1420,6 +1420,25 @@ mod tests {
         )
     }
 
+    fn temp_executor_with_builtins_and_echo() -> Executor {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-builtins-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        flux_tools::register_builtins(&mut reg);
+        let perms = PermissionManager::from_rules(&["echo".into()], &[]);
+        Executor::new(
+            reg,
+            perms,
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        )
+    }
+
     #[tokio::test]
     async fn single_op_stores_value_binds_symbol_and_traces() {
         let store = FlowStore::in_memory().unwrap();
@@ -1896,6 +1915,39 @@ mod tests {
         assert_eq!(
             store.get_value(&vid).unwrap(),
             Some(Value::String("else".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn any_in_when_gates_a_flow_step() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_with_builtins_and_echo();
+        let ast = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(Node::Call {
+                    op: "any".into(),
+                    args: vec![flow_lit(json!({
+                        "items": [{"score": 1}, {"score": 9}],
+                        "where": "it.score > 5"
+                    }))],
+                }),
+                then: vec![flow_bind("taken", "echo", vec![flow_lit(json!("yes"))])],
+                otherwise: vec![flow_bind("taken", "echo", vec![flow_lit(json!("no"))])],
+            }],
+            ..Default::default()
+        };
+
+        let mut sink = CollectSink::default();
+        execute_flow(&store, &ex, "sess", &ast, &mut sink)
+            .await
+            .unwrap();
+        let vid = store
+            .resolve("sess", &SymbolName("taken".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_value(&vid).unwrap(),
+            Some(Value::String("yes".into()))
         );
     }
 

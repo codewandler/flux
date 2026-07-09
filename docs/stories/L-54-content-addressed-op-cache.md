@@ -2,7 +2,8 @@
 id: L-54
 title: Content-addressed cache for deterministic read-only ops
 pillar: Language
-status: backlog
+status: ready
+priority: 10
 epic: flux-lang-agent-speed
 design: docs/designs/flux-lang-agent-speed.md
 note: "KF2: reuse deterministic read-only op results across turns, repairs, forks, and sub-agents when the input snapshot is unchanged"

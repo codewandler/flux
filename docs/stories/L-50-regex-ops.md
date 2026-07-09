@@ -2,7 +2,7 @@
 id: L-50
 title: Regex ops — `regex_match`, `regex_extract` (ReDoS-free via Rust `regex`)
 pillar: Language
-status: ready
+status: done
 priority: 6
 epic: data-transforms
 design: docs/designs/data-transforms.md
@@ -19,25 +19,29 @@ crate is linear-time by construction (Thompson NFA, no backtracking), so this is
 projection.
 
 ## Acceptance
-- [ ] `regex_match({s, pattern})` — returns `"true"`/`"false"` (matches the boolean-emitter
+- [x] `regex_match({s, pattern})` — returns `"true"`/`"false"` (matches the boolean-emitter
       convention). Pattern compiled via `RegexBuilder::size_limit(1 MiB)`; pattern length
       `> 512` chars → clear error before compilation. Invalid pattern → clear error naming
       the compile failure. Failing-first tests: `regex_match_true_false`,
       `regex_match_rejects_oversize_pattern`, `regex_match_reports_bad_pattern`.
-- [ ] `regex_extract({s, pattern, group?, all?})` — `group` defaults to `0` (whole
+- [x] `regex_extract({s, pattern, group?, all?})` — `group` defaults to `0` (whole
       match); with `all: true`, returns a JSON array of every match (of the requested
       group). Without `all`, returns the first match as a string, or `null` if no match.
       Missing capture group index → clear error. Failing-first tests:
       `regex_extract_first_and_all`, `regex_extract_null_on_no_match`,
       `regex_extract_bad_group_errors`.
-- [ ] Both ops registered in `register_cognition` and the `cognition` group; group
+- [x] Both ops registered in `register_cognition` and the `cognition` group; group
       description updated.
-- [ ] `website/docs/language/ops.md` cognition-tools table gains rows for both, with
+- [x] `website/docs/language/ops.md` cognition-tools table gains rows for both, with
       native-text examples (SemVer extraction, "does log line contain ERROR").
-- [ ] CHANGELOG entry under `[Unreleased]`.
+- [x] CHANGELOG entry under `[Unreleased]`.
 
 ## Progress
-- (implementation not yet started)
+- Implementation and acceptance tests are present in `flux-tools` cognition ops, using Rust
+  `regex` with pattern length and compiled-size limits.
+- Website docs already had the native-text examples; this pass also added the ops to the engine
+  ops reference. The op-addition changelog entry shipped with `v0.10.0`; `[Unreleased]` records the
+  reference-doc completion so the story trail stays current without pretending the ops are new.
 
 ## Notes
 - No dependency on L-46 — safe to work in parallel with L-49 while L-46 is in flight.

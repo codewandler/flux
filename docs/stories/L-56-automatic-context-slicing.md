@@ -2,7 +2,8 @@
 id: L-56
 title: Automatic context slicing for planner and model ops
 pillar: Language
-status: backlog
+status: ready
+priority: 12
 epic: flux-lang-agent-speed
 design: docs/designs/flux-lang-agent-speed.md
 note: "KF4: derive the minimum model-visible context from HIR symbol reads, op schemas, and policy-visible evidence boundaries"

@@ -567,13 +567,15 @@ pub enum Node {
     Thing { thing: ThingRef },
 
     /// Pure inline computation. `formula` is a safe whitelist expression over named variables:
-    /// arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min(a,b)`, `max(a,b)`), comparison
-    /// (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`), string functions
-    /// (`len/lower/upper/trim/replace/repeat/reverse/contains/concat`), and string literals
-    /// (`'…'`/`"…"`). `+` adds when both sides are numeric and concatenates otherwise. Because it
-    /// yields a bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars`
-    /// maps variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval
-    /// gate. Examples: `expr("price * 2", {"price": $btc})`, `expr("status == 'ok' && n > 0", …)`.
+    /// arithmetic (`+ - * /`, `round(x,n)`, `abs`, `min`, `max`, `sum`), comparison
+    /// (`== != < <= > >=`), boolean (`&& || !`, `true`/`false`, `any`, `all`, `has`), string
+    /// functions (`len/lower/upper/trim/replace/repeat/reverse/contains/concat/join/split`), list
+    /// helpers (`first`/`last`), string literals (`'…'`/`"…"`), lists, and objects. Dotted names
+    /// such as `it.author.name` descend object fields leniently (missing/null/non-object hops read
+    /// as `""`). `+` adds when both sides are numeric and concatenates otherwise. Because it yields a
+    /// bool, an `expr` is also a valid `when`/`unless`/`until`/`assert` condition. `vars` maps
+    /// variable names to node expressions (only `Lit` and `Var` are valid). No IO, no approval gate.
+    /// Examples: `expr("price * 2", {"price": $btc})`, `expr("it.state == 'ok' && len(tags) > 0", …)`.
     Expr {
         formula: String,
         #[serde(default)]

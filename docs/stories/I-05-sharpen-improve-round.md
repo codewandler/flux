@@ -3,7 +3,6 @@ id: I-05
 title: Sharpen the improve round — stable scored task set, severity-ordered planner picks
 pillar: Improve
 status: backlog
-priority: 9
 note: "ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate"
 ---
 

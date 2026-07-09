@@ -9,9 +9,9 @@ Pure nodes handle the data work inside a plan: formatting, field access, JSON ex
 type coercion, and value assembly. They perform no IO, dispatch no operation, and never pause for
 approval. Use them anywhere you would otherwise shell out just to reshape data.
 
-In the text form, two of them have first-class spellings (`fmt(…)` and the `$var.path` field
-access); the rest are written with the `@json` escape. All of them are ordinary nodes in the
-JSON wire form.
+In the text form, `fmt(…)`, `$var.path` field access, value templates, and invertible native
+expressions have first-class spellings. Other pure nodes use the `@json` escape. All of them are
+ordinary nodes in the JSON wire form.
 
 ## `fmt` — string interpolation
 
@@ -23,9 +23,9 @@ $label = fmt("BTC: {price} | 24h change: {change}%")
 interpolation inside string literals, but explicit about being a formatting step. Unbound
 placeholders are left verbatim (no silent data loss). The result is always a string.
 
-`fmt(…)` is the **only** pure node with a call-style text spelling. Writing `expr(…)`,
-`jq(…)`, or `peek(…)` call-style parses as an ordinary op call with that name — not the pure
-node.
+`fmt(…)` is the only pure node with a special call-style text spelling. Writing `expr(…)`,
+`jq(…)`, or `peek(…)` call-style parses as an ordinary op call with that name. Native formulas are
+written directly where they are invertible, for example `$ok = $score >= 0.8`.
 
 ## Field access — `$var.path`
 
@@ -73,7 +73,16 @@ missing data leniently (an absent key or out-of-range index yields `null`); the 
 ## `expr` — safe inline computation
 
 `expr` evaluates a whitelisted formula over named variables — a tiny recursive-descent
-evaluator, not `eval`, not a shell. It is written via `@json`:
+evaluator, not `eval`, not a shell. Invertible formulas in bind RHS and condition positions can be
+written directly:
+
+```flux
+$ok = $score >= 0.8
+when $count > 3 && $state == "ready"
+  return true
+```
+
+Non-invertible `expr` nodes are written via `@json`:
 
 ```flux
 @json {"kind": "bind", "name": "total", "value": {"kind": "expr", "formula": "price * qty", "vars": {"price": {"kind": "var", "name": "price"}, "qty": {"kind": "var", "name": "qty"}}}}
@@ -86,12 +95,63 @@ Supported, by precedence (lowest to highest):
 | boolean | `\|\|`, `&&`, unary `!`, `true` / `false` |
 | comparison | `==` `!=` `<` `<=` `>` `>=` (numeric when both sides are numbers, else lexicographic) |
 | arithmetic | `+` `-` `*` `/` — `+` concatenates when either side is non-numeric text |
-| functions | `round(x, n)`, `abs(x)`, `min(a, b)`, `max(a, b)`, `len(s)`, `lower(s)`, `upper(s)`, `trim(s)`, `replace(s, from, to)`, `repeat(s, n)`, `reverse(s)`, `contains(s, sub)`, `concat(a, b, …)` |
-| atoms | numbers, `'…'`/`"…"` string literals, variables, parentheses |
+| functions | `round(x, n)`, `abs(x)`, `min`, `max`, `sum(xs)`, `any(xs)`, `all(xs)`, `has(xs, v)`, `len(x)`, `first(xs)`, `last(xs)`, `lower(s)`, `upper(s)`, `trim(s)`, `replace(s, from, to)`, `repeat(s, n)`, `reverse(s)`, `contains(s, sub)`, `concat(a, b, …)`, `join(xs, sep)`, `split(s, sep)` |
+| atoms | numbers, `'…'`/`"…"` string literals, lists, objects, variables, dotted variable access, parentheses |
 
 Every variable used in the formula must be declared in `vars` (mapping names to symbol or
 literal nodes) — undeclared identifiers error. Comparisons yield a bool, so an `expr` is also a
 valid `when`/`unless`/`until`/`assert` condition.
+
+## Deterministic list transforms
+
+Pure cognition ops cover the common data-shaping jobs that used to require shell snippets or
+model-backed "return JSON" prompts. Predicate-bearing ops use a `where` string evaluated with
+`it` bound to the current element; extra comparands go in `vars`.
+
+Tier 1 handles projection and list mechanics:
+
+```flux
+$authors = map({ items: $issues, path: "author.username" })
+$hot = filter({ items: $issues, where: "it.state == 'opened' && it.score > min", vars: { min: 3 } })
+$label_lists = map({ items: $issues, path: "labels" })
+$labels = flatten({ items: $label_lists })
+$rest = skip({ items: $authors, n: 1 })
+$csv = join({ items: $authors, sep: "," })
+$parts = split({ s: $csv, sep: ",", trim: true })
+```
+
+Tier 2 handles reductions and boolean emitters that compose directly in conditions:
+
+```flux
+$total = sum({ items: $issues, path: "score" })
+$by_state = count_by({ items: $issues, path: "state" })
+$by_author = group_by({ items: $issues, path: "author.username" })
+when any({ items: $issues, where: "it.score > 8" })
+  do notify
+until all({ items: $checks, where: "it.status == 'ok'" })
+```
+
+Tier 3 trims objects and chooses fallbacks:
+
+```flux
+$slim = pick({ items: $issues, keys: ["id", "title", "state"] })
+$public = omit({ items: $issue, keys: ["raw_payload"] })
+$merged = merge_obj({ objects: [$defaults, $override] })
+$owner = coalesce({ values: [$issue.assignee.username?, $issue.author.username?], default: "unassigned" })
+$fields = keys({ item: $merged })
+$vals = values({ item: $merged })
+```
+
+Tier 4 uses Rust regex for bounded, linear-time string classification and extraction:
+
+```flux
+$has_error = regex_match({ s: $line, pattern: "ERROR" })
+$version = regex_extract({ s: $body, pattern: "v(\\d+\\.\\d+\\.\\d+)", group: 1 })
+```
+
+Use `map`/`filter` when the input is already structured JSON and the transformation is a field
+projection or predicate. Use `each` when every item must dispatch real work such as `read`,
+`web_fetch`, or `task`.
 
 ## `parse` — type coercion
 

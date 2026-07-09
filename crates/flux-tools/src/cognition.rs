@@ -39,14 +39,7 @@ pub fn register_cognition(registry: &mut ToolRegistry) {
     registry.register(Arc::new(LenTool));
     registry.register(Arc::new(FirstTool));
     registry.register(Arc::new(LastTool));
-    registry.register(Arc::new(FilterToolExtended));
-    registry.register(Arc::new(MapTool));
-    registry.register(Arc::new(FlattenTool));
-    registry.register(Arc::new(SkipTool));
-    registry.register(Arc::new(JoinTool));
-    registry.register(Arc::new(SplitTool));
-    registry.register(Arc::new(DedupeToolExtended));
-    registry.register(Arc::new(SortToolExtended));
+    crate::transform::register_transforms(registry);
     registry.register(Arc::new(ReviewNormalizeTool));
     registry.register(Arc::new(ReviewAggregateTool));
     registry.register(Arc::new(RegexMatchTool));
@@ -84,6 +77,17 @@ fn pure_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {
         access: vec![],
         group: Some("cognition".into()),
     }
+}
+
+fn mark_flux_expr(mut schema: Value, params: &[&str]) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        for param in params {
+            if let Some(prop) = properties.get_mut(*param).and_then(Value::as_object_mut) {
+                prop.insert("format".into(), Value::String("flux-expr".into()));
+            }
+        }
+    }
+    schema
 }
 
 /// Fetch a required string param, or a clear error.
@@ -1666,485 +1670,6 @@ impl Tool for ValuesTool {
 }
 
 // ---------------------------------------------------------------------------
-// L-47 transform ops: map, filter.where, flatten, skip, join, split
-// ---------------------------------------------------------------------------
-
-fn descend_path(v: &Value, path: &str) -> Value {
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current = v.clone();
-    for part in parts {
-        match &current {
-            Value::Object(map) => {
-                if let Some(next) = map.get(part) {
-                    current = next.clone();
-                } else {
-                    return Value::Null;
-                }
-            }
-            Value::String(s) => {
-                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(s) {
-                    if let Some(next) = map.get(part) {
-                        current = next.clone();
-                        continue;
-                    }
-                }
-                return Value::Null;
-            }
-            _ => return Value::Null,
-        }
-    }
-    current
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct MapInput {
-    items: Vec<Value>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    expr: Option<String>,
-    #[serde(default)]
-    vars: Option<serde_json::Map<String, Value>>,
-}
-
-pub struct MapTool;
-
-#[async_trait]
-impl Tool for MapTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "map",
-            "Project each element: `path` plucks a dotted field (missing → `null`); `expr` evaluates \
-             a formula with `it` bound to the element. Exactly one of `path` or `expr` required.",
-            flux_spec::tool_input_schema::<MapInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "map")?;
-        let path = params.get("path").and_then(|v| v.as_str());
-        let expr = params.get("expr").and_then(|v| v.as_str());
-
-        match (path, expr) {
-            (None, None) => {
-                return Err(Error::Other(
-                    "map: exactly one of `path` or `expr` required".into(),
-                ))
-            }
-            (Some(_), Some(_)) => {
-                return Err(Error::Other(
-                    "map: `path` and `expr` are mutually exclusive".into(),
-                ))
-            }
-            _ => {}
-        }
-
-        let result: Result<Vec<Value>> = if let Some(path_str) = path {
-            Ok(items
-                .iter()
-                .map(|elem| descend_path(elem, path_str))
-                .collect())
-        } else if let Some(expr_str) = expr {
-            let user_vars = params
-                .get("vars")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-
-            items
-                .iter()
-                .map(|elem| {
-                    let mut vars = std::collections::BTreeMap::new();
-                    vars.insert("it".to_string(), flux_lang::expr::ExprVal::from_json(elem));
-                    for (k, v) in &user_vars {
-                        vars.insert(k.clone(), flux_lang::expr::ExprVal::from_json(v));
-                    }
-                    let result = flux_lang::expr::eval_expr_value(expr_str, &vars)
-                        .map_err(|e| Error::Other(format!("map: expr evaluation failed: {e}")))?;
-                    let text = result.as_text();
-                    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
-                })
-                .collect()
-        } else {
-            unreachable!()
-        };
-
-        Ok(ToolResult::ok(serde_json::to_string(&result?)?))
-    }
-}
-
-pub struct FilterToolExtended;
-
-#[async_trait]
-impl Tool for FilterToolExtended {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "filter",
-            "Keep array items that satisfy a predicate. With `where` (formula with `it` bound), keeps \
-             elements where the formula is truthy. With `by` (dotted path), inspects that field; with \
-             `equals`, matches value. `where` and `by`/`equals` are mutually exclusive.",
-            flux_spec::tool_input_schema::<FilterInputExtended>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "filter")?;
-        let by = params.get("by").and_then(|v| v.as_str());
-        let equals = params.get("equals");
-        let where_formula = params.get("where").and_then(|v| v.as_str());
-
-        if where_formula.is_some() && (by.is_some() || equals.is_some()) {
-            return Err(Error::Other(
-                "filter: `where` and `by`/`equals` are mutually exclusive".into(),
-            ));
-        }
-
-        let out: Result<Vec<Value>> = if let Some(formula) = where_formula {
-            if formula.starts_with('.') {
-                return Err(Error::Other(
-                    "filter: element fields are `it.<field>`, not `.<field>`".into(),
-                ));
-            }
-            if formula.contains('$') {
-                return Err(Error::Other(
-                    "filter: symbols go in `vars`, elements are `it.<field>`".into(),
-                ));
-            }
-
-            let user_vars = params
-                .get("vars")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-
-            items
-                .into_iter()
-                .filter_map(|elem| {
-                    let mut vars = std::collections::BTreeMap::new();
-                    vars.insert("it".to_string(), flux_lang::expr::ExprVal::from_json(&elem));
-                    for (k, v) in &user_vars {
-                        vars.insert(k.clone(), flux_lang::expr::ExprVal::from_json(v));
-                    }
-                    match flux_lang::expr::eval_expr_value(formula, &vars) {
-                        Ok(result) if result.truthy() => Some(Ok(elem)),
-                        Ok(_) => None,
-                        Err(e) => Some(Err(Error::Other(format!(
-                            "filter: where evaluation failed: {e}"
-                        )))),
-                    }
-                })
-                .collect()
-        } else {
-            Ok(items
-                .into_iter()
-                .filter(|it| {
-                    let probe = match by {
-                        Some(path) => descend_path(it, path),
-                        None => it.clone(),
-                    };
-                    match equals {
-                        Some(eq) => &probe == eq,
-                        None => flux_lang::expr::ExprVal::from_json(&probe).truthy(),
-                    }
-                })
-                .collect())
-        };
-
-        Ok(ToolResult::ok(serde_json::to_string(&out?)?))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct FilterInputExtended {
-    items: Vec<Value>,
-    #[serde(default)]
-    by: Option<String>,
-    #[serde(default)]
-    equals: Option<Value>,
-    #[serde(default, rename = "where")]
-    where_formula: Option<String>,
-    #[serde(default)]
-    vars: Option<serde_json::Map<String, Value>>,
-}
-
-pub struct DedupeToolExtended;
-
-#[async_trait]
-impl Tool for DedupeToolExtended {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "dedupe",
-            "Remove duplicates from an array, preserving first-seen order. Pass `by` (dotted path) \
-             to de-duplicate on that field.",
-            flux_spec::tool_input_schema::<DedupeInputExtended>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "dedupe")?;
-        let by = params.get("by").and_then(|v| v.as_str());
-
-        let mut out: Vec<Value> = Vec::new();
-        let mut keys: Vec<Value> = Vec::new();
-        for it in items {
-            let key = match by {
-                Some(path) => descend_path(&it, path),
-                None => it.clone(),
-            };
-            if !keys.contains(&key) {
-                keys.push(key);
-                out.push(it);
-            }
-        }
-        Ok(ToolResult::ok(serde_json::to_string(&out)?))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct DedupeInputExtended {
-    items: Vec<Value>,
-    #[serde(default)]
-    by: Option<String>,
-}
-
-pub struct SortToolExtended;
-
-#[async_trait]
-impl Tool for SortToolExtended {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "sort",
-            "Stably sort an array. Pass `by` (dotted path) to sort on a field, and `order` \
-             (\"asc\" | \"desc\", default \"asc\").",
-            flux_spec::tool_input_schema::<SortInputExtended>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let mut items = arr_or_empty(&params, "items", "sort")?;
-        let by = params.get("by").and_then(|v| v.as_str());
-        let desc = match params.get("order") {
-            None | Some(Value::Null) => false,
-            Some(Value::String(s)) if s == "asc" => false,
-            Some(Value::String(s)) if s == "desc" => true,
-            Some(_) => {
-                return Err(Error::Other(
-                    "sort: param `order` must be \"asc\" or \"desc\"".into(),
-                ))
-            }
-        };
-        let key = |v: &Value| -> Value {
-            match by {
-                Some(path) => descend_path(v, path),
-                None => v.clone(),
-            }
-        };
-        items.sort_by(|a, b| {
-            let ord = cmp_value(&key(a), &key(b));
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
-        });
-        Ok(ToolResult::ok(serde_json::to_string(&items)?))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SortInputExtended {
-    items: Vec<Value>,
-    #[serde(default)]
-    by: Option<String>,
-    #[serde(default)]
-    order: Option<String>,
-}
-
-pub struct FlattenTool;
-
-#[async_trait]
-impl Tool for FlattenTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "flatten",
-            "Flatten nested arrays `depth` levels (default 1, max 8). Non-array elements pass through; \
-             string elements that are JSON arrays re-parse first.",
-            flux_spec::tool_input_schema::<FlattenInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "flatten")?;
-        let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-
-        if depth > 8 {
-            return Err(Error::Other("flatten: depth must be <= 8".into()));
-        }
-
-        fn flatten_level(items: Vec<Value>, remaining: u32) -> Vec<Value> {
-            if remaining == 0 {
-                return items;
-            }
-            let mut out = Vec::new();
-            for item in items {
-                let item = parse_json_array_string(item);
-                match item {
-                    Value::Array(arr) => out.extend(arr),
-                    other => out.push(other),
-                }
-            }
-            if remaining > 1 {
-                flatten_level(out, remaining - 1)
-            } else {
-                out
-            }
-        }
-
-        let result = flatten_level(items, depth);
-        Ok(ToolResult::ok(serde_json::to_string(&result)?))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct FlattenInput {
-    items: Vec<Value>,
-    #[serde(default)]
-    depth: Option<u32>,
-}
-
-pub struct SkipTool;
-
-#[async_trait]
-impl Tool for SkipTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "skip",
-            "Drop first `n` items (mirror of `top`); `n <= 0` returns unchanged; `n >= len` returns `[]`.",
-            flux_spec::tool_input_schema::<SkipInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "skip")?;
-        let n = params
-            .get("n")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| Error::Other("skip: required integer param `n` missing".into()))?;
-
-        let result: Vec<Value> = if n <= 0 {
-            items
-        } else {
-            items.into_iter().skip(n as usize).collect()
-        };
-        Ok(ToolResult::ok(serde_json::to_string(&result)?))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SkipInput {
-    items: Vec<Value>,
-    n: i64,
-}
-
-pub struct JoinTool;
-
-#[async_trait]
-impl Tool for JoinTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "join",
-            "Stringify each element (strings as-is, others compact JSON) and join with separator \
-             (default \"\\n\"). Returns plain text, not JSON.",
-            flux_spec::tool_input_schema::<JoinInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "join")?;
-        let sep = params.get("sep").and_then(|v| v.as_str()).unwrap_or("\n");
-
-        let parts: Vec<String> = items
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => serde_json::to_string(other).unwrap_or_default(),
-            })
-            .collect();
-
-        Ok(ToolResult::ok(parts.join(sep)))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct JoinInput {
-    items: Vec<Value>,
-    #[serde(default)]
-    sep: Option<String>,
-}
-
-pub struct SplitTool;
-
-#[async_trait]
-impl Tool for SplitTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "split",
-            "Split string on separator (default \"\\n\"). If `trim` is true, trim each part. \
-             Empty input returns `[]`. Returns JSON array of strings.",
-            flux_spec::tool_input_schema::<SplitInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let s = str_param(&params, "s", "split")?;
-        let sep = params.get("sep").and_then(|v| v.as_str()).unwrap_or("\n");
-        let trim = params
-            .get("trim")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if s.is_empty() {
-            return Ok(ToolResult::ok("[]".to_string()));
-        }
-
-        let parts: Vec<Value> = s
-            .split(sep)
-            .map(|part| {
-                let p = if trim { part.trim() } else { part };
-                Value::String(p.to_string())
-            })
-            .collect();
-
-        Ok(ToolResult::ok(serde_json::to_string(&parts)?))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SplitInput {
-    s: String,
-    #[serde(default)]
-    sep: Option<String>,
-    #[serde(default)]
-    trim: Option<bool>,
-}
-
-// ---------------------------------------------------------------------------
 // sum / count_by / group_by / any / all / has (L-48)
 // ---------------------------------------------------------------------------
 
@@ -2333,7 +1858,7 @@ impl Tool for AnyTool {
             "Returns \"true\" if any element satisfies the predicate, \"false\" otherwise. With \
              `where`, evaluates the formula per element with `it` bound. Without `where`, checks if \
              any element is truthy. Empty list → \"false\".",
-            flux_spec::tool_input_schema::<AnyInput>(),
+            mark_flux_expr(flux_spec::tool_input_schema::<AnyInput>(), &["where"]),
         )
     }
 
@@ -2386,7 +1911,7 @@ impl Tool for AllTool {
             "Returns \"true\" if all elements satisfy the predicate, \"false\" otherwise. With \
              `where`, evaluates the formula per element with `it` bound. Without `where`, checks if \
              all elements are truthy. Empty list → vacuously \"true\" (documented).",
-            flux_spec::tool_input_schema::<AllInput>(),
+            mark_flux_expr(flux_spec::tool_input_schema::<AllInput>(), &["where"]),
         )
     }
 
@@ -3417,5 +2942,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r2.content, "false");
+    }
+
+    #[tokio::test]
+    async fn op_expr_builtin_conformance_matrix() {
+        use flux_lang::expr::{eval_expr_value, ExprVal};
+
+        fn normalize_content(s: &str) -> Value {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
+        }
+
+        fn normalize_expr(v: ExprVal) -> Value {
+            normalize_content(&v.as_text())
+        }
+
+        let c = ctx();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("nums".into(), ExprVal::from_json(&json!([1, 2, 3])));
+        vars.insert("truthy".into(), ExprVal::from_json(&json!([true, "yes"])));
+        vars.insert("mixed".into(), ExprVal::from_json(&json!([true, false])));
+        vars.insert("words".into(), ExprVal::from_json(&json!(["a", "b"])));
+
+        let cases = [
+            (
+                SumTool
+                    .execute(&c, json!({"items": [1, 2, 3]}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("sum(nums)", &vars).unwrap(),
+            ),
+            (
+                AnyTool
+                    .execute(&c, json!({"items": [true, "yes"]}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("any(truthy)", &vars).unwrap(),
+            ),
+            (
+                AllTool
+                    .execute(&c, json!({"items": [true, false]}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("all(mixed)", &vars).unwrap(),
+            ),
+            (
+                HasTool
+                    .execute(&c, json!({"items": [1, 2, 3], "value": 2}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("has(nums, 2)", &vars).unwrap(),
+            ),
+            (
+                crate::transform::JoinTool
+                    .execute(&c, json!({"items": ["a", "b"], "sep": "|"}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("join(words, '|')", &vars).unwrap(),
+            ),
+            (
+                crate::transform::SplitTool
+                    .execute(&c, json!({"s": "a|b", "sep": "|"}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("split('a|b', '|')", &vars).unwrap(),
+            ),
+            (
+                FirstTool
+                    .execute(&c, json!({"items": ["a", "b"]}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("first(words)", &vars).unwrap(),
+            ),
+            (
+                LastTool
+                    .execute(&c, json!({"items": ["a", "b"]}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("last(words)", &vars).unwrap(),
+            ),
+            (
+                LenTool
+                    .execute(&c, json!({"items": ["a", "b"]}))
+                    .await
+                    .unwrap()
+                    .content,
+                eval_expr_value("len(words)", &vars).unwrap(),
+            ),
+        ];
+
+        for (op, expr) in cases {
+            assert_eq!(normalize_content(&op), normalize_expr(expr));
+        }
     }
 }

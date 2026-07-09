@@ -111,10 +111,39 @@ Without it the job fails fast with a clear message and nothing is published.
 To release: cut the version (`scripts/cut-release.sh <ver>`), then `git push --follow-tags origin main`.
 The tag fans out to both the binary `Release` workflow and this crates.io publish.
 
+**Binary Release workflow secret:** add **`RELEASE_TOKEN`** under
+*Settings → Secrets and variables → Actions* on the `codewandler/flux` repo. It must be a fine-grained
+GitHub PAT scoped to this repo with **Contents: write**. This is required even though
+`.github/workflows/release.yml` requests `contents: write`: tag-triggered `GITHUB_TOKEN` release
+creation has produced `HTTP 403: Resource not accessible by integration`, leaving a tag without a
+GitHub Release object. The workflow now fails fast if `RELEASE_TOKEN` is missing, creates or refreshes
+the release idempotently, then runs:
+
+```sh
+scripts/verify-github-release.sh vX.Y.Z
+```
+
+That verifier confirms the Release object exists and carries the installer scripts, checksum manifest,
+and platform archives that `/releases/latest` users need.
+
 **Manual fallback** (from a maintainer machine with a token):
 ```sh
 cargo login                      # or: export CARGO_REGISTRY_TOKEN=…
 scripts/publish-crates-io.sh     # same ordered, idempotent loop
+```
+
+**Backfill a missing binary Release** (tag exists, GitHub Release does not):
+```sh
+run_id=<failed Release workflow run id>
+tag=vX.Y.Z
+rm -rf /tmp/flux-release-backfill
+gh run download "$run_id" --repo codewandler/flux --pattern 'artifacts-*' --dir /tmp/flux-release-backfill
+find /tmp/flux-release-backfill -name '*-dist-manifest.json' -delete
+gh release create "$tag" --repo codewandler/flux --target "$(git rev-list -n1 "$tag")" \
+  --title "${tag#v}" --notes "Backfilled release for $tag."
+find /tmp/flux-release-backfill -type f -print0 |
+  xargs -0 gh release upload "$tag" --repo codewandler/flux
+scripts/verify-github-release.sh --repo codewandler/flux "$tag"
 ```
 
 - **Irreversible.** A published `name@version` can never be reused — only yanked.

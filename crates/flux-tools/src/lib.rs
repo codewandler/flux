@@ -14,6 +14,7 @@ pub mod extra;
 pub mod groups;
 pub mod reflect;
 pub mod toolchains;
+pub mod transform;
 
 pub use evidence::register_evidence;
 pub use reflect::register_reflect;

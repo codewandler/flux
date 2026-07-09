@@ -2,7 +2,7 @@
 //! milestones add full name / type / effect / bounded-loop checking over the whole AST, lowering a
 //! [`DraftAst`](crate::ast::DraftAst) into a typed [`HirFlow`](crate::ast::HirFlow).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
     is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, HirFlow, Node, SymbolName, TypeRef,
@@ -1110,6 +1110,7 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
                                 .join(", ")
                         ));
                     }
+                    check_flux_expr_literal_params(op, args, &sig, ops, d);
                 }
             }
             // Coupled to the runtime's `eval_arg` accepted set (runtime.rs, `fn eval_arg`):
@@ -1563,6 +1564,103 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
             }
         }
         Node::Peek { .. } | Node::Lit { .. } | Node::Thing { .. } | Node::CtxAppend { .. } => {}
+    }
+}
+
+fn check_flux_expr_literal_params(
+    op: &str,
+    args: &[Node],
+    sig: &OpSignature,
+    ops: &dyn OpCatalog,
+    d: &mut Diags,
+) {
+    match args {
+        [Node::Lit {
+            value: serde_json::Value::Object(map),
+        }] => {
+            let vars = flux_expr_var_keys_from_json(map);
+            for (param, value) in map {
+                if ops.param_format(op, param).as_deref() == Some("flux-expr") {
+                    if let Some(formula) = value.as_str() {
+                        validate_flux_expr_param(op, param, formula, &vars, d);
+                    }
+                }
+            }
+        }
+        [Node::Obj { fields }] => {
+            let vars = flux_expr_var_keys_from_template(fields);
+            for (param, value) in fields {
+                if ops.param_format(op, param).as_deref() == Some("flux-expr") {
+                    if let Node::Lit {
+                        value: serde_json::Value::String(formula),
+                    } = value.as_ref()
+                    {
+                        validate_flux_expr_param(op, param, formula, &vars, d);
+                    }
+                }
+            }
+        }
+        [Node::Lit {
+            value: serde_json::Value::String(formula),
+        }] => {
+            let Some(param) = single_bare_param(sig) else {
+                return;
+            };
+            if ops.param_format(op, &param).as_deref() == Some("flux-expr") {
+                let vars = BTreeSet::from(["it".to_string()]);
+                validate_flux_expr_param(op, &param, formula, &vars, d);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn single_bare_param(sig: &OpSignature) -> Option<String> {
+    if sig.required_params.len() == 1 {
+        sig.required_params.first().cloned()
+    } else if sig.required_params.is_empty() && sig.optional_params.len() == 1 {
+        sig.optional_params.first().cloned()
+    } else {
+        None
+    }
+}
+
+fn flux_expr_var_keys_from_json(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from(["it".to_string()]);
+    if let Some(vars) = map.get("vars").and_then(|v| v.as_object()) {
+        keys.extend(vars.keys().cloned());
+    }
+    keys
+}
+
+fn flux_expr_var_keys_from_template(fields: &BTreeMap<String, Box<Node>>) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from(["it".to_string()]);
+    if let Some(vars) = fields.get("vars") {
+        match vars.as_ref() {
+            Node::Lit {
+                value: serde_json::Value::Object(map),
+            } => keys.extend(map.keys().cloned()),
+            Node::Obj { fields } => keys.extend(fields.keys().cloned()),
+            _ => {}
+        }
+    }
+    keys
+}
+
+fn validate_flux_expr_param(
+    op: &str,
+    param: &str,
+    formula: &str,
+    var_keys: &BTreeSet<String>,
+    d: &mut Diags,
+) {
+    let refs: BTreeSet<&str> = var_keys.iter().map(String::as_str).collect();
+    for msg in crate::expr::validate_expr_formula(formula, &refs) {
+        d.add(format!(
+            "op `{op}` parameter `{param}` has invalid flux expression: {msg}"
+        ));
     }
 }
 
@@ -2110,6 +2208,73 @@ mod tests {
                     .collect(),
             })
         }
+    }
+
+    /// A catalog with a `where` parameter marked as `format: flux-expr`, mirroring the
+    /// transform/predicate cognition ops.
+    struct FluxExprCat;
+    impl OpCatalog for FluxExprCat {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            (name == "filter").then(|| OpSignature {
+                name: "filter".into(),
+                description: String::new(),
+                effects: Vec::new(),
+                risk: flux_spec::Risk::Low,
+                idempotency: flux_spec::Idempotency::Idempotent,
+                required_params: vec!["items".into()],
+                optional_params: vec!["vars".into(), "where".into()],
+                param_types: Default::default(),
+            })
+        }
+
+        fn param_format(&self, op: &str, param: &str) -> Option<String> {
+            (op == "filter" && param == "where").then(|| "flux-expr".to_string())
+        }
+    }
+
+    #[test]
+    fn analyzer_rejects_bad_literal_flux_expr_predicate() {
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "filter".into(),
+                args: vec![Node::Lit {
+                    value: serde_json::json!({
+                        "items": [{"score": 10}],
+                        "where": "it.score >",
+                    }),
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let err = analyze_flow(&ast, &FluxExprCat, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter().any(|d| {
+                d.message
+                    .contains("op `filter` parameter `where` has invalid flux expression")
+                    && d.message.contains("body[0]")
+            }),
+            "expected an early flux-expr diagnostic with a node path, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn analyzer_accepts_literal_flux_expr_predicate_vars() {
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "filter".into(),
+                args: vec![Node::Lit {
+                    value: serde_json::json!({
+                        "items": [{"score": 10}],
+                        "where": "it.score > min",
+                        "vars": {"min": 5},
+                    }),
+                }],
+            }],
+            ..Default::default()
+        };
+
+        assert!(analyze_flow(&ast, &FluxExprCat, &HashSet::new()).is_ok());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 id: L-48
 title: Aggregation & predicate ops — `sum`, `count_by`, `group_by`, `any`, `all`, `has`
 pillar: Language
-status: ready
+status: done
 priority: 4
 epic: data-transforms
 design: docs/designs/data-transforms.md
@@ -19,36 +19,37 @@ bespoke Rust ops (`candidates_empty`, `score_compare`, `grade`) that only exist 
 design note.
 
 ## Acceptance
-- [ ] `sum({items, path?})` — numeric sum; if `path` set, sum that dotted field per
+- [x] `sum({items, path?})` — numeric sum; if `path` set, sum that dotted field per
       element; non-numeric element (or missing field required by `path`) → clear error
       naming the offender. Failing-first tests: `sum_of_numbers`,
       `sum_with_path_and_bad_element_errors`.
-- [ ] `count_by({items, path})` — `[{key, count}]`, sorted count desc, key asc tiebreak,
+- [x] `count_by({items, path})` — `[{key, count}]`, sorted count desc, key asc tiebreak,
       deterministic. Failing-first test: `count_by_orders_count_desc_then_key`.
-- [ ] `group_by({items, path})` — `[{key, items}]`, first-seen key order (matches
+- [x] `group_by({items, path})` — `[{key, items}]`, first-seen key order (matches
       `dedupe`'s convention). Failing-first test:
       `group_by_first_seen_key_order`.
-- [ ] `any({items, where?, vars?})` — `"true"` iff some element satisfies `where` (or
+- [x] `any({items, where?, vars?})` — `"true"` iff some element satisfies `where` (or
       is truthy when `where` omitted). Empty list → `"false"`. Failing-first test:
       `any_true_on_match_false_on_empty`.
-- [ ] `all({items, where?, vars?})` — `"true"` iff every element satisfies. **Vacuously
+- [x] `all({items, where?, vars?})` — `"true"` iff every element satisfies. **Vacuously
       `"true"` on empty** — documented on the op description and reflected in the
       failing-first test `all_vacuously_true_on_empty_list`.
-- [ ] `has({items, value})` — JSON-equality membership → `"true"`/`"false"`. Failing-first
+- [x] `has({items, value})` — JSON-equality membership → `"true"`/`"false"`. Failing-first
       test: `has_equality_membership`.
-- [ ] **Conformance tests pin op ↔ expr-builtin identical outputs** for `sum`/`any`/`all`/
+- [x] **Conformance tests pin op ↔ expr-builtin identical outputs** for `sum`/`any`/`all`/
       `has` (and `join`/`split`/`first`/`last`/`len` shipped in L-46/L-47). Test:
       `op_expr_builtin_conformance_matrix`.
-- [ ] Ops usable directly in `when`/`until`/`assert` (call-cond position — no parser work
+- [x] Ops usable directly in `when`/`until`/`assert` (call-cond position — no parser work
       needed). End-to-end test: `any_in_when_gates_a_flow_step`.
-- [ ] All new ops registered in `register_cognition` and the `cognition` group; group
+- [x] All new ops registered in `register_cognition` and the `cognition` group; group
       description updated.
-- [ ] `website/docs/language/ops.md` cognition-tools table gains a row per new op with
+- [x] `website/docs/language/ops.md` cognition-tools table gains a row per new op with
       one native-text example.
-- [ ] CHANGELOG entry under `[Unreleased]`.
+- [x] CHANGELOG entry under `[Unreleased]`.
 
 ## Progress
-- (implementation not yet started)
+- Done 2026-07-09: aggregation/predicate ops are registered, documented, covered by direct
+  op tests, an op↔expr conformance matrix, and the `any_in_when_gates_a_flow_step` runtime test.
 
 ## Notes
 - Generic `reduce{items, formula, init}` is deliberately **rejected** — see design doc

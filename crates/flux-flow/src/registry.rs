@@ -218,6 +218,19 @@ impl OpCatalog for OpRegistry<'_> {
         self.get(name)
     }
 
+    fn param_format(&self, op: &str, param: &str) -> Option<String> {
+        self.tools.get(op).and_then(|tool| {
+            tool.spec()
+                .input_schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .and_then(|props| props.get(param))
+                .and_then(|prop| prop.get("format"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+    }
+
     fn composite(&self, name: &str) -> Option<CompositeOpDecl> {
         self.composites.iter().find(|c| c.name == name).cloned()
     }

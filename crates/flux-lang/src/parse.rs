@@ -3840,6 +3840,44 @@ journey greet
     }
 
     #[test]
+    fn native_expr_fallback_does_not_collide_with_existing_valid_forms() {
+        let src = r#"flow test
+  $plain = $score
+  $call = len($queue)
+  when $ready
+    return $plain
+  assert ok($plain)
+  $ok = $score >= 0.8
+"#;
+        let ast = parse(src).unwrap();
+
+        let Node::Bind { value, .. } = &ast.body[0] else {
+            panic!("expected first bind");
+        };
+        assert!(matches!(value.as_ref(), Node::Var { .. }));
+
+        let Node::Bind { value, .. } = &ast.body[1] else {
+            panic!("expected second bind");
+        };
+        assert!(matches!(value.as_ref(), Node::Call { op, .. } if op == "len"));
+
+        let Node::When { cond, .. } = &ast.body[2] else {
+            panic!("expected when");
+        };
+        assert!(matches!(cond.as_ref(), Node::Var { .. }));
+
+        let Node::Assert { cond, .. } = &ast.body[3] else {
+            panic!("expected assert");
+        };
+        assert!(matches!(cond.as_ref(), Node::Call { op, .. } if op == "ok"));
+
+        let Node::Bind { value, .. } = &ast.body[4] else {
+            panic!("expected native expr bind");
+        };
+        assert!(matches!(value.as_ref(), Node::Expr { formula, .. } if formula == "score >= 0.8"));
+    }
+
+    #[test]
     fn parse_when_with_dotted_access() {
         let src = "flow test\n  when $issue.state == 'opened'\n    return true\n";
         let ast = parse(src).unwrap();

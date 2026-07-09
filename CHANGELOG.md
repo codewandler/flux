@@ -11,6 +11,32 @@ All notable changes to this project are documented in this file. The format is b
 - **Tracked the Flux-Lang agent-speed epic.** New epic design and L-53..L-56 stories cover the
   four KF items: whole-flow dependency scheduling, content-addressed op caching, plan-delta
   emission, and automatic context slicing.
+- **Extracted the Flux-Lang expression evaluator.** `flux_lang::expr` is now a public module with
+  the shared tokenizer, validator, evaluator, and typed `ExprVal` surface. Expressions now preserve
+  objects, support lenient dotted access like `it.author.name`, and add list-aware built-ins:
+  `sum`, `any`, `all`, `has`, `join`, `split`, `first`, `last`, plus list overloads for `min` and
+  `max`. Note: object values no longer stringify inside `expr`, so `len(obj)` now returns key count
+  instead of the compact-JSON character count.
+- **Added deterministic core transform ops.** The cognition pack now exposes `map`, `flatten`,
+  `skip`, `join`, and `split`; `filter` accepts `where` predicates evaluated by the shared
+  `flux_lang::expr` engine; and `filter`/`sort`/`dedupe` `by` fields accept dotted paths.
+- **Added aggregation and predicate ops.** `sum`, `count_by`, `group_by`, `any`, `all`, and `has`
+  provide deterministic reductions and boolean emitters that can be used directly in
+  `when`/`until`/`assert` call positions.
+- **Added object and null-kit ops.** `pick`, `omit`, `merge_obj`, `coalesce`, `keys`, and `values`
+  provide deterministic payload trimming, shallow object merge, fallback selection, and object
+  introspection in pure Flux-Lang flows.
+- **Added native expression syntax for conditions and bind RHS.** Flux-Lang text now accepts
+  invertible formulas such as `when $count > 3`, `until len($queue) == 0`, and
+  `$ok = $score >= 0.8`, lowering them to pure `expr` nodes with an automatically built `vars` map.
+- **Completed the Flux-Lang data-transforms epic.** [L-46](docs/stories/L-46-expr-engine-module-and-list-builtins.md)
+  extracted the shared expression engine, [L-47](docs/stories/L-47-core-transform-ops.md)
+  shipped core list transforms, [L-48](docs/stories/L-48-aggregation-predicate-ops.md)
+  added reductions and predicates, [L-49](docs/stories/L-49-object-null-kit-ops.md)
+  added object/null helpers, [L-50](docs/stories/L-50-regex-ops.md) covered bounded regex,
+  [L-51](docs/stories/L-51-native-expr-conditions.md) added native expression syntax, and
+  [L-52](docs/stories/L-52-transforms-docs-examples-pass.md) closed the docs/examples pass with a
+  hermetic `examples/data-transforms.flux` gate.
 
 ### Changed
 
@@ -22,9 +48,24 @@ All notable changes to this project are documented in this file. The format is b
   Claude/Codex/OpenRouter model ids seen in those histories, including Claude Fable/Sonnet 5,
   GPT-5.4, GPT-5.3-Codex, and route-suffixed OpenRouter slugs. JSON output now carries the same
   normalized period, summary, metric, row, and cost-status data without progress noise.
+- **`filter` truthiness is aligned with Flux-Lang expressions.** In bare/`by` mode the strings
+  `""`, `"false"`, and `"0"` are now falsey, matching `when`/`until`/`expr`; a list item previously
+  kept solely because the inspected value was the literal string `"false"` or `"0"` will now be
+  dropped.
+- **Regex ops are included in the engine ops reference.** The previously shipped `regex_match` and
+  `regex_extract` cognition ops now appear in the planner-facing `flux-flow` registered-ops
+  reference alongside the other data-transform ops.
+- **Malformed literal transform predicates fail during analysis.** Op parameters marked with
+  JSON-Schema `format: "flux-expr"` are now validated before dispatch when their value is a literal
+  string, so bad `filter.where`/`map.expr`/`any.where`/`all.where` formulas get ordinary compile
+  diagnostics instead of a mid-run tool error.
 
 ### Fixed
 
+- **Release publication now fails fast and verifies assets.** The tag-triggered binary Release workflow
+  requires the repo-scoped `RELEASE_TOKEN` secret instead of falling back to a `GITHUB_TOKEN` path that
+  returned `HTTP 403`, retries/idempotently refreshes release creation, and runs
+  `scripts/verify-github-release.sh` to prove the tag has installer/checksum/platform assets.
 - **Planner field-access ingress is consistently lenient.** JSON `emit_plan` ASTs are now
   normalized like native-text plans so a model-provided `jq.optional = false` cannot make agent
   field access strict; strict `$x.field` remains the native text authoring behavior.

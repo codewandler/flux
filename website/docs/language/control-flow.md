@@ -116,9 +116,19 @@ each iteration — a stop-when-true check:
 
 ```flux
 repeat 10
-  until $done
+  until all({items: $checks, where: "it.status == 'ok'"})
   $done = bash("poll.sh")
 ```
+
+Native expression conditions also work on ordinary symbols:
+
+```flux
+when $count > 3
+  return "enough"
+```
+
+Use pure `map`/`filter` for per-item projection over structured JSON. Use `each` when the body must
+dispatch real work for each item.
 
 ## `each` — list-driven loop
 
