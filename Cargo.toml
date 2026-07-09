@@ -45,7 +45,7 @@ exclude = ["plugins"]
 
 [workspace.package]
 edition = "2021"
-version = "0.13.0"
+version = "0.13.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/flux"
 homepage = "https://github.com/codewandler/flux"
@@ -113,11 +113,12 @@ futures-util = "0.3"
 bytes = "1"
 async-trait = "0.1"
 async-stream = "0.3"
-# reqwest 0.13 split the old `rustls-tls` alias: `rustls` selects the TLS backend, `webpki-roots`
-# keeps the bundled trust store (same behavior as 0.12's `rustls-tls` = rustls + webpki roots).
+# reqwest 0.13's `rustls` feature bundles the TLS backend + platform trust store (via
+# rustls-platform-verifier). reqwest 0.13.2 removed the separate `webpki-roots` feature/dep, so
+# requesting it capped the whole graph at 0.13.1; `rustls` alone is the supported rustls path.
 # 0.13 also moved `RequestBuilder::form` behind the new `form` feature (flux-credentials/flux-auth
 # post OAuth token/introspection requests as form bodies).
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "rustls", "webpki-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "rustls"] }
 eventsource-stream = "0.2"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
