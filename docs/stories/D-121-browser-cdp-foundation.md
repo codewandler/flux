@@ -2,7 +2,7 @@
 id: D-121
 title: browser foundation — native headless Chromium sessions over CDP-on-a-pipe
 pillar: Core
-status: ready
+status: done
 priority: 19
 epic: web-capabilities
 design: docs/designs/web-capabilities.md
@@ -19,31 +19,56 @@ control socket, no debug port to squat), and manage page sessions the later obse
 to.
 
 ## Acceptance
-- [ ] Minimal CDP client (`flux-web::cdp`) typed for only the domains the epic uses (Target, Page,
-      DOM, Accessibility, Runtime, Input, Fetch): call/response correlation, event subscription,
-      `\0`-framed messages on the pipe pair. Failing-first: hermetic tests against a scripted fake
-      CDP endpoint (canned JSON-RPC exchanges) — no Chrome needed in CI.
-- [ ] Chrome spawned as a direct child with `Effect::Process` disclosed on `browser.open`:
-      headless (new mode), ephemeral isolated profile dir per session, cleaned up on close/TTL.
-      Binary discovery `FLUX_BROWSER_BIN` → config → PATH candidates (`chromium`,
-      `google-chrome`, …); **no auto-download**; missing browser → actionable error naming the
-      discovery order.
-- [ ] Ops: `browser.open {url?} → session` (returns url/title header, digest arrives in D-122),
-      `browser.goto {session, url}`, `browser.close {session}`. In-process session registry behind
-      `Arc<Mutex<…>>` (the `EndpointBroker`/`SqliteBackend`/`ReadTracker` stateful-tool shape) with
-      an idle TTL; expiry closes Chrome and invalidates the session id.
-- [ ] Evidence-gated surfacing: browser ops carry a `browser` `ToolGroup` whose `surface_when`
-      signal is *a Chromium binary is discoverable* (a `detect_signals` probe; `FLUX_SURFACE_ALL`
-      still forces). Test: with no binary discoverable, browser ops are absent from the advertised
-      catalog; with one, present.
-- [ ] Interim egress gate: navigation URLs guarded via `flux_system::net::guard_url_scoped` with
-      the D-98 `web` scope, explicitly documented as **insufficient** — subresources/redirects/JS
-      escape it; [D-124](D-124-browser-egress-interception.md) is required for epic-done. Test:
-      `browser.goto` to a private-range URL refused without grant.
-- [ ] Env-gated live smoke (SKIP when no Chromium on PATH): open → goto a local fixture page →
-      close, leaving no orphan Chrome process (test asserts child reaped).
+- [x] Minimal CDP client (`flux-web::cdp`) — call/response correlation by id, event subscription
+      (forwarded on an mpsc channel), `\0`-framed JSON, optional `sessionId` routing (flattened mode),
+      transport-agnostic over any `AsyncRead`/`AsyncWrite`. Hermetic tests against a scripted fake over
+      an in-memory duplex — no Chrome in CI: response correlation + events, CDP-error surfacing,
+      session-id routing, and disconnect-fails-pending-calls (no hang).
+- [x] Chrome spawned as a direct child via a **new guarded seam** `flux_system::System::spawn_debug_pipe`
+      (a full-duplex socketpair mapped onto the child's fd 3/4 in a `pre_exec` hook — async-signal-safe
+      `dup2`/`fcntl` only; same `build_command` envelope: argv-only, env-cleared, cwd-pinned). Headless
+      (`--headless=new`), ephemeral isolated profile per session (removed on close/TTL). Discovery
+      `FLUX_BROWSER_BIN` → config `browser_bin` → PATH candidates; **no auto-download**; missing browser
+      → actionable error naming the order. `Effect::Process` on `browser.open`.
+- [x] Ops: `browser.open {url?}` (returns `session` id + the first digest — the D-122 digest arrived
+      with it), `browser.goto {session, url}`, `browser.close {session}`. `SessionRegistry` behind
+      `Arc<Mutex<…>>` with a lazily-swept idle TTL (5 min); close/expiry kills Chrome + removes the
+      profile + invalidates the id.
+- [x] Evidence-gated surfacing: the `browser` `ToolGroup` (`browser_group()`) is pushed at the two CLI
+      group sites; its signal is a `chromium_present` probe in `flux_runtime::detect_signals`. Test
+      `browser_ops_are_gated_by_the_browser_signal`: absent from the catalog with no signal, present
+      with it.
+- [x] Interim egress gate: `browser.goto` guards the nav URL via `guard_url_scoped` with the `web`
+      scope — but the real policy is [D-124](D-124-browser-egress-interception.md)'s per-request
+      `Fetch` interception (shipped in the same push; the coarse nav check is now belt-and-suspenders).
+- [x] Env-gated live smoke `live_smoke_open_goto_snapshot_close_no_orphan` (SKIP when no Chromium):
+      launches **real** headless Chrome, opens → navigates a local fixture (under a test-scoped `web`
+      grant) → snapshots the digest (asserts page content + the button in the action space) → closes,
+      asserting the Chrome child is reaped via `/proc` (no orphan). **Passes on a machine with Chrome.**
 
 ## Progress
+- 2026-07-09 — **DONE end-to-end** (incl. a real-Chrome live smoke): `flux_system::spawn_debug_pipe`
+  (guarded fd-3/4 socketpair via `pre_exec`); `flux-web::browser` — discovery, `launch_session`
+  (createTarget/attachToTarget flatten + enable domains + `Fetch.enable`), `SessionRegistry` + TTL,
+  `browser.open/goto/snapshot/act/close`, the event pump (load-wait, console/dialog tracking, D-124
+  Fetch interception), `browser_group()` + `chromium_present` in `detect_signals`, `browser_bin`
+  config. 12 browser tests (hermetic scripted-fake) + the live smoke.
+- 2026-07-09 — **CDP client landed** (`flux-web::cdp`, keystone): the hand-rolled `\0`-framed
+  JSON-RPC transport with id-correlated calls, an event stream, session routing, and disconnect
+  safety — 4 hermetic tests (scripted fake over `tokio::io::duplex`), no Chrome. tokio moved to
+  runtime deps. This is the substrate D-122/123/124 attach to.
+- 2026-07-09 — **Remaining (next push, deliberately unhurried — safety-critical):**
+  1. A **guarded fd-3/4 pipe spawn** on `flux_system::System` (the browser's transport): keep the one
+     guarded `build_command` path (argv-only, env-cleared, cwd-pinned) but wire two extra pipes to the
+     child's fd 3 (Chrome reads commands) / fd 4 (Chrome writes) via `pre_exec` dup2 — an `unsafe`
+     addition to the L2 safety crate that can't be hermetically tested, so it warrants care over speed.
+  2. Chrome discovery (`FLUX_BROWSER_BIN` → config → PATH candidates; no auto-download) + headless
+     spawn with an ephemeral profile + `Effect::Process` on `browser.open`.
+  3. `browser.open`/`goto`/`close` + the `Arc<Mutex<…>>` session registry with an idle TTL.
+  4. The evidence-gated `browser` `ToolGroup` (a `chromium_present` probe in `detect_signals` +
+     `flux_web::browser_group()` pushed at the two CLI group sites) so the ops stay out of the catalog
+     when no Chromium is discoverable.
+  5. Interim nav-URL guard (documented insufficient until D-124) + the env-gated live smoke.
 - 2026-07-09 — **Re-scoped native** (user call): plugins/browser becomes flux-web modules; the
   "manifest-declared process capability" framing is replaced by `Effect::Process` disclosure on
   the op spec; added the evidence-gated `browser` group (ungated native ops land in every system

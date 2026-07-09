@@ -17,6 +17,26 @@
 
 ### New
 
+- Agents can now use a real web browser — the non-visual way. flux drives headless Chrome and lets
+  the agent "see" a page the way a screen reader does: a short digest of the readable content plus a
+  list of the things it can act on (buttons, links, form fields), each with a stable handle. It clicks,
+  types, and navigates by those handles and gets back just *what changed* — so a multi-step task on a
+  live, JavaScript-heavy site costs a trickle of tokens instead of re-reading the whole page every
+  turn. It never ingests raw HTML or screenshots. The browser tools only appear when a Chromium/Chrome
+  browser is actually installed (set `FLUX_BROWSER_BIN` or `browser_bin` to point at one), and every
+  request the page makes is held to the same egress rules as the rest of flux.
+- "Read this page" now returns a clean, readable document instead of a wall of HTML. Fetching a web
+  page strips the navigation, scripts, ads, and boilerplate and hands back condensed markdown — so
+  the agent spends its budget on the actual content, and pages it reads become searchable afterwards.
+  Ask for `raw: true` if you ever want the untouched source. There's also a pure "HTML → markdown"
+  step you can run on HTML you already have.
+- Agents can now make arbitrary HTTP requests. A new `http.request` capability lets a plan call
+  any HTTP(S) API — pick the method, set headers and a body, and get back the status, response
+  headers, and body. Non-2xx responses come back as normal results (a 404 is just a 404), and
+  header values can reference secrets so tokens are never shown. Reach for it when talking to an
+  API; keep using "read this page" (web fetch) when you just want a page's content. Private and
+  loopback addresses stay blocked unless you grant the new `web` egress scope in config (or pass
+  `--allow-private-net`).
 - `flux changelog` — see what changed in your version of flux, right from the terminal.
   Shows your installed version's highlights by default; `flux changelog --all` shows the
   full history, `flux changelog <version>` a specific release.
@@ -38,6 +58,12 @@
 - The language now accepts more real-world text: kebab-case flow names, dotted operation
   names, blank lines and comments between a header and its body, single-quoted strings in
   conditions, and scientific-notation numbers.
+
+### Action needed
+
+- If you granted `web_fetch` access to private/internal hosts in `config.toml` under
+  `[private_net] web_fetch = …`, rename that key to `web`. The web tools now share one
+  `[private_net] web` grant; an old `web_fetch` entry is ignored (public-only by default).
 
 ## [0.11.6] - 2026-07-09
 

@@ -15,7 +15,14 @@ optional arguments are in `[brackets]`.
 | `grep` | `pattern[, glob, literal, max_results, path]` | Low | Search by regex (supports `\b`, lookaheads); use `literal: true` for plain substring |
 | `glob` | `pattern[, path]` | Low | List files matching a glob pattern (`*` crosses `/`) |
 | `search` | `query[, limit]` | Low | Search the indexed datasource |
-| `web_fetch` | `url` | Low | Fetch an HTTP(S) URL |
+| `web_fetch` | `url[, raw]` | Low | Read a page as a **document**: HTML → condensed markdown (boilerplate stripped), non-HTML raw, `raw: true` forces the raw body. Fetched pages become `web.page` records. Private/loopback blocked unless the `web` egress scope grants them |
+| `html_to_markdown` | `html` | Low | Pure (no egress): condense an HTML string to readable markdown; composes with `http.request` |
+| `http.request` | `url[, method, headers, body, timeout]` | Medium | Make an arbitrary HTTP(S) request (any method/headers/body) → status + headers + capped body; non-2xx is a result. Header values may be `{"$secret": "ENV"}`. Private/loopback blocked unless the `web` egress scope grants them |
+| `browser.open` | `[url]` | Medium | Open a headless-Chromium session (evidence-gated on a discoverable browser) → `session` id + a non-visual page digest (condensed content + `e<N>` action refs). Every subrequest is guarded by the `web` egress scope |
+| `browser.goto` | `session, url` | Medium | Navigate a session; returns a delta of what changed |
+| `browser.snapshot` | `session[, view]` | Low | Re-observe a session as a digest (`view`: full \| actions \| content) |
+| `browser.act` | `session, action[, ref, value, full]` | Medium | Act on a ref (click/type/fill/select/press/scroll/goto/back) → delta digest; `full` for a whole digest |
+| `browser.close` | `session` | Low | Close a session + its Chromium child |
 | `write` | `path, content` | Medium | Write (create/overwrite) a file |
 | `edit` | `path, old_string, new_string[, replace_all]` | Medium | Replace a string in a file (must match exactly once unless `replace_all`); if the exact text isn't found, progressively looser matching is tried (trailing whitespace → indentation drift → first/last-line anchor) and the result reports which strategy matched |
 | `patch` | `path, edits` | Medium | Apply several line-anchored edits in one call; each edit is `{op, line, end_line?, text?}` where op is `insert_before`, `insert_after`, `replace_range`, or `delete_range`; ALL line numbers refer to the original file |

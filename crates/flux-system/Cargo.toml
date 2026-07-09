@@ -14,6 +14,10 @@ name = "flux_system"
 flux-core.workspace = true
 tokio.workspace = true
 url.workspace = true
+# The guarded CDP-pipe spawn (`spawn_debug_pipe`) maps a socket onto the child's fd 3/4 in a
+# `pre_exec` hook — dup2/fcntl only, async-signal-safe.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio.workspace = true

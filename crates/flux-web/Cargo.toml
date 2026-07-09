@@ -1,0 +1,38 @@
+[package]
+name = "codewandler-flux-web"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "flux native web capabilities: arbitrary HTTP (http.request), readable-markdown fetch, and non-visual browser use — all under one scoped `web` egress policy"
+
+[dependencies]
+flux-core.workspace = true
+flux-runtime.workspace = true
+flux-spec.workspace = true
+flux-system.workspace = true
+# For the shared `EgressAudit` seam (a `PrivateNetAdmit` is emitted when a request is admitted to a
+# private host under a grant). flux-plugin is L4; flux-web is L5, so this respects layering — the
+# same reuse flux-capabilities already makes for the endpoint broker.
+flux-plugin.workspace = true
+# The markdown engine (L0): flux-web builds a markdown AST from parsed HTML and renders it with the
+# writer. flux-markdown stays a pure markdown engine — the HTML parser lives here, not there.
+flux-markdown.workspace = true
+# The datasource record contract (L0): fetched pages are contributed as `web.page` records.
+flux-datasource.workspace = true
+# The evidence-gated ToolGroup (L0): the `browser` group surfaced by a Chromium-discoverable signal.
+flux-evidence.workspace = true
+reqwest.workspace = true
+url.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The async CDP client (tier 3) drives the browser over a `\0`-framed pipe: tokio IO + sync + tasks.
+tokio.workspace = true
+# HTML parsing for the tier-2 condenser (the html5ever family). The dep lands in flux-web — not
+# flux-markdown — so the markdown engine stays parser-free. Pure Rust; build-weight measured in D-120.
+scraper = "0.23"
+
+[dev-dependencies]
+tokio.workspace = true

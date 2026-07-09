@@ -38,6 +38,7 @@ flux-a2a.workspace = true
 flux-server = { workspace = true, features = ["introspect"] }
 flux-tui.workspace = true
 flux-capabilities.workspace = true
+flux-web.workspace = true
 flux-datasource.workspace = true
 flux-plugin.workspace = true
 flux-skill.workspace = true

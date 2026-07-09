@@ -59,8 +59,12 @@ impl PrivateNetGrant {
 /// per-endpoint grants are keyed by `"<plugin>:<endpoint_name>"` (finer than a whole plugin).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateNetConfig {
+    /// The family-wide `web` egress scope: grants private-network access to every native `flux-web`
+    /// op (`http.request`, `web_fetch`, `browser.*`) — the one policy the whole web family answers
+    /// to. (Replaced the per-tool `web_fetch` key in D-120's clean cutover; a legacy `web_fetch = …`
+    /// entry in an old config is now silently ignored — migrate it to `web`.)
     #[serde(default, skip_serializing_if = "PrivateNetGrant::is_default")]
-    pub web_fetch: PrivateNetGrant,
+    pub web: PrivateNetGrant,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, PrivateNetGrant>,
     /// Per-endpoint grants, keyed by `"<plugin>:<endpoint_name>"`. Merged on top of the
@@ -72,7 +76,7 @@ pub struct PrivateNetConfig {
 
 impl PrivateNetConfig {
     fn is_default(&self) -> bool {
-        self.web_fetch.is_default() && self.plugins.is_empty() && self.endpoints.is_empty()
+        self.web.is_default() && self.plugins.is_empty() && self.endpoints.is_empty()
     }
 }
 
@@ -137,8 +141,8 @@ pub struct Config {
     /// Default `provider/model` spec (a CLI `--model` flag overrides this).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Deprecated compatibility flag. If true, only `web_fetch` gets a private-net `*` grant; plugins
-    /// require `[private_net.plugins]` grants.
+    /// Deprecated compatibility flag. If true, the native web family (the `web` scope) gets a
+    /// private-net `*` grant; plugins still require `[private_net.plugins]` grants.
     #[serde(default)]
     pub allow_private_net: bool,
     /// Scoped private-network egress grants.
@@ -169,6 +173,10 @@ pub struct Config {
     /// Filesystem access widening (C-21): extra read-only roots + the unconfined hatch.
     #[serde(default, skip_serializing_if = "WorkspaceConfig::is_default")]
     pub workspace: WorkspaceConfig,
+    /// Path to a Chromium binary for the native browser ops (D-121). Absent → `FLUX_BROWSER_BIN` then
+    /// a `PATH` search for well-known Chromium binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_bin: Option<String>,
 }
 
 /// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
@@ -247,9 +255,11 @@ impl Limits {
 }
 
 impl Config {
-    /// Host patterns allowed to bypass the private-network guard for the `web_fetch` tool.
-    pub fn web_fetch_private_hosts(&self) -> Vec<String> {
-        let mut hosts = self.private_net.web_fetch.to_hosts();
+    /// Host patterns allowed to bypass the private-network guard for the whole native web family
+    /// (`http.request`, `web_fetch`, `browser.*`) — the `[private_net] web` scope. The deprecated
+    /// `allow_private_net` compat flag still widens it to `*` when set.
+    pub fn web_private_hosts(&self) -> Vec<String> {
+        let mut hosts = self.private_net.web.to_hosts();
         if self.allow_private_net && hosts.is_empty() {
             hosts.push("*".to_string());
         }
@@ -452,12 +462,14 @@ fn merge(user: Config, project: Config) -> Config {
             add_dirs: dedupe([project.workspace.add_dirs, user.workspace.add_dirs].concat()),
             allow_all: user.workspace.allow_all || project.workspace.allow_all,
         },
+        // Scalar: a project value overrides the user's.
+        browser_bin: project.browser_bin.or(user.browser_bin),
     }
 }
 
 fn merge_private_net(user: PrivateNetConfig, project: PrivateNetConfig) -> PrivateNetConfig {
     PrivateNetConfig {
-        web_fetch: merge_grant(user.web_fetch, project.web_fetch),
+        web: merge_grant(user.web, project.web),
         plugins: merge_grant_map(user.plugins, project.plugins),
         endpoints: merge_grant_map(user.endpoints, project.endpoints),
     }
@@ -724,7 +736,7 @@ deny = ["Bash(rm:*)"]
         let cfg = load(&dir).unwrap();
         assert_eq!(cfg.model.as_deref(), Some("claude/opus"));
         assert!(cfg.allow_private_net);
-        assert_eq!(cfg.web_fetch_private_hosts(), vec!["*"]);
+        assert_eq!(cfg.web_private_hosts(), vec!["*"]);
         assert!(cfg.plugin_private_hosts("prometheus").is_empty());
         assert_eq!(cfg.permissions.allow, vec!["read", "Bash(git:*)"]);
         assert_eq!(cfg.permissions.deny, vec!["Bash(rm:*)"]);
@@ -842,7 +854,7 @@ readonly_rounds_stop = 20
             home.join(".flux").join("config.toml"),
             r#"
 [private_net]
-web_fetch = ["localhost"]
+web = ["localhost"]
 
 [private_net.plugins]
 prometheus = ["prometheus.local"]
@@ -854,7 +866,7 @@ loki = ["loki.local"]
             &project,
             r#"
 [private_net]
-web_fetch = ["127.0.0.1"]
+web = ["127.0.0.1"]
 
 [private_net.plugins]
 prometheus = ["127.0.0.1"]
@@ -863,10 +875,7 @@ gitlab = true
         );
 
         let cfg = load(&project).unwrap();
-        assert_eq!(
-            cfg.web_fetch_private_hosts(),
-            vec!["localhost", "127.0.0.1"]
-        );
+        assert_eq!(cfg.web_private_hosts(), vec!["localhost", "127.0.0.1"]);
         assert_eq!(
             cfg.plugin_private_hosts("prometheus"),
             vec!["prometheus.local", "127.0.0.1"]

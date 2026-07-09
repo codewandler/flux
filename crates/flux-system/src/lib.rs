@@ -443,6 +443,21 @@ pub struct InteractiveChild {
     pub stdout: tokio::process::ChildStdout,
 }
 
+/// A host-managed child wired to the Chrome DevTools **remote-debugging pipe**: a full-duplex socket
+/// is mapped onto the child's fd 3 (it reads CDP commands) and fd 4 (it writes CDP responses/events),
+/// and the parent's end is handed back as one [`tokio::net::UnixStream`]. Spawned through the same
+/// safety envelope as every other flux subprocess (see [`System::spawn_debug_pipe`]): argv-only,
+/// workspace-pinned cwd, cleared + allow-listed env. `kill_on_drop`, so a dropped handle never leaks
+/// the process. Unix-only (the CDP pipe transport is a POSIX-fd mechanism).
+#[cfg(unix)]
+pub struct PipeChild {
+    /// The child process handle (for `kill`/`wait`/reaping).
+    pub child: tokio::process::Child,
+    /// The parent end of the debug pipe — the host writes framed CDP commands and reads
+    /// responses/events on this one full-duplex stream.
+    pub pipe: tokio::net::UnixStream,
+}
+
 /// The guarded IO surface tools are given. All filesystem access is confined to the workspace;
 /// process execution is argv-only.
 #[derive(Debug, Clone)]
@@ -862,6 +877,68 @@ impl System {
             stdin,
             stdout,
         })
+    }
+
+    /// Spawn a child wired to the Chrome DevTools **remote-debugging pipe**
+    /// (`--remote-debugging-pipe`): a full-duplex `socketpair` is mapped onto the child's fd 3 (CDP
+    /// command input) and fd 4 (CDP response/event output) via a `pre_exec` hook that calls only
+    /// async-signal-safe `dup2`/`fcntl`; the parent keeps the other end ([`PipeChild::pipe`]). Same
+    /// safety envelope as every other flux subprocess via [`build_command`](Self::build_command):
+    /// argv-only (no shell), workspace-pinned cwd, env cleared + allow-listed — so the browser
+    /// child cannot read the host's secrets. `kill_on_drop`. Unix-only.
+    ///
+    /// The caller passes `--remote-debugging-pipe` in `argv`; this method only wires the fds. Must be
+    /// called from within a Tokio runtime (it registers the parent socket with the reactor).
+    #[cfg(unix)]
+    pub fn spawn_debug_pipe(&self, argv: &[String], env: &[(String, String)]) -> Result<PipeChild> {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let (parent_end, child_end) = std::os::unix::net::UnixStream::pair()
+            .map_err(|e| Error::Other(format!("cdp socketpair: {e}")))?;
+        let child_fd = child_end.as_raw_fd();
+
+        let mut cmd = self.build_command(argv, env)?;
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+
+        // SAFETY: the closure runs in the forked child before `exec` and touches only async-signal-safe
+        // libc calls (`dup2`/`fcntl`) on an integer fd captured by value — no allocation, no locks.
+        unsafe {
+            cmd.as_std_mut().pre_exec(move || {
+                // Map the socket onto fd 3 and fd 4. `dup2` clears CLOEXEC on a freshly created target
+                // but is a no-op (leaving CLOEXEC) when target == child_fd — so clear CLOEXEC on both
+                // explicitly, covering the case where the socketpair fd already landed on 3 or 4.
+                if libc::dup2(child_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(child_fd, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(4, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::Other(format!("spawn {}: {e}", argv[0])))?;
+        // The child holds its own copy of the socket (via fork); the parent drops the child end.
+        drop(child_end);
+
+        parent_end
+            .set_nonblocking(true)
+            .map_err(|e| Error::Other(format!("cdp pipe nonblocking: {e}")))?;
+        let pipe = tokio::net::UnixStream::from_std(parent_end)
+            .map_err(|e| Error::Other(format!("cdp pipe async: {e}")))?;
+        Ok(PipeChild { child, pipe })
     }
 }
 

@@ -2,7 +2,7 @@
 id: D-120
 title: web.fetch reads pages as condensed markdown — flux-web condenser + unified fetch egress
 pillar: Agent
-status: ready
+status: done
 priority: 18
 epic: web-capabilities
 design: docs/designs/web-capabilities.md
@@ -19,28 +19,38 @@ security half of the original D-98: the per-tool `web_fetch` private-net special
 in favor of the family-wide `web` scope.
 
 ## Acceptance
-- [ ] Condenser core `flux-web::condense`: `html_to_markdown(html, opts)` parsing via the
-      html5ever family (dep lands in flux-web — flux-markdown stays a pure markdown engine,
-      consumed for AST + writer), readability-style extraction (drop nav/script/boilerplate).
-      Failing-first: golden fixture pages (a well-formed article AND a div-soup page) → expected
-      markdown.
-- [ ] `web_fetch` moves from `flux-capabilities::browser` into flux-web and upgrades in place:
-      `text/html` responses (content-type + sniff) return condensed markdown; non-HTML stays raw;
-      `raw: true` escape hatch; cap applies to the *condensed* output (test pins `len <= cap` —
-      the A-24 lesson). `flux-capabilities/src/browser.rs` retires.
-- [ ] Clean cutover to the D-98 `web` scope: `effective_web_fetch_private_hosts`
-      (`flux-cli/src/main.rs:5497`) and the `[private_net] web_fetch` key are **deleted**
-      (flux-cli + flux-config); D-96's docs/caveat updated. Test: a private-range URL through
-      `web_fetch` is refused without a `web` grant and admitted with one (`PrivateNetAdmit`
-      `caller: "web:web_fetch"`).
-- [ ] Pure op `html_to_markdown` registered (no egress; composes in flux-lang with
-      `http.request`).
-- [ ] Fetched pages contribute `web.page` datasource records (title/url/content — the `websearch`
-      → `web.result` pattern).
-- [ ] Dep-weight check recorded: gate + `flux-codegate` accept the html5ever-family dep in the
-      root workspace (build-time impact measured and noted in this story).
+- [x] Condenser core `flux-web::condense`: `html_to_markdown(html)` parsing via the html5ever family
+      (`scraper`; the dep lands in flux-web — flux-markdown stays a pure markdown engine, consumed for
+      its AST + writer), readability-style extraction (main-content region by text length, boilerplate
+      dropped). Tests: a well-formed article page AND a div-soup page condense to markdown; a table
+      becomes a pipe table; empty input → empty output.
+- [x] `web_fetch` moved from `flux-capabilities::browser` into `flux-web::fetch` and upgraded in
+      place: `text/html` responses (content-type + `looks_like_html` sniff) return condensed markdown;
+      non-HTML stays raw; `raw: true` escape hatch; the byte cap applies to the *condensed* output
+      (`cap_str`, char-boundary safe). `flux-capabilities/src/browser.rs` deleted; the crate's now-unused
+      `reqwest` dep dropped.
+- [x] Clean cutover to the D-98 `web` scope: `effective_web_fetch_private_hosts` (flux-cli) and the
+      `[private_net] web_fetch` key + `web_fetch_private_hosts()` accessor (flux-config) **deleted**;
+      config reference + D-96 note updated; `WHATS-NEW` Action-needed added. Test
+      `private_refused_without_grant_but_admitted_and_audited_with_one`: refused without a `web` grant,
+      admitted with one, audited `PrivateNetAdmit` `caller: "web:web_fetch"`.
+- [x] Pure op `html_to_markdown` registered (no egress, `effects: []`; composes with `http.request`) —
+      test `pure_html_to_markdown_op_condenses_without_egress`.
+- [x] Fetched HTML pages contribute `web.page` datasource records (title/url/content) via a light
+      `flux_web::RecordSink` seam, adapted in flux-cli to the workspace doc-index backend
+      (`BackendRecordSink`). Test `html_is_returned_as_condensed_markdown_and_recorded`.
+- [x] Dep-weight recorded: `scraper 0.23` pulls the html5ever family — `html5ever 0.29`,
+      `markup5ever 0.14`, `cssparser 0.34`, `selectors 0.26`, `ego-tree 0.10`, `string_cache`,
+      `tendril` — all pure Rust and modest. `cargo build --workspace` + `cargo test --workspace` +
+      `flux-codegate` all green.
 
 ## Progress
+- 2026-07-09 — **DONE.** `flux-web::condense` (scraper→flux-markdown AST→writer) + `flux-web::fetch`
+  (`WebFetchTool` markdown upgrade + `HtmlToMarkdownTool`); `register_web` registers all three; the
+  `web_fetch` per-tool egress path deleted end-to-end (flux-cli helper + flux-config field/accessor +
+  merge + tests migrated to `web`); `flux-capabilities::browser` retired; `web.page` records wired via
+  `RecordSink`/`BackendRecordSink`. 15 flux-web tests green; ops-reference/skill/config docs +
+  CHANGELOG + WHATS-NEW updated.
 - 2026-07-09 — **Re-scoped native** (user call): condenser home moves from a feature-gated
   flux-markdown `html` module to `flux-web::condense`; `web_fetch` moves into flux-web; the
   "public-only web_fetch" framing is superseded by the family-wide `web` scope (there is no

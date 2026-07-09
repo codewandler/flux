@@ -2,7 +2,7 @@
 id: D-98
 title: flux-web crate + http.request — native arbitrary HTTP under one scoped web egress policy
 pillar: Core
-status: ready
+status: done
 priority: 17
 epic: web-capabilities
 design: docs/designs/web-capabilities.md
@@ -18,28 +18,39 @@ per-tool special case. Founds the `crates/flux-web` crate every other tier build
 [web-capabilities](../designs/web-capabilities.md): APIs → `http.request`.
 
 ## Acceptance
-- [ ] New L5 library crate `crates/flux-web` (package `codewandler-flux-web`): root `Cargo.toml`
+- [x] New L5 library crate `crates/flux-web` (package `codewandler-flux-web`): root `Cargo.toml`
       `members` + a **path-only** `[workspace.dependencies]` alias (not in the publish closure —
       the `flux-eval` precedent; only flux-cli consumes it) + `"flux-web"` added to the L5 arm of
       the `flux-codegate` layer match (`cargo test -p flux-codegate` green).
-- [ ] Registration via the flux-eval precedent: `flux_web::register_web(&mut registry)` wired at
-      the same four `flux-cli/src/main.rs` sites as `flux_eval::register_eval_ops`.
-- [ ] `http.request` op (`flux-web::http`): `method`, `url`, `headers`, `body`, `timeout` →
+- [x] Registration via the flux-eval precedent: `flux_web::register_web(&mut registry, &opts)` wired
+      at the two `flux-cli/src/main.rs` registration sites (live loop + `skill_ops_registry`) beside
+      `flux_eval::register_eval_ops`. Takes a `WebOptions` (private-net scope + audit sink +
+      grant-source) because — unlike eval ops — web ops do guarded egress; the group-push sites are
+      D-121's (`browser_group()`).
+- [x] `http.request` op (`flux-web::http`): `method`, `url`, `headers`, `body`, `timeout` →
       `status`, response headers (capped), body (capped, char-boundary safe — the `web_fetch`
-      `MAX_BYTES` precedent). Non-2xx is a result, not an op failure (test: 404 returns
-      `status: 404`, op succeeds). Ungated (`group: None`).
-- [ ] The family-wide egress scope: `[private_net] web` (`PrivateNetGrant` shape) resolved once
-      and applied via `flux_system::net::guard_url_scoped` on every call; `--allow-private-net`
-      widens it ephemerally. Failing-first tests: private/loopback target refused without grant;
-      public target allowed; private target + `web` grant → allowed **with** a `PrivateNetAdmit`
-      event (`caller: "web:http.request"`, honest `grant_source`).
-- [ ] Secrets: header values resolved from `secret` references ride `resolve_secrets` and are
-      redactor-seeded (C-13) — test: a Bearer token in a header never appears readable in the tool
-      result rendering or persisted observations (C-22 lesson).
-- [ ] Honest metadata: `Effect::Network`, `NetworkFetch` intent, non-flat risk — plan approval
-      sees it (D-91 lesson).
+      `MAX_BYTES` precedent). Non-2xx is a result, not an op failure (test:
+      `not_found_is_a_result_not_a_failure` — 404 returns Ok, status in body). Ungated (`group: None`).
+- [x] The family-wide egress scope: `[private_net] web` (`PrivateNetGrant` shape) resolved once via
+      `Config::web_private_hosts()` and applied through `flux_system::net::guard_url_scoped` on every
+      call; `--allow-private-net` widens it ephemerally (`effective_web_private_hosts`). Failing-first
+      tests: `private_target_refused_without_grant`; `guard_allows_public_refuses_private`;
+      `private_admit_emits_audit_event` (private target + `web` grant → allowed **with** a
+      `PrivateNetAdmit`, `caller: "web:http.request"`, honest `grant_source`).
+- [x] Secrets: header values that are `{"$secret": "ENV"}` markers are resolved from the environment
+      and seeded into `ctx.redactor` — test `secret_header_is_resolved_and_seeded_into_the_redactor`
+      proves the value is scrubbed; `missing_secret_header_env_is_a_clean_error` names the var.
+- [x] Honest metadata: `Effect::Network`, `NetworkFetch` intent, `Risk::Medium` + `NonIdempotent`
+      (arbitrary HTTP can mutate) — plan approval sees it (D-91 lesson).
 
 ## Progress
+- 2026-07-09 — **DONE.** Crate scaffolded (`crates/flux-web`: `lib.rs` with `register_web`/`WebOptions`,
+  `http.rs`). Root `Cargo.toml` member + path-only alias; `flux-web` added to the flux-codegate L5 arm
+  (codegate green). `[private_net] web` field + `Config::web_private_hosts()` in flux-config;
+  `effective_web_private_hosts` / `web_grant_source` helpers + `register_web` wiring at both flux-cli
+  sites (audit sink = the same `EventStoreEgressAudit` the plugin path uses). 6 crate tests green;
+  ops-reference / flux-flow skill / website config docs updated; CHANGELOG + WHATS-NEW entries. The
+  `web_fetch` per-tool key is retained here and retired by D-120's cutover.
 - 2026-07-09 — **Re-scoped native** (user call): the web capabilities are table-stakes and none
   should sit behind a plugin install; the earlier plugin shape (plugins/web over host `http.do`,
   manifest `http_hosts: ["*"]` wildcard) is dropped — the family-wide `[private_net] web` scope
