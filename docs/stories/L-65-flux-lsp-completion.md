@@ -2,7 +2,7 @@
 id: L-65
 title: flux-lsp completion — ops, node-kinds, prelude types, in-scope $vars
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
@@ -26,7 +26,11 @@ node-kind keywords, prelude types, and the `$vars` in scope at the cursor — ch
 - [ ] Failing-first: completion at a chosen offset returns the expected op/keyword/`$var` set.
 
 ## Progress
-- (not started — depends on L-64)
+- Done 2026-07-09: `textDocument/completion` from the Rust SSOT catalogs — registered ops
+  (`OpRegistry::signatures`, precomputed once at startup), node-kind keywords
+  (`schema::node_kind_rows`), prelude types (`prelude::prelude_type_rows`), and in-scope `$vars`
+  scraped from the buffer. Verified over the LSP session (labeled items returned). Cursor-context
+  narrowing beyond the client's own prefix filtering is a later refinement.
 
 ## Notes
 - Depends on **L-64**. Build the registry once (`catalog.rs`); the IntelliJ `FluxVocabulary.kt` is

@@ -44,10 +44,6 @@ _None._
 ### flux-lsp — a Language Server for Flux-Lang, wired into Helix
 _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compile`; the IntelliJ_
 - [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
-- [L-64 — flux-lsp crate — tower-lsp server, text sync, diagnostics, Helix wiring](L-64-flux-lsp-crate-diagnostics-helix.md) · Language · LSP MVP — the end-to-end Helix loop: a standalone flux-lsp binary (L6) publishing positioned diagnostics, wired to hx config-only.
-- [L-65 — flux-lsp completion — ops, node-kinds, prelude types, in-scope $vars](L-65-flux-lsp-completion.md) · Language · LSP completion from the Rust SSOT catalogs + a CST scope walk; cursor context from the token at the offset.
-- [L-66 — flux-lsp hover — op signatures/schemas + node-kind & prelude docs](L-66-flux-lsp-hover.md) · Language · LSP hover via token-at-offset hit-testing on the CST → op signature / node-kind doc / prelude doc.
-- [L-67 — flux-lsp formatting + a `flux fmt` CLI verb](L-67-flux-lsp-formatting-and-fmt-verb.md) · Language · LSP textDocument/formatting via format::format on a clean parse, plus a first-class `flux fmt [--check]` verb (none exists today).
 - [L-68 — flux-lsp document symbols + go-to-definition](L-68-flux-lsp-symbols-and-goto-def.md) · Language · Navigation — a CST scope model with definition ranges powers documentSymbol + definition.
 - [L-69 — flux-lsp semantic tokens — Helix highlighting](L-69-flux-lsp-semantic-tokens.md) · Language · Highlighting via LSP semantic tokens from the CST token stream — Helix has no tree-sitter-flux, so this is its highlighting path (near-free from the CST).
 - [L-70 — Incremental reparse + comment-preserving format + docs/packaging + epic close](L-70-flux-lsp-incremental-docs-epic-close.md) · Language · Epic close — the CST payoffs (incremental reparse, comment-preserving format) + install/Helix docs + distribution + final gate.
@@ -330,6 +326,10 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-61 — Native syntax — Confirm / Throttle / Debounce / Verify + Peek / Parse](L-61-native-syntax-guardrails-and-sugar.md) · Language · @json coverage 2/4 — GATED on isolation. Native text for the guard-rail nodes plus the peek/parse expression sugar (parse( needs a fmt(-style special-case).
 - [L-62 — Native syntax — Try / Race / Scope / Saga / Pipe (arm/body control-flow)](L-62-native-syntax-arm-body-control-flow.md) · Language · @json coverage 3/4 — GATED on isolation. Native text for the arm/body control-flow nodes, reusing the match/case/branch parser machinery.
 - [L-63 — Native syntax — Thing (kind + selector grammar)](L-63-native-syntax-thing.md) · Language · @json coverage 4/4 — GATED on isolation. The heaviest/most structural node (kind-enum + selector); cleanly deferrable if scope needs trimming.
+- [L-64 — flux-lsp crate — tower-lsp server, text sync, diagnostics, Helix wiring](L-64-flux-lsp-crate-diagnostics-helix.md) · Language · LSP MVP — the end-to-end Helix loop: a standalone flux-lsp binary (L6) publishing positioned diagnostics, wired to hx config-only.
+- [L-65 — flux-lsp completion — ops, node-kinds, prelude types, in-scope $vars](L-65-flux-lsp-completion.md) · Language · LSP completion from the Rust SSOT catalogs + a CST scope walk; cursor context from the token at the offset.
+- [L-66 — flux-lsp hover — op signatures/schemas + node-kind & prelude docs](L-66-flux-lsp-hover.md) · Language · LSP hover via token-at-offset hit-testing on the CST → op signature / node-kind doc / prelude doc.
+- [L-67 — flux-lsp formatting + a `flux fmt` CLI verb](L-67-flux-lsp-formatting-and-fmt-verb.md) · Language · LSP textDocument/formatting via format::format on a clean parse, plus a first-class `flux fmt [--check]` verb (none exists today).
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

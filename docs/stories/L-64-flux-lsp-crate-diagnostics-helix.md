@@ -2,7 +2,7 @@
 id: L-64
 title: flux-lsp crate — tower-lsp server, text sync, diagnostics, Helix wiring
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
@@ -27,7 +27,13 @@ via the L-59 side-map), wired into Helix so `hx foo.flux` works end-to-end.
       at the expected range. Manual `hx` smoke documented.
 
 ## Progress
-- (not started — depends on the CST foundation L-59)
+- Done 2026-07-09: new `crates/flux-lsp` (L6 binary `flux-lsp`, tower-lsp/stdio); registered in root
+  `Cargo.toml` members, the L6 arm of `flux-codegate::layer()`, and `docs/architecture.md`.
+  `initialize` advertises diagnostics/completion/hover/formatting; FULL text sync + document store;
+  `publishDiagnostics` from the CST parser (`parse_cst`) with real byte→UTF-16 span mapping via a
+  `LineIndex`. `.helix/languages.toml` committed. Verified over a real LSP stdio handshake (capabilities
+  + positioned diagnostics on didOpen) plus unit tests. Diagnostics use the CST directly rather than
+  the re-pointed `parse` (L-59), which stays a future unification.
 
 ## Notes
 - Depends on **L-59** (the CST + range side-map). Deps: `flux-lang`, `flux-flow`, `flux-tools`,

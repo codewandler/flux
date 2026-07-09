@@ -2,7 +2,7 @@
 id: L-66
 title: flux-lsp hover — op signatures/schemas + node-kind & prelude docs
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
@@ -24,7 +24,10 @@ signature/schema for an op call, the node-kind doc for a keyword, the prelude-ty
 - [ ] Failing-first: hover over an op call returns its signature; over a keyword returns its doc.
 
 ## Progress
-- (not started — depends on L-64)
+- Done 2026-07-09: `textDocument/hover` — the identifier under the cursor is resolved against the op
+  catalog (renders the `OpSignature`: params, effects, risk, idempotency), then node-kind docs, then
+  prelude-type docs. Verified live: hover on `read` returns
+  `**read**(path, limit?, offset?) — Read one UTF-8 file, a list of files, or a glob pattern.`
 
 ## Notes
 - Depends on **L-64**. Reuses the `catalog.rs` cache from L-65.

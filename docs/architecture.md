@@ -26,7 +26,7 @@ the *surfaces* (CLI/TUI/server/SDK).
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
 | **L5 capabilities** | `flux-capabilities` `flux-auth` | web egress + datasource/RAG tools (`browser`/`datasource` modules); caller identity (separate) |
-| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack) |
+| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` `flux-lsp` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack), the Flux-Lang language server |
 
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
 envelope" structurally hard. Notable rules that fall out:
@@ -97,6 +97,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-sdk` | L6 | embeddable API (`Client` + `FlowClient`, DSL, recipes) | — |
 | `flux-app` | L6 | multi-agent Program runtime host (`flux run app.flux`) | — |
 | `flux-channels` | L6 | event-trigger channels: cron / webhook / Slack adapters that wake a `flux-app` program's journeys | — |
+| `flux-lsp` | L6 | Flux-Lang language server (`flux-lsp` binary): CST-driven diagnostics, completion, hover, formatting; wired into Helix config-only | — |
 | `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
 | `flux-capabilities` | L5 | `browser` (`web_fetch`, SSRF-guarded; CDP deferred) + `datasource` (keyword index + search; RAG deferred) modules | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
 | `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |

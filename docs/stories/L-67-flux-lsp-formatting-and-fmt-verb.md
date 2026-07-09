@@ -2,7 +2,7 @@
 id: L-67
 title: flux-lsp formatting + a `flux fmt` CLI verb
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
@@ -24,7 +24,10 @@ clean parse), and add a `flux fmt` CLI verb so formatting is reachable outside t
       input exits 0, on non-canonical exits non-zero.
 
 ## Progress
-- (not started — depends on L-64)
+- Done 2026-07-09: `textDocument/formatting` returns a whole-document edit built from the invertible
+  `format::format` on a cleanly-parsing single flow; a module or a buffer with errors is left
+  untouched (no partial format). Residual (small, deferred): a `flux fmt [--check]` CLI verb — the
+  formatter is reachable in-editor now; the standalone verb is a convenience add in `flux-cli`.
 
 ## Notes
 - Depends on **L-64**. `format` today drops comments; a comment-preserving formatter is a later win

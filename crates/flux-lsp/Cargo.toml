@@ -1,0 +1,20 @@
+[package]
+name = "flux-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language Server (LSP) for Flux-Lang — diagnostics, completion, hover, formatting."
+
+[[bin]]
+name = "flux-lsp"
+path = "src/main.rs"
+
+[dependencies]
+flux-lang.workspace = true
+flux-flow.workspace = true
+flux-tools.workspace = true
+flux-runtime.workspace = true
+tower-lsp.workspace = true
+tokio = { workspace = true }
+serde_json.workspace = true

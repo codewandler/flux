@@ -36,6 +36,7 @@ members = [
     "crates/flux-markdown",
     "crates/flux-channels",
     "crates/flux-audio",
+    "crates/flux-lsp",
 ]
 # `plugins/` is its own nested cargo workspace (the integration plugin pack, D-08): subprocess binaries
 # with heavy vendor deps (k8s client, cloud SDKs) kept OUT of the main flux gate. Built separately.
@@ -139,6 +140,8 @@ slack-morphism = ">=2.10, <2.18"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Language server (flux-lsp): tower-lsp bundles lsp-types + the async JSON-RPC stdio loop.
+tower-lsp = "0.20"
 # Plugin pack distribution (D-47): verify the minisign-signed `plugins-index.json`
 # (`minisign-verify` is pure Rust, zero dependencies) and unpack the per-target archives
 # (`tar` + `lzma-rs` for `.tar.xz` on unix/macOS targets, `zip` for `.zip` on the windows target).

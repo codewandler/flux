@@ -42,7 +42,7 @@ pub fn layer(name: &str) -> Option<u8> {
         "flux-capabilities" | "flux-auth" => 5,
         // L6 — surfaces / apps (and this lint crate itself)
         "flux-sdk" | "flux-server" | "flux-tui" | "flux-cli" | "flux-codegate" | "flux-app"
-        | "flux-channels" => 6,
+        | "flux-channels" | "flux-lsp" => 6,
         _ => return None,
     })
 }

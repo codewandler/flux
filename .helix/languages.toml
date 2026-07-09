@@ -1,0 +1,18 @@
+# Flux-Lang editor support for Helix (`hx`) — config only, no extension needed.
+#
+# Build the server once (`cargo build -p flux-lsp`) and put the binary on PATH, or point `command`
+# at the built binary (e.g. `target/debug/flux-lsp`). Then `hx foo.flux` gets live diagnostics
+# (error-recovering, with real spans), op/keyword/`$var` completion, hover, and `:format`.
+#
+# This repo-local file is merged over your global `~/.config/helix/languages.toml`.
+
+[language-server.flux-lsp]
+command = "flux-lsp"
+
+[[language]]
+name = "flux"
+scope = "source.flux"
+file-types = ["flux"]
+comment-token = "#"
+indent = { tab-width = 2, unit = "  " }
+language-servers = ["flux-lsp"]
