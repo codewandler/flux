@@ -24,15 +24,25 @@ flux run -m openai/gpt-5 "summarize this repository"
 flux run -m ollama/qwen2.5-coder:7b "explain the provider layer"
 ```
 
-Bare aliases resolve to Anthropic: `opus` → `claude-opus-4-8`, `sonnet` → `claude-sonnet-4-6`,
-`haiku` → `claude-haiku-4-5-20251001`. The default model is `sonnet`.
+Bare aliases resolve to Anthropic and track the current generation of each tier: `fable` →
+`claude-fable-5`, `opus` → `claude-opus-4-8`, `sonnet` → `claude-sonnet-5`, `haiku` →
+`claude-haiku-4-5`. The default model is `sonnet`. Bare `claude` is shorthand for `claude/sonnet`
+(the [Claude Code subscription](./claude-code.md) provider).
+
+flux gates the optional Messages-API fields per model, so every alias and id works: adaptive
+thinking and `output_config.effort` are only sent to models that accept them (the 4.6 family and
+newer — Haiku 4.5 and older reject them with HTTP 400), and `temperature`/`top_p` are omitted for
+the generations that reject sampling params (Fable 5, Opus ≥ 4.7, Sonnet ≥ 5). Unknown or future
+ids default to the newest shape, so a new Anthropic generation works on day one. The gating
+applies wherever an Anthropic model is served: `anthropic`, `claude`, `aws` (Bedrock
+inference-profile ids), and `openrouter-anthropic` (`anthropic/…` slugs).
 
 ## Supported providers
 
 | `-m` prefix | Wire | Credential | Notes |
 |---|---|---|---|
-| `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | bare aliases `opus` / `sonnet` / `haiku` |
-| `claude` | Anthropic Messages | Claude subscription OAuth | opt-in: `flux auth login claude` |
+| `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | bare aliases `fable` / `opus` / `sonnet` / `haiku` |
+| `claude` | Anthropic Messages | Claude subscription OAuth | [Claude Code subscription](./claude-code.md); bare `claude` = `claude/sonnet` |
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | full streaming + tool calls |
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth | opt-in: `flux auth login codex` |
 | `aws` | Anthropic Messages (Bedrock) | AWS chain (env / SSO / IRSA / EKS) | Claude via Bedrock; no `aws` CLI; region-aware ids; metered |

@@ -17,6 +17,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ```bash
 # Bare aliases resolve to Anthropic automatically
+flux run -m fable   "design the migration plan"
 flux run -m opus    "refactor this module"
 flux run -m sonnet  "explain the auth flow"
 flux run -m haiku   "summarise README.md"
@@ -24,14 +25,44 @@ flux run -m haiku   "summarise README.md"
 # Fully qualified form
 flux run -m anthropic/claude-opus-4-8      "write tests for the parser"
 flux run -m anthropic/claude-sonnet-4-6    "review this PR"
-flux run -m anthropic/claude-haiku-4-5-20251001     "quick lint pass"
+flux run -m anthropic/claude-haiku-4-5     "quick lint pass"
 ```
+
+### Model aliases
+
+The short aliases track the **current** generation of each tier; an explicit id is passed through
+verbatim (a future id works without a flux release). One owner:
+`flux_providers::anthropic::resolve_model` (mirrored for pricing in `flux-core`).
+
+| Alias | Resolves to | Tier |
+|---|---|---|
+| `fable` | `claude-fable-5` | Most capable |
+| `opus` | `claude-opus-4-8` | Frontier coding/agentic |
+| `sonnet` | `claude-sonnet-5` | Default — speed/quality balance |
+| `haiku` | `claude-haiku-4-5` | Fastest, cheapest |
+
+### Per-model request invariants
+
+flux gates the optional Messages-API fields per model, so every alias and id above **works** —
+the request never carries a field the model rejects (C-49):
+
+- **Adaptive thinking** (`thinking: {"type": "adaptive"}`) is sent only to models that accept it
+  (the 4.6 family and newer: Fable 5, Opus ≥ 4.6, Sonnet ≥ 4.6). Haiku 4.5 and every older model
+  reject it with HTTP 400, so they get no `thinking` field at all.
+- **Effort** (`output_config.effort`) follows the same gate.
+- **Sampling params** (`temperature`, `top_p`) are omitted for the generations that reject them
+  outright (Fable 5, Opus ≥ 4.7, Sonnet ≥ 5) and still sent to the models that accept them.
+- Unknown/future ids default to the newest shape (adaptive thinking on, sampling params off) —
+  a new Anthropic generation works day one.
+
+The same gating applies wherever an Anthropic model is served: `anthropic`, `claude`, `aws`
+(Bedrock inference-profile ids), and `openrouter-anthropic` (`anthropic/…` slugs).
 
 ### Config file
 
 ```toml
 # .flux/config.toml  (or ~/.flux/config.toml for a user-wide default)
-model = "anthropic/claude-sonnet-4-6"
+model = "anthropic/claude-sonnet-5"
 ```
 
 ### Notes
@@ -39,6 +70,33 @@ model = "anthropic/claude-sonnet-4-6"
 - `--think` / `--effort` exist as hidden flags but are not yet wired into the engine — currently no-ops.
 - Prompt caching is applied automatically for long context windows.
 - Streaming is fully supported; token deltas are shown in the TUI and REPL.
+
+## Claude subscription (`claude`) — Claude Code / Claude Max OAuth
+
+**Wire:** Anthropic Messages API (same codec and per-model invariants as `anthropic`)
+**Auth:** OAuth Bearer token — imported from Claude Code (`~/.claude/.credentials.json`) or via `flux auth login claude`
+
+The `claude` provider bills against a **Claude subscription** (Claude Max / Claude Code) instead
+of the metered API. Costs shown by flux for these runs are the *equivalent* metered figure,
+marked `(sub)`.
+
+```bash
+flux run -m claude          "explain the auth flow"   # bare `claude` = claude/sonnet
+flux run -m claude/opus     "refactor this module"
+flux run -m claude/fable    "design the migration plan"
+flux run -m claude/claude-sonnet-4-6  "pin the previous sonnet"
+```
+
+Subscription-specific invariants, on top of the per-model gating above:
+
+- Requests authenticate with `Authorization: Bearer …` plus the `anthropic-beta: oauth-2025-04-20`
+  header (never `x-api-key`).
+- The token is gated to the Claude Code product: flux prefixes the system prompt with the Claude
+  Code identity line, then appends its own system segments.
+- Model access follows the subscription: everything the alias table lists resolves, including
+  `fable` (`claude-fable-5`).
+- A spec with an empty model (`claude/`) is rejected client-side with a hint; it never reaches
+  the API.
 
 ## AWS Bedrock
 
@@ -275,9 +333,11 @@ model = "ollama/qwen2.5-coder:7b"
 
 | Use case | Recommended | Rationale |
 |---|---|---|
-| Daily coding, file edits | `anthropic/claude-sonnet-4-6` | Fast, strong at code, supports caching |
-| Long planning / reasoning | `anthropic/claude-opus-4-8` | Highest capability |
-| Quick summarise / lint | `anthropic/claude-haiku-4-5-20251001` | Cheapest, low latency |
+| Daily coding, file edits | `sonnet` (= `anthropic/claude-sonnet-5`) | Fast, strong at code, supports caching |
+| Long planning / reasoning | `opus` (= `anthropic/claude-opus-4-8`) | Frontier coding/agentic capability |
+| Hardest, long-horizon work | `fable` (= `anthropic/claude-fable-5`) | Most capable model |
+| Quick summarise / lint | `haiku` (= `anthropic/claude-haiku-4-5`) | Cheapest, low latency |
+| On a Claude subscription | `claude/sonnet`, `claude/opus`, … | Same models, billed to the subscription |
 | Multi-provider fallback | `openrouter/anthropic/claude-sonnet-4-6` | Same model, OpenRouter routing |
 | GLM / Zhipu AI work | `openrouter-anthropic/z-ai/glm-4.6` | Reliable GLM tool calling via the Messages endpoint |
 | Local / offline coding | `ollama/qwen2.5-coder:7b` | Runs on your machine, no key; needs a tool-capable model |
@@ -300,8 +360,8 @@ Run `flux auth status` to see what credentials are currently resolved and from w
 
 | `-m` prefix | Wire | Env var | Notes |
 |---|---|---|---|
-| `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | Supported; bare aliases `opus`/`sonnet`/`haiku` |
-| `claude` | Anthropic Messages | — | Claude subscription OAuth; opt-in (`flux auth login claude`) |
+| `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` | Supported; bare aliases `fable`/`opus`/`sonnet`/`haiku` |
+| `claude` | Anthropic Messages | — | Claude subscription OAuth; opt-in (`flux auth login claude`); bare `claude` = `claude/sonnet` |
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | Full streaming + tool-call support |
 | `codex` | OpenAI Responses | — | ChatGPT/Codex OAuth; opt-in (`flux auth login codex`) |
 | `aws` | Anthropic Messages (Bedrock) | `AWS_*` / SSO / IRSA / EKS Pod Identity | Claude via AWS Bedrock; full credential chain, no `aws` CLI; metered; region-aware model ids |

@@ -13,6 +13,7 @@ const sidebars = {
         'agent/cli',
         'agent/agent-loop',
         'agent/providers',
+        'agent/claude-code',
         'agent/safety',
         'agent/a2a',
         'agent/programs',

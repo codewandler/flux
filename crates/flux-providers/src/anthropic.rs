@@ -11,7 +11,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
+use crate::messages::{
+    anthropic_model_caps, build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile,
+};
 use flux_core::{Error, Result};
 use flux_provider::{
     ByteStream, ChunkStream, Credential, NativeProvider, Request, TokenSource, WireCodec,
@@ -29,16 +31,21 @@ const CLAUDE_CODE_SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's offici
 // Quirks profile
 // ---------------------------------------------------------------------------
 
-/// Anthropic-direct quirks: the full Messages feature set. Non-Anthropic gateways (OpenRouter,
-/// ollama) supply more conservative profiles in their own crates.
+/// Anthropic-direct quirks: the full Messages feature set, gated per model by
+/// [`anthropic_model_caps`] (C-49) — Haiku 4.5 and every pre-4.6 model reject adaptive thinking
+/// and `output_config.effort` with HTTP 400, and the newest generations (Fable 5, Opus ≥ 4.7,
+/// Sonnet ≥ 5) reject `temperature`/`top_p`. Non-Anthropic gateways (OpenRouter, ollama) supply
+/// more conservative profiles in their own crates.
 pub struct AnthropicProfile;
 
 impl ProviderProfile for AnthropicProfile {
-    fn quirks_for(&self, _model: &str) -> MessagesQuirks {
+    fn quirks_for(&self, model: &str) -> MessagesQuirks {
+        let caps = anthropic_model_caps(model);
         MessagesQuirks {
             prompt_caching: true,
-            thinking_adaptive: true,
-            effort_output_config: true,
+            thinking_adaptive: caps.adaptive_thinking,
+            effort_output_config: caps.effort,
+            sampling_params: caps.sampling_params,
             extra_body: Default::default(),
         }
     }
@@ -156,9 +163,10 @@ pub fn claude_oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
 /// only the documented short aliases are rewritten.
 pub fn resolve_model(alias: &str) -> String {
     match alias {
-        "sonnet" => "claude-sonnet-4-6",
+        "sonnet" => "claude-sonnet-5",
         "opus" => "claude-opus-4-8",
-        "haiku" => "claude-haiku-4-5-20251001",
+        "haiku" => "claude-haiku-4-5",
+        "fable" => "claude-fable-5",
         other => other,
     }
     .to_string()
@@ -171,9 +179,11 @@ mod tests {
 
     #[test]
     fn resolve_model_maps_short_aliases_to_canonical_ids() {
-        assert_eq!(resolve_model("sonnet"), "claude-sonnet-4-6");
+        // Keep in lock-step with the layer-forced mirror in `flux_core::pricing::resolve_alias`.
+        assert_eq!(resolve_model("sonnet"), "claude-sonnet-5");
         assert_eq!(resolve_model("opus"), "claude-opus-4-8");
-        assert_eq!(resolve_model("haiku"), "claude-haiku-4-5-20251001");
+        assert_eq!(resolve_model("haiku"), "claude-haiku-4-5");
+        assert_eq!(resolve_model("fable"), "claude-fable-5");
     }
 
     #[test]
@@ -189,7 +199,44 @@ mod tests {
         assert!(q.prompt_caching);
         assert!(q.thinking_adaptive);
         assert!(q.effort_output_config);
+        assert!(q.sampling_params);
         assert!(q.extra_body.is_empty());
+    }
+
+    #[test]
+    fn profile_gates_thinking_and_effort_off_for_haiku() {
+        // C-49: `claude/haiku` 400ed with "adaptive thinking is not supported on this model"
+        // because the profile ignored the model. Haiku 4.5 must get neither adaptive thinking
+        // nor `output_config.effort`.
+        for id in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
+            let q = AnthropicProfile.quirks_for(id);
+            assert!(!q.thinking_adaptive, "{id}");
+            assert!(!q.effort_output_config, "{id}");
+            assert!(q.sampling_params, "{id}");
+        }
+    }
+
+    #[test]
+    fn profile_gates_sampling_params_off_for_the_newest_generations() {
+        for id in ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5"] {
+            let q = AnthropicProfile.quirks_for(id);
+            assert!(q.thinking_adaptive, "{id}");
+            assert!(!q.sampling_params, "{id}");
+        }
+    }
+
+    #[test]
+    fn codec_omits_thinking_for_haiku_even_when_requested() {
+        // End-to-end through the codec: the request asks for thinking, the model can't take it,
+        // the body must not carry the field (it would be an HTTP 400).
+        let req = Request::new("claude-haiku-4-5", "hi").with_thinking(true);
+        let body = AnthropicMessages.build_body(&req).unwrap();
+        assert!(body.get("thinking").is_none());
+
+        // The same request against a 4.6-family model keeps adaptive thinking.
+        let req = Request::new("claude-sonnet-4-6", "hi").with_thinking(true);
+        let body = AnthropicMessages.build_body(&req).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
     }
 
     #[test]

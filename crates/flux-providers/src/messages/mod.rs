@@ -23,7 +23,7 @@ use flux_provider::{ByteStream, ChunkStream};
 mod quirks;
 mod wire;
 
-pub use quirks::{MessagesQuirks, ProviderProfile};
+pub use quirks::{anthropic_model_caps, AnthropicModelCaps, MessagesQuirks, ProviderProfile};
 use wire::{StreamEvent, WireBlock, WireDelta};
 
 // Convenience re-exports so the sibling provider modules get the request shape they build against
@@ -78,11 +78,15 @@ pub fn build_messages_body(req: &Request, q: &MessagesQuirks) -> Result<Value> {
         body["tools"] = serde_json::to_value(&req.tools)?;
     }
     if req.thinking && q.thinking_adaptive {
-        // Current Anthropic models accept only adaptive thinking; the older
+        // 4.6-family+ models accept only adaptive thinking; the older
         // `{type:"enabled",budget_tokens}` shape now 400s. Temperature is rejected alongside it.
+        // Models that predate adaptive thinking (`thinking_adaptive: false` — e.g. Haiku 4.5) get
+        // NO `thinking` field at all: sending the adaptive shape is a hard 400 there (C-49).
         body["thinking"] = json!({ "type": "adaptive" });
     } else if let Some(t) = req.temperature {
-        body["temperature"] = json!(t);
+        if q.sampling_params {
+            body["temperature"] = json!(t);
+        }
     }
     if q.effort_output_config {
         if let Some(effort) = req.effort {
@@ -90,7 +94,10 @@ pub fn build_messages_body(req: &Request, q: &MessagesQuirks) -> Result<Value> {
         }
     }
     if let Some(p) = req.top_p {
-        body["top_p"] = json!(p);
+        // Like temperature: rejected outright by the newest Anthropic generations (C-49).
+        if q.sampling_params {
+            body["top_p"] = json!(p);
+        }
     }
     if !req.stop_sequences.is_empty() {
         body["stop_sequences"] = json!(req.stop_sequences);
@@ -521,8 +528,51 @@ mod tests {
             prompt_caching: true,
             thinking_adaptive: true,
             effort_output_config: true,
+            sampling_params: true,
             extra_body: Default::default(),
         }
+    }
+
+    #[test]
+    fn thinking_and_effort_are_omitted_when_the_model_rejects_them() {
+        // The C-49 regression shape: a haiku-class model with thinking requested must get a body
+        // with NO `thinking` and NO `output_config` — both are hard 400s on that generation.
+        let req = Request::new("claude-haiku-4-5", "hi")
+            .with_thinking(true)
+            .with_effort(Effort::High);
+        let q = MessagesQuirks {
+            thinking_adaptive: false,
+            effort_output_config: false,
+            ..anthropic_quirks()
+        };
+        let body = build_messages_body(&req, &q).unwrap();
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn sampling_params_are_omitted_when_the_model_rejects_them() {
+        // Fable/Opus-4.7+/Sonnet-5 reject `temperature`/`top_p` outright; with thinking OFF the
+        // builder previously fell back to emitting them.
+        let mut req = Request::new("claude-fable-5", "hi");
+        req.temperature = Some(0.25);
+        req.top_p = Some(0.5);
+        let q = MessagesQuirks {
+            sampling_params: false,
+            ..anthropic_quirks()
+        };
+        let body = build_messages_body(&req, &q).unwrap();
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+
+        // …and a model that accepts them still gets them (thinking off). Dyadic values so the
+        // f32 → JSON number round-trip compares exactly.
+        let mut req = Request::new("claude-sonnet-4-6", "hi");
+        req.temperature = Some(0.25);
+        req.top_p = Some(0.5);
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["top_p"], 0.5);
     }
 
     #[test]

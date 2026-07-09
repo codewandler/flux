@@ -32,7 +32,9 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
+use crate::messages::{
+    anthropic_model_caps, build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile,
+};
 use flux_core::{Error, Result};
 use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
 
@@ -48,15 +50,20 @@ const SIGV4_ALGO: &str = "AWS4-HMAC-SHA256";
 // ---------------------------------------------------------------------------
 
 /// Bedrock passes the full Anthropic Messages feature set through to the same backend — the same
-/// profile as Anthropic-direct.
+/// profile as Anthropic-direct, including the per-model capability gating (C-49):
+/// [`anthropic_model_caps`] understands inference-profile ids
+/// (`global.anthropic.claude-haiku-4-5-20251001-v1:0`), so `aws/haiku` no longer sends adaptive
+/// thinking to a model that rejects it.
 pub struct BedrockProfile;
 
 impl ProviderProfile for BedrockProfile {
-    fn quirks_for(&self, _model: &str) -> MessagesQuirks {
+    fn quirks_for(&self, model: &str) -> MessagesQuirks {
+        let caps = anthropic_model_caps(model);
         MessagesQuirks {
             prompt_caching: true,
-            thinking_adaptive: true,
-            effort_output_config: true,
+            thinking_adaptive: caps.adaptive_thinking,
+            effort_output_config: caps.effort,
+            sampling_params: caps.sampling_params,
             extra_body: Default::default(),
         }
     }
@@ -1411,6 +1418,27 @@ mod tests {
             region: "us-east-1".to_string(),
             expiration: None,
         }
+    }
+
+    #[test]
+    fn profile_gates_thinking_off_for_haiku_inference_profiles() {
+        // C-49: `aws/haiku` resolves to a haiku inference-profile id; adaptive thinking and
+        // `output_config.effort` are hard 400s on that generation, so the profile must gate both
+        // off — through Bedrock's regional/global prefixes and `-v1:0` suffix.
+        for id in [
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        ] {
+            let q = BedrockProfile.quirks_for(id);
+            assert!(!q.thinking_adaptive, "{id}");
+            assert!(!q.effort_output_config, "{id}");
+            assert!(q.sampling_params, "{id}");
+        }
+        // The 4.6-family profiles keep the full feature set.
+        let q = BedrockProfile.quirks_for("us.anthropic.claude-sonnet-4-6");
+        assert!(q.thinking_adaptive);
+        assert!(q.effort_output_config);
+        assert!(q.sampling_params);
     }
 
     #[test]

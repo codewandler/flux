@@ -156,9 +156,10 @@ fn split_provider(spec: &str) -> (Option<&str>, &str) {
 /// is not mirrored here — pricing keys by the resolved canonical id, so it never sees the alias.)
 fn resolve_alias(model: &str) -> &str {
     match model {
-        "sonnet" => "claude-sonnet-4-6",
+        "sonnet" => "claude-sonnet-5",
         "opus" => "claude-opus-4-8",
-        "haiku" => "claude-haiku-4-5-20251001",
+        "haiku" => "claude-haiku-4-5",
+        "fable" => "claude-fable-5",
         other => other,
     }
 }
@@ -582,9 +583,9 @@ mod tests {
             output_tokens: 1_000_000,
             ..Default::default()
         };
-        // sonnet → claude-sonnet-4-6: 3 + 15 = 18.
+        // sonnet → claude-sonnet-5 (intro rates): 2 + 10 = 12.
         let m = builtin.cost(&u, "claude/sonnet").unwrap();
-        assert!((m.usd - 18.0).abs() < 1e-9, "got {}", m.usd);
+        assert!((m.usd - 12.0).abs() < 1e-9, "got {}", m.usd);
         // `anthropic/claude-sonnet-4-6` resolves to the same rates via prefix-strip.
         let m2 = builtin.cost(&u, "anthropic/claude-sonnet-4-6").unwrap();
         assert!((m2.usd - 18.0).abs() < 1e-9, "got {}", m2.usd);
@@ -613,7 +614,11 @@ mod tests {
         // Alias resolution + prefixing.
         assert_eq!(
             canonical_model_spec(Some("anthropic"), "sonnet"),
-            "anthropic/claude-sonnet-4-6"
+            "anthropic/claude-sonnet-5"
+        );
+        assert_eq!(
+            canonical_model_spec(Some("claude"), "fable"),
+            "claude/claude-fable-5"
         );
         // Bedrock regional routing prefix strips to the region-less id.
         assert_eq!(

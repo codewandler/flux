@@ -33,6 +33,8 @@ impl ProviderProfile for OllamaProfile {
             prompt_caching: false,
             thinking_adaptive: true,
             effort_output_config: false,
+            // Local models take the classic sampling params; nothing to gate.
+            sampling_params: true,
             extra_body: Default::default(),
         }
     }

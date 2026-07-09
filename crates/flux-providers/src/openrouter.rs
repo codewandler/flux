@@ -13,7 +13,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
+use crate::messages::{
+    anthropic_model_caps, build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile,
+};
 use flux_core::{Error, Result};
 use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
 
@@ -25,24 +27,38 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 // ---------------------------------------------------------------------------
 
 /// OpenRouter quirks. Conservative across the gateway's many non-Claude models: the Anthropic
-/// `output_config.effort` is off (not all upstreams accept it); adaptive thinking stays on.
-/// `provider.require_parameters` makes OpenRouter route tool requests only to upstreams that
-/// actually support `tools`. Prompt caching is the first model-keyed refinement (C-35): OpenRouter
-/// passes `cache_control` through to Anthropic-served models — where I-03 measured gather-shaped
-/// turns billing the ~20k prefix fully uncached (+35% corpus spend) — so `anthropic/…` slugs cache
-/// and every other vendor stays conservative (an upstream that rejects the field would 4xx).
+/// `output_config.effort` is off (not all upstreams accept it); adaptive thinking stays on for
+/// non-Anthropic vendors. `provider.require_parameters` makes OpenRouter route tool requests only
+/// to upstreams that actually support `tools`. Prompt caching is the first model-keyed refinement
+/// (C-35): OpenRouter passes `cache_control` through to Anthropic-served models — where I-03
+/// measured gather-shaped turns billing the ~20k prefix fully uncached (+35% corpus spend) — so
+/// `anthropic/…` slugs cache and every other vendor stays conservative (an upstream that rejects
+/// the field would 4xx). Anthropic-served slugs additionally take the per-model capability gating
+/// (C-49): OpenRouter forwards `thinking`/`temperature`/`top_p` verbatim, so a slug like
+/// `anthropic/claude-3.5-haiku` 400s on adaptive thinking exactly as Anthropic-direct does.
 pub struct OpenRouterProfile;
 
 impl ProviderProfile for OpenRouterProfile {
     fn quirks_for(&self, model: &str) -> MessagesQuirks {
         let mut extra_body = serde_json::Map::new();
         extra_body.insert("provider".into(), json!({ "require_parameters": true }));
+        // Vendor-prefix match, not substring: `anthropic/claude-…` is Anthropic-served by
+        // construction; a third-party slug that merely mentions "claude" is not.
+        let anthropic_served = model.starts_with("anthropic/");
+        let caps = anthropic_model_caps(model);
         MessagesQuirks {
-            // Vendor-prefix match, not substring: `anthropic/claude-…` is Anthropic-served by
-            // construction; a third-party slug that merely mentions "claude" is not.
-            prompt_caching: model.starts_with("anthropic/"),
-            thinking_adaptive: true,
+            prompt_caching: anthropic_served,
+            thinking_adaptive: if anthropic_served {
+                caps.adaptive_thinking
+            } else {
+                true
+            },
             effort_output_config: false,
+            sampling_params: if anthropic_served {
+                caps.sampling_params
+            } else {
+                true
+            },
             extra_body,
         }
     }
@@ -183,6 +199,25 @@ mod tests {
                 .quirks_for("someone/claude-clone")
                 .prompt_caching
         );
+    }
+
+    #[test]
+    fn anthropic_slugs_take_the_per_model_capability_gating() {
+        // C-49: OpenRouter forwards `thinking` verbatim, so an Anthropic-served pre-4.6 slug
+        // must not get adaptive thinking — while non-Anthropic vendors keep the flat default.
+        let q = OpenRouterProfile.quirks_for("anthropic/claude-3.5-haiku");
+        assert!(!q.thinking_adaptive);
+        let q = OpenRouterProfile.quirks_for("anthropic/claude-haiku-4.5");
+        assert!(!q.thinking_adaptive);
+        assert!(q.sampling_params);
+        // The newest Anthropic generations reject sampling params through the gateway too.
+        let q = OpenRouterProfile.quirks_for("anthropic/claude-opus-4.8");
+        assert!(q.thinking_adaptive);
+        assert!(!q.sampling_params);
+        // Non-Anthropic vendors: unchanged flat profile.
+        let q = OpenRouterProfile.quirks_for("z-ai/glm-4.6");
+        assert!(q.thinking_adaptive);
+        assert!(q.sampling_params);
     }
 
     #[test]

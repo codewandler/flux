@@ -100,13 +100,14 @@ struct AgentFlags {
     ///   IRSA, or EKS Pod Identity — no `aws` CLI needed), `openrouter` (OpenAI Chat wire),
     ///   `openrouter-anthropic` (OpenRouter's native Messages endpoint — leak-proof tool calls),
     ///   `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local Messages endpoint).
-    ///   Short aliases `sonnet`, `opus`, `haiku` are shorthands for `anthropic/<model>`; bare
+    ///   Short aliases `sonnet`, `opus`, `haiku`, `fable` are shorthands for `anthropic/<model>`;
+    ///   bare `claude` is shorthand for `claude/sonnet` (the subscription's default model); bare
     ///   `codex` is shorthand for `codex/gpt-5.5` (the ChatGPT-subscription main model; the
     ///   legacy `*-codex` ids are rejected by the backend); bare `aws` (or `aws/sonnet`,
     ///   `aws/opus`, `aws/haiku`) resolves to the region's Bedrock inference profile.
     /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `codex/gpt-5.5`,
     ///   `aws/us.anthropic.claude-sonnet-4-6`, `openrouter-anthropic/z-ai/glm-4.6`.
-    /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-4-6`).
+    /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-5`).
     #[arg(short = 'm', long)]
     model: Option<String>,
 
@@ -794,14 +795,16 @@ const KNOWN_PROVIDERS: &[&str] = &[
 ];
 
 /// The provider prefix a `provider/model` spec resolves to — the part before `/`, or a bare short
-/// alias mapped to its provider (`sonnet`/`opus`/`haiku`/`mock` → `anthropic`, bare `codex`/`aws` →
-/// themselves). `None` for a bare word that is not a known alias. The single source of truth for the
-/// bare-alias set, shared by [`build_provider`] and [`auth_row_for_spec`] so the two can never drift.
+/// alias mapped to its provider (`sonnet`/`opus`/`haiku`/`fable`/`mock` → `anthropic`, bare
+/// `claude`/`codex`/`aws` → themselves). `None` for a bare word that is not a known alias. The
+/// single source of truth for the bare-alias set, shared by [`parse_model_spec`] and
+/// [`auth_row_for_spec`] so the two can never drift.
 fn spec_provider_prefix(spec: &str) -> Option<&str> {
     match spec.split_once('/') {
         Some((p, _)) => Some(p),
         None => match spec {
-            "sonnet" | "opus" | "haiku" | "mock" => Some("anthropic"),
+            "sonnet" | "opus" | "haiku" | "fable" | "mock" => Some("anthropic"),
+            "claude" => Some("claude"),
             "codex" => Some("codex"),
             "aws" => Some("aws"),
             _ => None,
@@ -809,36 +812,61 @@ fn spec_provider_prefix(spec: &str) -> Option<&str> {
     }
 }
 
-/// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
-/// credentials. Provider must be an explicit prefix (`anthropic/`, `claude/`, `openai/`, `codex/`,
-/// `openrouter/`, `openrouter-anthropic/`, `ollama/`, `ollama-anthropic/`). Bare short aliases
-/// (`sonnet`, `opus`, `haiku`) are implicitly `anthropic/<alias>`.
-/// Any other bare string (no `/`) is an error — use `anthropic/` or `claude/` to disambiguate.
-fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
-    // Returns (native, provider, resolved_model) so callers can reconstruct the canonical
-    // `provider/model` spec (e.g. for cost/subscription detection, which reads the provider prefix).
-    let (provider, model) = match spec.split_once('/') {
-        Some((p, m)) if KNOWN_PROVIDERS.contains(&p) => (p.to_string(), m.to_string()),
+/// Parse a model spec into `(provider, raw model)` without touching credentials — the pure front
+/// half of [`build_provider`], split out so spec validation is unit-testable (C-49). Accepts a
+/// fully-qualified `provider/model`, or a bare short alias (`sonnet`/`opus`/`haiku`/`fable` →
+/// `anthropic/<alias>`, `claude` → the subscription's sonnet, `codex`/`aws` → that provider's
+/// default model). An empty model after the slash is rejected here, client-side — before C-49 a
+/// spec like `claude/` shipped an empty model id to the API and came back as a confusing HTTP 400.
+fn parse_model_spec(spec: &str) -> Result<(String, String)> {
+    match spec.split_once('/') {
+        Some((p, m)) if KNOWN_PROVIDERS.contains(&p) => {
+            // `codex` and `aws` resolve "" to a documented default model; every other provider
+            // needs the model named.
+            if m.is_empty() && !matches!(p, "codex" | "aws") {
+                let example = match p {
+                    "anthropic" | "claude" => format!("`{p}/sonnet`"),
+                    "openai" => "`openai/gpt-5.5`".to_string(),
+                    _ => format!("`{p}/<model>`"),
+                };
+                bail!("model spec `{spec}` names provider `{p}` but no model — add one, e.g. {example}");
+            }
+            Ok((p.to_string(), m.to_string()))
+        }
         Some((p, _)) => bail!(
             "unknown provider `{p}` — use one of: {}",
             KNOWN_PROVIDERS.join(", ")
         ),
         // Bare short aliases only; everything else needs an explicit provider prefix. The alias set
-        // lives in `spec_provider_prefix`; the bare model string is the alias itself for the anthropic
-        // short-names (`sonnet`/`opus`/`haiku`/`mock`), else the provider's default — bare `codex` →
-        // the ChatGPT-subscription main model, bare `aws` → the Bedrock default — resolved below.
+        // lives in `spec_provider_prefix`; the bare model string is the alias itself for the
+        // anthropic short-names (`sonnet`/`opus`/`haiku`/`fable`/`mock`); bare `claude` gets the
+        // subscription's default (`sonnet`); bare `codex`/`aws` resolve their provider defaults
+        // ("" → ChatGPT-subscription main model / the region's Bedrock profile) downstream.
         None => match spec_provider_prefix(spec) {
             Some(provider) => {
-                let model = if provider == "anthropic" { spec } else { "" };
-                (provider.to_string(), model.to_string())
+                let model = match provider {
+                    "anthropic" => spec,
+                    "claude" => "sonnet",
+                    _ => "",
+                };
+                Ok((provider.to_string(), model.to_string()))
             }
             None => bail!(
-                "model spec `{spec}` has no provider prefix — use `provider/model`, e.g. \
-                 `anthropic/{spec}` or `claude/{spec}` (providers: {})",
+                "model spec `{spec}` has no provider prefix — use `provider/model` \
+                 (e.g. `claude/sonnet`, `anthropic/claude-opus-4-8`, `openai/gpt-5.5`) or a bare \
+                 alias: sonnet, opus, haiku, fable, codex, aws (providers: {})",
                 KNOWN_PROVIDERS.join(", ")
             ),
         },
-    };
+    }
+}
+
+/// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
+/// credentials. Spec forms and validation live in [`parse_model_spec`].
+fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
+    // Returns (native, provider, resolved_model) so callers can reconstruct the canonical
+    // `provider/model` spec (e.g. for cost/subscription detection, which reads the provider prefix).
+    let (provider, model) = parse_model_spec(spec)?;
 
     let native = match provider.as_str() {
         "anthropic" => anthropic_from_env().context("anthropic provider")?,
@@ -5840,10 +5868,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     };
 
     let auto_approve = flags.yes;
-    let spec = flags
-        .model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_string());
+    // The bare `sonnet` alias, so the default model has ONE owner
+    // (`flux_providers::anthropic::resolve_model`) — `app_provider_for` resolves it below.
+    let spec = flags.model.clone().unwrap_or_else(|| "sonnet".to_string());
     let (provider, model) = app_provider_for(&spec);
 
     // `strict-review` is a built-in program name (no file): the L-13 `review_code` journey, wrapping
@@ -8042,12 +8069,52 @@ mod tests {
     #[test]
     fn auth_row_mapping() {
         assert_eq!(super::auth_row_for_spec("sonnet"), Some("anthropic"));
+        assert_eq!(super::auth_row_for_spec("fable"), Some("anthropic"));
+        assert_eq!(super::auth_row_for_spec("claude"), Some("claude"));
         assert_eq!(super::auth_row_for_spec("claude/sonnet"), Some("claude"));
         assert_eq!(
             super::auth_row_for_spec("openrouter-anthropic/x"),
             Some("openrouter")
         );
         assert_eq!(super::auth_row_for_spec("ollama/llama"), None);
+    }
+
+    /// C-49: spec parsing — bare aliases, bare-provider defaults, and the client-side empty-model
+    /// rejection (a spec like `claude/` previously shipped an empty model id to the API and came
+    /// back as a confusing HTTP 400).
+    #[test]
+    fn parse_model_spec_covers_aliases_defaults_and_rejects_empty_models() {
+        let parse = super::parse_model_spec;
+        // Bare anthropic short-names carry the alias through as the model.
+        assert_eq!(
+            parse("sonnet").unwrap(),
+            ("anthropic".into(), "sonnet".into())
+        );
+        assert_eq!(
+            parse("fable").unwrap(),
+            ("anthropic".into(), "fable".into())
+        );
+        // Bare `claude` defaults to the subscription's sonnet, like bare `codex`/`aws` defaults.
+        assert_eq!(parse("claude").unwrap(), ("claude".into(), "sonnet".into()));
+        assert_eq!(parse("codex").unwrap(), ("codex".into(), "".into()));
+        assert_eq!(parse("aws").unwrap(), ("aws".into(), "".into()));
+        // Fully-qualified specs pass through.
+        assert_eq!(
+            parse("claude/claude-fable-5").unwrap(),
+            ("claude".into(), "claude-fable-5".into())
+        );
+        // Empty model after the slash: rejected client-side with an actionable hint…
+        let err = parse("claude/").unwrap_err().to_string();
+        assert!(err.contains("no model"), "unexpected: {err}");
+        assert!(err.contains("claude/sonnet"), "unexpected: {err}");
+        let err = parse("anthropic/").unwrap_err().to_string();
+        assert!(err.contains("no model"), "unexpected: {err}");
+        // …except for the two providers whose resolvers document an "" → default mapping.
+        assert_eq!(parse("codex/").unwrap(), ("codex".into(), "".into()));
+        // Unknown bare words still point at the spec shape and the alias set.
+        let err = parse("gpt-5.5").unwrap_err().to_string();
+        assert!(err.contains("claude/sonnet"), "unexpected: {err}");
+        assert!(!err.contains("claude/gpt-5.5"), "unexpected: {err}");
     }
 
     #[test]

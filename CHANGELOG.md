@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **C-49 — Claude provider hardening: every documented model spec now works or fails
+  client-side.** An e2e sweep found `claude/haiku` (and every route to Haiku 4.5 — `anthropic`,
+  `aws`, `openrouter-anthropic`) failing with HTTP 400 "adaptive thinking is not supported on
+  this model": the Messages quirks profiles ignored the model and always sent
+  `thinking: {"type": "adaptive"}`. A shared per-model capability helper
+  (`messages::quirks::anthropic_model_caps`) now gates adaptive thinking, `output_config.effort`,
+  and the sampling params (`temperature`/`top_p` — rejected outright by Fable 5, Opus ≥ 4.7,
+  Sonnet ≥ 5) per model id, across the Anthropic-direct, Bedrock (inference-profile ids), and
+  OpenRouter (`anthropic/…` slugs) profiles; unknown/future ids default to the newest shape.
+  `claude/` (empty model) is now rejected client-side with a hint instead of round-tripping a
+  confusing API 400.
+
+### Changed
+
+- **C-49 — Anthropic model aliases refreshed; `fable` and bare `claude` added.** `sonnet` now
+  resolves to `claude-sonnet-5` (the current Sonnet — also flux's default model; previously
+  `claude-sonnet-4-6`), `haiku` to the undated `claude-haiku-4-5`, and a new `fable` alias
+  resolves to `claude-fable-5` (`claude/fable` previously 404ed). Bare `claude` is now shorthand
+  for `claude/sonnet`, mirroring bare `codex`. The pricing mirror, docs (`docs/model.md`), and a
+  new website page (`agent/claude-code` — the Claude Code subscription provider, its models, and
+  the per-model request invariants) moved in lock-step. Pin `anthropic/claude-sonnet-4-6` to keep
+  the previous default.
+
 ### Added
 
 - **L-73** — Public editor-setup docs page (Helix flagship) + LSP docs pass: new
