@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-09
+
 ### New
 
 - The agent can now answer "what knowledge do I have?" A new read-only `sources` operation lists

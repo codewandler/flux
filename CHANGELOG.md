@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-09
+
 ### Changed
 
 - **Dependency refresh (BREAKING): every dependency upgraded to latest across BOTH workspaces
