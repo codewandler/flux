@@ -43,7 +43,7 @@ flux-plugin = { package = "codewandler-flux-plugin", version = "0.12.1", path = 
 flux-datasource = { package = "codewandler-flux-datasource", version = "0.12.1", path = "../crates/flux-datasource" }
 flux-secret = { package = "codewandler-flux-secret", version = "0.12.1", path = "../crates/flux-secret" }
 flux-spec = { package = "codewandler-flux-spec", version = "0.12.1", path = "../crates/flux-spec" }
-host-kit = { package = "codewandler-host-kit", version = "0.1.0", path = "host-kit" }
+host-kit = { package = "codewandler-flux-host-kit", version = "0.2.0", path = "host-kit" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

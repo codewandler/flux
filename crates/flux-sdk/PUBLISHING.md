@@ -12,7 +12,9 @@ crates). Publishing in dependency order means every dependent resolves its deps 
 
 `flux-core` is TAKEN on crates.io by an unrelated crate (newest `0.5.2`) and every crate depends on it,
 so the bare `flux-*` names cannot be used. **Decision: vanity-prefix the whole closure
-`codewandler-flux-*`** (+ `codewandler-host-kit` for the plugin SDK). Already applied in the manifests.
+`codewandler-flux-*`** (incl. `codewandler-flux-host-kit` for the plugin SDK; its original
+misnamed `codewandler-host-kit` 0.1.0 is yanked — crates.io names are immutable, so the rename is
+a new crate). Already applied in the manifests.
 Per crate:
 
 ```toml

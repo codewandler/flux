@@ -40,7 +40,7 @@ CRATES=(
   codewandler-flux-cognition
   codewandler-flux-plugin
   codewandler-flux-capabilities
-  codewandler-host-kit
+  codewandler-flux-host-kit
   codewandler-flux-flow
   codewandler-flux-agent
   codewandler-flux-orchestrate
@@ -55,7 +55,7 @@ for c in "${CRATES[@]}"; do
   # single run grinds through the whole closure unattended.
   while true; do
     # host-kit lives in the nested plugins/ workspace (excluded from root); publish via manifest path.
-    if [ "$c" = "codewandler-host-kit" ]; then
+    if [ "$c" = "codewandler-flux-host-kit" ]; then
       publish_args="--manifest-path plugins/host-kit/Cargo.toml $DRY_RUN"
     else
       publish_args="-p $c $DRY_RUN"
