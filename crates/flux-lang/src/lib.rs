@@ -36,6 +36,7 @@ pub mod lexer;
 pub mod opspec;
 pub mod optimize;
 pub mod parse;
+pub mod parser;
 pub mod prelude;
 pub mod program;
 pub mod render;

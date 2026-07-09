@@ -84,9 +84,89 @@ pub enum SyntaxKind {
     /// End of input (never materialized into the tree; a parser convenience).
     EOF,
 
-    // ---- nodes (expanded by the tolerant parser, L-58) ----
-    /// The document root.
+    // ---- nodes (built by the tolerant parser, L-58) ----
+    /// The document root: a whole `.flux` module.
     ROOT,
+    /// A single top-level `flow` declaration (the common case) or the module wrapper.
+    FLOW_DECL,
+    /// The `flow [name]([params]) [-> type]` header line.
+    FLOW_HEADER,
+    /// The parenthesized parameter list of a flow header.
+    PARAM_LIST,
+    /// One `name: Type` parameter.
+    PARAM,
+    /// A pure-data top-level declaration the L6 host interprets (`agent`/`channel`/`datasource`/
+    /// `trigger`/`journey`/`op`). Kept as one opaque node here; the module loader owns their grammar.
+    DECL,
+    /// An indented block of statements (a flow/clause body).
+    BLOCK,
+
+    // statements
+    BIND_STMT,       // $x = expr  /  $x: T = expr  (also `memo`)
+    CALL_STMT,       // do op args  /  op(args)
+    WHEN_STMT,       // when cond … [else …]
+    ELSE_CLAUSE,     // else …
+    UNLESS_STMT,     // unless cond …
+    EACH_STMT,       // each $x in src [-> [flat] $c] …
+    REPEAT_STMT,     // repeat n [-> $c] …
+    UNTIL_CLAUSE,    // until cond  (first body line of repeat/loop)
+    MATCH_STMT,      // match subj … (case/default arms)
+    CASE_ARM,        // case v …
+    DEFAULT_ARM,     // default …
+    ROUTE_STMT,      // route sel … (case arms)
+    FALLBACK_STMT,   // fallback [-> $b] … (branch arms)
+    BRANCH_ARM,      // branch [$name] …
+    PARALLEL_STMT,   // parallel … (branch arms)
+    LOOP_STMT,       // loop for <ms> every <ms> [-> $b] …
+    TIMEOUT_STMT,    // timeout <ms> [-> $b] …
+    BUDGET_STMT,     // budget <n> [-> $b] …
+    WITH_TOOLS_STMT, // with_tools [names] …
+    RETRY_STMT,      // retry <n> [backoff …] [-> $b] …
+    SEQ_STMT,        // seq [-> $b] …
+    CTX_STMT,        // ctx $p … (purpose/include/exclude/budget sub-lines)
+    CTX_APPEND_STMT, // $pack += $a, $b
+    RETURN_STMT,     // return expr
+    ASSERT_STMT,     // assert cond [: "msg"]
+    EFFECT_ANNOT,    // @effect(tag) on the line above a bind
+    JSON_ESCAPE,     // @json <compact-json> (statement position)
+
+    // new native statements (L-60..L-63) — currently @json-only
+    MEMO_STMT,       // memo $x = expr
+    ONCE_STMT,       // once "label" [-> $b] …
+    CHECKPOINT_STMT, // checkpoint "label"
+    AWAIT_STMT,      // await [$b =] "source"
+    CONFIRM_STMT,    // confirm "msg" [risk r] …
+    THROTTLE_STMT,   // throttle "name" <max> per <window> …
+    DEBOUNCE_STMT,   // debounce "name" <ms> …
+    VERIFY_STMT,     // verify <cmd> contains <expect> [: "msg"]
+    TRY_STMT,        // try … catch [$e] …
+    CATCH_CLAUSE,    // catch [$e] …
+    RACE_STMT,       // race <ms> [-> $b] … (branch arms)
+    SCOPE_STMT,      // scope [$r = acquire] … finally …
+    FINALLY_CLAUSE,  // finally …
+    SAGA_STMT,       // saga … (step/undo arms)
+    STEP_ARM,        // step …
+    UNDO_CLAUSE,     // undo …
+    PIPE_STMT,       // pipe [-> $b] … (call steps)
+
+    // expressions
+    CALL_EXPR,  // op(args…)
+    VAR_EXPR,   // $sym
+    FIELD_EXPR, // $sym.path  (field-access sugar → jq)
+    LIT_EXPR,   // number / string / true / false / null literal
+    FMT_EXPR,   // fmt("…")
+    PARSE_EXPR, // parse(v, as: "…")   (L-61)
+    PEEK_EXPR,  // peek $sym            (L-61)
+    THING_EXPR, // thing <kind> "…"     (L-63)
+    JSON_EXPR,  // @json <compact-json> (inline)
+    OBJ_EXPR,   // { k: v, … }
+    OBJ_FIELD,  // k: v
+    LIST_EXPR,  // [ a, b, … ]
+    BIN_EXPR,   // a <op> b
+    UNARY_EXPR, // !a  /  -a
+    PAREN_EXPR, // ( expr )
+    ARG_LIST,   // (a, b, …)  or bare `a, b`
+    NAME,       // an identifier in name position (op names, keys, types)
 
     /// Sentinel marking the end of the enum — keep last. Not a real kind.
     #[doc(hidden)]
