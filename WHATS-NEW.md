@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-07-09
+
 ### New
 
 - `flux render` turns a `.flux` file into a polished, syntax-highlighted SVG image from the

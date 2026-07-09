@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-07-09
+
 ### Added
 
 - **L-77 — `flux render` CLI subcommand: `.flux` file → One-Dark SVG, and the doc-image

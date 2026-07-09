@@ -45,7 +45,7 @@ exclude = ["plugins"]
 
 [workspace.package]
 edition = "2021"
-version = "0.13.1"
+version = "0.13.2"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/flux"
 homepage = "https://github.com/codewandler/flux"
