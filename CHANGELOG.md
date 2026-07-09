@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stopped rejecting valid `expr` predicates that use list built-ins.** The `expr` formula
+  validator evaluated formulas against scalar dummy values, so a predicate applying a list built-in
+  (`sum`, `any`, `all`, `has`, `join`, `first`, `last`) to a variable or dotted field — e.g.
+  `filter(where: "has(it.labels, 'bug')")` or `map(expr: "sum(it.scores)")` — was wrongly reported
+  "malformed" and rejected at both plan-analysis time and op runtime. Validation now checks grammar
+  in a type-tolerant mode, so only genuinely malformed formulas and undeclared variables are flagged.
+- **Restored the efficiency summary in `flux usage`.** The per-session efficiency line
+  (turns, calls/turn, iterations/turn, plans/turn, cache-read %, uncached-in/turn, out/turn)
+  reappears for the flux harness on the unbounded `all time` view.
+- **Made `flux usage` metrics consistent under `--since`/`--until`/`--last`.** Call counts are now
+  derived from the window-filtered records so they match the token and cost totals, and whole-session
+  message counts are only attributed to sessions that fall entirely inside the window.
+- **Fixed cross-harness double-counting in the usage summary.** The combined/summary totals now union
+  active days and workspaces across harnesses instead of summing the per-harness counts, so a day or
+  workspace active in two harnesses is counted once.
+
 ## [0.11.2] - 2026-07-09
 
 ### Fixed

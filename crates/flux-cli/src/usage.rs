@@ -124,6 +124,10 @@ struct HarnessDataset {
     latest_session: Option<String>,
     records: Vec<UsageRecord>,
     sessions: Vec<SessionRecord>,
+    // Preformatted efficiency lines (flux only; other harnesses expose no turn projection). Held on
+    // the dataset because they need the `EventStore`, which is not available at render time.
+    latest_efficiency: Option<String>,
+    all_efficiency: Option<String>,
     scanned: usize,
     skipped: usize,
 }
@@ -137,6 +141,8 @@ impl HarnessDataset {
             latest_session: None,
             records: Vec::new(),
             sessions: Vec::new(),
+            latest_efficiency: None,
+            all_efficiency: None,
             scanned: 0,
             skipped: 0,
         }
@@ -150,6 +156,8 @@ impl HarnessDataset {
             latest_session: None,
             records: Vec::new(),
             sessions: Vec::new(),
+            latest_efficiency: None,
+            all_efficiency: None,
             scanned: 0,
             skipped: 0,
         }
@@ -200,7 +208,6 @@ struct SessionRecord {
     started_at_ms: Option<i64>,
     ended_at_ms: Option<i64>,
     cwd: Option<String>,
-    calls: u64,
     messages: u64,
 }
 
@@ -209,7 +216,6 @@ struct SessionBuild {
     started_at_ms: Option<i64>,
     ended_at_ms: Option<i64>,
     cwd: Option<String>,
-    calls: u64,
     messages: u64,
 }
 
@@ -233,7 +239,6 @@ impl SessionBuild {
             started_at_ms: self.started_at_ms,
             ended_at_ms: self.ended_at_ms,
             cwd: self.cwd,
-            calls: self.calls,
             messages: self.messages,
         }
     }
@@ -392,6 +397,12 @@ struct UsageMetrics {
     first_ms: Option<i64>,
     last_ms: Option<i64>,
     sessions: u64,
+    // The distinct local calendar days and workspace paths observed, kept as SETS (not counts) so a
+    // cross-harness `merge` unions them: a day or workspace active in two harnesses must be counted
+    // once, not twice, in the combined/summary totals. `active_days`/`workspaces` are the set lens,
+    // recomputed by `recompute_derived`.
+    active_day_keys: BTreeSet<String>,
+    workspace_keys: BTreeSet<String>,
     active_days: u64,
     workspaces: u64,
     covered_days: u64,
@@ -416,8 +427,10 @@ impl UsageMetrics {
         self.first_ms = merge_min(self.first_ms, other.first_ms);
         self.last_ms = merge_max(self.last_ms, other.last_ms);
         self.sessions += other.sessions;
-        self.active_days += other.active_days;
-        self.workspaces += other.workspaces;
+        self.active_day_keys
+            .extend(other.active_day_keys.iter().cloned());
+        self.workspace_keys
+            .extend(other.workspace_keys.iter().cloned());
         self.wall_ms += other.wall_ms;
         self.calls += other.calls;
         self.messages += other.messages;
@@ -428,6 +441,8 @@ impl UsageMetrics {
     }
 
     fn recompute_derived(&mut self) {
+        self.active_days = self.active_day_keys.len() as u64;
+        self.workspaces = self.workspace_keys.len() as u64;
         self.covered_days = match (self.first_ms, self.last_ms) {
             (Some(first), Some(last)) => (((last - first).max(0) / DAY_MS) + 1) as u64,
             _ => 0,
@@ -493,6 +508,24 @@ impl TimeFilter {
             }
         }
         true
+    }
+
+    /// True when no `--since`/`--until`/`--last` bound is active (the default `all time` view).
+    fn is_unbounded(&self) -> bool {
+        self.since_ms.is_none() && self.until_ms.is_none()
+    }
+
+    /// True when the whole `[start, end]` span lies inside the active window (half-open on the upper
+    /// bound, matching `matches`). Used to gate whole-session aggregates that cannot be sliced to a
+    /// sub-window. An unbounded filter contains everything, including spans with unknown timestamps.
+    fn fully_contains(&self, started_at_ms: Option<i64>, ended_at_ms: Option<i64>) -> bool {
+        let (Some(start), Some(end)) =
+            (started_at_ms.or(ended_at_ms), ended_at_ms.or(started_at_ms))
+        else {
+            return self.since_ms.is_none() && self.until_ms.is_none();
+        };
+        self.since_ms.is_none_or(|since| start >= since)
+            && self.until_ms.is_none_or(|until| end < until)
     }
 }
 
@@ -669,6 +702,11 @@ fn flux_dataset_from_store_with_progress(
     progress: &mut ProgressRenderer,
 ) -> Result<HarnessDataset> {
     let latest_session = store.latest_session()?;
+    let latest_efficiency = match &latest_session {
+        Some(session) => store.efficiency(session)?.as_ref().map(format_efficiency),
+        None => None,
+    };
+    let all_efficiency = store.efficiency_all()?.as_ref().map(format_efficiency);
     let streams = store.all_streams()?;
     let mut loaded = Vec::new();
     progress.begin(HarnessKind::Flux.label(), streams.len());
@@ -693,7 +731,7 @@ fn flux_dataset_from_store_with_progress(
             continue;
         }
         let mut stream_records = flux_records_from_events(&stream, &events, pricing);
-        let session = flux_session_from_events(&stream, &events, stream_records.len() as u64);
+        let session = flux_session_from_events(&stream, &events);
         records.append(&mut stream_records);
         sessions.push(session);
     }
@@ -705,18 +743,19 @@ fn flux_dataset_from_store_with_progress(
         latest_session,
         records,
         sessions,
+        latest_efficiency,
+        all_efficiency,
         scanned: streams.len(),
         skipped: 0,
     })
 }
 
-fn flux_session_from_events(stream: &str, events: &[StoredEvent], calls: u64) -> SessionRecord {
+fn flux_session_from_events(stream: &str, events: &[StoredEvent]) -> SessionRecord {
     let mut build = SessionBuild::default();
     for event in events {
         build.observe(Some(event.ts_ms));
     }
     build.messages = flux_events::turns(events).len() as u64;
-    build.calls = calls;
     build.into_record(HarnessKind::Flux, stream.to_string())
 }
 
@@ -849,6 +888,8 @@ fn external_dataset(
         latest_session: None,
         records,
         sessions,
+        latest_efficiency: None,
+        all_efficiency: None,
         scanned,
         skipped,
     }
@@ -933,7 +974,6 @@ fn parse_claude_projects(
             if usage_is_empty(&usage) {
                 continue;
             }
-            build.calls += 1;
             records.push(usage_record(
                 HarnessKind::Claude,
                 sid,
@@ -1042,7 +1082,6 @@ fn parse_codex_sessions(
                     if let Some(info) = v.pointer("/payload/info/last_token_usage") {
                         let usage = usage_from_codex_token_count(info);
                         if !usage_is_empty(&usage) {
-                            build.calls += 1;
                             token_count_records.push(usage_record(
                                 HarnessKind::Codex,
                                 session_id.clone(),
@@ -1103,7 +1142,6 @@ fn parse_codex_sessions(
         }
 
         if token_count_records.is_empty() {
-            build.calls += fallback_records.len() as u64;
             records.extend(fallback_records);
         } else {
             records.extend(token_count_records);
@@ -1231,7 +1269,6 @@ fn parse_opencode_db(
         }
         let build = sessions.entry(session_id.clone()).or_default();
         build.observe_range(started, ended);
-        build.calls += 1;
         build.messages += 1;
         records.push(usage_record(
             HarnessKind::Opencode,
@@ -1258,6 +1295,9 @@ fn parse_opencode_db(
 }
 
 fn report_from_dataset(dataset: HarnessDataset, filter: &TimeFilter) -> HarnessReport {
+    // The efficiency projection is a whole-history aggregate that cannot be sliced to a window, so
+    // only surface it on the unbounded `all time` view — never beside window-filtered token metrics.
+    let show_efficiency = filter.is_unbounded();
     let mut sections = Vec::new();
     if dataset.kind == HarnessKind::Flux {
         if let Some(latest) = &dataset.latest_session {
@@ -1265,13 +1305,19 @@ fn report_from_dataset(dataset: HarnessDataset, filter: &TimeFilter) -> HarnessR
             if !section.rows.is_empty() || section.metrics.sessions > 0 {
                 sections.push(UsageSection {
                     title: format!("latest session {latest}"),
-                    efficiency: None,
+                    efficiency: show_efficiency
+                        .then(|| dataset.latest_efficiency.clone())
+                        .flatten(),
                     ..section
                 });
             }
         }
     }
-    sections.push(section_from_dataset(&dataset, filter, None, true));
+    let mut all_sessions = section_from_dataset(&dataset, filter, None, true);
+    if show_efficiency {
+        all_sessions.efficiency = dataset.all_efficiency.clone();
+    }
+    sections.push(all_sessions);
 
     HarnessReport {
         kind: dataset.kind,
@@ -1332,8 +1378,6 @@ fn metrics_from_records(
 ) -> UsageMetrics {
     let mut metrics = UsageMetrics::default();
     let mut session_ids = BTreeSet::new();
-    let mut active_days = BTreeSet::new();
-    let mut workspaces = BTreeSet::new();
     let mut grouped_records = BTreeMap::<String, (Option<i64>, Option<i64>)>::new();
 
     for session in sessions {
@@ -1343,16 +1387,21 @@ fn metrics_from_records(
         metrics.first_ms = merge_min(metrics.first_ms, started_at_ms);
         metrics.last_ms = merge_max(metrics.last_ms, ended_at_ms.or(started_at_ms));
         if let Some(day) = local_day_key(started_at_ms.or(ended_at_ms)) {
-            active_days.insert(day);
+            metrics.active_day_keys.insert(day);
         }
         if let Some(cwd) = &session.cwd {
-            workspaces.insert(cwd.clone());
+            metrics.workspace_keys.insert(cwd.clone());
         }
         if let (Some(start), Some(end)) = (started_at_ms, ended_at_ms) {
             metrics.wall_ms += end.saturating_sub(start) as u64;
         }
-        metrics.messages += session.messages;
-        metrics.calls += session.calls;
+        // `session.messages` is a whole-session total that cannot be sliced to a sub-window (we keep
+        // only the session's min/max timestamp, not per-message times), so attribute it only when the
+        // session lies entirely within the active window. With no filter every session qualifies, so
+        // this is a no-op on the common `all time` path.
+        if filter.fully_contains(session.started_at_ms, session.ended_at_ms) {
+            metrics.messages += session.messages;
+        }
     }
 
     for record in records {
@@ -1360,7 +1409,7 @@ fn metrics_from_records(
         metrics.first_ms = merge_min(metrics.first_ms, record.started_at_ms);
         metrics.last_ms = merge_max(metrics.last_ms, record.ended_at_ms.or(record.started_at_ms));
         if let Some(day) = local_day_key(record.started_at_ms.or(record.ended_at_ms)) {
-            active_days.insert(day);
+            metrics.active_day_keys.insert(day);
         }
         sum_usage(&mut metrics.usage, &record.usage);
         if let Some(cost) = record.cost {
@@ -1390,11 +1439,11 @@ fn metrics_from_records(
     }
 
     metrics.sessions = session_ids.len() as u64;
-    metrics.workspaces = workspaces.len() as u64;
-    if metrics.calls == 0 {
-        metrics.calls = records.len() as u64;
-    }
-    metrics.active_days = active_days.len() as u64;
+    // Calls are counted from the window-filtered records (one record per usage-bearing call), so the
+    // call count stays consistent with the token/cost totals under `--since`/`--until`. Using a
+    // session's stored whole-session `calls` would over-report against a sub-window. With no filter
+    // this equals the sum of session call counts, so the `all time` output is unchanged.
+    metrics.calls = records.len() as u64;
     metrics.recompute_derived();
     metrics
 }
@@ -1887,6 +1936,30 @@ fn usage_from_codex_token_count(v: &Value) -> Usage {
     }
 }
 
+fn format_efficiency(e: &flux_events::EfficiencySummary) -> String {
+    let phases = if e.has_phase_rounds() {
+        format!(
+            " · gather {:.1}/turn · revise {:.1}/turn",
+            e.avg_gather_rounds_per_turn(),
+            e.avg_revise_rounds_per_turn(),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "efficiency: {} turn{} · {:.1} calls/turn · {:.1} iters/turn · {:.1} plans/turn{} · cache-read {:.0}% · uncached-in {}/turn · out {}/turn",
+        e.turns,
+        if e.turns == 1 { "" } else { "s" },
+        e.avg_calls_per_turn(),
+        e.avg_iterations_per_turn(),
+        e.avg_plans_per_turn(),
+        phases,
+        e.cache_read_share() * 100.0,
+        style::fmt_tokens(e.uncached_input_per_turn() as u64),
+        style::fmt_tokens(e.output_per_turn() as u64),
+    )
+}
+
 fn sum_usage(acc: &mut Usage, usage: &Usage) {
     acc.input_tokens += usage.input_tokens;
     acc.output_tokens += usage.output_tokens;
@@ -2377,7 +2450,6 @@ mod tests {
                 started_at_ms: Some(1_772_000_000_000),
                 ended_at_ms: Some(1_772_000_060_000),
                 cwd: None,
-                calls: 1,
                 messages: 2,
             }],
             1,
@@ -2559,6 +2631,75 @@ mod tests {
         );
         assert!(out.contains("combined by model"));
         assert!(!out.contains("combined total"));
+    }
+
+    #[test]
+    fn merge_unions_active_days_and_workspaces_across_harnesses() {
+        // A calendar day / workspace active in two harnesses must be counted ONCE in the combined
+        // total. Summing the per-harness cardinalities (the old bug) would report 3 days / 3
+        // workspaces here instead of the true 2.
+        let mut a = UsageMetrics {
+            sessions: 1,
+            active_day_keys: BTreeSet::from(["2026-07-08".to_string()]),
+            workspace_keys: BTreeSet::from(["/w/one".to_string()]),
+            ..Default::default()
+        };
+        a.recompute_derived();
+        let mut b = UsageMetrics {
+            sessions: 1,
+            active_day_keys: BTreeSet::from(["2026-07-08".to_string(), "2026-07-09".to_string()]),
+            workspace_keys: BTreeSet::from(["/w/one".to_string(), "/w/two".to_string()]),
+            ..Default::default()
+        };
+        b.recompute_derived();
+        a.merge(&b);
+        assert_eq!(a.active_days, 2, "the shared day must be counted once");
+        assert_eq!(a.workspaces, 2, "the shared workspace must be counted once");
+        assert_eq!(a.sessions, 2, "distinct sessions still sum");
+    }
+
+    #[test]
+    fn flux_efficiency_attaches_only_on_the_unbounded_window() {
+        // The efficiency projection is a whole-history aggregate: it is surfaced on `all time` but
+        // withheld under a `--since`/`--until` window so it is never shown beside filtered metrics.
+        let dataset = || HarnessDataset {
+            kind: HarnessKind::Flux,
+            source: None,
+            note: None,
+            latest_session: None,
+            records: Vec::new(),
+            sessions: Vec::new(),
+            latest_efficiency: None,
+            all_efficiency: Some("efficiency: 3 turns".to_string()),
+            scanned: 0,
+            skipped: 0,
+        };
+
+        let unbounded = TimeFilter {
+            since_ms: None,
+            until_ms: None,
+            label: "all time".to_string(),
+        };
+        let report = report_from_dataset(dataset(), &unbounded);
+        let all = report
+            .sections
+            .iter()
+            .find(|s| s.include_in_combined)
+            .unwrap();
+        assert_eq!(all.efficiency.as_deref(), Some("efficiency: 3 turns"));
+
+        let bounded = TimeFilter {
+            since_ms: Some(1),
+            until_ms: None,
+            label: "since 1".to_string(),
+        };
+        let report = report_from_dataset(dataset(), &bounded);
+        let all = report
+            .sections
+            .iter()
+            .find(|s| s.include_in_combined)
+            .unwrap();
+        assert_eq!(all.efficiency, None, "efficiency is hidden under a filter");
     }
 
     #[test]

@@ -160,11 +160,17 @@ pub fn validate_expr_formula(formula: &str, var_keys: &BTreeSet<&str>) -> Vec<St
         }
     }
     // Only run the structural check when nothing more specific already fired: a genuinely malformed
-    // formula (e.g. a trailing operator or unbalanced parens) has no named cause above.
-    if diags.is_empty() && eval_expr_value(formula, &dummy).is_err() {
-        diags.push(format!(
-            "`expr` formula is malformed and cannot be parsed: `{formula}`"
-        ));
+    // formula (e.g. a trailing operator or unbalanced parens) has no named cause above. Run it in
+    // type-tolerant mode so a well-formed formula is judged on GRAMMAR alone — the validator cannot
+    // know whether a variable will be a scalar or a list at runtime, so a builtin like `sum(nums)`
+    // or `has(it.labels, x)` must not be rejected just because the dummy shape does not fit.
+    if diags.is_empty() {
+        let _guard = ValidateGuard::enter();
+        if eval_expr_value(formula, &dummy).is_err() {
+            diags.push(format!(
+                "`expr` formula is malformed and cannot be parsed: `{formula}`"
+            ));
+        }
     }
     diags
 }
@@ -333,6 +339,47 @@ fn peek_op(t: &VecDeque<Tok>) -> Option<&str> {
     }
 }
 
+thread_local! {
+    // Set only while `validate_expr_formula` runs its structural pass. In this mode the parser tests
+    // GRAMMAR without depending on the runtime type of each variable: an operator or built-in applied
+    // to a placeholder of the wrong shape (e.g. `sum(nums)` where `nums` seeds as a scalar) yields a
+    // neutral value instead of aborting the parse, so only a genuinely malformed formula fails. Never
+    // set on the real evaluation path, which stays type-strict.
+    static VALIDATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn validating() -> bool {
+    VALIDATING.with(|c| c.get())
+}
+
+/// Scope guard that turns type-tolerant validation on for its lifetime and back off on drop (even if
+/// the parse unwinds), so the thread-local can never leak into a subsequent real evaluation.
+struct ValidateGuard;
+
+impl ValidateGuard {
+    fn enter() -> Self {
+        VALIDATING.with(|c| c.set(true));
+        ValidateGuard
+    }
+}
+
+impl Drop for ValidateGuard {
+    fn drop(&mut self) {
+        VALIDATING.with(|c| c.set(false));
+    }
+}
+
+/// Coerce an operand to a number for an arithmetic operator. On the real path a non-numeric operand
+/// returns `None` (the operator errors, unchanged); during validation it yields a neutral `1.0` so a
+/// grammatically valid formula is not rejected merely because a dummy variable had the wrong type.
+fn arith_num(v: &ExprVal) -> Option<f64> {
+    match v.as_num() {
+        Some(n) => Some(n),
+        None if validating() => Some(1.0),
+        None => None,
+    }
+}
+
 fn expr_or(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<ExprVal> {
     let mut lhs = expr_and(t, v)?;
     while peek_op(t) == Some("||") {
@@ -409,7 +456,7 @@ fn expr_add(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<Expr
             Some("-") => {
                 t.pop_front();
                 let rhs = expr_mul(t, v)?;
-                lhs = ExprVal::Num(lhs.as_num()? - rhs.as_num()?);
+                lhs = ExprVal::Num(arith_num(&lhs)? - arith_num(&rhs)?);
             }
             _ => break,
         }
@@ -424,15 +471,17 @@ fn expr_mul(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<Expr
             Some("*") => {
                 t.pop_front();
                 let r = expr_unary(t, v)?;
-                lhs = ExprVal::Num(lhs.as_num()? * r.as_num()?);
+                lhs = ExprVal::Num(arith_num(&lhs)? * arith_num(&r)?);
             }
             Some("/") => {
                 t.pop_front();
-                let r = expr_unary(t, v)?.as_num()?;
-                if r == 0.0 {
+                let r = arith_num(&expr_unary(t, v)?)?;
+                // Division by a literal zero is a runtime error, not a grammar error, so let the
+                // validation pass through it (the placeholder path never produces a zero divisor).
+                if r == 0.0 && !validating() {
                     return None;
                 }
-                lhs = ExprVal::Num(lhs.as_num()? / r);
+                lhs = ExprVal::Num(arith_num(&lhs)? / r);
             }
             _ => break,
         }
@@ -444,7 +493,7 @@ fn expr_unary(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<Ex
     match peek_op(t) {
         Some("-") => {
             t.pop_front();
-            Some(ExprVal::Num(-expr_unary(t, v)?.as_num()?))
+            Some(ExprVal::Num(-arith_num(&expr_unary(t, v)?)?))
         }
         Some("!") => {
             t.pop_front();
@@ -470,7 +519,15 @@ fn expr_atom(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<Exp
             if matches!(t.front(), Some(Tok::Op(s)) if s == "(") {
                 t.pop_front(); // consume "("
                 let args = expr_call_args(t, v)?;
-                expr_call_fn(&name, &args)
+                match expr_call_fn(&name, &args) {
+                    Some(val) => Some(val),
+                    // A known built-in applied to a wrong-shaped placeholder (e.g. `sum(nums)` when
+                    // `nums` seeds as a scalar) is a type mismatch, not a grammar error — keep the
+                    // validation parse alive. Unknown functions still fail (and are already reported
+                    // by the dedicated diagnostic before this pass runs).
+                    None if validating() && is_known_expr_fn(&name) => Some(ExprVal::Num(1.0)),
+                    None => None,
+                }
             } else {
                 match name.as_str() {
                     "true" => Some(ExprVal::Bool(true)),
@@ -769,6 +826,58 @@ mod tests {
             tokenize_expr("rec.missing? == \"z\"").len(),
             tokenize_expr("rec.missing == \"z\"").len(),
         );
+    }
+
+    /// The structural check runs in type-tolerant mode, so a list builtin (`sum`/`any`/`all`/`has`/
+    /// `join`/`first`/`last`) applied to a variable or dotted field validates — the analyzer cannot
+    /// know whether the variable is a scalar or a list at runtime, and the runtime evaluates these
+    /// per element with real list data. Before the fix the validator seeded every dummy as a scalar
+    /// and *evaluated*, so these builtins returned an error and every such predicate was wrongly
+    /// rejected as "malformed" at both analyze time and op runtime.
+    #[test]
+    fn list_builtins_over_variables_validate() {
+        let var_keys: BTreeSet<&str> = ["it", "nums"].into_iter().collect();
+        for formula in [
+            "has(it.labels, 'bug')",
+            "any(it.labels)",
+            "all(it.flags)",
+            "sum(it.scores) > 10",
+            "first(it.items)",
+            "last(nums)",
+            "join(nums, ',')",
+            "sum(nums)",
+        ] {
+            assert!(
+                validate_expr_formula(formula, &var_keys).is_empty(),
+                "list-builtin predicate must validate: `{formula}` -> {:?}",
+                validate_expr_formula(formula, &var_keys)
+            );
+        }
+
+        // Type tolerance must not swallow real errors: genuine grammar faults and undeclared
+        // variables are still rejected.
+        for bad in ["sum(", "it.score >", "(1 + 2", "has(it.x, )"] {
+            assert!(
+                !validate_expr_formula(bad, &var_keys).is_empty(),
+                "malformed formula must still be rejected: `{bad}`"
+            );
+        }
+        assert!(
+            !validate_expr_formula("sum(missing)", &var_keys).is_empty(),
+            "an undeclared variable must still be rejected even inside a list builtin"
+        );
+    }
+
+    /// The type-tolerant validation flag must never leak into a real evaluation on the same thread:
+    /// after validating a formula, `eval_expr_value` stays strict and still errors on a type mismatch.
+    #[test]
+    fn validation_mode_does_not_leak_into_evaluation() {
+        let var_keys: BTreeSet<&str> = ["nums"].into_iter().collect();
+        let _ = validate_expr_formula("sum(nums)", &var_keys);
+        let mut vars = BTreeMap::new();
+        vars.insert("nums".to_string(), ExprVal::Num(3.0));
+        // `sum` of a scalar is a genuine runtime type error and must still fail after a validation.
+        assert!(eval_expr_value("sum(nums)", &vars).is_err());
     }
 
     #[test]

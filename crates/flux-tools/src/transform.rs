@@ -657,6 +657,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filter_where_with_list_builtin_predicate_runs() {
+        // Regression: a predicate applying a list builtin (`has`/`any`/`sum`/…) to a dotted field
+        // must not be rejected as "malformed" by the pre-run formula validation — the validator
+        // cannot know `it.labels` is a list, and the op evaluates it per element with real data.
+        let c = ctx();
+        let r = FilterTool
+            .execute(
+                &c,
+                json!({
+                    "items": [
+                        {"id": 1, "labels": ["bug", "ui"]},
+                        {"id": 2, "labels": ["docs"]},
+                        {"id": 3, "labels": ["backend", "bug"]}
+                    ],
+                    "where": "has(it.labels, 'bug')"
+                }),
+            )
+            .await
+            .unwrap();
+        let kept: Vec<Value> = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|v| v["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "the list-builtin predicate must select items 1 and 3"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_expr_with_list_builtin_runs() {
+        // Same regression on the `map` `expr` path: `sum(it.scores)` over a list field must run.
+        let c = ctx();
+        let r = MapTool
+            .execute(
+                &c,
+                json!({
+                    "items": [{"scores": [1, 2, 3]}, {"scores": [10]}],
+                    "expr": "sum(it.scores)"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&r.content).unwrap(),
+            json!([6, 10])
+        );
+    }
+
+    #[tokio::test]
     async fn filter_where_and_by_mutually_exclusive() {
         let c = ctx();
         let err = FilterTool
