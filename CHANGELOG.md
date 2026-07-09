@@ -6,6 +6,39 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Flux-Lang lossless CST front-end (foundation).** New `flux_lang::{syntax, lexer, parser}`
+  modules: a layout-aware lossless lexer and an error-tolerant parser producing a rowan concrete
+  syntax tree. Every token and node carries a byte range, token text reproduces the source
+  byte-for-byte, and parsing never aborts — errors become `ERROR` nodes with resync, so a broken
+  buffer still yields a complete tree. This powers editor tooling; the classic parser remains the
+  semantic front-end until the `cst_to_draft` unification story (L-59).
+- **Native text syntax for all 16 formerly `@json`-only node kinds.** Durability and cross-turn
+  state (`memo`, `once`, `checkpoint`, `await`), guard rails (`confirm`, `throttle`, `debounce`,
+  `verify`), expression sugar (`peek $x`, `parse(…, as: "…")`), control flow (`try`/`catch`,
+  `race`, `scope`/`finally`, `saga` with `step`/`undo`, `pipe`), and `thing` references. Every node
+  kind now has a native spelling — round-trip- and property-tested — and `@json` remains only as
+  the escape for shapes the grammar cannot express (non-identifier symbol names, non-invertible
+  `expr` formulas, bracket-path `jq`, all-literal templates).
+- **`flux-lsp` language server with Helix wiring.** New `crates/flux-lsp` (tower-lsp over stdio):
+  positioned diagnostics from the tolerant CST parser, completion (ops, node-kind keywords,
+  prelude types, in-scope `$vars`), hover (op signatures with effects/risk, node-kind and
+  prelude-type docs), and whole-document formatting via the invertible formatter. A committed
+  `.helix/languages.toml` wires it into `hx` config-only. Built from source for now
+  (`cargo build -p flux-lsp`); shipping binaries is part of the packaging story (L-70).
+
+### Changed
+
+- **schemars 0.8 → 1.2.1 in the root workspace.** Op parameter schemas and `param_signature()`
+  strings now list required parameters in declared order (schemars 1.x behavior) instead of
+  alphabetical order.
+- **Language docs truth pass for the native syntax.** The website language pages, the Flux-Lang
+  syntax spec (`crates/flux-lang/docs/syntax.md`), and `STATUS.md` now document the native
+  spellings instead of describing the 16 nodes as `@json`-only — every rewritten snippet is
+  parser-validated — and the spec gained previously missing sections for `parse`, `checkpoint`,
+  `once`, `scope`/`finally`, and `saga`.
+
 ## [0.11.3] - 2026-07-09
 
 ### Fixed
