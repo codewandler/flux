@@ -1513,6 +1513,16 @@ mod tests {
     /// → close, then assert the Chrome child is reaped (no orphan). SKIPS when no Chromium is on PATH.
     #[tokio::test]
     async fn live_smoke_open_goto_snapshot_close_no_orphan() {
+        // Opt-in (FLUX_LIVE_BROWSER_SMOKE=1), like every live-external test in this repo: CI
+        // runners expose a snap-confined `chromium` shim whose sandboxing drops the inherited
+        // fd-3/4 debug pipe ("cdp: connection closed before response", 2026-07-09), so an
+        // auto-run keyed only on PATH discovery is nondeterministic across environments.
+        if std::env::var("FLUX_LIVE_BROWSER_SMOKE").is_err() {
+            eprintln!(
+                "SKIP live_smoke: set FLUX_LIVE_BROWSER_SMOKE=1 to run against a real Chromium"
+            );
+            return;
+        }
         if !chromium_present(None) {
             eprintln!("SKIP live_smoke: no Chromium discoverable");
             return;
