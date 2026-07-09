@@ -1,6 +1,6 @@
 //! The agent-facing retrieval ops over a [`DatasourceBackend`]: `search` / `get` / `list` / `relation`
-//! / `batch_get`. Each is a read-only [`Tool`] that parses its JSON input into the matching
-//! `flux-datasource` request type, calls the backend, and renders a compact text result.
+//! / `batch_get` / `sources`. Each is a read-only [`Tool`] that parses its JSON input into the
+//! matching `flux-datasource` request type, calls the backend, and renders a compact text result.
 
 use std::sync::Arc;
 
@@ -9,14 +9,14 @@ use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
 use flux_datasource::{
-    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput,
+    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
 };
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::ToolSpec;
 
 use super::DatasourceBackend;
 
-/// The five datasource retrieval ops over `backend`, as a tool vec (the form a surface registers into
+/// The six datasource retrieval ops over `backend`, as a tool vec (the form a surface registers into
 /// an agent/app registry — e.g. `App::with_tools`).
 pub fn datasource_tools(backend: Arc<dyn DatasourceBackend>) -> Vec<Arc<dyn Tool>> {
     vec![
@@ -24,11 +24,12 @@ pub fn datasource_tools(backend: Arc<dyn DatasourceBackend>) -> Vec<Arc<dyn Tool
         Arc::new(GetOp(backend.clone())),
         Arc::new(ListOp(backend.clone())),
         Arc::new(RelationOp(backend.clone())),
-        Arc::new(BatchGetOp(backend)),
+        Arc::new(BatchGetOp(backend.clone())),
+        Arc::new(SourcesOp(backend)),
     ]
 }
 
-/// Register all five datasource retrieval ops over `backend` into `registry`.
+/// Register all six datasource retrieval ops over `backend` into `registry`.
 pub fn register_datasource_ops(registry: &mut ToolRegistry, backend: Arc<dyn DatasourceBackend>) {
     for tool in datasource_tools(backend) {
         registry.register(tool);
@@ -253,6 +254,52 @@ impl Tool for BatchGetOp {
     }
 }
 
+/// `source (N records; entities: e1, e2)` — for `sources`.
+fn render_source(s: &SourceSummary) -> String {
+    format!(
+        "{} ({} record{}; entities: {})",
+        s.source,
+        s.count,
+        if s.count == 1 { "" } else { "s" },
+        s.entities.join(", ")
+    )
+}
+
+/// `sources` — enumerate the distinct sources in the index: per source, its entity types and record
+/// count. Answers "what knowledge do I have?" one call ahead of the other five ops, all of which
+/// require a known source key.
+struct SourcesOp(Arc<dyn DatasourceBackend>);
+
+#[async_trait]
+impl Tool for SourcesOp {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "sources",
+            "Enumerate the knowledge datasources in the index: per source, its entity types and \
+             record count. Call this before search/get/list/relation/batch_get to learn which \
+             source keys exist.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        )
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+        let sources = self.0.sources()?;
+        if sources.is_empty() {
+            return Ok(ToolResult::ok("no sources"));
+        }
+        Ok(ToolResult::ok(
+            sources
+                .iter()
+                .map(render_source)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +346,65 @@ mod tests {
             .await
             .unwrap();
         assert!(g.content.contains("Warm transfer"));
+    }
+
+    /// D-114: `sources` reports both the auto-indexed `local` source (the workspace doc walk) and a
+    /// program-`datasource`-declared source (ingested under its own name), after ingestion — the
+    /// scenario the acceptance criteria names.
+    #[tokio::test]
+    async fn sources_op_reports_local_and_a_declared_source() {
+        let backend = Arc::new(MemoryBackend::new());
+        let dyn_backend: Arc<dyn DatasourceBackend> = backend.clone();
+        // The auto-index path (`build_doc_index`) ingests under "local".
+        crate::datasource::ingest_markdown(
+            &*dyn_backend,
+            "local",
+            &[("README.md".to_string(), "workspace readme".to_string())],
+        )
+        .unwrap();
+        // A program `datasource` declaration ingests under its own name (`build_datasources`).
+        crate::datasource::ingest_markdown(
+            &*dyn_backend,
+            "docs",
+            &[(
+                "guide.md".to_string(),
+                "declared datasource guide".to_string(),
+            )],
+        )
+        .unwrap();
+
+        let sources = SourcesOp(dyn_backend);
+        let r = sources.execute(&ctx(), json!({})).await.unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("local"), "got: {}", r.content);
+        assert!(r.content.contains("docs"), "got: {}", r.content);
+        assert!(
+            r.content.contains("file.document"),
+            "reports the entity type: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn sources_op_reports_no_sources_on_an_empty_index() {
+        let sources = SourcesOp(Arc::new(MemoryBackend::new()));
+        let r = sources.execute(&ctx(), json!({})).await.unwrap();
+        assert!(!r.is_error);
+        assert_eq!(r.content, "no sources");
+    }
+
+    #[test]
+    fn sources_is_a_sixth_ungrouped_op() {
+        let tools = datasource_tools(Arc::new(MemoryBackend::new()));
+        assert_eq!(tools.len(), 6);
+        let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
+        assert!(names.contains(&"sources".to_string()), "names: {names:?}");
+        let spec = tools
+            .iter()
+            .find(|t| t.spec().name == "sources")
+            .unwrap()
+            .spec();
+        assert!(spec.group.is_none(), "ungrouped like the other five");
+        assert!(spec.has_effect(flux_spec::Effect::Read));
     }
 }

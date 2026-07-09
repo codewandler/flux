@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### New
+
+- The agent can now answer "what knowledge do I have?" A new read-only `sources` operation lists
+  every knowledge source in the index — its name, the kinds of records it holds, and how many —
+  so the agent no longer has to guess source names before searching or listing records.
+
 ## [0.12.0] - 2026-07-09
 
 ### New

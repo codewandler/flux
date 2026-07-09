@@ -193,6 +193,20 @@ pub struct Match {
     pub matched_fields: Vec<String>,
 }
 
+/// One entry in the datasource enumeration (`DatasourceBackend::sources` in flux-capabilities): a
+/// source key, the distinct entity types found under it, and its total record count. This is the read
+/// the other four request types presuppose — `get`/`list`/`relation`/`batch_get` all require a known
+/// `source` key; `sources()` is how a caller learns which ones exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSummary {
+    /// The source key (`"plugin"` or `"plugin/instance"`).
+    pub source: String,
+    /// The distinct entity types held under this source, sorted.
+    pub entities: Vec<String>,
+    /// Total record count for this source, across all its entities.
+    pub count: usize,
+}
+
 /// `get` input: fetch one record by its `(source, entity, id)` address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetInput {

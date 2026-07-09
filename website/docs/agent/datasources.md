@@ -65,15 +65,22 @@ Three routes feed the index:
 
 ## Reading it: the retrieval operations
 
-Retrieval is five read-only operations — low risk, never pausing for approval:
+Retrieval is six read-only operations — low risk, never pausing for approval:
 
 | op | arguments | description |
 |---|---|---|
+| `sources` | *(none)* | Enumerate the sources in the index: per source, its entity types and record count |
 | `search` | `query[, source, entity, limit]` | Keyword search over the whole index, ranked |
 | `get` | `source, entity, id` | Fetch one record in full by its address |
 | `list` | `source[, entity, offset, limit]` | Enumerate a source's records, paged |
 | `relation` | `source, entity, id[, rel]` | Follow a record's typed links to the linked records |
 | `batch_get` | `source, entity, ids` | Fetch several records of one entity in one call |
+
+`search`/`get`/`list`/`relation`/`batch_get` all take a `source` argument — so how does the agent
+learn which sources exist in the first place? It calls `sources`: no arguments, and the answer is
+every source key currently in the index (`local`, any program-declared name, any contributing
+plugin), each with the entity types it holds and how many records. Run it first, then `search`/
+`list` with a source you now know is real.
 
 These appear in the same [operation catalog](../language/ops.md) as everything else, so a
 Flux-Lang plan can mix retrieval with any other work:

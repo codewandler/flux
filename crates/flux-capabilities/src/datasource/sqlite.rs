@@ -14,6 +14,7 @@ use serde_json::Value;
 use flux_core::{Error, Result};
 use flux_datasource::{
     BatchGetInput, GetInput, Link, ListInput, Match, Record, RelationInput, SearchInput, Source,
+    SourceSummary,
 };
 
 use super::text::{matched_fields, snippet};
@@ -276,6 +277,43 @@ impl DatasourceBackend for SqliteBackend {
         Ok(out)
     }
 
+    fn sources(&self) -> Result<Vec<SourceSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, entity, COUNT(*) FROM records
+                 GROUP BY source, entity ORDER BY source, entity",
+            )
+            .map_err(map_sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(map_sql)?;
+        // Rows arrive ordered by (source, entity), so a source's rows are consecutive: fold each
+        // into the running summary, starting a new one whenever the source key changes.
+        let mut out: Vec<SourceSummary> = Vec::new();
+        for row in rows {
+            let (source, entity, count) = row.map_err(map_sql)?;
+            match out.last_mut() {
+                Some(last) if last.source == source => {
+                    last.entities.push(entity);
+                    last.count += count as usize;
+                }
+                _ => out.push(SourceSummary {
+                    source,
+                    entities: vec![entity],
+                    count: count as usize,
+                }),
+            }
+        }
+        Ok(out)
+    }
+
     fn clear(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("DELETE FROM records; DELETE FROM records_fts;")
@@ -398,6 +436,41 @@ mod tests {
             assert_eq!(got.title, "Warm transfer");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sources_reports_distinct_sources_entities_and_counts() {
+        let b = SqliteBackend::in_memory().unwrap();
+        b.upsert(&[
+            doc("a", "Agent loop", "streams tokens"),
+            doc("b", "Permissions", "gate every call"),
+            Record::new(
+                Source::new("gitlab"),
+                "gitlab.merge_request",
+                "1",
+                "MR",
+                "body",
+            ),
+            Record::new(Source::new("gitlab"), "gitlab.issue", "1", "Issue", "body"),
+        ])
+        .unwrap();
+        let sources = b.sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].source, "gitlab");
+        assert_eq!(sources[0].count, 2);
+        assert_eq!(
+            sources[0].entities,
+            vec!["gitlab.issue", "gitlab.merge_request"]
+        );
+        assert_eq!(sources[1].source, "local");
+        assert_eq!(sources[1].count, 2);
+        assert_eq!(sources[1].entities, vec!["file.document"]);
+    }
+
+    #[test]
+    fn sources_is_empty_on_an_empty_index() {
+        let b = SqliteBackend::in_memory().unwrap();
+        assert!(b.sources().unwrap().is_empty());
     }
 
     #[test]

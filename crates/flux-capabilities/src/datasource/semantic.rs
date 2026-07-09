@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use flux_core::Result;
 use flux_datasource::{
-    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput,
+    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
 };
 
 use super::{DatasourceBackend, Embedder, MemoryVectorStore, VectorStore};
@@ -187,6 +187,9 @@ impl DatasourceBackend for SemanticIndex {
     }
     fn batch_get(&self, input: &BatchGetInput) -> Result<Vec<Record>> {
         self.inner.batch_get(input)
+    }
+    fn sources(&self) -> Result<Vec<SourceSummary>> {
+        self.inner.sources()
     }
     fn clear(&self) -> Result<()> {
         self.vectors.clear()?;

@@ -35,6 +35,7 @@ policy.
 | `edit` | `path, old_string, new_string[, replace_all]` | medium, approval | Replace a string in a file (exact-match first, then progressively looser anchoring) |
 | `patch` | `path, edits` | medium, approval | Several line-anchored edits in one call |
 | `append` | `path, content` | low, approval | Append to a file, creating it if absent |
+| `sources` | | low | Enumerate the [datasource](../agent/datasources.md)'s sources: entity types + record count per source |
 | `search` | `query[, source, entity, limit]` | low | Keyword search over the indexed [datasource](../agent/datasources.md) |
 | `get` | `source, entity, id` | low | Fetch one datasource record in full by its address |
 | `list` | `source[, entity, offset, limit]` | low | Enumerate a datasource source's records, paged |
@@ -199,5 +200,5 @@ guarded IO. There is no trusted shortcut for any operation on this page.
 
 - [Node reference](./node-reference.md) — the `call` node and its JSON shape.
 - [Safety & approvals](../agent/safety.md) — the envelope every operation crosses.
-- [Datasources](../agent/datasources.md) — the knowledge layer behind `search`/`get`/`list`/`relation`/`batch_get`.
+- [Datasources](../agent/datasources.md) — the knowledge layer behind `sources`/`search`/`get`/`list`/`relation`/`batch_get`.
 - [Plugin authoring](../plugins/authoring.md) — how plugins project new operations.

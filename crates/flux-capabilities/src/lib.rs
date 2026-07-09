@@ -1,7 +1,8 @@
 //! `flux-capabilities` — the L5 capability tools the agent can call.
 //!
 //! - [`datasource`] — a knowledge layer (D-07): a pluggable [`DatasourceBackend`] over
-//!   `flux-datasource` records + the retrieval ops `search`/`get`/`list`/`relation`/`batch_get`.
+//!   `flux-datasource` records + the retrieval ops
+//!   `search`/`get`/`list`/`relation`/`batch_get`/`sources` (D-114).
 //!
 //! Web access (`http.request`, `web_fetch`, `browser.*`) moved to the native `flux-web` crate
 //! (web-capabilities epic, D-120); the former `browser` module retired with it.

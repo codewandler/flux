@@ -21,6 +21,7 @@ use serde_json::Value;
 use flux_core::{Error, Result};
 use flux_datasource::{
     BatchGetInput, GetInput, Link, ListInput, Match, Record, RelationInput, SearchInput, Source,
+    SourceSummary,
 };
 use flux_pg::sqlx::{self, postgres::PgRow, Row};
 use flux_pg::PgHandle;
@@ -438,6 +439,41 @@ impl DatasourceBackend for PostgresBackend {
         })
     }
 
+    fn sources(&self) -> Result<Vec<SourceSummary>> {
+        let pool = self.handle.pool().clone();
+        let ns = self.ns.clone();
+        self.handle.block_on(async move {
+            let rows = sqlx::query(
+                "SELECT source, entity, COUNT(*) AS cnt FROM ds_records WHERE ns = $1 \
+                 GROUP BY source, entity ORDER BY source, entity",
+            )
+            .bind(ns.as_str())
+            .fetch_all(&pool)
+            .await
+            .map_err(map_pg)?;
+            // Rows arrive ordered by (source, entity), so a source's rows are consecutive: fold
+            // each into the running summary, starting a new one whenever the source key changes.
+            let mut out: Vec<SourceSummary> = Vec::new();
+            for row in rows {
+                let source: String = row.get("source");
+                let entity: String = row.get("entity");
+                let count: i64 = row.get("cnt");
+                match out.last_mut() {
+                    Some(last) if last.source == source => {
+                        last.entities.push(entity);
+                        last.count += count as usize;
+                    }
+                    _ => out.push(SourceSummary {
+                        source,
+                        entities: vec![entity],
+                        count: count as usize,
+                    }),
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn clear(&self) -> Result<()> {
         let pool = self.handle.pool().clone();
         let ns = self.ns.clone();
@@ -683,6 +719,51 @@ mod tests {
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].id, "1");
         drop_schema(&h2, &schema);
+    }
+
+    #[test]
+    fn pg_sources_reports_distinct_sources_entities_and_counts() {
+        let Some((url, schema)) = test_env() else {
+            eprintln!(
+                "skipping pg_sources_reports_distinct_sources_entities_and_counts: \
+                 TEST_POSTGRES_URL unset"
+            );
+            return;
+        };
+        let h = PgHandle::connect(&url).unwrap();
+        PostgresBackend::ensure_schema(&h).unwrap();
+        let b = PostgresBackend::new(h.clone(), "kb");
+        b.upsert(&[
+            doc("a", "Agent loop", "streams tokens"),
+            doc("b", "Permissions", "gate every call"),
+            Record::new(
+                Source::new("gitlab"),
+                "gitlab.merge_request",
+                "1",
+                "MR",
+                "body",
+            ),
+            Record::new(Source::new("gitlab"), "gitlab.issue", "1", "Issue", "body"),
+        ])
+        .unwrap();
+
+        let sources = b.sources().unwrap();
+        assert_eq!(sources.len(), 2, "sources: {sources:?}");
+        assert_eq!(sources[0].source, "gitlab");
+        assert_eq!(sources[0].count, 2);
+        assert_eq!(
+            sources[0].entities,
+            vec!["gitlab.issue", "gitlab.merge_request"]
+        );
+        assert_eq!(sources[1].source, "local");
+        assert_eq!(sources[1].count, 2);
+        assert_eq!(sources[1].entities, vec!["file.document"]);
+
+        // A different namespace on the same table sees no sources (structural isolation).
+        let other = PostgresBackend::new(h.clone(), "other-kb");
+        assert!(other.sources().unwrap().is_empty());
+
+        drop_schema(&h, &schema);
     }
 
     #[test]

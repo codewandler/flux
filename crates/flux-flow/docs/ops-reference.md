@@ -15,6 +15,7 @@ optional arguments are in `[brackets]`.
 | `grep` | `pattern[, glob, literal, max_results, path]` | Low | Search by regex (supports `\b`, lookaheads); use `literal: true` for plain substring |
 | `glob` | `pattern[, path]` | Low | List files matching a glob pattern (`*` crosses `/`) |
 | `search` | `query[, limit]` | Low | Search the indexed datasource |
+| `sources` | | Low | Enumerate the datasources in the index: per source, its entity types and record count |
 | `web_fetch` | `url[, raw]` | Low | Read a page as a **document**: HTML → condensed markdown (boilerplate stripped), non-HTML raw, `raw: true` forces the raw body. Fetched pages become `web.page` records. Private/loopback blocked unless the `web` egress scope grants them |
 | `html_to_markdown` | `html` | Low | Pure (no egress): condense an HTML string to readable markdown; composes with `http.request` |
 | `http.request` | `url[, method, headers, body, timeout]` | Medium | Make an arbitrary HTTP(S) request (any method/headers/body) → status + headers + capped body; non-2xx is a result. Header values may be `{"$secret": "ENV"}`. Private/loopback blocked unless the `web` egress scope grants them |

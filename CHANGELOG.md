@@ -25,7 +25,6 @@ All notable changes to this project are documented in this file. The format is b
   spans — byte-identical output, pinned by a marker-palette snapshot test written against the
   pre-refactor renderer — so `flux-tui` (ANSI) and the `flow_render` SVG tree view (L-76) share
   one walk instead of a "render to ANSI then parse it back" round-trip. No new deps.
-
 - **L-76 — `flow_render`: Flux-Lang source/plan → syntax-highlighted SVG.** New model-facing
   built-in tool beside `flow_list`/`flow_run` (new `flux_tools::render`, registered in the CLI):
   pass inline `source` or the `name` of a stored flow (resolved through the same
@@ -39,6 +38,15 @@ All notable changes to this project are documented in this file. The format is b
   `rendered <name> (<view> view) → SVG WxH, N lines` summary — read-only, SVG-only (file
   output/PNG are L-77/L-78). Pure core `render_flux_svg` is directly reusable by the `flux
   render` CLI subcommand (L-77). No new deps.
+- **D-114 — `sources` op: enumerate the knowledge datasources the agent can query.** New
+  read-only, ungrouped datasource op beside `search`/`get`/`list`/`relation`/`batch_get`: no
+  arguments in, per source out its entity types and record count (`DatasourceBackend::sources`,
+  implemented for the in-memory, SQLite, and Postgres backends). Closes the discoverability gap —
+  `search`/`get`/`list`/`relation`/`batch_get` all take a `source` argument the agent previously
+  had to guess (`local`, a program-declared name, a contributing plugin's) or infer from a prior
+  `search` hit; now it can just ask. Registered in the same catalog as the other retrieval ops,
+  evidence-gated identically (surfaces whenever the datasource group does).
+
 ## [0.12.0] - 2026-07-09
 
 ### Fixed

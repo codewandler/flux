@@ -2,11 +2,12 @@
 //! each record's `title`+`body`. No persistence, no embeddings (the persistent SQLite-FTS5 backend and
 //! the [`Embedder`](super::Embedder) seam are separate). Records are deduped by `(source, entity, id)`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use flux_core::Result;
 use flux_datasource::{
-    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput,
+    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
 };
 
 use super::DatasourceBackend;
@@ -169,6 +170,24 @@ impl DatasourceBackend for MemoryBackend {
                         r.source.key() == input.source && r.entity == input.entity && &r.id == id
                     })
                     .cloned()
+            })
+            .collect())
+    }
+
+    fn sources(&self) -> Result<Vec<SourceSummary>> {
+        let store = self.records.lock().expect("datasource records poisoned");
+        let mut by_source: BTreeMap<String, (BTreeSet<String>, usize)> = BTreeMap::new();
+        for r in store.iter() {
+            let entry = by_source.entry(r.source.key()).or_default();
+            entry.0.insert(r.entity.clone());
+            entry.1 += 1;
+        }
+        Ok(by_source
+            .into_iter()
+            .map(|(source, (entities, count))| SourceSummary {
+                source,
+                entities: entities.into_iter().collect(),
+                count,
             })
             .collect())
     }
@@ -361,6 +380,42 @@ mod tests {
             .unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].id, "leaf");
+    }
+
+    #[test]
+    fn sources_reports_distinct_sources_entities_and_counts() {
+        let b = MemoryBackend::new();
+        b.upsert(&[
+            doc("a", "Agent loop", "streams tokens"),
+            doc("b", "Permissions", "gate every call"),
+            Record::new(
+                Source::new("gitlab"),
+                "gitlab.merge_request",
+                "1",
+                "MR",
+                "body",
+            ),
+            Record::new(Source::new("gitlab"), "gitlab.issue", "1", "Issue", "body"),
+        ])
+        .unwrap();
+        let mut sources = b.sources().unwrap();
+        sources.sort_by(|a, b| a.source.cmp(&b.source));
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].source, "gitlab");
+        assert_eq!(sources[0].count, 2);
+        assert_eq!(
+            sources[0].entities,
+            vec!["gitlab.issue", "gitlab.merge_request"]
+        );
+        assert_eq!(sources[1].source, "local");
+        assert_eq!(sources[1].count, 2);
+        assert_eq!(sources[1].entities, vec!["file.document"]);
+    }
+
+    #[test]
+    fn sources_is_empty_on_an_empty_index() {
+        let b = MemoryBackend::new();
+        assert!(b.sources().unwrap().is_empty());
     }
 
     #[test]

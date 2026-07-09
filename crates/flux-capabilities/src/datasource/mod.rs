@@ -50,10 +50,10 @@ pub use vector::SqliteVecStore;
 
 use flux_core::{ContextBlock, Result};
 use flux_datasource::{
-    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput,
+    BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
 };
 
-/// A datasource index backend: upsert records and answer the five retrieval verbs. All methods take
+/// A datasource index backend: upsert records and answer the six retrieval verbs. All methods take
 /// `&self` (interior mutability) so a backend is shared as `Arc<dyn DatasourceBackend>` across the ops.
 ///
 /// The trait is **per-scope by design** — an implementor instance is bound to exactly one scope (a
@@ -72,6 +72,11 @@ pub trait DatasourceBackend: Send + Sync {
     fn relation(&self, input: &RelationInput) -> Result<Vec<Record>>;
     /// Fetch several records of one entity from one source in a single call.
     fn batch_get(&self, input: &BatchGetInput) -> Result<Vec<Record>>;
+    /// Enumerate the distinct sources this backend holds: per source, its distinct entity types
+    /// (sorted) and total record count (story D-114). Closes the discoverability loop the other
+    /// five methods presuppose — `search`/`get`/`list`/`relation`/`batch_get` all require a known
+    /// `source` key; this is how a caller learns which ones exist.
+    fn sources(&self) -> Result<Vec<SourceSummary>>;
     /// Drop every record (the rebuild half of reindex; the caller then re-ingests).
     fn clear(&self) -> Result<()>;
     /// Drop every record under one source key. Returns how many were removed. Unlike [`clear`](Self::clear)

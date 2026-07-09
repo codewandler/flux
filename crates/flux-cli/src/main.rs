@@ -2189,8 +2189,9 @@ async fn build_agent_with(
     flux_tools::register_render(&mut registry);
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
-    // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`). The backend is also
-    // the sink `web_fetch` contributes `web.page` records to (below), so read pages are groundable.
+    // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
+    // backend is also the sink `web_fetch` contributes `web.page` records to (below), so read pages
+    // are groundable.
     let backend = build_doc_index(&system).await;
     flux_capabilities::register_datasource_ops(&mut registry, backend.clone());
 
@@ -5997,7 +5998,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     let cfg = flux_config::load(&cwd).unwrap_or_default();
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
-    // index the `search`/`get`/`list`/`relation`/`batch_get` ops read.
+    // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
     let backend = build_datasources(&program.datasources, &system).await?;
     let mut extra_tools: Vec<Arc<dyn flux_runtime::Tool>> =
         flux_capabilities::datasource_tools(backend.clone());
