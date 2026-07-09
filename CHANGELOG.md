@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-09
+
 ### Added
 
 - **Tracked the Flux-Lang agent-speed epic.** New epic design and L-53..L-56 stories cover the
