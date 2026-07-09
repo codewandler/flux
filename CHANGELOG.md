@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Allowed intentional cargo-dist workflow overrides.** The release workflow now passes
+  `--allow-dirty` to cargo-dist so the scoped `RELEASE_TOKEN` GitHub Release hardening does not
+  make tag builds fail as an out-of-date generated workflow.
+
 ## [0.11.1] - 2026-07-09
 
 ### Added
