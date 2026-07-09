@@ -319,6 +319,20 @@ enum Commands {
         #[command(subcommand)]
         action: FlowAction,
     },
+    /// Render a `.flux` file as a self-contained SVG: the highlighted source (default) or the
+    /// execution-path plan tree. The non-model entry point to the `flow_render` tool's renderer,
+    /// and the generator for flux's own doc images. Prints the SVG to stdout unless `-o` is given.
+    Render {
+        /// Path to the `.flux` file to render.
+        file: String,
+        /// Which view to render: `source` (highlighted source; total, malformed input still
+        /// renders) or `tree` (execution-path plan tree; a hard parse error exits non-zero).
+        #[arg(long, value_enum, default_value_t)]
+        view: RenderView,
+        /// Write the SVG to this path (workspace-confined, parents created) instead of stdout.
+        #[arg(short = 'o', long, value_name = "OUT.svg")]
+        out: Option<String>,
+    },
     /// Run the strict-review protocol over `--files` and print a `ReviewReport` (flux L-13; design
     /// `docs/designs/strict-review-flows.md`). Self-contained: the reviewer roles and the
     /// `strict_review` flow are embedded in the binary, so this works in any repo — a project's own
@@ -711,6 +725,25 @@ impl From<EffortArg> for Effort {
             EffortArg::High => Effort::High,
             EffortArg::Xhigh => Effort::Xhigh,
             EffortArg::Max => Effort::Max,
+        }
+    }
+}
+
+/// `flux render --view` — CLI mirror of [`flux_tools::render::View`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum RenderView {
+    /// The highlighted source (total — malformed input still renders).
+    #[default]
+    Source,
+    /// The execution-path plan tree (needs parseable source).
+    Tree,
+}
+
+impl From<RenderView> for flux_tools::render::View {
+    fn from(v: RenderView) -> Self {
+        match v {
+            RenderView::Source => Self::Source,
+            RenderView::Tree => Self::Tree,
         }
     }
 }
@@ -2719,6 +2752,50 @@ fn should_fail(
         .findings
         .iter()
         .any(|f| ReviewSeverity::from_finding_str(&f.severity) >= threshold)
+}
+
+/// `flux render <file.flux> [--view source|tree] [-o out.svg]` (L-77) — the non-gated entry point
+/// to the L-76 renderer, and the generator for flux's own doc images (replaces the
+/// flux-tree-sitter repo's `scripts/render-example.mjs`). Builds the workspace from the
+/// environment like every production construction site, then delegates to [`run_render_in`].
+async fn run_render(file: &str, view: RenderView, out: Option<&str>) -> Result<()> {
+    let system = System::new(
+        Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    run_render_in(&system, file, view, out).await
+}
+
+/// The testable core of `flux render`: reads `file` and writes the SVG through the
+/// workspace-confined `System` (SVG is text, so `write_file` suffices; parents are created).
+/// Without `out` the SVG prints to stdout. A hard parse error in `tree` view propagates — the
+/// CLI exits non-zero with the parser's message — while `source` view is total.
+async fn run_render_in(
+    system: &System,
+    file: &str,
+    view: RenderView,
+    out: Option<&str>,
+) -> Result<()> {
+    let source = system
+        .read_file(file)
+        .await
+        .map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
+    let svg = flux_tools::render::render_flux_svg(&source, view.into())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    match out {
+        Some(path) => {
+            system
+                .write_file(path, &svg)
+                .await
+                .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+            let view_word = match view {
+                RenderView::Source => "source",
+                RenderView::Tree => "tree",
+            };
+            eprintln!("rendered {file} ({view_word} view) → {path}");
+        }
+        None => println!("{svg}"),
+    }
+    Ok(())
 }
 
 async fn run_flow(
@@ -5723,6 +5800,9 @@ async fn main() -> Result<()> {
                         resume_value,
                     },
             }) => run_flow(&file, model, yes, resumable, resume, resume_value).await,
+            Some(Commands::Render { file, view, out }) => {
+                run_render(&file, view, out.as_deref()).await
+            }
             Some(Commands::Review {
                 agent,
                 files,
@@ -8081,6 +8161,86 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    /// L-77: `flux render` is an explicit subcommand — positional `.flux` file, `--view
+    /// source|tree` (default `source`), `-o <out.svg>`.
+    #[test]
+    fn render_subcommand_parses() {
+        use super::{Cli, Commands, RenderView};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "flux",
+            "render",
+            "greet.flux",
+            "--view",
+            "tree",
+            "-o",
+            "out.svg",
+        ])
+        .expect("`render` parses");
+        match cli.command {
+            Some(Commands::Render { file, view, out }) => {
+                assert_eq!(file, "greet.flux");
+                assert_eq!(view, RenderView::Tree);
+                assert_eq!(out.as_deref(), Some("out.svg"));
+            }
+            other => panic!("expected Render, got {other:?}"),
+        }
+        // The view defaults to `source` and `-o` is optional (SVG then prints to stdout).
+        let cli2 =
+            Cli::try_parse_from(["flux", "render", "greet.flux"]).expect("bare render parses");
+        match cli2.command {
+            Some(Commands::Render { view, out, .. }) => {
+                assert_eq!(view, RenderView::Source);
+                assert_eq!(out, None);
+            }
+            other => panic!("expected Render, got {other:?}"),
+        }
+    }
+
+    /// L-77: the render handler reads the `.flux` file and writes the SVG through the
+    /// workspace-confined `System` (`-o`), tree view propagates a hard parse error (non-zero
+    /// exit), and source view is total — malformed input still renders.
+    #[tokio::test]
+    async fn run_render_writes_svg_and_propagates_tree_parse_errors() {
+        use super::{run_render_in, RenderView};
+        let dir = std::env::temp_dir().join(format!("flux-render-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("greet.flux"),
+            "flow greet(name: String)\n  do notify \"hi\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("broken.flux"), "flow ((((\n").unwrap();
+        let system = super::System::new(super::Workspace::new(&dir).unwrap());
+
+        // `-o` writes the SVG into the workspace.
+        run_render_in(&system, "greet.flux", RenderView::Tree, Some("img/out.svg"))
+            .await
+            .expect("tree render of a valid flow succeeds");
+        let svg = std::fs::read_to_string(dir.join("img/out.svg")).unwrap();
+        assert!(svg.starts_with("<svg"), "got: {svg}");
+
+        // A hard parse error in `tree` view surfaces the parser's message as an Err.
+        let err = run_render_in(&system, "broken.flux", RenderView::Tree, None)
+            .await
+            .expect_err("tree view needs parseable source");
+        assert!(err.to_string().contains("parse"), "got: {err:#}");
+
+        // `source` view is total: the same malformed file still renders.
+        run_render_in(
+            &system,
+            "broken.flux",
+            RenderView::Source,
+            Some("broken.svg"),
+        )
+        .await
+        .expect("source view renders malformed input");
+        assert!(std::fs::read_to_string(dir.join("broken.svg"))
+            .unwrap()
+            .starts_with("<svg"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A registered plugin whose recorded binary is gone (a deleted checkout, a pruned pack

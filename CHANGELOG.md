@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **L-77 — `flux render` CLI subcommand: `.flux` file → One-Dark SVG, and the doc-image
+  generator.** `flux render <file.flux> [--view source|tree] [-o out.svg]` — the non-model entry
+  point to L-76's `flow_render` renderer: the highlighted source (default) or the execution-path
+  plan tree, as a self-contained SVG. Without `-o` the SVG prints to stdout; `-o` writes through
+  the workspace-confined `System` (parents created). A hard parse error in `tree` view exits
+  non-zero with the parser's message; `source` view is total (malformed input still renders).
+  This replaces the `codewandler/flux-tree-sitter` repo's `scripts/render-example.mjs` Node
+  script as the way flux regenerates its own doc images (that repo's README/AGENTS now point at
+  `flux render`; companion change there). No new deps.
+
 ### Fixed
 
 - Stale plugin registrations (a descriptor whose recorded binary no longer exists — e.g. a

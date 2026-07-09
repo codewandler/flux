@@ -32,10 +32,6 @@ _The question that triggered this epic: *what can the agent do today to enumerat
 - [D-116 — Static endpoint wiring — `flux endpoint add` + config bindings that resolve](D-116-static-endpoint-wiring.md) · Core · wiring a known service without k8s discovery today means hand-writing `flux endpoint import --from-json '<EndpointRef>'`, and even then only discovered @endpoint/* refs resolve — StaticResolver is constructed with an EMPTY bindings map ('No host config endpoint bindings are wired yet', main.rs:2185-2190)
 - [D-117 — Website: endpoints concept page, `flux endpoint` CLI reference, saved-flows page](D-117-endpoints-flows-website-docs.md) · Core · the endpoint subsystem (D-25..D-32) has design/story/roadmap coverage but ZERO public docs — no concept page, `flux endpoint` absent from the CLI reference, one incidental line in plugins/gitlab.md; ~/.flux/flows + flow_list/flow_run + op.register have one paragraph in modules-and-programs.md
 
-### flux-render — a built-in `flow_render` tool: flux source/plan → SVG (+ later PNG)
-_`.flux` has three highlighting stories today, and each is confined to a live program:_
-- [L-77 — flux render CLI subcommand + retire the tree-sitter doc-image Node script](L-77-flux-render-cli-subcommand.md) · Language · flux render <file.flux> [--view source|tree] [-o out.svg] over render_flux_svg (SVG is text → system.write_file); becomes the doc-image generator — flux-tree-sitter's scripts/render-example.mjs retires, its README/AGENTS point at flux render
-
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
@@ -356,6 +352,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-74 — flux_lang::highlight — CST-classified highlight spans (L0 substrate)](L-74-flux-lang-highlight-substrate.md) · Language · the shared highlight substrate: parse_cst walk classifies every token into HighlightClass spans by kind + parent-node kind; total (highlights invalid source); also the substrate flux-lsp L-69 semantic tokens adapts later
 - [L-75 — render_styled_spans — span form of the plan-tree renderer (ANSI refactored on top)](L-75-render-styled-spans.md) · Language · one tree walk, two presentations: render.rs gains render_styled_spans (lines of (text, Role)); render_styled becomes the ANSI stringifier over it — flux-tui output byte-identical
 - [L-76 — flow_render built-in tool — flux source/plan → SVG (source + tree views)](L-76-flow-render-tool-svg.md) · Language · model-facing flow_render beside flow_list/flow_run: render_flux_svg pure core in flux-tools (One-Dark theme ported verbatim from the tree-sitter Node script), source|tree views, name-or-source input, SVG returned inline via ok_view — text-only ToolResult keeps it read-only/SVG-only
+- [L-77 — flux render CLI subcommand + retire the tree-sitter doc-image Node script](L-77-flux-render-cli-subcommand.md) · Language · flux render <file.flux> [--view source|tree] [-o out.svg] over render_flux_svg (SVG is text → system.write_file); becomes the doc-image generator — flux-tree-sitter's scripts/render-example.mjs retires, its README/AGENTS point at flux render
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->
