@@ -230,3 +230,4 @@ to the [examples cookbook](./examples.md).
 - [Flows & syntax](./flows-and-syntax.md) — the full grammar behind the snippets.
 - [Examples](./examples.md) — complete flows you can run directly.
 - [Reliability & guard rails](./reliability.md) — constraints and failure handling.
+- [Editor setup](./editors.md) — highlighting and LSP support for hand-editing flows.

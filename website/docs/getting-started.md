@@ -92,6 +92,13 @@ plugins still crosses the runtime safety envelope. Take the
 [ten-minute language tour](./language/tour.md) to go deeper, or run a whole app from one `.flux`
 file with [multi-agent programs](./agent/programs.md).
 
+## Set up your editor
+
+Hand-editing `.flux` files is much nicer with syntax highlighting plus live diagnostics,
+completion, hover, and formatting from the `flux-lsp` language server. The
+[Editor setup](./language/editors.md) page has the recipes — Helix is the reference setup, with
+Neovim, Zed, and IntelliJ/TextMate covered too.
+
 ## Contributor setup
 
 Building from a checkout, the full repository gate is:

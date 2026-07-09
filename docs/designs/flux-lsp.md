@@ -52,7 +52,9 @@ capabilities) · `document.rs` (open-buffer store + line-index) · `convert.rs` 
 
 ## Helix wiring (config-only; Helix 25.07.1 present)
 
-No editor extension — Helix is a built-in LSP client. Repo-local
+No editor extension — Helix is a built-in LSP client. The user-facing recipe (highlighting via
+the tree-sitter grammar, then the server on top) lives on the public site at
+`website/docs/language/editors.md` (L-73); this section stays the architectural record. Repo-local
 `/home/timo/projects/flux/.helix/languages.toml` (also documented for `~/.config/helix/`):
 
 ```toml

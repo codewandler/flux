@@ -59,7 +59,10 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/codewandler/flux/r
 
 ```bash
 cargo install --git https://github.com/codewandler/flux flux-cli
+# optional: the .flux language server for your editor (diagnostics, completion, hover, formatting)
+cargo install --git https://github.com/codewandler/flux flux-lsp
 # …or clone and build: cargo build --release   → target/release/flux
+#    (from a clone, `task install` installs flux and flux-lsp together)
 ```
 
 Release assets (including checksums and plugin-release checks) are in each
@@ -225,7 +228,7 @@ The plugin release index is minisign-checked and each archive hash is verified b
 - Getting started: [Getting started](https://codewandler.github.io/flux/docs/getting-started)
 - Agent loop: [The agent loop](https://codewandler.github.io/flux/docs/agent/agent-loop)
 - Language guide: [Flux-Lang overview](https://codewandler.github.io/flux/docs/language/overview)
-- Editor support: [Tooling — editor support](https://codewandler.github.io/flux/docs/language/tooling#editor-support)
+- Editor support: [Editor setup](https://codewandler.github.io/flux/docs/language/editors)
 - SDK: [SDK overview](https://codewandler.github.io/flux/docs/sdk/overview)
 - Plugins: [Using plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins)
 

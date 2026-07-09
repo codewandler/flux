@@ -1,7 +1,8 @@
 # Flux-Lang editor support for Helix (`hx`) — config only, no extension needed.
 #
-# Server (diagnostics, completion, hover, :format): build once (`cargo build -p flux-lsp`) and put
-# the binary on PATH, or point `command` at the built binary (e.g. `target/debug/flux-lsp`).
+# Server (diagnostics, completion, hover, :format): install once with `task install` (installs
+# `flux` and `flux-lsp` to ~/.cargo/bin) or `cargo install --path crates/flux-lsp`, or point
+# `command` at a built binary (e.g. `target/debug/flux-lsp` after `cargo build -p flux-lsp`).
 #
 # Highlighting: Helix colours via tree-sitter ONLY (it does not render LSP semantic tokens), so
 # colour comes from the grammar below. After `hx --grammar fetch && hx --grammar build`, copy the

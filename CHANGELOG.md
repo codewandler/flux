@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **L-73** — Public editor-setup docs page (Helix flagship) + LSP docs pass: new
+  `/docs/language/editors` page (tree-sitter highlighting first, `flux-lsp` on top, verified
+  Helix recipe with `hx --health flux`; Neovim, Zed, IntelliJ/TextMate coverage; shipped-only
+  LSP capability table), the tooling page's editor section slimmed to a pointer, cross-links
+  from getting-started/tour/overview/flows-and-syntax, and a `crates/flux-lsp` README.
+
+### Changed
+
+- **`task install` now also installs `flux-lsp`.** The install task puts both the `flux` CLI and
+  the `flux-lsp` language server on `~/.cargo/bin`, and the install docs (README, the website
+  tooling page, and the repo-local `.helix/languages.toml`) now show the `cargo install` route to
+  the server for editor setup.
+
 ## [0.11.6] - 2026-07-09
 
 ### Added

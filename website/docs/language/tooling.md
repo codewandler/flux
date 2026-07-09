@@ -100,26 +100,15 @@ Editing conventions: 2-space indentation, no tabs, one statement per line. See
 
 ## Editor support
 
-Two complementary pieces, matching how modern editors split the work:
-
-- **`flux-lsp` — language intelligence.** A Language Server in the flux repository
-  (`cargo build -p flux-lsp`): live error-recovering diagnostics with real spans, completion
-  (ops, node-kind keywords, prelude types, in-scope `$vars`), hover (op signatures with
-  effects/risk, node-kind docs), and document formatting via the invertible formatter. Helix
-  needs config only — see the repo's
-  [`.helix/languages.toml`](https://github.com/codewandler/flux/blob/main/.helix/languages.toml);
-  any LSP-capable editor can wire the same binary.
-- **[`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) — syntax
-  highlighting.** A tree-sitter grammar with highlight/injection queries for **Helix, Neovim, and
-  Zed** (none of which read TextMate grammars). Note that Helix colours via tree-sitter *only* —
-  it does not render LSP semantic tokens — so in Helix the grammar provides all colour and the
-  LSP provides everything else. Install instructions per editor are in that repo's README.
-
-[`codewandler/flux-editors`](https://github.com/codewandler/flux-editors) additionally ships the
-TextMate grammar and the IntelliJ plugin for their own ecosystems.
+Editor support splits into two pieces: syntax highlighting from the
+[`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) grammar, and
+language intelligence — diagnostics, completion, hover, formatting — from the `flux-lsp` language
+server. Per-editor recipes (Helix first, plus Neovim, Zed, and IntelliJ/TextMate) are on the
+[Editor setup](./editors.md) page.
 
 ## Related docs
 
+- [Editor setup](./editors.md) — highlighting and language intelligence for `.flux` files.
 - [Flows & syntax](./flows-and-syntax.md) — write valid `.flux` text.
 - [Examples](./examples.md) — complete flows to run.
 - [FlowClient](../sdk/flow-client.md) — the SDK lifecycle for parsing and executing flows.

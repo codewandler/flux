@@ -51,6 +51,7 @@ const sidebars = {
             'language/types-and-effects',
             'language/ops',
             'language/tooling',
+            'language/editors',
           ],
         },
         'language/examples',

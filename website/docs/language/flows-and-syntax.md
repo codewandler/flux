@@ -243,3 +243,4 @@ through the formatter without it.
 - [Control flow](./control-flow.md) — branching, iteration, routing, and fallback.
 - [Pure data shaping](./pure-data.md) — transform values without dispatching IO.
 - [Node reference](./node-reference.md) — JSON shapes for every node kind.
+- [Editor setup](./editors.md) — highlighting, diagnostics, and completion while you write this syntax.

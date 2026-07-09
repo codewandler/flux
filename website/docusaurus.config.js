@@ -96,7 +96,7 @@ const config = {
       copyright: `Copyright (c) ${new Date().getFullYear()} codewandler.`,
     },
     prism: {
-      additionalLanguages: ['bash', 'json', 'rust', 'toml'],
+      additionalLanguages: ['bash', 'json', 'lua', 'rust', 'toml'],
     },
   },
 };

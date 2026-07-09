@@ -147,3 +147,4 @@ Risky steps prompt for approval exactly as they do in an agent turn. See [Toolin
 - [A ten-minute tour](./tour.md) — learn the language by building one flow.
 - [Flows & syntax](./flows-and-syntax.md) — exact text syntax rules.
 - [Execution model](./execution-model.md) — what happens after a plan is parsed.
+- [Editor setup](./editors.md) — highlighting and LSP support for hand-editing flows.

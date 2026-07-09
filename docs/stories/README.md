@@ -45,7 +45,7 @@ _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compi
 - [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
 - [L-68 — flux-lsp document symbols + go-to-definition](L-68-flux-lsp-symbols-and-goto-def.md) · Language · Navigation — a CST scope model with definition ranges powers documentSymbol + definition.
 - [L-69 — flux-lsp semantic tokens — for clients that render them](L-69-flux-lsp-semantic-tokens.md) · Language · Semantic tokens from the CST token stream — NOT a Helix path (Helix renders tree-sitter only; highlighting now comes from codewandler/flux-tree-sitter). Value: VS Code/Neovim + semantic distinctions a grammar can't make.
-- [L-70 — Incremental reparse + comment-preserving format + docs/packaging + epic close](L-70-flux-lsp-incremental-docs-epic-close.md) · Language · Epic close — the CST payoffs (incremental reparse, comment-preserving format) + install/Helix docs + distribution + final gate.
+- [L-70 — Incremental reparse + comment-preserving format + docs/packaging + epic close](L-70-flux-lsp-incremental-docs-epic-close.md) · Language · Epic close — the CST payoffs (incremental reparse, comment-preserving format) + distribution + final gate. Install/Helix docs shipped early in L-73.
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
@@ -331,6 +331,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-67 — flux-lsp formatting + a `flux fmt` CLI verb](L-67-flux-lsp-formatting-and-fmt-verb.md) · Language · LSP textDocument/formatting via format::format on a clean parse, plus a first-class `flux fmt [--check]` verb (none exists today).
 - [L-71 — Merged model-facing Node schema on emit_plan (third emission arm)](L-71-merged-model-facing-node-schema.md) · Language · MEASURED, DECIDED — merged is the DEFAULT arm: pooled 30-task first-emission 28/30 vs json 28/30 (run 2: 15/15, zero repairs) at −26% input/−23% cost on codex/gpt-5.5; one Node object (kind enum + unioned optional props) instead of the 43-variant oneOf, same wire, same parse path; json/text stay opt-in via FLUX_EMISSION.
 - [L-72 — flow_list/flow_run tools + unify flows and ops under ~/.flux/flows](L-72-flow-list-run-flows-home.md) · Language · flow_list/flow_run agent tools; ~/.flux/flows (@global_flows) is the unified home for reusable flows/ops (auto-load); fixed base_for bare-@name resolution
+- [L-73 — Public editor-setup docs page (Helix flagship) + LSP docs pass](L-73-editor-setup-docs-page.md) · Language · Pulls the docs bullet of L-70 forward: website editors page, Helix highlight→LSP recipe, cross-links, flux-lsp crate README.
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

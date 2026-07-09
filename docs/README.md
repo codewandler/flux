@@ -49,4 +49,8 @@ pillars, open the [board](stories/README.md), take the top `ready` story, follow
 the gate green. New or unscoped work? Create a story from
 [`stories/_TEMPLATE.md`](stories/_TEMPLATE.md) first, so the next agent inherits the context.
 
-Editor support (IntelliJ plugin + TextMate grammar) lives in a separate repo, **flux-editors**.
+Editor support: syntax highlighting comes from the **flux-tree-sitter** repo (Helix/Neovim/Zed),
+the TextMate grammar + IntelliJ plugin from **flux-editors**, and language intelligence from the
+in-repo `crates/flux-lsp` server. The public setup guide is
+[`website/docs/language/editors.md`](../website/docs/language/editors.md) (published at
+`/docs/language/editors`).
