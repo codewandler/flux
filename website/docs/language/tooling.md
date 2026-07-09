@@ -26,6 +26,9 @@ plan. Details:
   `task`, …) runs with no API credentials at all.
 - The safety envelope applies exactly as in an agent turn: risky steps prompt for approval;
   `--yes` auto-approves.
+- Beyond the CLI (which runs by **file path**), an **agent** can discover and run stored flows by
+  **name** with the `flow_list` / `flow_run` ops, resolved from the flows home — see
+  [Where flows live](#where-flows-live).
 
 ## `flux plan` — preview without executing
 
@@ -85,6 +88,10 @@ drift.
 
 - **Authored text** — your repository; the flux repo's own runnable examples are in
   [`examples/`](https://github.com/codewandler/flux/tree/main/examples).
+- **The reusable flows home** — drop `.flux` files (flows, ops, or whole modules) under
+  **`.flux/flows`** (project) or **`~/.flux/flows`** (global): the `flow_list` / `flow_run` ops
+  discover and run them by name, and any composite `op`s placed there **auto-load as callable ops**.
+  (The legacy `.flux/ops` / `~/.flux/ops` dirs are still read.)
 - **Planner-emitted JSON** — session storage and `.flux/flows/` in a workspace.
 
 Editing conventions: 2-space indentation, no tabs, one statement per line. See

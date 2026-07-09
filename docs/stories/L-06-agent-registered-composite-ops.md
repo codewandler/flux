@@ -28,4 +28,6 @@ the safety envelope.
 - Documented in the composite-op design and flow ops reference.
 
 ## Notes
-- `global` uses the `@global_ops` named root, prepared by the CLI as `~/.flux/ops`.
+- `global` uses the `@global_ops` named root, prepared by the CLI as `~/.flux/ops`. (Superseded by L-72:
+  the unified home is now `~/.flux/flows` / `@global_flows`; `.flux/ops` / `@global_ops` are still read.
+  `@global_ops` global loading had in fact never worked until L-72's bare-`@name` `base_for` fix.)

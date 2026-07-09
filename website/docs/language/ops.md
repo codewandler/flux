@@ -173,6 +173,16 @@ Registered **only** by the `flux app run` host for [multi-agent programs](../age
 | `ask` | `channel, message` | Send and return a correlation id |
 | `spawn` | `run[, input]` | Run a named journey to completion and return its result |
 
+## Flows
+
+Discover and run reusable flows and composite ops stored under `.flux/flows` (project) and
+`~/.flux/flows` (global) — see [Where flows live](./tooling.md#where-flows-live):
+
+| op | arguments | description |
+|---|---|---|
+| `flow_list` | | List the flows and composite ops in the flows home, each with its description and params |
+| `flow_run` | `name[, inputs]` | Run a stored flow by name; an `inputs` object is seeded as `$key` binds, then it runs in the current session |
+
 ## The loop itself
 
 flux's own agent turn loop is a Flux-Lang flow, driven by reflexive planning and evidence ops

@@ -52,8 +52,8 @@ function (`Workspace::resolve`), so this is a focused core change + CLI/config p
 
 ## Notes
 - Choke-point: `crates/flux-system/src/lib.rs:67` (`resolve`) → `Error::Config` on escape; `Workspace`
-  already holds `root` + `named: HashMap` (the multi-root precedent, wired for `@global_ops` at
-  `flux-cli/src/main.rs:1400`). Read-tool path: every builtin file tool routes through `System` →
+  already holds `root` + `named: HashMap` (the multi-root precedent, wired for `@global_ops` — and, since
+  L-72, also `@global_flows` / `~/.flux/flows`). Read-tool path: every builtin file tool routes through `System` →
   `resolve` (`flux-tools/src/lib.rs` read/write/glob/grep → `flux-system` guarded ops).
 - Patterns to mirror: `[skills] dirs` (`Vec<String>` + `~` expand + user/project concat merge,
   `flux-config/src/lib.rs`), the `--skill-dir` repeatable `PathBuf` flag, and the `FLUX_ENABLE_BASH`

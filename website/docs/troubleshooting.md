@@ -43,6 +43,7 @@ Everything lives under `~/.flux/`:
 | --- | --- |
 | `~/.flux/events.db` | the append-only event log (sessions, run traces, usage) |
 | `~/.flux/flow.db` | stored flow values, symbols, suspensions |
+| `~/.flux/flows/` | reusable flows + composite ops (`.flux` files, auto-loaded; `flow_list`/`flow_run`) |
 | `~/.flux/config.toml` | user-wide config (a project `.flux/config.toml` overrides it) |
 | `~/.flux/pricing.toml` | optional price overrides (see [Usage & cost](./agent/cost.md)) |
 | `~/.flux/plugins/` | installed plugin manifests |

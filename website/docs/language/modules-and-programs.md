@@ -74,6 +74,11 @@ Rules that keep composite ops safe and analyzable:
 Composite ops are how a module grows a vocabulary: name a multi-step pattern once, call it
 like a built-in everywhere else.
 
+**Reuse across sessions — the flows home.** Beyond the module they are declared in, composite ops
+saved as `.flux` files under `.flux/flows` (project) or `~/.flux/flows` (global) **auto-load as
+callable ops** on every run — so a `~/.flux/flows/greet.flux` that defines `op greet(...)` is callable
+by name anywhere. Use `flow_list` to see what is available and `flow_run` to run a stored flow by name.
+
 ## Program declarations
 
 Beyond flows and ops, a module may declare a whole multi-agent application: `agent`,

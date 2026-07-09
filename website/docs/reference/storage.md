@@ -22,6 +22,7 @@ Zero configuration. The `flux` binary opens (creating on first use):
 |---|---|
 | `~/.flux/events.db` | the unified event log — conversations, run traces, turn telemetry |
 | `~/.flux/flow.db` | flow-engine state — values, symbols, suspensions |
+| `~/.flux/flows/` | reusable flows and composite ops (`.flux` files) — auto-loaded, discovered/run by `flow_list`/`flow_run` (legacy `~/.flux/ops/` still read) |
 
 SQLite runs in WAL mode with a ~5 s busy timeout, so concurrent readers and multiple flux
 processes sharing the same log coordinate safely.

@@ -331,6 +331,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-66 — flux-lsp hover — op signatures/schemas + node-kind & prelude docs](L-66-flux-lsp-hover.md) · Language · LSP hover via token-at-offset hit-testing on the CST → op signature / node-kind doc / prelude doc.
 - [L-67 — flux-lsp formatting + a `flux fmt` CLI verb](L-67-flux-lsp-formatting-and-fmt-verb.md) · Language · LSP textDocument/formatting via format::format on a clean parse, plus a first-class `flux fmt [--check]` verb (none exists today).
 - [L-71 — Merged model-facing Node schema on emit_plan (third emission arm)](L-71-merged-model-facing-node-schema.md) · Language · MEASURED, DECIDED — merged is the DEFAULT arm: pooled 30-task first-emission 28/30 vs json 28/30 (run 2: 15/15, zero repairs) at −26% input/−23% cost on codex/gpt-5.5; one Node object (kind enum + unioned optional props) instead of the 43-variant oneOf, same wire, same parse path; json/text stay opt-in via FLUX_EMISSION.
+- [L-72 — flow_list/flow_run tools + unify flows and ops under ~/.flux/flows](L-72-flow-list-run-flows-home.md) · Language · flow_list/flow_run agent tools; ~/.flux/flows (@global_flows) is the unified home for reusable flows/ops (auto-load); fixed base_for bare-@name resolution
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

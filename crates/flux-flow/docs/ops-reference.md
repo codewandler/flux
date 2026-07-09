@@ -52,6 +52,8 @@ optional arguments are in `[brackets]`.
 | `git_push` | `[branch, remote]` | Medium | Push to remote |
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
 | `git_unstage` | `paths` | Low | Unstage files |
+| `flow_list` | | Low | List reusable flows and composite ops under `.flux/flows` / `~/.flux/flows` (and the legacy `.flux/ops` / `@global_ops`) — each with its description and params |
+| `flow_run` | `name[, inputs]` | Medium | Run a stored flow by name from the flows home; `inputs` (a JSON object) are seeded as `$key` binds. Runs in the current session by re-entering `run_plan` (needs a `LoopHost`) |
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,
 `python_run`, `pytest`, `npm`, `node_run`, `make`) may pause for user approval (controlled by the
@@ -160,7 +162,9 @@ start of the next turn.
 them in its catalog — only a pre-authored flow (the agent loop, or `flux flow run`) can call them, and only
 when a `LoopHost` is installed (the engine installs one per turn). `op.register` is a model-facing root op,
 available only when the engine installs a composite registrar. `observe`/`evidence`/`metrics` are ordinary
-builtins; `grade` is in the evidence-gated `eval` group.
+builtins; `grade` is in the evidence-gated `eval` group. `flow_list`/`flow_run` (registered by the CLI
+host's `flux_tools::register_flows`, not base `register_builtins`) are **model-facing**; `flow_run` also
+needs a `LoopHost`, since it re-enters `run_plan` to run the resolved flow.
 
 On the **user-facing** surface these machinery ops are filtered out by default so the turn shows real
 work, not plumbing. `flux run --show-loop` (or `FLUX_SHOW_LOOP=1`) reveals them so you can watch the

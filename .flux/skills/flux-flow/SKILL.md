@@ -77,8 +77,14 @@ Flux-Lang is the planning language for this project. The LLM has no directly-cal
 | `edit` | `path, old_string, new_string[, replace_all]` | Medium |
 | `task` | `role, task` | Medium |
 | `op.register` | `source, scope[, replace, expose]` | Medium |
+| `flow_list` | | Low |
+| `flow_run` | `name[, inputs]` | Medium |
 | `bash` | `command[, timeout_secs]` | High |
 | `proc.run` | `program[, args, timeout_secs]` | High |
+
+`flow_list` lists reusable flows and composite ops stored under `.flux/flows` / `~/.flux/flows`; `flow_run
+name [inputs]` runs one by name (seeding an `inputs` object as `$key` binds). Composite `op`s placed in
+that flows home auto-load as callable ops.
 
 `bash` and `proc.run` are generic process escape hatches and are **off by default** — they are only in the catalog when the
 `shell` group is opted in (config `enable_shell = true`, `FLUX_ENABLE_BASH=1`, or the `/shell` REPL

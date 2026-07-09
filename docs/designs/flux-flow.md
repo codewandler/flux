@@ -222,14 +222,18 @@ On that base, the built-in file tools (`flux-tools`) match a strong coding agent
 ## 6. Flows as artifacts
 
 A flow is first-class and durable: **NL instruction → compile to graph → optionally user-verifies → run
-now, or persist and re-run later** with bound parameters. Persisted flows live under
-**`.flux/flows/<name>`** (serialized AST + parameter schema + determinism knobs). Re-run loads the saved
-graph and executes it, **skipping compilation**; `cache`d `!model` nodes replay frozen outputs (zero
-model calls), `live` nodes re-invoke against current data. This is the repeatability/cost story: turn a
-one-off instruction into a reusable, auditable runbook.
+now, or persist and re-run later** with bound parameters. Reusable flows and composite ops live under
+**`.flux/flows/<name>.flux`** (project) and **`~/.flux/flows/<name>.flux`** (global, the `@global_flows`
+named root) — as **hand-authored `.flux` text** as well as serialized ASTs. Composite `op`s found there
+auto-load as callable ops (see [composite-ops.md](composite-ops.md)); re-run loads the saved graph and
+executes it, **skipping compilation**; `cache`d `!model` nodes replay frozen outputs (zero model calls),
+`live` nodes re-invoke against current data. This is the repeatability/cost story: turn a one-off
+instruction into a reusable, auditable runbook.
 
 The SDK surface: `compile(nl) -> Flow`, `flow.render()`, `flow.risk()`, `flow.run(approver)`,
-`flow.save(name)`, `load(name).run(params)`.
+`flow.save(name)`, `load(name).run(params)`. The **agent-facing** analogue is the pair of tools
+`flow_list` (discover flows/ops in the flows home) and `flow_run(name, inputs?)` (run a stored flow by
+name, seeding `inputs` as literal binds and re-entering the depth-guarded `run_plan` path).
 
 ## 7. Approval, determinism, error handling
 
@@ -412,7 +416,9 @@ Resolved in design (no longer open):
 
 Deferred to implementation (detail, not concept):
 
-- Flow parameter schema + on-disk format under `.flux/flows/<name>` — specified at M6.
+- Flow parameter schema + on-disk format under `.flux/flows/<name>` — specified at M6. (Partly delivered:
+  hand-authored `.flux` files in `.flux/flows` / `~/.flux/flows` load today, and `flow_run` seeds
+  parameters as literal binds; a first-class serialized-AST parameter schema is still M6.)
 - Exact `view(Session)` projection format and its token-budget interaction with compaction — M1/M3.
 
 Deferred follow-ups (separate decisions, not part of the self-hosted-loop work):

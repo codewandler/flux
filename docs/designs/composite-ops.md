@@ -67,6 +67,34 @@ Every registration is parsed and validated before it is installed. Existing acti
 Flux-Lang source in later engines. Scope precedence is global -> project -> session -> turn, with later
 scopes overriding earlier ones only when replacement was explicit.
 
+## The `~/.flux/flows` home (flows + ops, unified)
+
+Reusable, hand-authored definitions live under a single home: **`.flux/flows`** (project) and
+**`~/.flux/flows`** (global, exposed as the `@global_flows` named root). `DynamicComposites::load`
+(`crates/flux-flow/src/composites.rs`) reads it **leniently**: a file may hold a bare flow, a single op,
+or a whole module — every top-level `op` it finds is registered as a callable composite, and flows /
+unparseable files are skipped (a bad file never breaks startup). So dropping a `.flux` file into
+`~/.flux/flows` makes its ops callable by name, regardless of the file's structure.
+
+The legacy `op.register` write locations — `.flux/ops` (`@global_ops`) — are **still read** (strictly,
+one op per file) and unioned in, with the `flows` dirs taking precedence. `op.register` continues to
+write there; the `flows` home is the recommended place for hand-authored flows/ops.
+
+> Historical note: global composite loading from `@global_ops` (`~/.flux/ops`) had silently never worked
+> until a `flux-system` fix — `Workspace::base_for` did not resolve a bare `@name` (no `/subpath`) to its
+> named root, so the directory read resolved to a non-existent path and returned nothing.
+
+### Discovery and running — `flow_list` / `flow_run`
+
+Two model-facing tools (registered by `flux_tools::register_flows` at the CLI host, not base
+`register_builtins`) let the agent work with the flows home directly:
+
+- **`flow_list`** enumerates `.flux/flows` → `@global_flows` → `.flux/ops` → `@global_ops` and lists every
+  flow and composite op with its description and params.
+- **`flow_run(name, inputs?)`** resolves a flow by name, seeds `inputs` as prepended literal binds, and
+  runs it in the current session by re-entering the depth-guarded `run_plan` path (`ctx.loop_host`), so it
+  inherits the provider, session, and approval/IO envelope. (It needs a `LoopHost`, like `run_plan`.)
+
 ## Safety rules
 
 - `await` inside a composite is rejected for v1; composites are synchronous sub-flows.
