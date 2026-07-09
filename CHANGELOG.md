@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **L-74 — `flux_lang::highlight`: CST-classified highlight spans (L0 substrate).** New pure
+  module `flux_lang::highlight` — `highlight(src) -> Vec<(TextRange, HighlightClass)>` classifies
+  every token of a `.flux` source by walking the lossless CST (`parse_cst`), keyed on token kind
+  *and parent node kind* (the leading ident of a `when`/`flow`/`do` statement is a `Keyword`, a
+  `NAME` in type position is a `Type`, `$x` → `Var`, `@effect` → `Annotation`) — strictly more
+  accurate than keyword-list matching, and total: malformed/incomplete source still yields spans
+  (never panics), with a `"""triple"""` string as one span covering all its lines. The shared
+  substrate for the `flow_render` SVG source view (L-76) and, later, flux-lsp semantic tokens
+  (L-69). No new deps.
+
 ## [0.12.0] - 2026-07-09
 
 ### Fixed
