@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-07-09
+
 ### Added
 
 - **Wired the `codewandler/flux-tree-sitter` grammar into editor support.** The new sibling repo
