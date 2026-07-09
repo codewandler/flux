@@ -6,6 +6,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Documentation
+
+- Added a public Infrastructure page with an architecture diagram and a concise guide to flux's
+  planner/runtime split, mandatory safety envelope, three pillars, and L0-L6 crate layering.
+
 ## [0.13.2] - 2026-07-09
 
 ### Added

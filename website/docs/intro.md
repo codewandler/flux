@@ -40,6 +40,7 @@ They are useful when contributing, but they are more detailed and more volatile 
 
 - New to flux: read [Getting started](./getting-started.md).
 - How a turn works: read [Concepts](./concepts.md) and [The agent loop](./agent/agent-loop.md).
+- How the pieces fit together: see [Infrastructure](./infrastructure.md).
 - What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
 - Interested in the language: read [Flux-Lang overview](./language/overview.md).
 - Embedding flux: read the [SDK overview](./sdk/overview.md).
@@ -50,3 +51,4 @@ They are useful when contributing, but they are more detailed and more volatile 
 
 - [Getting started](./getting-started.md) — install flux and run the mock provider.
 - [Concepts](./concepts.md) — understand plans, symbols, evidence, and the safety envelope.
+- [Infrastructure](./infrastructure.md) — see the runtime, safety boundary, and crate layers at a glance.

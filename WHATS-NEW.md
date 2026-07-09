@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### Improved
+
+- The public docs now include a visual Infrastructure guide showing how requests become typed plans,
+  how every real effect crosses the safety envelope, and how the project fits together from core
+  contracts to user-facing surfaces.
+
 ## [0.13.2] - 2026-07-09
 
 ### New

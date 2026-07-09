@@ -5,6 +5,7 @@ const sidebars = {
     'intro',
     'getting-started',
     'concepts',
+    'infrastructure',
     'troubleshooting',
     {
       type: 'category',
