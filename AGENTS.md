@@ -86,6 +86,18 @@ Key rules:
 
 ---
 
+## Binaries — what builds to an executable, and why
+
+The repo deliberately ships **one** product binary. Every other executable is either dev tooling or exists because a protocol demands a separate process. Don't add a new binary without the same kind of justification.
+
+- **`flux`** (`crates/flux-cli`) — the product: agent CLI/REPL, flow/app runner, plugin manager, server, replay, auth, usage. The **only** binary in the release artifacts (everything else is `dist = false` or lives outside the dist workspace).
+- **`fluxlang`** (`crates/flux-lang/src/bin/fluxlang.rs`) — the language workbench: `skill` / `schema [--merged]` / `render` / `compile` over the pure language core. It is *not* redundant with `flux`: its job is to prove — and structurally preserve — that Flux-Lang stands alone without the engine. It builds from `flux-lang` only (seconds, not the full stack — handy when iterating on the parser/schema), is feature-gated behind `cli` so library consumers never pull `clap`, and is `dist = false`. Users get everything through `flux`; `fluxlang` is for people working *on* the language (dump the schema the planner advertises on `emit_plan`, debug a model-emitted JSON AST, check the `compile(format(ast))` round-trip).
+- **`flux-lsp`** (`crates/flux-lsp`) — the Flux-Lang language server. A separate binary because LSP requires one: editors spawn it as a child process speaking JSON-RPC over stdio. Deliberately unprefixed, unpublished, and `dist = false` until the distribution story lands.
+- **`echo_plugin` / `caps_plugin`** (`crates/flux-plugin/src/bin/`) — minimal test/example plugins that let the plugin host's process protocol be integration-tested without a real external service.
+- **`flux-plugin-*`** (`plugins/`, the nested workspace) — every integration plugin (gitlab, slack, kubernetes, …) is its own binary by design: plugins run as env-cleared child processes spawned by the host, so each one must be an executable. They ship via the signed plugins release, not the main `flux` release.
+
+---
+
 ## Non-negotiable conventions
 
 - **All real filesystem / process / network IO goes through `flux-system`** (`System` / `Workspace`). Tools never touch `std::fs` or `std::process::Command` directly. The guarded surface enforces workspace confinement, symlink/escape rejection, and **argv-only** execution — never build a shell string from model input.
