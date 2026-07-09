@@ -76,9 +76,10 @@ Text and JSON are two spellings of the same AST, and the toolchain holds a hard 
 parse(format(ast)) == ast
 ```
 
-Native spellings cover the supported subset; every node without one round-trips through the
-one-line `@json` escape. The invariant is property-tested in the repository, so a plan can be
-formatted for review and parsed back without drift.
+Native spellings cover every node kind; the rare shapes the text grammar cannot express (such as
+non-identifier symbol names) round-trip through the one-line `@json` escape. The invariant is
+property-tested in the repository, so a plan can be formatted for review and parsed back without
+drift.
 
 ## Where flows live
 

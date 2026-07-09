@@ -83,9 +83,9 @@ flow check-readme
 ```
 
 Humans usually write the text form; models may emit either surface, and both are normalized into the
-same AST before analysis and execution. A handful of node kinds have no native text spelling yet — in
-text they are written with a one-line `@json` escape. The [node reference](./node-reference.md)
-covers every kind in both shapes.
+same AST before analysis and execution. Every node kind has a native text spelling; a one-line
+`@json` escape remains for the rare shapes the text grammar cannot express. The
+[node reference](./node-reference.md) covers every kind in both shapes.
 
 ## How a plan runs
 

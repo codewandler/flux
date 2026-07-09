@@ -226,15 +226,17 @@ branch and return after the join instead.
 
 ## The `@json` escape
 
-Every AST node can be written in text. Nodes without a native spelling yet use a one-line
-`@json` escape carrying the node's compact JSON form:
+Every AST node kind has a native text spelling. The one-line `@json` escape — carrying a node's
+compact JSON form — remains for the rare *shapes* the text grammar cannot express: a symbol name
+that is not an identifier, a non-invertible `expr` formula, or a `jq` with a bracket path or
+non-symbol input:
 
 ```flux
-@json {"kind": "memo", "name": "schema", "value": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "schema.sql"}]}}
+@json {"kind": "bind", "name": "report.v2", "value": {"kind": "var", "name": "draft"}}
 ```
 
-Treat `@json` as an escape hatch, not a preferred style. The
-[node reference](./node-reference.md) marks which nodes need it.
+Treat `@json` as an escape hatch, not a preferred style — a plan written natively round-trips
+through the formatter without it.
 
 ## Related docs
 

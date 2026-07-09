@@ -9,8 +9,7 @@ Durability nodes let a flow outlive one straight-line execution. They cache work
 events, resume long runs without repeating side effects, and unwind partial work when a later step
 fails.
 
-None of these nodes has native text syntax yet. In `.flux` files they use the `@json` escape; in the
-JSON wire form they are ordinary nodes.
+All of these nodes have native text spellings; in the JSON wire form they are ordinary nodes.
 
 Two kinds of state are in play:
 
@@ -27,8 +26,11 @@ Like `bind`, but pinned across turns: if the symbol is already resolved for this
 op is skipped and the cached value reused.
 
 ```flux
-@json {"kind": "memo", "name": "survey", "value": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "big.log"}]}}
+memo $survey = read("big.log")
 ```
+
+Like `bind`, a `memo` accepts an optional type annotation and an `@effect(tag)` line above it:
+`memo $schema: String = read("schema.sql")`.
 
 The cache key is `(session, symbol name)` — a different session always recomputes. Use it for
 expensive deterministic work (large reads, slow searches, model calls) that later turns will
@@ -40,18 +42,14 @@ Returns a symbol's current in-session value, or an empty result if it is not yet
 pure lookup, no filesystem involved:
 
 ```flux
-@json {"kind": "bind", "name": "prev", "value": {"kind": "peek", "name": "last_result"}}
+$prev = peek $last_result
 ```
 
 `peek` pairs with `unless` for "skip if already computed" within a plan:
 
-```json
-{"kind": "unless",
- "cond": {"kind": "peek", "name": "survey"},
- "body": [
-   {"kind": "bind", "name": "survey",
-    "value": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "big.log"}]}}
- ]}
+```flux
+unless peek $survey
+  $survey = read("big.log")
 ```
 
 For caching across turns, prefer `memo`; `peek` is the in-plan conditional check.
@@ -59,8 +57,10 @@ For caching across turns, prefer `memo`; `peek` is the in-plan conditional check
 ## `await` — suspend until an event
 
 ```flux
-@json {"kind": "await", "source": "github.push", "binding": "push"}
+await $push = "github.push"
 ```
+
+The binding is optional — `await "webhook"` suspends without naming the received value.
 
 Reaching an `await` suspends the flow: the runtime records the suspend point, persists the
 flow, and returns a suspension. When the awaited input arrives — next turn, next webhook — the
@@ -74,7 +74,7 @@ bodies, because v1 keeps resume cursors simple and stable.
 ## `checkpoint` — durable resume point
 
 ```flux
-@json {"kind": "checkpoint", "label": "phase-1"}
+checkpoint "phase-1"
 ```
 
 A top-level marker (like `await`) for long or resumable flows. The first time a run reaches
@@ -90,12 +90,13 @@ An effect-level `memo`. The explicit label is an idempotency key: the first time
 body and reuse the stored result. A failed body records nothing and is retried.
 
 ```flux
-@json {"kind": "once", "label": "send-welcome", "body": [{"kind": "call", "op": "send_email", "args": [{"kind": "var", "name": "welcome_msg"}]}]}
+once "send-welcome"
+  send_email($welcome_msg)
 ```
 
 This is the guard for "never fire twice" effects — sending an email, charging a card — under
-re-execution, retries, or checkpoint fast-forwards. `bind` optionally names the stored result.
-The label must be a non-empty literal.
+re-execution, retries, or checkpoint fast-forwards. An optional `-> $bind` on the header names
+the stored result (`once "charge" -> $receipt`). The label must be a non-empty literal.
 
 ## `scope` — guaranteed cleanup
 
@@ -104,8 +105,14 @@ the resource), then run `body`; `finally` **always** runs afterward — on norma
 early `return`, or an error.
 
 ```flux
-@json {"kind": "scope", "acquire": {"kind": "call", "op": "lock.get", "args": [{"kind": "lit", "value": "deploy"}]}, "bind": "h", "body": [{"kind": "call", "op": "deploy", "args": []}], "finally": [{"kind": "call", "op": "lock.release", "args": [{"kind": "var", "name": "h"}]}]}
+scope $h = lock.get("deploy")
+  deploy()
+finally
+  lock.release($h)
 ```
+
+The `$bind = <acquire>` part of the header is optional — a bare `scope` still guarantees its
+`finally` block runs.
 
 - The body's result, `return`, or error propagates after `finally` runs.
 - A `finally` failure surfaces only when the body itself succeeded — cleanup errors never mask
@@ -119,7 +126,13 @@ step succeeds, its `undo` is registered. If a **later** step fails, the runtime 
 running the registered undos in **reverse** order, then propagates the original error:
 
 ```flux
-@json {"kind": "saga", "steps": [{"body": [{"kind": "call", "op": "charge", "args": []}], "undo": [{"kind": "call", "op": "refund", "args": []}]}, {"body": [{"kind": "call", "op": "ship", "args": []}]}]}
+saga
+  step
+    charge()
+  undo
+    refund()
+  step
+    ship()
 ```
 
 - The unwind is best-effort: an undo failure is recorded but does not stop the remaining

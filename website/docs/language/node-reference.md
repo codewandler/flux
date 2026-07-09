@@ -7,7 +7,9 @@ description: Every Flux-Lang node kind — the JSON wire shape, fields, semantic
 
 This is the precise JSON AST reference for Flux-Lang. Planners emit this shape, sessions store it,
 and SDKs pass it around. Text and JSON are semantically identical: every `.flux` construct lowers to
-these nodes, and nodes without native text syntax are written through `@json`.
+these nodes, every node kind has a native text spelling, and `@json` remains as the escape for rare
+shapes the text grammar cannot express (non-identifier symbol names, non-invertible `expr` formulas,
+bracket-path `jq`).
 
 ## Top-level shape
 
@@ -119,7 +121,9 @@ An unbound symbol is a hard error at evaluation time.
 
 ### `thing`
 
-A reference to an external object, resolved before execution begins. `@json`-only in text.
+A reference to an external object, resolved before execution begins. Text form:
+`thing <kind> <selector> "<value>"` — e.g. `thing person name "John"`,
+`thing file path "src/x.rs"`, `thing custom "widget" key "w-1"`.
 
 ```json
 {"kind": "thing", "thing": {"kind": "person", "selector": {"name": "John"}}}
@@ -348,7 +352,8 @@ Sequential block, optionally binding its final result. Text form: `seq [-> $bind
 
 ### `pipe`
 
-Chain calls, each step's output fed as the next step's first argument. `@json`-only in text.
+Chain calls, each step's output fed as the next step's first argument. Text form:
+`pipe [-> $bind]` + one indented call per line.
 
 ```json
 {"kind": "pipe", "bind": "hits", "steps": [
@@ -364,7 +369,8 @@ Chain calls, each step's output fed as the next step's first argument. `@json`-o
 
 ### `memo`
 
-Like `bind`, but compute-once-per-session keyed on `(session, name)`. `@json`-only in text.
+Like `bind`, but compute-once-per-session keyed on `(session, name)`. Text form:
+`memo $name[: Type] = <call>` (optionally preceded by `@effect(tag)`).
 
 ```json
 {"kind": "memo", "name": "survey",
@@ -393,8 +399,8 @@ order. Text form: `parallel` + `branch $name` arms. See [Concurrency](./concurre
 
 ### `race`
 
-First-success concurrency under a required deadline. `@json`-only in text. See
-[Concurrency](./concurrency.md).
+First-success concurrency under a required deadline. Text form: `race <timeout_ms> [-> $bind]` +
+`branch $name` arms. See [Concurrency](./concurrency.md).
 
 | field | type | required | description |
 |---|---|---|---|
@@ -408,8 +414,9 @@ First-success concurrency under a required deadline. `@json`-only in text. See
 
 ### `try`
 
-Run `body`; on failure bind the error string to `catch` and run `handler`. `@json`-only in
-text. See [Reliability & guard rails](./reliability.md).
+Run `body`; on failure bind the error string to `catch` and run `handler`. Text form: `try` +
+body, then an optional `catch [$err]` + handler block. See
+[Reliability & guard rails](./reliability.md).
 
 | field | type | required | description |
 |---|---|---|---|
@@ -435,7 +442,8 @@ retried.
 
 ### `verify`
 
-Run a command node and assert its output contains a substring. `@json`-only in text.
+Run a command node and assert its output contains a substring. Text form:
+`verify <cmd> contains <expect>[: "message"]`.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -445,7 +453,7 @@ Run a command node and assert its output contains a substring. `@json`-only in t
 
 ### `confirm`
 
-Explicit human approval gate. `@json`-only in text. See
+Explicit human approval gate. Text form: `confirm "message" [risk <level>]` + optional body. See
 [Reliability & guard rails](./reliability.md).
 
 | field | type | required | description |
@@ -492,7 +500,7 @@ Runtime-enforced tool allowlist for a body; nested scopes intersect. Text form:
 ### `throttle`
 
 At most `max` dispatches per sliding window, keyed per session by `name`; errors instead of
-blocking. `@json`-only in text.
+blocking. Text form: `throttle "name" <max> per <window_ms>` + body.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -503,8 +511,8 @@ blocking. `@json`-only in text.
 
 ### `debounce`
 
-Cross-turn coalescing: the body runs only after `wait_ms` of quiet for the key. `@json`-only
-in text.
+Cross-turn coalescing: the body runs only after `wait_ms` of quiet for the key. Text form:
+`debounce "name" <wait_ms>` + body.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -518,7 +526,8 @@ in text.
 
 ### `peek`
 
-Read a symbol's in-session value without IO (empty if unbound). `@json`-only in text.
+Read a symbol's in-session value without IO (empty if unbound). Text form: `peek $name` — an
+expression, valid as a bind value or condition.
 
 | field | type | required | description |
 |---|---|---|---|
@@ -526,8 +535,8 @@ Read a symbol's in-session value without IO (empty if unbound). `@json`-only in 
 
 ### `await`
 
-Suspend until an external event; resume binds the received value. Top-level only.
-`@json`-only in text. See [Durability & cross-turn state](./durability.md).
+Suspend until an external event; resume binds the received value. Top-level only. Text form:
+`await [$bind[: Type] =] "source"`. See [Durability & cross-turn state](./durability.md).
 
 | field | type | required | description |
 |---|---|---|---|
@@ -538,8 +547,9 @@ Suspend until an external event; resume binds the received value. Top-level only
 ### `scope` / `saga` / `once` / `checkpoint`
 
 The durability quartet — guaranteed cleanup, compensation, at-most-once effects, and durable
-resume. All `@json`-only in text; semantics, examples, and field-by-field behavior are on
-[Durability & cross-turn state](./durability.md). Field summary:
+resume. Text forms: `scope [$res = <acquire>]` + body + `finally` + cleanup; `saga` with `step` /
+`undo` arms; `once "label" [-> $bind]` + body; `checkpoint "label"`. Semantics, examples, and
+field-by-field behavior are on [Durability & cross-turn state](./durability.md). Field summary:
 
 | kind | fields |
 |---|---|

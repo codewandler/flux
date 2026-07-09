@@ -121,24 +121,24 @@ deterministic map/filter, and (b) bespoke Rust boolean-emitter ops that only exi
 L-51 native conditions → L-52 docs/examples. Design:
 [designs/data-transforms.md](designs/data-transforms.md).
 
-### Flux-Lang CST front-end + LSP (epic) — **proposed 2026-07-09**
+### Flux-Lang CST front-end + LSP (epic) — **core SHIPPED 2026-07-09 (L-57/58, L-60…L-67)**
 
 Editor-grade language support for Flux-Lang, in two coupled workstreams done as one parser pass.
-**(1) Front-end modernization:** replace the hand-written recursive-descent parser with a lossless
-concrete syntax tree (CST) on `rowan` (the rust-analyzer model), so spans and error-recovery become
-*structural* — every token/node carries a range and the tolerant parser always yields a complete
-tree with `ERROR` nodes instead of aborting on the first error. In the same pass, close the **`@json`
-syntax gap**: the 16 node kinds that today only round-trip through the `@json` escape
+**(1) Front-end:** a lossless concrete syntax tree (CST) on `rowan` (the rust-analyzer model) —
+a layout-aware lossless lexer and a tolerant parser whose spans and error-recovery are
+*structural*: every token/node carries a range and parsing always yields a complete tree with
+`ERROR` nodes instead of aborting on the first error (L-57/L-58). In the same pass the **`@json`
+syntax gap closed**: the 16 node kinds that formerly only round-tripped through the `@json` escape
 (`memo`/`once`/`checkpoint`/`await`, `confirm`/`throttle`/`debounce`/`verify`, `peek`/`parse`,
-`try`/`race`/`scope`/`saga`/`pipe`, `thing`) get real native text. The containment bet keeps
-`analyze`/`format`/runtime/optimizer/planner unchanged via a `cst_to_draft` lowering; the 56 parser
-tests + `parse(&format(&ast)) == ast` are the behaviour-preserving backbone. **(2) flux-lsp:** a
-standalone `flux-lsp` (tower-lsp) server wired into Helix (`hx`) config-only — diagnostics,
-completion, hover, formatting, then go-to-definition and semantic-token highlighting. Foundation
-first: the CST lands before the LSP features (which the CST makes cheap). Stories L-57–L-59 (CST) →
-L-60–L-63 (native-syntax coverage) → L-64–L-67 (LSP core) → L-68–L-70 (navigation, highlighting,
-closeout). Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
-[designs/flux-lsp.md](designs/flux-lsp.md).
+`try`/`race`/`scope`/`saga`/`pipe`, `thing`) now have native text (L-60–L-63), round-trip- and
+property-tested — `@json` remains only as the escape for unspellable shapes. **(2) flux-lsp:** a
+standalone `flux-lsp` (tower-lsp) server wired into Helix (`hx`) config-only — diagnostics from
+the CST parser, completion (ops/keywords/prelude/`$vars`), hover (op signatures + node-kind docs),
+and formatting (L-64–L-67). Remaining backlog: L-59 (re-point `parse` onto the CST via
+`cst_to_draft` — until then the proven legacy front-end stays authoritative and the CST powers the
+LSP), L-68 (symbols/go-to-def), L-69 (semantic tokens), L-70 (incremental reparse +
+comment-preserving format, epic closeout). Designs:
+[designs/flux-lang-cst.md](designs/flux-lang-cst.md), [designs/flux-lsp.md](designs/flux-lsp.md).
 
 ### A2A protocol conformance (epic) — **proposed 2026-07-07**
 

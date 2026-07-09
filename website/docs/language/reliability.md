@@ -9,9 +9,9 @@ Reliability constraints are first-class plan nodes, not instructions buried in a
 policy, deadline, dispatch cap, or approval gate is visible before execution and enforced by the
 runtime during execution.
 
-Five guard rails have native text spellings: `assert`, `retry`, `timeout`, `budget`, and
-`with_tools`. Five more use the `@json` escape today: `try`, `confirm`, `verify`, `throttle`, and
-`debounce`. Full field tables live in the [node reference](./node-reference.md).
+All ten guard rails have native text spellings: `assert`, `retry`, `timeout`, `budget`,
+`with_tools`, `try`, `confirm`, `verify`, `throttle`, and `debounce`. Full field tables live in the
+[node reference](./node-reference.md).
 
 ## `assert` — abort on a falsey condition
 
@@ -105,60 +105,62 @@ with_tools ["read", "grep"] -> $hits
 
 Use it to hand a sub-plan read-only capabilities, or to guarantee a model-influenced section cannot reach `bash` or `write` no matter what it emits. See [Safety & approvals](../agent/safety.md) for the session-level policy this composes with.
 
-## Guard rails written with `@json`
-
-The five nodes below have no native text spelling today. In a `.flux` file, write each as a single line of compact JSON behind the `@json` escape; in the JSON wire format they are ordinary nodes. Semantics are identical either way.
-
-### `try` — catch and handle errors
+## `try` — catch and handle errors
 
 ```flux
-@json {"kind": "try", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "might-fail.sh"}]}], "catch": "err", "handler": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "echo fallback: {err}"}]}]}
+try
+  bash("might-fail.sh")
+catch $err
+  bash("echo fallback: {err}")
 ```
 
 - The body runs first. If it succeeds, the handler never runs.
 - On failure, the error **string** is bound to the `catch` symbol (here `$err`) and the handler runs — the handler can interpolate `{err}` or branch on it.
 - If the handler itself errors, that error propagates.
-- `catch` and `handler` are both optional. A `try` with no handler suppresses errors **silently** — use that deliberately, or not at all.
+- The `catch $err` arm (and its handler block) is optional. A `try` with no handler suppresses errors **silently** — use that deliberately, or not at all.
 
-### `confirm` — human approval gate
+## `confirm` — human approval gate
 
 ```flux
-@json {"kind": "confirm", "message": "Delete all temporary files?", "risk": "high", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "rm -rf tmp/"}]}]}
+confirm "Delete all temporary files?" risk high
+  bash("rm -rf tmp/")
 ```
 
 - `message` is required. `risk` is one of `low` / `medium` (default) / `high` / `critical`.
 - The gate calls the session approver: the TUI shows a modal, `--yes` auto-approves, and the plain CLI prompts interactively. See [Safety & approvals](../agent/safety.md).
 - The body runs **only on approval**; a denial makes the node error immediately. A denied `confirm` inside a `retry` is not retried.
-- A `confirm` with no body is valid — a pure gate that pauses the flow for a decision without a conditional action.
+- A `confirm` with no body is valid — a pure gate that pauses the flow for a decision without a conditional action (`confirm "Proceed?"` on its own line).
 - The approver sees the risk prepended to the message, as `[high] Delete all temporary files?`, so the severity is visible where the decision is made.
 
-### `verify` — assert on command output
+## `verify` — assert on command output
 
 ```flux
-@json {"kind": "verify", "cmd": {"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "cargo test --workspace 2>&1"}]}, "expect": {"kind": "lit", "value": "test result: ok"}, "message": "workspace tests failed"}
+verify bash("cargo test --workspace 2>&1") contains "test result: ok": "workspace tests failed"
 ```
 
-- Runs `cmd` (any node producing a string — typically a `bash` call), then checks that the output **contains** the `expect` substring.
-- If the substring is missing, the flow aborts with a structured error; the optional `message` overrides the default error text.
+- Runs the command (any expression producing a string — typically a `bash` call), then checks that the output **contains** the expected substring.
+- If the substring is missing, the flow aborts with a structured error; the optional `: "message"` suffix overrides the default error text.
 - Use it after an edit or build to guard against silent failure. Wrap it in a `try` if you want to handle a failed check gracefully rather than aborting.
 
-### `throttle` — rate-limit dispatches
+## `throttle` — rate-limit dispatches
 
 ```flux
-@json {"kind": "throttle", "name": "fetches", "max": 5, "window_ms": 60000, "body": [{"kind": "call", "op": "web_fetch", "args": [{"kind": "var", "name": "url"}]}]}
+throttle "fetches" 5 per 60000
+  web_fetch($url)
 ```
 
-- Allows at most `max` op dispatches inside the body per sliding `window_ms` window.
+- The header reads `throttle "<name>" <max> per <window_ms>`: at most `max` op dispatches inside the body per sliding `window_ms` window.
 - The token bucket is keyed by `(session, name)` and updated **atomically**, and it survives across turns. Two `throttle` nodes with distinct names never share a bucket; reusing a `name` deliberately shares one.
 - When the limit is exceeded the node **errors instead of blocking**, so the plan stays responsive. Wrap it in `try` or `retry` (with a delay) if waiting is the right response.
 
-### `debounce` — coalesce bursts across turns
+## `debounce` — coalesce bursts across turns
 
 ```flux
-@json {"kind": "debounce", "name": "rebuild", "wait_ms": 300, "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "rebuild.sh"}]}]}
+debounce "rebuild" 300
+  bash("rebuild.sh")
 ```
 
-- Each time the node is reached, a last-trigger timestamp for its `name` is recorded in the session store. The body runs only once `wait_ms` has elapsed since that key's last trigger.
+- The header reads `debounce "<name>" <wait_ms>`. Each time the node is reached, a last-trigger timestamp for its `name` is recorded in the session store. The body runs only once `wait_ms` has elapsed since that key's last trigger.
 - Re-arrivals inside the window re-arm the timer, so a burst of triggers coalesces into a single body run after things settle.
 - Because the timestamp lives in the session store keyed by `(session, name)`, the settling window spans turns — not just one plan execution.
 
@@ -168,9 +170,3 @@ The five nodes below have no native text spelling today. In a `.flux` file, writ
 - First-success `race` and fan-out `parallel` — [Concurrency](./concurrency.md)
 - Guaranteed cleanup (`scope`), rollback (`saga`), and at-most-once effects (`once`) — [Durability & cross-turn state](./durability.md)
 - The session policy and approval chain every dispatch passes through — [Safety & approvals](../agent/safety.md)
-
-## Related docs
-
-- [Control flow](./control-flow.md) — `fallback`, loops, and bounded model routing.
-- [Concurrency](./concurrency.md) — first-success `race` and parallel branch behavior.
-- [Safety & approvals](../agent/safety.md) — session-level policy and approval prompts.

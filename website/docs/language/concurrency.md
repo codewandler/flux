@@ -46,12 +46,15 @@ A `parallel` with one branch is valid and degenerates to a sequential bind.
 
 ## `race` — first success wins
 
-`race` starts all branches together and completes as soon as one branch **succeeds**. It has
-no native text spelling yet — write it with the `@json` escape (or directly in the JSON wire
-form):
+`race` starts all branches together and completes as soon as one branch **succeeds**. The header
+reads `race <timeout_ms> [-> $bind]`, followed by the same `branch` arms as `parallel`:
 
 ```flux
-@json {"kind": "race", "timeout_ms": 5000, "bind": "result", "branches": [{"name": "fast", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "fast-path.sh"}]}]}, {"name": "slow", "body": [{"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "slow-path.sh"}]}]}]}
+race 5000 -> $result
+  branch $fast
+    bash("fast-path.sh")
+  branch $slow
+    bash("slow-path.sh")
 ```
 
 Semantics:

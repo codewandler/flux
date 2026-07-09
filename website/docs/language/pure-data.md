@@ -9,9 +9,10 @@ Pure nodes handle the data work inside a plan: formatting, field access, JSON ex
 type coercion, and value assembly. They perform no IO, dispatch no operation, and never pause for
 approval. Use them anywhere you would otherwise shell out just to reshape data.
 
-In the text form, `fmt(…)`, `$var.path` field access, value templates, and invertible native
-expressions have first-class spellings. Other pure nodes use the `@json` escape. All of them are
-ordinary nodes in the JSON wire form.
+In the text form, `fmt(…)`, `parse(…)`, `peek $x`, `$var.path` field access, value templates, and
+invertible native expressions have first-class spellings. The `@json` escape remains only for
+pathological shapes: non-invertible `expr` formulas and `jq` with bracket paths or non-symbol
+inputs. All of them are ordinary nodes in the JSON wire form.
 
 ## `fmt` — string interpolation
 
@@ -23,9 +24,10 @@ $label = fmt("BTC: {price} | 24h change: {change}%")
 interpolation inside string literals, but explicit about being a formatting step. Unbound
 placeholders are left verbatim (no silent data loss). The result is always a string.
 
-`fmt(…)` is the only pure node with a special call-style text spelling. Writing `expr(…)`,
-`jq(…)`, or `peek(…)` call-style parses as an ordinary op call with that name. Native formulas are
-written directly where they are invertible, for example `$ok = $score >= 0.8`.
+`fmt(…)` and `parse(…)` are the only pure nodes with special call-style text spellings. Writing
+`expr(…)`, `jq(…)`, or `peek(…)` call-style parses as an ordinary op call with that name — `peek`'s
+native form is the keyword spelling `peek $x`, and native formulas are written directly where they
+are invertible, for example `$ok = $score >= 0.8`.
 
 ## Field access — `$var.path`
 
@@ -82,10 +84,17 @@ when $count > 3 && $state == "ready"
   return true
 ```
 
-Non-invertible `expr` nodes are written via `@json`:
+Arithmetic over bound symbols is invertible too:
 
 ```flux
-@json {"kind": "bind", "name": "total", "value": {"kind": "expr", "formula": "price * qty", "vars": {"price": {"kind": "var", "name": "price"}, "qty": {"kind": "var", "name": "qty"}}}}
+$total = $price * $qty
+```
+
+A formula that uses `expr`'s *function library* is not spellable natively — `round($price, 2)` in
+text would parse as an op call named `round` — so function-bearing formulas are written via `@json`:
+
+```flux
+@json {"kind": "bind", "name": "rounded", "value": {"kind": "expr", "formula": "round(price, 2)", "vars": {"price": {"kind": "var", "name": "price"}}}}
 ```
 
 Supported, by precedence (lowest to highest):
@@ -155,11 +164,12 @@ projection or predicate. Use `each` when every item must dispatch real work such
 
 ## `parse` — type coercion
 
-Converts a string result (typically from `jq` or `fmt`) into a typed value. Written via
-`@json`:
+Converts a string result (typically from `jq` or `fmt`) into a typed value. `parse(…)` is
+special-cased in the expression grammar (like `fmt(…)`), so it lowers to the pure node, not an op
+call:
 
 ```flux
-@json {"kind": "bind", "name": "price_num", "value": {"kind": "parse", "as": "f64", "value": {"kind": "jq", "path": ".price", "input": {"kind": "var", "name": "raw"}}}}
+$price_num = parse($raw.price, as: "f64")
 ```
 
 `as` is one of `f64`, `i64`, `bool`, `json`, `string`. Coercion failures error rather than
@@ -188,14 +198,14 @@ symbols without a single shell-out.
 
 ## Putting it together
 
-The classic fetch-extract-compute-format chain, with no bash and no approval pauses — the
-native spellings used where they exist, `@json` for `expr`:
+The classic fetch-extract-compute-format chain, with no bash, no approval pauses, and no
+escapes — every step has a native spelling:
 
 ```flux
 flow btc-double
   $raw   = web_fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
   $price = $raw.bitcoin.usd
-  @json {"kind": "bind", "name": "doubled", "value": {"kind": "expr", "formula": "price * 2", "vars": {"price": {"kind": "var", "name": "price"}}}}
+  $doubled = $price * 2
   $label = fmt("BTC: {price} | Double: {doubled}")
   return { price: $price, doubled: $doubled, label: $label }
 ```
