@@ -24,6 +24,16 @@ parse (or receive JSON) -> analyze -> optimize -> execute
    inside a `parallel` branch, two branches binding the same symbol).
 3. **Optimize.** The optimizer may parallelize or reuse provably safe read-only work. It never
    changes what a plan is allowed to do — dispatch authorization remains the runtime floor.
+   The scheduler summarizes every top-level statement across its **whole subtree** (nested
+   blocks, conditions, templates, call arguments): a statement whose reachable operations are
+   all registered and read-only may run concurrently with other such statements when their
+   symbol reads and writes are independent. A statement containing a write/network/process
+   effect, an **unknown operation** (unknown effects are treated as the most dangerous
+   effects), or an approval/durability construct (`confirm`, `await`, `checkpoint`, `once`,
+   `saga`, `thing`) is a **hard fence**: nothing is scheduled across it in either direction,
+   so approval order and policy behavior are exactly those of sequential execution. The
+   optimized run is observationally equivalent to the sequential one — same bound values,
+   same user-visible trace order.
 4. **Execute.** The interpreter runs the body top to bottom, dispatching every operation
    through the safety envelope and recording a run trace.
 
