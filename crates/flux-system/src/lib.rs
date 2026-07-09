@@ -226,6 +226,9 @@ impl Workspace {
                 if let Some(base) = self.named.get(name) {
                     return (base.clone(), tail);
                 }
+            } else if let Some(base) = self.named.get(rest) {
+                // A bare `@name` (no subpath) resolves to the named root itself.
+                return (base.clone(), "");
             }
         }
         (self.root.clone(), input)
