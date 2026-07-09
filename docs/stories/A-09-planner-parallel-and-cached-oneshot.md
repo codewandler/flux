@@ -3,7 +3,7 @@ id: A-09
 title: Planner prompt prefers parallel for independent reads; one-shot compile repairs ride cached segments
 pillar: Agent
 status: done
-priority: 3
+priority:
 note: the grammar now teaches `parallel` for independent reads (each stays for ordered/dynamic-list iteration; all worked examples parse-tested against the real AST), and one-shot compile() repairs ride a byte-stable cached system segment with the repair exchange as messages
 ---
 

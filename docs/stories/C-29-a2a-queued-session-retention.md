@@ -3,7 +3,7 @@ id: C-29
 title: "Keep an a2a session minted before the turn gate from being pruned while it waits"
 pillar: Core
 status: done
-priority: 10
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "send/subscribe mint the a2a session before acquiring the single-turn gate and never touch updated_at while queued, so a concurrent request's lazy TTL sweep can delete a queued session once its wait exceeds the TTL — orphaning its event rows (they escape the sweep forever) and dropping its spend from usage rollups. The request itself still succeeds (the claimed -32603 is refuted)"

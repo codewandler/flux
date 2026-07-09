@@ -3,7 +3,7 @@ id: A-17
 title: Revise wiring — the loop routes on $ran.failure; revision rendering with ✓-done prefix
 pillar: Agent
 status: done
-priority: 5
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: closes the epic loop — agent-loop.flux routes on failure kind/fatality in flux-lang (the loop stays the program), and the surface renders revisions honestly

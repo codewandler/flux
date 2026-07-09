@@ -3,7 +3,7 @@ id: L-46
 title: Extract `flux_lang::expr` module + list-aware builtins + dotted variable access
 pillar: Language
 status: done
-priority: 1
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "epic foundation: extract the expr engine so ops (L-47..L-50) can reuse the same predicate language the runtime and analyzer already share"

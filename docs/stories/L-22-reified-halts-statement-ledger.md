@@ -3,7 +3,7 @@ id: L-22
 title: Reified halts + statement ledger + prefix fast-forward (resumable runtime mode)
 pillar: Language
 status: done
-priority: 3
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: the runtime core of patch-and-continue — failure returns Ok(FlowOutcome{failure}) with the prefix transcript, completed statements ledger as append-only events, an edited re-emission fast-forwards the hash-matching prefix with value rehydration; prereq L-21 denial fatality SHIPPED (b84204d)

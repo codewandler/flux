@@ -3,7 +3,7 @@ id: A-10
 title: Per-turn token budget ceiling — an enforced spend bound on the agent loop
 pillar: Agent
 status: done
-priority: 8
+priority:
 note: the loop now enforces an opt-in per-turn token ceiling at the top of plan() (stall-stop pattern) — honest budget-exceeded answer + durable turn.budget_exceeded observation; --turn-budget > FLUX_TURN_TOKEN_BUDGET > [limits] turn_token_budget, default OFF
 ---
 

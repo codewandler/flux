@@ -3,7 +3,7 @@ id: L-20
 title: Planner emission A/B — measure strict-JSON vs native-text on a fixed corpus
 pillar: Language
 status: done
-priority: 8
+priority:
 design: docs/designs/flux-lang-emission-ab.md
 note: MEASURED, DECIDED — keep json: strict-schema wins first-emission acceptance 93% vs 60% and within-one-retry 15/15 vs 13/15; native text wins base-prompt size (−47%) and cost (~15%) but loses validity + wall time (+10%); 15-task corpus × 2 arms live on openrouter sonnet ($1.74 total); FLUX_EMISSION selector stays (json default byte-identical, text behind the flag); full table in the design doc
 ---

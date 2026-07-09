@@ -3,7 +3,7 @@ id: L-36
 title: "jq path on a missing key must yield null (real jq semantics), not a turn-killing fatal error"
 pillar: Language
 status: done
-priority: 1
+priority:
 epic: flux-lang-evolution
 note: "s_362 turn 17535: the finalization plan's `jq(\".transcript\", $x)` on an object lacking the key returned Error::Other → turn_ended{outcome:error} — a fully-gathered turn's evidence discarded; `$a.b` sugar means ordinary field access has the same landmine"
 ---

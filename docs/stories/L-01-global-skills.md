@@ -3,7 +3,7 @@ id: L-01
 title: Global, multi-format skill loading
 pillar: Language
 status: done
-priority: 1
+priority:
 note: multi-dir + Agent-Skills/Claude format + `flux-markdown` (see [CHANGELOG](../../CHANGELOG.md))
 ---
 

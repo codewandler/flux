@@ -3,7 +3,7 @@ id: L-47
 title: Core transform ops — `map`, `filter.where`, `flatten`, `skip`, `join`, `split`
 pillar: Language
 status: done
-priority: 3
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "closes the biggest anti-pattern — plans using `ai.extract` (\"Return ONLY a JSON array\") as a stand-in for deterministic map/filter"

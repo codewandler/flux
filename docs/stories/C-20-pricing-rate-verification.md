@@ -3,7 +3,7 @@ id: C-20
 title: Verify the built-in pricing table against current vendor price sheets
 pillar: Core
 status: done
-priority: 3
+priority:
 note: every row verified against vendor sheets 2026-07-02 — headline find gpt-5.5 was 4× LOW ($1.25/$10 → $5/$30, the live codex path); llama row adjusted; unverifiable rows marked ESTIMATED; headline rates pinned by test; source URLs + approximation notes (Bedrock cross-region premium, gpt-5.5 long-context tier) in the doc comment
 ---
 

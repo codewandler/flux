@@ -3,7 +3,7 @@ id: D-21
 title: Plugin distribution for non-source users (scoping)
 pillar: Core
 status: done
-priority: 9
+priority:
 epic: plugin-platform-hardening
 note: "SCOPED — decision: fetch-on-install from a signed first-party pack channel (plugins-v* GitHub releases, per-plugin per-target archives + minisign-signed plugins-index.json, sha256 before anything executes, versioned store); bundling rejected on coupling not size; follow-ons filed D-46 (release pipeline) -> D-47 (verified remote install) -> D-48 (enforceable pin/rollback) + D-49 (naming/docs pass); design docs/designs/plugin-distribution.md; 4 key-custody/attestation/cadence questions recorded for the owner"
 ---

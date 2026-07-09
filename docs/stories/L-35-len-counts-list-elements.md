@@ -3,7 +3,7 @@ id: L-35
 title: "len() on a list must count elements, not characters of the joined JSON string"
 pillar: Language
 status: done
-priority: 2
+priority:
 epic: flux-lang-evolution
 note: "s_362: `$count = len($rs_files)` on a glob list returned 8542 (char count of the stringified array), not 232 (elements) — ExprVal has no List variant, so from_json stringifies arrays; the model confabulated an explanation around the wrong number"
 ---

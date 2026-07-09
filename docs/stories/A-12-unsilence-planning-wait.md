@@ -3,7 +3,7 @@ id: A-12
 title: Un-silence the planning wait — wire planning state + thinking streaming in normal mode
 pillar: Agent
 status: done
-priority: 1
+priority:
 epic: multipass-agent-loop
 design: docs/designs/multipass-agent-loop.md
 note: the streaming plumbing exists end-to-end (SharedSink → SinkEvent::Thinking/Planning → CliSink) but is dead in normal mode — the single biggest perceived-latency win, independent of the rest of the epic

@@ -3,7 +3,7 @@ id: L-49
 title: Object & null-kit ops — `pick`, `omit`, `merge_obj`, `coalesce`, `keys`, `values`
 pillar: Language
 status: done
-priority: 5
+priority:
 epic: data-transforms
 design: docs/designs/data-transforms.md
 note: "gitlab-plugin payload trimming (D-94 residual): today you rebuild issue objects field-by-field with `obj` templates; `pick` + `coalesce` make it one line"

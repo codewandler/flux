@@ -3,8 +3,8 @@ id: L-09
 title: Named-argument calls (deprecate positional binding)
 pillar: Language
 status: done
-priority: 1
-design: named-argument-calls
+priority:
+design: docs/designs/named-argument-calls.md
 ---
 
 # Named-argument calls (deprecate positional binding)

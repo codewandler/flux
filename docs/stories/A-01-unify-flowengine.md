@@ -3,7 +3,7 @@ id: A-01
 title: Unify SDK onto FlowEngine, retire the classic Agent loop
 pillar: Agent
 status: done
-priority: 1
+priority:
 design: docs/designs/flux-flow.md
 note: one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
 ---

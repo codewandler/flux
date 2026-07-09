@@ -3,7 +3,7 @@ id: L-31
 title: "Reject with_tools cap-scope inside a concurrent parallel/race branch"
 pillar: Language
 status: done
-priority: 11
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "parallel branches run concurrently against ONE shared executor, so a with_tools/CapScope in a branch mutates one shared cap-scope stack across await points — LIFO pop can drop the wrong branch's guard (op runs under a wider allowlist) or an intersection can empty the scope (spurious FlowError::Denied). Latent: no shipped .flux uses with_tools. Fix by static rejection, like check_await_position"

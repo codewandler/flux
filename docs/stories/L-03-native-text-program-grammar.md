@@ -4,7 +4,7 @@ title: Native-text module declarations (the whole app in flux-lang — `.flux` d
 pillar: Language
 status: done
 theme: downstream-managed-services
-design: ../designs/native-text-modules.md
+design: docs/designs/native-text-modules.md
 note: the whole app — `agent`/`channel`/`datasource`/`trigger`/`journey` + flows — in native flux-lang text (settings inline, secrets as `secret "ENV"` refs); JSON-program path deleted (clean cutover); `flux app run`/`flux flow run` load native text; supersedes the JSON manifest (see [design](../designs/native-text-modules.md))
 ---
 

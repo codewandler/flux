@@ -3,7 +3,7 @@ id: L-32
 title: "Classify executor denials structurally, not by prefix-matching tool output"
 pillar: Language
 status: done
-priority: 2
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "is_envelope_denial detects a denial by prefix-matching the tool's CONTENT (`` `{op}` denied by ``), so an op that actually ran and relayed that text (e.g. bash surfacing a nested CLI's stderr) is escalated to a fatal, never-retried FlowError::Denied — killing the whole turn instead of feeding a repairable failure back to the loop"

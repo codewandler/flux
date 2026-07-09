@@ -3,7 +3,7 @@ id: C-47
 title: Release-publication reliability — a tag must yield a downloadable GitHub Release
 pillar: Core
 status: blocked
-priority: 2
+priority:
 epic:
 design:
 note: "N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)"

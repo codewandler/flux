@@ -3,7 +3,7 @@ id: A-25
 title: "Make with_tools cap-scope transitive across nested sub-agent delegation"
 pillar: Agent
 status: done
-priority: 8
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "under opt-in with_max_depth>=2 a grandchild is spawned with an empty cap-scope stack (active_cap_scope()==None) and its spawner re-subsets the FULL base_registry, so an ancestor with_tools ceiling isn't enforced two hops down and TaskTool is re-registered unconditionally — a cap-scope escape on the opt-in nested path (default depth=1 keeps every child a leaf)"

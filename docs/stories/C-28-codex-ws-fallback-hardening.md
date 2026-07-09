@@ -3,7 +3,7 @@ id: C-28
 title: "Harden the codex WS transport so the guaranteed HTTP fallback always engages"
 pillar: Core
 status: done
-priority: 3
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "three ways the codex WS transport defeats its own fail-fast contract: a non-char-boundary byte slice panics on a >300-byte error payload; connect() waits for the first frame with no timeout so a blackholing proxy hangs the turn; and a clean Close before the terminal event silently truncates the response"

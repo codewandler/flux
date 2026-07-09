@@ -3,7 +3,7 @@ id: C-08
 title: Full OAuth2 login — codex PKCE (+ claude parity)
 pillar: Core
 status: done
-priority: 6
+priority:
 epic: subscription-providers-and-cost
 theme: subscription-providers-cost
 design: docs/designs/subscription-providers-and-cost.md

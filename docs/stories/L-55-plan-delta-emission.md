@@ -3,7 +3,7 @@ id: L-55
 title: Plan-delta emission for cheap safe repairs
 pillar: Language
 status: done
-priority: 11
+priority:
 epic: flux-lang-agent-speed
 design: docs/designs/flux-lang-agent-speed.md
 note: "KF3: let repair turns patch the previous AST, then materialize and validate the full plan before execution"

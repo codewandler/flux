@@ -3,7 +3,7 @@ id: D-52
 title: "Bound the server-supplied SCRAM iteration count in the host-terminated PG handshake"
 pillar: Core
 status: done
-priority: 5
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "host-side SCRAM feeds the server-supplied `i=` (up to u32::MAX) straight into PBKDF2 with no upper bound; a malicious/MITM'd Postgres endpoint sending i=2000000000 drives ~2B HMAC-SHA256 rounds — pure CPU the socket read-timeout never covers, pegging a core for minutes"

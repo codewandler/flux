@@ -3,7 +3,7 @@ id: C-13
 title: Seed the redactor from resolve_secrets (and one provider-key source of truth)
 pillar: Core
 status: done
-priority: 2
+priority:
 note: resolve_secrets now seeds every resolved value into the ONE redactor the App's journey + agent-target executors redact with; provider env-key seeding is sourced from flux_credentials::provider_env_keys() (now incl. the AWS secret material)
 ---
 

@@ -3,7 +3,7 @@ id: L-02
 title: flux-markdown engine + progressive-disclosure skills
 pillar: Language
 status: done
-priority: 7
+priority:
 note: flux-markdown is now its OWN two-pass engine (goldmark-style AST: recursive block pass + delimiter-stack inlines; zero external parser deps — the old wrapper crates survive only as dev-dep parity oracles with exact per-line ANSI/ratatui parity pinned); skills load Level-1 (frontmatter head-scan only) and the body reads lazily exactly at injection via the SkillBody Display; [skills] dirs config key layered CLI > project > user > defaults; agent + SDK now populate via default_skill_dirs; live-verified skill activation through the real engine
 ---
 

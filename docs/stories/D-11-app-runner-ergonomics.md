@@ -3,7 +3,7 @@ id: D-11
 title: App-runner ergonomics for declarative bots (knowledge-ingest config, OpenAPI, persona/event-context from file)
 pillar: Agent
 status: done
-priority: 1
+priority:
 theme: downstream-managed-services
 note: "the ready pick: configurable `flux app run` knowledge ingest + OpenAPI + persona/event-context-from-file; makes it a viable host for a declarative bot, unblocking Slack-channel assistant flows"
 ---

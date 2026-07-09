@@ -3,7 +3,7 @@ id: C-16
 title: Docs truth pass — align README/vision/roadmap claims with verified reality
 pillar: Core
 status: done
-priority: 11
+priority:
 note: README/roadmap claims aligned with landed reality (scope floor, plan-intents re-fire, bash sh -c defenses, bounded digest, durable evidence, correlated sub-agent audit) + the full live verification matrix ran — 2.0 calls/turn at $0.0032, honest budget stop, durable plan text/fingerprint, correlated subagent stream, merged usage keys
 ---
 

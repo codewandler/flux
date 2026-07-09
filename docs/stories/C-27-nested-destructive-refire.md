@@ -3,7 +3,7 @@ id: C-27
 title: "Re-fire the undisclosed-destructive gate on the current plan's disclosure, not any ancestor scope"
 pillar: Core
 status: done
-priority: 1
+priority:
 epic: review-hardening
 design: docs/designs/review-hardening.md
 note: "destructive_scope is a bare AtomicU32 depth counter, so a nested run_plan approved destructive:false inherits the outer plan's destructive disclosure (counter stays >0) — a runtime-assembled `rm -rf` invisible to the nested plan's static risk preview then dispatches with no re-fire and no prompt: a silent approval-gate bypass"

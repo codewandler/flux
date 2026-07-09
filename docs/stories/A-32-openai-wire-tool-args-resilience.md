@@ -3,7 +3,7 @@ id: A-32
 title: "OpenAI-wire tool-args resilience — malformed/truncated emit_plan JSON must feed back, not kill the turn"
 pillar: Agent
 status: done
-priority: 1
+priority:
 epic: parse-resilience
 design: docs/designs/parse-resilience.md
 note: "s_368 (deepseek-v4-flash:nitro via plain `openrouter`): two turns died with `runtime error: step plan failed: serialization error: …` — one after SEVEN successful multipass rounds. The Messages wire already repairs exactly this (`parse_tool_input`, names deepseek as offender); the OpenAI wire has a bare `serde_json::from_str(&args)?`"

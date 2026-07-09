@@ -3,7 +3,7 @@ id: A-08
 title: Sub-agent audit ON by default — child runs land correlated in the shared event store
 pillar: Agent
 status: done
-priority: 7
+priority:
 note: CLI + flux-app spawners audit into the shared event store by default — each child gets its own correlated stream (agent_id subagent:<role>, correlation_id = parent session), and the parent /evidence gains a compact subagent.trace pointer; in_memory stays the documented ephemeral mode for storeless hosts
 ---
 
