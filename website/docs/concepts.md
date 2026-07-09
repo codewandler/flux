@@ -31,6 +31,17 @@ authorization -> approval -> guarded IO
 This applies to built-in tools, plugin operations, sub-agent work, app journeys, and model-routed
 plans. There is no separate "trusted shortcut" for a tool call.
 
+## Operations do, datasources know
+
+An **operation** is the universal callable unit — the system's verbs. Reading a file, running a
+test, calling a plugin, asking the model to rank items: each is an operation in one catalog, and
+each crosses the safety envelope above. A **datasource** is the agent's knowledge layer — an
+indexed store of records (workspace docs, integration data) the agent looks things up in.
+
+The two meet cleanly: a datasource is *read through* operations. Retrieval (`search`, `get`, …) is
+just more read-only ops in the same catalog, so knowledge access is governed exactly like action.
+See [Datasources](./agent/datasources.md) and [Operations](./language/ops.md).
+
 ## A multi-pass loop
 
 A turn is not one blind guess. The loop first **orients** (one planner call that either answers, emits

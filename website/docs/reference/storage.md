@@ -96,5 +96,6 @@ shape-identical to the SQLite backend's.
 ## Related docs
 
 - [Configuration](./config.md) — runtime settings that affect local sessions.
+- [Datasources](../agent/datasources.md) — the knowledge layer these records serve.
 - [Time Machine](../agent/time-machine.md) — replay, fork, and diff recorded runs.
 - [FlowClient](../sdk/flow-client.md) — deterministic flow execution over stored state.

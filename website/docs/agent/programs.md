@@ -18,7 +18,7 @@ its settings inline as ordinary Flux-Lang values:
 
 - **`agent`** — a model, its tool allow-list, its datasources, and a description.
 - **`channel`** — a surface the app is reached on (CLI, Slack, HTTP/A2A, …).
-- **`datasource`** — grounded knowledge an agent answers from (e.g. a Markdown corpus).
+- **`datasource`** — grounded knowledge an agent answers from (e.g. a Markdown corpus) — see [Datasources](./datasources.md).
 - **`trigger`** — an event to listen for, and the journey to run when it fires.
 - **`journey`** — a named flow that does the work. A journey is an ordinary Flux-Lang flow.
 

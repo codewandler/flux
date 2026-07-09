@@ -35,7 +35,11 @@ policy.
 | `edit` | `path, old_string, new_string[, replace_all]` | medium, approval | Replace a string in a file (exact-match first, then progressively looser anchoring) |
 | `patch` | `path, edits` | medium, approval | Several line-anchored edits in one call |
 | `append` | `path, content` | low, approval | Append to a file, creating it if absent |
-| `search` | `query[, limit]` | low | Search the indexed datasource |
+| `search` | `query[, source, entity, limit]` | low | Keyword search over the indexed [datasource](../agent/datasources.md) |
+| `get` | `source, entity, id` | low | Fetch one datasource record in full by its address |
+| `list` | `source[, entity, offset, limit]` | low | Enumerate a datasource source's records, paged |
+| `relation` | `source, entity, id[, rel]` | low | Follow a datasource record's typed links |
+| `batch_get` | `source, entity, ids` | low | Fetch several datasource records in one call |
 | `web_fetch` | `url` | low | Fetch an HTTP(S) URL |
 | `web_search` | `query[, max_results]` | low | Web search (requires a search API key) |
 | `sqlite_query` | `db, sql[, params]` | low | Read-only SQLite query |
@@ -195,4 +199,5 @@ guarded IO. There is no trusted shortcut for any operation on this page.
 
 - [Node reference](./node-reference.md) — the `call` node and its JSON shape.
 - [Safety & approvals](../agent/safety.md) — the envelope every operation crosses.
+- [Datasources](../agent/datasources.md) — the knowledge layer behind `search`/`get`/`list`/`relation`/`batch_get`.
 - [Plugin authoring](../plugins/authoring.md) — how plugins project new operations.

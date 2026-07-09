@@ -16,6 +16,7 @@ const sidebars = {
         'agent/safety',
         'agent/a2a',
         'agent/programs',
+        'agent/datasources',
         'agent/time-machine',
         'agent/cost',
         'agent/realtime',
