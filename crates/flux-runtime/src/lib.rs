@@ -526,11 +526,7 @@ pub fn advertised_op_names(
 pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     let mut out = Vec::new();
     let mut push = |sig: &str| {
-        out.push(Observation::new(
-            flux_evidence::KIND_SIGNAL,
-            Phase::Turn,
-            json!({ "signal": sig }),
-        ));
+        out.push(Observation::signal(sig));
     };
     // Marker signals via a SINGLE upward walk (cwd→root): at each ancestor level, test every
     // not-yet-found marker — a marker in any parent still counts (running from a subdir, or a git

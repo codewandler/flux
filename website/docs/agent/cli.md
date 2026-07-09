@@ -31,6 +31,7 @@ require human confirmation — see [Safety & approvals](./safety.md).
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
 | `flux flow run <file>` | execute a stored Flux-Lang flow |
+| `flux render <file.flux>` | render a `.flux` file as a syntax-highlighted SVG (`--view source\|tree`, `-o out.svg`) |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |

@@ -81,6 +81,13 @@ impl EndpointRegistry {
         self.records.read().unwrap().get(id).cloned()
     }
 
+    /// Whether the registry holds no records at all (loaded + discovered + imported). Cheap —
+    /// the D-115 ambient-signal wiring asks this once at startup on the loaded registry instead
+    /// of re-reading `endpoints.toml`.
+    pub fn is_empty(&self) -> bool {
+        self.records.read().unwrap().is_empty()
+    }
+
     /// All records, sorted by id for stable display.
     pub fn list(&self) -> Vec<EndpointRecord> {
         let mut v: Vec<EndpointRecord> = self.records.read().unwrap().values().cloned().collect();

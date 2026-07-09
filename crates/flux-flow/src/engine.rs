@@ -70,6 +70,11 @@ pub struct FlowEngine {
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Workspace root, re-probed each turn for the surfacing signals above.
     pub cwd: std::path::PathBuf,
+    /// Session-ambient signals injected by the host surface (D-115): facts the per-turn workspace
+    /// walk can't see — e.g. the CLI's "the endpoints store is non-empty", computed once from its
+    /// startup-loaded registry. Appended to every turn's detected signals for group surfacing;
+    /// sticky-monotonic surfacing makes session-static values sufficient. Empty by default.
+    ambient_signals: Vec<String>,
     /// Monotonic union of every group that has surfaced on this ENGINE. `resolve_active_groups` is
     /// stateless (it reflects only the current turn's signals), so a marker file appearing then
     /// disappearing would rewrite segment A's op catalog and miss the provider prompt cache on the
@@ -149,9 +154,19 @@ impl FlowEngine {
             compact_threshold_chars,
             groups,
             cwd,
+            ambient_signals: Vec::new(),
             sticky_groups: std::sync::Mutex::new(std::collections::HashSet::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Inject session-ambient group-surfacing signals (D-115): host-known facts the per-turn
+    /// workspace walk can't see (e.g. the CLI injects `endpoint` when its startup-loaded
+    /// endpoints store is non-empty). They join every turn's probed signals; surfacing is
+    /// sticky-monotonic, so values computed once at startup are enough.
+    pub fn with_ambient_signals(mut self, signals: Vec<String>) -> Self {
+        self.ambient_signals = signals;
+        self
     }
 
     /// Run one user turn to completion, uninterruptible.
@@ -362,6 +377,7 @@ impl FlowEngine {
             &self.groups,
             &self.cwd,
             &self.sticky_groups,
+            &self.ambient_signals,
         );
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
@@ -754,6 +770,7 @@ impl FlowEngine {
             &self.groups,
             &self.cwd,
             &self.sticky_groups,
+            &self.ambient_signals,
         );
         if let Some(surfaced) = surfaced.as_ref() {
             self.record_active_groups(surfaced, sink);
@@ -1250,6 +1267,7 @@ pub(crate) fn surfaced_op_names(
     groups: &[flux_evidence::ToolGroup],
     cwd: &std::path::Path,
     sticky: &std::sync::Mutex<std::collections::HashSet<String>>,
+    ambient: &[String],
 ) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
     if groups.is_empty() {
         let advertised = reg
@@ -1260,7 +1278,15 @@ pub(crate) fn surfaced_op_names(
             .collect();
         return (advertised, None);
     }
-    let signals = flux_runtime::detect_signals(cwd);
+    let mut signals = flux_runtime::detect_signals(cwd);
+    // Session-ambient signals (D-115): host-known facts the workspace walk can't see — e.g. the
+    // CLI's "the endpoints store is non-empty", computed once from its startup-loaded registry.
+    // They join the probed signals and gate groups identically.
+    signals.extend(
+        ambient
+            .iter()
+            .map(|s| flux_evidence::Observation::signal(s)),
+    );
     let active = flux_evidence::resolve_active_groups(groups, &signals);
     // Monotonic surfacing (A-03 cache stability): fold this turn's active groups into the session's
     // sticky union and advertise from the ACCUMULATED set. `resolve_active_groups` is stateless, so a
@@ -3008,7 +3034,7 @@ mod tests {
         let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
 
         // Turn A — no `.git`: the git group is inactive, so `echo` is gated (not advertised).
-        let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
+        let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             !a.contains("echo"),
             "echo gated before the marker appears: {a:?}"
@@ -3016,7 +3042,7 @@ mod tests {
 
         // Turn B — `.git` present: the group surfaces, `echo` is advertised.
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let (b, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
+        let (b, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             b.contains("echo"),
             "echo advertised once the marker is present: {b:?}"
@@ -3025,7 +3051,7 @@ mod tests {
         // Turn C — `.git` removed: stateless resolution would drop `echo`, but the sticky union keeps
         // the group surfaced, so the advertised catalog never shrinks.
         std::fs::remove_dir_all(dir.join(".git")).unwrap();
-        let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky);
+        let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             c.contains("echo"),
             "sticky surfacing keeps echo after the marker disappears: {c:?}"
@@ -3034,6 +3060,45 @@ mod tests {
             b.is_subset(&c),
             "the advertised catalog never shrinks: {b:?} !⊆ {c:?}"
         );
+    }
+
+    /// D-115: session-ambient signals (host-known facts the per-turn workspace walk can't see —
+    /// e.g. the CLI's "the endpoints store is non-empty") surface groups exactly like
+    /// workspace-probed signals. A group gated on `endpoint` surfaces when the host injects the
+    /// ambient signal and stays gated when it doesn't — no marker file, no kubeconfig.
+    #[test]
+    fn ambient_signals_surface_groups_without_workspace_evidence() {
+        let dir = std::env::temp_dir().join(format!("flux-ambient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "endpoint".into(),
+            description: String::new(),
+            tools: vec!["echo".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_SIGNAL.to_string(),
+                signal: Some("endpoint".into()),
+            }],
+        }];
+
+        // No ambient signal (fresh sticky set): the group stays gated.
+        let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
+        let (gated, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
+        assert!(
+            !gated.contains("echo"),
+            "gated without the ambient signal: {gated:?}"
+        );
+
+        // The ambient `endpoint` signal surfaces it.
+        let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
+        let ambient = ["endpoint".to_string()];
+        let (surfaced, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &ambient);
+        assert!(
+            surfaced.contains("echo"),
+            "ambient signal surfaces the group: {surfaced:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A-10: once the turn's accumulated planner usage crosses the installed token budget, the

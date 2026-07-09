@@ -2032,6 +2032,19 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
     reg
 }
 
+/// The session-ambient group-surfacing signals known to the host at startup (D-115): `endpoint`
+/// when the loaded endpoints store has records — so an operator who registered a Postgres
+/// endpoint sees the endpoint ops without a kubeconfig. Computed from the startup-loaded registry
+/// (an in-memory emptiness check), never by re-reading `~/.flux/endpoints.toml` per turn;
+/// sticky-monotonic surfacing makes a startup-static answer sufficient.
+fn session_ambient_signals(endpoints: &flux_capabilities::EndpointRegistry) -> Vec<String> {
+    if endpoints.is_empty() {
+        Vec::new()
+    } else {
+        vec!["endpoint".to_string()]
+    }
+}
+
 /// Read-only ops pre-allowed by default when no `[permissions].allow` is configured, so the common
 /// case needs no config. `read`/`glob`/`grep`/`search` are the workspace reads; `now`/`cwd`/`home_dir`/
 /// `sys_info` are zero-arg ambient reads (no IO, no permission subjects) that carry no approval-worthy
@@ -2278,6 +2291,9 @@ async fn build_agent_with(
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
     let mut plugin_groups: Vec<flux_evidence::ToolGroup> = Vec::new();
+    // Session-ambient group-surfacing signals (D-115), computed below from the loaded endpoint
+    // registry — the engine appends them to every turn's workspace-probed signals.
+    let mut ambient_signals: Vec<String> = Vec::new();
     if let Some(dir) = plugins_dir() {
         // The cross-plugin endpoint-discovery broker (D-26/D-27): a registry of loaded plugins + the
         // shared endpoint registry, so a consumer plugin's `endpoint.discover` capability fans out to
@@ -2287,7 +2303,23 @@ async fn build_agent_with(
         let endpoint_registry = Arc::new(flux_capabilities::EndpointRegistry::with_path(
             flux_capabilities::EndpointRegistry::default_path().unwrap_or_default(),
         ));
-        let _ = endpoint_registry.load();
+        // A corrupt store must be HEARD, not swallowed: since D-115 the loaded registry decides
+        // whether the endpoint group surfaces at all, so a parse failure silently costing the
+        // operator their endpoint ops would be undebuggable — surface the "fix or remove it"
+        // message and continue with an empty registry.
+        if let Err(e) = endpoint_registry.load() {
+            eprintln!(
+                "{}",
+                style::dim(&format!("(endpoints store not loaded: {e})"))
+            );
+        }
+        // D-115: a non-empty endpoints store is session evidence the endpoint ops matter — an
+        // operator who registered a Postgres endpoint sees them without a kubeconfig. Asked once
+        // of the registry we JUST loaded (never a per-turn re-read of endpoints.toml); surfacing
+        // is sticky-monotonic, so a startup-static answer is enough. Known gap: a store that
+        // becomes non-empty mid-session (a pre-authored flow writing through the still-gated
+        // ops, or an import from another terminal) doesn't surface the group until next session.
+        ambient_signals = session_ambient_signals(&endpoint_registry);
         let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
             plugin_registry.clone(),
         ));
@@ -2368,14 +2400,7 @@ async fn build_agent_with(
                     m.capabilities.discover,
                 )) as Arc<dyn flux_plugin::HostCapabilities>
             };
-            match flux_plugin::load_plugin_tools(
-                &system,
-                &p.descriptor.program,
-                &p.descriptor.args,
-                make_caps,
-            )
-            .await
-            {
+            match flux_plugin::load_plugin_tools(&system, &p.name, &p.descriptor, make_caps).await {
                 Ok(lp) => {
                     // Register this plugin as a discovery provider so the broker can fan a query back
                     // to it (matched by its manifest's `discovers` products).
@@ -2459,10 +2484,13 @@ async fn build_agent_with(
                 .map(String::from)
         })
         .collect();
+    // The audit record must show EVERY gating input: the workspace-probed signals AND the
+    // session-ambient ones (D-115) the engine appends each turn — otherwise "why did this group
+    // surface?" is unanswerable from startup evidence.
     executor.observe(flux_evidence::Observation::new(
         "project.signals",
         flux_evidence::Phase::Startup,
-        serde_json::json!({ "signals": signals }),
+        serde_json::json!({ "signals": signals, "ambient": &ambient_signals }),
     ));
 
     let flow = open_flow_store(events.clone())?;
@@ -2475,6 +2503,7 @@ async fn build_agent_with(
         max_tokens: flags.max_tokens,
         max_iterations: 25,
         groups,
+        ambient_signals,
         compact_threshold_chars: compact_threshold(),
         cwd: cwd.clone(),
         // The CLI builds its own richly-configured executor (perms/approver/hooks/policy/identity)
@@ -2765,21 +2794,23 @@ async fn run_render(file: &str, view: RenderView, out: Option<&str>) -> Result<(
     run_render_in(&system, file, view, out).await
 }
 
-/// The testable core of `flux render`: reads `file` and writes the SVG through the
-/// workspace-confined `System` (SVG is text, so `write_file` suffices; parents are created).
-/// Without `out` the SVG prints to stdout. A hard parse error in `tree` view propagates — the
-/// CLI exits non-zero with the parser's message — while `source` view is total.
+/// The testable core of `flux render`. The INPUT is read like the sibling file-input subcommands
+/// (`flow run`, `app run`): a plain filesystem read relative to the invocation cwd, so `../` and
+/// absolute paths work — only the `-o` WRITE is workspace-confined (through `System::write_file`;
+/// SVG is text, parents are created). A UTF-8 BOM is stripped before parsing (a PowerShell/
+/// Notepad-authored file would otherwise fail the parser with an invisible U+FEFF in the first
+/// token). Without `out` the SVG streams to stdout, and a closed pipe (`flux render x.flux |
+/// head`) is success, not a panic. A hard parse error in `tree` view propagates — the CLI exits
+/// non-zero with the parser's message — while `source` view is total.
 async fn run_render_in(
     system: &System,
     file: &str,
     view: RenderView,
     out: Option<&str>,
 ) -> Result<()> {
-    let source = system
-        .read_file(file)
-        .await
-        .map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
-    let svg = flux_tools::render::render_flux_svg(&source, view.into())
+    let source = std::fs::read_to_string(file).with_context(|| format!("read {file}"))?;
+    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
+    let svg = flux_tools::render::render_flux_svg(source, view.into())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match out {
         Some(path) => {
@@ -2793,7 +2824,20 @@ async fn run_render_in(
             };
             eprintln!("rendered {file} ({view_word} view) → {path}");
         }
-        None => println!("{svg}"),
+        None => {
+            use std::io::Write;
+            // Not `println!`: Rust ignores SIGPIPE, so a consumer that stops reading early
+            // (`| head`, a converter erroring out) would turn the write into a panic with exit
+            // 101. A broken pipe means the consumer has everything it wants — exit cleanly.
+            let mut stdout = std::io::stdout();
+            match stdout
+                .write_all(svg.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                r => r.context("write SVG to stdout")?,
+            }
+        }
     }
     Ok(())
 }
@@ -6107,7 +6151,12 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         let endpoint_registry = Arc::new(flux_capabilities::EndpointRegistry::with_path(
             flux_capabilities::EndpointRegistry::default_path().unwrap_or_default(),
         ));
-        let _ = endpoint_registry.load();
+        if let Err(e) = endpoint_registry.load() {
+            eprintln!(
+                "{}",
+                style::dim(&format!("(endpoints store not loaded: {e})"))
+            );
+        }
         let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
             plugin_registry.clone(),
         ));
@@ -6178,14 +6227,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
                     broker_for_caps,
                 )
             };
-            match flux_plugin::load_plugin_tools(
-                &system,
-                &p.descriptor.program,
-                &p.descriptor.args,
-                make_caps,
-            )
-            .await
-            {
+            match flux_plugin::load_plugin_tools(&system, &p.name, &p.descriptor, make_caps).await {
                 Ok(lp) => {
                     plugin_registry.register(
                         lp.manifest.name.clone(),
@@ -7493,7 +7535,11 @@ async fn load_plugin_manifests(
     let system = System::new(
         Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
     );
-    for p in flux_plugin::discover(dir) {
+    // Same stale-registration handling as the agent-startup loops: dead descriptors get ONE
+    // aggregated line instead of a doomed spawn attempt + per-plugin noise each.
+    let (discovered, stale) = split_stale_plugins(flux_plugin::discover(dir));
+    warn_stale_plugins(&stale);
+    for p in discovered {
         match flux_plugin::PluginHost::spawn_verified(&system, &p.name, &p.descriptor).await {
             Ok(mut host) => {
                 match host.manifest().await {
@@ -7607,24 +7653,35 @@ fn plugin_binaries_in(dir: &std::path::Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Split discovered plugins into loadable descriptors and STALE registrations — path-shaped
-/// `program`s whose binary no longer exists on disk (a deleted checkout, a pruned pack store).
-/// Stale ones are skipped before any spawn attempt and reported by [`warn_stale_plugins`] as ONE
-/// aggregated line, so a pile of dead descriptors doesn't print a warning per plugin on every
-/// command. A bare command name has no checkable path and stays loadable — the spawn resolves it
-/// against PATH and a real failure there still gets its own detailed line.
+/// Split discovered plugins into loadable descriptors and STALE registrations — an ABSOLUTE
+/// recorded `program` whose binary is POSITIVELY confirmed absent (a deleted checkout, a pruned
+/// pack store). Stale ones are skipped before any spawn attempt and reported by
+/// [`warn_stale_plugins`] as ONE aggregated line, so a pile of dead descriptors doesn't print a
+/// warning per plugin on every command. Anything this can't confirm absent defers to the spawn
+/// (whose real error still gets its own detailed line): relative paths (they'd resolve against
+/// whatever the CURRENT cwd is), bare PATH-resolved names, and stat errors (permissions, a
+/// transient mount) — and on Windows a program recorded without `.exe` counts as present when the
+/// `.exe` sibling exists (CreateProcess appends it).
 fn split_stale_plugins(
     discovered: Vec<flux_plugin::DiscoveredPlugin>,
 ) -> (Vec<flux_plugin::DiscoveredPlugin>, Vec<String>) {
-    let (loadable, stale): (Vec<_>, Vec<_>) = discovered.into_iter().partition(|p| {
-        !(p.descriptor.program.contains(['/', '\\'])
-            && !std::path::Path::new(&p.descriptor.program).exists())
-    });
+    fn confirmed_absent(program: &str) -> bool {
+        let prog = std::path::Path::new(program);
+        if !prog.is_absolute() {
+            return false;
+        }
+        let absent = |p: &std::path::Path| matches!(p.try_exists(), Ok(false));
+        absent(prog) && (!cfg!(windows) || absent(&prog.with_extension("exe")))
+    }
+    let (loadable, stale): (Vec<_>, Vec<_>) = discovered
+        .into_iter()
+        .partition(|p| !confirmed_absent(&p.descriptor.program));
     (loadable, stale.into_iter().map(|p| p.name).collect())
 }
 
 /// One dim stderr line covering every stale plugin registration (empty → silence), with the
-/// remedy: rebuild/reinstall the binary, or unregister the plugin.
+/// remedy: `flux plugin status <name>` shows the recorded (missing) path; rebuild/reinstall the
+/// binary, or unregister the plugin.
 fn warn_stale_plugins(stale: &[String]) {
     if stale.is_empty() {
         return;
@@ -7632,7 +7689,7 @@ fn warn_stale_plugins(stale: &[String]) {
     eprintln!(
         "{}",
         style::dim(&format!(
-            "({} plugin registration(s) skipped — binary missing: {}; rebuild/reinstall, or `flux plugin uninstall <name>` to unregister)",
+            "({} plugin registration(s) skipped — binary missing: {}; `flux plugin status <name>` shows the recorded path; rebuild/reinstall, or `flux plugin uninstall <name>` to unregister)",
             stale.len(),
             stale.join(", ")
         ))
@@ -8199,31 +8256,44 @@ mod tests {
         }
     }
 
-    /// L-77: the render handler reads the `.flux` file and writes the SVG through the
-    /// workspace-confined `System` (`-o`), tree view propagates a hard parse error (non-zero
-    /// exit), and source view is total — malformed input still renders.
+    /// L-77: the render handler reads the `.flux` file from the plain filesystem (absolute and
+    /// out-of-workspace paths work, like `flow run`), strips a UTF-8 BOM before parsing, writes
+    /// the SVG through the workspace-confined `System` (`-o`), tree view propagates a hard parse
+    /// error (non-zero exit), and source view is total — malformed input still renders.
     #[tokio::test]
     async fn run_render_writes_svg_and_propagates_tree_parse_errors() {
         use super::{run_render_in, RenderView};
         let dir = std::env::temp_dir().join(format!("flux-render-cli-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("greet.flux"),
-            "flow greet(name: String)\n  do notify \"hi\"\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("broken.flux"), "flow ((((\n").unwrap();
+        let greet = dir.join("greet.flux");
+        std::fs::write(&greet, "flow greet(name: String)\n  do notify \"hi\"\n").unwrap();
+        let broken = dir.join("broken.flux");
+        std::fs::write(&broken, "flow ((((\n").unwrap();
+        // A BOM'd but otherwise-valid file (PowerShell Out-File / Notepad) must render in tree
+        // view — the BOM is stripped before the parser sees it.
+        let bommed = dir.join("bommed.flux");
+        std::fs::write(&bommed, "\u{feff}flow greet(name: String)\n  return 1\n").unwrap();
         let system = super::System::new(super::Workspace::new(&dir).unwrap());
 
-        // `-o` writes the SVG into the workspace.
-        run_render_in(&system, "greet.flux", RenderView::Tree, Some("img/out.svg"))
-            .await
-            .expect("tree render of a valid flow succeeds");
+        // The input is an ABSOLUTE path outside flux's own cwd (the read is NOT jailed — parity
+        // with `flow run`); `-o` writes into the workspace.
+        run_render_in(
+            &system,
+            greet.to_str().unwrap(),
+            RenderView::Tree,
+            Some("img/out.svg"),
+        )
+        .await
+        .expect("tree render of a valid flow succeeds");
         let svg = std::fs::read_to_string(dir.join("img/out.svg")).unwrap();
         assert!(svg.starts_with("<svg"), "got: {svg}");
 
+        run_render_in(&system, bommed.to_str().unwrap(), RenderView::Tree, None)
+            .await
+            .expect("a UTF-8 BOM is stripped, not fed to the parser");
+
         // A hard parse error in `tree` view surfaces the parser's message as an Err.
-        let err = run_render_in(&system, "broken.flux", RenderView::Tree, None)
+        let err = run_render_in(&system, broken.to_str().unwrap(), RenderView::Tree, None)
             .await
             .expect_err("tree view needs parseable source");
         assert!(err.to_string().contains("parse"), "got: {err:#}");
@@ -8231,7 +8301,7 @@ mod tests {
         // `source` view is total: the same malformed file still renders.
         run_render_in(
             &system,
-            "broken.flux",
+            broken.to_str().unwrap(),
             RenderView::Source,
             Some("broken.svg"),
         )
@@ -8243,11 +8313,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A registered plugin whose recorded binary is gone (a deleted checkout, a pruned pack
-    /// store) is a STALE registration: it is skipped up front and reported as one aggregated
-    /// warning line, not spawn-failed with a dim line per plugin on every command. Path-shaped
-    /// programs that exist stay loadable, and bare command names are left for the spawn to
-    /// resolve against PATH.
+    /// A registered plugin whose ABSOLUTE recorded binary is confirmed gone (a deleted checkout,
+    /// a pruned pack store) is a STALE registration: it is skipped up front and reported as one
+    /// aggregated warning line, not spawn-failed with a dim line per plugin on every command.
+    /// Everything else defers to the spawn: absolute paths that exist, bare PATH-resolved names,
+    /// and RELATIVE paths (which would resolve against whatever the current cwd happens to be —
+    /// a plugin registered with `install --dir` from its checkout must not be called "missing"
+    /// just because flux runs elsewhere).
     #[test]
     fn split_stale_plugins_partitions_missing_binaries() {
         let dir = std::env::temp_dir().join(format!("flux-stale-plugins-{}", std::process::id()));
@@ -8268,19 +8340,115 @@ mod tests {
                 dir.join("flux-plugin-gone").to_string_lossy().into_owned(),
             ),
             plugin("bare", "some-command-resolved-on-path".to_string()),
+            plugin(
+                "relative",
+                "plugins/target/release/flux-plugin-rel".to_string(),
+            ),
         ];
         let (loadable, stale) = super::split_stale_plugins(discovered);
         let names: Vec<&str> = loadable.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            ["live", "bare"],
-            "existing paths and bare PATH names stay loadable"
+            ["live", "bare", "relative"],
+            "existing, PATH-resolved, and cwd-relative programs all stay loadable"
         );
         assert_eq!(
             stale,
             ["gone"],
-            "a path-shaped program that no longer exists is stale"
+            "only an absolute program confirmed absent is stale"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-115: the `endpoint` group manifest and `endpoint_tools()` cannot drift — every
+    /// registered endpoint op must be listed in the group. (Membership was never actually
+    /// broken: `effective_group` falls back to each spec's own group tag — but the manifest is
+    /// what config reassignment edits, so the explicit list must stay complete.)
+    #[test]
+    fn endpoint_group_manifest_matches_endpoint_tools() {
+        use flux_capabilities::{
+            EndpointBroker, EndpointRegistry, HostProviderInvoker, PluginRegistry,
+        };
+        use std::sync::Arc;
+        let broker = Arc::new(EndpointBroker::new(
+            Arc::new(HostProviderInvoker::new(Arc::new(PluginRegistry::new()))),
+            Arc::new(PluginRegistry::new()),
+            Arc::new(EndpointRegistry::new()),
+        ));
+        let tools = flux_capabilities::endpoint_tools(broker, Arc::new(EndpointRegistry::new()));
+        let mut op_names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
+        op_names.sort();
+        let group = flux_tools::groups::builtin_groups()
+            .into_iter()
+            .find(|g| g.name == "endpoint")
+            .expect("endpoint group exists");
+        let mut listed = group.tools.clone();
+        listed.sort();
+        assert_eq!(
+            listed, op_names,
+            "the endpoint group manifest must gate every registered endpoint op"
+        );
+        // Registry-side gating agrees: every endpoint op self-declares the group.
+        for t in &tools {
+            assert_eq!(
+                t.spec().group.as_deref(),
+                Some("endpoint"),
+                "{}",
+                t.spec().name
+            );
+        }
+    }
+
+    /// D-115: a non-empty endpoints store injects the ambient `endpoint` signal — computed once
+    /// from the startup-loaded registry, never a per-turn re-read of `endpoints.toml` — which
+    /// surfaces the endpoint group with NO kubernetes signal. An empty/missing store injects
+    /// nothing, and without a kubeconfig the group stays gated.
+    #[test]
+    fn endpoint_store_signal_surfaces_group_without_kubeconfig() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-signal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        // Empty/missing store → no ambient signal.
+        let empty = EndpointRegistry::with_path(path.clone());
+        empty.load().unwrap();
+        assert!(
+            super::session_ambient_signals(&empty).is_empty(),
+            "an empty store injects nothing"
+        );
+
+        // Persist one record, reload fresh (the CLI's startup shape), and the signal appears.
+        let writer = EndpointRegistry::with_path(path.clone());
+        writer.put(flux_secret::endpoint::EndpointRecord {
+            endpoint: flux_secret::endpoint::EndpointRef::discovered(
+                "orders-pg",
+                "postgres://db.internal:5432",
+                "postgres",
+            ),
+            owner: "config".into(),
+            ttl_secs: None,
+            discovered_at_secs: None,
+            health: None,
+        });
+        writer.save().unwrap();
+        let loaded = EndpointRegistry::with_path(path);
+        loaded.load().unwrap();
+        let signals = super::session_ambient_signals(&loaded);
+        assert_eq!(signals, vec!["endpoint".to_string()]);
+
+        // With ONLY that ambient signal (no kubernetes), the built-in endpoint group surfaces;
+        // with no signals at all it stays gated. `Observation::signal` is the SAME constructor
+        // the engine's ambient injection uses, so this asserts the production shape, not a copy.
+        let obs: Vec<flux_evidence::Observation> = signals
+            .iter()
+            .map(|s| flux_evidence::Observation::signal(s))
+            .collect();
+        let groups = flux_tools::groups::builtin_groups();
+        let active = flux_evidence::resolve_active_groups(&groups, &obs);
+        assert!(active.contains("endpoint"), "surfaced by the store signal");
+        let none = flux_evidence::resolve_active_groups(&groups, &[]);
+        assert!(!none.contains("endpoint"), "gated with no signals");
         std::fs::remove_dir_all(&dir).ok();
     }
 

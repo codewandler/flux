@@ -35,6 +35,19 @@ impl Observation {
             data,
         }
     }
+
+    /// A group-surfacing signal observation: [`KIND_SIGNAL`] at [`Phase::Turn`] with the
+    /// `{"signal": name}` payload [`SignalMatch::matches`] reads. The ONE constructor for that
+    /// cross-crate shape — signal emitters (workspace probes, session-ambient injection, tests)
+    /// call this instead of hand-building the JSON, so a typo'd key can't silently stop a group
+    /// from surfacing.
+    pub fn signal(name: &str) -> Self {
+        Self::new(
+            KIND_SIGNAL,
+            Phase::Turn,
+            serde_json::json!({ "signal": name }),
+        )
+    }
 }
 
 /// Produces observations at a given phase.
@@ -287,7 +300,7 @@ mod tests {
     }
 
     fn signal(name: &str) -> Observation {
-        Observation::new("project.signal", Phase::Turn, json!({ "signal": name }))
+        Observation::signal(name)
     }
 
     #[test]

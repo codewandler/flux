@@ -59,7 +59,7 @@ A standalone binary for working with the language itself, built from the reposit
 | command | does |
 |---|---|
 | `fluxlang compile [file]` | Flux-Lang text → pretty-printed JSON AST (stdin when no file) |
-| `fluxlang render [file]` | JSON AST → human-readable tree (colored on a TTY) |
+| `fluxlang render [file]` | JSON AST → human-readable tree (colored on a TTY); not to be confused with `flux render`, which turns a `.flux` FILE into a syntax-highlighted SVG image |
 | `fluxlang schema` | Print the JSON Schema of the AST (`--merged` for the compact model-facing form — see [Execution model](./execution-model.md#how-a-model-emits-a-plan)) |
 | `fluxlang skill` | Print the language skill (the model-facing language reference) |
 

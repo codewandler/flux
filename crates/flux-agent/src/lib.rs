@@ -143,6 +143,11 @@ pub struct AgentSpec {
     pub max_iterations: usize,
     /// Evidence-gated tool groups (empty disables gating — every op advertised).
     pub groups: Vec<flux_evidence::ToolGroup>,
+    /// Session-ambient group-surfacing signals (D-115): host-known facts the per-turn workspace
+    /// walk can't see — e.g. the CLI injects `endpoint` when its startup-loaded endpoints store
+    /// is non-empty. Appended to every turn's probed signals; surfacing is sticky-monotonic, so
+    /// startup-static values are enough. Empty by default.
+    pub ambient_signals: Vec<String>,
     /// Summarize older turns once the persisted session exceeds this many chars (`0` disables it).
     pub compact_threshold_chars: usize,
     /// Workspace root, re-probed each turn for tool-surfacing signals.
@@ -166,6 +171,7 @@ impl Default for AgentSpec {
             max_tokens: 4096,
             max_iterations: 25,
             groups: Vec::new(),
+            ambient_signals: Vec::new(),
             compact_threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
             cwd: PathBuf::from("."),
             context: Vec::new(),
@@ -274,6 +280,7 @@ impl AgentSpec {
             self.groups,
             self.cwd,
         )
+        .map(|engine| engine.with_ambient_signals(self.ambient_signals))
     }
 }
 

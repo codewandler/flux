@@ -112,8 +112,12 @@ async fn plugin_operations_project_as_tools() {
 
     let exe = env!("CARGO_BIN_EXE_echo_plugin");
     let system = test_system();
+    let desc = flux_plugin::PluginDescriptor {
+        program: exe.to_string(),
+        ..Default::default()
+    };
     let flux_plugin::LoadedPlugin { tools, host, .. } =
-        load_plugin_tools(&system, exe, &[], |_| Arc::new(DenyHostCaps))
+        load_plugin_tools(&system, "echo", &desc, |_| Arc::new(DenyHostCaps))
             .await
             .unwrap();
     assert_eq!(tools.len(), 1);

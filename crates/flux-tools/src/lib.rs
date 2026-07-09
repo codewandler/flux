@@ -3528,11 +3528,7 @@ mod tests {
 
         // Opt-in: a `shell` signal observation (what `detect_signals` emits when FLUX_ENABLE_BASH /
         // enable_shell is set) activates the group → bash is advertised.
-        let sig = flux_evidence::Observation::new(
-            flux_evidence::KIND_SIGNAL,
-            flux_evidence::Phase::Turn,
-            json!({"signal": "shell"}),
-        );
+        let sig = flux_evidence::Observation::signal("shell");
         let on = flux_evidence::resolve_active_groups(&groups, std::slice::from_ref(&sig));
         assert!(on.contains("shell"));
         assert!(

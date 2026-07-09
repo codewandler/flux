@@ -100,17 +100,27 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             name: "endpoint".into(),
             description: "Endpoint discovery (D-28): find live service endpoints (kubernetes \
                           clusters, in-cluster services/ingresses, RDS/SQL databases, monitoring) \
-                          as weak references — URLs + a credential location, never a secret — and \
-                          select one to connect through. Surfaced when a kubeconfig is present."
+                          as weak references — URLs + a credential location, never a secret — \
+                          select one to connect through, and import it into the local store. \
+                          Surfaced when a kubeconfig is present or endpoints are registered in \
+                          the endpoints store (`~/.flux/endpoints.toml`)."
                 .into(),
+            // All FIVE endpoint ops listed explicitly (D-115). NOTE: membership was already
+            // effective before `endpoint.import` was added here — `flux_runtime::effective_group`
+            // falls back to each op's own `ToolSpec::group` tag ("endpoint") when the manifest
+            // doesn't list it — so this is explicitness, not a behavior change: the manifest is
+            // what config-based reassignment edits, and a flux-cli test pins it against
+            // `endpoint_tools()` so the two can't drift.
             tools: names(&[
                 "endpoint.discover",
                 "endpoint.select",
                 "endpoint.info",
                 "endpoint.list",
+                "endpoint.import",
             ]),
-            // Surfaced by the ambient `kubernetes` signal (a kubeconfig is present); a generic
-            // `endpoint` signal, if ever injected, surfaces it too.
+            // Surfaced by the ambient `kubernetes` signal (a kubeconfig is present), or by the
+            // session-ambient `endpoint` signal the CLI injects when its startup-loaded endpoints
+            // store is non-empty (D-115).
             surface_when: when_any(&["kubernetes", "endpoint"]),
         },
         ToolGroup {

@@ -20,11 +20,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **D-115 — endpoint ops surface from the endpoints store.** A registered endpoint
+  (`~/.flux/endpoints.toml`) now surfaces the `endpoint` op group without a kubeconfig: the CLI
+  injects a session-ambient `endpoint` signal when its startup-loaded registry is non-empty
+  (computed once — never a per-turn re-read; sticky-monotonic surfacing makes startup-static
+  sufficient), carried by a new ambient-signals seam on the engine (`AgentSpec.ambient_signals` →
+  `FlowEngine::with_ambient_signals`, appended to every turn's workspace-probed signals). A
+  corrupt endpoints store is now reported at startup ("fix or remove it") instead of silently
+  ignored, and the startup `project.signals` audit observation records the ambient signals
+  alongside the probed ones. Housekeeping while there: `endpoint.import` is listed explicitly in
+  the group manifest (membership already held via the spec's own group tag — `effective_group`
+  falls back to it — so this is explicitness, not a behavior change; a test now pins the
+  manifest against `endpoint_tools()`), and its spec is constructed honestly (LocalSystem
+  effect, not the read-only constructor). SDK note: `AgentSpec` gained a public
+  `ambient_signals` field — literal constructors add the field (or use `..Default::default()`).
 - Stale plugin registrations (a descriptor whose recorded binary no longer exists — e.g. a
   deleted checkout) no longer print one "failed to load" warning per plugin on every command.
   They are skipped up front and reported as a single aggregated line naming the plugins and the
-  remedy (rebuild/reinstall, or `flux plugin uninstall <name>`). A real load failure of a
-  present binary still gets its own detailed line.
+  remedy (`flux plugin status <name>` for the recorded path; rebuild/reinstall, or `flux plugin
+  uninstall <name>`). Only an ABSOLUTE recorded path positively confirmed absent counts as
+  stale — relative paths (cwd-dependent), bare PATH names, stat errors, and Windows programs
+  recorded without `.exe` all defer to the spawn, whose real failure still gets its own detailed
+  line. The same aggregation now also covers the `flux skill plugin` catalog path.
+- Agent-startup plugin loading now goes through the hash-verified spawn path
+  (`PluginHost::spawn_verified`): a descriptor with a recorded sha256 whose binary has drifted is
+  refused at session start exactly like `flux plugin call`/`status` — previously the agent-startup
+  loops spawned without the D-48 check. Hashless local/dev descriptors spawn as before. API note:
+  `flux_plugin::load_plugin_tools` now takes the plugin name + descriptor instead of
+  program/args.
 
 ## [0.13.0] - 2026-07-09
 

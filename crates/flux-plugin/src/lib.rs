@@ -2368,20 +2368,25 @@ pub struct LoadedPlugin {
     pub caps: Arc<dyn HostCapabilities>,
 }
 
-/// Spawn a plugin, fetch its manifest, and project every operation as a [`PluginTool`] sharing one
-/// host connection. Returns a [`LoadedPlugin`] (the tools plus the shared host/manifest/caps the
-/// endpoint broker fans out to) — keep the host handle alive for the session.
+/// Spawn a plugin from its descriptor, fetch its manifest, and project every operation as a
+/// [`PluginTool`] sharing one host connection. Returns a [`LoadedPlugin`] (the tools plus the
+/// shared host/manifest/caps the endpoint broker fans out to) — keep the host handle alive for
+/// the session.
+///
+/// Descriptor-based so the spawn goes through [`PluginHost::spawn_verified`] — the D-48 sha256
+/// check covers agent-startup discovery exactly like `flux plugin call`/`status` (a hashless
+/// dev/local descriptor spawns as before; recorded-hash drift is a hard refusal).
 ///
 /// `make_caps` builds the host capabilities *from the fetched manifest*, so the caps can be scoped
 /// to exactly what the plugin declared (see [`SystemHostCaps::with_grants`]) — the binding point
 /// where a plugin's requested privileges are pinned to its manifest.
 pub async fn load_plugin_tools(
     system: &flux_system::System,
-    program: &str,
-    args: &[String],
+    name: &str,
+    descriptor: &PluginDescriptor,
     make_caps: impl FnOnce(&PluginManifest) -> Arc<dyn HostCapabilities>,
 ) -> Result<LoadedPlugin> {
-    let mut host = PluginHost::spawn(system, program, args).await?;
+    let mut host = PluginHost::spawn_verified(system, name, descriptor).await?;
     let manifest = host.manifest().await?;
     let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));

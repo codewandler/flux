@@ -15,6 +15,24 @@
 
 ## [Unreleased]
 
+### New
+
+- `flux render` turns a `.flux` file into a polished, syntax-highlighted SVG image from the
+  command line — either the highlighted source (the default) or the plan tree the file compiles
+  to (`--view tree`). Print it to stdout or write it with `-o out.svg`. Great for READMEs, docs,
+  and slides: it's the same renderer agents already use through the `flow_render` tool.
+
+### Improved
+
+- If you registered service endpoints (for example a Postgres database), the endpoint operations
+  now show up in every session — previously they only appeared when a Kubernetes config was
+  present. A broken endpoints file is reported at startup with a fix-it hint instead of being
+  silently ignored.
+- Old plugin registrations whose program has been deleted no longer spam one warning per plugin
+  at the start of every command. You get a single line naming the affected plugins and how to fix
+  or remove them, and plugins whose recorded checksum no longer matches the binary on disk are
+  now refused at session start too, not just on direct plugin calls.
+
 ## [0.13.0] - 2026-07-09
 
 ### New

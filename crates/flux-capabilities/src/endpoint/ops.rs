@@ -2,8 +2,9 @@
 //! (D-28): `endpoint.discover` / `endpoint.list` / `endpoint.info` / `endpoint.select`, plus the
 //! D-30 `endpoint.import` (persist a known record to `~/.flux/endpoints.toml`, weak-ref only).
 //!
-//! Each is a read-only [`Tool`]. They are the planner's entry point into the discovery spine: ask
-//! *"which endpoints exist for product X?"*, inspect the registry, and **select** a weak
+//! The four query ops are read-only [`Tool`]s; `endpoint.import` is the one write-effect op (it
+//! persists a weak ref to the local store). They are the planner's entry point into the discovery
+//! spine: ask *"which endpoints exist for product X?"*, inspect the registry, and **select** a weak
 //! [`EndpointRef`](flux_secret::endpoint::EndpointRef) to bind to a `$var` and reuse across turns.
 //! Everything the agent sees is a weak reference — URLs + display labels + a credential *location*,
 //! **never** a secret value (the host injects credentials only at the moment of an IO call, behind
@@ -22,11 +23,12 @@ use flux_spec::ToolSpec;
 
 use super::{EndpointBroker, EndpointRegistry};
 
-/// The group all four endpoint ops belong to (surfaced by the `kubernetes` signal — see
-/// `flux-tools`' `builtin_groups`). Shared so the op specs and the group manifest can't drift.
+/// The group all five endpoint ops belong to (surfaced by the ambient `kubernetes` signal, or the
+/// D-115 `endpoint` signal when the endpoints store is non-empty — see `flux-tools`'
+/// `builtin_groups`). Shared so the op specs and the group manifest can't drift.
 pub const ENDPOINT_GROUP: &str = "endpoint";
 
-/// The four endpoint ops over `broker` + `endpoints`, as a tool vec (the form a surface registers
+/// The five endpoint ops over `broker` + `endpoints`, as a tool vec (the form a surface registers
 /// into an agent/app registry — e.g. `App::with_tools`).
 pub fn endpoint_tools(
     broker: Arc<EndpointBroker>,
@@ -41,7 +43,7 @@ pub fn endpoint_tools(
     ]
 }
 
-/// Register all four endpoint ops over `broker` + `endpoints` into `registry`.
+/// Register all five endpoint ops over `broker` + `endpoints` into `registry`.
 pub fn register_endpoint_ops(
     registry: &mut ToolRegistry,
     broker: Arc<EndpointBroker>,
@@ -296,24 +298,33 @@ struct ImportOp(Arc<EndpointRegistry>);
 #[async_trait]
 impl Tool for ImportOp {
     fn spec(&self) -> ToolSpec {
-        // Not read-only: it persists to the local endpoints store (`~/.flux/endpoints.toml`) — a
-        // `LocalSystem` effect (a weak ref, never a secret), distinct from the query ops.
-        ToolSpec::read_only(
-            "endpoint.import",
-            "Persist a discovered/known endpoint reference (by id) to your local endpoints store so it \
-             is remembered across sessions. Stores a weak reference only — URL + credential location, \
-             never a secret; the credential is re-resolved live each session. Returns the imported weak \
-             reference.",
-            json!({
+        // The ONE write-effect endpoint op: it persists to the local endpoints store
+        // (`~/.flux/endpoints.toml`) — a `LocalSystem` effect (a weak ref, never a secret) — so
+        // it is constructed literally rather than via the query ops' `ToolSpec::read_only`.
+        // Idempotent (re-importing the same id rewrites the same record), low risk (never a
+        // secret value), and grouped like its four read-only siblings so all five gate together.
+        ToolSpec {
+            name: "endpoint.import".into(),
+            description:
+                "Persist a discovered/known endpoint reference (by id) to your local endpoints store so it \
+                 is remembered across sessions. Stores a weak reference only — URL + credential location, \
+                 never a secret; the credential is re-resolved live each session. Returns the imported weak \
+                 reference."
+                    .into(),
+            input_schema: json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Endpoint id from endpoint.discover / endpoint.list"}
                 },
                 "required": ["id"]
             }),
-        )
-        .with_effects(vec![flux_spec::Effect::LocalSystem])
-        .with_group(ENDPOINT_GROUP)
+            output_schema: None,
+            effects: vec![flux_spec::Effect::LocalSystem],
+            risk: flux_spec::Risk::Low,
+            idempotency: flux_spec::Idempotency::Idempotent,
+            access: Vec::new(),
+            group: Some(ENDPOINT_GROUP.into()),
+        }
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
