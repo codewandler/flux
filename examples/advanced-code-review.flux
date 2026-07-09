@@ -9,9 +9,10 @@
 # parses and lowers.
 #
 # Demonstrates: parallel, retry/timeout, ctx/ctx_append, fallback, route, the cognition ops
-# (ai.extract/ai.judge/ai.rank, synth), and — via the documented `@json` escape, since these Tier-2
-# nodes have no native-text spelling (docs/syntax.md) — confirm (human-in-the-loop escalation),
-# saga+undo (compensating write + Slack notify), and a final verify.
+# (ai.extract/ai.judge/ai.rank, synth), confirm (human-in-the-loop escalation), saga+undo with
+# once-guarded steps (compensating write + Slack notify), and a final verify — all in native text.
+# Every node kind has a native spelling (docs/syntax.md); `@json` remains only as the escape for
+# shapes the grammar cannot express, and this file no longer needs it.
 #
 # `slack.message.send` is an out-of-process `flux-plugin-slack` op: it is not in any in-process
 # registry buildable from flux-eval's own dependency set, so `crates/flux-eval/tests/
@@ -84,8 +85,9 @@ flow code_review_pipeline(pr_branch: String, base_branch: String, notify_channel
       $action_label = "CHANGES_REQUESTED"
     case "escalate"
       $action_label = "ESCALATED"
-      # `confirm` (human-in-the-loop gate) has no native-text spelling — `@json` escape.
-      @json {"kind":"confirm","message":"AI flagged this PR for security escalation. Review the top claims and approve sending the escalation notice.","risk":"high","body":[{"kind":"call","op":"observe","args":[{"kind":"lit","value":{"kind":"escalation.approved"}}]}]}
+      # `confirm` — human-in-the-loop gate; the body runs only on approval, denial errors the arm.
+      confirm "AI flagged this PR for security escalation. Review the top claims and approve sending the escalation notice." risk high
+        observe({ kind: "escalation.approved" })
     default
       $action_label = "CHANGES_REQUESTED"
 
@@ -93,18 +95,27 @@ flow code_review_pipeline(pr_branch: String, base_branch: String, notify_channel
   $report = synth({ claims: $top_claims, format: "markdown", cite: true })
 
   # Phase 9: write + notify — a saga with compensating rollback. If the Slack step fails, the saga
-  # unwinds and the undo for step 1 deletes the file that was just written. `saga`/`once` are also
-  # Tier-2 nodes with no native-text spelling, so the whole step is one `@json` escape; the
-  # interpolated path/content/command/text are pre-bound to symbols with `fmt` (a `@json` call
-  # argument accepts only `lit`/`var`/`obj`/`list`, never a bare `fmt` — bind first, then pass
-  # `$name`, exactly like every other call in this flow).
+  # unwinds and the undo for step 1 deletes the file that was just written. Each step is guarded by
+  # `once`, so a replayed flow never double-writes the report or double-posts to Slack. The
+  # interpolated path/content/command/text are pre-bound to symbols with `fmt` (a call argument
+  # takes values — `lit`/`var`/obj/list — never a bare `fmt`; bind first, then pass `$name`,
+  # exactly like every other call in this flow).
   $report_path = fmt(".flux/reviews/{pr_branch}.md")
   $report_content = fmt("# Code Review: {pr_branch}\n\n**Decision**: {action_label}\n\n{report}")
   $rm_cmd = fmt("rm -f .flux/reviews/{pr_branch}.md")
   $slack_text = fmt(":mag: *Code Review Complete* — `{pr_branch}` -> *{action_label}*\n{report}")
-  @json {"kind":"saga","steps":[{"body":[{"kind":"once","label":"write-review-report","body":[{"kind":"call","op":"write","args":[{"kind":"obj","fields":{"path":{"kind":"var","name":"report_path"},"content":{"kind":"var","name":"report_content"}}}]}]}],"undo":[{"kind":"call","op":"bash","args":[{"kind":"var","name":"rm_cmd"}]}]},{"body":[{"kind":"budget","limit":3,"body":[{"kind":"once","label":"post-slack-review","body":[{"kind":"call","op":"slack.message.send","args":[{"kind":"obj","fields":{"channel":{"kind":"var","name":"notify_channel"},"text":{"kind":"var","name":"slack_text"}}}]}]}]}],"undo":[]}]}
+  saga
+    step
+      once "write-review-report"
+        write({ path: $report_path, content: $report_content })
+    undo
+      bash($rm_cmd)
+    step
+      budget 3
+        once "post-slack-review"
+          slack.message.send({ channel: $notify_channel, text: $slack_text })
 
-  # Phase 10: verify the report file actually landed. `verify` has no native-text spelling either.
-  @json {"kind":"verify","cmd":{"kind":"call","op":"path_exists","args":[{"kind":"var","name":"report_path"}]},"expect":{"kind":"lit","value":"true"},"message":"Review file was not written - saga compensation may have run."}
+  # Phase 10: verify the report file actually landed.
+  verify path_exists($report_path) contains "true": "Review file was not written - saga compensation may have run."
 
   return { status: $action_label, summary: $report, evidence: $top_claims, gaps: [], risks: $verdict }

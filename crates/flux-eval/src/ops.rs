@@ -581,7 +581,8 @@ impl Tool for EvalScalarTool {
 /// CURRENT workspace, reusing the eval harness's own [`runner::grade`](crate::runner::grade) so a flow's
 /// graded stop-condition uses the exact same check the benchmark does (no divergence). The criterion is
 /// a `{kind: "command"|"file_content"|"all", …}` object; the string boolean is read by a `when`
-/// condition's truthiness — `when grade(@json{…}) -> $done = true` is the evidence-based early stop.
+/// condition's truthiness — `when grade({kind: "command", …}) -> $done = true` is the
+/// evidence-based early stop.
 pub struct GradeTool;
 
 /// Arguments for the `grade` op.

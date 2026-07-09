@@ -1269,7 +1269,7 @@ op waits
   risk "low"
   idempotency "idempotent"
   effects []
-  @json {"kind":"await","source":"reply"}
+  await "reply"
 
 op a
   description "cycle"
