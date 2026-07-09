@@ -227,9 +227,9 @@ impl Tool for FlowRunTool {
         // Seed inputs as literal binds, prepended so a flow-local `bind` can still shadow them
         // (matches FlowStore::seed's last-writer-wins semantics).
         if let Some(inputs) = args.inputs {
-            let obj = inputs.as_object().ok_or_else(|| {
-                Error::Other("flow_run: `inputs` must be a JSON object".into())
-            })?;
+            let obj = inputs
+                .as_object()
+                .ok_or_else(|| Error::Other("flow_run: `inputs` must be a JSON object".into()))?;
             let mut seeded: Vec<Node> = obj
                 .iter()
                 .map(|(k, v)| Node::Bind {

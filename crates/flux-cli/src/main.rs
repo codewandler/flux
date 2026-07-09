@@ -2034,8 +2034,7 @@ async fn build_agent_with(
         // is the legacy location, still read during the ops→flows unification.
         for (name, sub) in [("global_flows", "flows"), ("global_ops", "ops")] {
             let dir = flux_dir.join(sub);
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             workspace
                 .add_named_root(name, &dir)
                 .with_context(|| format!("register {}", dir.display()))?;
