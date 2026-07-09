@@ -27,6 +27,14 @@ All notable changes to this project are documented in this file. The format is b
   prelude-type docs), and whole-document formatting via the invertible formatter. A committed
   `.helix/languages.toml` wires it into `hx` config-only. Built from source for now
   (`cargo build -p flux-lsp`); shipping binaries is part of the packaging story (L-70).
+- **Merged model-facing Node schema — a third emission arm (L-71).** `FLUX_EMISSION=merged`
+  advertises `emit_plan` with the `Node` definition collapsed to ONE object schema (`kind` enum +
+  the union of every kind's properties, each optional) instead of the 43-variant `oneOf` —
+  29.9 kB → 10.2 kB (−66%, ~7.5k → ~2.6k tokens). Same wire format, prompt, parse path, and
+  repair loop as the `json` arm; per-kind semantics stay in the node-kind catalog. New
+  `flux_lang::schema::{merge_node_schema, model_schema}`, `fluxlang schema --merged`, and a
+  three-arm emission-A/B live harness. `json` remains the default pending the measured A/B
+  (decision rule pre-registered in `docs/designs/flux-lang-emission-ab.md`).
 
 ### Changed
 

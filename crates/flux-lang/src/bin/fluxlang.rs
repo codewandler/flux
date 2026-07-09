@@ -32,7 +32,12 @@ enum Command {
     /// Print the Flux-Lang language skill (markdown).
     Skill,
     /// Print the JSON Schema of the Flux-Lang AST.
-    Schema,
+    Schema {
+        /// Print the model-facing merged schema — one `Node` object (`kind` enum + the union of
+        /// every kind's properties) — instead of the strict per-kind union.
+        #[arg(long)]
+        merged: bool,
+    },
     /// Render a JSON AST (from FILE, or stdin when omitted) as a human-readable tree.
     Render {
         /// Path to a JSON AST file; reads stdin when omitted.
@@ -55,8 +60,14 @@ fn main() {
 fn run() -> Result<()> {
     let out = match Cli::parse().command {
         Command::Skill => flux_lang::skill::render(),
-        Command::Schema => serde_json::to_string_pretty(&flux_lang::schema::ast_schema())
-            .map_err(|e| Error::Other(e.to_string()))?,
+        Command::Schema { merged } => {
+            let schema = if merged {
+                flux_lang::schema::model_schema()
+            } else {
+                flux_lang::schema::ast_schema()
+            };
+            serde_json::to_string_pretty(&schema).map_err(|e| Error::Other(e.to_string()))?
+        }
         Command::Render { file } => render_ast(file)?,
         Command::Compile { file } => compile_text(file)?,
     };

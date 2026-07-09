@@ -19,6 +19,144 @@ pub fn ast_schema() -> serde_json::Value {
     .clone()
 }
 
+/// The **model-facing merged** AST schema (L-71): [`ast_schema`] with the `Node` definition's
+/// 43-variant `oneOf` collapsed into ONE object schema via [`merge_node_schema`]. Same wire format
+/// (the internally-tagged `{"kind": …, …}` objects serde already speaks), a fraction of the tokens
+/// — per-kind field/semantics documentation stays in [`node_kind_catalog`], which the planner
+/// prompt carries anyway. Memoized like [`ast_schema`].
+pub fn model_schema() -> serde_json::Value {
+    static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut schema = ast_schema();
+        merge_node_schema(&mut schema);
+        schema
+    })
+    .clone()
+}
+
+/// Collapse the `Node` definition inside `schema` (any schema whose `$defs`/`definitions` map
+/// carries the schemars-derived 43-variant `oneOf`) into a single object schema:
+///
+/// - `kind` becomes a `string` enum of every variant tag, in declaration order;
+/// - the other properties are the **union** across variants, each declared once and all optional
+///   (`required` is just `["kind"]`) — placement/requiredness stays with the analyzer + repair
+///   loop, which are the enforcement authority in every emission arm;
+/// - a property whose shape differs across variants (e.g. `branches`: `Branch` vs
+///   `FallbackBranch`) merges to an `anyOf` of the distinct shapes; a shape that already accepts
+///   anything (`lit.value`) absorbs the rest.
+///
+/// Purely a projection of the derived schema — the AST types, serde encoding, and every consumer of
+/// [`ast_schema`] are untouched. A schema without a `oneOf` `Node` definition is left unchanged, so
+/// the merge is idempotent. Works on both the bare [`ast_schema`] and a tool-input schema embedding
+/// it (e.g. `emit_plan`'s), whichever defs key schemars emitted.
+pub fn merge_node_schema(schema: &mut serde_json::Value) {
+    let Some(defs_key) = ["$defs", "definitions"]
+        .into_iter()
+        .find(|k| schema.get(k).is_some())
+    else {
+        return;
+    };
+    let Some(node) = schema[defs_key].get("Node") else {
+        return;
+    };
+    let Some(variants) = node.get("oneOf").and_then(|v| v.as_array()).cloned() else {
+        return;
+    };
+
+    struct MergedProp {
+        shapes: Vec<serde_json::Value>,
+        /// The field description — kept only while every kind carrying the property agrees on it
+        /// (a shared property's meaning is kind-dependent, and kind semantics are the node-kind
+        /// catalog's job, not the merged schema's).
+        desc: Option<serde_json::Value>,
+        desc_consistent: bool,
+    }
+    let mut kinds: Vec<serde_json::Value> = Vec::new();
+    // Property name → merged shape/description. A `Vec` keyed by linear search keeps first-seen
+    // declaration order for ~60 properties (a map would reorder them).
+    let mut merged_props: Vec<(String, MergedProp)> = Vec::new();
+    for variant in &variants {
+        let Some(props) = variant.get("properties").and_then(|p| p.as_object()) else {
+            continue;
+        };
+        for (name, prop) in props {
+            if name == "kind" {
+                if let Some(tag) = variant_kind(variant) {
+                    kinds.push(serde_json::Value::String(tag));
+                }
+                continue;
+            }
+            // Compare shapes with the field description split off, so the same shape documented
+            // differently in two variants still merges to one declaration.
+            let mut shape = prop.clone();
+            let desc = shape.as_object_mut().and_then(|o| o.remove("description"));
+            let entry = match merged_props.iter_mut().find(|(n, _)| n == name) {
+                Some((_, entry)) => {
+                    if entry.desc != desc {
+                        entry.desc_consistent = false;
+                    }
+                    entry
+                }
+                None => {
+                    merged_props.push((
+                        name.clone(),
+                        MergedProp {
+                            shapes: Vec::new(),
+                            desc,
+                            desc_consistent: true,
+                        },
+                    ));
+                    &mut merged_props.last_mut().expect("just pushed").1
+                }
+            };
+            if !entry.shapes.contains(&shape) {
+                entry.shapes.push(shape);
+            }
+        }
+    }
+
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "kind".to_string(),
+        serde_json::json!({
+            "type": "string",
+            "enum": kinds,
+            "description": "Selects the node type. Only the fields that kind uses apply — see the \
+                            node-kind catalog for each kind's fields and semantics.",
+        }),
+    );
+    for (name, prop) in merged_props {
+        let mut merged = if prop.shapes.iter().any(|s| s.as_bool() == Some(true)) {
+            // One variant already accepts anything (`lit.value`) — the union is "anything".
+            serde_json::json!({})
+        } else if prop.shapes.len() == 1 {
+            prop.shapes.into_iter().next().expect("one shape")
+        } else {
+            serde_json::json!({ "anyOf": prop.shapes })
+        };
+        if prop.desc_consistent {
+            if let (Some(obj), Some(d)) = (merged.as_object_mut(), prop.desc) {
+                obj.insert("description".to_string(), d);
+            }
+        }
+        properties.insert(name, merged);
+    }
+
+    let description = format!(
+        "{} Model-facing merged form: `kind` selects the node type and the remaining properties \
+         are the union across all kinds — set only the fields your kind uses.",
+        node.get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+    );
+    schema[defs_key]["Node"] = serde_json::json!({
+        "description": description.trim(),
+        "type": "object",
+        "properties": properties,
+        "required": ["kind"],
+    });
+}
+
 /// The `(kind, description)` pairs behind [`node_kind_catalog`], for consumers that need to
 /// render the table differently than the verbatim catalog (e.g. escaping literal `|` characters
 /// for a strict markdown-table renderer, as the website generator does).
@@ -169,5 +307,110 @@ mod tests {
             .or_else(|| schema.get("$defs"))
             .expect("schema carries a definitions map");
         assert!(defs.get("Node").is_some(), "Node is defined in the schema");
+    }
+
+    fn defs(schema: &serde_json::Value) -> &serde_json::Value {
+        schema
+            .get("definitions")
+            .or_else(|| schema.get("$defs"))
+            .expect("schema carries a definitions map")
+    }
+
+    /// L-71: the merged model-facing schema collapses `Node` to ONE object whose `kind` enum covers
+    /// every variant in declaration order — the same tags [`node_kind_rows`] derives, so a new or
+    /// renamed variant can't silently fall out of the model surface.
+    #[test]
+    fn model_schema_kind_enum_matches_the_catalog() {
+        let merged = model_schema();
+        let node = &defs(&merged)["Node"];
+        assert!(node.get("oneOf").is_none(), "the oneOf is merged away");
+        assert_eq!(node["type"], "object");
+        assert_eq!(node["required"], serde_json::json!(["kind"]));
+        let kinds: Vec<String> = node["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("kind is an enum")
+            .iter()
+            .map(|k| k.as_str().expect("kind tags are strings").to_string())
+            .collect();
+        let catalog: Vec<String> = node_kind_rows().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, catalog, "kind enum = every variant, in order");
+    }
+
+    /// Every property of every `oneOf` variant survives the merge — the union is complete, so no
+    /// field a kind needs is hidden from the model.
+    #[test]
+    fn model_schema_unions_every_variant_property() {
+        let strict = ast_schema();
+        let merged = model_schema();
+        let merged_props = defs(&merged)["Node"]["properties"]
+            .as_object()
+            .expect("merged Node has properties");
+        for variant in defs(&strict)["Node"]["oneOf"]
+            .as_array()
+            .expect("strict Node is a oneOf")
+        {
+            let kind = variant_kind(variant).unwrap_or_default();
+            for name in variant["properties"].as_object().expect("props").keys() {
+                assert!(
+                    merged_props.contains_key(name),
+                    "merged Node is missing `{name}` (from `{kind}`)"
+                );
+            }
+        }
+    }
+
+    /// The merge never leaves a dangling `$ref`, and it pays for itself: the merged schema is well
+    /// under half the strict schema's serialized size (the measured motivation for the arm).
+    #[test]
+    fn model_schema_is_closed_and_much_smaller() {
+        let merged = model_schema();
+        let def_names: Vec<String> = defs(&merged)
+            .as_object()
+            .expect("defs map")
+            .keys()
+            .cloned()
+            .collect();
+        fn walk(v: &serde_json::Value, names: &[String]) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(r) = map.get("$ref").and_then(|r| r.as_str()) {
+                        let target = r.rsplit('/').next().unwrap_or_default();
+                        assert!(
+                            names.iter().any(|n| n == target),
+                            "dangling $ref `{r}` after the merge"
+                        );
+                    }
+                    map.values().for_each(|c| walk(c, names));
+                }
+                serde_json::Value::Array(arr) => arr.iter().for_each(|c| walk(c, names)),
+                _ => {}
+            }
+        }
+        walk(&merged, &def_names);
+
+        let strict_len = ast_schema().to_string().len();
+        let merged_len = merged.to_string().len();
+        assert!(
+            merged_len * 2 < strict_len,
+            "merged schema ({merged_len} B) must be < 50% of the strict schema ({strict_len} B)"
+        );
+    }
+
+    /// The merge is a targeted, idempotent projection: a second application is a no-op, and a
+    /// schema without a `oneOf` `Node` definition passes through untouched.
+    #[test]
+    fn merge_node_schema_is_idempotent_and_tolerant() {
+        let mut once = ast_schema();
+        merge_node_schema(&mut once);
+        let mut twice = once.clone();
+        merge_node_schema(&mut twice);
+        assert_eq!(
+            once, twice,
+            "re-merging an already-merged schema is a no-op"
+        );
+
+        let mut unrelated = serde_json::json!({ "type": "object" });
+        merge_node_schema(&mut unrelated);
+        assert_eq!(unrelated, serde_json::json!({ "type": "object" }));
     }
 }

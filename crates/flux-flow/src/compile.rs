@@ -201,8 +201,13 @@ struct AskUserInput {
 ///   they are parseable by construction) and parsed with [`flux_lang::parse`]. The decoded
 ///   [`DraftAst`] then flows through **exactly** the same gates as the JSON arm — surfacing
 ///   enforcement (A-04) and the analyze/lower validation (C-17) are arm-independent.
+/// - [`EmissionArm::Merged`] (L-71): the JSON arm with `emit_plan`'s `Node` definition collapsed
+///   to ONE object schema (`kind` enum + unioned optional props,
+///   [`flux_lang::schema::merge_node_schema`]) — ~65% fewer schema bytes, same wire format, same
+///   prompt, same parse/repair path. Per-kind semantics ride in the node-kind catalog the prompt
+///   already carries.
 ///
-/// This is a temporary measurement scaffold: once the A/B is decided, the losing arm and this
+/// This is a temporary measurement scaffold: once the A/B is decided, the losing arms and this
 /// selector are deleted (the project's no-fallbacks stance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmissionArm {
@@ -211,18 +216,23 @@ pub enum EmissionArm {
     Json,
     /// Native Flux-Lang text on `emit_plan` (`source` param) — the treatment arm.
     Text,
+    /// Merged single-object `Node` schema on `emit_plan` (`ast` param) — the JSON arm's wire and
+    /// parse path with the model-facing schema shrunk (L-71).
+    Merged,
 }
 
 impl EmissionArm {
-    /// Parse a selector value: unset/empty/`json` → [`Self::Json`], `text` → [`Self::Text`].
-    /// Anything else is an error — a typo must not silently pick an arm mid-experiment.
+    /// Parse a selector value: unset/empty/`json` → [`Self::Json`], `text` → [`Self::Text`],
+    /// `merged` → [`Self::Merged`]. Anything else is an error — a typo must not silently pick an
+    /// arm mid-experiment.
     pub fn parse(value: Option<&str>) -> Result<Self> {
         match value.map(str::trim) {
             None | Some("") => Ok(Self::Json),
             Some(v) if v.eq_ignore_ascii_case("json") => Ok(Self::Json),
             Some(v) if v.eq_ignore_ascii_case("text") => Ok(Self::Text),
+            Some(v) if v.eq_ignore_ascii_case("merged") => Ok(Self::Merged),
             Some(v) => Err(Error::Other(format!(
-                "invalid FLUX_EMISSION value `{v}` — use `json` or `text`"
+                "invalid FLUX_EMISSION value `{v}` — use `json`, `text`, or `merged`"
             ))),
         }
     }
@@ -819,7 +829,9 @@ async fn compile_turn_inner(
                     // the identical gates below — surfacing enforcement (A-04) and analyze/lower
                     // (C-17) hold regardless of which surface carried the plan.
                     let decoded: std::result::Result<DraftAst, String> = match arm {
-                        EmissionArm::Json => {
+                        // Merged (L-71) is schema-only: the payload is the same `ast` JSON, so it
+                        // shares the JSON arm's decode (and every gate below) verbatim.
+                        EmissionArm::Json | EmissionArm::Merged => {
                             let ast_val = input.get("ast").cloned().unwrap_or(input);
                             // Stringified-JSON tolerance (A-30): OpenAI-wire-trained models
                             // habitually double-encode nested tool args — `ast` arrives as a JSON
@@ -2170,7 +2182,9 @@ fn build_planner_prompt(ops: &OpRegistry, interactive: bool, arm: EmissionArm) -
         ""
     };
     let (plan_form, ast_word, grammar) = match arm {
-        EmissionArm::Json => ("a Flux-Lang flow AST", "AST", ast_grammar()),
+        // Merged differs from Json only in `emit_plan`'s advertised schema (planner_tools) —
+        // the prompt is the Json arm's, byte-identical.
+        EmissionArm::Json | EmissionArm::Merged => ("a Flux-Lang flow AST", "AST", ast_grammar()),
         EmissionArm::Text => ("native Flux-Lang source text", "plan", text_grammar()),
     };
     format!(
@@ -2201,26 +2215,49 @@ op is shown as `name({{params}})` — call a multi-param op with a single object
     )
 }
 
+/// `emit_plan`'s input schema for the merged arm (L-71): the JSON arm's derived schema with the
+/// `Node` definition collapsed to one object (`kind` enum + unioned optional props) by
+/// [`flux_lang::schema::merge_node_schema`]. Post-processing [`tool_input_schema`] keeps the root
+/// shape — `ast` required, `complete`/`gather`/`brief` intact — byte-compatible with the JSON arm;
+/// only the `Node` definition shrinks. Memoized like the underlying schema builders (the merge
+/// walks all 43 variants).
+fn merged_emit_plan_schema() -> serde_json::Value {
+    static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut schema = tool_input_schema::<EmitPlanInput>();
+        flux_lang::schema::merge_node_schema(&mut schema);
+        schema
+    })
+    .clone()
+}
+
 /// The only tools the planner can call: the synthetic `emit_plan` (and `ask_user` when interactive).
 /// There are NO directly-callable ops — every operation (reads included) is a node in the emitted AST,
-/// so a turn is always an auditable plan (pure DAG). The `arm` picks `emit_plan`'s surface (L-20):
-/// the strict derived `DraftAst` schema on `ast` (json, the unchanged default) or a native
-/// Flux-Lang `source` string (text).
+/// so a turn is always an auditable plan (pure DAG). The `arm` picks `emit_plan`'s surface (L-20 +
+/// L-71): the strict derived `DraftAst` schema on `ast` (json, the unchanged default), a native
+/// Flux-Lang `source` string (text), or the merged single-object `Node` schema on `ast` (merged).
 fn planner_tools(interactive: bool, arm: EmissionArm) -> Vec<ToolDef> {
     let mut tools: Vec<ToolDef> = Vec::new();
-    tools.push(match arm {
-        EmissionArm::Json => ToolDef {
-            name: "emit_plan".to_string(),
-            description: "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`. \
+    // Json and Merged share the surface contract (and thus the description verbatim) — they differ
+    // only in how tightly the advertised schema describes the same `ast` payload.
+    let json_description = "Emit the Flux-Lang flow AST to run (your only way to act). Pass the AST as `ast`. \
                       If this plan completes the request, also pass `complete` — `instructions` for your \
                       final message (the runtime writes it from the actual results and ends the turn), \
                       NOT the message itself. Omit `complete` if you must see the results before you can \
                       answer, or to keep working; then answer in prose once done. When the current \
                       phase's instructions allow it, tag `gather: true` (with a `brief: {goal, needs[]}`) \
                       for a small, read-only round instead — see the phase instructions for when this \
-                      applies and its limits."
-                .to_string(),
+                      applies and its limits.";
+    tools.push(match arm {
+        EmissionArm::Json => ToolDef {
+            name: "emit_plan".to_string(),
+            description: json_description.to_string(),
             input_schema: tool_input_schema::<EmitPlanInput>(),
+        },
+        EmissionArm::Merged => ToolDef {
+            name: "emit_plan".to_string(),
+            description: json_description.to_string(),
+            input_schema: merged_emit_plan_schema(),
         },
         EmissionArm::Text => ToolDef {
             name: "emit_plan".to_string(),
@@ -2700,6 +2737,14 @@ mod tests {
             EmissionArm::parse(Some(" Text ")).unwrap(),
             EmissionArm::Text
         );
+        assert_eq!(
+            EmissionArm::parse(Some("merged")).unwrap(),
+            EmissionArm::Merged
+        );
+        assert_eq!(
+            EmissionArm::parse(Some("MERGED")).unwrap(),
+            EmissionArm::Merged
+        );
         assert!(EmissionArm::parse(Some("yaml")).is_err());
         // With FLUX_EMISSION unset (the normal test env), the env read lands on the default arm.
         if std::env::var("FLUX_EMISSION").is_err() {
@@ -2753,6 +2798,90 @@ mod tests {
             !prompt.contains("{\"kind\":\"bind\""),
             "the JSON worked examples must not ride along in the text arm"
         );
+    }
+
+    /// L-71: the merged arm keeps the JSON arm's contract everywhere except `emit_plan`'s schema —
+    /// same prompt bytes, same `ast` root shape (`complete`/`gather`/`brief` intact), but the
+    /// `Node` definition is ONE object (kind enum + unioned props, no `oneOf`) at a fraction of
+    /// the strict schema's size.
+    #[test]
+    fn merged_arm_shrinks_the_node_schema_and_keeps_the_json_surface() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        assert_eq!(
+            build_planner_prompt(&ops, false, EmissionArm::Merged),
+            build_planner_prompt(&ops, false, EmissionArm::Json),
+            "merged differs from json only in the tool schema, never the prompt"
+        );
+
+        let json_emit = &planner_tools(false, EmissionArm::Json)[0];
+        let merged_emit = &planner_tools(false, EmissionArm::Merged)[0];
+        assert_eq!(merged_emit.name, "emit_plan");
+        assert_eq!(merged_emit.description, json_emit.description);
+        assert_eq!(merged_emit.input_schema["required"], json!(["ast"]));
+        for field in ["ast", "complete", "gather", "brief"] {
+            assert!(
+                merged_emit.input_schema["properties"].get(field).is_some(),
+                "merged schema keeps the `{field}` root param"
+            );
+        }
+
+        let defs = merged_emit
+            .input_schema
+            .get("definitions")
+            .or_else(|| merged_emit.input_schema.get("$defs"))
+            .expect("merged schema keeps a definitions map");
+        let node = &defs["Node"];
+        assert!(node.get("oneOf").is_none(), "the 43-way oneOf is merged");
+        assert_eq!(node["required"], json!(["kind"]));
+        let kinds = node["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("kind is an enum");
+        assert_eq!(
+            kinds.len(),
+            crate::schema::node_kind_rows().len(),
+            "the kind enum covers every node kind"
+        );
+
+        let merged_len = merged_emit.input_schema.to_string().len();
+        let json_len = json_emit.input_schema.to_string().len();
+        assert!(
+            merged_len * 2 < json_len,
+            "merged emit_plan schema ({merged_len} B) must be < 50% of the strict one ({json_len} B)"
+        );
+    }
+
+    /// L-71: a schema-shaped `ast` payload compiles identically under the merged arm — the wire
+    /// format and parse path are the JSON arm's, so the SAME emission yields the SAME plan.
+    #[tokio::test]
+    async fn merged_arm_accepts_the_same_ast_payload_as_json() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(VALID_AST).unwrap(),
+        )]);
+        let (json_out, _) = turn_with_arm(&p, &ops, EmissionArm::Json, CompileOptions::default())
+            .await
+            .expect("json arm plans");
+
+        let p = mock(vec![tool_call(
+            "emit_plan",
+            serde_json::from_str(VALID_AST).unwrap(),
+        )]);
+        let (merged_out, _) =
+            turn_with_arm(&p, &ops, EmissionArm::Merged, CompileOptions::default())
+                .await
+                .expect("merged arm plans");
+
+        match (json_out, merged_out) {
+            (TurnOutput::Plan(j), TurnOutput::Plan(m)) => {
+                assert_eq!(j.ast, m.ast, "both surfaces carry the same plan");
+                assert_eq!(m.attempts, 1);
+            }
+            other => panic!("both arms must produce a plan, got {other:?}"),
+        }
     }
 
     /// The text grammar's worked examples are the JSON grammar's examples re-rendered through

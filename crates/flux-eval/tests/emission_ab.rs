@@ -1,11 +1,12 @@
-//! L-20: the planner-emission A/B — strict-JSON `ast` (control) vs native-text `source`
-//! (treatment) — over the fixed corpus in `assets/emission-ab/tasks.json`.
+//! L-20/L-71: the planner-emission A/B — strict-JSON `ast` (control) vs native-text `source`
+//! (treatment) vs merged one-node-object `ast` schema (L-71) — over the fixed corpus in
+//! `assets/emission-ab/tasks.json`.
 //!
 //! Two tests:
 //! - [`corpus_is_valid`] (hermetic, always runs): the committed fixture parses, ids are unique,
 //!   and the corpus stays in the story's 10–20 task band.
 //! - [`emission_ab_live`] (env-gated + `#[ignore]`, the flux-eval synthetic-loop precedent): runs
-//!   BOTH arms over the corpus against a real model and prints the per-arm comparison table that
+//!   EVERY arm over the corpus against a real model and prints the per-arm comparison table that
 //!   `docs/designs/flux-lang-emission-ab.md` records. It spends real tokens, so it is skipped by
 //!   default; run it with
 //!
@@ -198,11 +199,12 @@ async fn run_arm(
     ArmReport { results }
 }
 
-fn print_comparison(json: &ArmReport, text: &ArmReport, model_spec: &str) {
-    let n = json.results.len() as f64;
-    let per = |v: u64| v as f64 / n;
-    let ju = json.usage_total();
-    let tu = text.usage_total();
+fn print_comparison(arms: &[(&str, &ArmReport)], model_spec: &str) {
+    let n = arms
+        .first()
+        .map(|(_, r)| r.results.len())
+        .unwrap_or_default();
+    let per = |v: u64| v as f64 / n as f64;
     let pricing = PricingTable::builtin();
     let cost = |u: &Usage| {
         pricing
@@ -210,61 +212,64 @@ fn print_comparison(json: &ArmReport, text: &ArmReport, model_spec: &str) {
             .map(|m| format!("${:.4}", m.usd))
             .unwrap_or_else(|| "n/a".to_string())
     };
+    // One markdown table, one column per arm — the L-71 third arm rides in the same table the
+    // design doc records, so N arms print without another format.
+    let row = |label: &str, cells: Vec<String>| eprintln!("| {label} | {} |", cells.join(" | "));
+    eprintln!("\n## Emission A/B — {model_spec} ({n} tasks/arm)\n");
     eprintln!(
-        "\n## Emission A/B — {model_spec} ({} tasks/arm)\n",
-        json.results.len()
+        "| metric | {} |",
+        arms.iter()
+            .map(|(l, _)| l.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
-    eprintln!("| metric | json (ast schema) | text (native source) |");
-    eprintln!("|---|---|---|");
-    eprintln!(
-        "| plans accepted | {}/{} | {}/{} |",
-        json.accepted(),
-        json.results.len(),
-        text.accepted(),
-        text.results.len()
+    eprintln!("|---|{}|", "---|".repeat(arms.len()));
+    let cells = |f: &dyn Fn(&ArmReport) -> String| arms.iter().map(|(_, r)| f(r)).collect();
+    row(
+        "plans accepted",
+        cells(&|r| format!("{}/{}", r.accepted(), r.results.len())),
     );
-    eprintln!(
-        "| first-emission acceptance | {}/{} | {}/{} |",
-        json.first_try(),
-        json.results.len(),
-        text.first_try(),
-        text.results.len()
+    row(
+        "first-emission acceptance",
+        cells(&|r| format!("{}/{}", r.first_try(), r.results.len())),
     );
-    eprintln!(
-        "| repair rounds (total) | {} | {} |",
-        json.repair_rounds(),
-        text.repair_rounds()
+    row(
+        "repair rounds (total)",
+        cells(&|r| r.repair_rounds().to_string()),
     );
-    eprintln!(
-        "| uncached input tok (total / per task) | {} / {:.0} | {} / {:.0} |",
-        ju.input_tokens,
-        per(ju.input_tokens),
-        tu.input_tokens,
-        per(tu.input_tokens)
+    row(
+        "uncached input tok (total / per task)",
+        cells(&|r| {
+            let u = r.usage_total();
+            format!("{} / {:.0}", u.input_tokens, per(u.input_tokens))
+        }),
     );
-    eprintln!(
-        "| cache-write tok (total) | {} | {} |",
-        ju.cache_creation_input_tokens, tu.cache_creation_input_tokens
+    row(
+        "cache-write tok (total)",
+        cells(&|r| r.usage_total().cache_creation_input_tokens.to_string()),
     );
-    eprintln!(
-        "| cache-read tok (total) | {} | {} |",
-        ju.cache_read_input_tokens, tu.cache_read_input_tokens
+    row(
+        "cache-read tok (total)",
+        cells(&|r| r.usage_total().cache_read_input_tokens.to_string()),
     );
-    eprintln!(
-        "| output tok (total / per task) | {} / {:.0} | {} / {:.0} |",
-        ju.output_tokens,
-        per(ju.output_tokens),
-        tu.output_tokens,
-        per(tu.output_tokens)
+    row(
+        "output tok (total / per task)",
+        cells(&|r| {
+            let u = r.usage_total();
+            format!("{} / {:.0}", u.output_tokens, per(u.output_tokens))
+        }),
     );
-    eprintln!(
-        "| wall time (total / per task) | {:.1}s / {:.1}s | {:.1}s / {:.1}s |",
-        json.wall_ms() as f64 / 1000.0,
-        json.wall_ms() as f64 / 1000.0 / n,
-        text.wall_ms() as f64 / 1000.0,
-        text.wall_ms() as f64 / 1000.0 / n
+    row(
+        "wall time (total / per task)",
+        cells(&|r| {
+            format!(
+                "{:.1}s / {:.1}s",
+                r.wall_ms() as f64 / 1000.0,
+                r.wall_ms() as f64 / 1000.0 / n as f64
+            )
+        }),
     );
-    eprintln!("| est. cost | {} | {} |", cost(&ju), cost(&tu));
+    row("est. cost", cells(&|r| cost(&r.usage_total())));
 }
 
 #[tokio::test]
@@ -295,10 +300,19 @@ async fn emission_ab_live() {
     );
     let json = run_arm(&provider, &model, &ops, &tasks, EmissionArm::Json).await;
     let text = run_arm(&provider, &model, &ops, &tasks, EmissionArm::Text).await;
-    print_comparison(&json, &text, &model_spec);
+    let merged = run_arm(&provider, &model, &ops, &tasks, EmissionArm::Merged).await;
+    print_comparison(
+        &[
+            ("json (ast schema)", &json),
+            ("text (native source)", &text),
+            ("merged (one-node schema)", &merged),
+        ],
+        &model_spec,
+    );
 
     // The run itself must have been able to measure: every task produced *some* outcome. (Plan
     // quality/acceptance is the experiment's RESULT, recorded in the design doc — not asserted.)
     assert_eq!(json.results.len(), tasks.len());
     assert_eq!(text.results.len(), tasks.len());
+    assert_eq!(merged.results.len(), tasks.len());
 }

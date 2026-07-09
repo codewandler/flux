@@ -1,5 +1,9 @@
 # Design: planner emission surface — strict JSON schema vs native text (an accuracy A/B)
 
+> **Status update (2026-07-09, L-71): a THIRD arm exists — `merged` (one-node-object schema).**
+> See *The merged arm* at the bottom of this doc. Built and tested; its live measurement is
+> pending.
+>
 > **Status update (2026-07-02, L-20): the A/B has been RUN — decision: keep `json`.** See
 > *Measured results & decision* at the bottom of this doc.
 >
@@ -191,3 +195,87 @@ reframes the text question as *projection, not emission* — corpus/training tex
 one contender that could re-open this A/B is a fine-tuned small model natively speaking text (its
 first-emission validity would not be limited by in-prompt grammar learning); the text arm +
 selector stay as the ready-made harness for that future re-measure.
+
+## The merged arm (2026-07-09, L-71) — one node object instead of the 43-way union
+
+### Why
+
+The json arm's `emit_plan` schema is the schemars-derived `DraftAst` schema: an internally-tagged
+`oneOf` with **43 variants**, each re-declaring shared properties (`body`, `bind`, `cond`, `max`,
+…) and each carrying its doc-comment as a variant description. Measured: **29,911 bytes
+(~7.5k tokens)** — on top of the ~3.2k-token node-kind catalog the planner prompt *also* carries,
+so the same per-kind semantics ride twice on every planning call.
+
+What the strict union buys on the wire is less than it looks:
+
+- **Providers don't enforce it.** No provider constrained-decodes a recursive 43-way `oneOf`; the
+  schema is guidance tokens, not validation.
+- **The rules that matter are context-sensitive.** Placement (`checkpoint` top-level only, pure
+  leaves inside `obj`/`list`, empty-branch rejection) is inexpressible in JSON Schema; the
+  analyzer + repair loop are the enforcement authority in *every* arm.
+- **The wire format is already uniform.** Internal serde tagging means every node is
+  `{"kind": …, …props}` — the union exists only in the schema's *description* of that format.
+
+So the merged arm advertises the same wire format through **one** `Node` object schema and lets
+the catalog own per-kind semantics. Expected upside beyond token cost: a simpler contract for
+small/weak models (the parse-resilience history — qwen/deepseek/GLM — is largely emission-shape
+trouble), and a shape simple enough that strict/constrained decoding could actually be enabled on
+providers that support it.
+
+### The merge (a projection, not a language change)
+
+`flux_lang::schema::merge_node_schema` (memoized as `model_schema()`) post-processes the derived
+schema — the AST types, serde encoding, parser, and every `ast_schema()` consumer are untouched:
+
+- `kind` → `{"type": "string", "enum": [all 43 tags, declaration order]}`;
+- every other property → the **union** across variants, declared once, all optional
+  (`required: ["kind"]`);
+- a property whose shape differs across kinds (7 of 60: `as`, `branches`, `cases`, `message`,
+  `name`, `steps`, `value`) merges to an `anyOf` of the distinct shapes; a shape that already
+  accepts anything (`lit.value`) absorbs the union to "anything";
+- a field description survives only when **every** kind carrying the property agrees on it —
+  a shared property's meaning is kind-dependent, and that is the catalog's job (this rule exists
+  because the naive first-seen merge stamped `var.name` with *throttle's* "stable bucket name"
+  doc);
+- idempotent, and tolerant of any schema without a `oneOf` `Node` definition — so it applies to
+  both the bare `ast_schema()` and `emit_plan`'s `tool_input_schema::<EmitPlanInput>()` (which
+  keeps `complete`/`gather`/`brief` intact).
+
+Measured result: **29,911 B → 10,248 B (−66%, ~7.5k → ~2.6k tokens)** for the bare AST schema;
+the `emit_plan` tool schema shrinks proportionally (guarded by a `< 50%` test in both crates).
+
+Wiring (`FLUX_EMISSION=merged`): `EmissionArm::Merged` shares the json arm's prompt bytes, decode
+path, gates, and repair loop — `planner_tools` swaps only `emit_plan.input_schema`. The live
+harness (`crates/flux-eval/tests/emission_ab.rs`) now runs json/text/merged and prints a
+three-column table.
+
+### What was deliberately NOT done
+
+- **No semantic node consolidation.** Collapsing the 43 kinds into category nodes with mode
+  props would trade variant pattern-matching (analyzer, formatter, optimizer, native grammar)
+  for stringly-typed prop validation — rejected; the kinds are not the problem, the schema
+  union was.
+- **No per-node reliability props** (`retry:`/`timeout_ms:` on every node, the Step-Functions
+  shape, or `on_timeout` edges). Wrappers express *extent* (what the deadline covers), which
+  edges/props don't; and an ingress desugaring would create a second spelling of the same plan,
+  fragmenting the plan corpus. Revisit only if merged-arm measurement shows nesting depth (not
+  schema size) is the remaining pain.
+
+### Decision rule (pre-registered, mirroring L-20)
+
+Cut production over to `merged` only if, on the same 15-task corpus + model, it holds
+**first-emission acceptance and accepted-within-one-retry at parity with `json`** (the L-20
+numbers: 93% / 15-of-15) while keeping its token savings. If it merely ties on cost or loses
+validity, `json` stays and the arm is deleted (no-fallbacks). Until measured, `json` remains the
+default; `merged` is opt-in via `FLUX_EMISSION=merged`.
+
+### Key files
+
+- `crates/flux-lang/src/schema.rs` — `merge_node_schema` / `model_schema` + drift-proof tests
+  (kind-enum ↔ catalog, union completeness, no dangling `$ref`, size bound, idempotence).
+- `crates/flux-flow/src/compile.rs` — `EmissionArm::Merged`, `merged_emit_plan_schema()`,
+  planner-tools/prompt wiring + arm tests (prompt byte-equality, schema shape, same-payload
+  same-plan).
+- `crates/flux-eval/tests/emission_ab.rs` — the three-arm live runner.
+- `crates/flux-lang/src/bin/fluxlang.rs` — `fluxlang schema --merged` (the public inspect
+  surface; documented on the website's Execution model + Tooling pages).

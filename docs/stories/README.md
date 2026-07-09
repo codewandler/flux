@@ -330,6 +330,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-65 — flux-lsp completion — ops, node-kinds, prelude types, in-scope $vars](L-65-flux-lsp-completion.md) · Language · LSP completion from the Rust SSOT catalogs + a CST scope walk; cursor context from the token at the offset.
 - [L-66 — flux-lsp hover — op signatures/schemas + node-kind & prelude docs](L-66-flux-lsp-hover.md) · Language · LSP hover via token-at-offset hit-testing on the CST → op signature / node-kind doc / prelude doc.
 - [L-67 — flux-lsp formatting + a `flux fmt` CLI verb](L-67-flux-lsp-formatting-and-fmt-verb.md) · Language · LSP textDocument/formatting via format::format on a clean parse, plus a first-class `flux fmt [--check]` verb (none exists today).
+- [L-71 — Merged model-facing Node schema on emit_plan (third emission arm)](L-71-merged-model-facing-node-schema.md) · Language · One Node object (kind enum + unioned optional props) instead of the 43-variant oneOf on emit_plan — same wire, same parse path; FLUX_EMISSION=merged.
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

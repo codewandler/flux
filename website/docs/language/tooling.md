@@ -57,7 +57,7 @@ A standalone binary for working with the language itself, built from the reposit
 |---|---|
 | `fluxlang compile [file]` | Flux-Lang text → pretty-printed JSON AST (stdin when no file) |
 | `fluxlang render [file]` | JSON AST → human-readable tree (colored on a TTY) |
-| `fluxlang schema` | Print the JSON Schema of the AST |
+| `fluxlang schema` | Print the JSON Schema of the AST (`--merged` for the compact model-facing form — see [Execution model](./execution-model.md#how-a-model-emits-a-plan)) |
 | `fluxlang skill` | Print the language skill (the model-facing language reference) |
 
 `compile` is the inverse of the formatter, which makes it a handy syntax checker:

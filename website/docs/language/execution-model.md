@@ -30,6 +30,31 @@ parse (or receive JSON) -> analyze -> optimize -> execute
 A plan that fails analysis never executes at all. That is the point: malformed plans are
 rejected before they can touch the world.
 
+## How a model emits a plan
+
+On the wire, every node is the same shape: a JSON object whose `kind` field names the node type
+and whose remaining fields are that kind's properties —
+
+```json
+{"kind": "retry", "max": 3, "body": [{"kind": "call", "op": "cargo_test"}]}
+```
+
+The planner emits a whole plan as one such tree through a single tool call, and there are two
+JSON Schemas that describe it:
+
+- The **strict schema** (`fluxlang schema`) spells out each node kind as its own variant with its
+  exact required fields — the full-fidelity contract, right for validators and editor tooling.
+- The **model-facing merged schema** (`fluxlang schema --merged`) collapses all node kinds into
+  **one** object type: `kind` is an enum of every node kind, and the properties are the union
+  across kinds, each optional. It is about a third of the strict schema's size, which matters
+  when the schema rides along on every planning call.
+
+Both describe the same wire format, and the merged form gives up no safety: which fields a kind
+requires — and where a node may appear at all (`checkpoint` at top level, pure leaves inside
+`obj`/`list`) — is context the analyzer checks anyway, on every plan, whichever schema the
+emitter saw. A plan that names a wrong field is rejected with a correction the model responds
+to, exactly like any other analysis failure.
+
 ## Symbols and values
 
 Symbols are names; values are immutable records in a value store the runtime owns.
