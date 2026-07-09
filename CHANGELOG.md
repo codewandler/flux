@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-07-09
+
 ### Added
 
 - **Flux-Lang lossless CST front-end (foundation).** New `flux_lang::{syntax, lexer, parser}`
