@@ -2782,6 +2782,7 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
                     plan_text: None,
                     phase: None,
                     plan_source: Some(redactor.redact(&source)),
+                    delta_source: None,
                 },
             );
         }

@@ -64,6 +64,7 @@ fn record_fork_plan(
             plan_text: None,
             phase: None,
             plan_source: Some(redactor.redact(&source)),
+            delta_source: None,
         },
     );
 }

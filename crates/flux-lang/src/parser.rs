@@ -140,6 +140,56 @@ impl<'s> Parser<'s> {
         self.nth(0) == SyntaxKind::IDENT && self.cur_text() == kw
     }
 
+    // --- header/block boundary lookahead --------------------------------
+    //
+    // The legacy preprocess drops blank and comment-only lines before the grammar ever sees them,
+    // so at a header→block or block→clause boundary (`flow f` + blank + body; `try` body + blank +
+    // `catch`) those lines are insignificant. `nth`/`at` deliberately treat NEWLINE as significant
+    // (the grammar is line-oriented), so boundaries use these dedicated helpers instead.
+
+    /// True when the next non-blank content is an INDENT — an indented block follows, possibly
+    /// after blank or comment-only lines.
+    fn at_block(&self) -> bool {
+        let mut i = self.pos;
+        loop {
+            match self.raw_kind_at(i) {
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::NEWLINE => i += 1,
+                k => return k == SyntaxKind::INDENT,
+            }
+        }
+    }
+
+    /// `at_kw` looking across blank/comment-only lines (clause keywords after a block's DEDENT).
+    fn at_kw_past_blank(&self, kw: &str) -> bool {
+        let mut i = self.pos;
+        loop {
+            match self.raw_kind_at(i) {
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::NEWLINE => i += 1,
+                SyntaxKind::IDENT => return &self.src[self.tokens[i].range] == kw,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Feed the blank/comment run up to the boundary content — call only after `at_block` /
+    /// `at_kw_past_blank` committed to crossing it (the trivia attaches to the current node).
+    fn skip_blank_lines(&mut self) {
+        while matches!(
+            self.raw_kind_at(self.pos),
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::NEWLINE
+        ) {
+            self.feed_one();
+        }
+    }
+
+    /// The boundary idiom: if an indented block follows (past blanks), enter it via `f`.
+    fn block_if_indented(&mut self, f: impl FnOnce(&mut Self)) {
+        if self.at_block() {
+            self.skip_blank_lines();
+            f(self);
+        }
+    }
+
     // --- builder feeding ------------------------------------------------
 
     fn feed_one(&mut self) {
@@ -225,7 +275,9 @@ impl<'s> Parser<'s> {
     // --- structural helpers --------------------------------------------
 
     fn at_newline(&self) -> bool {
-        self.nth(0) == SyntaxKind::NEWLINE
+        // A DEDENT is a line end too: the last line of a block (or of an unterminated file) is
+        // followed by DEDENT rather than NEWLINE, and header parsing must stop there the same way.
+        matches!(self.nth(0), SyntaxKind::NEWLINE | SyntaxKind::DEDENT)
     }
 
     /// Consume tokens up to and including the next NEWLINE (or EOF), feeding them to the current
@@ -277,9 +329,7 @@ impl<'s> Parser<'s> {
     fn opaque_decl(&mut self) {
         self.start(SyntaxKind::DECL);
         self.eat_to_end_of_line();
-        if self.at(SyntaxKind::INDENT) {
-            self.opaque_block();
-        }
+        self.block_if_indented(Self::opaque_block);
         self.finish_node();
     }
 
@@ -306,8 +356,23 @@ impl<'s> Parser<'s> {
     fn flow_decl(&mut self) {
         self.start(SyntaxKind::FLOW_DECL);
         self.flow_header();
-        if self.at(SyntaxKind::INDENT) {
-            self.block();
+        // Column-0 `goal "…"` directive lines are tolerated-and-ignored by the legacy parser —
+        // they may appear between the header and the body (or between body chunks). Consume each
+        // as an opaque line; a body block may follow any of them.
+        loop {
+            if self.at_kw_past_blank("goal") {
+                self.skip_blank_lines();
+                self.start(SyntaxKind::DECL);
+                self.eat_to_end_of_line();
+                self.finish_node();
+                continue;
+            }
+            if self.at_block() {
+                self.skip_blank_lines();
+                self.block();
+                continue;
+            }
+            break;
         }
         self.finish_node();
     }
@@ -316,7 +381,15 @@ impl<'s> Parser<'s> {
         self.start(SyntaxKind::FLOW_HEADER);
         self.bump(); // `flow`
         if self.at(SyntaxKind::IDENT) {
-            self.bump(); // optional name
+            self.bump(); // optional name…
+                         // …which may be kebab-case (`god-code-review`): the lexer splits it into
+                         // IDENT/NUMBER segments joined by `-`, all legal per `is_valid_decl_name`.
+            while self.at(SyntaxKind::MINUS)
+                && matches!(self.nth(1), SyntaxKind::IDENT | SyntaxKind::NUMBER)
+            {
+                self.bump(); // -
+                self.bump(); // segment
+            }
         }
         if self.at(SyntaxKind::L_PAREN) {
             self.param_list();
@@ -417,7 +490,7 @@ impl<'s> Parser<'s> {
                 "with_tools" => return self.simple_block_stmt(SyntaxKind::WITH_TOOLS_STMT, false),
                 "retry" => return self.simple_block_stmt(SyntaxKind::RETRY_STMT, false),
                 "seq" => return self.simple_block_stmt(SyntaxKind::SEQ_STMT, false),
-                "ctx" => return self.simple_block_stmt(SyntaxKind::CTX_STMT, false),
+                "ctx" => return self.ctx_stmt(),
                 "return" => return self.return_stmt(),
                 "assert" => return self.header_only_stmt(SyntaxKind::ASSERT_STMT),
                 "memo" => return self.memo_stmt(),
@@ -467,6 +540,10 @@ impl<'s> Parser<'s> {
     }
 
     fn expr_list_to_eol(&mut self) {
+        // An empty list is legal (`$pack +=` appends nothing; `do op` with no args).
+        if self.at_newline() || self.at_eof() {
+            return;
+        }
         loop {
             self.expr(0);
             if !self.eat(SyntaxKind::COMMA) {
@@ -489,6 +566,10 @@ impl<'s> Parser<'s> {
                      // `do op arg, arg` — the op name then a comma-separated arg list to end of line.
         self.start(SyntaxKind::NAME);
         self.expect(SyntaxKind::IDENT, "an operation name after `do`");
+        while self.at(SyntaxKind::DOT) && self.nth(1) == SyntaxKind::IDENT {
+            self.bump(); // .
+            self.bump(); // ident — dotted op names (`slack.message.send`) are one NAME
+        }
         self.finish_node();
         if !self.at_newline() && !self.at_eof() {
             self.start(SyntaxKind::ARG_LIST);
@@ -504,18 +585,15 @@ impl<'s> Parser<'s> {
         self.bump(); // when
         self.expr(0); // condition
         self.eat(SyntaxKind::NEWLINE);
-        if self.at(SyntaxKind::INDENT) {
-            self.block();
-        }
-        // optional `else` clause at the same level
-        self.eat_trivia();
-        if self.at_kw("else") {
+        self.block_if_indented(Self::block);
+        // optional `else` clause at the same level (blank/comment-only lines before it are
+        // insignificant, exactly as in the legacy preprocess)
+        if self.at_kw_past_blank("else") {
+            self.skip_blank_lines();
             self.start(SyntaxKind::ELSE_CLAUSE);
             self.bump();
             self.eat(SyntaxKind::NEWLINE);
-            if self.at(SyntaxKind::INDENT) {
-                self.block();
-            }
+            self.block_if_indented(Self::block);
             self.finish_node();
         }
         self.finish_node();
@@ -538,9 +616,7 @@ impl<'s> Parser<'s> {
             self.expect(SyntaxKind::VAR, "a collect variable after `->`");
         }
         self.eat(SyntaxKind::NEWLINE);
-        if self.at(SyntaxKind::INDENT) {
-            self.block();
-        }
+        self.block_if_indented(Self::block);
         self.finish_node();
     }
 
@@ -548,17 +624,15 @@ impl<'s> Parser<'s> {
     fn repeat_like(&mut self, kind: SyntaxKind) {
         self.start(kind);
         self.eat_to_end_of_line();
-        if self.at(SyntaxKind::INDENT) {
-            self.block_with_optional_until();
-        }
+        self.block_if_indented(Self::block_with_optional_until);
         self.finish_node();
     }
 
     fn block_with_optional_until(&mut self) {
         self.start(SyntaxKind::BLOCK);
         self.pos += 1; // INDENT
-        self.eat_trivia();
-        if self.at_kw("until") {
+        if self.at_kw_past_blank("until") {
+            self.skip_blank_lines();
             self.start(SyntaxKind::UNTIL_CLAUSE);
             self.bump(); // until
             self.expr(0);
@@ -584,18 +658,14 @@ impl<'s> Parser<'s> {
     fn match_like(&mut self, kind: SyntaxKind) {
         self.start(kind);
         self.eat_to_end_of_line();
-        if self.at(SyntaxKind::INDENT) {
-            self.arm_block(&["case", "default"]);
-        }
+        self.block_if_indented(|p| p.arm_block(&["case", "default"]));
         self.finish_node();
     }
 
     fn branch_block(&mut self, kind: SyntaxKind) {
         self.start(kind);
         self.eat_to_end_of_line();
-        if self.at(SyntaxKind::INDENT) {
-            self.arm_block(&["branch"]);
-        }
+        self.block_if_indented(|p| p.arm_block(&["branch"]));
         self.finish_node();
     }
 
@@ -617,9 +687,7 @@ impl<'s> Parser<'s> {
                     let kind = arm_kind(self.cur_text());
                     self.start(kind);
                     self.eat_to_end_of_line();
-                    if self.at(SyntaxKind::INDENT) {
-                        self.block();
-                    }
+                    self.block_if_indented(Self::block);
                     self.finish_node();
                 }
                 _ => {
@@ -635,20 +703,16 @@ impl<'s> Parser<'s> {
         self.start(SyntaxKind::TRY_STMT);
         self.bump(); // try
         self.eat(SyntaxKind::NEWLINE);
-        if self.at(SyntaxKind::INDENT) {
-            self.block();
-        }
-        self.eat_trivia();
-        if self.at_kw("catch") {
+        self.block_if_indented(Self::block);
+        if self.at_kw_past_blank("catch") {
+            self.skip_blank_lines();
             self.start(SyntaxKind::CATCH_CLAUSE);
             self.bump();
             if self.at(SyntaxKind::VAR) {
                 self.bump();
             }
             self.eat(SyntaxKind::NEWLINE);
-            if self.at(SyntaxKind::INDENT) {
-                self.block();
-            }
+            self.block_if_indented(Self::block);
             self.finish_node();
         }
         self.finish_node();
@@ -657,17 +721,13 @@ impl<'s> Parser<'s> {
     fn scope_stmt(&mut self) {
         self.start(SyntaxKind::SCOPE_STMT);
         self.eat_to_end_of_line(); // scope [$r = acquire]
-        if self.at(SyntaxKind::INDENT) {
-            self.block();
-        }
-        self.eat_trivia();
-        if self.at_kw("finally") {
+        self.block_if_indented(Self::block);
+        if self.at_kw_past_blank("finally") {
+            self.skip_blank_lines();
             self.start(SyntaxKind::FINALLY_CLAUSE);
             self.bump();
             self.eat(SyntaxKind::NEWLINE);
-            if self.at(SyntaxKind::INDENT) {
-                self.block();
-            }
+            self.block_if_indented(Self::block);
             self.finish_node();
         }
         self.finish_node();
@@ -676,9 +736,7 @@ impl<'s> Parser<'s> {
     fn saga_stmt(&mut self) {
         self.start(SyntaxKind::SAGA_STMT);
         self.eat_to_end_of_line(); // saga
-        if self.at(SyntaxKind::INDENT) {
-            self.arm_block(&["step", "undo"]);
-        }
+        self.block_if_indented(|p| p.arm_block(&["step", "undo"]));
         self.finish_node();
     }
 
@@ -715,6 +773,41 @@ impl<'s> Parser<'s> {
 
     /// A statement with a header line (optionally carrying an inline condition when `parse_cond`) and
     /// an indented body: `unless cond … / timeout ms … / with_tools […] …` and the new guard-rails.
+    /// `ctx $pack` + an indented block of `purpose`/`include`/`exclude`/`budget` sub-lines. The
+    /// sub-lines are NOT statements — each becomes one opaque [`SyntaxKind::CTX_ENTRY`] node so the
+    /// generic statement grammar never sees (and mis-flags) them.
+    fn ctx_stmt(&mut self) {
+        self.start(SyntaxKind::CTX_STMT);
+        self.bump(); // `ctx`
+        while !self.at_newline() && !self.at_eof() {
+            self.bump(); // header rest (`$pack`), captured verbatim
+        }
+        self.eat(SyntaxKind::NEWLINE);
+        if self.at_block() {
+            self.skip_blank_lines();
+            self.start(SyntaxKind::BLOCK);
+            self.pos += 1; // INDENT
+            loop {
+                self.eat_trivia();
+                match self.nth(0) {
+                    SyntaxKind::DEDENT => {
+                        self.pos += 1;
+                        break;
+                    }
+                    SyntaxKind::EOF => break,
+                    SyntaxKind::NEWLINE => self.bump(),
+                    _ => {
+                        self.start(SyntaxKind::CTX_ENTRY);
+                        self.eat_to_end_of_line();
+                        self.finish_node();
+                    }
+                }
+            }
+            self.finish_node();
+        }
+        self.finish_node();
+    }
+
     fn simple_block_stmt(&mut self, kind: SyntaxKind, parse_cond: bool) {
         self.start(kind);
         self.bump(); // the keyword
@@ -727,9 +820,7 @@ impl<'s> Parser<'s> {
             }
         }
         self.eat(SyntaxKind::NEWLINE);
-        if self.at(SyntaxKind::INDENT) {
-            self.block();
-        }
+        self.block_if_indented(Self::block);
         self.finish_node();
     }
 
@@ -849,37 +940,39 @@ impl<'s> Parser<'s> {
                 self.finish_node();
             }
             _ => {
-                // `op(args)` call, `fmt(...)`, `parse(...)`, or a bare name.
+                // `op(args)` call, `fmt(...)`, `parse(...)`, or a bare name. Op names may be
+                // dotted (`slack.message.send`, `ai.extract`) — the whole `IDENT (. IDENT)*` run
+                // is one NAME.
                 let kind = match text {
                     "fmt" => SyntaxKind::FMT_EXPR,
                     "parse" => SyntaxKind::PARSE_EXPR,
                     _ => SyntaxKind::CALL_EXPR,
                 };
-                if self.nth(1) == SyntaxKind::L_PAREN {
-                    self.start(kind);
-                    self.start(SyntaxKind::NAME);
+                let cp = self.checkpoint();
+                self.start(SyntaxKind::NAME);
+                self.bump(); // first ident
+                while self.at(SyntaxKind::DOT) && self.nth(1) == SyntaxKind::IDENT {
+                    self.bump(); // .
                     self.bump(); // ident
-                    self.finish_node();
+                }
+                self.finish_node();
+                if self.at(SyntaxKind::L_PAREN) {
                     self.call_args();
-                    self.finish_node();
-                } else {
-                    self.start(SyntaxKind::NAME);
-                    self.bump();
-                    self.finish_node();
+                    self.wrap(cp, kind);
                 }
             }
         }
     }
 
-    /// `thing <kind> "<selector>"` — consume the header form (kind ident + selector) without a body.
+    /// `thing <kind> [<custom-kind-str>] <selector-kw> "<value>"` — the whole form is a
+    /// space-delimited run of idents/strings/numbers (`thing custom "widget" key "w-1"`,
+    /// `thing person name "john"`), so consume that run greedily; operators/parens/EOL end it.
     fn eat_to_end_of_thing(&mut self) {
         self.bump(); // thing
-        if self.at(SyntaxKind::IDENT) {
-            self.bump(); // kind
-        }
-        // selector: a string or a bare token
-        if self.at(SyntaxKind::STRING) || self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER)
-        {
+        while matches!(
+            self.nth(0),
+            SyntaxKind::IDENT | SyntaxKind::STRING | SyntaxKind::NUMBER
+        ) {
             self.bump();
         }
     }

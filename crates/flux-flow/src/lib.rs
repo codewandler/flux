@@ -22,6 +22,7 @@ pub mod agent_sink;
 pub mod cassette;
 pub mod compile;
 pub mod composites;
+mod delta;
 pub mod engine;
 pub mod fork;
 pub mod loop_host;
@@ -41,7 +42,7 @@ pub use voice::{
 // language surface stays available from the engine crate (no consumer churn) and
 // `crate::{ast,render,analyze,host,store,…}` resolve inside the engine modules.
 pub use flux_lang::{
-    analyze, ast, effects, error, host, opspec, optimize, prelude, program, render, schema, sink,
-    store,
+    analyze, ast, context_slice, effects, error, host, opspec, optimize, prelude, program, render,
+    schema, sink, store,
 };
 pub use flux_lang::{FlowError, Result};

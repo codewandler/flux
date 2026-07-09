@@ -19,6 +19,9 @@
 //! - [`effects`] — lowering of semantic effects onto host [`flux_spec::Effect`] + policy actions.
 //! - [`schema`] — the single source of truth: a derived JSON Schema and the node-kind catalog that
 //!   drives the planner prompt and the generated skill/docs.
+//! - [`context_slice`] — automatic context slicing (KF4/L-56): derive the minimum model-visible
+//!   context for a planner repair round or a model-op call from HIR reads, field access paths, op
+//!   schemas, and diagnostics, gated by visibility/secret/policy and a token budget.
 //!
 //! It is an **L0 leaf**: it depends only on other pure contracts (`flux-core`, `flux-spec`,
 //! `flux-policy`) and has no IO, no provider, no runtime, and no dependency on concrete tools. The
@@ -26,6 +29,7 @@
 
 pub mod analyze;
 pub mod ast;
+pub mod context_slice;
 pub mod dsl;
 pub mod effects;
 pub mod error;
@@ -33,6 +37,7 @@ pub mod expr;
 pub mod format;
 pub mod host;
 pub mod lexer;
+pub mod lower_cst;
 pub mod opspec;
 pub mod optimize;
 pub mod parse;

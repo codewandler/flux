@@ -879,6 +879,11 @@ impl EngineLoopHost {
                 if let Some(src) = attempt.plan_source.take() {
                     attempt.plan_source = Some(redactor.redact(&src));
                 }
+                // KF3/L-55: same scrub for the raw delta — a `bash("curl -H 'Authorization: ...'")`
+                // arg carried in an inserted/replaced node would otherwise persist in the clear.
+                if let Some(src) = attempt.delta_source.take() {
+                    attempt.delta_source = Some(redactor.redact(&src));
+                }
             }
             let session_id = self.turn.lock().unwrap().session_id.clone();
             let _ = events.record_plan_attempt(&session_id, turn_id, attempt);
@@ -911,6 +916,15 @@ const PLAN_SOURCE_CAP: usize = 32_000;
 
 fn cap_plan_source(source: String) -> Option<String> {
     (source.chars().count() <= PLAN_SOURCE_CAP).then_some(source)
+}
+
+/// Cap for the durable `emit_plan_delta` audit record (KF3/L-55). Same drop-not-truncate policy as
+/// [`cap_plan_source`] and for the same reason: a present `delta_source` must always be the exact
+/// JSON the model sent, never a truncated (and therefore unparseable) suffix.
+const DELTA_SOURCE_CAP: usize = 32_000;
+
+fn cap_delta_source(source: String) -> Option<String> {
+    (source.chars().count() <= DELTA_SOURCE_CAP).then_some(source)
 }
 
 #[async_trait]
@@ -1162,6 +1176,11 @@ impl LoopHost for EngineLoopHost {
                     // L-38: the canonical parseable projection rides alongside the display render —
                     // the machine-minable record (`parse(plan_source) == c.ast` by L-18 totality).
                     plan_source: cap_plan_source(flux_lang::format::format(&c.ast)),
+                    // KF3/L-55: the raw `emit_plan_delta` input, when this plan was accepted by
+                    // patching the previous rejection instead of a whole re-emission — `None` for
+                    // every ordinary full emission. Reconstructs the patch alongside `plan_source`'s
+                    // materialized plan.
+                    delta_source: c.delta_source.clone().and_then(cap_delta_source),
                     ..Default::default()
                 });
                 // Design Part 1 — settled: "" only for an accepted `gather: true` plan (the phased

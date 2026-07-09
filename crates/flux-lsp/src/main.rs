@@ -46,7 +46,12 @@ impl Backend {
 
     /// Re-analyze `text` and publish diagnostics for `uri`.
     async fn refresh(&self, uri: Url, text: &str) {
-        let diags = diagnostics(text);
+        let mut diags = diagnostics(text);
+        // On a cleanly-parsing flow, add analyzer findings (unknown ops, unbound `$vars`, arity)
+        // as warnings — the L-59 range side-map turns their node paths into real spans.
+        if diags.is_empty() {
+            diags = self.analyzer_diagnostics(text);
+        }
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 }
@@ -188,6 +193,45 @@ impl Backend {
         items
     }
 
+    /// Analyzer findings with real spans: run `analyze_flow` against the server's op catalog and
+    /// resolve each diagnostic's rendered node path through the L-59 range side-map. Only single
+    /// flows are analyzed (the analyzer is per-flow); anything unresolvable falls back to the
+    /// document start so no finding is silently dropped.
+    fn analyzer_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
+        let Ok(lowered) = flux_lang::lower_cst::parse_with_ranges(text) else {
+            return Vec::new();
+        };
+        let catalog = SliceCatalog(&self.ops);
+        let Err(findings) = flux_lang::analyze::analyze_flow(
+            &lowered.ast,
+            &catalog,
+            &std::collections::HashSet::new(),
+        ) else {
+            return Vec::new();
+        };
+        let index = LineIndex::new(text);
+        findings
+            .iter()
+            .map(|d| {
+                let range = lowered
+                    .ranges
+                    .resolve_diagnostic(&d.message)
+                    .map(|r| Range {
+                        start: index.position(text, u32::from(r.start()) as usize),
+                        end: index.position(text, u32::from(r.end()) as usize),
+                    })
+                    .unwrap_or_default();
+                Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some("flux-lsp".into()),
+                    message: d.message.clone(),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
     fn hover_at(&self, text: &str, pos: Position) -> Option<Hover> {
         let word = word_at(text, pos)?;
         // An op call?
@@ -209,6 +253,15 @@ impl Backend {
 // ---------------------------------------------------------------------------
 // Diagnostics (from the lossless CST parse — real spans, error recovery)
 // ---------------------------------------------------------------------------
+
+/// The server's op list as an analyzer catalog (name lookup over the snapshot).
+struct SliceCatalog<'a>(&'a [OpSignature]);
+
+impl flux_lang::opspec::OpCatalog for SliceCatalog<'_> {
+    fn lookup(&self, name: &str) -> Option<OpSignature> {
+        self.0.iter().find(|o| o.name == name).cloned()
+    }
+}
 
 fn diagnostics(text: &str) -> Vec<Diagnostic> {
     let parsed = flux_lang::parser::parse_cst(text);
@@ -369,6 +422,31 @@ mod tests {
         );
         // Later good statements still parse (no cascade); the diagnostic is on line 1.
         assert!(diags.iter().all(|d| d.range.start.line <= 2));
+    }
+
+    #[test]
+    fn analyzer_warnings_carry_resolved_ranges() {
+        // `$y = read($nope)` on 0-based line 2 references an unbound symbol. The analyzer
+        // diagnostic's node path must resolve to that line via the L-59 range side-map.
+        let src = "flow f\n  $x = read(\"a.txt\")\n  $y = read($nope)\n  return $x\n";
+        let mut reg = flux_runtime::ToolRegistry::new();
+        flux_tools::register_builtins(&mut reg);
+        let ops = flux_flow::registry::OpRegistry::new(&reg).signatures();
+        let lowered = flux_lang::lower_cst::parse_with_ranges(src).expect("parses");
+        let findings = flux_lang::analyze::analyze_flow(
+            &lowered.ast,
+            &SliceCatalog(&ops),
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("unbound $nope must be diagnosed");
+        let index = LineIndex::new(src);
+        let hit = findings
+            .iter()
+            .filter(|d| d.message.contains("$nope") || d.message.contains("nope"))
+            .filter_map(|d| lowered.ranges.resolve_diagnostic(&d.message))
+            .map(|r| index.position(src, u32::from(r.start()) as usize).line)
+            .next();
+        assert_eq!(hit, Some(2), "unbound-symbol warning resolves to line 2");
     }
 
     #[test]

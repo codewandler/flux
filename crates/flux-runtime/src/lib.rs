@@ -17,7 +17,7 @@ pub use fn_tool::{tool_fn, FnTool};
 pub mod context;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -33,7 +33,7 @@ use flux_policy::{
     Request as PolicyRequest, ResourceKind, ResourceRef, Trust, TrustKind, TrustLevel,
 };
 use flux_secret::Redactor;
-use flux_spec::{Effect, IntentSet, Risk, ToolSpec};
+use flux_spec::{Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
 
 /// The result of executing a tool.
@@ -853,6 +853,19 @@ pub struct Executor {
     /// destructive plan still discloses per plan via its scope guard, and a runtime-assembled
     /// destructive op still asks — "trust all plans" is not "never ask about `rm -rf` again".
     trust_all: AtomicBool,
+    /// Content-addressed result cache for deterministic read-only ops (L-54). Keyed on op
+    /// identity + canonical input JSON + input-schema fingerprint + the invalidation-domain
+    /// generation below. Sits AFTER the whole authorization → approval envelope in
+    /// [`Executor::dispatch_outcome`], so a hit is served only to a caller the op is *currently*
+    /// admissible for; only redacted, successful results are stored.
+    op_cache: Mutex<HashMap<u64, ToolResult>>,
+    /// The invalidation-domain generation: every dispatch carrying a non-`Read` effect (a
+    /// workspace/process/network mutation — conservatively, anything that could change what a
+    /// read observes) starts a new generation. Keys embed the generation, so all older entries
+    /// become unreachable at once.
+    cache_gen: AtomicU64,
+    /// `FLUX_OP_CACHE=off|0` kill switch (resolved at construction); `with_op_cache` overrides.
+    cache_enabled: bool,
 }
 
 /// Holds an approved-plan scope open. While alive, [`Executor::dispatch`] skips the per-op approval
@@ -934,7 +947,28 @@ impl Executor {
             plan_scope: AtomicU32::new(0),
             destructive_scope: Mutex::new(Vec::new()),
             trust_all: AtomicBool::new(false),
+            op_cache: Mutex::new(HashMap::new()),
+            cache_gen: AtomicU64::new(0),
+            cache_enabled: std::env::var("FLUX_OP_CACHE")
+                .map(|v| v != "off" && v != "0")
+                .unwrap_or(true),
         }
+    }
+
+    /// Enable/disable the deterministic read-only op cache (overrides `FLUX_OP_CACHE`).
+    pub fn with_op_cache(mut self, on: bool) -> Self {
+        self.cache_enabled = on;
+        self
+    }
+
+    /// Turn boundary for the op cache (L-54): the engine calls this at the start of every user
+    /// turn. Between turns anything outside the runtime (the user's editor, another process) may
+    /// have mutated what a read observes — the executor's write-generation only tracks its OWN
+    /// dispatches — so the cache's reuse window is deliberately bounded to one turn: repair
+    /// rounds, retries, and nested plans within it.
+    pub fn begin_cache_turn(&self) {
+        self.cache_gen.fetch_add(1, Ordering::SeqCst);
+        self.op_cache.lock().unwrap().clear();
     }
 
     /// Whether we're currently executing the ops of an already-approved plan (or the user trusts all
@@ -1271,9 +1305,8 @@ impl Executor {
                 .last()
                 .copied()
                 .unwrap_or(false);
-        if (!self.in_approved_scope() || undisclosed_destructive)
-            && (force_approval || perm != PermDecision::Allow)
-        {
+        let approval_sensitive = force_approval || perm != PermDecision::Allow;
+        if (!self.in_approved_scope() || undisclosed_destructive) && approval_sensitive {
             let approver = self.approver.lock().unwrap().clone();
             match approver.request(name, &subjects, &intents).await {
                 ApprovalChoice::Allow => {}
@@ -1286,6 +1319,45 @@ impl Executor {
                         denied: true,
                     };
                 }
+            }
+        }
+
+        // 4½. Content-addressed op cache (L-54) — probed only AFTER every gate above passed, so a
+        //    hit is served strictly to a caller for whom the op is admissible RIGHT NOW. Cacheable =
+        //    deterministic (`Idempotent`) + read-only (every effect `Read`) + low-risk +
+        //    approval-insensitive + non-destructive; model calls, writes, unknown ops (no spec ⇒
+        //    returned above), and anything approval-shaped never enter the cache.
+        let cacheable = self.cache_enabled
+            && spec.effects.iter().all(|e| matches!(e, Effect::Read))
+            && spec.idempotency == Idempotency::Idempotent
+            && spec.risk == Risk::Low
+            && !approval_sensitive
+            && !intents.is_destructive();
+        let cache_key = cacheable.then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            // Op identity + normalized input (serde_json objects are key-sorted, so `to_string`
+            // is canonical) + schema fingerprint (the op's version-bearing surface) + the
+            // invalidation-domain generation.
+            name.hash(&mut h);
+            params.to_string().hash(&mut h);
+            spec.input_schema.to_string().hash(&mut h);
+            self.cache_gen.load(Ordering::SeqCst).hash(&mut h);
+            h.finish()
+        });
+        if let Some(key) = cache_key {
+            if let Some(hit) = self.op_cache.lock().unwrap().get(&key).cloned() {
+                // Audit-distinguishable from a fresh execution: the `tool_call` observation above
+                // fired as usual, and this marker says the result was replayed, not re-fetched.
+                self.ctx.evidence.lock().unwrap().record(Observation::new(
+                    "op_cache_hit",
+                    Phase::Turn,
+                    json!({ "tool": name }),
+                ));
+                return DispatchOutcome {
+                    result: hit,
+                    denied: false,
+                };
             }
         }
 
@@ -1309,6 +1381,23 @@ impl Executor {
                 Phase::Turn,
                 json!({ "tool": name }),
             ));
+        }
+        // 7. Cache maintenance (L-54). A dispatch carrying any non-`Read` effect may have changed
+        //    what a read would observe (workspace tree, filesystem, a remote datasource) — start a
+        //    new invalidation generation and drop the now-unreachable entries. A cacheable success
+        //    is stored (already redacted) for replay within this generation.
+        if spec.effects.iter().any(|e| !matches!(e, Effect::Read)) {
+            self.cache_gen.fetch_add(1, Ordering::SeqCst);
+            self.op_cache.lock().unwrap().clear();
+        } else if let Some(key) = cache_key {
+            if !result.is_error {
+                let mut cache = self.op_cache.lock().unwrap();
+                // Crude but safe size bound: a full reset never affects correctness, only reuse.
+                if cache.len() >= 512 {
+                    cache.clear();
+                }
+                cache.insert(key, result.clone());
+            }
         }
         // The op ran (successfully or not) — never a `denied` outcome, no matter what its own
         // content says (L-32).
@@ -1419,6 +1508,135 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(EchoTool));
         r
+    }
+
+    // ---- L-54: content-addressed op cache -------------------------------------------------
+
+    /// A deterministic read-only tool that counts real executions — the cache-observability probe.
+    fn counting_read_tool(counter: Arc<std::sync::atomic::AtomicUsize>) -> Arc<dyn Tool> {
+        crate::tool_fn(
+            ToolSpec::read_only("cread", "counting read", json!({"type": "object"})),
+            move |params: Value| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(Value::String(format!("result-{params}-{n}")))
+                }
+            },
+        )
+    }
+
+    /// A cache-test executor: the cache-probe tools allowed without prompting.
+    fn cache_executor(tools: Vec<Arc<dyn Tool>>) -> Executor {
+        let mut r = ToolRegistry::new();
+        for t in tools {
+            r.register(t);
+        }
+        let mut perms = PermissionManager::new();
+        perms.add_allow("cread");
+        perms.add_allow("cwrite");
+        perms.add_allow("cnow");
+        Executor::new(r, perms, Arc::new(AllowApprover), test_ctx()).with_op_cache(true)
+    }
+
+    #[tokio::test]
+    async fn repeated_deterministic_read_hits_the_cache() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = cache_executor(vec![counting_read_tool(count.clone())]);
+
+        let first = ex.dispatch("cread", json!({"path": "a"})).await;
+        let second = ex.dispatch("cread", json!({"path": "a"})).await;
+        assert!(!first.is_error && !second.is_error);
+        assert_eq!(
+            first.content, second.content,
+            "hit replays the exact result"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "guarded IO ran exactly once"
+        );
+
+        // Audit evidence distinguishes the hit from a fresh execution.
+        let hits = ex
+            .ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .all()
+            .iter()
+            .filter(|o| o.kind == "op_cache_hit")
+            .count();
+        assert_eq!(hits, 1, "exactly the second dispatch was a cache hit");
+
+        // Different input → different content address → fresh execution.
+        let other = ex.dispatch("cread", json!({"path": "b"})).await;
+        assert!(!other.is_error);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_write_invalidates_the_cache() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_tool = crate::tool_fn(
+            ToolSpec::read_only("cwrite", "mutates", json!({"type": "object"}))
+                .with_effects(vec![Effect::Write]),
+            |_params: Value| async move { Ok(Value::String("wrote".to_string())) },
+        );
+        let ex = cache_executor(vec![counting_read_tool(count.clone()), write_tool]);
+
+        ex.dispatch("cread", json!({"path": "a"})).await;
+        // The write starts a new invalidation generation…
+        let w = ex.dispatch("cwrite", json!({"path": "a"})).await;
+        assert!(!w.is_error, "{}", w.content);
+        // …so the same read re-runs its guarded IO instead of replaying a stale value.
+        ex.dispatch("cread", json!({"path": "a"})).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "the post-write read must not be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_and_disabled_reads_bypass_the_cache() {
+        // A read-only but NON-deterministic op (a clock) is never cached.
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        let mut now_spec = ToolSpec::read_only("cnow", "clock", json!({"type": "object"}));
+        now_spec.idempotency = Idempotency::NonIdempotent;
+        let now_tool = crate::tool_fn(now_spec, move |_params: Value| {
+            let c = c2.clone();
+            async move {
+                Ok(Value::String(format!(
+                    "t{}",
+                    c.fetch_add(1, Ordering::SeqCst)
+                )))
+            }
+        });
+        let ex = cache_executor(vec![now_tool]);
+        ex.dispatch("cnow", json!({})).await;
+        ex.dispatch("cnow", json!({})).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "non-idempotent: never cached"
+        );
+
+        // And with the cache disabled, even a deterministic read re-runs.
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut r = ToolRegistry::new();
+        r.register(counting_read_tool(count.clone()));
+        let mut perms = PermissionManager::new();
+        perms.add_allow("cread");
+        let ex = Executor::new(r, perms, Arc::new(AllowApprover), test_ctx()).with_op_cache(false);
+        ex.dispatch("cread", json!({"path": "a"})).await;
+        ex.dispatch("cread", json!({"path": "a"})).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "kill switch bypasses the cache"
+        );
     }
 
     /// A-03: everything rendered into the model prompt must be byte-stable — the backing `HashMap`'s

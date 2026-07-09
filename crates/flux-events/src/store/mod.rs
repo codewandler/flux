@@ -518,6 +518,7 @@ impl EventStore {
                 plan_text: attempt.plan_text,
                 phase: attempt.phase,
                 plan_source: attempt.plan_source,
+                delta_source: attempt.delta_source,
             })
             .in_turn(turn_id),
         )?;

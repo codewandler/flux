@@ -1,6 +1,6 @@
 # Flux-Lang agent speed (epic)
 
-**Status:** proposed 2026-07-09 · **Pillar:** Language · **Epic slug:** `flux-lang-agent-speed`
+**Status:** DELIVERED 2026-07-09 (L-53/L-54/L-55/L-56 all done) · **Pillar:** Language · **Epic slug:** `flux-lang-agent-speed`
 
 This epic tracks the four highest-leverage Flux-Lang features that would make every agent
 turn faster without weakening the core contract: the LLM emits a typed plan, and the

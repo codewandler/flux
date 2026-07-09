@@ -1,9 +1,19 @@
 //! The optimizer: lower a validated [`HirFlow`] into a [`PhysicalPlan`] — a schedule over the flow's
-//! top-level body. v1 schedules the **top level**: a maximal run of consecutive, mutually-independent
-//! **read-only** `bind`s (disjoint symbol reads/writes; their op carries no effect beyond `Read`)
-//! batches into a [`Stage::Parallel`]; a side-effecting node becomes an [`Stage::ApprovalFence`]
-//! ("don't speculate past a write"); every other node stays [`Stage::Sequential`] (the interpreter
-//! runs its nested bodies). [`NodeId`] is the index into the top-level `body`;
+//! top-level body. The scheduler (L-53) builds a **whole-node symbol dependency graph**: every
+//! statement is summarized by walking its entire subtree — nested blocks, `when` conditions,
+//! object/list templates, call arguments — into (reads, writes, class). Whole-node **read-only**
+//! statements (every reachable op registered with only `Read` effects, no approval/durability
+//! construct) are placed into dependency **levels** between fences; each multi-node level becomes a
+//! [`Stage::Parallel`]. An order floor keeps the emitted stage sequence in exact program order, so
+//! the replayed trace is identical to sequential execution while independent reads still overlap.
+//!
+//! **Fences.** A write/network/process effect, an **unknown op** (unknown effects are treated as
+//! the most dangerous effects), or an approval/durability construct (`confirm`, `await`,
+//! `checkpoint`, `once`, `saga`, `thing`) anywhere in a statement's subtree makes the whole
+//! statement a [`Stage::ApprovalFence`]: nothing is scheduled across it in either direction, so
+//! approval ordering and policy behavior match sequential execution exactly. A statement carrying
+//! a nested `return` stays [`Stage::Sequential`] ([`crate::runtime::execute_plan`] forbids `return`
+//! inside a parallel stage). [`NodeId`] is the index into the top-level `body`;
 //! [`crate::runtime::execute_plan`] runs the result.
 //!
 //! Two eliminations run alongside the scheduler:
@@ -14,12 +24,14 @@
 //!   [`Stage::Alias`] — provided no intervening node rebinds a symbol the call reads and no side effect
 //!   runs between them. Non-idempotent reads (a clock/random) are never deduped.
 //!
-//! **Soundness:** only consecutive *simple read-only binds* whose reads are the explicit `Var` names
-//! in their call args are reordered into a batch, and program order is preserved across every batch
-//! boundary — so no read-after-write / write-after-write hazard can cross a stage. A node whose reads
-//! can't be determined precisely (anything but a read-only `bind`-of-`call`) is never batched. CSE
-//! reuses a value only when the op is deterministic and the inputs are provably unchanged; a CSE source
-//! is kept live so dead-step never removes it out from under an alias.
+//! **Soundness:** a node enters a level only when its whole-subtree read/write sets (gathered by
+//! the analyzer's exhaustive visitor, so no node kind can hide a read or a binder) have no
+//! RAW/WAW/WAR hazard against any co-scheduled level, and the order floor forbids placing a node
+//! at a level below its predecessor's — so the emitted stage sequence is always a refinement of
+//! program order and no hazard can cross a stage. Over-approximated read/write sets only
+//! *suppress* parallelism, never wrongly permit it. CSE reuses a value only when the op is
+//! deterministic and the inputs are provably unchanged; a CSE source is kept live so dead-step
+//! never removes it out from under an alias.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,7 +43,7 @@ use crate::opspec::OpCatalog;
 /// Lower a [`HirFlow`] to a [`PhysicalPlan`] (see the module docs for the scheduling rules).
 pub fn optimize(hir: &HirFlow, ops: &dyn OpCatalog) -> PhysicalPlan {
     let mut stages: Vec<Stage> = Vec::new();
-    let mut batch = Batch::default();
+    let mut batch = Window::default();
 
     // Common-subexpression elimination: a read-only, deterministic op called twice with the same args
     // (no intervening invalidation) is dispatched once; the duplicate becomes a `Stage::Alias` that
@@ -58,8 +70,8 @@ pub fn optimize(hir: &HirFlow, ops: &dyn OpCatalog) -> PhysicalPlan {
             continue;
         }
         if let Some((target, source)) = aliases.get(&i) {
-            // The `source` is an earlier node, so its stage is already emitted; flush the batch so the
-            // alias runs after it.
+            // The `source` is an earlier node, so its stage is already emitted; flush the window so
+            // the alias runs after it.
             batch.flush(&mut stages);
             stages.push(Stage::Alias {
                 target: target.clone(),
@@ -67,85 +79,192 @@ pub fn optimize(hir: &HirFlow, ops: &dyn OpCatalog) -> PhysicalPlan {
             });
             continue;
         }
-        match readonly_bind(node, ops) {
-            // A read-only bind joins the current batch when independent of it, else starts a fresh one.
-            Some((reads, write)) => {
-                if !batch.independent(&reads, write.as_deref()) {
-                    batch.flush(&mut stages);
-                }
-                batch.push(i, reads, write);
-            }
-            // Anything else flushes the batch, then runs in program order — fenced if side-effecting.
-            None => {
+        let summary = summarize(node, ops);
+        match summary.class {
+            // A hard fence: emit everything scheduled so far, then the fence in program order.
+            // Nothing is ever scheduled across it, in either direction.
+            NodeClass::Fenced => {
                 batch.flush(&mut stages);
-                stages.push(if is_side_effecting(node, ops) {
-                    Stage::ApprovalFence(NodeId(i as u32))
-                } else {
-                    Stage::Sequential(NodeId(i as u32))
-                });
+                stages.push(Stage::ApprovalFence(NodeId(i as u32)));
             }
+            // Value-safe but not parallelizable (a nested `return`): run alone in program order.
+            NodeClass::Barrier => {
+                batch.flush(&mut stages);
+                stages.push(Stage::Sequential(NodeId(i as u32)));
+            }
+            // Whole-node read-only work: place at the earliest hazard-free level at or after the
+            // previous node's level (the order floor keeps the emitted schedule in program order).
+            NodeClass::ReadOnly => batch.place(i, &summary),
         }
     }
     batch.flush(&mut stages);
     PhysicalPlan { stages }
 }
 
-/// The accumulating set of consecutive independent read-only binds.
+/// How a whole node — including every nested body, template, condition, and call argument — may
+/// be scheduled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeClass {
+    /// Every op reachable in the subtree is registered and read-only, and no approval or
+    /// durability construct appears: safe to run concurrently with other `ReadOnly` nodes.
+    ReadOnly,
+    /// Value-safe but not parallelizable — the subtree carries a `return`, which
+    /// [`crate::runtime::execute_plan`] forbids inside a parallel stage. Runs alone, in order.
+    Barrier,
+    /// A hard fence: a write/network/process effect, an **unknown** op (unknown effects are
+    /// treated as the most dangerous effects), or an approval/durability construct (`confirm`,
+    /// `await`, `checkpoint`, `once`, `saga`, `thing`). Nothing is scheduled across a fence in
+    /// either direction, so approval ordering and policy behavior match sequential execution.
+    Fenced,
+}
+
+/// The whole-node scheduling summary: every symbol the subtree reads, every symbol it binds, and
+/// its [`NodeClass`]. Over-approximating reads/writes is sound — it only suppresses parallelism.
+struct NodeSummary {
+    reads: BTreeSet<String>,
+    writes: BTreeSet<String>,
+    class: NodeClass,
+}
+
+/// Summarize a node for the scheduler by walking its whole subtree with the analyzer's exhaustive
+/// visitor (the same one `collect_var_reads` uses, so no node kind can hide a read, a binder, or
+/// an effect from the hazard analysis).
+fn summarize(node: &Node, ops: &dyn OpCatalog) -> NodeSummary {
+    let nodes = std::slice::from_ref(node);
+    let mut reads = BTreeSet::new();
+    collect_var_reads(nodes, &mut reads);
+    let mut writes = BTreeSet::new();
+    let mut fenced = false;
+    let mut barrier = false;
+    crate::analyze::for_each_node(nodes, &mut |n| {
+        collect_binder_writes(n, &mut writes);
+        match n {
+            Node::Call { op, .. } => {
+                if !is_readonly_op(op, ops) {
+                    fenced = true;
+                }
+            }
+            Node::Confirm { .. }
+            | Node::Await { .. }
+            | Node::Checkpoint { .. }
+            | Node::Once { .. }
+            | Node::Saga { .. }
+            | Node::Thing { .. } => fenced = true,
+            Node::Return { .. } => barrier = true,
+            _ => {}
+        }
+    });
+    let class = if fenced {
+        NodeClass::Fenced
+    } else if barrier {
+        NodeClass::Barrier
+    } else {
+        NodeClass::ReadOnly
+    };
+    NodeSummary {
+        reads,
+        writes,
+        class,
+    }
+}
+
+/// Record the symbol(s) a single node BINDS — every binder position in the grammar. Paired with
+/// the exhaustive visitor this yields the write set of a whole subtree.
+fn collect_binder_writes(n: &Node, acc: &mut BTreeSet<String>) {
+    let mut w = |s: &SymbolName| {
+        acc.insert(s.0.clone());
+    };
+    match n {
+        Node::Bind { name, .. } | Node::Memo { name, .. } | Node::Ctx { name, .. } => w(name),
+        Node::CtxAppend { ctx, .. } => w(ctx),
+        Node::Each { item, collect, .. } => {
+            w(item);
+            if let Some(c) = collect {
+                w(c);
+            }
+        }
+        Node::Repeat {
+            collect: Some(c), ..
+        } => w(c),
+        Node::Await {
+            binding: Some(b), ..
+        } => w(b),
+        Node::Scope { bind, .. }
+        | Node::Timeout { bind, .. }
+        | Node::Budget { bind, .. }
+        | Node::CapScope { bind, .. }
+        | Node::Retry { bind, .. }
+        | Node::Seq { bind, .. }
+        | Node::Once { bind, .. }
+        | Node::Race { bind, .. }
+        | Node::Fallback { bind, .. }
+        | Node::Loop { bind, .. }
+        | Node::Pipe { bind, .. } => {
+            if let Some(b) = bind {
+                w(b);
+            }
+        }
+        Node::Try { catch: Some(c), .. } => w(c),
+        Node::Parallel { branches } => {
+            for b in branches {
+                w(&b.name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The window scheduler: dependency levels between two fences. A `ReadOnly` node is placed at the
+/// earliest level with no RAW/WAW/WAR hazard against any existing level, **but never before the
+/// level of the previously placed node** (the order floor). That floor keeps the emitted stage
+/// sequence — and therefore the replayed trace — in exact program order, while still letting a
+/// later independent read run concurrently with an earlier dependent one (they share a level).
 #[derive(Default)]
-struct Batch {
+struct Window {
+    levels: Vec<Level>,
+    floor: usize,
+}
+
+#[derive(Default)]
+struct Level {
     ids: Vec<usize>,
     reads: BTreeSet<String>,
     writes: BTreeSet<String>,
 }
 
-impl Batch {
-    /// A candidate node is independent of the batch when its written symbol is neither read nor
-    /// written by the batch, and none of its reads hit a symbol the batch writes (no RAW/WAR/WAW).
-    fn independent(&self, reads: &BTreeSet<String>, write: Option<&str>) -> bool {
-        let write_ok = write
-            .map(|w| !self.reads.contains(w) && !self.writes.contains(w))
-            .unwrap_or(true);
-        write_ok && reads.is_disjoint(&self.writes)
-    }
-
-    fn push(&mut self, i: usize, reads: BTreeSet<String>, write: Option<String>) {
-        self.ids.push(i);
-        self.reads.extend(reads);
-        if let Some(w) = write {
-            self.writes.insert(w);
+impl Window {
+    fn place(&mut self, i: usize, s: &NodeSummary) {
+        let mut lvl = self.floor;
+        for (li, level) in self.levels.iter().enumerate() {
+            let raw = !s.reads.is_disjoint(&level.writes);
+            let waw = !s.writes.is_disjoint(&level.writes);
+            let war = !s.writes.is_disjoint(&level.reads);
+            if raw || waw || war {
+                lvl = lvl.max(li + 1);
+            }
         }
+        if lvl >= self.levels.len() {
+            self.levels.resize_with(lvl + 1, Level::default);
+        }
+        let level = &mut self.levels[lvl];
+        level.ids.push(i);
+        level.reads.extend(s.reads.iter().cloned());
+        level.writes.extend(s.writes.iter().cloned());
+        self.floor = lvl;
     }
 
     fn flush(&mut self, stages: &mut Vec<Stage>) {
-        match self.ids.len() {
-            0 => {}
-            1 => stages.push(Stage::Sequential(NodeId(self.ids[0] as u32))),
-            _ => stages.push(Stage::Parallel(
-                self.ids.iter().map(|&i| NodeId(i as u32)).collect(),
-            )),
+        for level in self.levels.drain(..) {
+            match level.ids.len() {
+                0 => {}
+                1 => stages.push(Stage::Sequential(NodeId(level.ids[0] as u32))),
+                _ => stages.push(Stage::Parallel(
+                    level.ids.iter().map(|&i| NodeId(i as u32)).collect(),
+                )),
+            }
         }
-        self.ids.clear();
-        self.reads.clear();
-        self.writes.clear();
+        self.floor = 0;
     }
-}
-
-/// If `node` is a `bind`/`memo` of a **read-only** `call`, return `(reads, written-symbol)` — its
-/// reads are the explicit `Var` names in the call args. Only such nodes are eligible to batch.
-fn readonly_bind(node: &Node, ops: &dyn OpCatalog) -> Option<(BTreeSet<String>, Option<String>)> {
-    let (name, value) = match node {
-        Node::Bind { name, value, .. } | Node::Memo { name, value, .. } => (name, value.as_ref()),
-        _ => return None,
-    };
-    let Node::Call { op, args } = value else {
-        return None;
-    };
-    if !is_readonly_op(op, ops) {
-        return None;
-    }
-    let mut reads = BTreeSet::new();
-    collect_var_reads(args, &mut reads);
-    Some((reads, Some(name.0.clone())))
 }
 
 /// A known op all of whose effects are `Read` (or that declares none) — safe to run speculatively /
@@ -153,22 +272,6 @@ fn readonly_bind(node: &Node, ops: &dyn OpCatalog) -> Option<(BTreeSet<String>, 
 fn is_readonly_op(op: &str, ops: &dyn OpCatalog) -> bool {
     match ops.lookup(op) {
         Some(sig) => sig.effects.iter().all(|e| matches!(e, Effect::Read)),
-        None => false,
-    }
-}
-
-/// Whether the node calls an op carrying a non-`Read` (mutating / external) effect.
-fn is_side_effecting(node: &Node, ops: &dyn OpCatalog) -> bool {
-    let op = match node {
-        Node::Bind { value, .. } | Node::Memo { value, .. } => match value.as_ref() {
-            Node::Call { op, .. } => Some(op.as_str()),
-            _ => None,
-        },
-        Node::Call { op, .. } => Some(op.as_str()),
-        _ => None,
-    };
-    match op.and_then(|o| ops.lookup(o)) {
-        Some(sig) => sig.effects.iter().any(|e| !matches!(e, Effect::Read)),
         None => false,
     }
 }
@@ -181,8 +284,10 @@ fn is_side_effecting(node: &Node, ops: &dyn OpCatalog) -> bool {
 /// silently hide a read site — the earlier hand-rolled match dropped `obj`/`list`/`fmt`/`expr` under
 /// a `_ => {}`, making a reader invisible to the batch/CSE hazard check (L-26). This drives both
 /// `Batch::independent` (parallelization) and `cse_aliases` (invalidation); over-approximating is
-/// sound — extra reads only *suppress* batching/aliasing, never wrongly permit them.
-fn collect_var_reads(nodes: &[Node], acc: &mut BTreeSet<String>) {
+/// sound — extra reads only *suppress* batching/aliasing, never wrongly permit them. `pub(crate)`:
+/// also the whole-flow (unnarrowed) read source for [`crate::context_slice::required_symbols_in_flow`]
+/// (KF4/L-56), which needs the identical soundness guarantee but has no interest in narrowing.
+pub(crate) fn collect_var_reads(nodes: &[Node], acc: &mut BTreeSet<String>) {
     crate::analyze::for_each_node(nodes, &mut |n| collect_leaf_read(n, acc));
 }
 
@@ -218,7 +323,7 @@ fn collect_leaf_read(n: &Node, acc: &mut BTreeSet<String>) {
 /// Collect interpolation tokens (`{name}` / `{{name}}`) from a literal value, recursing into arrays
 /// and objects (the interpolator recurses the same way). Mirrors `runtime::interpolate_str`'s scan so
 /// no interpolated read is missed.
-fn collect_interp_reads(value: &serde_json::Value, acc: &mut BTreeSet<String>) {
+pub(crate) fn collect_interp_reads(value: &serde_json::Value, acc: &mut BTreeSet<String>) {
     match value {
         serde_json::Value::String(s) => collect_interp_reads_str(s, acc),
         serde_json::Value::Array(a) => a.iter().for_each(|x| collect_interp_reads(x, acc)),
@@ -229,7 +334,7 @@ fn collect_interp_reads(value: &serde_json::Value, acc: &mut BTreeSet<String>) {
 
 /// Collect interpolation tokens (`{name}` / `{{name}}`) from a single string (a `lit` string or an
 /// inline `fmt` template).
-fn collect_interp_reads_str(s: &str, acc: &mut BTreeSet<String>) {
+pub(crate) fn collect_interp_reads_str(s: &str, acc: &mut BTreeSet<String>) {
     let mut rest = s;
     while let Some(open) = rest.find('{') {
         let at = &rest[open..];
@@ -384,6 +489,178 @@ mod tests {
             ..Default::default()
         };
         optimize(&hir, &Cat).stages
+    }
+
+    // ---- L-53: whole-flow dependency scheduler --------------------------------------------
+
+    #[test]
+    fn nested_readonly_work_batches_into_parallel_stages() {
+        // Read-only calls hidden inside a `when` (condition + child block), an object template,
+        // and a plain bind are all independent → ONE parallel stage, not three sequential nodes.
+        let template = Node::Bind {
+            name: "t".into(),
+            value: Box::new(Node::Obj {
+                fields: [
+                    (
+                        "x".to_string(),
+                        Box::new(Node::Call {
+                            op: "read".into(),
+                            args: vec![lit("f1")],
+                        }),
+                    ),
+                    (
+                        "y".to_string(),
+                        Box::new(Node::Call {
+                            op: "read".into(),
+                            args: vec![lit("f2")],
+                        }),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            ty: None,
+            effect: None,
+        };
+        let when = Node::When {
+            cond: Box::new(Node::Call {
+                op: "read".into(),
+                args: vec![lit("flag")],
+            }),
+            then: vec![bind("w", "read", vec![lit("f3")])],
+            otherwise: vec![],
+        };
+        let stages = plan(vec![
+            template,
+            when,
+            bind("c", "read", vec![lit("f4")]),
+            bind("r", "read", vec![lit("{{t}}{{w}}{{c}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Parallel(vec![NodeId(0), NodeId(1), NodeId(2)]),
+                Stage::Sequential(NodeId(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipelined_levels_preserve_program_order() {
+        // $a = read f; $c = read $a; $b = read g — b is independent of the a→c chain, but program
+        // order must be preserved in the emitted schedule, so b joins c's LEVEL (they run
+        // concurrently) rather than jumping ahead of it.
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("f")]),
+            bind("c", "read", vec![var("a")]),
+            bind("b", "read", vec![lit("g")]),
+            bind("r", "read", vec![lit("{{c}}{{b}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Sequential(NodeId(0)),
+                Stage::Parallel(vec![NodeId(1), NodeId(2)]),
+                Stage::Sequential(NodeId(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_op_is_a_hard_fence() {
+        // `mystery` is not in the catalog: unknown effects → hard fence, no speculation across.
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            Node::Call {
+                op: "mystery".into(),
+                args: vec![],
+            },
+            bind("b", "read", vec![lit("{{a}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Sequential(NodeId(0)),
+                Stage::ApprovalFence(NodeId(1)),
+                Stage::Sequential(NodeId(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_write_fences_the_whole_node() {
+        // A write buried inside a `when` body makes the WHOLE node a fence — the reads on either
+        // side never batch across it.
+        let when_with_write = Node::When {
+            cond: Box::new(lit("true")),
+            then: vec![Node::Call {
+                op: "write".into(),
+                args: vec![lit("out")],
+            }],
+            otherwise: vec![],
+        };
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            when_with_write,
+            bind("b", "read", vec![lit("{{a}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Sequential(NodeId(0)),
+                Stage::ApprovalFence(NodeId(1)),
+                Stage::Sequential(NodeId(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_construct_is_a_hard_fence() {
+        // `confirm` is the approval gate itself — always a fence, even with a read-only body.
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            Node::Confirm {
+                message: "ok?".into(),
+                risk: None,
+                body: vec![bind("k", "read", vec![lit("y")])],
+            },
+            bind("b", "read", vec![lit("{{a}}{{k}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Sequential(NodeId(0)),
+                Stage::ApprovalFence(NodeId(1)),
+                Stage::Sequential(NodeId(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_return_never_enters_a_parallel_stage() {
+        // `execute_plan` hard-errors on `return` inside a parallel stage; a when-with-return is
+        // scheduled sequentially even though it is read-only.
+        let when_with_return = Node::When {
+            cond: Box::new(Node::Call {
+                op: "read".into(),
+                args: vec![lit("flag")],
+            }),
+            then: vec![Node::Return {
+                value: Box::new(lit("early")),
+            }],
+            otherwise: vec![],
+        };
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            when_with_return,
+            bind("r", "read", vec![lit("{{a}}")]),
+        ]);
+        assert!(
+            !stages
+                .iter()
+                .any(|s| matches!(s, Stage::Parallel(ids) if ids.contains(&NodeId(1)))),
+            "a return-carrying node must not be parallelized: {stages:?}"
+        );
     }
 
     #[test]

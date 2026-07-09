@@ -64,6 +64,11 @@ pub struct PlanAttempt {
     /// — round-trips via `parse`. `None` for non-accepted outcomes, pre-L-38 logs, and oversized
     /// plans (never truncated: a present `plan_source` always parses).
     pub plan_source: Option<String>,
+    /// The raw `emit_plan_delta` tool input (canonical JSON) when this attempt patched the
+    /// previous rejected plan instead of re-emitting it whole (KF3/L-55) — `None` for every
+    /// ordinary full emission. Together with `plan_source` this reconstructs both the patch that
+    /// was sent and the full plan it materialized into.
+    pub delta_source: Option<String>,
 }
 
 /// A turn's telemetry, folded from its `TurnStarted` / `PlanAttempted` / `TurnEnded`
@@ -122,6 +127,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                 plan_text,
                 phase,
                 plan_source,
+                delta_source,
             } => {
                 if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
                     t.plan_attempts.push(PlanAttempt {
@@ -132,6 +138,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                         plan_text: plan_text.clone(),
                         phase: phase.clone(),
                         plan_source: plan_source.clone(),
+                        delta_source: delta_source.clone(),
                     });
                 }
             }
@@ -937,6 +944,7 @@ mod tests {
                     plan_text: None,
                     phase: None,
                     plan_source: None,
+                    delta_source: None,
                 },
             ),
             ev(
@@ -951,6 +959,7 @@ mod tests {
                     plan_text: Some("$x = read(\"a\")".into()),
                     phase: Some("execute".into()),
                     plan_source: Some("flow\n  $x = read(\"a\")".into()),
+                    delta_source: None,
                 },
             ),
             ev(
@@ -1057,6 +1066,7 @@ mod tests {
                     plan_text: Some("$x = read(\"a\")".into()),
                     phase: None,
                     plan_source: None,
+                    delta_source: None,
                 },
             ),
             // Turn 20: a real L-38 accepted plan — must export, paired with THIS turn's user_input.
@@ -1081,6 +1091,7 @@ mod tests {
                     plan_text: Some("$x = read(\"README.md\")".into()),
                     phase: Some("execute".into()),
                     plan_source: Some("flow\n  $x = read(\"README.md\")".into()),
+                    delta_source: None,
                 },
             ),
         ];
@@ -1115,6 +1126,7 @@ mod tests {
                 plan_text: None,
                 phase: None,
                 plan_source: Some("flow\n  $x = read(\"a\")".into()),
+                delta_source: None,
             },
         )];
         let (rows, skips) = corpus_rows("s_1", &events);
@@ -1392,6 +1404,7 @@ mod tests {
             plan_text: None,
             phase: phase.map(str::to_string),
             plan_source: None,
+            delta_source: None,
         };
         let mut events = Vec::new();
         let mut seq = 0i64;

@@ -67,7 +67,12 @@ pub enum EventKind {
     /// a phase-aware call. `plan_source` is the accepted plan's CANONICAL parseable Flux-Lang text
     /// (`flux_lang::format::format`, L-38) — machine-minable, round-trips via `parse`; `None` for
     /// non-accepted outcomes, pre-L-38 logs, and oversized plans (never truncated: a present
-    /// `plan_source` always parses). All newer fields are `#[serde(default)]` so older logs decode.
+    /// `plan_source` always parses). `delta_source` is the raw `emit_plan_delta` tool input
+    /// (canonical JSON) when this accepted attempt was produced by patching the previous rejected
+    /// plan rather than re-emitting it whole (KF3/L-55) — `None` for every ordinary full emission,
+    /// so the durable record can reconstruct BOTH the patch that was sent and (via `plan_source`)
+    /// the full plan it materialized into. All newer fields are `#[serde(default)]` so older logs
+    /// decode.
     PlanAttempted {
         step: u32,
         outcome: String,
@@ -81,6 +86,8 @@ pub enum EventKind {
         phase: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_source: Option<String>,
     },
     /// A turn closed with its final `outcome`, iteration count, and assistant `answer`. `usage` is
     /// the turn's accumulated token tally — `None` for turns recorded before usage capture, or when

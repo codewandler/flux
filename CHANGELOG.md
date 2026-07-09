@@ -13,6 +13,67 @@ All notable changes to this project are documented in this file. The format is b
   Helix recipe with `hx --health flux`; Neovim, Zed, IntelliJ/TextMate coverage; shipped-only
   LSP capability table), the tooling page's editor section slimmed to a pointer, cross-links
   from getting-started/tour/overview/flows-and-syntax, and a `crates/flux-lsp` README.
+- **L-54 — content-addressed cache for deterministic read-only ops.** `Executor::dispatch` now
+  replays a deterministic read's result instead of re-running its guarded IO when the same op is
+  dispatched again with the same input within a turn. The cache sits strictly AFTER the whole
+  authorization → approval envelope (a hit is served only when the op is admissible right now),
+  and only ops that are read-only (`Read` effects), `Idempotent`, low-risk, approval-insensitive,
+  and non-destructive qualify — model calls, writes, and unknown ops never enter it. Keys hash op
+  identity + canonical input + input-schema fingerprint + an invalidation-domain generation; any
+  non-read dispatch starts a new generation, and the engine resets the cache at every turn start
+  (external edits between turns can't be tracked, so the reuse window is repair rounds, retries,
+  and nested plans within one turn). Hits are audit-distinguishable via a new `op_cache_hit`
+  observation. Kill switch: `FLUX_OP_CACHE=off`.
+- **L-53 — whole-flow dependency scheduler: independent read-only work runs in parallel.** The
+  optimizer now summarizes every top-level statement across its whole subtree (nested blocks,
+  `when` conditions, templates, call arguments) into symbol reads/writes and an effect class,
+  then schedules whole-node read-only statements into dependency levels — a `when` block, a
+  template bind, and a plain read that are mutually independent share one parallel stage, where
+  the old scheduler only batched consecutive `bind`-of-`call` statements. Hard fences preserve
+  the safety envelope: any write/network/process effect, any **unknown** op, or an
+  approval/durability construct (`confirm`, `await`, `checkpoint`, `once`, `saga`, `thing`)
+  pins its statement in program order and nothing is scheduled across it in either direction.
+  An order floor keeps the emitted schedule in exact program order, so the optimized run is
+  observationally equivalent to sequential execution — proven by a new trace-equivalence test
+  (same bound values, same user-visible op event order) alongside six failing-first scheduler
+  tests. Docs: the execution-model page now spells out what parallelizes and what fences.
+- **L-59 — the CST is now the flow front-end, and analyzer diagnostics carry real source ranges.**
+  New `flux_lang::lower_cst`: `cst_to_draft` (strict lowering — every lexer/parser error reported
+  with its `TextRange`) and `parse_with_ranges`, which pairs the exact legacy `DraftAst` (the
+  proven line machinery stays the semantic authority, so behavior and error texts are unchanged)
+  with a node-path→range side-map keyed by the analyzer's own locator paths (`body[3].then[1]`,
+  longest-prefix resolution). `parse`/`parse_program` are re-pointed through the front-end with a
+  debug-mode acceptance-agreement gate, and flux-lsp now publishes analyzer findings (unknown
+  ops, unbound `$vars`, arity) as warnings with resolved spans. Hardening the agreement guards
+  (examples corpus + a CST assertion inside the 1000-seed round-trip property test) fixed nine
+  tolerant-parser gaps: kebab-case flow names, `ctx` sub-lines, blank/comment lines at block
+  boundaries, dotted op names, empty `+=` appends, full `thing` selector forms, scientific-
+  notation numbers, single-quoted strings, and column-0 `goal` lines.
+- **L-55 — plan-delta emission for cheap safe repairs.** A repair round can now patch just the
+  invalid node(s) of the previous rejected plan instead of re-emitting it whole: a new
+  `emit_plan_delta` tool (advertised only after a plan this turn was decoded and then rejected)
+  takes a versioned `{version, base, ops[]}` patch — `base` pins it to the previous AST's content
+  hash (a stale `base` is refused without touching the previous plan); `ops` replace/insert/delete
+  nodes by the SAME path vocabulary analyzer diagnostics already use (`body[3].then[1]`, …, at any
+  nesting depth). The materialized result runs through the identical model-ingress normalization,
+  hidden-ops surfacing, and analyzer/lower gates a full `emit_plan` does before it can ever be
+  accepted — an emission optimization, not a new execution path; the runtime still only ever sees
+  a complete, analyzed plan. Audit (`PlanAttempted.delta_source`) records the raw delta alongside
+  the materialized `plan_source` so either can be reconstructed.
+- **L-56 — automatic context slicing for planner and model ops.** New `flux_lang::context_slice`:
+  a pure, deterministic engine that derives the minimum model-visible context for one decision
+  from HIR symbol reads, `jq` field-access-path narrowing, an op's declared param schema, and
+  planner repair diagnostics, then gates the result (`Private`/`Hidden`/secret-derived/
+  policy-denied symbols are never included unless explicitly referenced *and* permitted) and
+  trims it to a token budget — exact when a host `TokenCounter` is supplied, a deterministic
+  ~4-chars/token fallback otherwise — returning a full audit record of what was kept or dropped
+  and why. Wired into two real default paths: `ctx`/`ctx_append` context packs
+  (`flux_lang::runtime::build_ctx`, which feeds `ai.reason` and future `Ctx`-typed model-op params)
+  now exclude `Private`/`Hidden` members by default and emit a `context.sliced` audit observation;
+  a rejected `emit_plan`/`emit_plan_delta` now appends a sliced, budgeted "relevant session
+  symbols" block to its repair feedback, scoped to what the rejected plan actually read plus what
+  its diagnostics named, instead of relying on the model to re-derive relevance from the full
+  session view.
 
 ### Changed
 

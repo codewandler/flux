@@ -4084,6 +4084,68 @@ fn build_ctx(
             .collect()
     };
 
+    // KF4/L-56: gate Private/Hidden members out of the pack by default before any budgeting runs.
+    // Being named in `include:` is a reference, not a permission grant (bullet 4) — a `Ctx` node has
+    // no mechanism (yet) to grant one, so the boundary here is always empty and every Private/Hidden
+    // member is excluded, full stop. Uses the shared [`crate::context_slice`] engine so the exclusion
+    // is audited (an observation), not just silently dropped.
+    let members = {
+        let mut required = crate::context_slice::RequiredSymbols::default();
+        let mut candidates = Vec::with_capacity(members.len());
+        for sym in &members {
+            required.require_whole(&sym.0);
+            let visibility = store
+                .binding(session_id, sym)?
+                .map(|b| b.visibility)
+                .unwrap_or(Visibility::Visible);
+            candidates.push(crate::context_slice::Candidate {
+                name: sym.0.clone(),
+                flags: crate::context_slice::SymbolFlags {
+                    visibility,
+                    secret_derived: false,
+                    policy_denied: false,
+                },
+                text: String::new(), // gating only here — sizing is the char-budget pass below
+            });
+        }
+        let (kept, gate_record) = crate::context_slice::slice_context(
+            &required,
+            &std::collections::BTreeSet::new(),
+            &candidates,
+            &crate::context_slice::Boundary::none(),
+            None,
+            None,
+        );
+        if !gate_record.excluded.is_empty() {
+            let excluded_names: Vec<String> = gate_record
+                .excluded
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
+            transcript.push(format!(
+                "[ctx {}] excluded gated member(s) (private/hidden): {excluded_names:?}",
+                name.0
+            ));
+            sink.observation(&flux_evidence::Observation::new(
+                "context.sliced",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({
+                    "ctx": name.0,
+                    "excluded": gate_record
+                        .excluded
+                        .iter()
+                        .map(|(n, r)| serde_json::json!({ "name": n, "reason": format!("{r:?}") }))
+                        .collect::<Vec<_>>(),
+                }),
+            ));
+        }
+        let kept: std::collections::HashSet<&str> = kept.iter().map(|s| s.as_str()).collect();
+        members
+            .into_iter()
+            .filter(|s| kept.contains(s.0.as_str()))
+            .collect::<Vec<_>>()
+    };
+
     // Char size + visibility rank per member. An unbound member contributes nothing (a pack tolerates
     // a not-yet-resolved reference rather than erroring).
     let sizes: Vec<usize> = members
@@ -4509,6 +4571,69 @@ mod tests {
         );
     }
 
+    /// KF4/L-56 bullet 4: a `Private`/`Hidden` member is never included in a context pack, budget or
+    /// no budget — being named in `include:` is a reference, not a permission grant, and `ctx` has no
+    /// mechanism to grant one. The exclusion is audited via a `context.sliced` observation, and a
+    /// `Visible` member alongside the gated ones is unaffected.
+    #[test]
+    fn ctx_excludes_private_and_hidden_members_by_default() {
+        let store = MemStore::new();
+        let sid = "s";
+        let put = |name: &str, val: &str, vis: Visibility| {
+            let vid = store.put_value(sid, &Value::String(val.into())).unwrap();
+            store
+                .bind(sid, &SymbolName(name.into()), &vid, None, val, vis)
+                .unwrap();
+        };
+        put("secret", "classified", Visibility::Private);
+        put("scratch", "internal", Visibility::Hidden);
+        put("ok", "fine", Visibility::Visible);
+
+        let mut transcript = Vec::new();
+        let mut sink = BufferSink::default();
+        let members = vec![
+            SymbolName("secret".into()),
+            SymbolName("scratch".into()),
+            SymbolName("ok".into()),
+        ];
+        let vid = build_ctx(
+            &store,
+            sid,
+            &SymbolName("pack".into()),
+            &None,
+            &members,
+            None, // no budget: the gate applies regardless
+            &mut transcript,
+            &mut sink,
+        )
+        .unwrap();
+
+        let Some(Value::Struct(fields)) = store.get_value(&vid).unwrap() else {
+            panic!("ctx produced a struct value")
+        };
+        let Value::List(kept_vals) = &fields["members"] else {
+            panic!("members is a list")
+        };
+        let kept: Vec<String> = kept_vals
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["ok".to_string()],
+            "private/hidden members excluded, the visible one kept"
+        );
+
+        let obs = observations(sink);
+        assert!(
+            obs.iter().any(|(k, _)| k == "context.sliced"),
+            "the gating exclusion is audited even though nothing was budget-shrunk: {obs:?}"
+        );
+    }
+
     /// Appending a higher-priority member re-budgets the pack and can evict a previously-kept,
     /// lower-priority member (priority-prefix semantics — no rank inversion).
     #[test]
@@ -4766,6 +4891,166 @@ mod tests {
                 .unwrap()
                 .and_then(|id| store_flow.get_value(&id).unwrap());
             assert!(vp.is_some(), "symbol ${sym} should be bound by the plan");
+            assert_eq!(vp, vf, "symbol ${sym} differs: plan vs linear execution");
+        }
+    }
+
+    /// L-53: the whole-flow scheduler's optimized execution is observationally equivalent to
+    /// sequential execution — same bound values AND the same user-visible event ordering (the
+    /// order floor keeps stage emission in program order; parallel stages replay their buffered
+    /// events in that same order).
+    #[tokio::test]
+    async fn scheduled_plan_matches_sequential_values_and_trace_order() {
+        struct RwCat;
+        impl OpCatalog for RwCat {
+            fn lookup(&self, name: &str) -> Option<OpSignature> {
+                let (effects, idem) = match name {
+                    "read" => (
+                        vec![flux_spec::Effect::Read],
+                        flux_spec::Idempotency::NonIdempotent,
+                    ),
+                    "write" => (
+                        vec![flux_spec::Effect::Write],
+                        flux_spec::Idempotency::NonIdempotent,
+                    ),
+                    _ => return None,
+                };
+                Some(OpSignature {
+                    name: name.into(),
+                    description: String::new(),
+                    effects,
+                    risk: flux_spec::Risk::Low,
+                    idempotency: idem,
+                    required_params: vec!["x".into()],
+                    optional_params: Vec::new(),
+                    param_types: Default::default(),
+                })
+            }
+        }
+        struct RwHost(RwCat);
+        #[async_trait::async_trait]
+        impl OpHost for RwHost {
+            async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+                OpOutcome::ok(format!("{op}({input})"))
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.0
+            }
+            async fn request_approval(
+                &self,
+                _label: &str,
+                _intents: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+
+        /// Records the user-visible op event stream.
+        #[derive(Default)]
+        struct RecSink {
+            calls: Vec<String>,
+        }
+        impl FlowSink for RecSink {
+            fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+                self.calls.push(format!("{name}:{input}"));
+            }
+        }
+
+        let call = |op: &str, arg: serde_json::Value| Node::Call {
+            op: op.into(),
+            args: vec![flow_lit(arg)],
+        };
+        let bind_call = |name: &str, op: &str, arg: serde_json::Value| Node::Bind {
+            name: SymbolName(name.into()),
+            value: Box::new(call(op, arg)),
+            ty: None,
+            effect: None,
+        };
+        // Reads feeding a template, a read-only `when` child block, a plain read, a write fence,
+        // then a post-fence read; the final bind consumes everything top-level (nothing is dead).
+        let body = vec![
+            // two independent reads…
+            bind_call("x1", "read", json!("f1")),
+            bind_call("x2", "read", json!("f2")),
+            // …consumed by an object template (reads $x1/$x2 → scheduled after them)
+            Node::Bind {
+                name: SymbolName("t".into()),
+                value: Box::new(Node::Obj {
+                    fields: [
+                        ("x".to_string(), Box::new(flow_var("x1"))),
+                        ("y".to_string(), Box::new(flow_var("x2"))),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                ty: None,
+                effect: None,
+            },
+            // a read-only `when` child block (call in the condition AND in the body)
+            Node::When {
+                cond: Box::new(call("read", json!("flag"))),
+                then: vec![bind_call("w", "read", json!("f3"))],
+                otherwise: vec![],
+            },
+            // an independent plain read
+            bind_call("c", "read", json!("f4")),
+            // write (hard fence)
+            call("write", json!("out")),
+            // a post-fence read
+            bind_call("d", "read", json!("f5")),
+            // final consumer keeps every top-level symbol live
+            bind_call("r", "read", json!("{{t}}{{c}}{{d}}")),
+        ];
+
+        let host = RwHost(RwCat);
+        let hir = crate::ast::HirFlow {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let plan = crate::optimize::optimize(&hir, &RwCat);
+        // The scheduler found real parallelism: template + when + plain read share a stage.
+        assert!(
+            plan.stages
+                .iter()
+                .any(|s| matches!(s, Stage::Parallel(ids) if ids.len() == 3)),
+            "expected a 3-node parallel stage, got {:?}",
+            plan.stages
+        );
+
+        let store_plan = MemStore::new();
+        let mut rec_plan = RecSink::default();
+        execute_plan(&store_plan, &host, "s", &body, &plan, &mut rec_plan)
+            .await
+            .unwrap();
+
+        let store_flow = MemStore::new();
+        let ast = DraftAst {
+            body: body.clone(),
+            ..Default::default()
+        };
+        let mut rec_flow = RecSink::default();
+        execute_flow(&store_flow, &host, "s", &ast, &mut rec_flow)
+            .await
+            .unwrap();
+
+        // Identical user-visible op event ordering…
+        assert_eq!(
+            rec_plan.calls, rec_flow.calls,
+            "optimized trace must equal the sequential trace"
+        );
+        // …and identical bound values.
+        for sym in ["x1", "x2", "t", "c", "d", "r"] {
+            let vp = store_plan
+                .resolve("s", &SymbolName(sym.into()))
+                .unwrap()
+                .and_then(|id| store_plan.get_value(&id).unwrap());
+            let vf = store_flow
+                .resolve("s", &SymbolName(sym.into()))
+                .unwrap()
+                .and_then(|id| store_flow.get_value(&id).unwrap());
             assert_eq!(vp, vf, "symbol ${sym} differs: plan vs linear execution");
         }
     }

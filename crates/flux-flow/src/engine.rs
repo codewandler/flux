@@ -186,6 +186,10 @@ impl FlowEngine {
 
         self.events
             .record_message(session_id, &Message::user_text(user_input))?;
+        // Turn boundary for the deterministic read cache (L-54): between turns the user (or any
+        // external process) may have changed what a read observes, so the cache never survives a
+        // turn — its reuse window is repair rounds / retries / sub-plans WITHIN this turn.
+        self.executor.begin_cache_turn();
         // Non-fatal: a DB hiccup must never prevent a turn from running.
         let turn_id = self
             .events
@@ -3679,6 +3683,7 @@ mod tests {
                     plan_text: None,
                     phase: None,
                     plan_source: Some(flux_lang::format::format(&ast_y)),
+                    delta_source: None,
                 },
             )
             .unwrap();

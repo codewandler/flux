@@ -101,6 +101,29 @@ fn lex_raw(src: &str) -> RawScan {
                 SyntaxKind::COMMENT
             }
             b'"' => scan_string(src, &mut i, &mut s),
+            // Single-quoted strings appear inside native expr formulas (`$x.state == 'opened'`).
+            b'\'' => {
+                i += 1;
+                loop {
+                    if i >= n || bytes[i] == b'\n' || bytes[i] == b'\r' {
+                        s.errors.push(LexError {
+                            range: range(start, i),
+                            message: "unterminated string: missing closing `'`".into(),
+                        });
+                        break;
+                    }
+                    if bytes[i] == b'\\' && i + 1 < n {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                SyntaxKind::STRING
+            }
             b'$' => {
                 i += 1;
                 consume_ident_tail(bytes, &mut i);
@@ -119,6 +142,20 @@ fn lex_raw(src: &str) -> RawScan {
                     i += 1; // '.'
                     while i < n && bytes[i].is_ascii_digit() {
                         i += 1;
+                    }
+                }
+                // Scientific notation (`1e+300`, `2.5E-3`) — serde_json prints large f64 literals
+                // this way, so formatted plans contain them.
+                if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+                    let mut j = i + 1;
+                    if j < n && (bytes[j] == b'+' || bytes[j] == b'-') {
+                        j += 1;
+                    }
+                    if j < n && bytes[j].is_ascii_digit() {
+                        i = j;
+                        while i < n && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
                     }
                 }
                 SyntaxKind::NUMBER

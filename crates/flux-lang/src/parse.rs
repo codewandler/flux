@@ -38,7 +38,17 @@ use flux_spec::{Effect, Idempotency, Risk};
 use std::collections::BTreeMap;
 
 /// Parse a single Flux-Lang flow from text into a [`DraftAst`].
+///
+/// Re-pointed onto the CST front-end (L-59): this delegates to
+/// [`crate::lower_cst::parse_with_ranges`], which runs the tolerant CST parser (asserting
+/// acceptance agreement in debug builds) and produces the analyzer range side-map alongside the
+/// AST. Semantics and error texts come from the shared line machinery below, unchanged.
 pub fn parse(src: &str) -> Result<DraftAst> {
+    crate::lower_cst::parse_with_ranges(src).map(|l| l.ast)
+}
+
+/// The legacy line-machinery flow parser — the semantic authority the CST front-end lowers with.
+pub(crate) fn parse_flow_text(src: &str) -> Result<DraftAst> {
     let lines = preprocess(src)?;
     if lines.is_empty() {
         return Err(perr("empty input: expected a `flow` header"));
@@ -117,6 +127,24 @@ fn is_flow_header(t: &str) -> bool {
 /// [`crate::program::Module::parse_str`]; module declarations are pure data (the L6 hosts give them
 /// runtime meaning), so this adds **no** new node kinds.
 pub fn parse_program(src: &str) -> Result<Module> {
+    let module = parse_program_text(src)?;
+    // The CST front-end gate (L-59): a legacy-accepted module must be ERROR-free in the tolerant
+    // CST too. Module-level range maps are deferred (the analyzer runs per flow); the agreement
+    // assert keeps the front-ends honest until then.
+    #[cfg(debug_assertions)]
+    {
+        let cst = crate::parser::parse_cst(src);
+        debug_assert!(
+            cst.errors.is_empty(),
+            "CST/legacy acceptance drift on a legacy-accepted module: {:?}",
+            cst.errors
+        );
+    }
+    Ok(module)
+}
+
+/// The legacy line-machinery module parser — see [`parse_flow_text`].
+pub(crate) fn parse_program_text(src: &str) -> Result<Module> {
     let lines = preprocess(src)?;
     if lines.is_empty() {
         return Err(perr(

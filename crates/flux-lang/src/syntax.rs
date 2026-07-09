@@ -168,6 +168,10 @@ pub enum SyntaxKind {
     ARG_LIST,   // (a, b, …)  or bare `a, b`
     NAME,       // an identifier in name position (op names, keys, types)
 
+    /// One `purpose`/`include`/`exclude`/`budget` sub-line inside a `ctx` block. Kept opaque —
+    /// the sub-line grammar belongs to the semantic parser; the CST only needs the span.
+    CTX_ENTRY,
+
     /// Sentinel marking the end of the enum — keep last. Not a real kind.
     #[doc(hidden)]
     __LAST,

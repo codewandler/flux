@@ -30,6 +30,7 @@ use schemars::JsonSchema;
 
 use crate::analyze::{for_each_node, lower, Diagnostic};
 use crate::ast::{DraftAst, Node};
+use crate::delta;
 use crate::registry::OpRegistry;
 use crate::state::SessionView;
 
@@ -102,6 +103,11 @@ pub struct Compiled {
     /// `gather` is `true` and the model supplied a usable `brief` (parsed tolerantly, like
     /// [`Completion`]).
     pub brief: Option<Brief>,
+    /// The raw `emit_plan_delta` tool input (canonical JSON), when this plan was accepted by
+    /// patching the previous rejected plan rather than re-emitting it whole (KF3/L-55). `None` for
+    /// every ordinary full emission. Carried through to the audit record alongside the
+    /// materialized plan (`plan_source`) so either can be reconstructed.
+    pub delta_source: Option<String>,
 }
 
 /// The orient/gather grounding artifact (design Part 1's `brief: {goal, needs[]}`): what the turn is
@@ -181,6 +187,46 @@ struct EmitPlanTextInput {
     /// Present alongside `gather: true`: the grounding artifact — what the turn is ultimately
     /// trying to accomplish, and what this gather round still needs to learn.
     brief: Option<EmitPlanBriefInput>,
+}
+
+/// `emit_plan_delta`'s input (KF3/L-55): a small patch against the previous rejected plan,
+/// applied to a clone and re-run through the same normalize/hidden-ops/analyze gates a full
+/// `emit_plan` is. Only advertised once a previous plan this turn was decoded and then rejected
+/// (see `compile_turn_inner`'s `last_rejected_ast`) — arm-independent, since a delta always speaks
+/// the AST's JSON wire form regardless of which surface produced the plan it patches.
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct EmitPlanDeltaInput {
+    /// The delta format version — currently always `1`.
+    version: u32,
+    /// The content hash of the plan this delta patches, exactly as given in the rejection
+    /// feedback that offered this tool. A hash that no longer matches the current plan (the
+    /// rejection has since moved on) is refused as a stale delta.
+    base: String,
+    /// The patch operations, applied in order to a COPY of the base plan.
+    ops: Vec<EmitPlanDeltaOpInput>,
+    /// Attach only when the materialized plan completes the request — same contract as
+    /// `emit_plan`'s `complete`.
+    complete: Option<EmitPlanCompletionInput>,
+    /// Same contract as `emit_plan`'s `gather` tag.
+    gather: Option<bool>,
+    /// Same contract as `emit_plan`'s `brief`.
+    brief: Option<EmitPlanBriefInput>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct EmitPlanDeltaOpInput {
+    /// One of `"replace"` (overwrite the node at `path`'s index), `"insert"` (insert `node`
+    /// before `path`'s index — the list's length appends), or `"delete"` (remove the node at
+    /// `path`'s index).
+    action: String,
+    /// The node path to patch, exactly as shown in the rejection feedback (e.g. `body[2]`,
+    /// `body[0].then[1]`).
+    path: String,
+    /// The replacement/inserted Flux-Lang node. Required for `replace`/`insert`; omit for
+    /// `delete`.
+    node: Option<Node>,
 }
 
 #[derive(JsonSchema)]
@@ -294,6 +340,12 @@ impl Phase {
 /// What the planner produced for a turn: an executable plan, or a plain-prose answer (a chat turn —
 /// the model chose to respond rather than emit a graph). The one engine drives [`compile_turn`] every
 /// turn and either executes the `Plan` or surfaces the `Chat` text as the assistant reply.
+// `Compiled` (the AST + turn metadata) is inherently bigger than a bare `String` — KF3/L-55's
+// `delta_source` field tipped the size DIFFERENCE between variants over clippy's threshold.
+// Boxing `Compiled` would ripple through every match site across `flux-flow`/`flux-cli`/`flux-eval`
+// (~35 call sites) to save one heap allocation ONCE PER TURN, not in a hot per-node loop — not
+// worth the churn for a size lint at this boundary.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum TurnOutput {
     Plan(Compiled),
@@ -381,6 +433,7 @@ pub async fn compile(
                         complete: None,
                         gather: false,
                         brief: None,
+                        delta_source: None,
                     })
                 }
                 Err(diags) => {
@@ -392,6 +445,7 @@ pub async fn compile(
                             complete: None,
                             gather: false,
                             brief: None,
+                            delta_source: None,
                         });
                     }
                     last_err = join_diags(&diags);
@@ -538,7 +592,10 @@ async fn compile_turn_inner(
     let segments = assemble_system_segments(base_system, ops, view, interactive, arm, phase);
     // Pure DAG: the model's ONLY tools are `emit_plan` (+ `ask_user`). Every op — reads included — is a
     // node in the emitted graph, so a turn is always an auditable plan, never a free-form tool call.
-    let tools = planner_tools(interactive, arm);
+    // `emit_plan_delta` (KF3/L-55) joins this set from the second step onward, once a previous
+    // plan this turn was decoded and rejected — see `last_rejected_ast` below — so it's assembled
+    // fresh each step rather than fixed here.
+    let base_tools = planner_tools(interactive, arm);
     let mut messages = conversation.to_vec();
     // Forward thinking-token deltas to the sink while we're in the planning phase, so both surfaces
     // (CLI: dims them on stderr; TUI: streams them into a dedicated Thinking entry) can show reasoning
@@ -549,6 +606,11 @@ async fn compile_turn_inner(
     // emit_plan). When the step budget runs out, the turn is rejected WITH this text (C-17/F2) —
     // never "accepted with diagnostics" for a caller to execute blind.
     let mut last_reject = String::new();
+    // KF3/L-55: the last plan THIS turn that successfully decoded/materialized but was then
+    // rejected (hidden op, gather violation, or analyzer diagnostics) — the base a follow-up
+    // `emit_plan_delta` may patch. `None` until the first such rejection, which is also exactly
+    // when `emit_plan_delta` starts being advertised (there is nothing to patch before then).
+    let mut last_rejected_ast: Option<DraftAst> = None;
     // A-40: how many `max_tokens`-truncation split-repairs this turn has already spent, bounded by
     // [`TRUNCATION_REPAIRS`].
     let mut truncation_repairs: u32 = 0;
@@ -557,12 +619,16 @@ async fn compile_turn_inner(
         // tell "this step rejected something" apart from "last_reject still holds an earlier
         // step's text" — one clone, taken only when tracing is actually active.
         let step_reject_snapshot = planner_trace_enabled().then(|| last_reject.clone());
+        let mut step_tools = base_tools.clone();
+        if last_rejected_ast.is_some() {
+            step_tools.push(emit_plan_delta_tool_def());
+        }
         let req = Request {
             model: model.to_string(),
             system: None,
             system_segments: segments.clone(),
             messages: messages.clone(),
-            tools: tools.clone(),
+            tools: step_tools,
             max_tokens: opts.max_tokens,
             temperature: None,
             top_p: None,
@@ -657,6 +723,7 @@ async fn compile_turn_inner(
                             // `complete` above, neither rides through this path.
                             gather: false,
                             brief: None,
+                            delta_source: None,
                         }));
                     }
                     // No tool_use id to answer here — the rejection rides as a plain user message.
@@ -771,12 +838,12 @@ async fn compile_turn_inner(
         }
 
         // Answer every tool_use (keeps the local history valid); capture an accepted plan if any.
-        // A message carrying MORE than one `emit_plan` is rejected outright (C-17/F3): a turn takes
-        // exactly one plan, and silently letting the last call win would execute a plan the model
-        // may not have meant as final.
-        let emit_plan_calls = tool_uses
+        // A message carrying MORE than one plan-emitting call (`emit_plan` or `emit_plan_delta`,
+        // KF3/L-55) is rejected outright (C-17/F3): a turn takes exactly one plan, and silently
+        // letting the last call win would execute a plan the model may not have meant as final.
+        let plan_calls = tool_uses
             .iter()
-            .filter(|(_, name, _)| name == "emit_plan")
+            .filter(|(_, name, _)| name == "emit_plan" || name == "emit_plan_delta")
             .count();
         let mut results = Vec::new();
         let mut done: Option<Compiled> = None;
@@ -804,11 +871,11 @@ async fn compile_turn_inner(
                 continue;
             }
             match name.as_str() {
-                "emit_plan" if emit_plan_calls > 1 => {
+                "emit_plan" | "emit_plan_delta" if plan_calls > 1 => {
                     last_reject = format!(
-                        "invalid: you called emit_plan {emit_plan_calls} times in one message — a \
-                         turn takes exactly ONE plan. Merge the steps into a single plan and call \
-                         emit_plan once."
+                        "invalid: you called emit_plan/emit_plan_delta {plan_calls} times in one \
+                         message — a turn takes exactly ONE plan. Merge the steps into a single \
+                         call and emit it once."
                     );
                     results.push(ContentBlock::tool_result_text(
                         id,
@@ -882,82 +949,100 @@ async fn compile_turn_inner(
                     };
                     match decoded {
                         Ok(ast) => {
-                            // Surfacing enforcement (A-04): a model-emitted plan may only call ops
-                            // advertised this turn. A registered-but-hidden op (e.g. `bash` with the
-                            // `shell` group off) is rejected unconditionally — including on the last
-                            // repair step, where ordinary diagnostics would be tolerated: a gated op
-                            // must never execute because the model ran out of repair budget.
-                            let hidden = ops.hidden_ops_in(&ast.body);
-                            if !hidden.is_empty() {
-                                last_reject = hidden_ops_rejection(&hidden);
-                                results.push(ContentBlock::tool_result_text(
-                                    id,
-                                    last_reject.clone(),
-                                    true,
-                                ));
-                                continue;
-                            }
-                            // Gather is enforced, not trusted (design Part 1): a `gather: true` plan
-                            // is only ever granted in the orient/gather phases, and even there must
-                            // be effect-clean and small — the SAME repair-feedback shape as the
-                            // hidden-op gate above, never a silent downgrade or a hard turn error.
-                            if gather {
-                                if phase == Phase::Execute {
-                                    last_reject = GATHER_REJECTED_IN_EXECUTE_PHASE.to_string();
+                            match gate_candidate_plan(
+                                ast, ops, view, phase, step, complete, gather, brief,
+                            ) {
+                                PlanGate::Accepted(c) => {
                                     results.push(ContentBlock::tool_result_text(
                                         id,
-                                        last_reject.clone(),
-                                        true,
+                                        "plan accepted".to_string(),
+                                        false,
                                     ));
-                                    continue;
+                                    done = Some(c);
                                 }
-                                if let Some(msg) = gather_violation(&ast, ops) {
+                                PlanGate::Rejected(msg, ast) => {
                                     last_reject = msg;
                                     results.push(ContentBlock::tool_result_text(
                                         id,
                                         last_reject.clone(),
                                         true,
                                     ));
-                                    continue;
-                                }
-                            }
-                            match validate_plan(&ast, ops, view) {
-                                Ok(()) => {
-                                    results.push(ContentBlock::tool_result_text(
-                                        id,
-                                        "plan accepted".to_string(),
-                                        false,
-                                    ));
-                                    done = Some(Compiled {
-                                        ast,
-                                        attempts: step,
-                                        diagnostics: Vec::new(),
-                                        complete,
-                                        gather,
-                                        brief,
-                                    });
-                                }
-                                Err(diags) => {
-                                    // Always repair feedback — never "accepted with diagnostics"
-                                    // (C-17/F2): every `compile_turn` caller executes the plan it
-                                    // gets back, so a diagnostics-carrying plan must not escape,
-                                    // not even on the last step. If the budget runs out, the turn
-                                    // is rejected with this text (below).
-                                    let msg = join_diags(&diags);
-                                    last_reject = format!(
-                                        "invalid plan: {msg}. Fix it and call emit_plan again."
-                                    );
-                                    results.push(ContentBlock::tool_result_text(
-                                        id,
-                                        last_reject.clone(),
-                                        true,
-                                    ));
+                                    // KF3/L-55: this decoded-but-rejected ast becomes the base a
+                                    // follow-up `emit_plan_delta` may patch (advertised from the
+                                    // next step onward).
+                                    last_rejected_ast = Some(ast);
                                 }
                             }
                         }
                         // A decode failure is repair feedback like any other rejection — record it
                         // (A-31) so the exhausted-budget error names the actual cause instead of
-                        // the bare "did not produce a plan" that made s_360 undiagnosable.
+                        // the bare "did not produce a plan" that made s_360 undiagnosable. There is
+                        // no successfully-decoded ast here, so `last_rejected_ast` is left as-is.
+                        Err(msg) => {
+                            last_reject = msg.clone();
+                            results.push(ContentBlock::tool_result_text(id, msg, true));
+                        }
+                    }
+                }
+                // KF3/L-55: patch `last_rejected_ast` instead of re-emitting the whole plan. Only
+                // ever reached once `last_rejected_ast` is `Some` (that's what makes this tool
+                // advertised at all this step — see the `tools` assembly above), but a real
+                // provider's tool-choice isn't verified server-side, so handle `None` gracefully
+                // rather than assume the precondition.
+                "emit_plan_delta" => {
+                    let Some(base_ast) = last_rejected_ast.clone() else {
+                        last_reject = "emit_plan_delta: there is no previous rejected plan this \
+                                        turn to patch yet — call emit_plan with a full plan first."
+                            .to_string();
+                        results.push(ContentBlock::tool_result_text(
+                            id,
+                            last_reject.clone(),
+                            true,
+                        ));
+                        continue;
+                    };
+                    let complete = parse_completion(input.get("complete"));
+                    let gather = parse_gather(input.get("gather"));
+                    let brief = gather.then(|| parse_brief(input.get("brief"))).flatten();
+                    let materialized =
+                        delta::parse_delta(&input).and_then(|d| delta::apply_delta(&base_ast, &d));
+                    match materialized {
+                        Ok(mut ast) => {
+                            // Model-ingress normalization: EXACTLY the same relax pass a full
+                            // emission gets, so a node a delta inserts/replaces shares the same
+                            // lenient field-access contract as one that arrived in a whole plan.
+                            flux_lang::ast::relax_field_access(&mut ast);
+                            // Audit (KF3/L-55): the raw delta input, so this attempt's record can
+                            // reconstruct the patch that was sent, not just what it materialized
+                            // into (`plan_source` already carries the materialized plan).
+                            let delta_source = serde_json::to_string(&input).ok();
+                            match gate_candidate_plan(
+                                ast, ops, view, phase, step, complete, gather, brief,
+                            ) {
+                                PlanGate::Accepted(mut c) => {
+                                    c.delta_source = delta_source;
+                                    results.push(ContentBlock::tool_result_text(
+                                        id,
+                                        "plan accepted".to_string(),
+                                        false,
+                                    ));
+                                    done = Some(c);
+                                }
+                                PlanGate::Rejected(msg, ast) => {
+                                    last_reject = msg;
+                                    results.push(ContentBlock::tool_result_text(
+                                        id,
+                                        last_reject.clone(),
+                                        true,
+                                    ));
+                                    last_rejected_ast = Some(ast);
+                                }
+                            }
+                        }
+                        // A malformed delta (bad JSON shape, stale base, bad path, out-of-range
+                        // index, an unparseable `node`) is repair feedback like any other rejection
+                        // — the PREVIOUS `last_rejected_ast` is left untouched (never reassigned
+                        // here), so a follow-up delta can still target the same, still-valid base.
                         Err(msg) => {
                             last_reject = msg.clone();
                             results.push(ContentBlock::tool_result_text(id, msg, true));
@@ -1736,6 +1821,64 @@ fn join_diags(diags: &[Diagnostic]) -> String {
         .join("; ")
 }
 
+/// The token budget for [`sliced_repair_symbols`]'s appended block — generous enough to name every
+/// relevant symbol in an ordinary repair, small next to the planner's own catalog/grammar segments.
+/// Enforced with the deterministic fallback estimator (KF4/L-56 bullet 3): this call site has no
+/// host-exact provider token count to thread through, so it demonstrates the "no counter available"
+/// path (the `Ctx`-pack wiring in `flux_lang::runtime::build_ctx` demonstrates the exact-count path).
+const REPAIR_CONTEXT_TOKEN_BUDGET: u64 = 2_000;
+
+/// KF4/L-56: narrow the session symbols shown alongside repair feedback to the ones the REJECTED
+/// plan's HIR actually reads plus the ones its diagnostics name — bullet 1's "HIR symbol reads" and
+/// "planner repair diagnostics" dependency sources, applied to the planner-feedback surface bullet 2
+/// asks for by default — instead of leaving the model to re-derive relevance from the whole (already
+/// visibility-filtered, per `FlowStore::view`) [`SessionView`]. Returns `None` when nothing in `view`
+/// is referenced (nothing useful to add to the repair message).
+fn sliced_repair_symbols(
+    ast: &DraftAst,
+    diags: &[Diagnostic],
+    view: &SessionView,
+) -> Option<String> {
+    let required = crate::context_slice::required_symbols_in_flow(&ast.body);
+    let diag_symbols = crate::context_slice::required_symbols_from_diagnostics(diags);
+    let candidates: Vec<crate::context_slice::Candidate> = view
+        .symbols
+        .iter()
+        .map(|s| crate::context_slice::Candidate {
+            name: s.name.0.clone(),
+            flags: crate::context_slice::SymbolFlags {
+                visibility: s.visibility,
+                secret_derived: false,
+                policy_denied: false,
+            },
+            text: s.summary.clone(),
+        })
+        .collect();
+    let (kept, _record) = crate::context_slice::slice_context(
+        &required,
+        &diag_symbols,
+        &candidates,
+        &crate::context_slice::Boundary::none(),
+        Some(REPAIR_CONTEXT_TOKEN_BUDGET),
+        None, // deterministic fallback estimator — no host-exact counter at this call site
+    );
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n\nRelevant session symbols for this repair:\n");
+    for name in &kept {
+        if let Some(sym) = view.symbols.iter().find(|s| s.name.0 == *name) {
+            let ty = sym
+                .ty
+                .as_deref()
+                .map(|t| format!(": {t}"))
+                .unwrap_or_default();
+            out.push_str(&format!("- ${}{} = {}\n", sym.name.0, ty, sym.summary));
+        }
+    }
+    Some(out)
+}
+
 /// The repair feedback for a plan calling registered-but-hidden ops (A-04). Shared by the
 /// `emit_plan` branch and the plain-text plan fallback (C-17/F1), so both paths gate identically.
 fn hidden_ops_rejection(hidden: &[String]) -> String {
@@ -1868,6 +2011,84 @@ fn gather_violation(ast: &DraftAst, ops: &OpRegistry) -> Option<String> {
         ));
     }
     None
+}
+
+/// The outcome of running a decoded (full-emission or delta-materialized) plan candidate through
+/// the shared post-decode gates. [`Rejected`](PlanGate::Rejected) carries the candidate `ast`
+/// back — the caller uses it as the new `last_rejected_ast` base a follow-up `emit_plan_delta` can
+/// patch (KF3/L-55).
+enum PlanGate {
+    Accepted(Compiled),
+    Rejected(String, DraftAst),
+}
+
+/// Run a decoded plan `ast` through EXACTLY the gates a full `emit_plan` always ran — hidden-ops
+/// surfacing (A-04) → gather enforcement (design Part 1) → analyzer/lower (C-17) — regardless of
+/// whether `ast` arrived as a whole emission or was just materialized from an `emit_plan_delta`
+/// patch (KF3/L-55: an emission optimization, not new execution semantics — a plan's provenance
+/// never changes what gets accepted). `complete`/`gather`/`brief` ride through unchanged into the
+/// accepted [`Compiled`]; `delta_source` is NOT set here — callers that came from the delta path
+/// attach it themselves after a successful gate.
+#[allow(clippy::too_many_arguments)]
+fn gate_candidate_plan(
+    ast: DraftAst,
+    ops: &OpRegistry<'_>,
+    view: Option<&SessionView>,
+    phase: Phase,
+    step: u32,
+    complete: Option<Completion>,
+    gather: bool,
+    brief: Option<Brief>,
+) -> PlanGate {
+    // Surfacing enforcement (A-04): a model-emitted plan may only call ops advertised this turn.
+    // A registered-but-hidden op (e.g. `bash` with the `shell` group off) is rejected
+    // unconditionally — including on the last repair step, where ordinary diagnostics would be
+    // tolerated: a gated op must never execute because the model ran out of repair budget. This
+    // applies identically whether the hidden op arrived in a whole plan or was patched in by a
+    // delta — the gate runs on the MATERIALIZED ast either way.
+    let hidden = ops.hidden_ops_in(&ast.body);
+    if !hidden.is_empty() {
+        return PlanGate::Rejected(hidden_ops_rejection(&hidden), ast);
+    }
+    // Gather is enforced, not trusted (design Part 1): a `gather: true` plan is only ever granted
+    // in the orient/gather phases, and even there must be effect-clean and small.
+    if gather {
+        if phase == Phase::Execute {
+            return PlanGate::Rejected(GATHER_REJECTED_IN_EXECUTE_PHASE.to_string(), ast);
+        }
+        if let Some(msg) = gather_violation(&ast, ops) {
+            return PlanGate::Rejected(msg, ast);
+        }
+    }
+    match validate_plan(&ast, ops, view) {
+        Ok(()) => PlanGate::Accepted(Compiled {
+            ast,
+            attempts: step,
+            diagnostics: Vec::new(),
+            complete,
+            gather,
+            brief,
+            delta_source: None,
+        }),
+        Err(diags) => {
+            // Always repair feedback — never "accepted with diagnostics" (C-17/F2): every
+            // `compile_turn` caller executes the plan it gets back, so a diagnostics-carrying plan
+            // must not escape, not even on the last step. If the budget runs out, the turn is
+            // rejected with this text.
+            let msg = join_diags(&diags);
+            let mut text = format!("invalid plan: {msg}. Fix it and call emit_plan again.");
+            // KF4/L-56: append the sliced, budgeted set of session symbols this repair round is
+            // actually relevant to, by default — nothing when the rejected plan and its diagnostics
+            // reference no existing session symbol (the common case: a typo'd op name, a malformed
+            // literal — nothing to narrow).
+            if let Some(v) = view {
+                if let Some(block) = sliced_repair_symbols(&ast, &diags, v) {
+                    text.push_str(&block);
+                }
+            }
+            PlanGate::Rejected(text, ast)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2202,7 +2423,9 @@ SEE the results before you can answer or to keep working — you'll get the resu
 again or answer directly in prose (answering in prose ends the turn).\n\nYou have NO directly-callable tools except `emit_plan`\
 {ask_line} — you cannot run `read`/`grep`/`bash`/etc. yourself. To gather information, put `read`/`grep`/\
 `glob` as NODES in a plan and emit it; the runtime executes the plan and gives you the results, so you \
-can plan the next step.\n\nIMPORTANT — \
+can plan the next step.\n\nIf a plan you emit is rejected, the feedback may offer `emit_plan_delta` — a \
+cheaper way to patch just the invalid node(s) by path instead of re-emitting the whole plan; use it when \
+offered and the fix is small.\n\nIMPORTANT — \
 express control flow as Flux-Lang nodes, NOT inside shell commands, so the plan stays auditable: use a \
 `repeat` node for loops and a `when` node for branches — e.g. run the tests three times with \
 `repeat max 3 {{ cargo_test() }}`, never a shell `for` loop. The generic `bash` op is OFF by default \
@@ -2284,6 +2507,44 @@ fn planner_tools(interactive: bool, arm: EmissionArm) -> Vec<ToolDef> {
         });
     }
     tools
+}
+
+/// `emit_plan_delta`'s input schema (KF3/L-55): arm-independent — a delta always speaks the AST's
+/// JSON wire form, so `node` uses the SAME merged, compact `Node` definition the merged `emit_plan`
+/// arm does ([`flux_lang::schema::merge_node_schema`]), regardless of which arm is active this
+/// turn. Memoized like [`merged_emit_plan_schema`].
+fn emit_plan_delta_schema() -> serde_json::Value {
+    static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut schema = tool_input_schema::<EmitPlanDeltaInput>();
+        flux_lang::schema::merge_node_schema(&mut schema);
+        schema
+    })
+    .clone()
+}
+
+/// The `emit_plan_delta` tool definition (KF3/L-55) — appended to the advertised tool set from the
+/// second step onward within a turn, once a previous plan was decoded and then rejected (see
+/// `compile_turn_inner`'s `last_rejected_ast`). There is nothing to patch on a turn's first step,
+/// so the model's first call is always a full `emit_plan`.
+fn emit_plan_delta_tool_def() -> ToolDef {
+    ToolDef {
+        name: "emit_plan_delta".to_string(),
+        description: "Patch the PREVIOUS rejected plan instead of re-emitting it whole — cheaper \
+                      for a small fix. Pass `version: 1`, `base` (the previous plan's content hash, \
+                      given in the rejection feedback), and `ops`: a list of {action, path, node?} \
+                      where `action` is `\"replace\"`, `\"insert\"`, or `\"delete\"`, `path` is the \
+                      exact node path named in the rejection (e.g. `body[3].then[1]`), and `node` \
+                      (a single Flux-Lang node — omit for `delete`) replaces the node at that index, \
+                      or is inserted before it (`insert` at the list's length appends). Ops apply in \
+                      order to a COPY of the previous plan, which is then analyzed exactly like a \
+                      full plan — a bad patch is repair feedback, never a partial run. If the \
+                      previous plan changed since the rejection (a stale `base`) or your patch is \
+                      malformed, nothing is applied and you'll be told why; call `emit_plan` with a \
+                      full plan instead if you'd rather start over. Same optional `complete`/\
+                      `gather`/`brief` contract as `emit_plan`.".to_string(),
+        input_schema: emit_plan_delta_schema(),
+    }
 }
 
 #[cfg(test)]
@@ -4345,6 +4606,315 @@ mod tests {
         .unwrap();
         assert_eq!(out.attempts, 2);
         assert!(out.diagnostics.is_empty());
+    }
+
+    // -- KF4/L-56: automatic context slicing for planner feedback ---------------------------------
+
+    /// A repair round's tool-result feedback carries a SLICED view of session symbols: only the
+    /// ones the rejected plan actually reads (`$existing`), not every symbol the (already
+    /// visibility-filtered) `SessionView` happens to hold (`$unrelated`, never touched by the
+    /// plan). This is the "planner feedback receives the sliced context by default" wiring
+    /// (bullet 2), driven by the rejected plan's HIR reads (bullet 1).
+    #[tokio::test]
+    async fn repair_feedback_carries_a_sliced_view_of_relevant_symbols() {
+        struct Capture {
+            responses: Mutex<VecDeque<Vec<Chunk>>>,
+            requests: Mutex<Vec<Request>>,
+        }
+        #[async_trait]
+        impl Provider for Capture {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, req: Request) -> Result<ChunkStream> {
+                self.requests.lock().unwrap().push(req);
+                let chunks = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default();
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        // Reads the existing session symbol `$existing` (a valid whole read), then references an
+        // unbound `$typo` — the analyzer rejects the whole plan with an unbound-symbol diagnostic.
+        let invalid = r#"{"ast":{"body":[
+            {"kind":"call","op":"read","args":[{"kind":"var","name":"existing"}]},
+            {"kind":"call","op":"read","args":[{"kind":"var","name":"typo"}]}
+        ]}}"#;
+        let provider = Capture {
+            responses: Mutex::new(
+                vec![
+                    tool_call("emit_plan", serde_json::from_str(invalid).unwrap()),
+                    tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        };
+
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let view = SessionView {
+            symbols: vec![
+                sym(
+                    "existing",
+                    "the existing value",
+                    flux_lang::ast::Visibility::Visible,
+                ),
+                sym(
+                    "unrelated",
+                    "never read by this plan",
+                    flux_lang::ast::Visibility::Visible,
+                ),
+            ],
+        };
+        let out = plan(
+            &provider,
+            "mock",
+            "do it",
+            &ops,
+            Some(&view),
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.attempts, 2,
+            "the unbound-symbol plan costs a repair round"
+        );
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let last_msg = requests[1].messages.last().expect("a repair message");
+        let tool_result_text = last_msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => content.iter().find_map(|c| match c {
+                    flux_core::ToolResultContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("a tool_result block carries the repair feedback");
+
+        assert!(
+            tool_result_text.contains("Relevant session symbols for this repair"),
+            "the sliced block is present: {tool_result_text}"
+        );
+        assert!(
+            tool_result_text.contains("$existing"),
+            "the read symbol is named: {tool_result_text}"
+        );
+        assert!(
+            !tool_result_text.contains("$unrelated"),
+            "an unread session symbol stays excluded: {tool_result_text}"
+        );
+    }
+
+    // -- KF3/L-55: plan-delta emission for cheap safe repairs -------------------------------------
+
+    /// A successful one-node repair via `emit_plan_delta`: the first `emit_plan` names an unknown
+    /// op (rejected with an analyzer diagnostic at `body[0]`); instead of re-emitting the whole
+    /// plan, the model patches just that node. The materialized result must equal what a full
+    /// re-emission would have produced, and the accepted `Compiled` must carry the raw delta for
+    /// audit (reconstructable alongside the materialized `plan_source`).
+    #[tokio::test]
+    async fn delta_repairs_a_single_invalid_node() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let invalid_ast: DraftAst =
+            serde_json::from_str(r#"{"body":[{"kind":"call","op":"nope.op","args":[]}]}"#).unwrap();
+        let base = crate::delta::ast_content_hash(&invalid_ast);
+        let delta = json!({
+            "version": 1,
+            "base": base,
+            "ops": [{
+                "action": "replace",
+                "path": "body[0]",
+                "node": {"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "x"}]},
+            }],
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", json!({ "ast": invalid_ast })),
+            tool_call("emit_plan_delta", delta),
+        ]);
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.attempts, 2, "the invalid plan costs a repair round");
+        assert!(out.diagnostics.is_empty());
+        assert_eq!(out.ast.body.len(), 1);
+        assert!(matches!(&out.ast.body[0], Node::Call { op, .. } if op == "read"));
+        let recorded = out
+            .delta_source
+            .as_deref()
+            .expect("an accepted delta-materialized plan records its raw delta for audit");
+        let recorded: serde_json::Value = serde_json::from_str(recorded).unwrap();
+        assert_eq!(
+            recorded["base"], base,
+            "the recorded delta reconstructs the exact patch that was sent"
+        );
+    }
+
+    /// A malformed `emit_plan_delta` (an unrecognized `action`) is repair feedback, not a crash or
+    /// a silent accept — the turn keeps failing with a legible cause once the repair budget runs
+    /// out.
+    #[tokio::test]
+    async fn delta_with_malformed_op_is_repair_feedback() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let invalid_ast: DraftAst =
+            serde_json::from_str(r#"{"body":[{"kind":"call","op":"nope.op","args":[]}]}"#).unwrap();
+        let base = crate::delta::ast_content_hash(&invalid_ast);
+        let bad_delta = json!({
+            "version": 1,
+            "base": base,
+            "ops": [{ "action": "frobnicate", "path": "body[0]" }],
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", json!({ "ast": invalid_ast })),
+            tool_call("emit_plan_delta", bad_delta),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let err = plan(&p, "mock", "do it", &ops, None, None, opts)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("emit_plan_delta"),
+            "names the failing tool: {msg}"
+        );
+        assert!(
+            msg.contains("frobnicate") || msg.contains("action"),
+            "explains the malformed op: {msg}"
+        );
+    }
+
+    /// A delta whose `base` no longer matches the current rejected plan is refused as stale — and,
+    /// crucially, that refusal does NOT corrupt the previous rejected plan: a follow-up delta
+    /// carrying the CORRECT base still succeeds.
+    #[tokio::test]
+    async fn delta_with_stale_base_is_rejected_then_a_correctly_based_delta_still_succeeds() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let invalid_ast: DraftAst =
+            serde_json::from_str(r#"{"body":[{"kind":"call","op":"nope.op","args":[]}]}"#).unwrap();
+        let real_base = crate::delta::ast_content_hash(&invalid_ast);
+        let fix_node =
+            json!({"kind": "call", "op": "read", "args": [{"kind": "lit", "value": "x"}]});
+        let stale_delta = json!({
+            "version": 1,
+            "base": "not-the-real-hash",
+            "ops": [{ "action": "replace", "path": "body[0]", "node": fix_node.clone() }],
+        });
+        let fixed_delta = json!({
+            "version": 1,
+            "base": real_base,
+            "ops": [{ "action": "replace", "path": "body[0]", "node": fix_node }],
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", json!({ "ast": invalid_ast })),
+            tool_call("emit_plan_delta", stale_delta),
+            tool_call("emit_plan_delta", fixed_delta),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 3,
+            ..Default::default()
+        };
+        let out = plan(&p, "mock", "do it", &ops, None, None, opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.attempts, 3,
+            "both the stale delta and the corrected one cost a step"
+        );
+        assert!(matches!(&out.ast.body[0], Node::Call { op, .. } if op == "read"));
+    }
+
+    /// A delta that patches in a hidden/denied op (`bash`, `shell` group off) must never be
+    /// accepted just because it arrived via a patch instead of a whole plan — the SAME gate a full
+    /// `emit_plan` runs applies to the materialized result.
+    #[tokio::test]
+    async fn delta_that_introduces_a_hidden_op_is_still_gated() {
+        let reg = full_registry();
+        let ops = ops_without_bash(&reg);
+        let invalid_ast: DraftAst =
+            serde_json::from_str(r#"{"body":[{"kind":"call","op":"nope.op","args":[]}]}"#).unwrap();
+        let base = crate::delta::ast_content_hash(&invalid_ast);
+        let delta = json!({
+            "version": 1,
+            "base": base,
+            "ops": [{
+                "action": "replace",
+                "path": "body[0]",
+                "node": {"kind": "call", "op": "bash", "args": [{"kind": "lit", "value": "rm x"}]},
+            }],
+        });
+        let p = mock(vec![
+            tool_call("emit_plan", json!({ "ast": invalid_ast })),
+            tool_call("emit_plan_delta", delta),
+        ]);
+        let opts = CompileOptions {
+            max_steps: 2,
+            ..Default::default()
+        };
+        let err = plan(&p, "mock", "delete x", &ops, None, None, opts)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bash"),
+            "a delta-introduced hidden op must still be named in the rejection: {err}"
+        );
+    }
+
+    /// Defensive: `emit_plan_delta` called with no previous rejected plan this turn (e.g. a
+    /// provider that ignores which tools were actually advertised this step) is repair feedback,
+    /// not a panic — the model recovers with an ordinary `emit_plan` on the next step.
+    #[tokio::test]
+    async fn delta_with_no_previous_plan_is_repair_feedback() {
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        let delta = json!({
+            "version": 1,
+            "base": "irrelevant",
+            "ops": [{ "action": "delete", "path": "body[0]" }],
+        });
+        let p = mock(vec![
+            tool_call("emit_plan_delta", delta),
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let out = plan(
+            &p,
+            "mock",
+            "do it",
+            &ops,
+            None,
+            None,
+            CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.attempts, 2,
+            "the bogus first-step delta costs a repair round"
+        );
     }
 
     #[tokio::test]

@@ -3276,7 +3276,7 @@ mod tests {
     #[async_trait]
     impl Tool for MarkTool {
         fn spec(&self) -> ToolSpec {
-            ToolSpec::read_only(
+            let mut spec = ToolSpec::read_only(
                 "mark",
                 "record a mark",
                 json!({
@@ -3284,7 +3284,12 @@ mod tests {
                     "properties": { "text": { "type": "string" } },
                     "required": ["text"]
                 }),
-            )
+            );
+            // A dispatch-recording probe: every call appends to the mark log, so it is NOT
+            // idempotent — declaring that keeps it out of the deterministic-read cache (L-54),
+            // whose whole contract is "replaying the result is indistinguishable from re-running".
+            spec.idempotency = flux_spec::Idempotency::NonIdempotent;
+            spec
         }
         async fn execute(
             &self,
