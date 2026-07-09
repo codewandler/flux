@@ -18,10 +18,10 @@ a screenshot. The digest *is* the action space: every interactive element gets a
 act ops (D-123) target.
 
 ## Acceptance
-- [ ] Digest builder over `Accessibility.getFullAXTree` joined with DOM node identity
-      (`backendNodeId`): header (`url · title`), `## content` (condensed readable text — reuse the
-      D-120 condenser or AX text), `## actions` table — `e<N> role "accessible name" (state)`,
-      states covering disabled/checked/expanded/current value for inputs.
+- [ ] Digest builder (`flux-web::digest`) over `Accessibility.getFullAXTree` joined with DOM node
+      identity (`backendNodeId`): header (`url · title`), `## content` (condensed readable text —
+      reuse `flux-web::condense` or AX text), `## actions` table — `e<N> role "accessible name"
+      (state)`, states covering disabled/checked/expanded/current value for inputs.
 - [ ] Interactive filter by AX role (button, link, textbox, combobox, checkbox, radio, tab,
       menuitem, …) **plus** a DOM-heuristic fallback so unlabeled div-soup clickables still
       surface (fixture: a page whose only "button" is a `div` with a click handler).
@@ -36,7 +36,8 @@ act ops (D-123) target.
       return the digest as their result.
 
 ## Progress
-- 2026-07-09 — Filed with the epic; needs [D-121](D-121-browser-plugin-cdp-foundation.md).
+- 2026-07-09 — Filed with the epic; needs [D-121](D-121-browser-cdp-foundation.md). Re-scoped
+  native same day (flux-web modules; substance unchanged).
 
 ## Notes
 - Hermetic-first: the builder is pure over captured AX/DOM payloads, so goldens don't need Chrome;

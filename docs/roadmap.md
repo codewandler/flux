@@ -81,26 +81,29 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ### Web capabilities — request · read · browse (epic) — **proposed 2026-07-09 (D-98 + D-120…D-124)**
 
 Working with the web is **three fundamentally different capabilities** — distinguished by what the
-model *sees*, what can go wrong, and how egress is governed — and flux ships them as three
-deliberately separate surfaces: **tier 1, request** —
-[D-98](stories/D-98-flux-web-plugin-and-http-request-op.md), a `web` plugin `http.request` op
-(arbitrary method/headers/body) under the standard plugin envelope, introducing the open-**public**
-egress declaration (`http_hosts: ["*"]`; the SSRF guard always runs, private ranges only via the
-scoped grant); **tier 2, read** — [D-120](stories/D-120-web-fetch-readable-markdown.md), pages as
-*documents*: an HTML→readable-markdown condenser (feature-gated `html` module in `flux-markdown`)
-behind an upgraded, now **public-only** native `web_fetch` (the bespoke private-net path from the
-D-96 caveat dies — clean cutover) plus a composable pure `html_to_markdown` op; **tier 3, browse**
-— non-visual browser use over headless Chromium and a minimal hand-rolled CDP-on-a-pipe client
-([D-121](stories/D-121-browser-plugin-cdp-foundation.md)): the agent observes a byte-budgeted
+model *sees* and what can go wrong — and flux ships them as three deliberately separate surfaces,
+**all native, no plugins** (table-stakes capabilities don't sit behind an install step), in one new
+L5 crate **`crates/flux-web`** governed by one family-wide scoped egress policy
+(`[private_net] web`; public-only default, SSRF guard on every request, `PrivateNetAdmit` audit):
+**tier 1, request** — [D-98](stories/D-98-flux-web-crate-and-http-request-op.md), the crate + a
+native `http.request` op (arbitrary method/headers/body, status/bytes back); **tier 2, read** —
+[D-120](stories/D-120-web-fetch-readable-markdown.md), pages as *documents*: an
+HTML→readable-markdown condenser (`flux-web::condense`, emitting through the `flux-markdown` AST)
+behind an upgraded `web_fetch` (which cuts over to the `web` scope — the per-tool special case
+from the D-96 caveat dies) plus a composable pure `html_to_markdown` op; **tier 3, browse** —
+non-visual browser use over headless Chromium and a minimal hand-rolled CDP-on-a-pipe client,
+evidence-gated behind a Chromium-discoverable signal
+([D-121](stories/D-121-browser-cdp-foundation.md)): the agent observes a byte-budgeted
 **page digest** — condensed content + a resolved action space of stable element refs from the
 accessibility tree, never HTML source, never screenshots
 ([D-122](stories/D-122-browser-page-digest.md)) — acts by ref and re-observes **deltas**, so a
 browsing task costs tokens proportional to change, not page size
 ([D-123](stories/D-123-browser-actions-delta.md)), with every request (subresource, redirect hop,
-JS-initiated) run through the scoped private-net guard via CDP interception — required for
-epic-done ([D-124](stories/D-124-browser-egress-interception.md)). The rule the surface teaches:
+JS-initiated) run through the scoped guard via CDP interception — required for epic-done
+([D-124](stories/D-124-browser-egress-interception.md)). The rule the surface teaches:
 **APIs → tier 1, documents → tier 2, applications → tier 3.** Subsumes and re-scopes the original
-D-98. Design: [designs/web-capabilities.md](designs/web-capabilities.md).
+D-98 (first drafted as plugins; revised native the same day, user call). Design:
+[designs/web-capabilities.md](designs/web-capabilities.md).
 
 ### flux-render — `flow_render`: flux source/plan → SVG (epic) — **proposed 2026-07-09 (L-74…L-78)**
 

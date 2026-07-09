@@ -30,12 +30,14 @@ tokens proportional to change, not to page size.
 - [ ] Honest metadata: `Effect::Network`, Risk Medium, `NetworkFetch` intents on act — plan
       approval sees browsing side effects (D-91 lesson); form-submission-shaped acts disclose as
       such in the rendered plan.
-- [ ] Env-gated live smoke: local fixture form (test-granted localhost) — fill two fields, submit,
-      assert the delta reports the navigation and the new page's refs resolve.
+- [ ] Env-gated live smoke: local fixture form (served on localhost under a test-scoped
+      `[private_net] web` grant) — fill two fields, submit, assert the delta reports the
+      navigation and the new page's refs resolve.
 
 ## Progress
-- 2026-07-09 — Filed with the epic; needs [D-122](D-122-browser-page-digest.md).
+- 2026-07-09 — Filed with the epic; needs [D-122](D-122-browser-page-digest.md). Re-scoped native
+  same day (flux-web modules; substance unchanged).
 
 ## Notes
-- The live smoke's localhost fixture needs an explicit test-scoped private-net grant — that's the
-  D-20 model working as intended, not a hole to special-case.
+- The live smoke's localhost fixture needs an explicit test-scoped `web` grant — that's the D-20
+  scoped-egress model working as intended, not a hole to special-case.
