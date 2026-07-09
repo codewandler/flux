@@ -39,12 +39,15 @@ use std::collections::BTreeMap;
 
 /// Parse a single Flux-Lang flow from text into a [`DraftAst`].
 ///
-/// Re-pointed onto the CST front-end (L-59): this delegates to
-/// [`crate::lower_cst::parse_with_ranges`], which runs the tolerant CST parser (asserting
-/// acceptance agreement in debug builds) and produces the analyzer range side-map alongside the
-/// AST. Semantics and error texts come from the shared line machinery below, unchanged.
+/// This is the AST-only entry: one pass of the proven line machinery, no CST. The CST front-end
+/// (L-59) lives in [`crate::lower_cst`] — [`crate::lower_cst::parse_with_ranges`] runs BOTH
+/// parsers and adds the analyzer range side-map; use it when ranges are needed (the LSP does).
+/// CST/legacy acceptance agreement is enforced by the dedicated guards (the `cst_agreement`
+/// corpus sweep and the round-trip property test), NOT by a per-parse assertion — an assertion
+/// here would double every parse and turn grammar drift into a process abort on untrusted
+/// (model-emitted) input in debug builds (review finding, 2026-07-09).
 pub fn parse(src: &str) -> Result<DraftAst> {
-    crate::lower_cst::parse_with_ranges(src).map(|l| l.ast)
+    parse_flow_text(src)
 }
 
 /// The legacy line-machinery flow parser — the semantic authority the CST front-end lowers with.
@@ -127,20 +130,10 @@ fn is_flow_header(t: &str) -> bool {
 /// [`crate::program::Module::parse_str`]; module declarations are pure data (the L6 hosts give them
 /// runtime meaning), so this adds **no** new node kinds.
 pub fn parse_program(src: &str) -> Result<Module> {
-    let module = parse_program_text(src)?;
-    // The CST front-end gate (L-59): a legacy-accepted module must be ERROR-free in the tolerant
-    // CST too. Module-level range maps are deferred (the analyzer runs per flow); the agreement
-    // assert keeps the front-ends honest until then.
-    #[cfg(debug_assertions)]
-    {
-        let cst = crate::parser::parse_cst(src);
-        debug_assert!(
-            cst.errors.is_empty(),
-            "CST/legacy acceptance drift on a legacy-accepted module: {:?}",
-            cst.errors
-        );
-    }
-    Ok(module)
+    // AST-only, single-pass — CST/legacy acceptance agreement is enforced by the dedicated test
+    // guards, not per-parse (see `parse`). Module-level range maps are deferred (the analyzer
+    // runs per flow).
+    parse_program_text(src)
 }
 
 /// The legacy line-machinery module parser — see [`parse_flow_text`].

@@ -13,8 +13,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - **Released:** v0.11.6 (2026-07-09) — the `flow_list` / `flow_run` tools + the `~/.flux/flows`
   unified flows/ops home (L-72), the L-71 merged-Node-schema planner emission default, and the
   bare-`@name` named-root fix. **In flight (`[Unreleased]`):** `task install` now also installs
-  `flux-lsp`. **Focus:** the Language pillar — the `data-transforms` epic (L-46–L-52) is shipped;
-  `flux-lang-agent-speed` (L-53–L-56) leads the ready queue. See [CHANGELOG](../../CHANGELOG.md).
+  `flux-lsp`. **Focus:** the Language pillar — the `data-transforms` epic (L-46–L-52) and
+  `flux-lang-agent-speed` (L-53–L-56, plus the L-59 CST keystone) are shipped; next up per the
+  generated board below. See [CHANGELOG](../../CHANGELOG.md).
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 <!-- BEGIN track:board -->

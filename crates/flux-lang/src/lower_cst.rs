@@ -73,15 +73,6 @@ impl RangeMap {
         self.resolve(&message[start..end])
     }
 
-    /// Number of mapped paths (test/introspection aid).
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
     fn insert(&mut self, path: String, range: TextRange) {
         self.map.insert(path, range);
     }
@@ -118,16 +109,14 @@ pub fn cst_to_draft(parse: &Parse, src: &str) -> std::result::Result<Lowered, Ve
     Ok(Lowered { ast, ranges })
 }
 
-/// The re-pointed flow front-end: legacy semantics/errors (pinned texts), CST-derived ranges.
-/// This is what [`crate::parse::parse`] delegates to; use it directly when ranges are needed.
+/// The range-bearing flow front-end: legacy semantics/errors (pinned texts), CST-derived ranges.
+/// Costs one extra (CST) parse over [`crate::parse::parse`], so it is for callers that consume
+/// the ranges — the LSP. Acceptance drift between the two front-ends is enforced by the dedicated
+/// test guards (`cst_agreement`, the round-trip property test), not asserted per parse: an
+/// assertion here aborted debug builds on untrusted model-emitted text (review, 2026-07-09).
 pub fn parse_with_ranges(src: &str) -> Result<Lowered> {
     let ast = crate::parse::parse_flow_text(src)?;
     let parse = parse_cst(src);
-    debug_assert!(
-        parse.errors.is_empty(),
-        "CST/legacy acceptance drift on a legacy-accepted source: {:?}",
-        parse.errors
-    );
     let mut ranges = RangeMap::default();
     map_flow(&parse.syntax(), &ast, &mut ranges);
     Ok(Lowered { ast, ranges })
@@ -337,56 +326,10 @@ fn recurse(node: &Node, stmt: &SyntaxNode, path: &str, ranges: &mut RangeMap) {
             pair_branches(stmt, branches.iter().map(|b| &b.body), path, ranges)
         }
         Node::Match { cases, default, .. } => {
-            let Some(block) = block_of(stmt) else { return };
-            let arms: Vec<SyntaxNode> = block
-                .children()
-                .filter(|c| c.kind() == SyntaxKind::CASE_ARM)
-                .collect();
-            if arms.len() == cases.len() {
-                for (j, (case, arm)) in cases.iter().zip(arms.iter()).enumerate() {
-                    let cpath = format!("{path}.cases[{j}]");
-                    ranges.insert(cpath.clone(), arm.text_range());
-                    pair_block(
-                        block_of(arm).as_ref(),
-                        &case.body,
-                        &format!("{cpath}.body"),
-                        ranges,
-                    );
-                }
-            }
-            let def_block = child_of(&block, SyntaxKind::DEFAULT_ARM).and_then(|d| block_of(&d));
-            pair_block(
-                def_block.as_ref(),
-                default,
-                &format!("{path}.default"),
-                ranges,
-            );
+            pair_cases(stmt, cases.iter().map(|c| &c.body), default, path, ranges)
         }
         Node::Route { cases, default, .. } => {
-            let Some(block) = block_of(stmt) else { return };
-            let arms: Vec<SyntaxNode> = block
-                .children()
-                .filter(|c| c.kind() == SyntaxKind::CASE_ARM)
-                .collect();
-            if arms.len() == cases.len() {
-                for (j, (case, arm)) in cases.iter().zip(arms.iter()).enumerate() {
-                    let cpath = format!("{path}.cases[{j}]");
-                    ranges.insert(cpath.clone(), arm.text_range());
-                    pair_block(
-                        block_of(arm).as_ref(),
-                        &case.body,
-                        &format!("{cpath}.body"),
-                        ranges,
-                    );
-                }
-            }
-            let def_block = child_of(&block, SyntaxKind::DEFAULT_ARM).and_then(|d| block_of(&d));
-            pair_block(
-                def_block.as_ref(),
-                default,
-                &format!("{path}.default"),
-                ranges,
-            );
+            pair_cases(stmt, cases.iter().map(|c| &c.body), default, path, ranges)
         }
         Node::Saga { steps } => {
             let Some(block) = block_of(stmt) else { return };
@@ -439,6 +382,42 @@ fn recurse(node: &Node, stmt: &SyntaxNode, path: &str, ranges: &mut RangeMap) {
         // Header-only / expression statements: statement-level range is the finest source truth.
         _ => {}
     }
+}
+
+/// Pair CASE_ARM children with case bodies (+ the DEFAULT_ARM block): the shared lowering for
+/// `match` and `route`, whose case structs differ in type but not in shape.
+fn pair_cases<'a>(
+    stmt: &SyntaxNode,
+    bodies: impl Iterator<Item = &'a Vec<Node>>,
+    default: &[Node],
+    path: &str,
+    ranges: &mut RangeMap,
+) {
+    let Some(block) = block_of(stmt) else { return };
+    let arms: Vec<SyntaxNode> = block
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::CASE_ARM)
+        .collect();
+    let bodies: Vec<&Vec<Node>> = bodies.collect();
+    if arms.len() == bodies.len() {
+        for (j, (body, arm)) in bodies.iter().zip(arms.iter()).enumerate() {
+            let cpath = format!("{path}.cases[{j}]");
+            ranges.insert(cpath.clone(), arm.text_range());
+            pair_block(
+                block_of(arm).as_ref(),
+                body,
+                &format!("{cpath}.body"),
+                ranges,
+            );
+        }
+    }
+    let def_block = child_of(&block, SyntaxKind::DEFAULT_ARM).and_then(|d| block_of(&d));
+    pair_block(
+        def_block.as_ref(),
+        default,
+        &format!("{path}.default"),
+        ranges,
+    );
 }
 
 /// Pair BRANCH_ARM children with branch bodies: `{path}.branches[j]` + `.branches[j].body[i]`.

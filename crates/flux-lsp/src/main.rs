@@ -46,11 +46,15 @@ impl Backend {
 
     /// Re-analyze `text` and publish diagnostics for `uri`.
     async fn refresh(&self, uri: Url, text: &str) {
-        let mut diags = diagnostics(text);
+        // One CST parse serves both phases: tolerant errors first; on a clean buffer, the SAME
+        // tree feeds the strict lowering + range side-map (previously this path parsed the buffer
+        // three times per keystroke — review finding, 2026-07-09).
+        let parsed = flux_lang::parser::parse_cst(text);
+        let mut diags = cst_diagnostics(&parsed, text);
         // On a cleanly-parsing flow, add analyzer findings (unknown ops, unbound `$vars`, arity)
         // as warnings — the L-59 range side-map turns their node paths into real spans.
         if diags.is_empty() {
-            diags = self.analyzer_diagnostics(text);
+            diags = self.analyzer_diagnostics(&parsed, text);
         }
         self.client.publish_diagnostics(uri, diags, None).await;
     }
@@ -197,8 +201,12 @@ impl Backend {
     /// resolve each diagnostic's rendered node path through the L-59 range side-map. Only single
     /// flows are analyzed (the analyzer is per-flow); anything unresolvable falls back to the
     /// document start so no finding is silently dropped.
-    fn analyzer_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
-        let Ok(lowered) = flux_lang::lower_cst::parse_with_ranges(text) else {
+    fn analyzer_diagnostics(
+        &self,
+        parsed: &flux_lang::parser::Parse,
+        text: &str,
+    ) -> Vec<Diagnostic> {
+        let Ok(lowered) = flux_lang::lower_cst::cst_to_draft(parsed, text) else {
             return Vec::new();
         };
         let catalog = SliceCatalog(&self.ops);
@@ -213,19 +221,24 @@ impl Backend {
         findings
             .iter()
             .map(|d| {
-                let range = lowered
+                let resolved = lowered
                     .ranges
                     .resolve_diagnostic(&d.message)
                     .map(|r| Range {
                         start: index.position(text, u32::from(r.start()) as usize),
                         end: index.position(text, u32::from(r.end()) as usize),
-                    })
-                    .unwrap_or_default();
+                    });
+                // An unresolvable path means the range side-map degraded (CST/legacy structure
+                // divergence) — say so instead of silently anchoring at the document start.
+                let message = match resolved {
+                    Some(_) => d.message.clone(),
+                    None => format!("{} (unlocated — range map incomplete)", d.message),
+                };
                 Diagnostic {
-                    range,
+                    range: resolved.unwrap_or_default(),
                     severity: Some(DiagnosticSeverity::WARNING),
                     source: Some("flux-lsp".into()),
-                    message: d.message.clone(),
+                    message,
                     ..Default::default()
                 }
             })
@@ -264,7 +277,11 @@ impl flux_lang::opspec::OpCatalog for SliceCatalog<'_> {
 }
 
 fn diagnostics(text: &str) -> Vec<Diagnostic> {
-    let parsed = flux_lang::parser::parse_cst(text);
+    cst_diagnostics(&flux_lang::parser::parse_cst(text), text)
+}
+
+/// Tolerant-parse errors from an already-built CST, as positioned LSP diagnostics.
+fn cst_diagnostics(parsed: &flux_lang::parser::Parse, text: &str) -> Vec<Diagnostic> {
     let index = LineIndex::new(text);
     parsed
         .errors

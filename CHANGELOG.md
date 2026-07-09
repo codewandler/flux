@@ -88,6 +88,29 @@ All notable changes to this project are documented in this file. The format is b
   tooling page, and the repo-local `.helix/languages.toml`) now show the `cargo install` route to
   the server for editor setup.
 
+### Fixed
+
+- **Review-hardening pass over the agent-speed epic (xhigh code review, 2026-07-09).** Op cache:
+  `now`, `evidence`, and `metrics` are now declared non-idempotent (a cached clock froze time
+  within a turn; cached metrics froze the agent's own progress signals), sub-agent `task`
+  dispatches carry `Effect::Process` so they invalidate the parent's cache, cache hits are
+  re-redacted against the CURRENT secret set, the invalidation generation now bumps BEFORE a
+  write's IO (closing a concurrent-read staleness window), the hit path no longer holds the cache
+  lock across the evidence lock, and `plan_turn` gets the same per-turn cache boundary as
+  `run_turn`. Scheduler: `throttle`/`debounce` are hard fences again (their name-keyed durable
+  buckets are invisible to the symbol hazard model), the binder-write collector is exhaustive (a
+  future binder variant can no longer silently vanish from the write set), and node summaries are
+  gathered in one visitor pass. Plan deltas: rejection feedback now carries the rejected plan's
+  content hash — the `base` that `emit_plan_delta` requires (previously the schema promised it
+  but nothing supplied it, so a model's first delta always failed) — the verdict bookkeeping is
+  shared between full emissions and deltas, and the hash derivation reuses the one shared
+  `sha256_hex`. Front-end: `parse`/`parse_program` are single-pass again (the CST + range map is
+  built only by `parse_with_ranges` for callers that consume ranges, i.e. the LSP), the
+  per-parse acceptance debug-asserts are gone (agreement is enforced by the dedicated test
+  guards; the asserts aborted debug builds on untrusted model-emitted text), the LSP parses once
+  per keystroke instead of three times, and analyzer warnings whose node path cannot be resolved
+  say "(unlocated)" instead of silently piling at the document start.
+
 ## [0.11.6] - 2026-07-09
 
 ### Added

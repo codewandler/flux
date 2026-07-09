@@ -132,11 +132,13 @@ struct NodeSummary {
 fn summarize(node: &Node, ops: &dyn OpCatalog) -> NodeSummary {
     let nodes = std::slice::from_ref(node);
     let mut reads = BTreeSet::new();
-    collect_var_reads(nodes, &mut reads);
     let mut writes = BTreeSet::new();
     let mut fenced = false;
     let mut barrier = false;
+    // One exhaustive pass gathers reads, binder writes, and the effect class together — the
+    // visitor previously ran twice per statement (review, 2026-07-09).
     crate::analyze::for_each_node(nodes, &mut |n| {
+        collect_leaf_read(n, &mut reads);
         collect_binder_writes(n, &mut writes);
         match n {
             Node::Call { op, .. } => {
@@ -150,6 +152,12 @@ fn summarize(node: &Node, ops: &dyn OpCatalog) -> NodeSummary {
             | Node::Once { .. }
             | Node::Saga { .. }
             | Node::Thing { .. } => fenced = true,
+            // Throttle/debounce carry durable, name-keyed session-store state
+            // (`__throttle_bucket_*` / `__debounce_last_*`) that the symbol-level hazard model
+            // cannot see: two same-name statements co-scheduled into one parallel stage would
+            // interleave their bucket read-modify-writes nondeterministically. Fence them, as the
+            // pre-L-53 scheduler effectively did (review finding, 2026-07-09).
+            Node::Throttle { .. } | Node::Debounce { .. } => fenced = true,
             Node::Return { .. } => barrier = true,
             _ => {}
         }
@@ -210,7 +218,35 @@ fn collect_binder_writes(n: &Node, acc: &mut BTreeSet<String>) {
                 w(&b.name);
             }
         }
-        _ => {}
+        // Exhaustive on purpose (mirrors the analyzer's no-`_` policy, F12): a future
+        // binder-carrying variant must be classified above or this match stops compiling — it can
+        // never silently vanish from the scheduler's write set (review finding, 2026-07-09).
+        Node::Repeat { collect: None, .. }
+        | Node::Await { binding: None, .. }
+        | Node::Try { catch: None, .. }
+        | Node::Call { .. }
+        | Node::When { .. }
+        | Node::Assert { .. }
+        | Node::Confirm { .. }
+        | Node::Throttle { .. }
+        | Node::Debounce { .. }
+        | Node::Unless { .. }
+        | Node::Verify { .. }
+        | Node::Return { .. }
+        | Node::Peek { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. }
+        | Node::Expr { .. }
+        | Node::Fmt { .. }
+        | Node::Jq { .. }
+        | Node::Parse { .. }
+        | Node::Match { .. }
+        | Node::Route { .. }
+        | Node::Saga { .. }
+        | Node::Checkpoint { .. }
+        | Node::Obj { .. }
+        | Node::List { .. } => {}
     }
 }
 
@@ -660,6 +696,33 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, Stage::Parallel(ids) if ids.contains(&NodeId(1)))),
             "a return-carrying node must not be parallelized: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_and_debounce_are_hard_fences() {
+        // Their name-keyed durable session-store state is invisible to the symbol hazard model,
+        // so they must never share a parallel stage (review finding, 2026-07-09).
+        let throttle = |i: u32| Node::Throttle {
+            name: "x".into(),
+            max: 1,
+            window_ms: 1000,
+            body: vec![bind(&format!("t{i}"), "read", vec![lit("f")])],
+        };
+        let stages = plan(vec![
+            bind("a", "read", vec![lit("x")]),
+            throttle(1),
+            throttle(2),
+            bind("b", "read", vec![lit("{{a}}{{t1}}{{t2}}")]),
+        ]);
+        assert_eq!(
+            stages,
+            vec![
+                Stage::Sequential(NodeId(0)),
+                Stage::ApprovalFence(NodeId(1)),
+                Stage::ApprovalFence(NodeId(2)),
+                Stage::Sequential(NodeId(3)),
+            ]
         );
     }
 

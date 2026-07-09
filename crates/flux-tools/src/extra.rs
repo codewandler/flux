@@ -595,12 +595,16 @@ pub struct NowTool;
 #[async_trait]
 impl Tool for NowTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec::read_only(
+        let mut spec = ToolSpec::read_only(
             "now",
             "Return the current wall-clock time: unix seconds and a UTC timestamp \
              (`YYYY-MM-DD HH:MM:SS UTC`). Replaces shelling out to `date`.",
             tool_input_schema::<NowInput>(),
-        )
+        );
+        // A clock is read-only but NOT deterministic: two calls must never return the same
+        // instant. NonIdempotent keeps it out of the op result cache (L-54 review, 2026-07-09).
+        spec.idempotency = Idempotency::NonIdempotent;
+        spec
     }
 
     fn permission_subjects(&self, _params: &Value) -> Vec<String> {

@@ -31,6 +31,10 @@ and relevant workspace or datasource snapshot are unchanged.
       and audit evidence that distinguishes cache hit from fresh execution.
 
 ## Progress
+- 2026-07-09 review fix: `now`/`evidence`/`metrics` declared NonIdempotent (frozen clock/metrics);
+  `task` carries Effect::Process (sub-agent writes invalidate the parent cache); hits re-redacted
+  against the current secret set; generation bumps BEFORE write IO; hit path drops the cache lock
+  before the evidence lock; `plan_turn` gets the same per-turn cache boundary as `run_turn`.
 - 2026-07-09 DONE. Cache lives in `flux-runtime::Executor` at the ONLY dispatch seam, probed
   strictly AFTER the whole authorization→approval envelope (a hit is served only to a caller the
   op is admissible for right now — the story's envelope invariant by construction). Key =

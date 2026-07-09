@@ -25,7 +25,7 @@ use flux_runtime::{
     ApprovalChoice, Approver, Executor, IdentityCell, PermissionManager, SpawnOutcome,
     SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
 };
-use flux_spec::{tool_input_schema, Idempotency, IntentSet, Risk, ToolSpec};
+use flux_spec::{tool_input_schema, Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
 use tokio_util::sync::CancellationToken;
 
@@ -753,7 +753,11 @@ impl Tool for TaskTool {
                 .into(),
             input_schema: tool_input_schema::<TaskInput>(),
             output_schema: None,
-            effects: Vec::new(),
+            // A sub-agent runs arbitrary work (on its own executor) over the SHARED workspace:
+            // declaring Process makes every `task` dispatch bump the parent's op-cache
+            // invalidation generation, so post-task reads never replay pre-task state (L-54
+            // review, 2026-07-09).
+            effects: vec![Effect::Process],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),

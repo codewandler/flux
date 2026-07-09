@@ -96,7 +96,9 @@ impl Tool for EvidenceOp {
             output_schema: None,
             effects: vec![Effect::Read],
             risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
+            // Read-only but NOT deterministic: the result reflects the evidence log, which grows on
+            // every dispatch — caching would freeze the agent's own progress signals (L-54 review).
+            idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
             group: None,
         }
@@ -138,7 +140,9 @@ impl Tool for MetricsOp {
             output_schema: None,
             effects: vec![Effect::Read],
             risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
+            // Read-only but NOT deterministic: the result reflects the evidence log, which grows on
+            // every dispatch — caching would freeze the agent's own progress signals (L-54 review).
+            idempotency: Idempotency::NonIdempotent,
             access: Vec::new(),
             group: None,
         }
