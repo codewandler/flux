@@ -35,7 +35,6 @@ _The question that triggered this epic: *what can the agent do today to enumerat
 
 ### flux-render — a built-in `flow_render` tool: flux source/plan → SVG (+ later PNG)
 _`.flux` has three highlighting stories today, and each is confined to a live program:_
-- [L-75 — render_styled_spans — span form of the plan-tree renderer (ANSI refactored on top)](L-75-render-styled-spans.md) · Language · one tree walk, two presentations: render.rs gains render_styled_spans (lines of (text, Role)); render_styled becomes the ANSI stringifier over it — flux-tui output byte-identical
 - [L-76 — flow_render built-in tool — flux source/plan → SVG (source + tree views)](L-76-flow-render-tool-svg.md) · Language · model-facing flow_render beside flow_list/flow_run: render_flux_svg pure core in flux-tools (One-Dark theme ported verbatim from the tree-sitter Node script), source|tree views, name-or-source input, SVG returned inline via ok_view — text-only ToolResult keeps it read-only/SVG-only
 - [L-77 — flux render CLI subcommand + retire the tree-sitter doc-image Node script](L-77-flux-render-cli-subcommand.md) · Language · flux render <file.flux> [--view source|tree] [-o out.svg] over render_flux_svg (SVG is text → system.write_file); becomes the doc-image generator — flux-tree-sitter's scripts/render-example.mjs retires, its README/AGENTS point at flux render
 
@@ -356,6 +355,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-72 — flow_list/flow_run tools + unify flows and ops under ~/.flux/flows](L-72-flow-list-run-flows-home.md) · Language · flow_list/flow_run agent tools; ~/.flux/flows (@global_flows) is the unified home for reusable flows/ops (auto-load); fixed base_for bare-@name resolution
 - [L-73 — Public editor-setup docs page (Helix flagship) + LSP docs pass](L-73-editor-setup-docs-page.md) · Language · Pulls the docs bullet of L-70 forward: website editors page, Helix highlight→LSP recipe, cross-links, flux-lsp crate README.
 - [L-74 — flux_lang::highlight — CST-classified highlight spans (L0 substrate)](L-74-flux-lang-highlight-substrate.md) · Language · the shared highlight substrate: parse_cst walk classifies every token into HighlightClass spans by kind + parent-node kind; total (highlights invalid source); also the substrate flux-lsp L-69 semantic tokens adapts later
+- [L-75 — render_styled_spans — span form of the plan-tree renderer (ANSI refactored on top)](L-75-render-styled-spans.md) · Language · one tree walk, two presentations: render.rs gains render_styled_spans (lines of (text, Role)); render_styled becomes the ANSI stringifier over it — flux-tui output byte-identical
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

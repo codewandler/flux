@@ -2,8 +2,7 @@
 id: L-75
 title: render_styled_spans — span form of the plan-tree renderer (ANSI refactored on top)
 pillar: Language
-status: ready
-priority: 14
+status: done
 epic: flux-render
 design: docs/designs/flux-render.md
 note: "one tree walk, two presentations: render.rs gains render_styled_spans (lines of (text, Role)); render_styled becomes the ANSI stringifier over it — flux-tui output byte-identical"
@@ -19,17 +18,22 @@ over those spans. `Role` mirrors the current `Palette` fields (`keyword`/`op`/`s
 L-76) then build on **one** tree walk — no "render to ANSI then parse it back" round-trip.
 
 ## Acceptance
-- [ ] `crates/flux-lang/src/render.rs` gains `Role` + `render_styled_spans`; `render_styled` is
+- [x] `crates/flux-lang/src/render.rs` gains `Role` + `render_styled_spans`; `render_styled` is
   reimplemented as the ANSI palette applied to those spans.
-- [ ] Failing-first test: for a representative flow AST, joining each span line's `text` fragments
+- [x] Failing-first test: for a representative flow AST, joining each span line's `text` fragments
   reproduces the plain (uncoloured) render line-for-line, and connector glyphs (`├─`/`└─`/`│`)
   carry `Role::Connector`.
-- [ ] Behavior-preserving: all existing `render.rs` / `flux-tui` tests pass unchanged — the ANSI
+- [x] Behavior-preserving: all existing `render.rs` / `flux-tui` tests pass unchanged — the ANSI
   output of `render_styled` stays byte-identical (pin one snapshot if none exists).
-- [ ] Gate green: `cargo build/test/clippy -D warnings/fmt` + `cargo test -p flux-codegate`.
+- [x] Gate green: `cargo build/test/clippy -D warnings/fmt` + `cargo test -p flux-codegate`.
 
 ## Progress
-- (not started)
+- 2026-07-09 — DONE. `Role` (the 8 palette roles + `Text` for structural glue) +
+  `render_styled_spans` landed; `head`/`expr`/`lit`/`eff`/`thing_span` now emit spans and
+  `render_styled` is the palette stringifier over them. Byte-identity guarded by a marker-palette
+  snapshot test (`styled_ansi_output_is_pinned_byte_exact`) written and pinned against the
+  pre-refactor renderer, incl. the connector-wrapped indent-only runs (`"   "`/`"│  "`).
+  Failing-first span test: `spans_join_to_plain_render_and_connectors_carry_role`. Full gate green.
 
 ## Notes
 - Design: [flux-render.md](../designs/flux-render.md) § "2. `flux_lang::render`".

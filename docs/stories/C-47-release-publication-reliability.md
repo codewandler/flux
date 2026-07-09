@@ -34,6 +34,15 @@ matters on both the binary and crate paths.
 - [x] Documented in the release runbook alongside the crates.io publish flow.
 
 ## Progress
+- 2026-07-09 ROOT CAUSE CONFIRMED on v0.12.0/v0.12.1: the Release workflow's host step fails with
+  `HTTP 403: Resource not accessible by personal access token` on POST /releases — the scoped
+  RELEASE_TOKEN (cf1612f) has lost/lacks Contents:write (expired or mis-scoped fine-grained PAT).
+  Every platform build succeeds; only release creation dies, reproducing N-001 exactly (tag with
+  no Release object). MANUAL BACKFILL RUNBOOK PROVEN (v0.12.1): `gh run download <release-run-id>`
+  -> `gh release create vX.Y.Z <16 assets>` with the local repo-scoped token ->
+  `scripts/verify-github-release.sh`. UNBLOCK: maintainer must mint a fresh RELEASE_TOKEN with
+  Contents: read+write on codewandler/flux (or revert the step to GITHUB_TOKEN with
+  `permissions: contents: write`).
 - 2026-07-09: Root cause confirmed from failed Release run logs for `v0.9.3` and `v0.11.0`: the
   hand-written `gh release create` step returned `HTTP 403: Resource not accessible by integration`
   when it fell back to `GITHUB_TOKEN`. `v0.9.3` still has a tag and no GitHub Release; `v0.11.0` was

@@ -17,6 +17,14 @@ All notable changes to this project are documented in this file. The format is b
   (never panics), with a `"""triple"""` string as one span covering all its lines. The shared
   substrate for the `flow_render` SVG source view (L-76) and, later, flux-lsp semantic tokens
   (L-69). No new deps.
+- **L-75 — `flux_lang::render`: span form of the plan-tree renderer.** New public `Role` enum
+  (the eight `Palette` roles + `Text` for structural glue) and
+  `render_styled_spans(ast) -> Vec<Vec<(String, Role)>>` — the same tree walk emitting lines of
+  `(text, role)` spans, with every tree glyph (`├─`/`└─`/`│`, including indent-only runs)
+  carrying `Role::Connector`. `render_styled` is now the ANSI-palette stringifier over those
+  spans — byte-identical output, pinned by a marker-palette snapshot test written against the
+  pre-refactor renderer — so `flux-tui` (ANSI) and the `flow_render` SVG tree view (L-76) share
+  one walk instead of a "render to ANSI then parse it back" round-trip. No new deps.
 
 ## [0.12.0] - 2026-07-09
 
