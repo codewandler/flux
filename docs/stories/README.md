@@ -31,6 +31,13 @@ _None._
 - [L-55 — Plan-delta emission for cheap safe repairs](L-55-plan-delta-emission.md) · Language · KF3: let repair turns patch the previous AST, then materialize and validate the full plan before execution
 - [L-56 — Automatic context slicing for planner and model ops](L-56-automatic-context-slicing.md) · Language · KF4: derive the minimum model-visible context from HIR symbol reads, op schemas, and policy-visible evidence boundaries
 
+### flux-render — a built-in `flow_render` tool: flux source/plan → SVG (+ later PNG)
+_`.flux` has three highlighting stories today, and each is confined to a live program:_
+- [L-74 — flux_lang::highlight — CST-classified highlight spans (L0 substrate)](L-74-flux-lang-highlight-substrate.md) · Language · the shared highlight substrate: parse_cst walk classifies every token into HighlightClass spans by kind + parent-node kind; total (highlights invalid source); also the substrate flux-lsp L-69 semantic tokens adapts later
+- [L-75 — render_styled_spans — span form of the plan-tree renderer (ANSI refactored on top)](L-75-render-styled-spans.md) · Language · one tree walk, two presentations: render.rs gains render_styled_spans (lines of (text, Role)); render_styled becomes the ANSI stringifier over it — flux-tui output byte-identical
+- [L-76 — flow_render built-in tool — flux source/plan → SVG (source + tree views)](L-76-flow-render-tool-svg.md) · Language · model-facing flow_render beside flow_list/flow_run: render_flux_svg pure core in flux-tools (One-Dark theme ported verbatim from the tree-sitter Node script), source|tree views, name-or-source input, SVG returned inline via ok_view — text-only ToolResult keeps it read-only/SVG-only
+- [L-77 — flux render CLI subcommand + retire the tree-sitter doc-image Node script](L-77-flux-render-cli-subcommand.md) · Language · flux render <file.flux> [--view source|tree] [-o out.svg] over render_flux_svg (SVG is text → system.write_file); becomes the doc-image generator — flux-tree-sitter's scripts/render-example.mjs retires, its README/AGENTS point at flux render
+
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
@@ -42,13 +49,16 @@ _None._
 
 ### flux-lsp — a Language Server for Flux-Lang, wired into Helix
 _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compile`; the IntelliJ_
-- [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
 - [L-68 — flux-lsp document symbols + go-to-definition](L-68-flux-lsp-symbols-and-goto-def.md) · Language · Navigation — a CST scope model with definition ranges powers documentSymbol + definition.
 - [L-69 — flux-lsp semantic tokens — for clients that render them](L-69-flux-lsp-semantic-tokens.md) · Language · Semantic tokens from the CST token stream — NOT a Helix path (Helix renders tree-sitter only; highlighting now comes from codewandler/flux-tree-sitter). Value: VS Code/Neovim + semantic distinctions a grammar can't make.
 - [L-70 — Incremental reparse + comment-preserving format + docs/packaging + epic close](L-70-flux-lsp-incremental-docs-epic-close.md) · Language · Epic close — the CST payoffs (incremental reparse, comment-preserving format) + distribution + final gate. Install/Helix docs shipped early in L-73.
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
+
+### flux-render — a built-in `flow_render` tool: flux source/plan → SVG (+ later PNG)
+_`.flux` has three highlighting stories today, and each is confined to a live program:_
+- [L-78 — flux render PNG output — resvg rasterization + embedded font + write_file_bytes](L-78-flux-render-png.md) · Language · Phase 2, opt-in: flux-system gains write_file_bytes; flux-tools gains resvg/usvg/tiny-skia/fontdb + an embedded monospace font (headless text layout); CLI -o out.png rasterizes L-77's SVG — model-facing tool stays SVG-only; ⚠ confirm flux-codegate accepts the new deps
 
 ### GitLab plugin hardening (epic)
 _The `gitlab` plugin has outgrown its connectivity phase — its 64-op surface is broadly useful, but_
@@ -321,6 +331,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-52 — Data-transforms docs pass + rewrite deterministic LLM-as-mapper patterns + final gate](L-52-transforms-docs-examples-pass.md) · Language · the epic's closing story: public docs get the new vocabulary + native-text examples the user asked for; the LLM-as-mapper anti-patterns in-repo get replaced where honest
 - [L-57 — SyntaxKind + lossless layout-aware lexer for the CST front-end](L-57-cst-syntaxkind-lossless-lexer.md) · Language · CST foundation — GATED on flux-lang front-end isolation (no worktree). Lossless token stream: comments/newlines as trivia, `\"\"\"` one STRING token, significant NEWLINE/INDENT/DEDENT.
 - [L-58 — Tolerant event parser + rowan green tree with ERROR-node recovery](L-58-cst-tolerant-parser-rowan-tree.md) · Language · CST foundation — GATED on isolation. The error-recovery core: a hand-written event parser that always completes a tree, wrapping unexpected input in ERROR nodes and resyncing at NEWLINE/DEDENT.
+- [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
 - [L-60 — Native syntax — Memo / Once / Checkpoint / Await (durability & idempotency)](L-60-native-syntax-durability-nodes.md) · Language · @json coverage 1/4 — GATED on isolation. Native text for the single-header durability/idempotency nodes so they stop round-tripping via @json.
 - [L-61 — Native syntax — Confirm / Throttle / Debounce / Verify + Peek / Parse](L-61-native-syntax-guardrails-and-sugar.md) · Language · @json coverage 2/4 — GATED on isolation. Native text for the guard-rail nodes plus the peek/parse expression sugar (parse( needs a fmt(-style special-case).
 - [L-62 — Native syntax — Try / Race / Scope / Saga / Pipe (arm/body control-flow)](L-62-native-syntax-arm-body-control-flow.md) · Language · @json coverage 3/4 — GATED on isolation. Native text for the arm/body control-flow nodes, reusing the match/case/branch parser machinery.

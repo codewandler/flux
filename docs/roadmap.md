@@ -78,6 +78,23 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### flux-render — `flow_render`: flux source/plan → SVG (epic) — **proposed 2026-07-09 (L-74…L-78)**
+
+A model-facing built-in tool `flow_render` (beside `flow_list`/`flow_run`) that turns Flux-Lang into
+a syntax-highlighted image — the highlighted **source** or the **execution-path tree** — rendered
+entirely from flux's own view of the code: the lossless rowan CST for source, the `render_styled`
+plan renderer for the tree. No tree-sitter, no external toolchain. Serves the surfaces that can't
+run a grammar (GitHub READMEs, Slack, docs, chat/tool-result panels) and lets flux regenerate its
+own doc images, retiring the brittle Node script in `flux-tree-sitter`. Layered for reuse: a pure
+`flux_lang::highlight` substrate ([L-74](stories/L-74-flux-lang-highlight-substrate.md) — also the
+base flux-lsp L-69 semantic tokens will adapt), a span form of the plan renderer
+([L-75](stories/L-75-render-styled-spans.md)), the SVG tool itself
+([L-76](stories/L-76-flow-render-tool-svg.md)), a `flux render` CLI subcommand that replaces the
+Node doc-image script ([L-77](stories/L-77-flux-render-cli-subcommand.md)), and deferred opt-in PNG
+rasterization ([L-78](stories/L-78-flux-render-png.md), backlog — the only story that adds deps).
+Phase 1 is SVG-only by constraint and by design: `ToolResult` is text-only, so the model-facing tool
+stays read-only string generation. Design: [designs/flux-render.md](designs/flux-render.md).
+
 ### v0.6.0 beta hardening (epic) — ✅ **done 2026-07-08 (external beta test)**
 
 The first external beta test of a shipped release (Codex, clean `/tmp` workspace vs. the published
