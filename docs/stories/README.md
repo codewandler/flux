@@ -10,12 +10,11 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.11.0 (2026-07-09) — enriched `flux usage` reporting + pricing, plus the strict
-  field-access / model-ingress normalization pass. **In flight (`[Unreleased]`):** the Flux-Lang
-  agent-speed epic is now tracked (L-53–L-56); `flux usage` gains time-window metrics and
-  unpriced-reason surfacing; planner field-access ingress is consistently lenient. **Focus:** the
-  Language pillar — the `data-transforms` epic (L-46–L-52) is shipped; `flux-lang-agent-speed`
-  (L-53–L-56) now leads the ready queue. See [CHANGELOG](../../CHANGELOG.md).
+- **Released:** v0.11.6 (2026-07-09) — the `flow_list` / `flow_run` tools + the `~/.flux/flows`
+  unified flows/ops home (L-72), the L-71 merged-Node-schema planner emission default, and the
+  bare-`@name` named-root fix. **In flight (`[Unreleased]`):** `task install` now also installs
+  `flux-lsp`. **Focus:** the Language pillar — the `data-transforms` epic (L-46–L-52) is shipped;
+  `flux-lang-agent-speed` (L-53–L-56) leads the ready queue. See [CHANGELOG](../../CHANGELOG.md).
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 <!-- BEGIN track:board -->
