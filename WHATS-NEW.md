@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-09
+
 ### New
 
 - Agents can now use a real web browser — the non-visual way. flux drives headless Chrome and lets

@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-09
+
 ### Fixed
 
 - **C-49 — Claude provider hardening: every documented model spec now works or fails
