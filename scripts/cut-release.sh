@@ -86,8 +86,11 @@ fi
 git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md
 git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock both workspaces.
 - Roll CHANGELOG [Unreleased] -> [$NEW]."
-git tag "v$NEW"
+# Annotated, not lightweight: `git push --follow-tags` only pushes annotated tags (a lightweight
+# tag here silently stayed local on the 0.11.4 cut and the workflows never fired).
+git tag -a "v$NEW" -m "flux $NEW"
 
 echo
 echo "== cut v$NEW. Review 'git show', then push to trigger the Release + crates.io workflows: =="
-echo "   git push --follow-tags origin main"
+echo "   git push origin main \"v$NEW\""
+echo "   (verify: git ls-remote origin \"refs/tags/v$NEW\")"
