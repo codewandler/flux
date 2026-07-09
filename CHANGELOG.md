@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-07-09
+
 ### Added
 
 - **`flow_list` / `flow_run` tools — the agent can discover and run stored flows.** Reusable
