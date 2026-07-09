@@ -2,7 +2,7 @@
 id: L-63
 title: Native syntax — Thing (kind + selector grammar)
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lang-cst.md
@@ -24,7 +24,14 @@ per the reviewed CST proposal, across CST production + `format` arm + `cst_to_dr
       **no** `@json`; the `@json` guard tests migrated off `Thing`.
 
 ## Progress
-- (not started — gated on isolation; depends on L-59)
+- Done 2026-07-09 (parse.rs + format.rs): native expression syntax `thing <kind> <selector> "<value>"`
+  — kind ∈ {context/file/person/ticket/email/repo/dataset/calendar_event/url/secret} or
+  `custom "<name>"`; selector ∈ {id/name/path/query/key}. Every `ThingRef` is spellable, so no guard
+  needed. Native in expression position (op args, bind values — where references are used); a bare
+  `thing` *statement* still uses `@json` (consistent with `fmt`/`jq` bare-statement rendering).
+  `thing_references_round_trip_natively` + the random property test pass; full suite green; clippy +
+  fmt clean. **Closes the @json coverage gap — all 16 formerly-@json-only node kinds now have native
+  syntax.**
 
 ## Notes
 - **Gated** on isolation. Depends on **L-59**. Cleanly **deferrable** — the epic can ship native

@@ -2262,6 +2262,69 @@ fn parse_pipe(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)
     Ok((Node::Pipe { steps, bind }, 1 + region.len()))
 }
 
+/// `thing <kind> <selector> "<value>"` — an external reference. `rest` is the text after `thing`.
+/// `<kind>` is a known kind word or `custom "<name>"`; `<selector>` is `id`/`name`/`path`/`query`/`key`.
+fn parse_thing(rest: &str) -> Result<(Node, &str)> {
+    let (kind_word, r) = take_while(rest.trim_start(), is_ident_char);
+    if kind_word.is_empty() {
+        return Err(perr(
+            "`thing` expects a kind (e.g. `person`, `file`, `url`, or `custom \"…\"`)",
+        ));
+    }
+    let (kind, r) = if kind_word == "custom" {
+        let (name, r2) = take_string(r.trim_start(), "thing custom kind")?;
+        (crate::ast::ThingKind::Custom(name), r2)
+    } else {
+        (
+            thing_kind_from_word(kind_word)
+                .ok_or_else(|| perr(&format!("unknown `thing` kind: `{kind_word}`")))?,
+            r,
+        )
+    };
+    let (sel_word, r) = take_while(r.trim_start(), is_ident_char);
+    let (value, r) = take_string(r.trim_start(), "thing selector")?;
+    let selector = selector_from_word(sel_word, value).ok_or_else(|| {
+        perr(&format!(
+            "unknown `thing` selector: `{sel_word}` (use id/name/path/query/key)"
+        ))
+    })?;
+    Ok((
+        Node::Thing {
+            thing: crate::ast::ThingRef { kind, selector },
+        },
+        r,
+    ))
+}
+
+fn thing_kind_from_word(w: &str) -> Option<crate::ast::ThingKind> {
+    use crate::ast::ThingKind::*;
+    Some(match w {
+        "context" => Context,
+        "file" => File,
+        "person" => Person,
+        "ticket" => Ticket,
+        "email" => Email,
+        "repo" => Repo,
+        "dataset" => Dataset,
+        "calendar_event" => CalendarEvent,
+        "url" => Url,
+        "secret" => Secret,
+        _ => return None,
+    })
+}
+
+fn selector_from_word(w: &str, v: String) -> Option<crate::ast::Selector> {
+    use crate::ast::Selector::*;
+    Some(match w {
+        "id" => Id(v),
+        "name" => Name(v),
+        "path" => Path(v),
+        "query" => Query(v),
+        "key" => Key(v),
+        _ => return None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -2488,6 +2551,8 @@ fn parse_expr(s: &str) -> Result<(Node, &str)> {
                         }
                         Ok((Node::Peek { name: name.into() }, tail))
                     }
+                    // `thing <kind> <selector> "<value>"` — an external reference.
+                    "thing" => parse_thing(rest),
                     _ => Err(perr(&format!("unexpected token: `{ident}`"))),
                 }
             }
@@ -2948,6 +3013,42 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("pipe -> $out"), "{text}");
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn thing_references_round_trip_natively() {
+        use crate::ast::{Selector, ThingKind, ThingRef};
+        let mk = |kind: ThingKind, selector: Selector| Node::Thing {
+            thing: ThingRef { kind, selector },
+        };
+        let ast = DraftAst {
+            body: vec![
+                bind("f", mk(ThingKind::File, Selector::Path("src/x.rs".into()))),
+                bind("p", mk(ThingKind::Person, Selector::Name("john".into()))),
+                bind("u", mk(ThingKind::Url, Selector::Id("https://x".into()))),
+                bind(
+                    "c",
+                    mk(
+                        ThingKind::Custom("widget".into()),
+                        Selector::Key("w-1".into()),
+                    ),
+                ),
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            !text.contains("@json"),
+            "thing refs should render natively:\n{text}"
+        );
+        assert!(text.contains("$f = thing file path \"src/x.rs\""), "{text}");
+        assert!(text.contains("$p = thing person name \"john\""), "{text}");
+        assert!(text.contains("$u = thing url id \"https://x\""), "{text}");
+        assert!(
+            text.contains("$c = thing custom \"widget\" key \"w-1\""),
+            "{text}"
+        );
         assert_round_trips(&ast);
     }
 

@@ -359,6 +359,16 @@ fn fmt_expr(node: &Node, multiline: bool) -> String {
                 compact_str(as_type, multiline)
             )
         }
+        // `thing <kind> <selector> "<value>"` — an external reference.
+        Node::Thing { thing } => {
+            let (sel_word, val) = selector_word_value(&thing.selector);
+            format!(
+                "thing {} {} {}",
+                thing_kind_word(&thing.kind, multiline),
+                sel_word,
+                compact_str(val, multiline)
+            )
+        }
         other => format!("@json {}", compact(other)),
     }
 }
@@ -506,6 +516,36 @@ fn join_syms(syms: &[SymbolName]) -> String {
 /// be spelled natively rather than escaped. `Expr` needs `parse_condition_expr`, so it is excluded.
 fn call_like_operand(n: &Node, multiline: bool) -> bool {
     !matches!(n, Node::Expr { .. }) && !fmt_expr(n, multiline).starts_with("@json ")
+}
+
+/// The native word for a [`crate::ast::ThingKind`] (a `Custom` kind renders `custom "<name>"`).
+fn thing_kind_word(k: &crate::ast::ThingKind, multiline: bool) -> String {
+    use crate::ast::ThingKind::*;
+    match k {
+        Context => "context".into(),
+        File => "file".into(),
+        Person => "person".into(),
+        Ticket => "ticket".into(),
+        Email => "email".into(),
+        Repo => "repo".into(),
+        Dataset => "dataset".into(),
+        CalendarEvent => "calendar_event".into(),
+        Url => "url".into(),
+        Secret => "secret".into(),
+        Custom(s) => format!("custom {}", compact_str(s, multiline)),
+    }
+}
+
+/// The native word and inner value of a [`crate::ast::Selector`].
+fn selector_word_value(s: &crate::ast::Selector) -> (&'static str, &String) {
+    use crate::ast::Selector::*;
+    match s {
+        Id(v) => ("id", v),
+        Name(v) => ("name", v),
+        Path(v) => ("path", v),
+        Query(v) => ("query", v),
+        Key(v) => ("key", v),
+    }
 }
 
 fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut String) {
