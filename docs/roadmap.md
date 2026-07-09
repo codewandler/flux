@@ -134,11 +134,14 @@ syntax gap closed**: the 16 node kinds that formerly only round-tripped through 
 property-tested — `@json` remains only as the escape for unspellable shapes. **(2) flux-lsp:** a
 standalone `flux-lsp` (tower-lsp) server wired into Helix (`hx`) config-only — diagnostics from
 the CST parser, completion (ops/keywords/prelude/`$vars`), hover (op signatures + node-kind docs),
-and formatting (L-64–L-67). Remaining backlog: L-59 (re-point `parse` onto the CST via
-`cst_to_draft` — until then the proven legacy front-end stays authoritative and the CST powers the
-LSP), L-68 (symbols/go-to-def), L-69 (semantic tokens), L-70 (incremental reparse +
-comment-preserving format, epic closeout). Designs:
-[designs/flux-lang-cst.md](designs/flux-lang-cst.md), [designs/flux-lsp.md](designs/flux-lsp.md).
+and formatting (L-64–L-67). Syntax **highlighting** ships separately as the sibling
+[`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) grammar
+(Helix/Neovim/Zed — Helix renders tree-sitter only, not LSP semantic tokens). Remaining backlog:
+L-59 (re-point `parse` onto the CST via `cst_to_draft` — until then the proven legacy front-end
+stays authoritative and the CST powers the LSP), L-68 (symbols/go-to-def), L-69 (semantic tokens,
+re-scoped to clients that render them), L-70 (incremental reparse + comment-preserving format,
+epic closeout). Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
+[designs/flux-lsp.md](designs/flux-lsp.md).
 
 ### A2A protocol conformance (epic) — **proposed 2026-07-07**
 

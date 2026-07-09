@@ -45,7 +45,7 @@ _None._
 _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compile`; the IntelliJ_
 - [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
 - [L-68 — flux-lsp document symbols + go-to-definition](L-68-flux-lsp-symbols-and-goto-def.md) · Language · Navigation — a CST scope model with definition ranges powers documentSymbol + definition.
-- [L-69 — flux-lsp semantic tokens — Helix highlighting](L-69-flux-lsp-semantic-tokens.md) · Language · Highlighting via LSP semantic tokens from the CST token stream — Helix has no tree-sitter-flux, so this is its highlighting path (near-free from the CST).
+- [L-69 — flux-lsp semantic tokens — for clients that render them](L-69-flux-lsp-semantic-tokens.md) · Language · Semantic tokens from the CST token stream — NOT a Helix path (Helix renders tree-sitter only; highlighting now comes from codewandler/flux-tree-sitter). Value: VS Code/Neovim + semantic distinctions a grammar can't make.
 - [L-70 — Incremental reparse + comment-preserving format + docs/packaging + epic close](L-70-flux-lsp-incremental-docs-epic-close.md) · Language · Epic close — the CST payoffs (incremental reparse, comment-preserving format) + install/Helix docs + distribution + final gate.
 
 ### flux-planner: from trained-and-usable to shippable

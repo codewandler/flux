@@ -91,6 +91,26 @@ Editing conventions: 2-space indentation, no tabs, one statement per line. See
 [Flows & syntax](./flows-and-syntax.md) for the grammar and the
 [examples cookbook](./examples.md) for ready-to-run material.
 
+## Editor support
+
+Two complementary pieces, matching how modern editors split the work:
+
+- **`flux-lsp` — language intelligence.** A Language Server in the flux repository
+  (`cargo build -p flux-lsp`): live error-recovering diagnostics with real spans, completion
+  (ops, node-kind keywords, prelude types, in-scope `$vars`), hover (op signatures with
+  effects/risk, node-kind docs), and document formatting via the invertible formatter. Helix
+  needs config only — see the repo's
+  [`.helix/languages.toml`](https://github.com/codewandler/flux/blob/main/.helix/languages.toml);
+  any LSP-capable editor can wire the same binary.
+- **[`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) — syntax
+  highlighting.** A tree-sitter grammar with highlight/injection queries for **Helix, Neovim, and
+  Zed** (none of which read TextMate grammars). Note that Helix colours via tree-sitter *only* —
+  it does not render LSP semantic tokens — so in Helix the grammar provides all colour and the
+  LSP provides everything else. Install instructions per editor are in that repo's README.
+
+[`codewandler/flux-editors`](https://github.com/codewandler/flux-editors) additionally ships the
+TextMate grammar and the IntelliJ plugin for their own ecosystems.
+
 ## Related docs
 
 - [Flows & syntax](./flows-and-syntax.md) — write valid `.flux` text.

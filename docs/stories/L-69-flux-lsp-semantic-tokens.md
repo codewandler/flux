@@ -1,19 +1,23 @@
 ---
 id: L-69
-title: flux-lsp semantic tokens — Helix highlighting
+title: flux-lsp semantic tokens — for clients that render them
 pillar: Language
 status: backlog
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
-note: "Highlighting via LSP semantic tokens from the CST token stream — Helix has no tree-sitter-flux, so this is its highlighting path (near-free from the CST)."
+note: "Semantic tokens from the CST token stream — NOT a Helix path (Helix renders tree-sitter only; highlighting now comes from codewandler/flux-tree-sitter). Value: VS Code/Neovim + semantic distinctions a grammar can't make."
 ---
 
-# flux-lsp semantic tokens — Helix highlighting
+# flux-lsp semantic tokens — for clients that render them
 
 ## Goal
-Emit `textDocument/semanticTokens` classified from the CST token stream (`SyntaxKind`) so Helix — which
-has no `tree-sitter-flux` grammar — gets syntax highlighting from the server.
+Emit `textDocument/semanticTokens` classified from the CST token stream (`SyntaxKind`) for LSP
+clients that render them (VS Code; Neovim layered over tree-sitter). **Not a Helix feature**:
+Helix (as of 25.07) colours via tree-sitter only, and Flux highlighting there is covered by
+[`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter). The residual
+value here is *semantic* classification a grammar can't do — e.g. a registry-known op vs an
+unknown identifier, bound vs unbound `$symbols`.
 
 ## Acceptance
 - [ ] `initialize` advertises a semantic-tokens legend (keyword, op, string, number, `$symbol`,
@@ -26,5 +30,7 @@ has no `tree-sitter-flux` grammar — gets syntax highlighting from the server.
 - (not started — depends on L-59/L-64)
 
 ## Notes
-- Depends on **L-64** + the CST token stream. A native `tree-sitter-flux` grammar remains an explicit
-  out-of-scope future track.
+- Depends on **L-64** + the CST token stream.
+- 2026-07-09: `codewandler/flux-tree-sitter` shipped (grammar + queries for Helix/Neovim/Zed),
+  which removes the original "Helix highlighting" motivation entirely — re-scoped as above and
+  deprioritized accordingly.

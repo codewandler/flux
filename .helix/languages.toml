@@ -1,8 +1,14 @@
 # Flux-Lang editor support for Helix (`hx`) — config only, no extension needed.
 #
-# Build the server once (`cargo build -p flux-lsp`) and put the binary on PATH, or point `command`
-# at the built binary (e.g. `target/debug/flux-lsp`). Then `hx foo.flux` gets live diagnostics
-# (error-recovering, with real spans), op/keyword/`$var` completion, hover, and `:format`.
+# Server (diagnostics, completion, hover, :format): build once (`cargo build -p flux-lsp`) and put
+# the binary on PATH, or point `command` at the built binary (e.g. `target/debug/flux-lsp`).
+#
+# Highlighting: Helix colours via tree-sitter ONLY (it does not render LSP semantic tokens), so
+# colour comes from the grammar below. After `hx --grammar fetch && hx --grammar build`, copy the
+# grammar repo's queries where Helix looks for them:
+#   mkdir -p ~/.config/helix/runtime/queries/flux
+#   cp <flux-tree-sitter>/queries/*.scm ~/.config/helix/runtime/queries/flux/
+# Full instructions: https://github.com/codewandler/flux-tree-sitter
 #
 # This repo-local file is merged over your global `~/.config/helix/languages.toml`.
 
@@ -16,3 +22,7 @@ file-types = ["flux"]
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
 language-servers = ["flux-lsp"]
+
+[[grammar]]
+name = "flux"
+source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "main" }

@@ -48,7 +48,7 @@ capabilities) · `document.rs` (open-buffer store + line-index) · `convert.rs` 
 | **Formatting** | `format::format` on the lowered `DraftAst` | `textDocument/formatting`; also add a `flux fmt [--check]` CLI verb (none exists) |
 | **Document symbols** | CST scope model | later (L-68) |
 | **Go-to-definition** | `$var` bind sites with def ranges (CST) | later (L-68) |
-| **Semantic tokens** | CST token stream classified by `SyntaxKind` | later (L-69); the Helix highlighting path |
+| **Semantic tokens** | CST token stream classified by `SyntaxKind` | later (L-69); only for clients that render them — Helix does not (see Highlighting below) |
 
 ## Helix wiring (config-only; Helix 25.07.1 present)
 
@@ -68,13 +68,22 @@ indent = { tab-width = 2, unit = "  " }
 language-servers = ["flux-lsp"]
 ```
 
-## Highlighting & tree-sitter (out of scope)
+## Highlighting & tree-sitter
 
-Helix has no `tree-sitter-flux` grammar, so syntax highlighting comes from the server's **semantic
-tokens** (L-69), which the CST token stream makes near-free. A native `tree-sitter-flux` grammar
-(which would give Helix editor-native highlighting/folding without the server running) is an
-**explicit out-of-scope future track**, not part of this epic. The in-repo Prism (website) and
-TextMate (`flux-editors/textmate`) grammars remain the highlighting story for their own contexts.
+**Superseded by a sibling repo (2026-07-09):** a native tree-sitter grammar now exists at
+[`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) (grammar +
+highlight/injection/locals queries, Rust/Node bindings, corpus tests) and is the highlighting
+story for Helix, Neovim, and Zed. Two corrections to this design's original premise:
+
+- **Helix does not render LSP semantic tokens at all** (as of 25.07) — colour in Helix comes
+  *only* from a tree-sitter grammar, so semantic tokens were never a Helix highlighting path.
+  This server contributes diagnostics/completion/hover/formatting; the grammar contributes colour.
+- **L-69 (semantic tokens) is therefore re-scoped**: still near-free from the CST token stream,
+  but only valuable for clients that render them (VS Code, Neovim layered over tree-sitter) and
+  for *semantic* distinctions a grammar can't make (e.g. registry-known op vs unknown identifier).
+
+The in-repo Prism (website) and TextMate/IntelliJ (`codewandler/flux-editors`) grammars remain the
+highlighting story for their own contexts.
 
 ## Prior art (reference only)
 

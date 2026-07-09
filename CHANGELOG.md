@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Wired the `codewandler/flux-tree-sitter` grammar into editor support.** The new sibling repo
+  ships a tree-sitter grammar + highlight queries for Helix, Neovim, and Zed. The repo-local
+  `.helix/languages.toml` now declares the grammar (Helix colours via tree-sitter only — it does
+  not render LSP semantic tokens), the website tooling page gained an Editor support section
+  covering flux-lsp + the grammar + flux-editors, and the flux-lsp design/L-69 story are re-scoped
+  accordingly (semantic tokens are for clients that render them, not a Helix path).
+
+### Fixed
+
+- **`cut-release.sh` now creates an annotated tag.** The lightweight tag it previously created was
+  not pushed by the `git push --follow-tags` command the script printed, so the tag-triggered
+  Release + crates.io workflows silently never fired (hit on the 0.11.4 cut); the printed push
+  command now names the tag explicitly and suggests an `ls-remote` verification.
+
 ## [0.11.4] - 2026-07-09
 
 ### Added
