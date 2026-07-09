@@ -48,6 +48,8 @@ scoped model and advances the operator-ergonomics half of
 - Touch points: the four wiring sites in `crates/flux-cli/src/main.rs`; the grant-source override uses
   `flux_plugin::SystemHostCaps::with_grant_source`.
 - Follow-up: wiring a `PrivateNetAdmit` audit sink into the direct `plugin call` path (its thinness is
-  the D-95 gap); [D-98](D-98-flux-web-crate-and-http-request-op.md) founds the family-wide
-  `[private_net] web` scope (native, web-capabilities epic), and [D-120](D-120-web-fetch-readable-markdown.md)
-  then retires `web_fetch`'s special native private-net path onto it.
+  the D-95 gap). **Done:** [D-98](D-98-flux-web-crate-and-http-request-op.md) founded the family-wide
+  `[private_net] web` scope (native, web-capabilities epic), and
+  [D-120](D-120-web-fetch-readable-markdown.md) retired `web_fetch`'s special native private-net path
+  onto it — `effective_web_fetch_private_hosts` and the `[private_net] web_fetch` key are gone; the
+  web family now answers to one `web` grant.

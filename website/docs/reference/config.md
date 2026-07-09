@@ -15,13 +15,14 @@ automatically.
 
 ```toml
 model = "sonnet"                 # default model (-m overrides; e.g. "anthropic/claude-sonnet-4-6")
+browser_bin = "/usr/bin/chromium" # optional Chromium path for the browser ops (else FLUX_BROWSER_BIN / PATH)
 
 [permissions]                    # deny wins, then allow, otherwise prompt
 allow = ["read", "glob", "grep", "search", "Bash(git:*)"]
 deny  = ["Bash(rm:*)"]
 
 [private_net]                    # optional private/loopback egress grants (SSRF guard is on by default)
-web_fetch = ["localhost"]        # or `true` for any private host — applies to web_fetch only
+web = ["localhost"]              # or `true` for any private host — the native web family (http.request, web_fetch, browser.*)
 
 [private_net.plugins]            # per plugin (by manifest name), intersected with its declared hosts
 prometheus = ["prometheus.local"]
@@ -44,9 +45,11 @@ widen past the policy floor, and destructive operations always re-fire the appro
 ## Private-network egress
 
 The network guard refuses private, loopback, and link-local addresses by default (SSRF defense).
-`[private_net]` grants scoped exceptions: `web_fetch` opts the fetch tool into named private hosts (or
-`true` for any), and `[private_net.plugins]` grants a plugin access to specific hosts — always
-intersected with the hosts the plugin declares in its manifest, so nothing undeclared is reachable.
+`[private_net]` grants scoped exceptions: `web` opts the whole native web family — `http.request`,
+`web_fetch`, and the `browser.*` ops — into named private hosts (or `true` for any); and
+`[private_net.plugins]` grants a plugin access to specific hosts — always intersected with the hosts
+the plugin declares in its manifest, so nothing undeclared is reachable. A private host admitted under
+the `web` scope is audited with a `PrivateNetAdmit` event (`caller: "web:<op>"`).
 
 To reach a private endpoint **once** without editing config — for a quick test, or a one-off
 `flux plugin call` against internal infrastructure — pass the global `--allow-private-net` flag:

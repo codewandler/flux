@@ -579,6 +579,12 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     if kubeconfig_present() {
         push("kubernetes");
     }
+    // `browser` is ambient too (a Chromium binary is discoverable): it surfaces the native `browser`
+    // group (flux-web, D-121). Advertising a browser that isn't installed only misleads the planner,
+    // so the ops stay out of the catalog until a binary is found.
+    if chromium_present() {
+        push("browser");
+    }
     out
 }
 
@@ -591,6 +597,27 @@ fn kubeconfig_present() -> bool {
     std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".kube").join("config"))
         .is_some_and(|p| p.exists())
+}
+
+/// Whether a Chromium binary is discoverable (the `browser`-group signal): `FLUX_BROWSER_BIN` is set,
+/// or one of the well-known Chromium binaries is on `PATH`. Ambient (env/PATH), independent of `cwd`.
+/// Mirrors `flux_web::discover_chrome`'s candidate order — L2 can't depend on the L5 web crate.
+fn chromium_present() -> bool {
+    if std::env::var_os("FLUX_BROWSER_BIN").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    const CANDIDATES: [&str; 6] = [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome",
+        "google-chrome-unstable",
+    ];
+    std::env::split_paths(&path).any(|dir| CANDIDATES.iter().any(|c| dir.join(c).is_file()))
 }
 
 /// Cap an oversized tool result for the model transcript: within `cap` chars it is returned

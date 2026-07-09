@@ -33,6 +33,54 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **D-121…D-124 — native non-visual browser (tier 3).** The agent can now drive a real headless
+  Chromium without ever receiving HTML source or screenshots. New ops (evidence-gated behind a
+  `browser` group that surfaces only when a Chromium binary is discoverable): `browser.open {url?}`,
+  `browser.goto`, `browser.snapshot {view}`, `browser.act {action, ref?, value?}`, `browser.close`.
+  - **CDP-on-a-pipe (D-121):** a hand-rolled, transport-agnostic CDP client (`flux-web::cdp`, id-
+    correlated calls + event stream over `\0`-framed JSON — no WebSocket, no debug port). Chrome is
+    spawned through a **new guarded seam** `flux_system::System::spawn_debug_pipe` — a full-duplex
+    socketpair mapped onto the child's fd 3/4 in an async-signal-safe `pre_exec` hook, keeping the one
+    `build_command` envelope (argv-only, env-cleared, cwd-pinned). Discovery `FLUX_BROWSER_BIN` →
+    config `browser_bin` → PATH; **no auto-download**. `Arc<Mutex<…>>` session registry with an idle
+    TTL; ephemeral profile per session; `Effect::Process` disclosed.
+  - **The digest (D-122):** `browser.snapshot` builds a byte-budgeted digest from the accessibility
+    tree joined with DOM identity — a `url · title` header, condensed `## content`, and a `## actions`
+    table of `e<N> role "name" (state)` with refs stable across observations (dead nodes marked, never
+    renumbered) + a DOM-heuristic fallback for div-soup clickables.
+  - **Act + delta (D-123):** `browser.act` clicks/types/fills/selects/presses/scrolls/navigates by
+    ref and returns a **delta** — what changed (nav, added/removed refs, dialogs, console errors) — not
+    the whole page (`full: true` to override), with a navigation-aware bounded auto-wait.
+  - **Egress interception (D-124):** every browser subrequest (navigation, subresource, redirect hop,
+    JS `fetch()`) is routed through `guard_url_scoped` via CDP `Fetch` interception — the SSRF chokepoint
+    a navigation-only check can't be. Violations fail the request and surface in the digest; a private
+    host admitted under the `web` grant audits `PrivateNetAdmit { caller: "web:browser" }`. No off switch.
+  - Hermetically tested against a scripted-fake CDP endpoint (no Chrome in CI); an env-gated live smoke
+    drives real headless Chrome end-to-end when one is installed.
+- **D-120 — `web_fetch` reads pages as condensed markdown; unified `web` egress.** `web_fetch` moved
+  into `flux-web` and now returns readable **markdown** for `text/html` responses (navigation/scripts/
+  boilerplate stripped, the main content region preferred, cap applied *after* condensation so the
+  budget buys content) — non-HTML stays raw, `raw: true` forces the raw body. A new pure op
+  `html_to_markdown` condenses an HTML string with no egress, so `http.request → html_to_markdown`
+  reads any fetched HTML. The condenser lives in `flux-web::condense` (the html5ever family lands
+  here, not in flux-markdown, which stays a pure markdown engine consumed for its AST + writer).
+  Fetched pages contribute `web.page` datasource records (title/url/content) so read content is
+  groundable. **Clean cutover** to the family-wide `web` egress scope: the per-tool
+  `effective_web_fetch_private_hosts` path and the `[private_net] web_fetch` config key are deleted
+  (a legacy `web_fetch = …` entry is now silently ignored — migrate it to `web`); admissions audit as
+  `PrivateNetAdmit { caller: "web:web_fetch" }`. `flux-capabilities::browser` retired.
+- **D-98 — `flux-web` crate + `http.request` (native web capabilities, tier 1).** New L5 library
+  crate `crates/flux-web` (package `codewandler-flux-web`, path-only/unpublished — the `flux-eval`
+  precedent) founds the native web family. Its first op, `http.request`, gives the model raw HTTP
+  protocol access — any method/headers/body → status + response headers + a char-boundary-capped
+  body; a non-2xx response is a *result*, not an op failure. Header values may be secret references
+  (`{"$secret": "ENV"}`) resolved from the environment and seeded into the redactor so a token never
+  surfaces in output or persisted events. All flux-web ops answer to one family-wide egress scope:
+  the new `[private_net] web` config key (public-only by default; `--allow-private-net` widens it),
+  guarded by `flux_system::net::guard_url_scoped` on every request, with private-host admissions
+  audited as `PrivateNetAdmit { caller: "web:http.request" }`. Registered via `flux_web::register_web`
+  alongside the eval ops. First story of the web-capabilities epic (design:
+  `docs/designs/web-capabilities.md`).
 - **`flux changelog` + `WHATS-NEW.md` — a customer-centric changelog (C-48).** New repo-root
   `WHATS-NEW.md` holds plain-language, per-release "what has changed" notes (no story IDs, no
   crate names; `### New/Improved/Fixed/Action needed`), embedded into the binary and shown by the

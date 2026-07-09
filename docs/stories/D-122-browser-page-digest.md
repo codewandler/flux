@@ -2,7 +2,7 @@
 id: D-122
 title: browser page digest — condensed content + resolved action space with stable refs
 pillar: Agent
-status: backlog
+status: done
 priority:
 epic: web-capabilities
 design: docs/designs/web-capabilities.md
@@ -18,24 +18,30 @@ a screenshot. The digest *is* the action space: every interactive element gets a
 act ops (D-123) target.
 
 ## Acceptance
-- [ ] Digest builder (`flux-web::digest`) over `Accessibility.getFullAXTree` joined with DOM node
+- [x] Digest builder (`flux-web::digest`) over `Accessibility.getFullAXTree` joined with DOM node
       identity (`backendNodeId`): header (`url · title`), `## content` (condensed readable text —
       reuse `flux-web::condense` or AX text), `## actions` table — `e<N> role "accessible name"
       (state)`, states covering disabled/checked/expanded/current value for inputs.
-- [ ] Interactive filter by AX role (button, link, textbox, combobox, checkbox, radio, tab,
+- [x] Interactive filter by AX role (button, link, textbox, combobox, checkbox, radio, tab,
       menuitem, …) **plus** a DOM-heuristic fallback so unlabeled div-soup clickables still
       surface (fixture: a page whose only "button" is a `div` with a click handler).
-- [ ] Stable refs: `e<N>` ↔ `backendNodeId` map held session-side; re-observation preserves live
+- [x] Stable refs: `e<N>` ↔ `backendNodeId` map held session-side; re-observation preserves live
       refs; dead nodes are marked dead, never silently renumbered. Test: two snapshots around a
       partial DOM mutation keep untouched refs identical.
-- [ ] Both sections byte-budgeted with omission markers, `len <= cap` pinned by test (A-24
+- [x] Both sections byte-budgeted with omission markers, `len <= cap` pinned by test (A-24
       lesson); caps overridable per call.
-- [ ] Deterministic output ordering (document order; ties broken stably) — replay/`flux diff`
+- [x] Deterministic output ordering (document order; ties broken stably) — replay/`flux diff`
       friendly. Failing-first: canned AX/DOM payload through the builder → golden digest.
-- [ ] `browser.snapshot {session, view: full|actions|content}`; `browser.open`/`goto` (D-121) now
+- [x] `browser.snapshot {session, view: full|actions|content}`; `browser.open`/`goto` (D-121) now
       return the digest as their result.
 
 ## Progress
+- 2026-07-09 — **DONE.** `flux-web::digest`: pure `build_digest(url, title, ax_tree, refs, view, caps)`
+  over `Accessibility.getFullAXTree` (`backendDOMNodeId` join); AX-role interactive filter + a
+  focusable/named-generic DOM-heuristic fallback; `RefMap` stable `e<N>`↔backend refs (dead marked, not
+  renumbered); byte-budgeted sections with `…` markers; deterministic AX-node order; `browser.snapshot
+  {session, view}` and open/goto return the digest. 5 golden tests over canned AX payloads (incl. the
+  exact design-doc format, ref stability across a mutation, div-soup fallback, caps).
 - 2026-07-09 — Filed with the epic; needs [D-121](D-121-browser-cdp-foundation.md). Re-scoped
   native same day (flux-web modules; substance unchanged).
 

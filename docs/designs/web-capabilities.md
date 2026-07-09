@@ -1,6 +1,6 @@
 # Design: Web capabilities — request · read · browse
 
-**Status:** proposed · **Pillar:** Agent / Core · **Stories:**
+**Status:** implemented (2026-07-09) · **Pillar:** Agent / Core · **Stories:**
 [D-98](../stories/D-98-flux-web-crate-and-http-request-op.md) ·
 [D-120](../stories/D-120-web-fetch-readable-markdown.md) ·
 [D-121](../stories/D-121-browser-cdp-foundation.md) ·

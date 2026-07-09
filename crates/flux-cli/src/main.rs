@@ -1751,6 +1751,19 @@ impl flux_plugin::EgressAudit for EventStoreEgressAudit {
     }
 }
 
+/// L6 binding of the L5 [`flux_web::RecordSink`] seam: contributes the `web.page` records `web_fetch`
+/// produces to the workspace datasource backend, so a fetched page is searchable afterwards. Errors
+/// are swallowed — contribution is best-effort enrichment, never load-bearing for the fetch.
+struct BackendRecordSink {
+    backend: Arc<dyn flux_capabilities::DatasourceBackend>,
+}
+
+impl flux_web::RecordSink for BackendRecordSink {
+    fn contribute(&self, records: &[flux_datasource::Record]) {
+        let _ = self.backend.upsert(records);
+    }
+}
+
 /// Seed `redactor` from the credential-bearing env vars: the provider keys
 /// (`flux_credentials::provider_env_keys()` — the single source, covering the API-key providers and
 /// the AWS secret material the Bedrock chain materializes into env) plus flux's own `FLUX_SECRET`.
@@ -2171,17 +2184,11 @@ async fn build_agent_with(
     // discover and run authored flows.
     flux_tools::register_flows(&mut registry);
 
-    // Guarded web access (policy-gated as network egress; private/loopback scoped to web_fetch).
-    registry.register(Arc::new(
-        flux_capabilities::browser::WebFetchTool::default().private_net(
-            flux_system::net::PrivateNetAllow::from_hosts(effective_web_fetch_private_hosts(&cfg)),
-        ),
-    ));
-
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
-    // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`).
+    // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`). The backend is also
+    // the sink `web_fetch` contributes `web.page` records to (below), so read pages are groundable.
     let backend = build_doc_index(&system).await;
-    flux_capabilities::register_datasource_ops(&mut registry, backend);
+    flux_capabilities::register_datasource_ops(&mut registry, backend.clone());
 
     // This run's session on the store opened above. `session_override` (L-25's `flow run --resume`)
     // wins outright — it names an already-halted session to continue, distinct from the REPL's own
@@ -2204,6 +2211,31 @@ async fn build_agent_with(
     // redactor shares its value store across clones, so a credential resolved mid-run is scrubbed.
     let redactor = flux_secret::Redactor::new();
     seed_provider_env_secrets(&redactor);
+
+    // Native web capabilities (flux-web): `http.request` (tier 1), `web_fetch` + `html_to_markdown`
+    // (tier 2), all under the family-wide `[private_net] web` egress scope. Registered here — after
+    // the session is resolved — because the `PrivateNetAdmit` audit sink needs the event store +
+    // session id, and `web_fetch` contributes `web.page` records to the datasource backend.
+    {
+        let web_audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
+            store: events.clone(),
+            stream: session_id.clone(),
+        });
+        flux_web::register_web(
+            &mut registry,
+            &flux_web::WebOptions {
+                private_net: flux_system::net::PrivateNetAllow::from_hosts(
+                    effective_web_private_hosts(&cfg),
+                ),
+                audit: Some(web_audit),
+                grant_source: Some(web_grant_source()),
+                records: Some(Arc::new(BackendRecordSink {
+                    backend: backend.clone(),
+                })),
+                browser_bin: cfg.browser_bin.clone(),
+            },
+        );
+    }
 
     // Discover subprocess plugins (~/.flux/plugins/*.toml) and project their operations as tools.
     // Each plugin's host capabilities are the guarded System (same boundary as built-in tools).
@@ -2373,6 +2405,7 @@ async fn build_agent_with(
     // advertises only the surfaced groups' ops; an empty manifest would disable gating.
     let mut groups = flux_tools::groups::builtin_groups();
     groups.push(flux_eval::eval_group());
+    groups.push(flux_web::browser_group());
     groups.extend(plugin_groups);
     let groups = flux_config::merge_groups(groups, flux_config::load_groups(&cwd));
     // Record the current workspace signals as a startup observation (audit; per-turn resolution
@@ -5531,14 +5564,23 @@ fn effective_plugin_private_hosts(cfg: &flux_config::Config, name: &str) -> Vec<
     }
 }
 
-/// The `web_fetch` private-net host grant, widened to `*` when `--allow-private-net` is active. Unlike
-/// the plugin path there is no manifest safeguard, so this fully opens `web_fetch` to private ranges
-/// for the run.
-fn effective_web_fetch_private_hosts(cfg: &flux_config::Config) -> Vec<String> {
+/// The family-wide `web`-scope private-net host grant (native `flux-web` ops: `http.request`,
+/// `web_fetch`, `browser.*`), widened to `*` when `--allow-private-net` is active.
+fn effective_web_private_hosts(cfg: &flux_config::Config) -> Vec<String> {
     if private_net_cli_override() {
         vec!["*".to_string()]
     } else {
-        cfg.web_fetch_private_hosts()
+        cfg.web_private_hosts()
+    }
+}
+
+/// The `grant_source` recorded in a native-web `PrivateNetAdmit` audit: the CLI-flag label when
+/// `--allow-private-net` is active, else the `web`-scope config source.
+fn web_grant_source() -> String {
+    if private_net_cli_override() {
+        "cli:--allow-private-net".to_string()
+    } else {
+        "config:web".to_string()
     }
 }
 
@@ -7307,7 +7349,8 @@ fn skill_ops_registry() -> Result<(ToolRegistry, Vec<flux_evidence::ToolGroup>)>
     flux_tools::register_builtins(&mut registry);
     flux_eval::register_eval_ops(&mut registry);
     flux_tools::register_reflect(&mut registry);
-    registry.register(Arc::new(flux_capabilities::WebFetchTool::default()));
+    // Native web ops for the catalog render (no egress config / audit — this registry never fetches).
+    flux_web::register_web(&mut registry, &flux_web::WebOptions::default());
     flux_capabilities::register_datasource_ops(
         &mut registry,
         Arc::new(flux_capabilities::MemoryBackend::new()),
@@ -7316,6 +7359,7 @@ fn skill_ops_registry() -> Result<(ToolRegistry, Vec<flux_evidence::ToolGroup>)>
     let cwd = std::env::current_dir()?;
     let mut groups = flux_tools::groups::builtin_groups();
     groups.push(flux_eval::eval_group());
+    groups.push(flux_web::browser_group());
     let groups = flux_config::merge_groups(groups, flux_config::load_groups(&cwd));
     Ok((registry, groups))
 }
@@ -10625,7 +10669,7 @@ mod tests {
         std::env::remove_var("FLUX_ALLOW_PRIVATE_NET");
         assert!(!super::private_net_cli_override());
         assert!(super::effective_plugin_private_hosts(&cfg, "gitlab").is_empty());
-        assert!(super::effective_web_fetch_private_hosts(&cfg).is_empty());
+        assert!(super::effective_web_private_hosts(&cfg).is_empty());
         assert_eq!(
             super::private_net_grant_source_for("gitlab"),
             "config:plugin/gitlab"
@@ -10639,7 +10683,7 @@ mod tests {
             vec!["*".to_string()]
         );
         assert_eq!(
-            super::effective_web_fetch_private_hosts(&cfg),
+            super::effective_web_private_hosts(&cfg),
             vec!["*".to_string()]
         );
         assert_eq!(
