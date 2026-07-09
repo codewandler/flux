@@ -1119,6 +1119,21 @@ fn parse_stmt(lines: &[Line], indent: usize) -> Result<(Node, usize)> {
     if let Some(rest) = kw(t, "verify") {
         return parse_verify(rest);
     }
+    if let Some(rest) = kw(t, "try") {
+        return parse_try(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "race") {
+        return parse_race(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "scope") {
+        return parse_scope(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "saga") {
+        return parse_saga(rest, lines, indent);
+    }
+    if let Some(rest) = kw(t, "pipe") {
+        return parse_pipe(rest, lines, indent);
+    }
 
     if t.starts_with('$') {
         return parse_dollar(t);
@@ -2066,6 +2081,187 @@ fn parse_parse_node(args_str: &str) -> Result<(Node, &str)> {
     ))
 }
 
+/// `try` + body, optionally followed by a sibling `catch [$err]` + handler (the clause shape mirrors
+/// `when`/`else`).
+fn parse_try(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    if !rest.trim().is_empty() {
+        return Err(perr(
+            "`try` takes no header — put the guarded work in its body",
+        ));
+    }
+    let body_region = child_region(lines, indent);
+    let (body, _) = parse_stmts(body_region, indent)?;
+    let mut used = 1 + body_region.len();
+    let mut catch = None;
+    let mut handler = Vec::new();
+    if let Some(cand) = lines.get(used) {
+        if cand.indent == indent {
+            if let Some(c) = kw(&cand.text, "catch") {
+                catch = if c.trim().is_empty() {
+                    None
+                } else {
+                    let nm = c
+                        .trim()
+                        .strip_prefix('$')
+                        .ok_or_else(|| perr("`catch` expects `$name` or nothing"))?;
+                    let (name, tail) = take_while(nm, is_ident_char);
+                    if name.is_empty() || !tail.trim().is_empty() {
+                        return Err(perr(&format!("invalid `catch` binding: `{c}`")));
+                    }
+                    Some(SymbolName::from(name))
+                };
+                let handler_region = child_region(&lines[used..], indent);
+                let (h, _) = parse_stmts(handler_region, indent)?;
+                handler = h;
+                used += 1 + handler_region.len();
+            }
+        }
+    }
+    Ok((
+        Node::Try {
+            body,
+            catch,
+            handler,
+        },
+        used,
+    ))
+}
+
+/// `race <timeout_ms> [-> $bind]` + `branch $name` arms — first-wins concurrency (twin of `parallel`).
+fn parse_race(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let (timeout_ms, r) = take_u64(rest.trim_start())?;
+    let bind = parse_optional_arrow_bind(r, "race")?;
+    let region = child_region(lines, indent);
+    let (arms, default) = parse_arms(region, "branch")?;
+    if !default.is_empty() {
+        return Err(perr(
+            "`race` has no `default` arm — use `branch $name` only",
+        ));
+    }
+    let mut branches = Vec::with_capacity(arms.len());
+    for (hdr, body) in arms {
+        let name = hdr
+            .trim()
+            .strip_prefix('$')
+            .ok_or_else(|| perr(&format!("`race` branch needs a `$name`, got: `{hdr}`")))?;
+        let (nm, tail) = take_while(name, is_ident_char);
+        if nm.is_empty() || !tail.trim().is_empty() {
+            return Err(perr(&format!("invalid `race` branch name: `{hdr}`")));
+        }
+        branches.push(crate::ast::Branch {
+            name: SymbolName::from(nm),
+            body,
+        });
+    }
+    Ok((
+        Node::Race {
+            timeout_ms,
+            branches,
+            bind,
+        },
+        1 + region.len(),
+    ))
+}
+
+/// `scope [$res = <acquire>]` + body, optionally followed by a sibling `finally` + cleanup block.
+fn parse_scope(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let rest = rest.trim();
+    let (bind, acquire) = if rest.is_empty() {
+        (None, None)
+    } else {
+        let nm = rest
+            .strip_prefix('$')
+            .ok_or_else(|| perr("`scope` header must be `$name = <acquire>`"))?;
+        let (name, r) = take_while(nm, is_ident_char);
+        if name.is_empty() {
+            return Err(perr("`scope` has an empty resource name"));
+        }
+        let acq = r
+            .trim_start()
+            .strip_prefix('=')
+            .ok_or_else(|| perr("`scope` expects `=` after `$name`"))?;
+        let acquire = parse_condition_expr(acq, "scope acquire")?;
+        (Some(SymbolName::from(name)), Some(Box::new(acquire)))
+    };
+    let body_region = child_region(lines, indent);
+    let (body, _) = parse_stmts(body_region, indent)?;
+    let mut used = 1 + body_region.len();
+    let mut finally = Vec::new();
+    if let Some(cand) = lines.get(used) {
+        if cand.indent == indent && cand.text == "finally" {
+            let fin_region = child_region(&lines[used..], indent);
+            let (f, _) = parse_stmts(fin_region, indent)?;
+            finally = f;
+            used += 1 + fin_region.len();
+        }
+    }
+    Ok((
+        Node::Scope {
+            acquire,
+            bind,
+            body,
+            finally,
+        },
+        used,
+    ))
+}
+
+/// `saga` + `step` … `undo` arm pairs (each `step` optionally followed by a sibling `undo`).
+fn parse_saga(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    if !rest.trim().is_empty() {
+        return Err(perr("`saga` takes no header — use `step`/`undo` arms"));
+    }
+    let region = child_region(lines, indent);
+    let steps = parse_saga_steps(region)?;
+    Ok((Node::Saga { steps }, 1 + region.len()))
+}
+
+fn parse_saga_steps(region: &[Line]) -> Result<Vec<crate::ast::SagaStep>> {
+    let mut steps = Vec::new();
+    if region.is_empty() {
+        return Ok(steps);
+    }
+    let arm_indent = region[0].indent;
+    let mut i = 0;
+    while i < region.len() {
+        if region[i].indent != arm_indent {
+            return Err(perr_at(
+                region[i].number,
+                &format!("unexpected indentation in `saga`: `{}`", region[i].text),
+            ));
+        }
+        if kw(&region[i].text, "step").is_none() {
+            return Err(perr_at(
+                region[i].number,
+                &format!("expected `step`, got: `{}`", region[i].text),
+            ));
+        }
+        let body_region = child_region(&region[i..], arm_indent);
+        let (body, _) = parse_stmts(body_region, arm_indent)?;
+        i += 1 + body_region.len();
+        let mut undo = Vec::new();
+        if i < region.len()
+            && region[i].indent == arm_indent
+            && kw(&region[i].text, "undo").is_some()
+        {
+            let undo_region = child_region(&region[i..], arm_indent);
+            let (u, _) = parse_stmts(undo_region, arm_indent)?;
+            undo = u;
+            i += 1 + undo_region.len();
+        }
+        steps.push(crate::ast::SagaStep { body, undo });
+    }
+    Ok(steps)
+}
+
+/// `pipe [-> $bind]` + indented call steps.
+fn parse_pipe(rest: &str, lines: &[Line], indent: usize) -> Result<(Node, usize)> {
+    let bind = parse_optional_arrow_bind(rest, "pipe")?;
+    let region = child_region(lines, indent);
+    let (steps, _) = parse_stmts(region, indent)?;
+    Ok((Node::Pipe { steps, bind }, 1 + region.len()))
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -2685,6 +2881,73 @@ mod tests {
             text.contains("$n = parse($raw.price, as: \"f64\")"),
             "{text}"
         );
+        assert_round_trips(&ast);
+    }
+
+    #[test]
+    fn arm_body_control_flow_round_trips_natively() {
+        // try / race / scope / saga / pipe — formerly @json-only (L-62).
+        let ast = DraftAst {
+            body: vec![
+                Node::Try {
+                    body: vec![call("risky", vec![])],
+                    catch: Some("err".into()),
+                    handler: vec![call("log", vec![var("err")])],
+                },
+                Node::Race {
+                    timeout_ms: 5000,
+                    branches: vec![
+                        crate::ast::Branch {
+                            name: "fast".into(),
+                            body: vec![call("cheap", vec![])],
+                        },
+                        crate::ast::Branch {
+                            name: "slow".into(),
+                            body: vec![call("expensive", vec![])],
+                        },
+                    ],
+                    bind: Some("winner".into()),
+                },
+                Node::Scope {
+                    acquire: Some(Box::new(call("lock", vec![]))),
+                    bind: Some("h".into()),
+                    body: vec![call("use_it", vec![var("h")])],
+                    finally: vec![call("release", vec![var("h")])],
+                },
+                Node::Saga {
+                    steps: vec![
+                        crate::ast::SagaStep {
+                            body: vec![call("charge", vec![])],
+                            undo: vec![call("refund", vec![])],
+                        },
+                        crate::ast::SagaStep {
+                            body: vec![call("ship", vec![])],
+                            undo: vec![],
+                        },
+                    ],
+                },
+                Node::Pipe {
+                    steps: vec![call("a", vec![]), call("b", vec![])],
+                    bind: Some("out".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let text = format(&ast);
+        assert!(
+            !text.contains("@json"),
+            "batch-3 nodes should render natively:\n{text}"
+        );
+        assert!(text.contains("catch $err"), "{text}");
+        assert!(text.contains("race 5000 -> $winner"), "{text}");
+        assert!(text.contains("branch $fast"), "{text}");
+        assert!(text.contains("scope $h = lock()"), "{text}");
+        assert!(text.contains("finally"), "{text}");
+        assert!(
+            text.contains("saga") && text.contains("step") && text.contains("undo"),
+            "{text}"
+        );
+        assert!(text.contains("pipe -> $out"), "{text}");
         assert_round_trips(&ast);
     }
 

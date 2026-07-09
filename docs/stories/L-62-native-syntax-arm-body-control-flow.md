@@ -2,7 +2,7 @@
 id: L-62
 title: Native syntax — Try / Race / Scope / Saga / Pipe (arm/body control-flow)
 pillar: Language
-status: backlog
+status: done
 priority:
 epic: flux-lsp
 design: docs/designs/flux-lang-cst.md
@@ -23,7 +23,13 @@ reusing the existing arm-parsing machinery (`match`/`case`, `parallel`/`branch`,
 - [ ] Failing-first per node: round-trips natively, text contains **no** `@json`.
 
 ## Progress
-- (not started — gated on isolation; depends on L-59)
+- Done 2026-07-09 (parse.rs + format.rs): `try` + body / `catch [$err]` + handler (clause shape like
+  `when`/`else`); `race <ms> [-> $b]` + `branch $name` arms (reuses `parse_arms`); `scope [$r =
+  <acquire>]` + body / `finally` + cleanup; `saga` + `step`…`undo` arm pairs (custom `parse_saga_
+  steps`); `pipe [-> $b]` + call steps. Guards keep round-trip total (branch names identifiers;
+  scope renders only when bind/acquire are both present and acquire is spellable, else `@json`).
+  `arm_body_control_flow_round_trips_natively` + the random property test pass; full suite green;
+  clippy + fmt clean.
 
 ## Notes
 - **Gated** on isolation. Depends on **L-59**. Native `|>` pipe operator stays deferred (this ships

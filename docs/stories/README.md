@@ -44,7 +44,6 @@ _None._
 ### flux-lsp — a Language Server for Flux-Lang, wired into Helix
 _Today the only `.flux` surfaces are `flux flow run` and the dev `fluxlang compile`; the IntelliJ_
 - [L-59 — cst_to_draft lowering + re-point parse/parse_program (behavior-preserving)](L-59-cst-lower-to-draftast-repoint-parse.md) · Language · CST foundation KEYSTONE — GATED on isolation. Projects the CST to today's DraftAst; re-points parse/parse_program; range side-map for analyzer diagnostics. All existing tests + the round-trip invariant stay green.
-- [L-62 — Native syntax — Try / Race / Scope / Saga / Pipe (arm/body control-flow)](L-62-native-syntax-arm-body-control-flow.md) · Language · @json coverage 3/4 — GATED on isolation. Native text for the arm/body control-flow nodes, reusing the match/case/branch parser machinery.
 - [L-63 — Native syntax — Thing (kind + selector grammar)](L-63-native-syntax-thing.md) · Language · @json coverage 4/4 — GATED on isolation. The heaviest/most structural node (kind-enum + selector); cleanly deferrable if scope needs trimming.
 - [L-64 — flux-lsp crate — tower-lsp server, text sync, diagnostics, Helix wiring](L-64-flux-lsp-crate-diagnostics-helix.md) · Language · LSP MVP — the end-to-end Helix loop: a standalone flux-lsp binary (L6) publishing positioned diagnostics, wired to hx config-only.
 - [L-65 — flux-lsp completion — ops, node-kinds, prelude types, in-scope $vars](L-65-flux-lsp-completion.md) · Language · LSP completion from the Rust SSOT catalogs + a CST scope walk; cursor context from the token at the offset.
@@ -330,6 +329,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-58 — Tolerant event parser + rowan green tree with ERROR-node recovery](L-58-cst-tolerant-parser-rowan-tree.md) · Language · CST foundation — GATED on isolation. The error-recovery core: a hand-written event parser that always completes a tree, wrapping unexpected input in ERROR nodes and resyncing at NEWLINE/DEDENT.
 - [L-60 — Native syntax — Memo / Once / Checkpoint / Await (durability & idempotency)](L-60-native-syntax-durability-nodes.md) · Language · @json coverage 1/4 — GATED on isolation. Native text for the single-header durability/idempotency nodes so they stop round-tripping via @json.
 - [L-61 — Native syntax — Confirm / Throttle / Debounce / Verify + Peek / Parse](L-61-native-syntax-guardrails-and-sugar.md) · Language · @json coverage 2/4 — GATED on isolation. Native text for the guard-rail nodes plus the peek/parse expression sugar (parse( needs a fmt(-style special-case).
+- [L-62 — Native syntax — Try / Race / Scope / Saga / Pipe (arm/body control-flow)](L-62-native-syntax-arm-body-control-flow.md) · Language · @json coverage 3/4 — GATED on isolation. Native text for the arm/body control-flow nodes, reusing the match/case/branch parser machinery.
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

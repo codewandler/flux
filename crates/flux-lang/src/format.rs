@@ -866,6 +866,96 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             }
             out.push('\n');
         }
+        Node::Try {
+            body,
+            catch,
+            handler,
+        } if opt_ident(catch) => {
+            out.push_str(&ind);
+            out.push_str("try\n");
+            fmt_body(body, level + 1, indent, multiline, out);
+            out.push_str(&ind);
+            out.push_str("catch");
+            if let Some(c) = catch {
+                out.push_str(" $");
+                out.push_str(&c.0);
+            }
+            out.push('\n');
+            fmt_body(handler, level + 1, indent, multiline, out);
+        }
+        Node::Race {
+            timeout_ms,
+            branches,
+            bind,
+        } if branches.iter().all(|b| b.name.is_identifier()) && opt_ident(bind) => {
+            out.push_str(&ind);
+            out.push_str(&format!("race {timeout_ms}"));
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            let ind1 = indent_of(level + 1, indent);
+            for br in branches {
+                out.push_str(&ind1);
+                out.push_str("branch $");
+                out.push_str(&br.name.0);
+                out.push('\n');
+                fmt_body(&br.body, level + 2, indent, multiline, out);
+            }
+        }
+        Node::Scope {
+            acquire,
+            bind,
+            body,
+            finally,
+        } if opt_ident(bind)
+            && bind.is_some() == acquire.is_some()
+            && acquire
+                .as_ref()
+                .is_none_or(|a| !fmt_expr(a, multiline).starts_with("@json ")) =>
+        {
+            out.push_str(&ind);
+            out.push_str("scope");
+            if let (Some(b), Some(a)) = (bind, acquire) {
+                out.push_str(" $");
+                out.push_str(&b.0);
+                out.push_str(" = ");
+                out.push_str(&fmt_expr(a, multiline));
+            }
+            out.push('\n');
+            fmt_body(body, level + 1, indent, multiline, out);
+            if !finally.is_empty() {
+                out.push_str(&ind);
+                out.push_str("finally\n");
+                fmt_body(finally, level + 1, indent, multiline, out);
+            }
+        }
+        Node::Saga { steps } => {
+            out.push_str(&ind);
+            out.push_str("saga\n");
+            let ind1 = indent_of(level + 1, indent);
+            for st in steps {
+                out.push_str(&ind1);
+                out.push_str("step\n");
+                fmt_body(&st.body, level + 2, indent, multiline, out);
+                if !st.undo.is_empty() {
+                    out.push_str(&ind1);
+                    out.push_str("undo\n");
+                    fmt_body(&st.undo, level + 2, indent, multiline, out);
+                }
+            }
+        }
+        Node::Pipe { steps, bind } if opt_ident(bind) => {
+            out.push_str(&ind);
+            out.push_str("pipe");
+            if let Some(b) = bind {
+                out.push_str(" -> $");
+                out.push_str(&b.0);
+            }
+            out.push('\n');
+            fmt_body(steps, level + 1, indent, multiline, out);
+        }
         Node::Confirm {
             message,
             risk,
