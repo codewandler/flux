@@ -470,9 +470,11 @@ mod tests {
             ]
         );
         assert_eq!(edit.optional_params, vec!["replace_all".to_string()]);
+        // `param_signature` renders required params in declared (schema) order, then the sorted
+        // optional set — a membership set, not an alphabetical one (see the req_sorted check above).
         assert_eq!(
             edit.param_signature(),
-            "{new_string, old_string, path, replace_all}"
+            "{path, old_string, new_string, replace_all}"
         );
     }
 }
