@@ -121,6 +121,25 @@ deterministic map/filter, and (b) bespoke Rust boolean-emitter ops that only exi
 L-51 native conditions → L-52 docs/examples. Design:
 [designs/data-transforms.md](designs/data-transforms.md).
 
+### Flux-Lang CST front-end + LSP (epic) — **proposed 2026-07-09**
+
+Editor-grade language support for Flux-Lang, in two coupled workstreams done as one parser pass.
+**(1) Front-end modernization:** replace the hand-written recursive-descent parser with a lossless
+concrete syntax tree (CST) on `rowan` (the rust-analyzer model), so spans and error-recovery become
+*structural* — every token/node carries a range and the tolerant parser always yields a complete
+tree with `ERROR` nodes instead of aborting on the first error. In the same pass, close the **`@json`
+syntax gap**: the 16 node kinds that today only round-trip through the `@json` escape
+(`memo`/`once`/`checkpoint`/`await`, `confirm`/`throttle`/`debounce`/`verify`, `peek`/`parse`,
+`try`/`race`/`scope`/`saga`/`pipe`, `thing`) get real native text. The containment bet keeps
+`analyze`/`format`/runtime/optimizer/planner unchanged via a `cst_to_draft` lowering; the 56 parser
+tests + `parse(&format(&ast)) == ast` are the behaviour-preserving backbone. **(2) flux-lsp:** a
+standalone `flux-lsp` (tower-lsp) server wired into Helix (`hx`) config-only — diagnostics,
+completion, hover, formatting, then go-to-definition and semantic-token highlighting. Foundation
+first: the CST lands before the LSP features (which the CST makes cheap). Stories L-57–L-59 (CST) →
+L-60–L-63 (native-syntax coverage) → L-64–L-67 (LSP core) → L-68–L-70 (navigation, highlighting,
+closeout). Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
+[designs/flux-lsp.md](designs/flux-lsp.md).
+
 ### A2A protocol conformance (epic) — **proposed 2026-07-07**
 
 After v0.4.0 (multi-tenant principal auth + multi-agent mount) the A2A wire surface is stable enough
