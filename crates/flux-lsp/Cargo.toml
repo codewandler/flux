@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Language Server (LSP) for Flux-Lang — diagnostics, completion, hover, formatting."
 
+# Not a release artifact yet — build from source (`cargo build -p flux-lsp`). Shipping binaries
+# is part of the packaging story (L-70).
+[package.metadata.dist]
+dist = false
+
 [[bin]]
 name = "flux-lsp"
 path = "src/main.rs"
