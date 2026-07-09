@@ -2799,9 +2799,11 @@ async fn run_render(file: &str, view: RenderView, out: Option<&str>) -> Result<(
 /// absolute paths work — only the `-o` WRITE is workspace-confined (through `System::write_file`;
 /// SVG is text, parents are created). A UTF-8 BOM is stripped before parsing (a PowerShell/
 /// Notepad-authored file would otherwise fail the parser with an invisible U+FEFF in the first
-/// token). Without `out` the SVG streams to stdout, and a closed pipe (`flux render x.flux |
-/// head`) is success, not a panic. A hard parse error in `tree` view propagates — the CLI exits
-/// non-zero with the parser's message — while `source` view is total.
+/// token). Without `out` the SVG streams to stdout; an early-closing consumer (`flux render
+/// x.flux | head`) never panics — on Unix the process ends with the conventional SIGPIPE exit
+/// (`main` resets `SIG_DFL`, A-61), on Windows the `BrokenPipe` write error is treated as
+/// success. A hard parse error in `tree` view propagates — the CLI exits non-zero with the
+/// parser's message — while `source` view is total.
 async fn run_render_in(
     system: &System,
     file: &str,
@@ -2826,9 +2828,13 @@ async fn run_render_in(
         }
         None => {
             use std::io::Write;
-            // Not `println!`: Rust ignores SIGPIPE, so a consumer that stops reading early
-            // (`| head`, a converter erroring out) would turn the write into a panic with exit
-            // 101. A broken pipe means the consumer has everything it wants — exit cleanly.
+            // Not `println!`: a consumer that stops reading early (`| head`, a converter erroring
+            // out) must not turn the write into a panic. On Unix this arm is normally moot —
+            // `main`'s A-61 `reset_sigpipe` restores `SIG_DFL`, so the process ends on SIGPIPE
+            // (conventional exit 141, like `cat`) before the write ever returns EPIPE. The arm IS
+            // the path on Windows (no SIGPIPE — the closed pipe surfaces as a BrokenPipe io
+            // error) and under std's default SIG_IGN (unit tests). A broken pipe means the
+            // consumer has everything it wants — exit cleanly.
             let mut stdout = std::io::stdout();
             match stdout
                 .write_all(svg.as_bytes())
@@ -8259,24 +8265,32 @@ mod tests {
     /// L-77: the render handler reads the `.flux` file from the plain filesystem (absolute and
     /// out-of-workspace paths work, like `flow run`), strips a UTF-8 BOM before parsing, writes
     /// the SVG through the workspace-confined `System` (`-o`), tree view propagates a hard parse
-    /// error (non-zero exit), and source view is total — malformed input still renders.
+    /// error (non-zero exit), and source view is total — malformed input still renders. The
+    /// inputs live OUTSIDE the workspace root, so re-jailing the read through
+    /// `System::read_file` fails this test — the un-jailed read is a pinned decision, not an
+    /// oversight.
     #[tokio::test]
     async fn run_render_writes_svg_and_propagates_tree_parse_errors() {
         use super::{run_render_in, RenderView};
-        let dir = std::env::temp_dir().join(format!("flux-render-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let greet = dir.join("greet.flux");
+        let base = std::env::temp_dir().join(format!("flux-render-cli-{}", std::process::id()));
+        // `ws` is the System workspace root (`-o` writes land here); the inputs live in a SIBLING
+        // dir the workspace envelope does not cover.
+        let ws = base.join("ws");
+        let srcdir = base.join("elsewhere");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&srcdir).unwrap();
+        let greet = srcdir.join("greet.flux");
         std::fs::write(&greet, "flow greet(name: String)\n  do notify \"hi\"\n").unwrap();
-        let broken = dir.join("broken.flux");
+        let broken = srcdir.join("broken.flux");
         std::fs::write(&broken, "flow ((((\n").unwrap();
         // A BOM'd but otherwise-valid file (PowerShell Out-File / Notepad) must render in tree
         // view — the BOM is stripped before the parser sees it.
-        let bommed = dir.join("bommed.flux");
+        let bommed = srcdir.join("bommed.flux");
         std::fs::write(&bommed, "\u{feff}flow greet(name: String)\n  return 1\n").unwrap();
-        let system = super::System::new(super::Workspace::new(&dir).unwrap());
+        let system = super::System::new(super::Workspace::new(&ws).unwrap());
 
-        // The input is an ABSOLUTE path outside flux's own cwd (the read is NOT jailed — parity
-        // with `flow run`); `-o` writes into the workspace.
+        // The input is an ABSOLUTE path outside the workspace root (the read is NOT jailed —
+        // parity with `flow run`); `-o` writes into the workspace.
         run_render_in(
             &system,
             greet.to_str().unwrap(),
@@ -8285,7 +8299,7 @@ mod tests {
         )
         .await
         .expect("tree render of a valid flow succeeds");
-        let svg = std::fs::read_to_string(dir.join("img/out.svg")).unwrap();
+        let svg = std::fs::read_to_string(ws.join("img/out.svg")).unwrap();
         assert!(svg.starts_with("<svg"), "got: {svg}");
 
         run_render_in(&system, bommed.to_str().unwrap(), RenderView::Tree, None)
@@ -8307,10 +8321,10 @@ mod tests {
         )
         .await
         .expect("source view renders malformed input");
-        assert!(std::fs::read_to_string(dir.join("broken.svg"))
+        assert!(std::fs::read_to_string(ws.join("broken.svg"))
             .unwrap()
             .starts_with("<svg"));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// A registered plugin whose ABSOLUTE recorded binary is confirmed gone (a deleted checkout,

@@ -33,8 +33,10 @@ CLI) as the way flux regenerates its own doc images.
 ## Progress
 - 2026-07-09 — Implemented end-to-end. `Render` subcommand (positional file, `--view source|tree`
   via a `RenderView` ValueEnum mirroring `flux_tools::render::View`, `-o` optional) dispatching to
-  `run_render` → testable `run_render_in(&System, …)`: reads the file and writes the SVG through
-  the workspace-confined `System` (`read_file`/`write_file`), stdout without `-o`. Tests:
+  `run_render` → testable `run_render_in(&System, …)`: reads the input from the plain filesystem
+  (cwd-relative/absolute, parity with `flow run`/`app run` — hardened in `472ecc6`; the first cut
+  read via `System::read_file`) and writes `-o` through the workspace-confined
+  `System::write_file`, stdout without `-o`. Tests:
   `render_subcommand_parses` (clap wiring + defaults) and
   `run_render_writes_svg_and_propagates_tree_parse_errors` (writes `<svg`, tree view surfaces the
   parser's message as a non-zero exit, source view total on malformed input). Verified live:
@@ -47,6 +49,15 @@ CLI) as the way flux regenerates its own doc images.
   with `flux render` (same 768px layout; filename caption gone — the L-76 renderer has no title
   chrome; a few token classes shift hue because flux-lang's CST highlighter is the colour source
   now).
+- 2026-07-10 — Post-release review triage. Grounded three external findings: (1) the un-jailed
+  INPUT read is deliberate (the workspace envelope governs model-initiated ops; a user-named CLI
+  path argument carries the user's own authority, parity with `flow run`/`app run`) — the render
+  test now places inputs outside the workspace root so a re-jailed read fails it, and the stale
+  claim above (pre-`472ecc6` wording) is corrected; (2) the stdout `BrokenPipe` arm is
+  unreachable on Unix by design — `main`'s A-61 `reset_sigpipe` (`SIG_DFL`) ends the process the
+  conventional way on an early-closing consumer (exit 141, like `cat`); the arm is the live path
+  on Windows (no SIGPIPE) — code comments now say so instead of claiming "Rust ignores SIGPIPE";
+  (3) the v0.13.2 SemVer question is a recorded release-time decision, not a defect in this story.
 
 ## Notes
 - Design: [flux-render.md](../designs/flux-render.md) § "Phase 1 bonus — CLI subcommand".
