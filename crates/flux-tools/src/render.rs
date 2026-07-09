@@ -500,8 +500,7 @@ mod tests {
         // Counter-suffixed (not just PID): this is called from more than one test in this module,
         // and a shared dir let two tests race a concurrent write/read of the same fixture file.
         let n = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("flux-render-test-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flux-render-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(dir.join(".flux/flows")).unwrap();
         std::fs::write(
             dir.join(".flux/flows/greet.flux"),
