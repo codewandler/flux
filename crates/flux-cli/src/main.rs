@@ -4,6 +4,7 @@
 //! interactive REPL and TUI land in M2; this establishes the end-to-end path
 //! (CLI → provider → stream → render).
 
+mod changelog;
 mod plugin_skill;
 mod preset;
 mod skill_cmd;
@@ -415,6 +416,17 @@ enum Commands {
         /// With `--install`, target the user-global `~/.claude/skills` instead of project `.flux/skills`.
         #[arg(long)]
         global: bool,
+    },
+    /// Show what changed in flux, in plain language (the customer changelog).
+    Changelog {
+        /// Show a specific version's section (e.g. `0.11.6`).
+        version: Option<String>,
+        /// Show every recorded release.
+        #[arg(long)]
+        all: bool,
+        /// Show the not-yet-released section (development builds).
+        #[arg(long)]
+        unreleased: bool,
     },
     /// Print a shell completion script to stdout (defaults to fish).
     Completion {
@@ -5663,6 +5675,11 @@ async fn main() -> Result<()> {
                 global,
             }) => run_skill(type_, install, global).await,
             Some(Commands::Completion { shell }) => run_completion(shell.as_deref()),
+            Some(Commands::Changelog {
+                version,
+                all,
+                unreleased,
+            }) => changelog::run(version.as_deref(), all, unreleased),
             Some(Commands::Preset { args }) => preset::run_preset(&args).await,
             // No subcommand → interactive REPL (the one implicit entry point).
             None => run_repl(AgentFlags::from_model_yes(None, false)).await,

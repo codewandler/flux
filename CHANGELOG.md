@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flux changelog` + `WHATS-NEW.md` — a customer-centric changelog (C-48).** New repo-root
+  `WHATS-NEW.md` holds plain-language, per-release "what has changed" notes (no story IDs, no
+  crate names; `### New/Improved/Fixed/Action needed`), embedded into the binary and shown by the
+  new `flux changelog` subcommand (own version by default, `--all`, `<version>`, `--unreleased`).
+  `scripts/cut-release.sh` now rolls and stages BOTH changelogs and warns loudly when the customer
+  section is empty at cut time; AGENTS.md documents the dual-changelog rule.
 - **L-73** — Public editor-setup docs page (Helix flagship) + LSP docs pass: new
   `/docs/language/editors` page (tree-sitter highlighting first, `flux-lsp` on top, verified
   Helix recipe with `hx --health flux`; Neovim, Zed, IntelliJ/TextMate coverage; shipped-only
