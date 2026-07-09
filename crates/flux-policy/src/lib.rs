@@ -360,6 +360,15 @@ pub fn default_local_grants() -> AuthorizationPolicy {
                 vec![ResourceRef::any(ResourceKind::Process)],
                 true,
             ),
+            // Browser navigation (the native `browser.*` ops) spawns a headless browser and drives
+            // it — a real capability, so it is granted but **approval-gated**, exactly like
+            // `process.exec`. (The ops are additionally evidence-gated on a discoverable browser and
+            // every subrequest answers to the `web` egress scope.)
+            grant(
+                vec![Action::from("browser.navigate")],
+                vec![ResourceRef::any(ResourceKind::Network)],
+                true,
+            ),
         ],
     }
 }
@@ -687,6 +696,18 @@ mod tests {
                 &t,
                 "process.exec",
                 &ResourceRef::any(ResourceKind::Process)
+            )
+            .decision,
+            Decision::ApprovalRequired
+        );
+        // browser navigation is granted but requires approval (like process.exec)
+        assert_eq!(
+            eval(
+                &p,
+                &c,
+                &t,
+                "browser.navigate",
+                &ResourceRef::any(ResourceKind::Network)
             )
             .decision,
             Decision::ApprovalRequired
