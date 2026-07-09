@@ -190,44 +190,45 @@ struct AskUserInput {
     question: String,
 }
 
-/// Which surface `emit_plan` speaks — the **L-20 emission A/B scaffold**, selected per turn via the
-/// `FLUX_EMISSION` env switch (see `docs/designs/flux-lang-emission-ab.md`).
+/// Which surface `emit_plan` speaks — the **emission A/B scaffold** (L-20/L-71), selected per turn
+/// via the `FLUX_EMISSION` env switch (see `docs/designs/flux-lang-emission-ab.md`).
 ///
-/// - [`EmissionArm::Json`] (the default): the shipped strict derived [`DraftAst`] JSON schema.
-///   With `FLUX_EMISSION` unset this is byte-identical to the pre-selector surface — prompt,
-///   tools, and parse path all unchanged.
+/// - [`EmissionArm::Merged`] (the default since the measured L-71 cutover, 2026-07-09): the JSON
+///   arm with `emit_plan`'s `Node` definition collapsed to ONE object schema (`kind` enum +
+///   unioned optional props, [`flux_lang::schema::merge_node_schema`]) — ~65% fewer schema bytes,
+///   same wire format, same prompt, same parse/repair path. Per-kind semantics ride in the
+///   node-kind catalog the prompt already carries. Measured vs `json` on the pooled 30-task
+///   corpus (codex/gpt-5.5): first-emission acceptance 28/30 both arms, −26% uncached input.
+/// - [`EmissionArm::Json`]: the strict derived [`DraftAst`] JSON schema — the L-20 winner and the
+///   pre-L-71 default, kept opt-in for re-measurement.
 /// - [`EmissionArm::Text`]: the plan rides as native Flux-Lang **text** in a single `source`
 ///   string, taught via the native grammar (worked examples rendered by [`flux_lang::format`], so
 ///   they are parseable by construction) and parsed with [`flux_lang::parse`]. The decoded
 ///   [`DraftAst`] then flows through **exactly** the same gates as the JSON arm — surfacing
 ///   enforcement (A-04) and the analyze/lower validation (C-17) are arm-independent.
-/// - [`EmissionArm::Merged`] (L-71): the JSON arm with `emit_plan`'s `Node` definition collapsed
-///   to ONE object schema (`kind` enum + unioned optional props,
-///   [`flux_lang::schema::merge_node_schema`]) — ~65% fewer schema bytes, same wire format, same
-///   prompt, same parse/repair path. Per-kind semantics ride in the node-kind catalog the prompt
-///   already carries.
 ///
-/// This is a temporary measurement scaffold: once the A/B is decided, the losing arms and this
-/// selector are deleted (the project's no-fallbacks stance).
+/// The selector is a measurement scaffold, not a runtime fallback: arms exist to be re-measured
+/// per model family (`crates/flux-eval/tests/emission_ab.rs`; L-40 wants the text arm re-run
+/// behind a fine-tuned model), and losing arms are deleted once no measurement wants them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmissionArm {
-    /// Strict derived `DraftAst` JSON schema on `emit_plan` (`ast` param) — the control arm.
-    #[default]
+    /// Strict derived `DraftAst` JSON schema on `emit_plan` (`ast` param) — the L-20 control arm.
     Json,
     /// Native Flux-Lang text on `emit_plan` (`source` param) — the treatment arm.
     Text,
     /// Merged single-object `Node` schema on `emit_plan` (`ast` param) — the JSON arm's wire and
-    /// parse path with the model-facing schema shrunk (L-71).
+    /// parse path with the model-facing schema shrunk (L-71). The default since the L-71 cutover.
+    #[default]
     Merged,
 }
 
 impl EmissionArm {
-    /// Parse a selector value: unset/empty/`json` → [`Self::Json`], `text` → [`Self::Text`],
-    /// `merged` → [`Self::Merged`]. Anything else is an error — a typo must not silently pick an
-    /// arm mid-experiment.
+    /// Parse a selector value: unset/empty/`merged` → [`Self::Merged`] (the default since the
+    /// L-71 cutover), `json` → [`Self::Json`], `text` → [`Self::Text`]. Anything else is an
+    /// error — a typo must not silently pick an arm mid-experiment.
     pub fn parse(value: Option<&str>) -> Result<Self> {
         match value.map(str::trim) {
-            None | Some("") => Ok(Self::Json),
+            None | Some("") => Ok(Self::Merged),
             Some(v) if v.eq_ignore_ascii_case("json") => Ok(Self::Json),
             Some(v) if v.eq_ignore_ascii_case("text") => Ok(Self::Text),
             Some(v) if v.eq_ignore_ascii_case("merged") => Ok(Self::Merged),
@@ -2725,11 +2726,12 @@ mod tests {
     }
 
     #[test]
-    fn emission_arm_defaults_to_json_and_rejects_junk() {
-        // The selector contract: unset/empty/`json` → Json (the shipped behavior), `text` → Text,
-        // anything else is a hard error (no silent fallback mid-experiment).
-        assert_eq!(EmissionArm::parse(None).unwrap(), EmissionArm::Json);
-        assert_eq!(EmissionArm::parse(Some("")).unwrap(), EmissionArm::Json);
+    fn emission_arm_defaults_to_merged_and_rejects_junk() {
+        // The selector contract: unset/empty/`merged` → Merged (the L-71 cutover default),
+        // `json`/`text` opt-in for measurement, anything else a hard error (no silent fallback
+        // mid-experiment).
+        assert_eq!(EmissionArm::parse(None).unwrap(), EmissionArm::Merged);
+        assert_eq!(EmissionArm::parse(Some("")).unwrap(), EmissionArm::Merged);
         assert_eq!(EmissionArm::parse(Some("json")).unwrap(), EmissionArm::Json);
         assert_eq!(EmissionArm::parse(Some("JSON")).unwrap(), EmissionArm::Json);
         assert_eq!(EmissionArm::parse(Some("text")).unwrap(), EmissionArm::Text);
@@ -2748,33 +2750,34 @@ mod tests {
         assert!(EmissionArm::parse(Some("yaml")).is_err());
         // With FLUX_EMISSION unset (the normal test env), the env read lands on the default arm.
         if std::env::var("FLUX_EMISSION").is_err() {
-            assert_eq!(EmissionArm::from_env().unwrap(), EmissionArm::Json);
+            assert_eq!(EmissionArm::from_env().unwrap(), EmissionArm::Merged);
         }
     }
 
     #[test]
-    fn json_arm_surface_is_byte_identical_when_unset() {
-        // The default (env unset) arm must reproduce the pre-selector surface exactly: the strict
-        // `ast` schema on emit_plan and the JSON grammar in the prompt — no trace of the text arm.
+    fn default_arm_is_merged_and_keeps_the_json_prompt_surface() {
+        // Post-cutover contract (L-71): env-unset selects Merged, whose PROMPT is byte-identical
+        // to the json arm's — only emit_plan's advertised schema differs (that delta is asserted
+        // in merged_arm_shrinks_the_node_schema_and_keeps_the_json_surface). No text-arm leakage.
         let reg = full_registry();
         let ops = OpRegistry::new(&reg);
         let default_arm = EmissionArm::default();
-        assert_eq!(default_arm, EmissionArm::Json);
+        assert_eq!(default_arm, EmissionArm::Merged);
         let prompt = build_planner_prompt(&ops, false, EmissionArm::Json);
         assert_eq!(
             prompt,
             build_planner_prompt(&ops, false, default_arm),
-            "default arm builds the json prompt"
+            "default arm keeps the json prompt bytes"
         );
         assert!(
             prompt.contains("(a Flux-Lang flow AST)") && prompt.contains("\"kind\":\"bind\""),
-            "json prompt keeps the original wording and JSON worked examples"
+            "prompt keeps the original wording and JSON worked examples"
         );
         assert!(
             !prompt.contains("native Flux-Lang source text") && !prompt.contains("`flow` header"),
-            "no text-arm material leaks into the json prompt"
+            "no text-arm material leaks into the default prompt"
         );
-        let tools = planner_tools(false, EmissionArm::Json);
+        let tools = planner_tools(false, default_arm);
         assert_eq!(tools[0].input_schema["required"], json!(["ast"]));
     }
 

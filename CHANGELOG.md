@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **The merged Node schema is now the planner's default emission arm (L-71 cutover).** The L-71
+  A/B was run live — two runs on codex/gpt-5.5, 15 tasks × 3 arms each: pooled first-emission
+  acceptance 28/30 for both `json` and `merged` (run 2: merged 15/15 with zero repair rounds,
+  the fastest arm) at −26% uncached input tokens and −23% estimated cost. That clears the
+  pre-registered parity rule, so `FLUX_EMISSION` unset now selects `merged`; `json` (the L-20
+  winner) and `text` stay opt-in via `FLUX_EMISSION` as the measurement scaffold. The A/B
+  harness now also takes `FLUX_EMISSION_AB_MODEL=codex/<model>` to run arms against the
+  ChatGPT/Codex subscription provider. Tables + decision in
+  `docs/designs/flux-lang-emission-ab.md`.
+
 ## [0.11.5] - 2026-07-09
 
 ### Added

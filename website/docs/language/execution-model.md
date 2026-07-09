@@ -47,7 +47,9 @@ JSON Schemas that describe it:
 - The **model-facing merged schema** (`fluxlang schema --merged`) collapses all node kinds into
   **one** object type: `kind` is an enum of every node kind, and the properties are the union
   across kinds, each optional. It is about a third of the strict schema's size, which matters
-  when the schema rides along on every planning call.
+  when the schema rides along on every planning call — measured on a fixed planning corpus, it
+  matched the strict schema's first-emission acceptance at roughly a quarter less input cost, so
+  it is the schema flux's planner advertises by default.
 
 Both describe the same wire format, and the merged form gives up no safety: which fields a kind
 requires — and where a node may appear at all (`checkpoint` at top level, pure leaves inside

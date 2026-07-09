@@ -14,8 +14,10 @@
 //!   FLUX_EMISSION_AB=1 cargo test -p flux-eval --test emission_ab -- --ignored --nocapture
 //!   ```
 //!
-//!   Requirements: `OPENROUTER_API_KEY` (the OpenRouter Anthropic-Messages wire), and optionally
-//!   `FLUX_EMISSION_AB_MODEL` (default `anthropic/claude-sonnet-4.6` — the working default from
+//!   `FLUX_EMISSION_AB_MODEL` picks the model. `codex/<model>` (e.g. `codex/gpt-5.5`) runs the
+//!   ChatGPT/Codex subscription provider (OAuth via flux-credentials — `flux auth login codex`);
+//!   any other value is an OpenRouter model id on the Anthropic-Messages wire and needs
+//!   `OPENROUTER_API_KEY` (default `anthropic/claude-sonnet-4.6` — the working default from
 //!   the L-20 story). Metrics per arm: first-emission acceptance, repair rounds, tokens
 //!   (uncached-in / cache / out, straight from the planner's [`flux_core::Usage`]), and wall time.
 
@@ -279,15 +281,37 @@ async fn emission_ab_live() {
         eprintln!("emission_ab_live: skipped (set FLUX_EMISSION_AB=1 to run — spends real tokens)");
         return;
     }
-    let provider = match flux_providers::openrouter::openrouter_anthropic_from_env() {
-        Ok(p) => p,
-        Err(e) => {
-            panic!("emission_ab_live: OPENROUTER_API_KEY must resolve for the live run: {e}");
+    let spec = std::env::var("FLUX_EMISSION_AB_MODEL")
+        .unwrap_or_else(|_| "anthropic/claude-sonnet-4.6".to_string());
+    // Harness-local spec resolution, deliberately smaller than the CLI's `build_provider`:
+    // `codex/<model>` runs the subscription provider; EVERYTHING else stays an OpenRouter model id
+    // on the Anthropic-Messages wire, so the L-20 default `anthropic/claude-sonnet-4.6` keeps
+    // meaning the OpenRouter route (there, `anthropic/` is part of the model id, not a provider).
+    let (provider, model, model_spec) = match spec.split_once('/') {
+        Some(("codex", m)) => {
+            let tokens = match flux_credentials::codex_token_source() {
+                Ok(t) => t,
+                Err(e) => panic!(
+                    "emission_ab_live: codex credentials must resolve (`flux auth login codex`): {e}"
+                ),
+            };
+            let model = flux_providers::codex::resolve_model(m);
+            let model_spec = format!("codex/{model}");
+            (flux_providers::codex::oauth(tokens), model, model_spec)
+        }
+        _ => {
+            let provider = match flux_providers::openrouter::openrouter_anthropic_from_env() {
+                Ok(p) => p,
+                Err(e) => {
+                    panic!(
+                        "emission_ab_live: OPENROUTER_API_KEY must resolve for the live run: {e}"
+                    );
+                }
+            };
+            let model_spec = format!("openrouter-anthropic/{spec}");
+            (provider, spec.clone(), model_spec)
         }
     };
-    let model = std::env::var("FLUX_EMISSION_AB_MODEL")
-        .unwrap_or_else(|_| "anthropic/claude-sonnet-4.6".to_string());
-    let model_spec = format!("openrouter-anthropic/{model}");
 
     let mut reg = ToolRegistry::new();
     flux_tools::register_builtins(&mut reg);

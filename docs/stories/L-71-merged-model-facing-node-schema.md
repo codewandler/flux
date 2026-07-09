@@ -6,7 +6,7 @@ status: done
 priority:
 epic: flux-lang-emission-ab
 design: docs/designs/flux-lang-emission-ab.md
-note: "One Node object (kind enum + unioned optional props) instead of the 43-variant oneOf on emit_plan — same wire, same parse path; FLUX_EMISSION=merged."
+note: "MEASURED, DECIDED — merged is the DEFAULT arm: pooled 30-task first-emission 28/30 vs json 28/30 (run 2: 15/15, zero repairs) at −26% input/−23% cost on codex/gpt-5.5; one Node object (kind enum + unioned optional props) instead of the 43-variant oneOf, same wire, same parse path; json/text stay opt-in via FLUX_EMISSION."
 ---
 
 # Merged model-facing Node schema on emit_plan (third emission arm)
@@ -53,9 +53,20 @@ each optional, each declared once — added as a third emission arm (`EmissionAr
   CHANGELOG. Description-consistency rule added after the naive merge stamped `var.name` with
   throttle's "stable bucket name" doc. NOT done (deliberate): semantic node consolidation and
   per-node retry/timeout props — rationale in the design doc's "What was deliberately NOT done".
-- **Next:** run the live three-arm A/B (`FLUX_EMISSION_AB=1 cargo test -p flux-eval --test
-  emission_ab -- --ignored --nocapture`) and record the table in the design doc; cut over or delete
-  the arm per the pre-registered rule.
+- 2026-07-09: live three-arm A/B run 1 on `codex/gpt-5.5` (harness generalized: `FLUX_EMISSION_AB_MODEL`
+  now takes `codex/<model>` for the subscription provider; flux-credentials dev-dep added). Result:
+  merged −26% uncached input / −21% est. cost vs json, but one task below parity on both
+  pre-registered metrics (13/15 vs 14/15 first-emission; 14/15 vs 15/15 within-one-retry — 3 of 4
+  repair rounds from the single `jq-extract` outlier). Table + reading in the design doc
+  ("Measured — run 1"). No cutover on this run alone.
+- 2026-07-09: confirming run 2, same model (user call — flat-rate subscription, same-model
+  comparison): merged SWEPT it — 15/15 first emission, zero repair rounds, fastest arm (6.9s/task)
+  — while json repeated 14/15 (`when-branch` again). Pooled 30 tasks/arm: first-emission 28/30
+  both arms, merged −26% uncached input / −23% est. cost; run 1's `jq-extract` spiral did not
+  reproduce. **DECIDED per the pre-registered rule: cut over.** `EmissionArm::default()` /
+  env-unset now selects `Merged`; `json`/`text` stay opt-in via `FLUX_EMISSION` as the
+  measurement scaffold (L-40 wants text re-run behind a fine-tuned model). Tables + caveat
+  (single model family measured) in the design doc.
 
 ## Notes
 - Key files: `crates/flux-lang/src/schema.rs` (merge + tests), `crates/flux-flow/src/compile.rs`

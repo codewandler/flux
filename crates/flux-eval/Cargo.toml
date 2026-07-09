@@ -29,7 +29,9 @@ flux-orchestrate.workspace = true
 # L3->L3, test-only (tests/examples_validate.rs): the model-backed cognition ops
 # (ai.extract/rank/judge/reason, synth, ai.rewrite) some checked-in examples call.
 flux-cognition.workspace = true
-# For the env-gated L-20 emission A/B runner (tests/emission_ab.rs): it drives the planner's two
-# emission arms against a live OpenRouter model.
+# For the env-gated L-20/L-71 emission A/B runner (tests/emission_ab.rs): it drives the planner's
+# emission arms against a live model — OpenRouter by default, or the codex subscription provider
+# (`FLUX_EMISSION_AB_MODEL=codex/…`), whose OAuth tokens come from flux-credentials.
 flux-provider.workspace = true
 flux-providers.workspace = true
+flux-credentials.workspace = true

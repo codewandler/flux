@@ -1841,6 +1841,7 @@ dependencies = [
  "async-trait",
  "codewandler-flux-cognition",
  "codewandler-flux-core",
+ "codewandler-flux-credentials",
  "codewandler-flux-events",
  "codewandler-flux-evidence",
  "codewandler-flux-flow",

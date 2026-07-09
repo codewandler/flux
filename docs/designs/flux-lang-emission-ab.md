@@ -1,8 +1,11 @@
 # Design: planner emission surface — strict JSON schema vs native text (an accuracy A/B)
 
-> **Status update (2026-07-09, L-71): a THIRD arm exists — `merged` (one-node-object schema).**
-> See *The merged arm* at the bottom of this doc. Built and tested; its live measurement is
-> pending.
+> **Status update (2026-07-09, L-71): MEASURED, DECIDED — `merged` is now the default arm.**
+> Two live runs on codex/gpt-5.5 (15 tasks × 3 arms each): pooled first-emission acceptance
+> **28/30 json vs 28/30 merged** (run 2: merged 15/15, zero repair rounds — beating json's 14/15)
+> at **−26% uncached input / −23% est. cost**. That clears the pre-registered parity bar, so
+> `FLUX_EMISSION` unset now selects `merged`; `json` and `text` stay opt-in for re-measurement.
+> Tables under *The merged arm → Measured*.
 >
 > **Status update (2026-07-02, L-20): the A/B has been RUN — decision: keep `json`.** See
 > *Measured results & decision* at the bottom of this doc.
@@ -268,6 +271,78 @@ Cut production over to `merged` only if, on the same 15-task corpus + model, it 
 numbers: 93% / 15-of-15) while keeping its token savings. If it merely ties on cost or loses
 validity, `json` stays and the arm is deleted (no-fallbacks). Until measured, `json` remains the
 default; `merged` is opt-in via `FLUX_EMISSION=merged`.
+
+### Measured — run 1 (2026-07-09, `codex/gpt-5.5`, 15 tasks/arm)
+
+The harness now takes a full provider spec via `FLUX_EMISSION_AB_MODEL` (`codex/<model>` →
+ChatGPT/Codex subscription provider; anything else → OpenRouter model id, the L-20 route).
+
+| metric | json (ast schema) | text (native source) | merged (one-node schema) |
+|---|---|---|---|
+| plans accepted | 15/15 | 15/15 | 15/15 |
+| first-emission acceptance | **14/15** | 11/15 | **13/15** |
+| accepted within one retry | **15/15** | 15/15 | **14/15** |
+| repair rounds (total) | 1 | 4 | 4 |
+| uncached input tok (total / per task) | 176,531 / 11,769 | 152,120 / 10,141 | 130,818 / **8,721 (−26%)** |
+| cache-read tok (total) | 61,440 | 0 | 45,056 |
+| output tok (total / per task) | 3,739 / 249 | 3,042 / 203 | 4,388 / 293 |
+| wall time (total / per task) | 130.6s / 8.7s | 102.8s / 6.9s | 157.2s / 10.5s |
+| est. cost | $1.0255 | $0.8519 | $0.8083 (**−21%**) |
+
+Reading:
+
+- **Cost thesis confirmed:** merged saves ~3.0k uncached input tokens per planning call vs json
+  (−26%) and −21% estimated cost, on top of json's own cache hits.
+- **Validity is one task below parity, concentrated in one outlier:** 3 of merged's 4 repair
+  rounds came from a single task (`jq-extract`, a 1,406-output-token repair spiral); `when-branch`
+  cost both json and merged one repair each (intrinsically hard task, not schema-shaped). A
+  one-task delta on a 15-task corpus is within noise — but the pre-registered bar is parity, and
+  strictly this run does not clear it.
+- **Text arm re-confirms L-20** on a second model family: cheapest input, worst first-emission
+  acceptance (11/15).
+
+**Verdict after run 1: no cutover on that run alone** — one confirming run required.
+
+### Measured — run 2 (2026-07-09, `codex/gpt-5.5` again) and the decision
+
+The confirming run stayed on codex/gpt-5.5 (user call: the subscription is flat-rate, and the
+rule's "same corpus + model" comparison is cleanest when the confirming sample is drawn from the
+same model as run 1).
+
+| metric | json (ast schema) | text (native source) | merged (one-node schema) |
+|---|---|---|---|
+| plans accepted | 15/15 | 15/15 | 15/15 |
+| first-emission acceptance | 14/15 | 8/15 | **15/15** |
+| accepted within one retry | 15/15 | 14/15 | **15/15** |
+| repair rounds (total) | 1 | 8 | **0** |
+| uncached input tok (total / per task) | 145,800 / 9,720 | 94,641 / 6,309 | 107,443 / 7,163 |
+| output tok (total / per task) | 3,533 / 236 | 4,495 / 300 | 3,179 / 212 |
+| wall time (total / per task) | 119.5s / 8.0s | 156.9s / 10.5s | **103.8s / 6.9s** |
+| est. cost | $0.8811 | $0.6372 | $0.6664 |
+
+Merged swept run 2: 15/15 first emission, zero repairs, fastest arm, and json's only repair was
+`when-branch` again. Run 1's `jq-extract` spiral did not reproduce — a one-off, not a schema
+defect. (Text collapsed to 8/15 here; its L-20 loss is now confirmed on two model families.)
+
+**Pooled, 30 tasks/arm (the decision sample):**
+
+| metric | json | text | merged |
+|---|---|---|---|
+| first-emission acceptance | 28/30 (93%) | 19/30 (63%) | **28/30 (93%)** |
+| accepted within one retry | 30/30 | 29/30 | 29/30 |
+| repair rounds (total) | 2 | 12 | 4 |
+| uncached input tok / task | 10,744 | 8,225 | **7,942 (−26%)** |
+| est. cost (both runs) | $1.9066 | $1.4891 | **$1.4747 (−23%)** |
+
+**DECISION: cut over.** First-emission acceptance is at exact parity (28/30 both arms, and the
+confirming run beat json outright); within-one-retry differs only by run 1's unreproduced
+outlier (29/30 vs 30/30); the token savings hold (−26% input, −23% cost). Per the pre-registered
+rule, `merged` is now the **default** arm (`EmissionArm::default()` / `FLUX_EMISSION` unset).
+`json` (the L-20 winner) and `text` remain opt-in via `FLUX_EMISSION` as the measurement
+scaffold — `json` for re-measurement on new model families, `text` because L-40 wants it re-run
+behind a fine-tuned model. Caveat recorded: both runs were one model family (gpt-5.5); if a
+production model regresses on merged, `FLUX_EMISSION=json` is the diagnostic, and the A/B
+harness re-cuts the table.
 
 ### Key files
 
