@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-07-09
+
 ### Fixed
 
 - **Stopped rejecting valid `expr` predicates that use list built-ins.** The `expr` formula
