@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-07-10
+
 ### Added
 
 - **D-116: static endpoint wiring — `flux endpoint add` + config bindings that resolve.** A new
@@ -33,6 +35,8 @@ All notable changes to this project are documented in this file. The format is b
   operations, TOML configuration, complete Flux fences, plugin-pack membership, SDK commands, and
   security wording; the website workflow now builds previews from main/PRs but deploys stable Pages
   only for a published release or an explicit dispatch.
+- The release cutter now regenerates and stages the website's customer-changelog mirror after
+  rolling `WHATS-NEW.md`, keeping the generated drift guard green during the release gate.
 
 ## [0.14.5] - 2026-07-10
 

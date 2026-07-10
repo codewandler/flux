@@ -8,10 +8,11 @@
 #   scripts/cut-release.sh minor        # bump minor, reset patch  (flux uses minor as the breaking signal)
 #   scripts/cut-release.sh <ver> --no-gate   # skip the build/test/clippy/fmt gate (not recommended)
 #
-# It stages ONLY the release files (root Cargo.toml + both Cargo.lock + CHANGELOG.md) so concurrent
-# uncommitted work from other sessions is never swept in. It does NOT push — it prints the push
-# command (pushing the tag triggers the Release + crates.io workflows). Run from the repo root, and
-# commit your actual code/content changes first: this cuts the release on top of them.
+# It stages ONLY the release files (root/plugins manifests + locks, both changelogs, and the
+# generated website customer-changelog mirror) so concurrent uncommitted work from other sessions
+# is never swept in. It does NOT push — it prints the push command (pushing the tag triggers the
+# Release + crates.io workflows). Run from the repo root, and commit your actual code/content
+# changes first: this cuts the release on top of them.
 #
 set -euo pipefail
 
@@ -101,6 +102,12 @@ else
   echo "   !! no [Unreleased] header in WHATS-NEW.md — add the [$NEW] section by hand" >&2
 fi
 
+# 3c) WHATS-NEW.md is the source of truth for the public website mirror. Regenerate it before the
+#     gate so `website_in_sync` validates the just-rolled release rather than the previous file.
+UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync \
+  website_customer_changelog_is_in_sync >/dev/null
+echo "   regenerated website customer changelog"
+
 # 4) the gate (skippable). Mirrors AGENTS.md's dev-loop gate + both-workspace fmt + codegate.
 if [ "$NO_GATE" -eq 0 ]; then
   echo "== gate =="
@@ -116,9 +123,10 @@ else
 fi
 
 # 5) commit ONLY the release files, then tag. Never `git add -A` (protects concurrent work).
-git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md WHATS-NEW.md
+git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md WHATS-NEW.md \
+  website/docs/whats-new.md
 git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock both workspaces.
-- Roll CHANGELOG [Unreleased] -> [$NEW]."
+- Roll CHANGELOG and WHATS-NEW [Unreleased] -> [$NEW], including the generated website mirror."
 # Annotated, not lightweight: `git push --follow-tags` only pushes annotated tags (a lightweight
 # tag here silently stayed local on the 0.11.4 cut and the workflows never fired).
 git tag -a "v$NEW" -m "flux $NEW"

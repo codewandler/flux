@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.14.6] - 2026-07-10
+
 ### New
 
 - **Wire a known service once and reuse it everywhere.** `flux endpoint add <name> --url <url>`
