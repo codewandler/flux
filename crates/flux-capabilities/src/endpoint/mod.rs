@@ -95,6 +95,20 @@ impl EndpointRegistry {
         v
     }
 
+    /// The config-bound (`SourceKind::Config`) records as a name→ref map — the [`StaticResolver`]'s
+    /// binding table (D-116). These are the operator-wired named endpoints (from `flux endpoint add`,
+    /// persisted here, or from `[[endpoint.static]]`, merged in at startup); discovered `@endpoint/*`
+    /// records are excluded — the broker resolves those from the registry directly.
+    pub fn config_bindings(&self) -> HashMap<String, EndpointRef> {
+        self.records
+            .read()
+            .unwrap()
+            .values()
+            .filter(|r| r.endpoint.source == SourceKind::Config)
+            .map(|r| (r.endpoint.id.clone(), r.endpoint.clone()))
+            .collect()
+    }
+
     /// Replace exactly the set owned by `owner`, leaving other owners' records untouched. This is
     /// how a provider refreshes its discoveries without disturbing the rest (fluxplane's
     /// `ReplaceOwned`).
@@ -329,6 +343,66 @@ mod tests {
         reloaded.load().unwrap();
         assert_eq!(reloaded.resolve(&rec.endpoint.id).unwrap(), rec);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_bindings_excludes_discovered_records() {
+        let reg = EndpointRegistry::new();
+        reg.put(EndpointRecord::config(EndpointRef::named(
+            "pg-prod",
+            "postgres://db.example:5432/app",
+        )));
+        reg.put(EndpointRecord {
+            owner: "kubernetes".into(),
+            ..EndpointRecord::config(EndpointRef::discovered(
+                "pg-disc",
+                "postgres://disc:5432/x",
+                "postgres",
+            ))
+        });
+        let bindings = reg.config_bindings();
+        assert_eq!(
+            bindings.len(),
+            1,
+            "only the named config record is a binding"
+        );
+        assert!(bindings.contains_key("pg-prod"));
+        assert!(
+            !bindings.contains_key("@endpoint/pg-disc"),
+            "discovered refs resolve from the registry, not the static bindings table"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_bound_ref_resolves_through_broker_chain() {
+        // D-116: a config-bound record — exactly what `flux endpoint add` / `[[endpoint.static]]`
+        // persists — is routed by the broker to the `StaticResolver` built from `config_bindings()`
+        // and resolves to its bare URL at connect time. Before D-116 the resolver got an EMPTY map,
+        // so a named ref errored and only discovered `@endpoint/*` refs resolved.
+        let registry = Arc::new(EndpointRegistry::new());
+        registry.put(EndpointRecord::config(EndpointRef::named(
+            "pg-prod",
+            "postgres://db.example:5432/app",
+        )));
+        let resolver = Arc::new(StaticResolver::new(
+            test_system(),
+            registry.config_bindings(),
+        ));
+        let broker = EndpointBroker::new(
+            Arc::new(HostProviderInvoker::new(Arc::new(PluginRegistry::new()))),
+            Arc::new(PluginRegistry::new()),
+            registry,
+        )
+        .with_static_resolver(resolver);
+
+        let resolved = broker.resolve_endpoint("pg-prod").await.unwrap();
+        assert_eq!(resolved.url, "postgres://db.example:5432/app");
+        assert!(
+            resolved.injected_headers.is_empty(),
+            "an unauthenticated config binding injects no credential header"
+        );
+        // An id that was never wired still errors — no silent default.
+        assert!(broker.resolve_endpoint("never-wired").await.is_err());
     }
 
     #[tokio::test]

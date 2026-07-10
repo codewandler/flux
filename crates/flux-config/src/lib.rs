@@ -90,11 +90,43 @@ pub struct EndpointConfig {
     /// consumer use any provider's credentials). No matching entry → no cross-plugin resolution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cross_plugin_credentials: Vec<String>,
+    /// Statically-declared endpoints (`[[endpoint.static]]`) — the declarative alternative to
+    /// `flux endpoint add`. Each is a weak reference (no secret; the credential is a *location*), put
+    /// into the session registry at startup so it surfaces the endpoint group, lists, and resolves.
+    /// Held as plain strings here (kept a `flux-secret`-free leaf); the surface crate validates and
+    /// converts them into `EndpointRef`s.
+    #[serde(default, rename = "static", skip_serializing_if = "Vec::is_empty")]
+    pub static_endpoints: Vec<StaticEndpoint>,
+}
+
+/// One `[[endpoint.static]]` declaration: a named, config-bound endpoint. Fields mirror the weak
+/// `EndpointRef` (id + bare url + product/protocol hints + a credential *reference* + labels) — never
+/// a secret value. Validation (credential-free url, parseable credential ref, non-`@endpoint/` id)
+/// happens in the surface crate against the same rules as `flux endpoint add`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticEndpoint {
+    /// The named reference id (a bare name, e.g. `pg-prod`); not an `@endpoint/…` (discovered) id.
+    pub id: String,
+    /// Bare `scheme://host[:port][/path]` — never with embedded credentials.
+    pub url: String,
+    /// Product class (`postgres`, …); optional.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub product: String,
+    /// Wire-protocol hint (`postgres`, `http`, …); optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Credential *location* in `scheme/...` form (`env/PGPASSWORD`, `kubernetes/<ns>/<name>/<key>`,
+    /// `plugin/<p>/<i>/<slot>`); optional (unauthenticated when omitted). Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    /// Non-secret labels (region, tags) for display/filtering.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 impl EndpointConfig {
     fn is_default(&self) -> bool {
-        self.cross_plugin_credentials.is_empty()
+        self.cross_plugin_credentials.is_empty() && self.static_endpoints.is_empty()
     }
 }
 
@@ -386,6 +418,10 @@ fn merge(user: Config, project: Config) -> Config {
                 ]
                 .concat(),
             ),
+            static_endpoints: merge_static_endpoints(
+                user.endpoint.static_endpoints,
+                project.endpoint.static_endpoints,
+            ),
         },
         enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
@@ -511,6 +547,24 @@ fn dedupe(items: Vec<String>) -> Vec<String> {
         let trimmed = item.trim();
         if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
             out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// Merge static endpoint declarations: user first, then project — a project entry with the same `id`
+/// overrides the user's (so a repo can retarget a named endpoint), otherwise it is appended.
+/// Insertion order is preserved (deterministic display / registry seeding).
+fn merge_static_endpoints(
+    user: Vec<StaticEndpoint>,
+    project: Vec<StaticEndpoint>,
+) -> Vec<StaticEndpoint> {
+    let mut out = user;
+    for ep in project {
+        if let Some(slot) = out.iter_mut().find(|e| e.id == ep.id) {
+            *slot = ep;
+        } else {
+            out.push(ep);
         }
     }
     out
@@ -714,6 +768,70 @@ cross_plugin_credentials = ["sql:kubernetes", "report:*"]
         // The wildcard is scoped to its consumer, not global.
         assert!(!cfg.cross_plugin_credential_granted("other", "kubernetes"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn static_endpoints_parse_from_config() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[endpoint.static]]
+id = "pg-prod"
+url = "postgres://db.example:5432/app"
+product = "postgres"
+protocol = "postgres"
+credential_ref = "env/PGPASSWORD"
+labels = { region = "eu" }
+
+[[endpoint.static]]
+id = "metrics"
+url = "http://prom.internal:9090"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.endpoint.static_endpoints.len(), 2);
+        let pg = &cfg.endpoint.static_endpoints[0];
+        assert_eq!(pg.id, "pg-prod");
+        assert_eq!(pg.url, "postgres://db.example:5432/app");
+        assert_eq!(pg.product, "postgres");
+        assert_eq!(pg.protocol.as_deref(), Some("postgres"));
+        assert_eq!(pg.credential_ref.as_deref(), Some("env/PGPASSWORD"));
+        assert_eq!(pg.labels.get("region").map(String::as_str), Some("eu"));
+        // A minimal declaration keeps the optional fields empty (unauthenticated).
+        assert_eq!(cfg.endpoint.static_endpoints[1].id, "metrics");
+        assert!(cfg.endpoint.static_endpoints[1].credential_ref.is_none());
+        // A declared static endpoint means the endpoint config is no longer default.
+        assert!(!cfg.endpoint.is_default());
+        assert!(Config::default().endpoint.is_default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_static_endpoints_project_overrides_user_by_id() {
+        let user = vec![
+            StaticEndpoint {
+                id: "pg".into(),
+                url: "postgres://user-host:5432/app".into(),
+                ..Default::default()
+            },
+            StaticEndpoint {
+                id: "cache".into(),
+                url: "redis://user-host:6379".into(),
+                ..Default::default()
+            },
+        ];
+        let project = vec![StaticEndpoint {
+            id: "pg".into(),
+            url: "postgres://project-host:5432/app".into(),
+            ..Default::default()
+        }];
+        let merged = merge_static_endpoints(user, project);
+        // `pg` retargeted to the project url in place; `cache` retained; order preserved.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "pg");
+        assert_eq!(merged[0].url, "postgres://project-host:5432/app");
+        assert_eq!(merged[1].id, "cache");
     }
 
     #[test]

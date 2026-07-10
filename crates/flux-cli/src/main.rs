@@ -754,6 +754,32 @@ enum PluginAction {
 /// credential *location* (the `credential_ref`), never a value.
 #[derive(clap::Subcommand, Debug)]
 enum EndpointAction {
+    /// Wire a known service so the agent can use it now and in any later session: persist a weak,
+    /// credential-free `EndpointRef` to `~/.flux/endpoints.toml`. The canonical case is a Postgres
+    /// database. The credential is a *location* (`--credential-ref`), never a value; the URL must be
+    /// credential-free. The declarative alternative is a `[[endpoint.static]]` block in
+    /// `.flux/config.toml`.
+    Add {
+        /// The named reference id the agent uses as `endpoint_ref` (a bare name, e.g. `pg-prod`).
+        /// Not an `@endpoint/…` id — that prefix is reserved for discovered endpoints.
+        id: String,
+        /// Bare `scheme://host[:port][/path]` — no embedded credentials (use `--credential-ref`).
+        #[arg(long)]
+        url: String,
+        /// Product class (`postgres`, `prometheus`, …) — drives op surfacing and display.
+        #[arg(long)]
+        product: Option<String>,
+        /// Wire-protocol hint (`postgres`, `http`, `ami`, …).
+        #[arg(long)]
+        protocol: Option<String>,
+        /// Credential *location*: `env/KEY`, `kubernetes/<ns>/<name>/<key>`, or
+        /// `plugin/<p>/<i>/<slot>`. Omit for an unauthenticated endpoint. Never a value.
+        #[arg(long, value_name = "REF")]
+        credential_ref: Option<String>,
+        /// Repeatable non-secret label `key=value` (region, tags) for display/filtering.
+        #[arg(long = "label", value_name = "K=V")]
+        labels: Vec<String>,
+    },
     /// List the persisted endpoint records (id, product, bare URL, owner, ttl/health, credential
     /// location) — never a secret value.
     List,
@@ -2466,16 +2492,21 @@ async fn build_agent_with(
         // is sticky-monotonic, so a startup-static answer is enough. Known gap: a store that
         // becomes non-empty mid-session (a pre-authored flow writing through the still-gated
         // ops, or an import from another terminal) doesn't surface the group until next session.
+        // D-116: merge operator-declared `[[endpoint.static]]` bindings into the registry as
+        // config-bound records BEFORE computing ambient signals, so a declaratively-wired endpoint
+        // also surfaces the endpoint group (D-115) — identically to a `flux endpoint add` record.
+        merge_static_endpoints(&endpoint_registry, &cfg);
         ambient_signals = session_ambient_signals(&endpoint_registry);
         let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
             plugin_registry.clone(),
         ));
-        // The static config resolver (named endpoints + Env credentials) is the first link of the
-        // broker's resolver chain. (No host config endpoint bindings are wired yet — an empty map
-        // resolves named refs to "not bound"; discovered `@endpoint/*` refs resolve from the registry.)
+        // The static config resolver is the first link of the broker's resolver chain (D-116): it
+        // binds every config-bound named ref — from `flux endpoint add` (persisted) or
+        // `[[endpoint.static]]` (merged above) — plus its Env credential. Discovered `@endpoint/*`
+        // refs resolve from the registry in the broker.
         let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
             system.clone(),
-            std::collections::HashMap::new(),
+            endpoint_registry.config_bindings(),
         ));
         // Cross-plugin credential audit (D-27): records consumer→provider resolutions by LOCATION.
         let xplugin_audit: Arc<dyn flux_capabilities::CrossPluginAudit> =
@@ -6886,9 +6917,11 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         let invoker = Arc::new(flux_capabilities::HostProviderInvoker::new(
             plugin_registry.clone(),
         ));
+        // D-116: bind config-bound named refs (from `flux endpoint add` + `[[endpoint.static]]`).
+        merge_static_endpoints(&endpoint_registry, &cfg);
         let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
             system.clone(),
-            std::collections::HashMap::new(),
+            endpoint_registry.config_bindings(),
         ));
         // Cross-plugin credential audit (D-27) + endpoint discovery audit (D-30): records
         // consumer->provider resolutions and per-provider discovery counts onto this run's stream —
@@ -7130,19 +7163,165 @@ fn render_endpoint_row(record: &flux_secret::endpoint::EndpointRecord) -> String
 /// `flux endpoint …` — the operator mirror of the agent's `endpoint.*` ops over the persisted
 /// `~/.flux/endpoints.toml` store. Every path is reference-only: it shows the credential *location*,
 /// never a value. Synchronous (pure file IO over the store).
-fn run_endpoint(action: EndpointAction) -> Result<()> {
-    use flux_capabilities::EndpointRegistry;
+/// Parse repeatable `key=value` label args into a map (rejects a missing `=` or an empty key).
+fn parse_labels(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for kv in pairs {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("label `{kv}` must be `key=value`"))?;
+        if k.trim().is_empty() {
+            bail!("label key in `{kv}` must not be empty");
+        }
+        out.insert(k.trim().to_string(), v.to_string());
+    }
+    Ok(out)
+}
 
+/// True if a URL embeds credentials in its authority (`scheme://user[:pass]@host…`). The credential
+/// belongs in a `--credential-ref` *location*, never in the URL.
+fn url_has_userinfo(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority.contains('@')
+}
+
+/// Build a weak, config-bound [`EndpointRef`](flux_secret::endpoint::EndpointRef) from
+/// operator-supplied parts, enforcing the D-116 invariants shared by `flux endpoint add` and
+/// `[[endpoint.static]]`: a named (non-`@endpoint/`) id, a credential-free URL, and a parseable
+/// credential *location* (never a value).
+fn endpoint_ref_from_parts(
+    id: &str,
+    url: &str,
+    product: Option<&str>,
+    protocol: Option<&str>,
+    credential_ref: Option<&str>,
+    labels: std::collections::BTreeMap<String, String>,
+) -> Result<flux_secret::endpoint::EndpointRef> {
+    use flux_secret::endpoint::{EndpointRef, ENDPOINT_REF_PREFIX};
+    if id.trim().is_empty() {
+        bail!("endpoint id must not be empty");
+    }
+    if id.starts_with(ENDPOINT_REF_PREFIX) {
+        bail!(
+            "`{id}` uses the reserved `{ENDPOINT_REF_PREFIX}` prefix (that is for discovered \
+             endpoints); pick a bare name like `pg-prod`"
+        );
+    }
+    if url.trim().is_empty() {
+        bail!("endpoint url must not be empty");
+    }
+    if url_has_userinfo(url) {
+        bail!(
+            "url must not embed credentials (`user:pass@…`); pass the bare host and put the \
+             credential location in `--credential-ref` (e.g. `env/PGPASSWORD`)"
+        );
+    }
+    let credential_ref = match credential_ref {
+        Some(s) => Some(
+            flux_secret::Ref::parse(s)
+                .map_err(|e| anyhow::anyhow!("invalid credential ref `{s}`: {e}"))?,
+        ),
+        None => None,
+    };
+    Ok(EndpointRef {
+        product: product.unwrap_or_default().to_string(),
+        protocol: protocol.map(str::to_string),
+        credential_ref,
+        labels,
+        ..EndpointRef::named(id, url)
+    })
+}
+
+/// Merge operator-declared `[[endpoint.static]]` bindings (D-116) into `registry` as config-bound
+/// records so they surface, list, and resolve like a `flux endpoint add` record. An invalid entry is
+/// warned-and-skipped so one typo can't sink the rest.
+fn merge_static_endpoints(
+    registry: &flux_capabilities::EndpointRegistry,
+    cfg: &flux_config::Config,
+) {
+    for ep in &cfg.endpoint.static_endpoints {
+        let product = Some(ep.product.as_str()).filter(|s| !s.is_empty());
+        match endpoint_ref_from_parts(
+            &ep.id,
+            &ep.url,
+            product,
+            ep.protocol.as_deref(),
+            ep.credential_ref.as_deref(),
+            ep.labels.clone(),
+        ) {
+            Ok(reference) => registry.put(flux_secret::endpoint::EndpointRecord::config(reference)),
+            Err(e) => eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "(ignoring invalid [[endpoint.static]] `{}`: {e})",
+                    ep.id
+                ))
+            ),
+        }
+    }
+}
+
+fn run_endpoint(action: EndpointAction) -> Result<()> {
     // The persisted store. A standalone CLI invocation has no in-memory session registry, so every
     // subcommand operates on `~/.flux/endpoints.toml` (loaded fresh; a missing file is empty).
-    let path = EndpointRegistry::default_path()
+    let path = flux_capabilities::EndpointRegistry::default_path()
         .ok_or_else(|| anyhow::anyhow!("HOME is not set (no endpoints store path)"))?;
-    let registry = EndpointRegistry::with_path(path.clone());
+    run_endpoint_in(&path, action)
+}
+
+/// The path-parameterized body of [`run_endpoint`] (tests pass a temp store so they don't touch
+/// `HOME`), mirroring [`run_plugin_in`].
+fn run_endpoint_in(path: &std::path::Path, action: EndpointAction) -> Result<()> {
+    use flux_capabilities::EndpointRegistry;
+
+    let registry = EndpointRegistry::with_path(path.to_path_buf());
     registry
         .load()
         .map_err(|e| anyhow::anyhow!("load endpoints store: {e}"))?;
 
     match action {
+        EndpointAction::Add {
+            id,
+            url,
+            product,
+            protocol,
+            credential_ref,
+            labels,
+        } => {
+            // Wire a weak, credential-free config-bound ref (D-116). The shared validator rejects a
+            // credential-bearing URL / an `@endpoint/` id / an unparseable credential ref — the same
+            // rules a `[[endpoint.static]]` block is held to.
+            let reference = endpoint_ref_from_parts(
+                &id,
+                &url,
+                product.as_deref(),
+                protocol.as_deref(),
+                credential_ref.as_deref(),
+                parse_labels(&labels)?,
+            )?;
+            registry.put(flux_secret::endpoint::EndpointRecord::config(
+                reference.clone(),
+            ));
+            registry
+                .save()
+                .map_err(|e| anyhow::anyhow!("persist endpoint `{id}`: {e}"))?;
+            println!(
+                "added {} → {} (weak ref persisted to {}; credential: {})",
+                reference.id,
+                reference.url,
+                path.display(),
+                reference
+                    .credential_ref
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+            Ok(())
+        }
         EndpointAction::List => {
             let records = registry.list();
             if records.is_empty() {
@@ -8949,12 +9128,13 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 mod tests {
     use super::{
         app_plugin_caps, build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, format_evidence, loop_machinery_label, new_render_suffix,
-        plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
-        resolve_plugin_operation_name, run_corpus_export_with, run_plugin_in, run_usage_with,
-        should_fail, tool_preview, truncate, usage_annotation, write_generated_skill, EventStore,
-        EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness, PluginAction,
-        RedactorSecretSink, ReviewSeverity,
+        credential_location, endpoint_ref_from_parts, format_evidence, loop_machinery_label,
+        merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
+        plugin_status_one, render_endpoint_row, render_review_markdown,
+        resolve_plugin_operation_name, run_corpus_export_with, run_endpoint_in, run_plugin_in,
+        run_usage_with, should_fail, tool_preview, truncate, url_has_userinfo, usage_annotation,
+        write_generated_skill, EndpointAction, EventStore, EventStoreCrossPluginAudit,
+        EventStoreEgressAudit, Liveness, PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use serde_json::json;
@@ -9499,6 +9679,299 @@ mod tests {
         assert!(active.contains("endpoint"), "surfaced by the store signal");
         let none = flux_evidence::resolve_active_groups(&groups, &[]);
         assert!(!none.contains("endpoint"), "gated with no signals");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-116: `flux endpoint add` persists a weak, credential-free config-bound ref to the store, and
+    /// `list`/`show` render it. The persisted file carries the credential *location*, never a value.
+    #[test]
+    fn endpoint_add_persists_weak_ref_and_lists() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-add-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "pg-prod".into(),
+                url: "postgres://db.example:5432/app".into(),
+                product: Some("postgres".into()),
+                protocol: Some("postgres".into()),
+                credential_ref: Some("env/PGPASSWORD".into()),
+                labels: vec!["region=eu".into()],
+            },
+        )
+        .unwrap();
+
+        // The record round-trips as a config-bound (source=Config), owner=config weak ref.
+        let reg = EndpointRegistry::with_path(path.clone());
+        reg.load().unwrap();
+        let rec = reg.resolve("pg-prod").expect("added ref persisted");
+        assert_eq!(rec.endpoint.url, "postgres://db.example:5432/app");
+        assert_eq!(rec.endpoint.product, "postgres");
+        assert_eq!(
+            rec.endpoint.source,
+            flux_secret::endpoint::SourceKind::Config
+        );
+        assert_eq!(rec.owner, "config");
+        assert_eq!(
+            rec.endpoint.credential_ref.as_ref().map(|r| r.to_string()),
+            Some("env/PGPASSWORD".to_string())
+        );
+        assert_eq!(
+            rec.endpoint.labels.get("region").map(String::as_str),
+            Some("eu")
+        );
+
+        // Persisted on disk as a *location* only (the `Ref` serializes as scheme+slot, never a
+        // value) — the credential slot name is present, the scheme is `env`.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("PGPASSWORD"),
+            "credential slot (location) persisted"
+        );
+        assert!(
+            on_disk.contains("env"),
+            "credential scheme persisted as a location"
+        );
+        // The list renderer produces a row for it (reuses the same helper `flux endpoint list` uses).
+        let row = render_endpoint_row(&rec);
+        assert!(row.contains("pg-prod") && row.contains("postgres://db.example:5432/app"));
+        // list/show/resolve all succeed against the persisted store.
+        run_endpoint_in(&path, EndpointAction::List).unwrap();
+        run_endpoint_in(
+            &path,
+            EndpointAction::Show {
+                id: "pg-prod".into(),
+            },
+        )
+        .unwrap();
+        run_endpoint_in(
+            &path,
+            EndpointAction::Resolve {
+                id: "pg-prod".into(),
+            },
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-116: `flux endpoint add` rejects a credential-bearing URL, an `@endpoint/` id, and an
+    /// unparseable credential ref — and leaves the store untouched on rejection.
+    #[test]
+    fn endpoint_add_rejects_credential_bearing_url_and_bad_inputs() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-add-reject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        // Inline `user:pass@` is rejected with a pointer to `--credential-ref`.
+        let err = run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "pg".into(),
+                url: "postgres://user:secret@db.example:5432/app".into(),
+                product: None,
+                protocol: None,
+                credential_ref: None,
+                labels: vec![],
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not embed credentials"), "got: {msg}");
+        assert!(msg.contains("--credential-ref"), "points at the fix: {msg}");
+        // Nothing was written — the store file does not exist yet.
+        assert!(!path.exists(), "a rejected add persists nothing");
+
+        // An `@endpoint/` id (reserved for discovered) is rejected.
+        assert!(run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "@endpoint/pg".into(),
+                url: "postgres://db.example:5432/app".into(),
+                product: None,
+                protocol: None,
+                credential_ref: None,
+                labels: vec![],
+            },
+        )
+        .is_err());
+
+        // An unparseable credential ref is rejected.
+        assert!(run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "pg".into(),
+                url: "postgres://db.example:5432/app".into(),
+                product: None,
+                protocol: None,
+                credential_ref: Some("not-a-ref".into()),
+                labels: vec![],
+            },
+        )
+        .is_err());
+
+        // The store never came into existence across all three rejections.
+        let reg = EndpointRegistry::with_path(path.clone());
+        reg.load().unwrap();
+        assert!(reg.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-116: the shared validator's low-level invariants (also exercised by `[[endpoint.static]]`).
+    #[test]
+    fn endpoint_ref_from_parts_validates() {
+        // A valid, unauthenticated named ref.
+        let r = endpoint_ref_from_parts(
+            "m",
+            "http://prom:9090",
+            None,
+            None,
+            None,
+            parse_labels(&[]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.id, "m");
+        assert_eq!(r.source, flux_secret::endpoint::SourceKind::Config);
+        assert!(r.credential_ref.is_none());
+
+        // Userinfo detection: authority `@` is a credential, a path `@` is not.
+        assert!(url_has_userinfo("postgres://u:p@host:5432/db"));
+        assert!(!url_has_userinfo("postgres://host:5432/db"));
+        assert!(!url_has_userinfo("https://host/path@thing"));
+
+        // Empty id / empty url are rejected.
+        assert!(
+            endpoint_ref_from_parts("", "http://x", None, None, None, Default::default()).is_err()
+        );
+        assert!(endpoint_ref_from_parts("m", "  ", None, None, None, Default::default()).is_err());
+        // A malformed label is rejected at parse time.
+        assert!(parse_labels(&["novalue".to_string()]).is_err());
+    }
+
+    /// D-116: `[[endpoint.static]]` bindings merge into the registry as config-bound records that
+    /// then populate the StaticResolver binding table (via `config_bindings`); an invalid entry is
+    /// skipped, not fatal.
+    #[test]
+    fn static_endpoint_config_merges_into_registry_bindings() {
+        use flux_capabilities::EndpointRegistry;
+        let cfg = flux_config::Config {
+            endpoint: flux_config::EndpointConfig {
+                static_endpoints: vec![
+                    flux_config::StaticEndpoint {
+                        id: "pg-prod".into(),
+                        url: "postgres://db.example:5432/app".into(),
+                        product: "postgres".into(),
+                        credential_ref: Some("env/PGPASSWORD".into()),
+                        ..Default::default()
+                    },
+                    // Invalid (credential-bearing URL) — must be skipped, not abort the merge.
+                    flux_config::StaticEndpoint {
+                        id: "bad".into(),
+                        url: "postgres://u:p@host/db".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let reg = EndpointRegistry::new();
+        merge_static_endpoints(&reg, &cfg);
+        let bindings = reg.config_bindings();
+        assert!(
+            bindings.contains_key("pg-prod"),
+            "valid static binding wired"
+        );
+        assert!(!bindings.contains_key("bad"), "invalid entry skipped");
+        assert_eq!(bindings["pg-prod"].url, "postgres://db.example:5432/app");
+    }
+
+    /// D-116 e2e (gated on `TEST_POSTGRES_URL`, like the pg backend tests): an operator-added
+    /// Postgres endpoint resolves end-to-end through the broker's resolver chain — the named ref
+    /// (`sql.endpoint`, the sql plugin's default dial-by-reference target) binds to its bare URL and
+    /// the credential ref materializes host-side. These are exactly the two things the sql plugin
+    /// asks the host for when it dials by reference and runs host-terminated SCRAM (D-31); the SCRAM
+    /// leg itself is that story's tested contract, so this proof stops at the resolution seam D-116
+    /// closes (before D-116 the StaticResolver had an empty map and `sql.endpoint` never resolved).
+    #[tokio::test]
+    async fn endpoint_add_postgres_resolves_through_broker_e2e() {
+        use flux_capabilities::{
+            EndpointBroker, EndpointRegistry, HostProviderInvoker, PluginRegistry, StaticResolver,
+        };
+        use flux_plugin::ReferenceResolver; // brings `resolve_endpoint`/`resolve_credential` in scope
+        use std::sync::Arc;
+        let Ok(pg_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!(
+                "skipping endpoint_add_postgres_resolves_through_broker_e2e: TEST_POSTGRES_URL unset"
+            );
+            return;
+        };
+        // The stored URL must be credential-free — strip any userinfo the test DSN carries.
+        let bare = {
+            match pg_url.split_once("://") {
+                Some((scheme, rest)) => {
+                    let slash = rest.find('/').unwrap_or(rest.len());
+                    match rest[..slash].find('@') {
+                        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+                        None => pg_url.clone(),
+                    }
+                }
+                None => pg_url.clone(),
+            }
+        };
+
+        let dir = std::env::temp_dir().join(format!("flux-ep-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+        // The credential is a *location*: an env var the host materializes, never part of the URL.
+        let cred_key = format!("FLUX_D116_PGPASS_{}", std::process::id());
+        std::env::set_var(&cred_key, "host-side-only");
+
+        // Operator wires the service in one command → a weak, credential-free ref is persisted.
+        run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "sql.endpoint".into(),
+                url: bare.clone(),
+                product: Some("postgres".into()),
+                protocol: Some("postgres".into()),
+                credential_ref: Some(format!("env/{cred_key}")),
+                labels: vec![],
+            },
+        )
+        .unwrap();
+
+        // A fresh session loads the store and builds the resolver from its config bindings.
+        let registry = Arc::new(EndpointRegistry::with_path(path.clone()));
+        registry.load().unwrap();
+        assert!(
+            registry.resolve("sql.endpoint").is_some(),
+            "endpoint.list / `flux endpoint list` would show the added ref"
+        );
+        let system = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let resolver = Arc::new(StaticResolver::new(system, registry.config_bindings()));
+        let broker = EndpointBroker::new(
+            Arc::new(HostProviderInvoker::new(Arc::new(PluginRegistry::new()))),
+            Arc::new(PluginRegistry::new()),
+            registry,
+        )
+        .with_static_resolver(resolver);
+
+        // Dial-by-reference: the named ref binds to its bare URL through the broker chain.
+        let resolved = broker.resolve_endpoint("sql.endpoint").await.unwrap();
+        assert_eq!(resolved.url, bare);
+        // Host-terminated auth: the credential ref materializes host-side (the value never enters a
+        // plugin — this is the same host-side read `host.conn_authenticate` performs for SCRAM).
+        let material = broker
+            .resolve_credential(&flux_secret::Ref::env(&cred_key))
+            .await
+            .unwrap();
+        assert_eq!(material.value, "host-side-only");
         std::fs::remove_dir_all(&dir).ok();
     }
 

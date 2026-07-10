@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-116: static endpoint wiring — `flux endpoint add` + config bindings that resolve.** A new
+  `flux endpoint add <id> --url <url> [--product] [--protocol] [--credential-ref <ref>] [--label
+  k=v]…` persists a weak, credential-free config-bound `EndpointRef` to `~/.flux/endpoints.toml`,
+  rejecting a credential-bearing URL (points to `--credential-ref`), an `@endpoint/…` id (reserved
+  for discovered refs), and an unparseable credential ref. A declarative `[[endpoint.static]]`
+  array-of-tables under the config `[endpoint]` table is the config-as-code alternative, merged into
+  the session registry at startup (invalid entries warned-and-skipped). Both surfaces now populate
+  the `StaticResolver` binding map — previously constructed with an empty `HashMap`, so only
+  discovered `@endpoint/*` refs resolved — via the new `EndpointRegistry::config_bindings()`, so a
+  named/config-bound `endpoint_ref` resolves through the broker's `ReferenceResolver` chain at
+  connect time. This closes the "wire a service with an endpoint, then the agent can use it" loop
+  without a Kubernetes provider (the canonical case: a Postgres database reached by host-terminated
+  SCRAM). `flux_config::EndpointConfig` gains `static_endpoints` (`StaticEndpoint`); `run_endpoint`
+  is refactored to a path-parameterized `run_endpoint_in` for testing.
+
 ## [0.14.4] - 2026-07-10
 
 ### Fixed

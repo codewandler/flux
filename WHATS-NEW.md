@@ -15,6 +15,18 @@
 
 ## [Unreleased]
 
+### New
+
+- **Wire a known service once and reuse it everywhere.** `flux endpoint add <name> --url <url>`
+  (with optional `--product`, `--protocol`, `--credential-ref <location>`, and repeatable
+  `--label key=value`) records a service endpoint — a Postgres database, say — so the agent can
+  reach it by name in this session and every later one, with no Kubernetes discovery in the picture.
+  The URL must be credential-free; the credential is stored as a *location* (an `env/…`,
+  `kubernetes/…`, or `plugin/…` reference), never a value. Prefer config-as-code? Declare the same
+  endpoints with `[[endpoint.static]]` blocks in `.flux/config.toml`. Endpoints wired either way now
+  resolve at connect time exactly like cluster-discovered ones — previously a statically-registered
+  endpoint was recorded but never actually bound.
+
 ## [0.14.4] - 2026-07-10
 
 ### Fixed
