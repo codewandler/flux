@@ -40,10 +40,10 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # flux contracts (path deps into the sibling crates; these are L0/L4 and pure of vendor deps)
-flux-plugin = { package = "codewandler-flux-plugin", version = "0.13.0", path = "../crates/flux-plugin" }
-flux-datasource = { package = "codewandler-flux-datasource", version = "0.13.0", path = "../crates/flux-datasource" }
-flux-secret = { package = "codewandler-flux-secret", version = "0.13.0", path = "../crates/flux-secret" }
-flux-spec = { package = "codewandler-flux-spec", version = "0.13.0", path = "../crates/flux-spec" }
+flux-plugin = { package = "codewandler-flux-plugin", version = "0.14.0", path = "../crates/flux-plugin" }
+flux-datasource = { package = "codewandler-flux-datasource", version = "0.14.0", path = "../crates/flux-datasource" }
+flux-secret = { package = "codewandler-flux-secret", version = "0.14.0", path = "../crates/flux-secret" }
+flux-spec = { package = "codewandler-flux-spec", version = "0.14.0", path = "../crates/flux-spec" }
 host-kit = { package = "codewandler-flux-host-kit", version = "0.2.0", path = "host-kit" }
 
 serde = { version = "1", features = ["derive"] }

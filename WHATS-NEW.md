@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-10
+
 ### Improved
 
 - Flux-Lang editor diagnostics now recognize the built-in model, knowledge-search, and web-reading
