@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-07-10
+
 ### Improved
 
 - The terminal UI is now a dense daily driver: the transcript is borderless, the multiline input is

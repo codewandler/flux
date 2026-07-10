@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-07-10
+
 ### Added
 
 - **A-65 — dense daily-driver TUI makeover.** `flux-tui` now uses a borderless, viewport-cached
