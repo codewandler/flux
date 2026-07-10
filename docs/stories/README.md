@@ -23,7 +23,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Now (in progress)
 - [C-50 — Harden audited safety, correctness, and efficiency seams](C-50-audit-hardening-wave.md) · Core · concurrent hardening wave from the 2026-07-10 repository audit
-- [D-129 — Plugins pack 0.1.1 — ship the slack fixes; manifests inherit the workspace version](D-129-plugins-pack-0-1-1-version-inheritance.md) · Core · delivery vehicle for D-127/D-128; also kills the hand-maintained per-plugin manifest version strings (kubernetes already drifted to 0.2.0 vs its 0.1.0 descriptor)
 
 ## Next (ready — take the top one unless the user named a story)
 _None._
@@ -281,6 +280,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-126 — `flux auth set` — stored bearer tokens for plugin auth purposes (no-env configuration)](D-126-flux-auth-set-stored-plugin-bearer.md) · Core · plain (non-OAuth2) plugin auth purposes resolve ONLY from process env today; operators need a configure-in-advance path when the session env can't carry secrets
 - [D-127 — slack mrkdwn→Markdown renderer mangles and panics on multi-byte chars](D-127-slack-mrkdwn-multibyte-panic.md) · Core · byte-wise fallthrough pushes `bytes[i] as char` (mojibake for every non-ASCII char) and leaves `i` mid-sequence → the next `text[i..]` slice panics; message.list defaults to markdown → crashes on any channel with an em-dash
 - [D-128 — slack.file.upload never landed: PUT to the pre-signed URL 302s, alt_text breaks the complete call](D-128-slack-external-upload-contract.md) · Core · found live while attaching the 0.14.7 release demo — the external-upload flow had never been exercised against real Slack (the unit test's MockHost matches by URL substring and ignored the method)
+- [D-129 — Plugins pack 0.1.1 — ship the slack fixes; manifests inherit the workspace version](D-129-plugins-pack-0-1-1-version-inheritance.md) · Core · delivery vehicle for D-127/D-128; also kills the hand-maintained per-plugin manifest version strings (kubernetes already drifted to 0.2.0 vs its 0.1.0 descriptor)
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this
