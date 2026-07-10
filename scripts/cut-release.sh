@@ -53,6 +53,16 @@ if [ "$plugins_before" -gt 0 ]; then
   sed -i "s/\"$OLD\"/\"$NEW\"/g" plugins/Cargo.toml
   echo "   bumped $plugins_before version string(s) in plugins/Cargo.toml"
 fi
+# host-kit versions in LOCKSTEP with the flux workspace (see plugins/host-kit/Cargo.toml): every
+# cut republishes it with a matching version + flux dep line, so a flux release always has a
+# compatible host-kit by construction.
+hostkit_before=$(grep -c "\"$OLD\"" plugins/host-kit/Cargo.toml || true)
+if [ "$hostkit_before" -gt 0 ]; then
+  sed -i "s/\"$OLD\"/\"$NEW\"/g" plugins/host-kit/Cargo.toml
+  echo "   bumped $hostkit_before version string(s) in plugins/host-kit/Cargo.toml"
+else
+  echo "   !! plugins/host-kit/Cargo.toml carries no \"$OLD\" — lockstep broken? fix by hand" >&2
+fi
 
 # 1b) the `[workspace.dependencies]` publish-closure pins (`flux-core = { version = "0.MI.0", ... }`)
 #     deliberately stay at MINOR.0 across patch releases — the loosest correct `^0.MI.0` requirement
@@ -123,8 +133,8 @@ else
 fi
 
 # 5) commit ONLY the release files, then tag. Never `git add -A` (protects concurrent work).
-git add Cargo.toml plugins/Cargo.toml Cargo.lock plugins/Cargo.lock CHANGELOG.md WHATS-NEW.md \
-  website/docs/whats-new.md
+git add Cargo.toml plugins/Cargo.toml plugins/host-kit/Cargo.toml Cargo.lock plugins/Cargo.lock \
+  CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md
 git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock both workspaces.
 - Roll CHANGELOG and WHATS-NEW [Unreleased] -> [$NEW], including the generated website mirror."
 # Annotated, not lightweight: `git push --follow-tags` only pushes annotated tags (a lightweight

@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-host-kit"
-version = "0.2.0"
+version = "0.14.6"
 dependencies = [
  "base64",
  "codewandler-flux-datasource",
