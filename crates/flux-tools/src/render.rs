@@ -339,31 +339,13 @@ impl Tool for FlowRenderTool {
     }
 }
 
-/// Resolve `name` to the stored source that defines it: a file whose stem is `name`, else any file
-/// declaring a flow named `name` (mirrors `flows::resolve_flow`, but keeps the raw text — the
-/// source view renders the file as written).
+/// Resolve through the shared stored-flow catalog, keeping the raw text so source view renders the
+/// selected file as written.
 fn resolve_source(ctx: &ToolContext, name: &str) -> Result<String> {
-    let files = crate::flows::flow_files(ctx);
-    if let Some((_, source)) = files
-        .iter()
-        .find(|(p, _)| crate::flows::basename(p) == name)
-    {
-        return Ok(source.clone());
-    }
-    for (_, source) in &files {
-        if let Ok(module) = Module::parse_str(source) {
-            let found = match &module {
-                Module::Flow(ast) => ast.name.as_deref() == Some(name),
-                Module::Program(p) => p.flow_named(name).is_some(),
-            };
-            if found {
-                return Ok(source.clone());
-            }
-        }
-    }
-    Err(Error::Other(format!(
-        "flow_render: no flow named `{name}` under .flux/flows or ~/.flux/flows (try flow_list)"
-    )))
+    crate::flows::StoredFlowCatalog::load(ctx.system.as_ref())
+        .resolve(name)
+        .map(|resolved| resolved.source)
+        .map_err(|e| Error::Other(format!("flow_render: {e}")))
 }
 
 /// Register the render pack: `flow_render`, beside `flow_list` / `flow_run`.

@@ -84,16 +84,27 @@ write there; the `flows` home is the recommended place for hand-authored flows/o
 > until a `flux-system` fix — `Workspace::base_for` did not resolve a bare `@name` (no `/subpath`) to its
 > named root, so the directory read resolved to a non-existent path and returned nothing.
 
-### Discovery and running — `flow_list` / `flow_run`
+### Discovery and running — agent tools and the CLI
 
-Two model-facing tools (registered by `flux_tools::register_flows` at the CLI host, not base
-`register_builtins`) let the agent work with the flows home directly:
+One `flux-tools` `StoredFlowCatalog`, backed by `System`, owns discovery, precedence, malformed-file
+reporting, filename/declaration aliases, and flow-vs-op resolution. The model-facing tools
+(`register_flows` at the CLI host, not base `register_builtins`), `flow_render`, and the direct CLI
+all consume that same snapshot:
 
 - **`flow_list`** enumerates `.flux/flows` → `@global_flows` → `.flux/ops` → `@global_ops` and lists every
   flow and composite op with its description and params.
 - **`flow_run(name, inputs?)`** resolves a flow by name, seeds `inputs` as prepended literal binds, and
   runs it in the current session by re-entering the depth-guarded `run_plan` path (`ctx.loop_host`), so it
-  inherits the provider, session, and approval/IO envelope. (It needs a `LoopHost`, like `run_plan`.)
+  inherits the provider, session, and approval/IO envelope. Its compatibility-lenient input semantics
+  are unchanged. (It needs a `LoopHost`, like `run_plan`.)
+- **`flux flow list`** (alias `ls`) prints the identical catalog without constructing an agent,
+  provider, event store, or session.
+- **`flux flow run <target>`** resolves an existing file first, then a saved filename stem or declared
+  flow name. Declared parameters form a strict contract: `--inputs <JSON object>` and repeatable
+  `--arg key=value` are validated and converted to literal binds before execution. `--map-inputs
+  <text>` is explicitly opt-in and lowers into the executed AST (`ai.extract`, JSON parse, one-object
+  assertion, strict field binds), so approval, tracing, recording, and resume see the mapping work.
+  Deterministic overlays win, and a complete deterministic input set skips the model call.
 
 ## Safety rules
 

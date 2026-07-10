@@ -19,7 +19,9 @@ pub mod toolchains;
 pub mod transform;
 
 pub use evidence::register_evidence;
-pub use flows::register_flows;
+pub use flows::{
+    register_flows, ResolvedStoredFlow, StoredFlowCatalog, StoredFlowEntry, StoredFlowKind,
+};
 pub use reflect::register_reflect;
 pub use render::register_render;
 

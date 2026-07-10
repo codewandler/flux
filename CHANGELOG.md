@@ -6,6 +6,38 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **L-79 — run saved flows directly from the CLI.** `flux flow list` (alias `ls`) now prints the
+  same project/global flows-and-ops catalog as `flow_list` without constructing an agent session;
+  `flux flow run <target>` resolves an existing path first, then a saved filename stem or declared
+  flow name. Declared parameters are a strict CLI contract: `--inputs <JSON object>` and repeatable
+  `--arg key=value` merge with typed coercion and last-arg-wins precedence, rejecting malformed JSON,
+  unknown/missing keys, and deterministic type mismatches before execution. Optional
+  `--map-inputs <text>` lowers missing parameters into recorded `ai.extract` → JSON parse →
+  cardinality assertion → strict field-bind nodes, uses the same `-m` as authored model ops, and is
+  skipped when deterministic inputs are complete. Discovery/resolution is now one System-backed
+  `flux-tools` catalog shared by `flow_list`, `flow_run`, `flow_render`, and the CLI. Explicit
+  module-local composites shadow same-named auto-loaded definitions before validation, fixing direct
+  runs of mixed flow/op files inside a flows home.
+
+### Fixed
+
+- **v0.14.0 regression: `flux app run --serve <addr>` (space form, no program) was silently
+  misparsed.** The CLI review wave's `require_equals = true` on `--serve` was meant to stop a
+  *preceding* bare `--serve` from swallowing a following `<program>` positional, but it also broke
+  the far more common documented form (`flux app run --serve <addr> --yes`, no program) used
+  throughout README.md, the public website docs, `docs/a2a.md`, and the flux-markdown test
+  corpora — the address silently fell back to the default and got misread as `<program>` instead.
+  Reverted `--serve` to its pre-review-wave optional-value behavior; `plugin install --dir` keeps
+  `require_equals` (every documented use there is the bare, no-value form, so there's no
+  equivalent breakage). Disambiguate the original footgun by argument order
+  (`flux app run prog.flux --serve`) or `--serve=addr`.
+- `plugins/{alertmanager,aws}`: both plugins' leap-year checks used `u64::is_multiple_of`, stable
+  only since Rust 1.87 while the plugins workspace MSRV is pinned to 1.85 — pre-existing,
+  unrelated to the CLI review wave, caught by CI (`cut-release.sh`'s local gate checks
+  plugins-workspace `fmt` but not `clippy`). Rewritten as plain modulo checks.
+
 ## [0.14.0] - 2026-07-10
 
 ### Changed

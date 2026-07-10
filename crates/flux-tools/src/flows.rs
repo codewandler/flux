@@ -19,10 +19,175 @@ use flux_lang::ast::{DraftAst, Node, Param};
 use flux_lang::program::Module;
 use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
+use flux_system::System;
 
-/// Directories searched, in precedence order (project shadows global; flows shadow ops).
-/// `@`-prefixed entries are workspace *named roots* — read only when the CLI registered them.
+/// Directories searched, in precedence order (project flows shadow global flows; flows shadow the
+/// legacy ops homes). `@`-prefixed entries are workspace named roots, read only when registered.
 const FLOW_DIRS: &[&str] = &[".flux/flows", "@global_flows", ".flux/ops", "@global_ops"];
+
+/// The kind of declaration shown in the stored-flow catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredFlowKind {
+    Flow,
+    Op,
+    Error,
+}
+
+impl StoredFlowKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flow => "flow",
+            Self::Op => "op",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One visible declaration in a [`StoredFlowCatalog`]. The first declaration of a name wins in
+/// directory precedence order, exactly as `flow_list` has always behaved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredFlowEntry {
+    pub name: String,
+    pub kind: StoredFlowKind,
+    pub description: String,
+    pub params: Vec<Param>,
+    pub path: String,
+}
+
+/// A stored flow selected by filename stem or declared flow name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedStoredFlow {
+    pub path: String,
+    pub source: String,
+    pub ast: DraftAst,
+}
+
+#[derive(Debug, Clone)]
+struct StoredFlowFile {
+    dir_rank: usize,
+    path: String,
+    stem: String,
+    source: String,
+    parsed: std::result::Result<Module, String>,
+}
+
+/// The one system-backed catalog for saved flows and composite ops. It is independent of a
+/// tool/agent session so CLI discovery can run without constructing a provider or event store.
+#[derive(Debug, Clone)]
+pub struct StoredFlowCatalog {
+    files: Vec<StoredFlowFile>,
+    entries: Vec<StoredFlowEntry>,
+}
+
+impl StoredFlowCatalog {
+    /// Discover `.flux` files in the established precedence order. Missing directories,
+    /// unregistered named roots, and unreadable directories are skipped as before; a malformed
+    /// individual file remains a visible `[error]` entry.
+    pub fn load(system: &System) -> Self {
+        let ws = system.workspace();
+        let mut files = Vec::new();
+        for (dir_rank, dir) in FLOW_DIRS.iter().enumerate() {
+            if let Some(root) = dir.strip_prefix('@') {
+                if !ws.has_named_root(root) {
+                    continue;
+                }
+            }
+            let Ok(found) = system.read_dir_text_files(dir, "flux") else {
+                continue;
+            };
+            files.extend(found.into_iter().map(|(path, source)| StoredFlowFile {
+                dir_rank,
+                stem: basename(&path),
+                parsed: Module::parse_str(&source).map_err(|e| e.to_string()),
+                path,
+                source,
+            }));
+        }
+
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        for file in &files {
+            for entry in entries_of(file) {
+                if seen.insert(entry.name.clone()) {
+                    entries.push(entry);
+                }
+            }
+        }
+        Self { files, entries }
+    }
+
+    /// Visible, already-shadowed catalog entries in deterministic display order.
+    pub fn entries(&self) -> &[StoredFlowEntry] {
+        &self.entries
+    }
+
+    /// Render exactly the text shared by the `flow_list` tool and `flux flow list`.
+    pub fn render(&self) -> String {
+        if self.entries.is_empty() {
+            return "no flows found — add .flux files under .flux/flows or ~/.flux/flows".into();
+        }
+        self.entries
+            .iter()
+            .map(|entry| {
+                let desc = if entry.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", entry.description)
+                };
+                let params = if entry.params.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  (params: {})",
+                        entry
+                            .params
+                            .iter()
+                            .map(|p| p.name.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!("{} [{}]{}{}", entry.name, entry.kind.label(), desc, params)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Resolve a filename stem or declared flow name. Within each directory tier, a filename stem
+    /// wins over a declaration alias; directory precedence always wins across tiers. A matching
+    /// op-only target is reported explicitly instead of degrading to "not found".
+    pub fn resolve(&self, name: &str) -> Result<ResolvedStoredFlow> {
+        for dir_rank in 0..FLOW_DIRS.len() {
+            if let Some(file) = self
+                .files
+                .iter()
+                .find(|file| file.dir_rank == dir_rank && file.stem == name)
+            {
+                return resolve_from_stem(file, name);
+            }
+
+            for file in self.files.iter().filter(|file| file.dir_rank == dir_rank) {
+                match &file.parsed {
+                    Ok(Module::Flow(ast)) if ast.name.as_deref() == Some(name) => {
+                        return Ok(resolved(file, ast.clone()));
+                    }
+                    Ok(Module::Program(program)) => {
+                        if let Some(ast) = program.flow_named(name) {
+                            return Ok(resolved(file, ast.clone()));
+                        }
+                        if let Some(op) = program.ops.iter().find(|op| op.name == name) {
+                            return Err(op_only_error(&file.path, &op.name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(Error::Other(format!(
+            "no stored flow named `{name}` under .flux/flows or ~/.flux/flows — try `flux flow list` (or `flow_list`)"
+        )))
+    }
+}
 
 /// Register the flow discovery/run pack. Like the reflect pack, `flow_run` is only meaningful
 /// with a model-in-the-loop host installed, but it stays model-facing (unlike `run_plan`).
@@ -39,26 +204,7 @@ fn loop_host(ctx: &ToolContext) -> Result<&dyn LoopHost> {
     })
 }
 
-/// Every `.flux` file under the flow dirs as `(workspace_path, source)`, in `FLOW_DIRS`
-/// precedence order. Missing dirs and unregistered named roots are skipped. Crate-visible so
-/// `flow_render` resolves stored flows through the same dirs.
-pub(crate) fn flow_files(ctx: &ToolContext) -> Vec<(String, String)> {
-    let ws = ctx.system.workspace();
-    let mut out = Vec::new();
-    for dir in FLOW_DIRS {
-        if let Some(root) = dir.strip_prefix('@') {
-            if !ws.has_named_root(root) {
-                continue;
-            }
-        }
-        if let Ok(files) = ctx.system.read_dir_text_files(dir, "flux") {
-            out.extend(files);
-        }
-    }
-    out
-}
-
-pub(crate) fn basename(path: &str) -> String {
+fn basename(path: &str) -> String {
     path.rsplit('/')
         .next()
         .unwrap_or(path)
@@ -67,55 +213,82 @@ pub(crate) fn basename(path: &str) -> String {
         .to_string()
 }
 
-fn param_names(ps: &[Param]) -> Vec<String> {
-    ps.iter().map(|p| p.name.to_string()).collect()
-}
-
-/// One discoverable declaration (a top-level flow or a composite op).
-struct Entry {
-    name: String,
-    kind: &'static str,
-    description: String,
-    params: Vec<String>,
-}
-
 /// Parse one file into its discoverable entries. An unparseable file yields a single
 /// `error` entry so `flow_list` surfaces it rather than hiding it.
-fn entries_of(path: &str, source: &str) -> Vec<Entry> {
-    match Module::parse_str(source) {
-        Ok(Module::Flow(ast)) => vec![Entry {
-            name: ast.name.clone().unwrap_or_else(|| basename(path)),
-            kind: "flow",
+fn entries_of(file: &StoredFlowFile) -> Vec<StoredFlowEntry> {
+    match &file.parsed {
+        Ok(Module::Flow(ast)) => vec![StoredFlowEntry {
+            name: ast.name.clone().unwrap_or_else(|| file.stem.clone()),
+            kind: StoredFlowKind::Flow,
             description: String::new(),
-            params: param_names(&ast.params),
+            params: ast.params.clone(),
+            path: file.path.clone(),
         }],
         Ok(Module::Program(program)) => {
-            let mut v = Vec::new();
-            for f in &program.flows {
-                v.push(Entry {
-                    name: f.name.clone().unwrap_or_else(|| basename(path)),
-                    kind: "flow",
+            let mut entries = Vec::new();
+            for flow in &program.flows {
+                entries.push(StoredFlowEntry {
+                    name: flow.name.clone().unwrap_or_else(|| file.stem.clone()),
+                    kind: StoredFlowKind::Flow,
                     description: String::new(),
-                    params: param_names(&f.params),
+                    params: flow.params.clone(),
+                    path: file.path.clone(),
                 });
             }
-            for o in &program.ops {
-                v.push(Entry {
-                    name: o.name.clone(),
-                    kind: "op",
-                    description: o.meta.description.clone(),
-                    params: param_names(&o.params),
+            for op in &program.ops {
+                entries.push(StoredFlowEntry {
+                    name: op.name.clone(),
+                    kind: StoredFlowKind::Op,
+                    description: op.meta.description.clone(),
+                    params: op.params.clone(),
+                    path: file.path.clone(),
                 });
             }
-            v
+            entries
         }
-        Err(e) => vec![Entry {
-            name: basename(path),
-            kind: "error",
-            description: format!("parse error: {e}"),
+        Err(error) => vec![StoredFlowEntry {
+            name: file.stem.clone(),
+            kind: StoredFlowKind::Error,
+            description: format!("parse error: {error}"),
             params: Vec::new(),
+            path: file.path.clone(),
         }],
     }
+}
+
+fn resolved(file: &StoredFlowFile, ast: DraftAst) -> ResolvedStoredFlow {
+    ResolvedStoredFlow {
+        path: file.path.clone(),
+        source: file.source.clone(),
+        ast,
+    }
+}
+
+fn resolve_from_stem(file: &StoredFlowFile, name: &str) -> Result<ResolvedStoredFlow> {
+    match &file.parsed {
+        Err(error) => Err(Error::Other(format!("{}: {error}", file.path))),
+        Ok(Module::Flow(ast)) => Ok(resolved(file, ast.clone())),
+        Ok(Module::Program(program)) => {
+            if let Some(ast) = program.flow_named(name) {
+                Ok(resolved(file, ast.clone()))
+            } else if let Some(ast) = program.flows.first() {
+                Ok(resolved(file, ast.clone()))
+            } else if let Some(op) = program.ops.first() {
+                Err(op_only_error(&file.path, &op.name))
+            } else {
+                Err(Error::Other(format!(
+                    "`{}` has no runnable flow",
+                    file.path
+                )))
+            }
+        }
+    }
+}
+
+fn op_only_error(path: &str, op: &str) -> Error {
+    Error::Other(format!(
+        "`{path}` defines composite op `{op}` and no runnable flow — standalone ops cannot be run with `flux flow run`; call it from a flow or directly from an agent, e.g. {op}({{…}})"
+    ))
 }
 
 /// Arguments for `flow_list` (none today).
@@ -146,33 +319,9 @@ impl Tool for FlowListTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
-        let mut seen = HashSet::new();
-        let mut lines = Vec::new();
-        for (path, source) in flow_files(ctx) {
-            for e in entries_of(&path, &source) {
-                // First (highest-precedence) definition of a name wins.
-                if !seen.insert(e.name.clone()) {
-                    continue;
-                }
-                let desc = if e.description.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {}", e.description)
-                };
-                let params = if e.params.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (params: {})", e.params.join(", "))
-                };
-                lines.push(format!("{} [{}]{}{}", e.name, e.kind, desc, params));
-            }
-        }
-        if lines.is_empty() {
-            return Ok(ToolResult::ok(
-                "no flows found — add .flux files under .flux/flows or ~/.flux/flows",
-            ));
-        }
-        Ok(ToolResult::ok(lines.join("\n")))
+        Ok(ToolResult::ok(
+            StoredFlowCatalog::load(ctx.system.as_ref()).render(),
+        ))
     }
 }
 
@@ -217,7 +366,7 @@ impl Tool for FlowRunTool {
         params
             .get("name")
             .and_then(|v| v.as_str())
-            .map(|n| vec![format!("flow:{n}")])
+            .map(|name| vec![format!("flow:{name}")])
             .unwrap_or_default()
     }
 
@@ -225,17 +374,20 @@ impl Tool for FlowRunTool {
         let args: FlowRunInput = crate::parse_params(params, "flow_run")?;
         let mut ast = resolve_flow(ctx, &args.name)?;
 
-        // Seed inputs as literal binds, prepended so a flow-local `bind` can still shadow them
-        // (matches FlowStore::seed's last-writer-wins semantics).
+        // Preserve the agent tool's existing compatibility semantics: arbitrary input keys are
+        // literal binds and a flow-local bind can shadow them. The strict declared-param contract is
+        // intentionally a CLI-only policy.
         if let Some(inputs) = args.inputs {
             let obj = inputs
                 .as_object()
                 .ok_or_else(|| Error::Other("flow_run: `inputs` must be a JSON object".into()))?;
             let mut seeded: Vec<Node> = obj
                 .iter()
-                .map(|(k, v)| Node::Bind {
-                    name: k.clone().into(),
-                    value: Box::new(Node::Lit { value: v.clone() }),
+                .map(|(key, value)| Node::Bind {
+                    name: key.clone().into(),
+                    value: Box::new(Node::Lit {
+                        value: value.clone(),
+                    }),
                     ty: None,
                     effect: None,
                 })
@@ -254,47 +406,139 @@ impl Tool for FlowRunTool {
     }
 }
 
-/// Resolve `name` to a runnable flow AST: a file whose stem is `name` (its flow named `name`,
-/// else its first flow), or any file declaring a flow named `name`.
 fn resolve_flow(ctx: &ToolContext, name: &str) -> Result<DraftAst> {
-    let files = flow_files(ctx);
-    if let Some((path, source)) = files.iter().find(|(p, _)| basename(p) == name) {
-        return flow_from_source(path, source, name);
-    }
-    for (_path, source) in &files {
-        if let Ok(module) = Module::parse_str(source) {
-            match module {
-                Module::Flow(ast) if ast.name.as_deref() == Some(name) => return Ok(ast),
-                Module::Program(program) => {
-                    if let Some(f) = program.flow_named(name) {
-                        return Ok(f.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Err(Error::Other(format!(
-        "flow_run: no flow named `{name}` under .flux/flows or ~/.flux/flows (try flow_list)"
-    )))
+    StoredFlowCatalog::load(ctx.system.as_ref())
+        .resolve(name)
+        .map(|resolved| resolved.ast)
+        .map_err(|e| Error::Other(format!("flow_run: {e}")))
 }
 
-fn flow_from_source(path: &str, source: &str, name: &str) -> Result<DraftAst> {
-    match Module::parse_str(source).map_err(|e| Error::Other(format!("{path}: {e}")))? {
-        Module::Flow(ast) => Ok(ast),
-        Module::Program(program) => {
-            if let Some(f) = program.flow_named(name) {
-                Ok(f.clone())
-            } else if let Some(f) = program.flows.first() {
-                Ok(f.clone())
-            } else if let Some(o) = program.ops.first() {
-                Err(Error::Other(format!(
-                    "`{path}` defines op `{}` and no flow — call it directly, e.g. {}({{…}})",
-                    o.name, o.name
-                )))
-            } else {
-                Err(Error::Other(format!("`{path}` has no runnable flow")))
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_system::Workspace;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("flux-stored-catalog-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (TempDir, System) {
+        let temp = TempDir::new();
+        let project = temp.path().join("project");
+        let global = temp.path().join("global-flows");
+        std::fs::create_dir_all(project.join(".flux/flows")).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        let mut workspace = Workspace::new(&project).unwrap();
+        workspace.add_named_root("global_flows", &global).unwrap();
+        (temp, System::new(workspace))
+    }
+
+    fn write(base: &Path, path: &str, source: &str) {
+        std::fs::write(base.join(path), source).unwrap();
+    }
+
+    #[test]
+    fn project_declarations_shadow_global_ones() {
+        let (temp, system) = fixture();
+        let project = temp.path().join("project");
+        let global = temp.path().join("global-flows");
+        write(
+            &project,
+            ".flux/flows/project.flux",
+            "flow shared(value: String)\n  return \"project\"\n",
+        );
+        write(
+            &global,
+            "global.flux",
+            "flow shared(value: Number)\n  return \"global\"\n",
+        );
+
+        let catalog = StoredFlowCatalog::load(&system);
+        let shared: Vec<_> = catalog
+            .entries()
+            .iter()
+            .filter(|entry| entry.name == "shared")
+            .collect();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].params[0].ty, flux_lang::ast::TypeRef::String);
+        let resolved = catalog.resolve("shared").unwrap();
+        assert_eq!(resolved.path, ".flux/flows/project.flux");
+    }
+
+    #[test]
+    fn filename_stems_and_declared_names_resolve_to_the_same_flow() {
+        let (temp, system) = fixture();
+        let project = temp.path().join("project");
+        write(
+            &project,
+            ".flux/flows/by-file.flux",
+            "flow by-declaration(name: String)\n  return $name\n",
+        );
+
+        let catalog = StoredFlowCatalog::load(&system);
+        let by_stem = catalog.resolve("by-file").unwrap();
+        let by_name = catalog.resolve("by-declaration").unwrap();
+        assert_eq!(by_stem.path, by_name.path);
+        assert_eq!(by_stem.ast, by_name.ast);
+    }
+
+    #[test]
+    fn malformed_files_are_listed_and_fail_resolution() {
+        let (temp, system) = fixture();
+        let project = temp.path().join("project");
+        write(&project, ".flux/flows/broken.flux", "flow broken( ((((\n");
+
+        let catalog = StoredFlowCatalog::load(&system);
+        let entry = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "broken")
+            .unwrap();
+        assert_eq!(entry.kind, StoredFlowKind::Error);
+        assert!(entry.description.starts_with("parse error:"));
+        assert!(catalog.render().contains("broken [error] — parse error:"));
+        let error = catalog.resolve("broken").unwrap_err().to_string();
+        assert!(error.contains(".flux/flows/broken.flux"), "{error}");
+    }
+
+    #[test]
+    fn op_only_stems_and_declared_names_get_an_actionable_error() {
+        let (temp, system) = fixture();
+        let project = temp.path().join("project");
+        write(
+            &project,
+            ".flux/flows/helpers.flux",
+            "op greet(name: String) -> String\n  return fmt(\"hi {name}\")\n",
+        );
+
+        let catalog = StoredFlowCatalog::load(&system);
+        for target in ["helpers", "greet"] {
+            let error = catalog.resolve(target).unwrap_err().to_string();
+            assert!(error.contains("composite op `greet`"), "{target}: {error}");
+            assert!(error.contains("call it from a flow"), "{target}: {error}");
         }
     }
 }

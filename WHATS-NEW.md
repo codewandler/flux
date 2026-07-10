@@ -15,6 +15,21 @@
 
 ## [Unreleased]
 
+### New
+
+- Saved flows are now directly scriptable from the terminal. `flux flow list` shows project and
+  global flows (plus reusable operations), and `flux flow run <name>` runs one without needing its
+  path. Pass typed values with `--inputs` or repeatable `--arg key=value`; flux catches missing,
+  unknown, or mistyped inputs before the flow starts. If you want natural-language input, opt in with
+  `--map-inputs "deploy three replicas to dev"` — deterministic values still win, and fully supplied
+  flows never call a model or require provider credentials.
+
+### Fixed
+
+- `flux app run --serve <address> --yes` (no program) is back to working as documented — a v0.14.0
+  change broke this common form, silently ignoring the address you gave and trying to serve on the
+  default one instead.
+
 ## [0.14.0] - 2026-07-10
 
 ### Improved

@@ -12,6 +12,8 @@ Common paths:
 
 ```bash
 flux run "fix the failing test"
+flux flow list
+flux flow run deploy --arg env=dev --arg replicas=3
 flux flow run path/to/flow.flux
 flux app run path/to/app.flux
 ```
@@ -30,12 +32,31 @@ require human confirmation — see [Safety & approvals](./safety.md).
 | `flux tui` | ratatui chat UI with an in-UI approval modal |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
-| `flux flow run <file>` | execute a stored Flux-Lang flow |
+| `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
+| `flux flow run <name\|file>` | execute a saved flow by name or an existing Flux-Lang file (files win) |
 | `flux render <file.flux>` | render a `.flux` file as a syntax-highlighted SVG (`--view source\|tree`, `-o out.svg`) |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
 | `flux plugin …` / `flux preset …` | manage subprocess plugins / prebuilt flows |
+
+## Saved flow inputs
+
+Put reusable `.flux` files in `.flux/flows` (project) or `~/.flux/flows` (global). `flux flow list`
+shows the same names, parameter lists, parse errors, and project-before-global precedence the agent's
+`flow_list` operation sees. Run by filename stem or the name in the `flow` declaration:
+
+```bash
+flux flow run deploy --inputs '{"env":"dev"}'
+flux flow run deploy --arg env=dev --arg replicas=3
+flux flow run deploy --map-inputs "deploy three replicas to dev" -m sonnet
+```
+
+Declared parameters are required. Unknown keys, missing values, malformed JSON, and concrete type
+mismatches fail before the flow starts. `--arg` overrides `--inputs`, and a later duplicate `--arg`
+wins. Natural-language mapping is never implicit: only `--map-inputs` invokes a model, and it maps
+only parameters not already supplied deterministically. A flow that is otherwise deterministic can
+run without provider credentials.
 
 ## Two modes
 

@@ -8,26 +8,41 @@ description: Running, previewing, and compiling Flux-Lang flows — flux flow ru
 Flux-Lang files are runnable artifacts. This page covers the commands that execute, preview,
 compile, format, and round-trip them.
 
-## `flux flow run` — execute a stored flow
+## `flux flow list` / `run` — discover and execute saved flows
 
 ```bash
+flux flow list                         # alias: flux flow ls
+flux flow run deploy                   # filename stem or declared flow name
 flux flow run my-flow.flux
+flux flow run deploy --inputs '{"env":"dev"}'
+flux flow run deploy --arg env=dev --arg replicas=3
+flux flow run deploy --map-inputs "deploy three replicas to dev" -m sonnet
 flux flow run my-flow.flux --yes -m anthropic/claude-sonnet-5
 ```
 
-Runs a checked-in flow **deterministically** — no model compiles anything; the file *is* the
-plan. Details:
+`list` reads `.flux/flows` (project) and `~/.flux/flows` (global), showing saved flows, composite
+ops, declared parameters, and parse errors without starting an agent session. Project definitions
+win name collisions. `run` resolves an existing file first; otherwise it looks up the target as a
+saved filename stem or declared flow name.
+
+The selected flow is already the plan — no model compiles it. Details:
 
 - Accepts **native text or a JSON AST** — a file starting with `{` is read as the JSON wire
   form; anything else parses as Flux-Lang text. Both load to the same plan.
 - The file must contain a bare flow, or a module with exactly one flow (or journey). Composite
   `op` declarations in the module are registered for the run.
+- Declared flow parameters are required. Pass a JSON object with `--inputs`, or repeatable
+  `--arg key=value` values coerced from the declared type. Args override JSON and the last duplicate
+  arg wins. Unknown/missing keys, malformed JSON, and concrete type mismatches fail before effects.
+- `--map-inputs <text>` is the explicit model-assisted mode. It maps only still-missing parameters;
+  deterministic values win. The mapping is part of the recorded plan and uses the same `-m` as any
+  model ops authored in the flow. If deterministic inputs cover the contract, no mapping call occurs.
 - The provider is constructed **lazily**: a flow that never reaches a model op (`ai.reason`,
   `task`, …) runs with no API credentials at all.
 - The safety envelope applies exactly as in an agent turn: risky steps prompt for approval;
   `--yes` auto-approves.
-- Beyond the CLI (which runs by **file path**), an **agent** can discover and run stored flows by
-  **name** with the `flow_list` / `flow_run` ops, resolved from the flows home — see
+- An **agent** sees the same catalog and can discover/run saved flows with `flow_list` / `flow_run`
+  (whose existing compatibility-lenient input behavior is unchanged) — see
   [Where flows live](#where-flows-live).
 
 ## `flux plan` — preview without executing
@@ -89,9 +104,9 @@ drift.
 - **Authored text** — your repository; the flux repo's own runnable examples are in
   [`examples/`](https://github.com/codewandler/flux/tree/main/examples).
 - **The reusable flows home** — drop `.flux` files (flows, ops, or whole modules) under
-  **`.flux/flows`** (project) or **`~/.flux/flows`** (global): the `flow_list` / `flow_run` ops
-  discover and run them by name, and any composite `op`s placed there **auto-load as callable ops**.
-  (The legacy `.flux/ops` / `~/.flux/ops` dirs are still read.)
+  **`.flux/flows`** (project) or **`~/.flux/flows`** (global): `flux flow list` / `run` and the
+  agent's `flow_list` / `flow_run` ops share one catalog, while composite `op`s placed there
+  **auto-load as callable ops**. (The legacy `.flux/ops` / `~/.flux/ops` dirs are still read.)
 - **Planner-emitted JSON** — session storage and `.flux/flows/` in a workspace.
 
 Editing conventions: 2-space indentation, no tabs, one statement per line. See

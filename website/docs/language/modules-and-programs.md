@@ -77,7 +77,10 @@ like a built-in everywhere else.
 **Reuse across sessions — the flows home.** Beyond the module they are declared in, composite ops
 saved as `.flux` files under `.flux/flows` (project) or `~/.flux/flows` (global) **auto-load as
 callable ops** on every run — so a `~/.flux/flows/greet.flux` that defines `op greet(...)` is callable
-by name anywhere. Use `flow_list` to see what is available and `flow_run` to run a stored flow by name.
+by name anywhere. Agents use `flow_list` / `flow_run`; from a terminal, `flux flow list` shows the
+same catalog and `flux flow run <name>` runs a saved flow directly. Supply declared parameters with
+`--inputs '{"key":"value"}'` or repeatable `--arg key=value`; opt in to natural-language mapping only
+when wanted with `--map-inputs "…"`.
 
 ## Program declarations
 

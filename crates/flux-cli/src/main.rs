@@ -341,9 +341,9 @@ enum Commands {
     /// Run a single behavioral loop (a Flux-Lang flow — native text, or a pre-compiled DraftAst JSON file).
     ///
     /// Reusable flows and composite ops live as `.flux` files under `.flux/flows` (project) and
-    /// `~/.flux/flows` (global): the agent discovers them with the `flow_list` tool and runs them
-    /// with `flow_run`, and composite `op`s placed there auto-load as callable ops. (The legacy
-    /// `~/.flux/ops` / `.flux/ops` dirs are still read.)
+    /// `~/.flux/flows` (global): list/run them directly with `flux flow list` / `flux flow run
+    /// <name>`, or let the agent use `flow_list` / `flow_run`. Composite `op`s placed there
+    /// auto-load as callable ops. (The legacy `~/.flux/ops` / `.flux/ops` dirs are still read.)
     Flow {
         #[command(subcommand)]
         action: FlowAction,
@@ -536,10 +536,24 @@ enum AppAction {
 /// `flux flow …`
 #[derive(clap::Subcommand, Debug)]
 enum FlowAction {
-    /// Run a checked-in Flux-Lang program file.
+    /// List saved flows and composite ops from the project and global flows homes.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Run a checked-in Flux-Lang file or a saved flow by filename stem / declared name.
     Run {
-        /// Path to the `.flux` loop — native Flux-Lang text, or a checked-in DraftAst JSON.
-        file: String,
+        /// Existing file path, saved-flow filename stem, or declared flow name. Existing files win.
+        target: String,
+        /// Deterministic flow inputs as one JSON object. Keys must be declared flow parameters.
+        #[arg(long, value_name = "JSON")]
+        inputs: Option<String>,
+        /// Deterministic input override, repeatable. Values are coerced from the parameter TypeRef;
+        /// a later duplicate key wins.
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        args: Vec<String>,
+        /// Opt in to model-assisted mapping for parameters not covered by --inputs / --arg. The
+        /// mapper is recorded in the Flux AST and runs through the normal approval/runtime envelope.
+        #[arg(long, value_name = "TEXT")]
+        map_inputs: Option<String>,
         /// Model for the program's agent steps.
         #[arg(short = 'm', long)]
         model: Option<String>,
@@ -552,10 +566,10 @@ enum FlowAction {
         /// erroring the whole run. Implied by `--resume`.
         #[arg(long)]
         resumable: bool,
-        /// Resume a previously halted run of THIS file: a literal session id (printed by the halt
+        /// Resume a previously halted run of THIS flow target: a literal session id (printed by the halt
         /// report), or `last` — the most recent halted `flow run` session for this flow's declared
         /// name (`flow <name> -> …`; an unnamed flow can't be disambiguated this way and needs the
-        /// explicit session id). Re-parses this (possibly corrected) file, folds the halted
+        /// explicit session id). Re-resolves/re-parses this (possibly corrected) target, folds the halted
         /// session's statement ledger, fast-forwards the matching completed prefix (values
         /// rehydrated), and executes from the first changed statement.
         #[arg(long, value_name = "SESSION|last")]
@@ -2180,6 +2194,29 @@ async fn build_agent_lazy(
     build_agent_with(flags, false, session_override).await
 }
 
+/// Build the workspace view used by every saved-flow consumer. Agent construction creates the two
+/// global homes (preserving its existing behavior); read-only CLI listing/resolution merely
+/// registers homes that already exist, so `flux flow list` has no session/provider side effects.
+fn workspace_with_flow_roots(cwd: &std::path::Path, create_global: bool) -> Result<Workspace> {
+    let mut workspace = Workspace::from_env(cwd).context("workspace")?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let flux_dir = std::path::PathBuf::from(home).join(".flux");
+        for (name, sub) in [("global_flows", "flows"), ("global_ops", "ops")] {
+            let dir = flux_dir.join(sub);
+            if create_global {
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("create {}", dir.display()))?;
+            }
+            if dir.is_dir() {
+                workspace
+                    .add_named_root(name, &dir)
+                    .with_context(|| format!("register {}", dir.display()))?;
+            }
+        }
+    }
+    Ok(workspace)
+}
+
 async fn build_agent_with(
     flags: &AgentFlags,
     eager_provider: bool,
@@ -2228,21 +2265,10 @@ async fn build_agent_with(
             (Box::new(native), m, canonical_spec)
         };
 
-    let mut workspace = Workspace::from_env(&cwd).context("workspace")?;
-    if let Some(home) = std::env::var_os("HOME") {
-        let flux_dir = std::path::PathBuf::from(home).join(".flux");
-        // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
-        // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
-        // is the legacy location, still read during the ops→flows unification.
-        for (name, sub) in [("global_flows", "flows"), ("global_ops", "ops")] {
-            let dir = flux_dir.join(sub);
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            workspace
-                .add_named_root(name, &dir)
-                .with_context(|| format!("register {}", dir.display()))?;
-        }
-    }
-    let system = Arc::new(System::new(workspace));
+    // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
+    // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
+    // is the legacy location, still read during the ops→flows unification.
+    let system = Arc::new(System::new(workspace_with_flow_roots(&cwd, true)?));
 
     // Project context folded into the system prompt: environment, git working-tree state, repo
     // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
@@ -2677,12 +2703,6 @@ async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
     Ok(())
 }
 
-/// `flux flow run <file.flux> [--yes] [-m <model>]` — load a checked-in Flux-Lang graph (JSON
-/// `DraftAst`) and execute it directly, **skipping the NL→plan compile**. This is the thin slice of
-/// flow persistence that makes the improve flows runnable; full `.flux/flows` save/load is flux-flow M6.
-/// The file is validated against the live op registry (`analyze_flow`) before anything runs, and it
-/// executes through the same `Executor::dispatch` envelope as every other turn (destructive ops still
-/// escalate; `--yes` auto-approves).
 /// `flux eval <adapter> [--tasks a,b] [--members a,b] [--limit N] [-m model] [--trials N]
 /// [--report out.md] [--watch]` — run a benchmark suite ad-hoc through flux-eval and print a summary
 /// (same adapters + scoring the `eval_run` op and improve loop use). `--watch` streams each task's
@@ -2984,47 +3004,499 @@ async fn run_render_in(
     Ok(())
 }
 
+struct LoadedCliFlow {
+    ast: flux_flow::ast::DraftAst,
+    composites: Vec<flux_lang::program::CompositeOpDecl>,
+}
+
+/// `flux flow list` / `ls`: discovery only. This deliberately constructs just a guarded `System`
+/// and the shared catalog — no provider, event store, session, plugin process, or agent engine.
+fn run_flow_list() -> Result<()> {
+    let cwd = std::env::current_dir().context("current dir")?;
+    let system = System::new(workspace_with_flow_roots(&cwd, false)?);
+    println!("{}", flux_tools::StoredFlowCatalog::load(&system).render());
+    Ok(())
+}
+
+/// Parse an existing path using the long-standing file semantics. JSON DraftAst files remain
+/// supported; a native module path must still select exactly one flow/journey.
+fn parse_cli_flow_source(label: &str, source: &str) -> Result<LoadedCliFlow> {
+    if source.trim_start().starts_with('{') {
+        return Ok(LoadedCliFlow {
+            ast: serde_json::from_str(source)
+                .with_context(|| format!("parse {label} as a Flux-Lang DraftAst (JSON)"))?,
+            composites: Vec::new(),
+        });
+    }
+    match flux_lang::program::Module::parse_str(source)
+        .map_err(|e| anyhow::anyhow!("parse {label} as Flux-Lang text: {e}"))?
+    {
+        flux_lang::program::Module::Flow(ast) => Ok(LoadedCliFlow {
+            ast,
+            composites: Vec::new(),
+        }),
+        flux_lang::program::Module::Program(program) => {
+            let ast = match (program.flows.as_slice(), program.journeys.as_slice()) {
+                ([flow], []) => flow.clone(),
+                ([], [journey]) => journey.flow.clone(),
+                _ => bail!(
+                    "`flux flow run` needs a bare flow or a module with exactly one flow/journey"
+                ),
+            };
+            Ok(LoadedCliFlow {
+                ast,
+                composites: program.ops,
+            })
+        }
+    }
+}
+
+/// Resolve the positional target as a real file first, then as a saved-flow filename stem or
+/// declaration. Saved-name runs do not return their file's ops as module-local declarations: those
+/// ops are already in the engine's auto-loaded composite snapshot and must be installed once.
+fn load_cli_flow_target(target: &str) -> Result<LoadedCliFlow> {
+    if std::path::Path::new(target).is_file() {
+        let source =
+            std::fs::read_to_string(target).with_context(|| format!("read flow {target}"))?;
+        return parse_cli_flow_source(target, &source);
+    }
+
+    let cwd = std::env::current_dir().context("current dir")?;
+    let system = System::new(workspace_with_flow_roots(&cwd, false)?);
+    let resolved = flux_tools::StoredFlowCatalog::load(&system)
+        .resolve(target)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(LoadedCliFlow {
+        ast: resolved.ast,
+        composites: Vec::new(),
+    })
+}
+
+fn validate_flow_input_value(
+    key: &str,
+    value: &serde_json::Value,
+    ty: &flux_lang::ast::TypeRef,
+) -> Result<()> {
+    use flux_lang::ast::TypeRef;
+    let valid = match ty {
+        TypeRef::Any | TypeRef::Named(_) => true,
+        TypeRef::Bool => value.is_boolean(),
+        TypeRef::Number => value.is_number(),
+        TypeRef::String => value.is_string(),
+        TypeRef::List(inner) => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| value_matches_type(item, inner))),
+    };
+    if valid {
+        Ok(())
+    } else {
+        bail!(
+            "input `{key}` expects {}, got {}",
+            ty.label(),
+            json_value_kind(value)
+        )
+    }
+}
+
+fn value_matches_type(value: &serde_json::Value, ty: &flux_lang::ast::TypeRef) -> bool {
+    use flux_lang::ast::TypeRef;
+    match ty {
+        TypeRef::Any | TypeRef::Named(_) => true,
+        TypeRef::Bool => value.is_boolean(),
+        TypeRef::Number => value.is_number(),
+        TypeRef::String => value.is_string(),
+        TypeRef::List(inner) => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| value_matches_type(item, inner))),
+    }
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "Bool",
+        serde_json::Value::Number(_) => "Number",
+        serde_json::Value::String(_) => "String",
+        serde_json::Value::Array(_) => "List",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Coerce one final (last-wins) `--arg` value from its declared TypeRef. Any/named values accept
+/// either JSON or plain text; concrete scalar/list types are deliberately strict.
+fn coerce_flow_arg(
+    key: &str,
+    raw: &str,
+    ty: &flux_lang::ast::TypeRef,
+) -> Result<serde_json::Value> {
+    use flux_lang::ast::TypeRef;
+    let value = match ty {
+        TypeRef::String => serde_json::Value::String(raw.to_string()),
+        TypeRef::Any | TypeRef::Named(_) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        }
+        TypeRef::Number | TypeRef::Bool | TypeRef::List(_) => serde_json::from_str(raw)
+            .with_context(|| format!("--arg {key} expects {} JSON", ty.label()))?,
+    };
+    validate_flow_input_value(key, &value, ty)?;
+    Ok(value)
+}
+
+fn mapper_schema(params: &[flux_lang::ast::Param]) -> serde_json::Value {
+    let properties: serde_json::Map<String, serde_json::Value> = params
+        .iter()
+        .map(|param| (param.name.0.clone(), schema_for_type(&param.ty)))
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": params.iter().map(|param| param.name.0.clone()).collect::<Vec<_>>(),
+    })
+}
+
+fn schema_for_type(ty: &flux_lang::ast::TypeRef) -> serde_json::Value {
+    use flux_lang::ast::TypeRef;
+    match ty {
+        TypeRef::Any => serde_json::json!({}),
+        TypeRef::Bool => serde_json::json!({"type": "boolean"}),
+        TypeRef::Number => serde_json::json!({"type": "number"}),
+        TypeRef::String => serde_json::json!({"type": "string"}),
+        TypeRef::List(inner) => {
+            serde_json::json!({"type": "array", "items": schema_for_type(inner)})
+        }
+        TypeRef::Named(name) => {
+            serde_json::json!({"description": format!("Flux value of type {name}")})
+        }
+    }
+}
+
+fn used_flow_symbols(ast: &flux_flow::ast::DraftAst) -> std::collections::HashSet<String> {
+    use flux_flow::ast::Node;
+    let mut used: std::collections::HashSet<String> = ast
+        .params
+        .iter()
+        .map(|param| param.name.0.clone())
+        .collect();
+    flux_lang::analyze::for_each_node(&ast.body, &mut |node| match node {
+        Node::Bind { name, .. }
+        | Node::Memo { name, .. }
+        | Node::Peek { name }
+        | Node::Var { name } => {
+            used.insert(name.0.clone());
+        }
+        Node::Each { item, collect, .. } => {
+            used.insert(item.0.clone());
+            if let Some(name) = collect {
+                used.insert(name.0.clone());
+            }
+        }
+        Node::Repeat {
+            collect: Some(name),
+            ..
+        } => {
+            used.insert(name.0.clone());
+        }
+        Node::Pipe { bind, .. }
+        | Node::Seq { bind, .. }
+        | Node::Retry { bind, .. }
+        | Node::Loop { bind, .. }
+        | Node::Fallback { bind, .. }
+        | Node::Timeout { bind, .. }
+        | Node::Budget { bind, .. }
+        | Node::CapScope { bind, .. }
+        | Node::Scope { bind, .. }
+        | Node::Once { bind, .. } => {
+            if let Some(name) = bind {
+                used.insert(name.0.clone());
+            }
+        }
+        Node::Race { bind, branches, .. } => {
+            if let Some(name) = bind {
+                used.insert(name.0.clone());
+            }
+            used.extend(branches.iter().map(|branch| branch.name.0.clone()));
+        }
+        Node::Try {
+            catch: Some(name), ..
+        } => {
+            used.insert(name.0.clone());
+        }
+        Node::Await {
+            binding: Some(name),
+            ..
+        } => {
+            used.insert(name.0.clone());
+        }
+        Node::Parallel { branches } => {
+            used.extend(branches.iter().map(|branch| branch.name.0.clone()));
+        }
+        Node::Ctx {
+            name,
+            include,
+            exclude,
+            ..
+        } => {
+            used.insert(name.0.clone());
+            used.extend(include.iter().chain(exclude).map(|name| name.0.clone()));
+        }
+        Node::CtxAppend { ctx, add } => {
+            used.insert(ctx.0.clone());
+            used.extend(add.iter().map(|name| name.0.clone()));
+        }
+        _ => {}
+    });
+    used
+}
+
+fn fresh_mapper_symbol(
+    base: &str,
+    used: &mut std::collections::HashSet<String>,
+) -> flux_lang::ast::SymbolName {
+    let mut candidate = base.to_string();
+    let mut suffix = 0usize;
+    while used.contains(&candidate) {
+        suffix += 1;
+        candidate = format!("{base}_{suffix}");
+    }
+    used.insert(candidate.clone());
+    candidate.into()
+}
+
+/// Lower opt-in natural-language mapping into ordinary, recorded Flux nodes. Strict `jq` field
+/// reads make a missing field/non-object fatal before the original body begins; bind annotations
+/// retain each declared TypeRef in the plan.
+fn mapper_nodes(
+    ast: &flux_flow::ast::DraftAst,
+    missing: &[flux_lang::ast::Param],
+    text: &str,
+) -> Result<Vec<flux_flow::ast::Node>> {
+    use flux_flow::ast::{FlowEffect, Node, TypeRef};
+    let mut used = used_flow_symbols(ast);
+    let raw = fresh_mapper_symbol("__flux_map_raw", &mut used);
+    let parsed = fresh_mapper_symbol("__flux_map_json", &mut used);
+    let object = fresh_mapper_symbol("__flux_map_args", &mut used);
+    let schema =
+        serde_json::to_string(&mapper_schema(missing)).context("serialize input schema")?;
+
+    let call_fields = [
+        (
+            "ask".to_string(),
+            Box::new(Node::Lit {
+                value: serde_json::Value::String(
+                    "Extract exactly one argument object for the requested flow parameters. Return a JSON array containing exactly that one object and no prose."
+                        .into(),
+                ),
+            }),
+        ),
+        (
+            "from".to_string(),
+            Box::new(Node::Lit {
+                value: serde_json::Value::String(text.to_string()),
+            }),
+        ),
+        (
+            "schema".to_string(),
+            Box::new(Node::Lit {
+                value: serde_json::Value::String(schema),
+            }),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut nodes = vec![
+        Node::Bind {
+            name: raw.clone(),
+            value: Box::new(Node::Call {
+                op: "ai.extract".into(),
+                args: vec![Node::Obj {
+                    fields: call_fields,
+                }],
+            }),
+            ty: Some(TypeRef::String),
+            effect: Some(FlowEffect::Model),
+        },
+        Node::Bind {
+            name: parsed.clone(),
+            value: Box::new(Node::Parse {
+                value: Box::new(Node::Var { name: raw }),
+                as_type: "json".into(),
+            }),
+            ty: Some(TypeRef::List(Box::new(TypeRef::Any))),
+            effect: None,
+        },
+        Node::Assert {
+            cond: Box::new(Node::Expr {
+                formula: "len(items) == 1".into(),
+                vars: [(
+                    "items".to_string(),
+                    Box::new(Node::Var {
+                        name: parsed.clone(),
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            message: Some(
+                "--map-inputs must return exactly one argument object in a JSON array".into(),
+            ),
+        },
+        Node::Bind {
+            name: object.clone(),
+            value: Box::new(Node::Jq {
+                path: "[0]".into(),
+                input: Box::new(Node::Var { name: parsed }),
+                optional: false,
+            }),
+            ty: Some(TypeRef::Any),
+            effect: None,
+        },
+    ];
+    nodes.extend(missing.iter().map(|param| Node::Bind {
+        name: param.name.clone(),
+        value: Box::new(Node::Jq {
+            path: format!(".{}", param.name.0),
+            input: Box::new(Node::Var {
+                name: object.clone(),
+            }),
+            optional: false,
+        }),
+        ty: Some(param.ty.clone()),
+        effect: None,
+    }));
+    Ok(nodes)
+}
+
+/// Apply the CLI-only strict parameter contract and prepend the normalized AST nodes. Merge order:
+/// mapper base, then `--inputs`, then repeatable `--arg` (last duplicate wins).
+fn prepare_cli_flow_inputs(
+    ast: &mut flux_flow::ast::DraftAst,
+    inputs: Option<&str>,
+    args: &[String],
+    map_inputs: Option<&str>,
+) -> Result<()> {
+    let mut deterministic = match inputs {
+        Some(raw) => {
+            let value: serde_json::Value = serde_json::from_str(raw)
+                .with_context(|| "--inputs must be a valid JSON object")?;
+            value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("--inputs must be a JSON object"))?
+        }
+        None => serde_json::Map::new(),
+    };
+
+    // Preserve last-wins semantics even when an earlier duplicate is malformed for the declared
+    // type: only the final raw value is coerced.
+    let mut raw_args = std::collections::BTreeMap::new();
+    for arg in args {
+        let (key, value) = arg
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--arg expects KEY=VALUE (got `{arg}`)"))?;
+        if key.is_empty() {
+            bail!("--arg expects a non-empty key in KEY=VALUE");
+        }
+        raw_args.insert(key.to_string(), value.to_string());
+    }
+
+    let declared: std::collections::HashMap<&str, &flux_lang::ast::Param> = ast
+        .params
+        .iter()
+        .map(|param| (param.name.0.as_str(), param))
+        .collect();
+    let unknown: std::collections::BTreeSet<String> = deterministic
+        .keys()
+        .chain(raw_args.keys())
+        .filter(|key| !declared.contains_key(key.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "unknown flow input parameter(s): {} — declared parameters: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", "),
+            ast.params
+                .iter()
+                .map(|param| param.name.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    for (key, raw) in raw_args {
+        let param = declared[&key.as_str()];
+        deterministic.insert(key.clone(), coerce_flow_arg(&key, &raw, &param.ty)?);
+    }
+    for param in &ast.params {
+        if let Some(value) = deterministic.get(&param.name.0) {
+            validate_flow_input_value(&param.name.0, value, &param.ty)?;
+        }
+    }
+
+    let missing: Vec<flux_lang::ast::Param> = ast
+        .params
+        .iter()
+        .filter(|param| !deterministic.contains_key(&param.name.0))
+        .cloned()
+        .collect();
+    if !missing.is_empty() && map_inputs.is_none() {
+        bail!(
+            "missing required flow parameter(s): {} — pass --inputs, --arg, or opt in with --map-inputs",
+            missing
+                .iter()
+                .map(|param| format!("{} ({})", param.name.0, param.ty.label()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let mut prefix = Vec::new();
+    // If deterministic overlays cover the whole contract, skip the mapper (and therefore the model)
+    // even when --map-inputs was supplied.
+    if !missing.is_empty() {
+        if let Some(text) = map_inputs {
+            prefix.extend(mapper_nodes(ast, &missing, text)?);
+        }
+    }
+    prefix.extend(ast.params.iter().filter_map(|param| {
+        deterministic
+            .get(&param.name.0)
+            .map(|value| flux_flow::ast::Node::Bind {
+                name: param.name.clone(),
+                value: Box::new(flux_flow::ast::Node::Lit {
+                    value: value.clone(),
+                }),
+                ty: Some(param.ty.clone()),
+                effect: None,
+            })
+    }));
+    prefix.append(&mut ast.body);
+    ast.body = prefix;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_flow(
-    file: &str,
+    target: &str,
+    inputs: Option<String>,
+    args: Vec<String>,
+    map_inputs: Option<String>,
     model: Option<String>,
     yes: bool,
     resumable: bool,
     resume: Option<String>,
     resume_value: Option<String>,
 ) -> Result<()> {
-    // Build the agent flags from the command's own model/`--yes` (reuses the shared agent wiring).
+    let LoadedCliFlow {
+        mut ast,
+        composites,
+    } = load_cli_flow_target(target)?;
+    prepare_cli_flow_inputs(&mut ast, inputs.as_deref(), &args, map_inputs.as_deref())?;
+
+    // Build the agent only after target/input validation, so malformed deterministic input cannot
+    // create a session and no flow effect can run before the strict contract passes.
     let flags = AgentFlags::from_model_yes(model.as_deref(), yes);
-
-    let src = std::fs::read_to_string(file).with_context(|| format!("read flow {file}"))?;
-    // A behavioral loop file is native flux-lang text, or a checked-in JSON `DraftAst` (sniffed by the
-    // leading `{`). Both load as the same AST.
-    let (ast, composites): (
-        flux_flow::ast::DraftAst,
-        Vec<flux_lang::program::CompositeOpDecl>,
-    ) = if src.trim_start().starts_with('{') {
-        (
-            serde_json::from_str(&src)
-                .with_context(|| format!("parse {file} as a Flux-Lang DraftAst (JSON)"))?,
-            Vec::new(),
-        )
-    } else {
-        match flux_lang::program::Module::parse_str(&src)
-            .map_err(|e| anyhow::anyhow!("parse {file} as Flux-Lang text: {e}"))?
-        {
-            flux_lang::program::Module::Flow(ast) => (ast, Vec::new()),
-            flux_lang::program::Module::Program(program) => {
-                let ast = match (program.flows.as_slice(), program.journeys.as_slice()) {
-                    ([flow], []) => flow.clone(),
-                    ([], [journey]) => journey.flow.clone(),
-                    _ => bail!(
-                        "`flux flow run` needs a bare flow or a module with exactly one flow/journey"
-                    ),
-                };
-                (ast, program.ops)
-            }
-        }
-    };
-
     run_draft_ast_with_composites_resumable(
         &flags,
         &ast,
@@ -3037,7 +3509,7 @@ async fn run_flow(
 }
 
 /// Execute a pre-built `DraftAst` through the full envelope — the shared core behind both
-/// `flux flow run <file.flux>` and `flux preset <name> --run`. Builds the agent, validates the flow
+/// `flux flow run <name|file>` and `flux preset <name> --run`. Builds the agent, validates the flow
 /// against the live op registry, previews risk + installs the per-op approver, runs it, and prints the
 /// outcome. The only inputs are the agent flags (model/`--yes`) and the AST itself.
 pub(crate) async fn run_draft_ast(
@@ -3144,6 +3616,13 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         .ensure_session_loaded(&engine.flow, &session_id)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut active_composites = engine.composites.active_for_session(&session_id);
+    // A path-loaded module owns its local declarations. If that path also lives under a flows home,
+    // the same ops are already present in the auto-loaded snapshot; remove those copies before
+    // installing the explicit declarations so module-local ops shadow rather than collide. A
+    // saved-NAME run passes no explicit declarations and therefore uses the auto-loaded copy once.
+    let explicit_names: std::collections::HashSet<&str> =
+        composites.iter().map(|op| op.name.as_str()).collect();
+    active_composites.retain(|op| !explicit_names.contains(op.name.as_str()));
     active_composites.extend(composites.iter().cloned());
 
     // Validate against the live op registry before running anything.
@@ -5576,6 +6055,19 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(s));
         }
 
+        // Test hook for direct model-backed cognition ops (not the planner loop): return a canned
+        // text completion. L-79 uses this to exercise `ai.extract` input mapping through the real
+        // binary without provider credentials or a network stub.
+        if let Ok(text) = std::env::var("FLUX_MOCK_RESPONSE") {
+            let chunks = vec![
+                Chunk::TextDelta(text),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+
         // Second call: the plan (emitted on the first call with no `complete`) has run and its results
         // were fed back, so the engine loops here — answer in prose, which ends the turn. The usage
         // chunk mimics a cached re-send (most of the prompt read from cache) so the offline path
@@ -6036,16 +6528,35 @@ async fn async_main(cli: Cli) -> Result<()> {
                     },
             }) => run_app(program.as_deref(), &agent, serve).await,
             Some(Commands::Flow {
+                action: FlowAction::List,
+            }) => run_flow_list(),
+            Some(Commands::Flow {
                 action:
                     FlowAction::Run {
-                        file,
+                        target,
+                        inputs,
+                        args,
+                        map_inputs,
                         model,
                         yes,
                         resumable,
                         resume,
                         resume_value,
                     },
-            }) => run_flow(&file, model, yes, resumable, resume, resume_value).await,
+            }) => {
+                run_flow(
+                    &target,
+                    inputs,
+                    args,
+                    map_inputs,
+                    model,
+                    yes,
+                    resumable,
+                    resume,
+                    resume_value,
+                )
+                .await
+            }
             Some(Commands::Render { file, view, out }) => {
                 run_render(&file, view, out.as_deref()).await
             }
@@ -8514,6 +9025,277 @@ mod tests {
             }
             other => panic!("expected Render, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn saved_flow_subcommands_and_input_flags_parse() {
+        use super::{Cli, Commands, FlowAction};
+        use clap::Parser;
+
+        for list_word in ["list", "ls"] {
+            let cli = Cli::try_parse_from(["flux", "flow", list_word]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Flow {
+                    action: FlowAction::List
+                })
+            ));
+        }
+
+        let cli = Cli::try_parse_from([
+            "flux",
+            "flow",
+            "run",
+            "deploy",
+            "--inputs",
+            r#"{"env":"dev"}"#,
+            "--arg",
+            "replicas=2",
+            "--arg",
+            "replicas=3",
+            "--map-inputs",
+            "deploy three replicas",
+            "-m",
+            "aws/sonnet",
+            "--yes",
+            "--resumable",
+            "--resume",
+            "last",
+            "--resume-value",
+            "42",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Flow {
+                action:
+                    FlowAction::Run {
+                        target,
+                        inputs,
+                        args,
+                        map_inputs,
+                        model,
+                        yes,
+                        resumable,
+                        resume,
+                        resume_value,
+                    },
+            }) => {
+                assert_eq!(target, "deploy");
+                assert_eq!(inputs.as_deref(), Some(r#"{"env":"dev"}"#));
+                assert_eq!(args, ["replicas=2", "replicas=3"]);
+                assert_eq!(map_inputs.as_deref(), Some("deploy three replicas"));
+                assert_eq!(model.as_deref(), Some("aws/sonnet"));
+                assert!(yes && resumable);
+                assert_eq!(resume.as_deref(), Some("last"));
+                assert_eq!(resume_value.as_deref(), Some("42"));
+            }
+            other => panic!("expected flow run, got {other:?}"),
+        }
+    }
+
+    fn cli_input_ast(params: Vec<(&str, flux_flow::ast::TypeRef)>) -> flux_flow::ast::DraftAst {
+        flux_flow::ast::DraftAst {
+            name: Some("input-test".into()),
+            params: params
+                .into_iter()
+                .map(|(name, ty)| flux_flow::ast::Param {
+                    name: name.into(),
+                    ty,
+                })
+                .collect(),
+            body: vec![flux_flow::ast::Node::Return {
+                value: Box::new(flux_flow::ast::Node::Lit {
+                    value: serde_json::json!("body"),
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_flow_inputs_merge_and_coerce_by_declared_type() {
+        use flux_flow::ast::{Node, TypeRef};
+        let mut ast = cli_input_ast(vec![
+            ("env", TypeRef::String),
+            ("replicas", TypeRef::Number),
+            ("enabled", TypeRef::Bool),
+            ("tags", TypeRef::List(Box::new(TypeRef::String))),
+            ("payload", TypeRef::Any),
+            ("named", TypeRef::Named("DeploySpec".into())),
+        ]);
+        super::prepare_cli_flow_inputs(
+            &mut ast,
+            Some(
+                r#"{"env":"json","replicas":1,"enabled":false,"tags":["old"],"payload":null,"named":{"old":true}}"#,
+            ),
+            &[
+                "env=arg".into(),
+                "replicas=not-a-number".into(),
+                "replicas=3".into(),
+                "enabled=true".into(),
+                "tags=[\"blue\",\"green\"]".into(),
+                "payload={\"mode\":\"safe\"}".into(),
+                "named=plain-text".into(),
+            ],
+            Some("this mapper must be skipped"),
+        )
+        .unwrap();
+
+        let values: std::collections::BTreeMap<String, serde_json::Value> = ast.body[..6]
+            .iter()
+            .map(|node| match node {
+                Node::Bind { name, value, .. } => match value.as_ref() {
+                    Node::Lit { value } => (name.0.clone(), value.clone()),
+                    other => panic!("expected literal input bind, got {other:?}"),
+                },
+                other => panic!("expected input bind, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(values["env"], serde_json::json!("arg"));
+        assert_eq!(values["replicas"], serde_json::json!(3));
+        assert_eq!(values["enabled"], serde_json::json!(true));
+        assert_eq!(values["tags"], serde_json::json!(["blue", "green"]));
+        assert_eq!(values["payload"], serde_json::json!({"mode": "safe"}));
+        assert_eq!(values["named"], serde_json::json!("plain-text"));
+        assert!(
+            !ast.body.iter().any(|node| matches!(
+                node,
+                Node::Bind { value, .. }
+                    if matches!(value.as_ref(), Node::Call { op, .. } if op == "ai.extract")
+            )),
+            "a fully deterministic contract must skip --map-inputs"
+        );
+    }
+
+    #[test]
+    fn cli_flow_inputs_reject_bad_json_unknown_missing_and_type_mismatches() {
+        use flux_flow::ast::TypeRef;
+        let base = || cli_input_ast(vec![("env", TypeRef::String), ("n", TypeRef::Number)]);
+
+        let mut ast = base();
+        assert!(
+            super::prepare_cli_flow_inputs(&mut ast, Some("{"), &[], None)
+                .unwrap_err()
+                .to_string()
+                .contains("valid JSON object")
+        );
+        let mut ast = base();
+        assert!(
+            super::prepare_cli_flow_inputs(&mut ast, Some("[]"), &[], None)
+                .unwrap_err()
+                .to_string()
+                .contains("must be a JSON object")
+        );
+        let mut ast = base();
+        assert!(super::prepare_cli_flow_inputs(
+            &mut ast,
+            Some(r#"{"env":"dev","n":1,"extra":true}"#),
+            &[],
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown flow input parameter(s): extra"));
+        let mut ast = base();
+        assert!(
+            super::prepare_cli_flow_inputs(&mut ast, Some(r#"{"env":"dev"}"#), &[], None,)
+                .unwrap_err()
+                .to_string()
+                .contains("missing required flow parameter(s): n (Number)")
+        );
+        let mut ast = base();
+        assert!(super::prepare_cli_flow_inputs(
+            &mut ast,
+            Some(r#"{"env":"dev","n":"3"}"#),
+            &[],
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("input `n` expects Number, got String"));
+        let mut ast = base();
+        assert!(super::prepare_cli_flow_inputs(
+            &mut ast,
+            Some(r#"{"env":"dev","n":3}"#),
+            &["broken".into()],
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("--arg expects KEY=VALUE"));
+    }
+
+    #[test]
+    fn mapper_ast_uses_missing_schema_strict_fields_and_collision_free_symbols() {
+        use flux_flow::ast::{Node, TypeRef};
+        let mut ast = cli_input_ast(vec![
+            ("known", TypeRef::String),
+            ("env", TypeRef::String),
+            ("replicas", TypeRef::Number),
+        ]);
+        ast.body.splice(
+            0..0,
+            ["__flux_map_raw", "__flux_map_json", "__flux_map_args"]
+                .into_iter()
+                .map(|name| Node::Bind {
+                    name: name.into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!("occupied"),
+                    }),
+                    ty: None,
+                    effect: None,
+                }),
+        );
+        super::prepare_cli_flow_inputs(
+            &mut ast,
+            Some(r#"{"known":"fixed"}"#),
+            &[],
+            Some("three replicas in dev"),
+        )
+        .unwrap();
+
+        let Node::Bind {
+            name: raw,
+            value: extract,
+            ..
+        } = &ast.body[0]
+        else {
+            panic!("mapper must begin with ai.extract bind")
+        };
+        assert_eq!(raw.0, "__flux_map_raw_1");
+        let Node::Call { op, args } = extract.as_ref() else {
+            panic!("mapper first bind must be a call")
+        };
+        assert_eq!(op, "ai.extract");
+        let Node::Obj { fields } = &args[0] else {
+            panic!("ai.extract must receive named args")
+        };
+        let Node::Lit { value } = fields["schema"].as_ref() else {
+            panic!("schema must be literal")
+        };
+        let schema: serde_json::Value = serde_json::from_str(value.as_str().unwrap()).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["env", "replicas"]));
+        assert!(schema["properties"].get("known").is_none());
+        assert_eq!(schema["properties"]["env"]["type"], "string");
+        assert_eq!(schema["properties"]["replicas"]["type"], "number");
+
+        assert!(matches!(&ast.body[1], Node::Bind { name, .. } if name.0 == "__flux_map_json_1"));
+        assert!(matches!(&ast.body[3], Node::Bind { name, .. } if name.0 == "__flux_map_args_1"));
+        for (node, expected) in ast.body[4..6].iter().zip(["env", "replicas"]) {
+            let Node::Bind { name, value, .. } = node else {
+                panic!("mapped field must bind")
+            };
+            assert_eq!(name.0, expected);
+            assert!(matches!(
+                value.as_ref(),
+                Node::Jq {
+                    optional: false,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(&ast.body[6], Node::Bind { name, value, .. }
+            if name.0 == "known" && matches!(value.as_ref(), Node::Lit { .. })));
     }
 
     /// L-77: the render handler reads the `.flux` file from the plain filesystem (absolute and

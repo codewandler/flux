@@ -166,8 +166,20 @@ flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR 
 flux tui                         # ratatui chat UI (in-UI approval modal)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
-flux flow run <file.flux>        # run one checked-in Flux-Lang flow directly (native text or DraftAst JSON),
-                                 #   skipping NL→plan; opt-in resumable mode (L-25):
+flux flow list                   # list saved flows + composite ops (alias: `flux flow ls`) from
+                                 #   .flux/flows first, then ~/.flux/flows; no agent session/model
+flux flow run <name|file>        # run a saved flow by filename stem/declared name, or an existing
+                                 #   file (files win; native text or DraftAst JSON), skipping NL→plan
+                                 #   --inputs '{"env":"dev"}'     typed JSON-object inputs
+                                 #   --arg env=dev --arg replicas=3  repeatable typed overrides;
+                                 #                                    later duplicate args win
+                                 #   --map-inputs "three in dev"    opt-in model mapping for only
+                                 #                                    the still-missing parameters
+                                 #   Declared flow parameters are required. Unknown/missing keys,
+                                 #   malformed JSON, and concrete type mismatches fail before effects.
+                                 #   Without --map-inputs this path is deterministic and needs no
+                                 #   provider credentials unless the flow itself contains model ops.
+                                 #   Existing opt-in resumable mode (L-25):
                                  #   --resumable          a halt (a failed statement, or a paused `await`) prints
                                  #                        a structured halt report (✓/✗/· marked statements,
                                  #                        machine-readable failure, session id) and exits non-zero
