@@ -7,10 +7,10 @@ lossless CST front-end in `flux-lang`.
 
 | Capability | Details |
 |---|---|
-| Diagnostics | live and error-recovering, with real source spans (full-document sync) |
-| Completion | triggers on `$` and `@`; ops, node-kind keywords, prelude types, in-scope `$vars` |
-| Hover | op signatures with effects/risk, node-kind docs, prelude-type docs |
-| Formatting | whole-document formatting via the invertible formatter |
+| Diagnostics | live and error-recovering, with real source spans across every flow/composite op in a module |
+| Completion | triggers on `$` and `@`; stable host + module-local ops, node-kind keywords, prelude types, in-scope `$vars` |
+| Hover | stable host and module-local op signatures with effects/risk, node-kind docs, prelude-type docs |
+| Formatting | whole-document formatting via the invertible formatter for bare flows; modules are left unchanged to preserve declaration order |
 
 Go-to-definition, document symbols, and semantic tokens are not implemented yet (stories L-68 /
 L-69).

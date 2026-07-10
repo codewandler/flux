@@ -28,6 +28,7 @@ use rowan::TextRange;
 use crate::ast::{DraftAst, Node};
 use crate::error::Result;
 use crate::parser::{parse_cst, Parse};
+use crate::program::Module;
 use crate::syntax::{SyntaxKind, SyntaxNode};
 
 /// A lowering problem with a real source span (parser/lexer errors surfaced strictly).
@@ -82,6 +83,25 @@ pub struct Lowered {
     pub ranges: RangeMap,
 }
 
+/// Source ranges for one executable top-level declaration in a module.
+#[derive(Debug, Clone)]
+pub struct DeclarationRanges {
+    /// The complete `flow` / `op` declaration range, used for declaration-level diagnostics.
+    pub declaration: TextRange,
+    /// Analyzer node paths (`body[0]…`) relative to this declaration's executable body.
+    pub body: RangeMap,
+}
+
+/// A semantically-lowered whole `.flux` document plus per-declaration analyzer range maps.
+#[derive(Debug, Clone)]
+pub struct LoweredModule {
+    pub module: Module,
+    /// Top-level flows in semantic `Program::flows` order (one entry for a bare `Module::Flow`).
+    pub flows: Vec<DeclarationRanges>,
+    /// Composite operations in semantic `Program::ops` order.
+    pub ops: Vec<DeclarationRanges>,
+}
+
 /// Strict CST lowering: any lexer/parser error fails with spans; a clean tree lowers to the exact
 /// legacy `DraftAst` (semantic authority: the shared line machinery) plus the range side-map.
 pub fn cst_to_draft(parse: &Parse, src: &str) -> std::result::Result<Lowered, Vec<LowerError>> {
@@ -104,6 +124,81 @@ pub fn cst_to_draft(parse: &Parse, src: &str) -> std::result::Result<Lowered, Ve
     let mut ranges = RangeMap::default();
     map_flow(&parse.syntax(), &ast, &mut ranges);
     Ok(Lowered { ast, ranges })
+}
+
+/// Strict CST lowering for a complete module. Unlike [`cst_to_draft`], this accepts any mix of
+/// top-level flows and composite operations and retains an independent body-path range map for each
+/// declaration, so repeated `body[0]` analyzer paths never collide across declarations.
+pub fn cst_to_module(
+    parse: &Parse,
+    src: &str,
+) -> std::result::Result<LoweredModule, Vec<LowerError>> {
+    if !parse.errors.is_empty() {
+        return Err(parse
+            .errors
+            .iter()
+            .map(|e| LowerError {
+                message: e.message.clone(),
+                range: Some(e.range),
+            })
+            .collect());
+    }
+    let module = Module::parse_str(src).map_err(|e| {
+        vec![LowerError {
+            range: legacy_error_range(&e.to_string(), src),
+            message: e.to_string(),
+        }]
+    })?;
+    let root = parse.syntax();
+    let lowered = match &module {
+        Module::Flow(ast) => LoweredModule {
+            module: module.clone(),
+            flows: declaration_ranges(&root, SyntaxKind::FLOW_DECL, std::slice::from_ref(ast)),
+            ops: Vec::new(),
+        },
+        Module::Program(program) => LoweredModule {
+            module: module.clone(),
+            flows: declaration_ranges(&root, SyntaxKind::FLOW_DECL, &program.flows),
+            ops: declaration_ranges(
+                &root,
+                SyntaxKind::OP_DECL,
+                &program
+                    .ops
+                    .iter()
+                    .map(|op| op.body.clone())
+                    .collect::<Vec<_>>(),
+            ),
+        },
+    };
+    Ok(lowered)
+}
+
+fn declaration_ranges(
+    root: &SyntaxNode,
+    kind: SyntaxKind,
+    bodies: &[DraftAst],
+) -> Vec<DeclarationRanges> {
+    let declarations: Vec<SyntaxNode> = root.children().filter(|c| c.kind() == kind).collect();
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(i, ast)| {
+            let declaration = declarations.get(i);
+            let mut body = RangeMap::default();
+            if let Some(declaration) = declaration {
+                let block = declaration
+                    .children()
+                    .find(|c| c.kind() == SyntaxKind::BLOCK);
+                pair_block(block.as_ref(), &ast.body, "body", &mut body);
+            }
+            DeclarationRanges {
+                declaration: declaration
+                    .map(SyntaxNode::text_range)
+                    .unwrap_or_else(|| TextRange::empty(0.into())),
+                body,
+            }
+        })
+        .collect()
 }
 
 /// The range-bearing flow front-end: legacy semantics/errors (pinned texts), CST-derived ranges.
@@ -504,6 +599,32 @@ mod tests {
             .get("body[5].default[0]")
             .expect("default[0]");
         assert!(src[r].contains("dirty()"));
+    }
+
+    #[test]
+    fn module_lowering_maps_each_flow_and_composite_independently() {
+        let src = "op summarize(text: String) -> String\n  description \"Summarize text\"\n  risk \"low\"\n  $out = ai.reason($text)\n  return $out\n\nflow first\n  $a = summarize(\"one\")\n  return $a\n\nflow second\n  $b = missing()\n  return $b\n";
+        let parsed = parse_cst(src);
+        let lowered = cst_to_module(&parsed, src).expect("module lowers");
+        assert!(matches!(lowered.module, Module::Program(_)));
+        assert_eq!(lowered.ops.len(), 1);
+        assert_eq!(lowered.flows.len(), 2);
+
+        let op_bind = lowered.ops[0].body.get("body[0]").unwrap();
+        let first_bind = lowered.flows[0].body.get("body[0]").unwrap();
+        let second_bind = lowered.flows[1].body.get("body[0]").unwrap();
+        assert_eq!(
+            u32::from(op_bind.start()) as usize,
+            src.find("$out = ai.reason").unwrap()
+        );
+        assert_eq!(
+            u32::from(first_bind.start()) as usize,
+            src.find("$a = summarize").unwrap()
+        );
+        assert_eq!(
+            u32::from(second_bind.start()) as usize,
+            src.find("$b = missing").unwrap()
+        );
     }
 
     #[test]

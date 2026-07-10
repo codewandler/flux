@@ -20,6 +20,11 @@ flux-lang.workspace = true
 flux-flow.workspace = true
 flux-tools.workspace = true
 flux-runtime.workspace = true
+flux-provider.workspace = true
+flux-cognition.workspace = true
+flux-capabilities.workspace = true
+flux-web.workspace = true
 tower-lsp.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true
+text-size.workspace = true

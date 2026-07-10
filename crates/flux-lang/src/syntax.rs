@@ -91,12 +91,18 @@ pub enum SyntaxKind {
     FLOW_DECL,
     /// The `flow [name]([params]) [-> type]` header line.
     FLOW_HEADER,
+    /// A top-level composite operation declaration.
+    OP_DECL,
+    /// The `op name(params) [-> type]` header line.
+    OP_HEADER,
+    /// One leading composite-op metadata line (`description`, `risk`, `effects`, …).
+    OP_META,
     /// The parenthesized parameter list of a flow header.
     PARAM_LIST,
     /// One `name: Type` parameter.
     PARAM,
     /// A pure-data top-level declaration the L6 host interprets (`agent`/`channel`/`datasource`/
-    /// `trigger`/`journey`/`op`). Kept as one opaque node here; the module loader owns their grammar.
+    /// `trigger`/`journey`). Kept as one opaque node here; the module loader owns their grammar.
     DECL,
     /// An indented block of statements (a flow/clause body).
     BLOCK,

@@ -9,7 +9,8 @@
 //!
 //! Scope: the **flow** grammar is parsed precisely (that is the `parse` path, where the 16
 //! native-syntax nodes live and what the editor edits most); other top-level declarations
-//! (`agent`/`channel`/…) are captured structurally as opaque [`SyntaxKind::DECL`] nodes.
+//! (`agent`/`channel`/…) are captured structurally as opaque [`SyntaxKind::DECL`] nodes; composite
+//! `op` declarations are structured like flows so the LSP can analyze their bodies with ranges.
 
 use crate::lexer::{lex, LexToken};
 use crate::syntax::{FluxLang, SyntaxKind};
@@ -304,6 +305,7 @@ impl<'s> Parser<'s> {
                     self.pos += 1;
                 }
                 SyntaxKind::IDENT if self.at_kw("flow") => self.flow_decl(),
+                SyntaxKind::IDENT if self.at_kw("op") => self.op_decl(),
                 SyntaxKind::IDENT if self.at_decl_kw() => self.opaque_decl(),
                 _ => {
                     // Unexpected top-level content: recover a line at a time.
@@ -320,7 +322,7 @@ impl<'s> Parser<'s> {
     fn at_decl_kw(&self) -> bool {
         matches!(
             self.cur_text(),
-            "agent" | "channel" | "datasource" | "trigger" | "journey" | "op"
+            "agent" | "channel" | "datasource" | "trigger" | "journey"
         )
     }
 
@@ -377,9 +379,24 @@ impl<'s> Parser<'s> {
         self.finish_node();
     }
 
+    fn op_decl(&mut self) {
+        self.start(SyntaxKind::OP_DECL);
+        self.callable_header(SyntaxKind::OP_HEADER);
+        if self.at_block() {
+            self.skip_blank_lines();
+            self.op_block();
+        }
+        self.finish_node();
+    }
+
     fn flow_header(&mut self) {
-        self.start(SyntaxKind::FLOW_HEADER);
-        self.bump(); // `flow`
+        self.callable_header(SyntaxKind::FLOW_HEADER);
+    }
+
+    /// Shared header grammar for `flow` and composite `op` declarations.
+    fn callable_header(&mut self, kind: SyntaxKind) {
+        self.start(kind);
+        self.bump(); // `flow` / `op`
         if self.at(SyntaxKind::IDENT) {
             self.bump(); // optional name…
                          // …which may be kebab-case (`god-code-review`): the lexer splits it into
@@ -400,6 +417,43 @@ impl<'s> Parser<'s> {
         }
         self.eat(SyntaxKind::NEWLINE);
         self.finish_node();
+    }
+
+    /// A composite body starts with zero or more flat metadata lines, followed by ordinary
+    /// Flux-Lang statements at the same indentation. Metadata stays in the lossless tree but is not
+    /// a statement, so the AST↔CST range walk pairs only the executable body.
+    fn op_block(&mut self) {
+        self.start(SyntaxKind::BLOCK);
+        self.pos += 1; // INDENT (not emitted into the tree)
+        let mut in_meta = true;
+        loop {
+            self.eat_trivia();
+            match self.nth(0) {
+                SyntaxKind::DEDENT => {
+                    self.pos += 1;
+                    break;
+                }
+                SyntaxKind::EOF => break,
+                SyntaxKind::NEWLINE => self.bump(),
+                SyntaxKind::IDENT if in_meta && self.at_composite_meta() => {
+                    self.start(SyntaxKind::OP_META);
+                    self.eat_to_end_of_line();
+                    self.finish_node();
+                }
+                _ => {
+                    in_meta = false;
+                    self.statement();
+                }
+            }
+        }
+        self.finish_node();
+    }
+
+    fn at_composite_meta(&self) -> bool {
+        matches!(
+            self.cur_text(),
+            "description" | "risk" | "idempotency" | "effects" | "limits" | "expose" | "view"
+        )
     }
 
     fn param_list(&mut self) {

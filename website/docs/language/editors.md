@@ -113,6 +113,10 @@ should report the tree-sitter parser ✓, highlight queries ✓, and `flux-lsp` 
 `.flux` file and check the live experience: colour everywhere, squiggles on a deliberate typo,
 hover on an op name, completion after typing `$`, and `:format`.
 
+Diagnostics, completion, and hover understand multi-declaration modules and the stable cognition,
+datasource, and native-web operations provided by the CLI. Formatting currently applies only to a
+bare single-flow file; modules are left unchanged so declaration order is never rewritten.
+
 ### Working in the flux repo
 
 The repository ships a repo-local

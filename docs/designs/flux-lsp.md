@@ -26,6 +26,10 @@ is downward, so the `flux-codegate` layering lint is satisfied:
   `prelude::prelude_type_rows`, and the CST.
 - `flux-flow` (L3) — `registry::OpRegistry::{op_names, signatures, get}` for op completion/hover.
 - `flux-tools` (L2) — `register_builtins` to fill the registry.
+- `flux-cognition` + `flux-provider` (L3/L1) — model-op specs backed by a non-generating
+  `NullProvider`; the editor never invokes a model.
+- `flux-capabilities` + `flux-web` (L5) — datasource and native-web specs backed by an empty
+  in-memory index and catalog-only web options; constructing the catalog performs no IO.
 - `flux-runtime` (L2) — `ToolRegistry`.
 - `tower-lsp` + `lsp-types` + `tokio` — the async LSP server framework (flux already uses tokio).
 
@@ -42,13 +46,33 @@ capabilities) · `document.rs` (open-buffer store + line-index) · `convert.rs` 
 
 | LSP feature | Source (reused) | Notes |
 |---|---|---|
-| **Diagnostics** | tolerant parse (`ERROR` nodes) + `analyze_flow`/`lower` + the `cst_to_draft` range side-map | `publishDiagnostics` on `didOpen`/`didChange` (debounced) |
-| **Completion** | `OpRegistry::{op_names,signatures}` + `schema::node_kind_rows()` + `prelude::prelude_type_rows()` + in-scope `$vars` from a CST scope walk | cursor context from the token at the offset (`$`/`@` sigil, statement head, arg position) |
+| **Diagnostics** | tolerant parse (`ERROR` nodes) + `lower` + declaration-local `cst_to_module` range maps | every top-level flow/composite op is analyzed on `didOpen`/`didChange` |
+| **Completion** | stable host + module-local op signatures + `schema::node_kind_rows()` + `prelude::prelude_type_rows()` + in-scope `$vars` | cursor context from the token at the offset (`$`/`@` sigil, statement head, arg position) |
 | **Hover** | token-at-offset → `OpSignature` (op) / node-kind doc (keyword) / prelude doc (type) | hit-testing trivial on a CST |
-| **Formatting** | `format::format` on the lowered `DraftAst` | `textDocument/formatting`; also add a `flux fmt [--check]` CLI verb (none exists) |
+| **Formatting** | `format::format` on a bare-flow `DraftAst` | modules return no edit until declaration order is preserved; a future `flux fmt [--check]` remains L-67 |
 | **Document symbols** | CST scope model | later (L-68) |
 | **Go-to-definition** | `$var` bind sites with def ranges (CST) | later (L-68) |
 | **Semantic tokens** | CST token stream classified by `SyntaxKind` | later (L-69); only for clients that render them — Helix does not (see Highlighting below) |
+
+### Authoring catalog and modules
+
+The LSP builds a **catalog-only** registry for stable operations that the CLI host installs: core
+tools, cognition, datasource retrieval, and native web. Provider-backed cognition uses
+`NullProvider`; datasource retrieval uses an empty `MemoryBackend`; native web uses
+`WebOptions::default`. The server reads only their `ToolSpec`s, so editor startup performs no model,
+network, filesystem, or credential IO. Dynamically discovered plugin and endpoint operations remain
+host-dependent and are not silently accepted.
+
+The CST structures every top-level `flow` and composite `op` declaration. Whole-module lowering
+keeps one analyzer range map per declaration, and the LSP analyzes every flow/op against a catalog
+containing all module-local composites (including forward references and `expose false` internal
+ops). Duplicate/conflicting ops, recursion, bad arguments/types, and unbound symbols stay errors at
+their declaration-local spans. Completion and hover include local composites too.
+
+Formatting intentionally remains bare-flow-only. `Program` groups declarations by kind and does not
+retain their original cross-kind order, so formatting a module today could reorder source. The LSP
+returns no formatting edit for a multi-declaration module until an order-preserving representation
+exists.
 
 ## Helix wiring (config-only; Helix 25.07.1 present)
 
@@ -107,5 +131,8 @@ Depends on the CST foundation (L-57–L-59) in [flux-lang-cst.md](flux-lang-cst.
 - Integration: drive the server over an in-memory duplex — `didOpen` a bad buffer → positioned
   `publishDiagnostics`; completion at a cursor returns the expected op/keyword/`$var` set; hover over
   an op returns its signature; formatting returns canonical text.
+- Module integration: several flows plus forward-referenced composite ops analyze independently;
+  body diagnostics resolve within the owning declaration; stable cognition/datasource/web ops do not
+  produce false unknown-op warnings; a genuinely unknown op still does.
 - End-to-end: `hx examples/*.flux` → squiggle at the right span, completion popup, hover card,
   `:format`.
