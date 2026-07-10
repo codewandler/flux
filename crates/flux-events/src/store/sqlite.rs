@@ -466,10 +466,14 @@ impl EventBackend for SqliteEvents {
             .map_err(map_sql)
     }
 
-    fn prune_empty(&self) -> Result<usize> {
+    fn prune_empty_excluding(&self, keep: &[String]) -> Result<usize> {
+        let keep: std::collections::HashSet<i64> = keep
+            .iter()
+            .filter_map(|stream| parse_id(stream).ok())
+            .collect();
         let conn = self.conn.lock().unwrap();
         let tx = begin_write(&conn)?;
-        let empty: Vec<i64> = {
+        let mut empty: Vec<i64> = {
             let mut stmt = tx
                 .prepare("SELECT n FROM streams WHERE msg_count = 0")
                 .map_err(map_sql)?;
@@ -479,6 +483,7 @@ impl EventBackend for SqliteEvents {
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(map_sql)?
         };
+        empty.retain(|n| !keep.contains(n));
         for n in &empty {
             let stream = format!("s_{n}");
             tx.execute("DELETE FROM events WHERE stream = ?1", [&stream])

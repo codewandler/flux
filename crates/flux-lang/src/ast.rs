@@ -1085,6 +1085,14 @@ pub enum RunEvent {
         input_hash: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_hash_redacted: Option<String>,
+        /// Redacted, bounded JSON input retained only for human-facing historical views. Replay
+        /// matching deliberately continues to use the hashes above.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_view: Option<String>,
+        /// Whether [`RunEvent::OpRecorded::input_view`] was shortened at the cassette cap. Kept
+        /// separate from `truncated`, which means the recorded RESULT cannot be replayed safely.
+        #[serde(default)]
+        input_view_truncated: bool,
         #[serde(default)]
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1247,6 +1255,8 @@ mod tests {
                 seq,
                 op,
                 input_hash_redacted,
+                input_view,
+                input_view_truncated,
                 content,
                 view,
                 is_error,
@@ -1258,6 +1268,8 @@ mod tests {
                 assert_eq!(seq, 0);
                 assert_eq!(op, "read");
                 assert!(input_hash_redacted.is_none());
+                assert!(input_view.is_none());
+                assert!(!input_view_truncated);
                 assert!(content.is_empty());
                 assert!(view.is_none());
                 assert!(!is_error && !denied && !redacted && !truncated);

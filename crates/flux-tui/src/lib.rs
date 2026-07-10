@@ -1,12 +1,10 @@
 //! `flux-tui` — a ratatui chat frontend for the agent.
 //!
-//! [`render`] draws the chat — a **scrollable** transcript, a one-line status/spinner row, and an
-//! input box, plus an optional approval modal — into a ratatui frame and is verified headlessly with
-//! `TestBackend`. [`run`] drives the real interactive loop over crossterm: type, Enter submits a turn
-//! that **streams token-by-token** into the transcript (assistant replies render as **Markdown**),
-//! tool activity appears live, the planner's **DAG plan** is shown inline, an **animated spinner**
-//! tracks the running turn, PgUp/PgDn/wheel scroll the history, Ctrl-C interrupts, and tool calls
-//! that need approval raise a y/a/N modal (the TUI installs its own [`ChannelApprover`]).
+//! [`render`] draws a dense, borderless chat: a viewport-only transcript, compact header/footer,
+//! and multiline composer separated solely by its background. [`run`] drives the async crossterm
+//! loop: turns stream Markdown, plans and tool cards inline; follow-ups queue visibly; sessions can
+//! be resumed with their durable activity; PgUp/PgDn/wheel scroll; Ctrl-C interrupts; and guarded
+//! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
 pub mod theme;
 pub mod toolview;
@@ -15,23 +13,61 @@ mod markdown;
 mod plan;
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
+use flux_provider::Provider;
 use flux_runtime::{ApprovalChoice, Approver, ToolResult};
 use flux_spec::IntentSet;
 
 use crate::theme::Theme;
+
+/// Provider/model resolved by the CLI for an in-TUI `/model` switch.
+pub struct ResolvedModel {
+    pub provider: Arc<dyn Provider>,
+    /// Provider-facing model id stored on [`FlowEngine`].
+    pub wire_model: String,
+    /// Canonical user-facing provider/model spec used for cost attribution.
+    pub model_spec: String,
+}
+
+/// Surface-owned model factory. `flux-tui` stays provider-neutral; `flux-cli` supplies the same
+/// resolver its command-line `-m` path uses.
+pub trait ModelResolver: Send + Sync {
+    fn resolve(&self, spec: &str) -> anyhow::Result<ResolvedModel>;
+}
+
+/// Optional capabilities for the richer TUI entry point.
+pub struct TuiRunOptions {
+    /// Preserve the engine's headless allow approver instead of installing the interactive sheet.
+    pub auto_approve: bool,
+    /// Canonical provider/model spec used for header display and cost attribution.
+    pub model_spec: Option<String>,
+    /// Optional surface-owned resolver that enables `/model <spec>`.
+    pub model_resolver: Option<Arc<dyn ModelResolver>>,
+}
+
+impl TuiRunOptions {
+    pub fn new(auto_approve: bool, model_spec: Option<String>) -> Self {
+        Self {
+            auto_approve,
+            model_spec,
+            model_resolver: None,
+        }
+    }
+}
 
 /// Braille spinner frames (shared idiom with the CLI).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -88,7 +124,7 @@ struct SlashCmd {
     desc: &'static str,
 }
 
-/// The available slash commands (all argument-free).
+/// The available slash commands.
 const COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "help",
@@ -96,7 +132,7 @@ const COMMANDS: &[SlashCmd] = &[
     },
     SlashCmd {
         name: "clear",
-        desc: "clear the transcript",
+        desc: "start a fresh session",
     },
     SlashCmd {
         name: "new",
@@ -104,11 +140,51 @@ const COMMANDS: &[SlashCmd] = &[
     },
     SlashCmd {
         name: "model",
-        desc: "show the active model",
+        desc: "show or switch model",
     },
     SlashCmd {
         name: "quit",
         desc: "exit flux",
+    },
+    SlashCmd {
+        name: "plan",
+        desc: "toggle reviewed plan mode",
+    },
+    SlashCmd {
+        name: "run",
+        desc: "execute the pending plan",
+    },
+    SlashCmd {
+        name: "compact",
+        desc: "compact session context",
+    },
+    SlashCmd {
+        name: "shell",
+        desc: "toggle the generic bash op",
+    },
+    SlashCmd {
+        name: "tools",
+        desc: "list registered tools",
+    },
+    SlashCmd {
+        name: "evidence",
+        desc: "show durable evidence",
+    },
+    SlashCmd {
+        name: "session",
+        desc: "show the active session",
+    },
+    SlashCmd {
+        name: "sessions",
+        desc: "list recent sessions",
+    },
+    SlashCmd {
+        name: "resume",
+        desc: "resume a session id",
+    },
+    SlashCmd {
+        name: "queue",
+        desc: "manage queued follow-ups",
     },
 ];
 
@@ -127,9 +203,11 @@ fn slash_matches(query: &str) -> Vec<&'static SlashCmd> {
 }
 
 /// The `/help` body.
-const HELP_TEXT: &str = "keybindings:\n\
-    ↵ send · Ctrl-J / Alt-↵ newline · ↑/↓ history · Ctrl-E expand tools\n\
-    PgUp/PgDn / wheel scroll · /command menu · Ctrl-C interrupt · Esc quit";
+const HELP_TEXT: &str = "keys: ↵ send/queue · Ctrl-J or Alt-↵ newline · ↑/↓ history\n\
+    PgUp/PgDn or wheel scroll · Ctrl-End latest · Ctrl-E details\n\
+    Ctrl-C interrupt/clear/quit · Ctrl-D quit · Esc close panel\n\
+commands: /plan /run /model /shell /tools /evidence /session /sessions /resume\n\
+    /new /clear /compact /queue /quit";
 
 /// One item in the transcript. Each renders to one or more styled [`Line`]s at a given width.
 #[derive(Debug)]
@@ -188,6 +266,57 @@ impl ToolEntry {
             result: None,
         }
     }
+
+    fn historical(
+        name: String,
+        input: serde_json::Value,
+        content: String,
+        is_error: bool,
+        elapsed: Duration,
+    ) -> Self {
+        let call = toolview::format_call(&name, &input);
+        let summary = toolview::format_result(&name, &content, is_error);
+        ToolEntry {
+            name,
+            call,
+            input,
+            started: Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(Instant::now),
+            result: Some(ToolOutcome {
+                is_error,
+                content,
+                summary,
+                elapsed,
+            }),
+        }
+    }
+
+    fn historical_reduced(name: String, error: Option<String>, elapsed: Duration) -> Self {
+        let input = serde_json::Value::Null;
+        let call = toolview::format_call(&name, &input);
+        let is_error = error.is_some();
+        let content = error.unwrap_or_default();
+        let summary = if is_error {
+            toolview::format_result(&name, &content, true)
+        } else {
+            Some("completed".into())
+        };
+        ToolEntry {
+            name,
+            call,
+            input,
+            started: Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(Instant::now),
+            result: Some(ToolOutcome {
+                is_error,
+                content,
+                summary,
+                elapsed,
+            }),
+        }
+    }
 }
 
 /// A streaming-then-finalized assistant message with a per-width render cache.
@@ -197,6 +326,15 @@ struct Assistant {
     done: bool,
     /// `(width, rendered lines)` — only populated once `done`, recomputed when the width changes.
     cache: RefCell<Option<(u16, Vec<Line<'static>>)>>,
+}
+
+/// Cached, fully wrapped transcript layout. State changes invalidate the cache; animation-only
+/// frames reuse it and clone only the rows currently visible in the viewport.
+#[derive(Debug)]
+struct TranscriptLayout {
+    revision: u64,
+    width: u16,
+    lines: Vec<Line<'static>>,
 }
 
 impl Assistant {
@@ -240,6 +378,8 @@ fn fresh_textarea() -> TextArea<'static> {
 #[derive(Debug)]
 pub struct ChatState {
     entries: Vec<Entry>,
+    transcript_revision: u64,
+    transcript_layout: RefCell<Option<TranscriptLayout>>,
     /// The multiline input editor.
     input: TextArea<'static>,
     /// When set, an approval modal is shown over the transcript.
@@ -250,7 +390,9 @@ pub struct ChatState {
     phase: Phase,
     /// Start of the running turn (for the elapsed timer + spinner frame).
     turn_start: Option<Instant>,
+    session_id: String,
     model: String,
+    model_spec: Option<String>,
     theme: Theme,
     /// Whether tool cards show their full detail (toggled with Ctrl-E).
     expand_tools: bool,
@@ -297,6 +439,17 @@ pub struct ChatState {
     history_pos: Option<usize>,
     /// The in-progress text stashed when recall began, restored on Down past the newest entry.
     history_draft: String,
+    /// Follow-ups submitted while an action is active. Never overwrite an earlier item.
+    queue: VecDeque<String>,
+    /// Whether queue draining is paused while the user manages it.
+    queue_open: bool,
+    queue_sel: usize,
+    /// Queue slot currently being edited in the composer. The item remains in place until submit,
+    /// so finishing the active action cannot silently move the edit ahead of older follow-ups.
+    queue_edit_index: Option<usize>,
+    /// Recent sessions shown by the `/sessions` picker.
+    session_picker: Option<Vec<flux_events::SessionSummary>>,
+    session_sel: usize,
     // --- scrollback ---
     /// Top wrapped-line offset; ignored while `follow` is set.
     scroll: u16,
@@ -316,6 +469,13 @@ pub struct ChatState {
     /// Whether the NEXT `Plan` entry is a bounded, read-only gather round rather than the full
     /// execution plan (mirrors the CLI's `CliSink::gather_mode` — same derivation, same caveats).
     gather_mode: bool,
+    /// Manual plan mode: prompts compile a plan and `/run` executes the latest one.
+    plan_mode: bool,
+    pending_plan: Option<flux_flow::ast::DraftAst>,
+    /// Activity received while detached from the bottom of the transcript.
+    unread: usize,
+    next_action_id: u64,
+    active_action_id: Option<u64>,
 }
 
 /// What the agent is doing — drives the status line.
@@ -327,15 +487,24 @@ enum Phase {
 }
 
 impl ChatState {
+    #[cfg(test)]
     fn new(model: String) -> Self {
+        Self::for_session(model, String::new())
+    }
+
+    fn for_session(model: String, session_id: String) -> Self {
         ChatState {
             entries: Vec::new(),
+            transcript_revision: 0,
+            transcript_layout: RefCell::new(None),
             input: fresh_textarea(),
             modal: None,
             assistant_open: false,
             phase: Phase::Idle,
             turn_start: None,
+            session_id,
             model,
+            model_spec: None,
             theme: Theme::default(),
             expand_tools: false,
             verbose: false,
@@ -353,6 +522,12 @@ impl ChatState {
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
+            queue: VecDeque::new(),
+            queue_open: false,
+            queue_sel: 0,
+            queue_edit_index: None,
+            session_picker: None,
+            session_sel: 0,
             scroll: 0,
             follow: true,
             last_max_scroll: Cell::new(0),
@@ -360,6 +535,11 @@ impl ChatState {
             plan_phase: None,
             execute_rounds: 0,
             gather_mode: false,
+            plan_mode: false,
+            pending_plan: None,
+            unread: 0,
+            next_action_id: 1,
+            active_action_id: None,
         }
     }
 
@@ -385,6 +565,7 @@ impl ChatState {
     /// Attach a resolved `provider/model` spec + pricing table so the header can show a running
     /// dollar cost alongside tokens (C-06) — mirrors the CLI's `CliSink::with_cost`.
     pub fn with_cost(mut self, model_spec: String, pricing: flux_core::PricingTable) -> Self {
+        self.model_spec = Some(model_spec.clone());
         self.cost_model = Some((model_spec, pricing));
         self
     }
@@ -396,6 +577,16 @@ impl ChatState {
         self.verbose = verbose;
         self.expand_tools = self.expand_tools || verbose;
         self
+    }
+
+    fn mark_transcript_dirty(&mut self) {
+        self.transcript_revision = self.transcript_revision.saturating_add(1);
+        self.transcript_layout.get_mut().take();
+    }
+
+    fn toggle_details(&mut self) {
+        self.expand_tools = !self.expand_tools;
+        self.mark_transcript_dirty();
     }
 
     /// Fold one turn's [`Usage`] into the session's cumulative header metrics — EVERY tier (C-06:
@@ -424,7 +615,81 @@ impl ChatState {
 
     fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
+        self.mark_transcript_dirty();
         self.assistant_open = false;
+        if !self.follow {
+            self.unread = self.unread.saturating_add(1);
+        }
+    }
+
+    fn enqueue(&mut self, text: String) {
+        if !text.trim().is_empty() {
+            self.queue.push_back(text);
+            self.queue_sel = self.queue_sel.min(self.queue.len().saturating_sub(1));
+        }
+    }
+
+    fn queue_remove_selected(&mut self) -> Option<String> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let index = self.queue_sel.min(self.queue.len() - 1);
+        let removed = self.queue.remove(index);
+        self.queue_edit_index = self.queue_edit_index.and_then(|editing| {
+            if editing == index {
+                None
+            } else if editing > index {
+                Some(editing - 1)
+            } else {
+                Some(editing)
+            }
+        });
+        self.queue_sel = self.queue_sel.min(self.queue.len().saturating_sub(1));
+        removed
+    }
+
+    fn queue_begin_edit(&mut self) -> Option<String> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let index = self.queue_sel.min(self.queue.len() - 1);
+        let text = self.queue.get(index)?.clone();
+        self.queue_edit_index = Some(index);
+        Some(text)
+    }
+
+    fn queue_commit_edit(&mut self, text: String) -> bool {
+        let Some(index) = self.queue_edit_index.take() else {
+            return false;
+        };
+        let Some(item) = self.queue.get_mut(index) else {
+            return false;
+        };
+        *item = text;
+        true
+    }
+
+    fn queue_cancel_edit(&mut self) -> bool {
+        self.queue_edit_index.take().is_some()
+    }
+
+    fn queue_move(&mut self, delta: isize) {
+        if self.queue.len() < 2 {
+            return;
+        }
+        let from = self.queue_sel.min(self.queue.len() - 1);
+        let to = from
+            .saturating_add_signed(delta)
+            .min(self.queue.len().saturating_sub(1));
+        if from != to {
+            self.queue.swap(from, to);
+            if self.queue_edit_index == Some(from) {
+                self.queue_edit_index = Some(to);
+            } else if self.queue_edit_index == Some(to) {
+                self.queue_edit_index = Some(from);
+            }
+            self.queue_sel = to;
+        }
     }
 
     /// Append a user message.
@@ -441,6 +706,7 @@ impl ChatState {
                 done: false,
                 cache: RefCell::new(None),
             }));
+            self.mark_transcript_dirty();
             self.assistant_open = false;
         }
     }
@@ -450,6 +716,7 @@ impl ChatState {
         if let Some(Entry::Thinking(a)) = self.entries.last_mut() {
             if !a.done {
                 a.text.push_str(delta);
+                self.mark_transcript_dirty();
                 return;
             }
         }
@@ -459,6 +726,7 @@ impl ChatState {
             done: false,
             cache: RefCell::new(None),
         }));
+        self.mark_transcript_dirty();
         self.assistant_open = false;
     }
 
@@ -468,6 +736,7 @@ impl ChatState {
             if !a.done {
                 a.text = a.text.trim_end().to_string();
                 a.done = true;
+                self.mark_transcript_dirty();
             }
         }
     }
@@ -477,6 +746,7 @@ impl ChatState {
         if self.assistant_open {
             if let Some(Entry::Assistant(a)) = self.entries.last_mut() {
                 a.text.push_str(delta);
+                self.mark_transcript_dirty();
                 return;
             }
         }
@@ -485,6 +755,7 @@ impl ChatState {
             done: false,
             cache: RefCell::new(None),
         }));
+        self.mark_transcript_dirty();
         self.assistant_open = true;
     }
 
@@ -493,6 +764,7 @@ impl ChatState {
             if let Some(Entry::Assistant(a)) = self.entries.last_mut() {
                 a.text = a.text.trim_end().to_string();
                 a.done = true;
+                self.mark_transcript_dirty();
             }
         }
         self.assistant_open = false;
@@ -591,9 +863,7 @@ impl ChatState {
     fn record_history(&mut self, text: &str) {
         self.history_pos = None;
         self.history_draft.clear();
-        if self.push_history(text) {
-            save_history(&self.history);
-        }
+        self.push_history(text);
     }
 
     /// Append to in-memory history, skipping empties and consecutive duplicates. Returns whether the
@@ -612,13 +882,14 @@ impl ChatState {
         let summary = toolview::format_result(name, &content, is_error);
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
-                if tool.result.is_none() {
+                if tool.result.is_none() && tool.name == name {
                     tool.result = Some(ToolOutcome {
                         is_error,
                         elapsed: tool.started.elapsed(),
                         summary,
                         content,
                     });
+                    self.mark_transcript_dirty();
                     return;
                 }
             }
@@ -630,8 +901,9 @@ impl ChatState {
         });
     }
 
-    /// Flatten the transcript to styled lines at `width`, with a blank line between entries.
-    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// Flatten the transcript to styled logical lines at `width`, with a blank line between
+    /// entries. [`Self::ensure_transcript_layout`] wraps and caches these rows.
+    fn build_transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let t = &self.theme;
         let mut out: Vec<Line> = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
@@ -650,16 +922,27 @@ impl ChatState {
                 }
                 Entry::Assistant(a) => out.extend(a.lines(width, t)),
                 Entry::Thinking(a) => {
-                    // Prefix the thinking block with a dimmed header line.
                     if !a.text.is_empty() {
-                        out.push(Line::styled("🤔 thinking…".to_string(), t.muted_style()));
-                        out.extend(a.lines(width, t).into_iter().map(|mut l| {
-                            // Dim the whole thinking block so it reads as secondary content.
-                            for span in &mut l.spans {
-                                span.style = span.style.patch(t.muted_style());
-                            }
-                            l
-                        }));
+                        let count = a.text.lines().count().max(1);
+                        out.push(Line::styled(
+                            if a.done {
+                                format!(
+                                    "thinking · {count} line{} · Ctrl-E details",
+                                    if count == 1 { "" } else { "s" }
+                                )
+                            } else {
+                                "thinking…".to_string()
+                            },
+                            t.muted_style(),
+                        ));
+                        if self.expand_tools {
+                            out.extend(a.lines(width, t).into_iter().map(|mut l| {
+                                for span in &mut l.spans {
+                                    span.style = span.style.patch(t.muted_style());
+                                }
+                                l
+                            }));
+                        }
                     }
                 }
                 Entry::Tool(tool) => out.extend(self.tool_lines(tool, width)),
@@ -693,6 +976,72 @@ impl ChatState {
         out
     }
 
+    fn ensure_transcript_layout(&self, width: u16) {
+        let current = self.transcript_layout.borrow();
+        let valid = current.as_ref().is_some_and(|layout| {
+            layout.revision == self.transcript_revision && layout.width == width
+        });
+        drop(current);
+        if valid {
+            return;
+        }
+        let mut lines = wrap_styled_lines(self.build_transcript_lines(width), width);
+        const MAX_LAYOUT_LINES: usize = u16::MAX as usize;
+        if lines.len() > MAX_LAYOUT_LINES {
+            let omitted = lines.len() - MAX_LAYOUT_LINES + 1;
+            lines.drain(0..omitted);
+            lines.insert(
+                0,
+                Line::styled(
+                    format!("… {omitted} older rows omitted"),
+                    self.theme.muted_style(),
+                ),
+            );
+        }
+        *self.transcript_layout.borrow_mut() = Some(TranscriptLayout {
+            revision: self.transcript_revision,
+            width,
+            lines,
+        });
+    }
+
+    /// All wrapped transcript rows, primarily for tests and non-viewport projections.
+    #[cfg(test)]
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.ensure_transcript_layout(width);
+        self.transcript_layout
+            .borrow()
+            .as_ref()
+            .map(|layout| layout.lines.clone())
+            .unwrap_or_default()
+    }
+
+    /// Clone only the visible wrapped rows. Layout is cached across spinner frames, so a long
+    /// transcript does not get rebuilt or handed wholesale to the terminal widget on every tick.
+    fn transcript_viewport(&self, width: u16, height: u16) -> Vec<Line<'static>> {
+        self.ensure_transcript_layout(width);
+        let layout = self.transcript_layout.borrow();
+        let Some(layout) = layout.as_ref() else {
+            return Vec::new();
+        };
+        let total = layout.lines.len().min(u16::MAX as usize) as u16;
+        let max_scroll = total.saturating_sub(height);
+        self.last_max_scroll.set(max_scroll);
+        self.last_page.set(height.max(1));
+        let offset = if self.follow {
+            max_scroll
+        } else {
+            self.scroll.min(max_scroll)
+        };
+        layout
+            .lines
+            .iter()
+            .skip(offset as usize)
+            .take(height as usize)
+            .cloned()
+            .collect()
+    }
+
     /// Render one tool card: a `→ verb arg … [badge]` header, a one-line summary, and — when
     /// `expand_tools` is set — the full detail (a unified diff for `edit`/`write`, else the output,
     /// capped at [`MAX_DETAIL`] lines unless `verbose`).
@@ -700,23 +1049,22 @@ impl ChatState {
         let t = &self.theme;
         let mut out: Vec<Line> = Vec::new();
 
-        // Badge (right-aligned, fixed idea of width): running shows live elapsed, done shows ✓/✗.
+        // Badge (right-aligned, fixed idea of width): running is static, done shows ✓/✗ + elapsed.
         let (badge, badge_style) = match &tool.result {
-            None => (
-                format!("◌ {}", fmt_elapsed(tool.started.elapsed())),
-                t.warn_style(),
-            ),
+            // Keep the in-flight badge static: elapsed time already lives in the animated footer,
+            // which lets the cached transcript remain untouched across spinner-only frames.
+            None => ("◌ running".to_string(), t.warn_style()),
             Some(o) if o.is_error => (format!("✗ {}", fmt_elapsed(o.elapsed)), t.err_style()),
             Some(o) => (format!("✓ {}", fmt_elapsed(o.elapsed)), t.ok_style()),
         };
 
         // Header: `→ verb  arg`, with the arg truncated so the badge sits flush right on one row.
         let verb = &tool.call.verb;
-        let badge_w = badge.chars().count();
-        let fixed = 2 + verb.chars().count() + 2; // "→ " + verb + "  "
+        let badge_w = UnicodeWidthStr::width(badge.as_str());
+        let fixed = 2 + UnicodeWidthStr::width(verb.as_str()) + 2; // "→ " + verb + "  "
         let arg_room = (width as usize).saturating_sub(fixed + badge_w + 1);
         let arg = truncate(&tool.call.arg, arg_room.max(4));
-        let used = fixed + arg.chars().count();
+        let used = fixed + UnicodeWidthStr::width(arg.as_str());
         let pad = (width as usize).saturating_sub(used + badge_w).max(1);
         out.push(Line::from(vec![
             Span::styled("→ ", t.tool_style()),
@@ -785,9 +1133,16 @@ impl ChatState {
     fn header_line(&self, width: u16) -> Line<'static> {
         let t = &self.theme;
         let left = vec![
-            Span::styled("▌ ", t.accent_style()),
             Span::styled("flux", t.accent_style().add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {}", self.model), t.muted_style()),
+            Span::styled(
+                format!(
+                    "  {}{} · {}",
+                    self.session_id,
+                    if self.plan_mode { " · PLAN" } else { "" },
+                    self.model_spec.as_deref().unwrap_or(&self.model)
+                ),
+                t.muted_style(),
+            ),
         ];
         let mut right = Vec::new();
         // C-06: the header used to sum only input/output, silently ignoring cache read/write
@@ -824,8 +1179,20 @@ impl ChatState {
     fn footer_line(&self, width: u16) -> Line<'static> {
         let t = &self.theme;
         let left = match self.phase {
+            Phase::Idle if self.unread > 0 => vec![Span::styled(
+                format!(" ↓ {} new · Ctrl-End latest", self.unread),
+                t.accent_style(),
+            )],
+            Phase::Idle if self.plan_mode => vec![Span::styled(
+                if self.pending_plan.is_some() {
+                    " PLAN · /run execute · send to refine"
+                } else {
+                    " PLAN · describe a task"
+                },
+                t.muted_style(),
+            )],
             Phase::Idle => vec![Span::styled(
-                " ↵ send · ^J newline · ↑↓ history · ^E expand · /cmds · ^C/Esc quit",
+                " Enter send · Ctrl-J newline · / commands",
                 t.muted_style(),
             )],
             Phase::Thinking | Phase::Planning => {
@@ -855,19 +1222,309 @@ impl ChatState {
     }
 
     fn running(&self) -> bool {
-        self.turn_start.is_some()
+        self.active_action_id.is_some()
+    }
+
+    fn begin_action(&mut self) -> u64 {
+        let id = self.next_action_id;
+        self.next_action_id = self.next_action_id.saturating_add(1);
+        self.active_action_id = Some(id);
+        id
+    }
+
+    fn accept_ui_event(&self, event: UiEvent) -> Option<UiEvent> {
+        match event {
+            UiEvent::Tagged { action_id, event } if self.active_action_id == Some(action_id) => {
+                Some(*event)
+            }
+            UiEvent::Tagged { .. } => None,
+            event => Some(event),
+        }
+    }
+
+    /// Replace the visible state with a read-only projection of one durable session. Nothing in
+    /// this fold can dispatch an op or mutate the event store.
+    fn project_session(
+        &mut self,
+        events: &flux_events::EventStore,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        use flux_events::EventKind;
+        use flux_flow::ast::RunEvent;
+
+        let stored = events
+            .load_stream(session_id, None)
+            .map_err(|e| anyhow::anyhow!("load session {session_id}: {e}"))?;
+        events
+            .info(session_id)
+            .map_err(|e| anyhow::anyhow!("load session {session_id}: {e}"))?;
+
+        let mut entries = Vec::new();
+        let mut starts: HashMap<String, (String, i64)> = HashMap::new();
+        let mut turn_usage = Vec::new();
+        let mut call_usage: Vec<(String, Usage)> = Vec::new();
+        let mut proposed_plan_recorded = false;
+
+        for event in stored {
+            match event.kind {
+                EventKind::Message(message) => {
+                    let text = message.text();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    match message.role {
+                        flux_core::Role::User => entries.push(Entry::User(text)),
+                        flux_core::Role::Assistant => {
+                            // `plan_turn` stores "Proposed plan: …" as provider context after the
+                            // accepted attempt. The attempt itself is the richer durable UI entry;
+                            // do not render the same tree twice on resume.
+                            if proposed_plan_recorded && text.starts_with("Proposed plan:\n") {
+                                proposed_plan_recorded = false;
+                                continue;
+                            }
+                            proposed_plan_recorded = false;
+                            entries.push(Entry::Assistant(Assistant {
+                                text,
+                                done: true,
+                                cache: RefCell::new(None),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                EventKind::Compacted { .. } => entries.push(Entry::Notice {
+                    text: "◇ context compacted".into(),
+                    sev: Sev::Info,
+                }),
+                EventKind::PlanAttempted {
+                    outcome,
+                    error,
+                    plan_text,
+                    phase,
+                    ..
+                } => match outcome.as_str() {
+                    "accepted" => {
+                        if let Some(plan_text) = plan_text {
+                            proposed_plan_recorded = true;
+                            entries.push(Entry::Plan(serde_json::json!({
+                                "plan": plan_text,
+                                "ops": 0,
+                                "historical": true,
+                                "phase": phase,
+                            })));
+                        }
+                    }
+                    "compile_error" => entries.push(Entry::Notice {
+                        text: format!(
+                            "planning failed: {}",
+                            error.unwrap_or_else(|| "unknown error".into())
+                        ),
+                        sev: Sev::Err,
+                    }),
+                    "rejected" => entries.push(Entry::Notice {
+                        text: "plan rejected".into(),
+                        sev: Sev::Warn,
+                    }),
+                    _ => {}
+                },
+                EventKind::Run(RunEvent::StepStarted { step, op, .. }) => {
+                    if !flux_flow::engine::is_loop_machinery_op(&op) {
+                        starts.insert(step.0, (op, event.ts_ms));
+                    }
+                }
+                EventKind::Run(RunEvent::OpRecorded {
+                    step,
+                    op,
+                    input_view,
+                    input_view_truncated,
+                    content,
+                    view,
+                    is_error,
+                    denied,
+                    ..
+                }) => {
+                    if flux_flow::engine::is_loop_machinery_op(&op) {
+                        starts.remove(&step.0);
+                        continue;
+                    }
+                    let elapsed_ms = starts
+                        .remove(&step.0)
+                        .map(|(_, start)| event.ts_ms.saturating_sub(start).max(0) as u64)
+                        .unwrap_or(0);
+                    let input = input_view
+                        .and_then(|raw| {
+                            if input_view_truncated {
+                                Some(serde_json::Value::String(raw))
+                            } else {
+                                serde_json::from_str(&raw)
+                                    .ok()
+                                    .or(Some(serde_json::Value::String(raw)))
+                            }
+                        })
+                        .unwrap_or(serde_json::Value::Null);
+                    entries.push(Entry::Tool(ToolEntry::historical(
+                        op,
+                        input,
+                        view.unwrap_or(content),
+                        is_error || denied,
+                        Duration::from_millis(elapsed_ms),
+                    )));
+                }
+                EventKind::Run(RunEvent::StepSucceeded { step, .. }) => {
+                    if let Some((op, start)) = starts.remove(&step.0) {
+                        let elapsed_ms = event.ts_ms.saturating_sub(start).max(0) as u64;
+                        entries.push(Entry::Tool(ToolEntry::historical_reduced(
+                            op,
+                            None,
+                            Duration::from_millis(elapsed_ms),
+                        )));
+                    }
+                }
+                EventKind::Run(RunEvent::StepFailed { step, error }) => {
+                    if let Some((op, start)) = starts.remove(&step.0) {
+                        let elapsed_ms = event.ts_ms.saturating_sub(start).max(0) as u64;
+                        entries.push(Entry::Tool(ToolEntry::historical_reduced(
+                            op,
+                            Some(error),
+                            Duration::from_millis(elapsed_ms),
+                        )));
+                    }
+                }
+                EventKind::Observation(observation) => {
+                    if let Some(entry) = historical_observation_entry(&observation) {
+                        entries.push(entry);
+                    }
+                }
+                EventKind::ModelChanged { model } => entries.push(Entry::Notice {
+                    text: format!("model switched to {model}"),
+                    sev: Sev::Info,
+                }),
+                EventKind::TurnEnded {
+                    usage: Some(usage), ..
+                } => turn_usage.push(usage),
+                EventKind::CallUsage { model, usage } => call_usage.push((model, usage)),
+                _ => {}
+            }
+        }
+
+        self.entries = entries;
+        self.mark_transcript_dirty();
+        self.session_id = session_id.to_string();
+        // The engine, not historical registry metadata, owns the model that will execute the next
+        // turn. Keep the active model initialized by the caller across startup/resume projection.
+        self.assistant_open = false;
+        self.phase = Phase::Idle;
+        self.turn_start = None;
+        self.active_action_id = None;
+        self.steps = 0;
+        self.last_elapsed = None;
+        self.pending_plan = None;
+        self.session_picker = None;
+        self.session_sel = 0;
+        self.plan_phase = None;
+        self.execute_rounds = 0;
+        self.gather_mode = false;
+        self.scroll = 0;
+        self.follow = true;
+        self.unread = 0;
+        self.tokens_in = 0;
+        self.tokens_out = 0;
+        self.tokens_cache_read = 0;
+        self.tokens_cache_write = 0;
+        self.tokens_reasoning = 0;
+        self.cost_usd = None;
+        self.cost_unpriced = false;
+        for usage in &turn_usage {
+            self.tokens_in += usage.input_tokens;
+            self.tokens_out += usage.output_tokens;
+            self.tokens_cache_read += usage.cache_read_input_tokens;
+            self.tokens_cache_write += usage.cache_creation_input_tokens;
+            self.tokens_reasoning += usage.reasoning_tokens;
+        }
+        if let Some((_, pricing)) = &self.cost_model {
+            if call_usage.is_empty() {
+                if let Some(spec) = self.model_spec.as_deref() {
+                    for usage in &turn_usage {
+                        match pricing.cost(usage, spec) {
+                            Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
+                            None if flux_core::is_metered_cloud_spec(spec) => {
+                                self.cost_unpriced = true
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            } else {
+                for (model, usage) in &call_usage {
+                    match pricing.cost(usage, model) {
+                        Some(money) => *self.cost_usd.get_or_insert(0.0) += money.usd,
+                        None if flux_core::is_metered_cloud_spec(model) => {
+                            self.cost_unpriced = true
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn historical_observation_entry(observation: &flux_evidence::Observation) -> Option<Entry> {
+    match observation.kind.as_str() {
+        flux_evidence::KIND_DESTRUCTIVE => Some(Entry::Notice {
+            text: "⚠ destructive operation flagged".into(),
+            sev: Sev::Warn,
+        }),
+        "skill.activated" => observation
+            .data
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .map(|name| Entry::Notice {
+                text: format!("✦ skill activated: {name}"),
+                sev: Sev::Info,
+            }),
+        "flow.halt" => Some(Entry::Notice {
+            text: halt_line(&observation.data),
+            sev: Sev::Err,
+        }),
+        "flow.brief" => Some(Entry::Brief {
+            goal: observation
+                .data
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            needs: observation
+                .data
+                .get("needs")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        }),
+        _ => None,
     }
 }
 
 /// Compose a one-row bar: `left` spans, padding, then `right` spans flush to `width`.
 fn bar_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Line<'static> {
-    let span_w =
-        |spans: &[Span]| -> usize { spans.iter().map(|s| s.content.chars().count()).sum() };
-    let pad = (width as usize)
-        .saturating_sub(span_w(&left) + span_w(&right))
-        .max(1);
+    let span_w = |spans: &[Span]| -> usize {
+        spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
+    };
+    let mut right = right;
+    if span_w(&left) + span_w(&right) + 1 > width as usize {
+        right.clear();
+    }
+    let pad = (width as usize).saturating_sub(span_w(&left) + span_w(&right));
     let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
     spans.extend(right);
     Line::from(spans)
 }
@@ -885,16 +1542,83 @@ fn fmt_count(n: u64) -> String {
 
 /// Truncate `s` to `max` display columns (approximated by char count), appending `…` when cut.
 fn truncate(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
+    if UnicodeWidthStr::width(s) <= max {
         s.to_string()
     } else if max == 0 {
         String::new()
     } else {
-        let mut out: String = s.chars().take(max - 1).collect();
+        let target = max.saturating_sub(1);
+        let mut width = 0;
+        let mut out = String::new();
+        for ch in s.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + ch_width > target {
+                break;
+            }
+            out.push(ch);
+            width += ch_width;
+        }
         out.push('…');
         out
     }
+}
+
+/// Hard-wrap styled lines to terminal display columns while preserving line/span styles. Markdown
+/// is already word-wrapped; this closes the remaining long-user-input/tool/notice cases so viewport
+/// offsets are exact and Ratatui never has to reflow rows hidden outside the viewport.
+fn wrap_styled_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let max = width as usize;
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let Line {
+            style: line_style,
+            alignment,
+            spans,
+        } = line;
+        if spans.is_empty() {
+            out.push(Line {
+                style: line_style,
+                alignment,
+                spans,
+            });
+            continue;
+        }
+
+        let mut row = Vec::new();
+        let mut columns: usize = 0;
+        for span in spans {
+            let span_style = span.style;
+            let mut chunk = String::new();
+            for ch in span.content.chars() {
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if columns > 0 && columns.saturating_add(ch_width) > max {
+                    if !chunk.is_empty() {
+                        row.push(Span::styled(std::mem::take(&mut chunk), span_style));
+                    }
+                    out.push(Line {
+                        style: line_style,
+                        alignment,
+                        spans: std::mem::take(&mut row),
+                    });
+                    columns = 0;
+                }
+                chunk.push(ch);
+                columns = columns.saturating_add(ch_width);
+            }
+            if !chunk.is_empty() {
+                row.push(Span::styled(chunk, span_style));
+            }
+        }
+        out.push(Line {
+            style: line_style,
+            alignment,
+            spans: row,
+        });
+    }
+    out
 }
 
 /// Whether a `FLUX_*` boolean env value is ON: `1`/`true`/`yes`/`on`, case-insensitive. Mere
@@ -922,48 +1646,33 @@ fn fmt_elapsed(d: Duration) -> String {
 /// Max persisted history entries.
 const HISTORY_CAP: usize = 500;
 
-/// Path to the persisted input history (`~/.flux/history`), if `$HOME` is known.
-fn history_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".flux").join("history"))
-}
-
-/// Load persisted input history (oldest first), newest [`HISTORY_CAP`] kept. Newlines were escaped
-/// on save (one entry per line), so unescape them here.
-fn load_history() -> Vec<String> {
-    let Some(path) = history_path() else {
-        return Vec::new();
+/// Derive recall history from the same durable event store as sessions. This avoids a parallel
+/// `~/.flux/history` file and keeps all filesystem ownership inside `flux-events`.
+fn load_history(events: &flux_events::EventStore) -> Vec<String> {
+    let mut history = Vec::new();
+    let Ok(mut sessions) = events.list(50) else {
+        return history;
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut lines: Vec<String> = text
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.replace("\\n", "\n"))
-        .collect();
-    if lines.len() > HISTORY_CAP {
-        lines.drain(0..lines.len() - HISTORY_CAP);
+    sessions.reverse();
+    for session in sessions {
+        let Ok(stored) = events.load_by_kind(&session.id, "message") else {
+            continue;
+        };
+        for event in stored {
+            if let flux_events::EventKind::Message(message) = event.kind {
+                if message.role == flux_core::Role::User {
+                    let text = message.text();
+                    if !text.trim().is_empty() && history.last() != Some(&text) {
+                        history.push(text);
+                    }
+                }
+            }
+        }
     }
-    lines
-}
-
-/// Persist input history (best-effort, capped). Newlines in a prompt are escaped so each entry stays
-/// on one line.
-fn save_history(history: &[String]) {
-    let Some(path) = history_path() else {
-        return;
-    };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if history.len() > HISTORY_CAP {
+        history.drain(0..history.len() - HISTORY_CAP);
     }
-    let start = history.len().saturating_sub(HISTORY_CAP);
-    let body = history[start..]
-        .iter()
-        .map(|h| h.replace('\n', "\\n"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _ = std::fs::write(path, body);
+    history
 }
 
 /// A centered sub-rect `w`×`h` (clamped to `area`).
@@ -980,22 +1689,37 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 /// Render the chat: scrollable transcript, a status/spinner row, the input box, optional modal.
 pub fn render(frame: &mut Frame, state: &ChatState) {
-    let input_h = state.input_rows() + 2; // + borders
+    if frame.area().width < 24 || frame.area().height < 6 {
+        frame.render_widget(
+            Paragraph::new("terminal too small — resize to continue")
+                .style(state.theme.muted_style()),
+            frame.area(),
+        );
+        return;
+    }
+    let input_h = state.input_rows();
     let slash = state
         .slash_query()
         .map(|q| slash_matches(&q))
         .unwrap_or_default();
     let menu_h = (slash.len().min(6)) as u16;
+    let queue_h = if state.queue.is_empty() {
+        0
+    } else {
+        state.queue.len().min(3) as u16
+    };
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(queue_h),
         Constraint::Length(menu_h),
         Constraint::Length(input_h),
         Constraint::Length(1),
     ])
     .split(frame.area());
-    let (header_area, transcript_area, menu_area, input_area, footer_area) =
-        (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]);
+    let (header_area, transcript_area, queue_area, menu_area, input_area, footer_area) = (
+        chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5],
+    );
 
     // --- header bar ---
     frame.render_widget(
@@ -1004,41 +1728,56 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     );
 
     // --- transcript (scrollable) ---
-    let inner_w = transcript_area.width.saturating_sub(2);
-    let inner_h = transcript_area.height.saturating_sub(2);
-    let lines = state.transcript_lines(inner_w);
-    let transcript = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(state.theme.muted_style()),
-    );
-    let total = transcript.line_count(inner_w) as u16;
-    let max_scroll = total.saturating_sub(inner_h);
-    state.last_max_scroll.set(max_scroll);
-    state.last_page.set(inner_h.max(1));
-    let offset = if state.follow {
-        max_scroll
-    } else {
-        state.scroll.min(max_scroll)
-    };
-    frame.render_widget(transcript.scroll((offset, 0)), transcript_area);
+    let inner_w = transcript_area.width;
+    let inner_h = transcript_area.height;
+    let visible = state.transcript_viewport(inner_w, inner_h);
+    frame.render_widget(Paragraph::new(visible), transcript_area);
+
+    // --- queued follow-ups (visible even while composing another message) ---
+    if !state.queue.is_empty() {
+        let mut rows: Vec<Line> = state
+            .queue
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(i, prompt)| {
+                Line::from(vec![
+                    Span::styled(format!(" {}. ", i + 1), state.theme.accent_style()),
+                    Span::styled(
+                        truncate(&prompt.replace('\n', " "), 72),
+                        state.theme.muted_style(),
+                    ),
+                ])
+            })
+            .collect();
+        if state.queue.len() > 3 {
+            rows[2] = Line::styled(
+                format!(" +{} more queued", state.queue.len() - 2),
+                state.theme.muted_style(),
+            );
+        }
+        frame.render_widget(Paragraph::new(rows), queue_area);
+    }
 
     // --- slash-command menu (between transcript and input) ---
     if !slash.is_empty() {
         let theme = &state.theme;
         let sel = state.slash_sel.min(slash.len() - 1);
+        let start = sel.saturating_sub(5).min(slash.len().saturating_sub(6));
         let rows: Vec<Line> = slash
             .iter()
+            .skip(start)
             .take(6)
             .enumerate()
             .map(|(i, c)| {
-                let style = if i == sel {
+                let absolute = start + i;
+                let style = if absolute == sel {
                     Style::default().bg(theme.sel_bg).fg(theme.accent)
                 } else {
                     theme.muted_style()
                 };
                 Line::from(vec![
-                    Span::styled(if i == sel { " ▸ " } else { "   " }, style),
+                    Span::styled(if absolute == sel { " ▸ " } else { "   " }, style),
                     Span::styled(format!("/{}", c.name), style.add_modifier(Modifier::BOLD)),
                     Span::styled(format!("   {}", c.desc), style),
                 ])
@@ -1047,12 +1786,19 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         frame.render_widget(Paragraph::new(rows), menu_area);
     }
 
-    // --- input (multiline; tui-textarea owns its cursor + scrolling) ---
+    // --- input (multiline; its background is the only visual boundary) ---
+    frame.render_widget(
+        Block::default().style(state.theme.composer_style()),
+        input_area,
+    );
     let mut input = state.input.clone();
-    input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(state.theme.accent_style()),
+    input.set_style(state.theme.composer_style());
+    input.set_placeholder_style(state.theme.muted_style().bg(state.theme.composer_bg));
+    input.set_cursor_style(
+        state
+            .theme
+            .composer_style()
+            .add_modifier(Modifier::REVERSED),
     );
     frame.render_widget(&input, input_area);
 
@@ -1062,24 +1808,124 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         footer_area,
     );
 
-    // --- approval modal ---
+    // --- queue manager (background-separated sheet, no decorative frame) ---
+    if state.queue_open && !state.queue.is_empty() {
+        let visible = state.queue.len().min(10);
+        let height = (visible as u16 + 2).min(frame.area().height);
+        let area = centered(frame.area(), frame.area().width.min(76), height);
+        frame.render_widget(Clear, area);
+        let selected = state.queue_sel.min(state.queue.len() - 1);
+        let start = selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(state.queue.len().saturating_sub(visible));
+        let mut rows = vec![Line::styled(
+            " queued · Enter edit · Delete remove · Alt-↑/↓ reorder · Esc close ",
+            state.theme.accent_style().bg(state.theme.panel_bg),
+        )];
+        rows.extend(
+            state
+                .queue
+                .iter()
+                .skip(start)
+                .take(visible)
+                .enumerate()
+                .map(|(offset, prompt)| {
+                    let index = start + offset;
+                    let style = if index == selected {
+                        Style::default()
+                            .fg(state.theme.accent)
+                            .bg(state.theme.sel_bg)
+                    } else {
+                        state.theme.panel_style()
+                    };
+                    Line::styled(
+                        format!(
+                            " {}  {}",
+                            index + 1,
+                            truncate(&prompt.replace('\n', " "), 68)
+                        ),
+                        style,
+                    )
+                }),
+        );
+        if state.queue.len() > visible {
+            rows.push(Line::styled(
+                format!(" {}/{} ", selected + 1, state.queue.len()),
+                state.theme.muted_style().bg(state.theme.panel_bg),
+            ));
+        }
+        frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
+    }
+
+    // --- session picker (dense transient sheet) ---
+    if let Some(sessions) = state.session_picker.as_ref() {
+        let visible = sessions.len().min(12);
+        let height = (visible as u16 + 2).min(frame.area().height);
+        let width = frame.area().width.min(76);
+        let area = centered(frame.area(), width, height);
+        frame.render_widget(Clear, area);
+        let selected = state.session_sel.min(sessions.len().saturating_sub(1));
+        let start = selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(sessions.len().saturating_sub(visible));
+        let mut rows = vec![Line::styled(
+            " sessions · Enter resume · Esc close ",
+            state.theme.accent_style().bg(state.theme.panel_bg),
+        )];
+        rows.extend(sessions.iter().skip(start).take(visible).enumerate().map(
+            |(offset, session)| {
+                let index = start + offset;
+                let marker = if session.id == state.session_id {
+                    "●"
+                } else {
+                    " "
+                };
+                let label = format!(
+                    " {marker} {}  · {} msg · {}",
+                    session.id, session.messages, session.model
+                );
+                let style = if index == selected {
+                    Style::default()
+                        .fg(state.theme.accent)
+                        .bg(state.theme.sel_bg)
+                } else {
+                    state.theme.panel_style()
+                };
+                Line::styled(truncate(&label, width as usize), style)
+            },
+        ));
+        if sessions.len() > visible {
+            rows.push(Line::styled(
+                format!(" {}/{} ", selected + 1, sessions.len()),
+                state.theme.muted_style().bg(state.theme.panel_bg),
+            ));
+        }
+        frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
+    }
+
+    // --- approval sheet ---
     if let Some(modal) = &state.modal {
-        let area = centered(frame.area(), 64, 7);
+        let height = 4.min(frame.area().height);
+        let area = Rect {
+            x: frame.area().x,
+            y: input_area.y.saturating_sub(height),
+            width: frame.area().width,
+            height,
+        };
         frame.render_widget(Clear, area);
         let p = Paragraph::new(modal.as_str())
             .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("approve")
-                    .border_style(state.theme.warn_style()),
-            );
+            .style(state.theme.panel_style().fg(state.theme.warn));
         frame.render_widget(p, area);
     }
 }
 
 /// A UI event produced by the running turn (on a background task) for the event loop to render.
 enum UiEvent {
+    Tagged {
+        action_id: u64,
+        event: Box<UiEvent>,
+    },
     Text(String),
     /// A live thinking-token delta streamed during the planning phase.
     Thinking(String),
@@ -1115,32 +1961,68 @@ enum UiEvent {
         subjects: Vec<String>,
         reply: oneshot::Sender<ApprovalChoice>,
     },
+    PlanReady(Option<flux_flow::ast::DraftAst>),
     Finished,
+}
+
+type PendingApproval = (String, Vec<String>, oneshot::Sender<ApprovalChoice>);
+
+fn show_next_approval(
+    state: &mut ChatState,
+    current: &mut Option<(String, oneshot::Sender<ApprovalChoice>)>,
+    queued: &mut VecDeque<PendingApproval>,
+) {
+    if current.is_some() {
+        return;
+    }
+    if let Some((tool, subjects, reply)) = queued.pop_front() {
+        state.modal = Some(format!(
+            "approve `{tool}` {subjects:?}\n\n[y]es   [a]lways   [N]o"
+        ));
+        *current = Some((tool, reply));
+    }
 }
 
 /// Forwards a turn's streamed output to the event loop over an mpsc channel.
 struct ChannelSink {
     tx: mpsc::UnboundedSender<UiEvent>,
+    action_id: u64,
+}
+
+impl ChannelSink {
+    fn send(&self, event: UiEvent) {
+        let _ = self.tx.send(UiEvent::Tagged {
+            action_id: self.action_id,
+            event: Box::new(event),
+        });
+    }
+}
+
+fn send_action_event(tx: &mpsc::UnboundedSender<UiEvent>, action_id: u64, event: UiEvent) {
+    let _ = tx.send(UiEvent::Tagged {
+        action_id,
+        event: Box::new(event),
+    });
 }
 
 impl AgentSink for ChannelSink {
     fn text_delta(&mut self, t: &str) {
-        let _ = self.tx.send(UiEvent::Text(t.to_string()));
+        self.send(UiEvent::Text(t.to_string()));
     }
     fn thinking_delta(&mut self, t: &str) {
-        let _ = self.tx.send(UiEvent::Thinking(t.to_string()));
+        self.send(UiEvent::Thinking(t.to_string()));
     }
     fn planning(&mut self, active: bool) {
-        let _ = self.tx.send(UiEvent::Planning(active));
+        self.send(UiEvent::Planning(active));
     }
     fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        let _ = self.tx.send(UiEvent::ToolCall {
+        self.send(UiEvent::ToolCall {
             name: name.to_string(),
             input: input.clone(),
         });
     }
     fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        let _ = self.tx.send(UiEvent::ToolResult {
+        self.send(UiEvent::ToolResult {
             name: name.to_string(),
             content: result.content.clone(),
             is_error: result.is_error,
@@ -1148,15 +2030,15 @@ impl AgentSink for ChannelSink {
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
         if let Some(u) = usage {
-            let _ = self.tx.send(UiEvent::Usage(u));
+            self.send(UiEvent::Usage(u));
         }
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         if o.kind == "flow.plan" {
-            let _ = self.tx.send(UiEvent::Plan(o.data.clone()));
+            self.send(UiEvent::Plan(o.data.clone()));
         } else if o.kind == "loop.phase" {
             if let Some(phase) = o.data.get("phase").and_then(|v| v.as_str()) {
-                let _ = self.tx.send(UiEvent::Phase(phase.to_string()));
+                self.send(UiEvent::Phase(phase.to_string()));
             }
         } else if o.kind == "flow.brief" {
             let goal = o
@@ -1175,15 +2057,15 @@ impl AgentSink for ChannelSink {
                         .collect()
                 })
                 .unwrap_or_default();
-            let _ = self.tx.send(UiEvent::Brief { goal, needs });
+            self.send(UiEvent::Brief { goal, needs });
         } else if o.kind == flux_evidence::KIND_DESTRUCTIVE {
-            let _ = self.tx.send(UiEvent::Notice {
+            self.send(UiEvent::Notice {
                 text: "⚠ destructive operation flagged".into(),
                 sev: Sev::Warn,
             });
         } else if o.kind == "skill.activated" {
             if let Some(name) = o.data.get("skill").and_then(|v| v.as_str()) {
-                let _ = self.tx.send(UiEvent::Notice {
+                self.send(UiEvent::Notice {
                     text: format!("✦ skill activated: {name}"),
                     sev: Sev::Info,
                 });
@@ -1192,7 +2074,7 @@ impl AgentSink for ChannelSink {
             // A-17: reuse the plain `Notice`/`Sev::Err` machinery already used for other real-time
             // cues (destructive-op flags, skill activation) rather than a dedicated `Entry`/`UiEvent`
             // variant — the halt line is exactly that shape: a one-off red status line.
-            let _ = self.tx.send(UiEvent::Notice {
+            self.send(UiEvent::Notice {
                 text: halt_line(&o.data),
                 sev: Sev::Err,
             });
@@ -1231,6 +2113,98 @@ impl Approver for ChannelApprover {
 
 type Tui = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
+#[derive(Default)]
+struct TerminalGuard {
+    raw: bool,
+    alternate: bool,
+    mouse: bool,
+    paste: bool,
+    cursor_hidden: bool,
+}
+
+impl TerminalGuard {
+    fn enter(mut out: std::io::Stdout) -> anyhow::Result<(Tui, Self)> {
+        use crossterm::cursor::Hide;
+        use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+        use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+
+        let mut guard = Self::default();
+        enable_raw_mode()?;
+        guard.raw = true;
+        crossterm::execute!(out, EnterAlternateScreen)?;
+        guard.alternate = true;
+        crossterm::execute!(out, EnableMouseCapture)?;
+        guard.mouse = true;
+        crossterm::execute!(out, EnableBracketedPaste)?;
+        guard.paste = true;
+        crossterm::execute!(out, Hide)?;
+        guard.cursor_hidden = true;
+        let terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
+        Ok((terminal, guard))
+    }
+
+    fn restore(
+        &mut self,
+        backend: &mut ratatui::backend::CrosstermBackend<std::io::Stdout>,
+    ) -> anyhow::Result<()> {
+        use crossterm::cursor::Show;
+        use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
+        use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+
+        let mut first_error: Option<anyhow::Error> = None;
+        macro_rules! attempt {
+            ($condition:expr, $command:expr, $field:ident) => {
+                if $condition {
+                    if let Err(error) = crossterm::execute!(backend, $command) {
+                        first_error.get_or_insert_with(|| error.into());
+                    } else {
+                        self.$field = false;
+                    }
+                }
+            };
+        }
+        attempt!(self.cursor_hidden, Show, cursor_hidden);
+        attempt!(self.paste, DisableBracketedPaste, paste);
+        attempt!(self.mouse, DisableMouseCapture, mouse);
+        attempt!(self.alternate, LeaveAlternateScreen, alternate);
+        if self.raw {
+            if let Err(error) = disable_raw_mode() {
+                first_error.get_or_insert_with(|| error.into());
+            } else {
+                self.raw = false;
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        use crossterm::cursor::Show;
+        use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
+        use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+        let mut out = std::io::stdout();
+        if self.cursor_hidden {
+            let _ = crossterm::execute!(out, Show);
+        }
+        if self.paste {
+            let _ = crossterm::execute!(out, DisableBracketedPaste);
+        }
+        if self.mouse {
+            let _ = crossterm::execute!(out, DisableMouseCapture);
+        }
+        if self.alternate {
+            let _ = crossterm::execute!(out, LeaveAlternateScreen);
+        }
+        if self.raw {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
 /// Run the interactive TUI against `agent`/`session_id`. Requires a real terminal. Installs a modal
 /// approver unless `auto_approve` is set (i.e. `--yes` was passed), then always restores the
 /// terminal (raw mode + alternate screen + mouse capture) even on error. `model_spec` is the
@@ -1245,80 +2219,90 @@ pub async fn run(
     auto_approve: bool,
     model_spec: Option<String>,
 ) -> anyhow::Result<()> {
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
+    run_with_options(
+        agent,
+        session_id,
+        TuiRunOptions::new(auto_approve, model_spec),
+    )
+    .await
+}
+
+/// Run the interactive TUI with optional surface capabilities such as live model resolution.
+pub async fn run_with_options(
+    agent: FlowEngine,
+    session_id: String,
+    options: TuiRunOptions,
+) -> anyhow::Result<()> {
     use std::io::IsTerminal;
 
     let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
     // Only replace the approver with the modal when NOT auto-approving; if --yes was passed,
     // build_agent already installed AllowApprover and we must not clobber it.
-    if !auto_approve {
+    if !options.auto_approve {
         agent
             .executor
             .set_approver(Arc::new(ChannelApprover { tx: tx.clone() }));
     }
     let model = agent.model.clone();
-    let agent = Arc::new(agent);
+    let events = agent.events.clone();
 
-    let mut out = std::io::stdout();
+    let out = std::io::stdout();
     if !std::io::stdin().is_terminal() || !out.is_terminal() {
         anyhow::bail!("flux tui requires a real terminal on stdin and stdout");
     }
 
-    enable_raw_mode()?;
-    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
-
     let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
-    let mut state = ChatState::new(model).with_verbose(verbose);
-    if let Some(spec) = model_spec {
+    let mut state = ChatState::for_session(model, session_id.clone()).with_verbose(verbose);
+    if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
-    state.history = load_history();
-    let result = event_loop(&mut terminal, agent, &session_id, &mut state, tx, rx).await;
+    state.project_session(&events, &session_id)?;
+    state.history = load_history(&events);
+    let agent = Arc::new(tokio::sync::RwLock::new(agent));
 
-    disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    result
+    let (mut terminal, mut guard) = TerminalGuard::enter(out)?;
+    let result = event_loop(
+        &mut terminal,
+        agent,
+        &mut state,
+        tx,
+        rx,
+        options.model_resolver,
+    )
+    .await;
+    let restore = guard.restore(terminal.backend_mut());
+    result.and(restore)
 }
 
 async fn event_loop(
     terminal: &mut Tui,
-    agent: Arc<FlowEngine>,
-    session_id: &str,
+    agent: Arc<tokio::sync::RwLock<FlowEngine>>,
     state: &mut ChatState,
     tx: mpsc::UnboundedSender<UiEvent>,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
+    model_resolver: Option<Arc<dyn ModelResolver>>,
 ) -> anyhow::Result<()> {
-    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+    use crossterm::event::{
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    };
+    use futures_util::StreamExt as _;
 
     let mut cancel = CancellationToken::new();
     let mut pending_reply: Option<(String, oneshot::Sender<ApprovalChoice>)> = None;
+    let mut approval_queue: VecDeque<PendingApproval> = VecDeque::new();
     // A message typed while a turn was running, started as soon as the turn finishes.
-    let mut pending_input: Option<String> = None;
-
-    // Read terminal input on a dedicated OS thread so the main loop can stay async: blocking
-    // `event::read()` here (not on a runtime worker) lets the loop `.await` below, which is what
-    // actually drives the spawned turn — a synchronous `event::poll` loop would starve it.
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
-            if input_tx.send(ev).is_err() {
-                break;
-            }
-        }
-    });
+    let mut input = EventStream::new();
+    let mut pending_ui: Option<UiEvent> = None;
+    let mut exit_after_finish = false;
 
     loop {
         // Drain everything the running turn has produced.
-        while let Ok(ev) = rx.try_recv() {
+        while let Some(ev) = pending_ui.take().or_else(|| rx.try_recv().ok()) {
+            let Some(ev) = state.accept_ui_event(ev) else {
+                continue;
+            };
             match ev {
+                UiEvent::Tagged { .. } => unreachable!("tagged events are unwrapped above"),
                 UiEvent::Text(t) => state.stream_text(&t),
                 UiEvent::Thinking(t) => state.stream_thinking(&t),
                 UiEvent::Planning(active) => {
@@ -1373,38 +2357,68 @@ async fn event_loop(
                     subjects,
                     reply,
                 } => {
-                    state.modal = Some(format!(
-                        "approve `{tool}` {subjects:?}\n\n[y]es   [a]lways   [N]o"
-                    ));
-                    pending_reply = Some((tool, reply));
+                    approval_queue.push_back((tool, subjects, reply));
+                    show_next_approval(state, &mut pending_reply, &mut approval_queue);
+                }
+                UiEvent::PlanReady(plan) => {
+                    if let Some(plan) = plan {
+                        state.pending_plan = Some(plan);
+                        state.push(Entry::Notice {
+                            text: "plan ready · /run to execute · keep chatting to refine".into(),
+                            sev: Sev::Info,
+                        });
+                    }
                 }
                 UiEvent::Finished => {
+                    if let Some((_tool, reply)) = pending_reply.take() {
+                        let _ = reply.send(ApprovalChoice::Deny);
+                    }
+                    for (_tool, _subjects, reply) in approval_queue.drain(..) {
+                        let _ = reply.send(ApprovalChoice::Deny);
+                    }
+                    state.modal = None;
                     state.end_stream();
                     state.phase = Phase::Idle;
                     state.last_elapsed = state.turn_start.map(|s| s.elapsed());
                     state.turn_start = None;
-                    // A message composed while this turn ran starts now.
-                    if let Some(queued) = pending_input.take() {
-                        cancel = start_turn(&agent, session_id, &tx, state, queued);
+                    state.active_action_id = None;
+                    // A queued message starts only after the prior task's Finished marker.
+                    if !state.queue_open && state.queue_edit_index.is_none() {
+                        if let Some(queued) = state.queue.pop_front() {
+                            cancel = start_turn(&agent, &tx, state, queued);
+                        }
                     }
                 }
             }
         }
 
+        if exit_after_finish && !state.running() {
+            break;
+        }
+
         terminal.draw(|f| render(f, state))?;
 
-        // Await the next input event or a ~30 fps tick. The `.await` here yields to the runtime so
-        // the spawned turn task is actually polled (the engine's model call + streaming run on it);
-        // the tick keeps the spinner animating and flushes streamed tokens while a turn is running.
+        // Idle blocks without a timer. While active, an 80ms tick is enough for spinner/elapsed
+        // animation; streamed UI events wake the loop immediately and are batched above.
         let ev = tokio::select! {
-            maybe = input_rx.recv() => match maybe {
-                Some(ev) => ev,
-                None => break, // input reader gone
+            maybe = input.next() => match maybe {
+                Some(Ok(ev)) => ev,
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
             },
-            _ = tokio::time::sleep(Duration::from_millis(33)) => continue,
+            maybe = rx.recv() => {
+                pending_ui = maybe;
+                if pending_ui.is_none() { break; }
+                continue;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(80)), if state.running() => continue,
         };
         match ev {
             Event::Resize(_, _) => continue,
+            Event::Paste(text) => {
+                state.input.insert_str(text);
+                continue;
+            }
             Event::Mouse(m) => {
                 match m.kind {
                     MouseEventKind::ScrollUp => scroll_up(state, 3),
@@ -1431,6 +2445,92 @@ async fn event_loop(
                         let _ = reply.send(choice);
                     }
                     state.modal = None;
+                    show_next_approval(state, &mut pending_reply, &mut approval_queue);
+                    continue;
+                }
+
+                if state.session_picker.is_some() {
+                    match key.code {
+                        KeyCode::Esc => state.session_picker = None,
+                        KeyCode::Up => {
+                            state.session_sel = state.session_sel.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            let last = state
+                                .session_picker
+                                .as_ref()
+                                .map_or(0, |sessions| sessions.len().saturating_sub(1));
+                            state.session_sel = (state.session_sel + 1).min(last);
+                        }
+                        KeyCode::Enter if state.running() => state.push(Entry::Notice {
+                            text: "session switching waits for the active action to finish".into(),
+                            sev: Sev::Warn,
+                        }),
+                        KeyCode::Enter => {
+                            let selected = state.session_picker.as_ref().and_then(|sessions| {
+                                sessions
+                                    .get(state.session_sel.min(sessions.len().saturating_sub(1)))
+                                    .map(|session| session.id.clone())
+                            });
+                            if let Some(session_id) = selected {
+                                let engine = agent.read().await;
+                                let active_model = engine.model.clone();
+                                let events = engine.events.clone();
+                                drop(engine);
+                                match state.project_session(&events, &session_id) {
+                                    Ok(()) => {
+                                        state.model = active_model;
+                                        state.history = load_history(&events);
+                                    }
+                                    Err(error) => state.push(Entry::Notice {
+                                        text: error.to_string(),
+                                        sev: Sev::Err,
+                                    }),
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if state.queue_open {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.queue_open = false;
+                            if !state.running() {
+                                if let Some(next) = state.queue.pop_front() {
+                                    cancel = start_turn(&agent, &tx, state, next);
+                                }
+                            }
+                        }
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                            state.queue_move(-1)
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                            state.queue_move(1)
+                        }
+                        KeyCode::Up => {
+                            state.queue_sel = state.queue_sel.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            state.queue_sel =
+                                (state.queue_sel + 1).min(state.queue.len().saturating_sub(1));
+                        }
+                        KeyCode::Delete | KeyCode::Backspace => {
+                            state.queue_remove_selected();
+                            if state.queue.is_empty() {
+                                state.queue_open = false;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(edit) = state.queue_begin_edit() {
+                                state.set_input(&edit);
+                            }
+                            state.queue_open = false;
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
 
@@ -1438,6 +2538,12 @@ async fn event_loop(
                 // for the input editor (line start/end); PgDn reattaches follow when it reaches the
                 // bottom, so a dedicated jump-to-bottom isn't needed.
                 match key.code {
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.follow = true;
+                        state.scroll = state.last_max_scroll.get();
+                        state.unread = 0;
+                        continue;
+                    }
                     KeyCode::PageUp => {
                         scroll_up(state, state.last_page.get());
                         continue;
@@ -1451,49 +2557,40 @@ async fn event_loop(
 
                 // Slash-command menu: when the input is a bare `/cmd` prefix with matches, ↑/↓ select,
                 // Tab/Enter run the command, Esc dismisses; other keys fall through to edit/filter.
-                if let Some(query) = state.slash_query() {
-                    let matches = slash_matches(&query);
-                    if !matches.is_empty() {
-                        match key.code {
-                            KeyCode::Up => {
-                                state.slash_up(matches.len());
-                                continue;
-                            }
-                            KeyCode::Down => {
-                                state.slash_down(matches.len());
-                                continue;
-                            }
-                            KeyCode::Esc => {
-                                state.input = fresh_textarea();
-                                continue;
-                            }
-                            KeyCode::Tab | KeyCode::Enter => {
-                                let name = matches[state.slash_sel.min(matches.len() - 1)].name;
-                                state.input = fresh_textarea();
-                                state.slash_sel = 0;
-                                match name {
-                                    "quit" => break,
-                                    "clear" | "new" => {
-                                        state.entries.clear();
-                                        state.follow = true;
-                                        state.scroll = 0;
-                                    }
-                                    "help" => state.push(Entry::Notice {
-                                        text: HELP_TEXT.into(),
-                                        sev: Sev::Info,
-                                    }),
-                                    "model" => {
-                                        let m = state.model.clone();
-                                        state.push(Entry::Notice {
-                                            text: format!("model: {m}"),
-                                            sev: Sev::Info,
-                                        });
-                                    }
-                                    _ => {}
+                if state.queue_edit_index.is_none() {
+                    if let Some(query) = state.slash_query() {
+                        let matches = slash_matches(&query);
+                        if !matches.is_empty() {
+                            match key.code {
+                                KeyCode::Up => {
+                                    state.slash_up(matches.len());
+                                    continue;
                                 }
-                                continue;
+                                KeyCode::Down => {
+                                    state.slash_down(matches.len());
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    state.input = fresh_textarea();
+                                    continue;
+                                }
+                                KeyCode::Tab => {
+                                    let name = matches[state.slash_sel.min(matches.len() - 1)].name;
+                                    let needs_arg = matches!(name, "model" | "resume");
+                                    state.set_input(&format!(
+                                        "/{name}{}",
+                                        if needs_arg { " " } else { "" }
+                                    ));
+                                    state.slash_sel = 0;
+                                    continue;
+                                }
+                                KeyCode::Enter => {
+                                    let name = matches[state.slash_sel.min(matches.len() - 1)].name;
+                                    state.set_input(&format!("/{name}"));
+                                    state.slash_sel = 0;
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -1512,9 +2609,27 @@ async fn event_loop(
                 let last_row = state.input.lines().len().saturating_sub(1);
 
                 match key.code {
-                    KeyCode::Esc => break,
-                    KeyCode::Up if cur_row == 0 && !ctrl => state.history_prev(),
-                    KeyCode::Down if cur_row == last_row && !ctrl => state.history_next(),
+                    KeyCode::Esc => {
+                        if state.queue_cancel_edit() {
+                            state.input = fresh_textarea();
+                            if !running {
+                                if let Some(next) = state.queue.pop_front() {
+                                    cancel = start_turn(&agent, &tx, state, next);
+                                }
+                            }
+                        } else if state.slash_query().is_some() {
+                            state.input = fresh_textarea();
+                        }
+                    }
+                    KeyCode::Char('d') if ctrl && !running && state.input_blank() => break,
+                    KeyCode::Up if cur_row == 0 && !ctrl && state.queue_edit_index.is_none() => {
+                        state.history_prev()
+                    }
+                    KeyCode::Down
+                        if cur_row == last_row && !ctrl && state.queue_edit_index.is_none() =>
+                    {
+                        state.history_next()
+                    }
                     KeyCode::Char('c') if ctrl => {
                         if running {
                             // Cancel the running turn (input stays live so you can keep typing).
@@ -1524,27 +2639,68 @@ async fn event_loop(
                                 sev: Sev::Info,
                             });
                         } else if state.input_blank() {
-                            break; // empty line → quit
+                            if state.queue_cancel_edit() {
+                                state.input = fresh_textarea();
+                                if let Some(next) = state.queue.pop_front() {
+                                    cancel = start_turn(&agent, &tx, state, next);
+                                }
+                            } else {
+                                break; // empty line → quit
+                            }
                         } else {
+                            let cancelled_edit = state.queue_cancel_edit();
                             state.input = fresh_textarea(); // non-empty line → clear it
+                            if cancelled_edit {
+                                if let Some(next) = state.queue.pop_front() {
+                                    cancel = start_turn(&agent, &tx, state, next);
+                                }
+                            }
                         }
                     }
-                    KeyCode::Char('e') if ctrl => state.expand_tools = !state.expand_tools,
+                    KeyCode::Char('e') if ctrl => state.toggle_details(),
                     _ if want_newline => state.input.insert_newline(),
                     KeyCode::Enter => {
                         if state.input_blank() {
                             let _ = state.take_input();
+                            if state.queue_cancel_edit() && !running {
+                                if let Some(next) = state.queue.pop_front() {
+                                    cancel = start_turn(&agent, &tx, state, next);
+                                }
+                            }
                             continue;
                         }
                         let text = state.take_input();
-                        if running {
-                            pending_input = Some(text);
-                            state.push(Entry::Notice {
-                                text: "↩ queued — sends when the current turn finishes".into(),
-                                sev: Sev::Info,
-                            });
+                        if state.queue_edit_index.is_none() && text.trim_start().starts_with('/') {
+                            let wants_quit = handle_command(
+                                &text,
+                                &agent,
+                                &tx,
+                                state,
+                                &mut cancel,
+                                model_resolver.as_ref(),
+                            )
+                            .await?;
+                            if wants_quit {
+                                state.queue.clear();
+                                if running {
+                                    cancel.cancel();
+                                    exit_after_finish = true;
+                                } else {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        if state.queue_commit_edit(text.clone()) {
+                            if !running {
+                                if let Some(next) = state.queue.pop_front() {
+                                    cancel = start_turn(&agent, &tx, state, next);
+                                }
+                            }
+                        } else if running {
+                            state.enqueue(text);
                         } else {
-                            cancel = start_turn(&agent, session_id, &tx, state, text);
+                            cancel = start_turn(&agent, &tx, state, text);
                         }
                     }
                     // Everything else (text, backspace, arrows, word-nav, home/end) edits the input —
@@ -1560,25 +2716,410 @@ async fn event_loop(
     Ok(())
 }
 
+async fn handle_command(
+    text: &str,
+    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    state: &mut ChatState,
+    cancel: &mut CancellationToken,
+    model_resolver: Option<&Arc<dyn ModelResolver>>,
+) -> anyhow::Result<bool> {
+    let command = text.trim().trim_start_matches('/');
+    let (name, args) = command
+        .split_once(char::is_whitespace)
+        .map(|(name, args)| (name, args.trim()))
+        .unwrap_or((command, ""));
+    let busy = state.running();
+    let read_only = command_is_read_only(name, args);
+    if busy && !read_only && !matches!(name, "quit" | "exit") {
+        state.push(Entry::Notice {
+            text: format!("/{name} waits for an idle session — interrupt the current action first"),
+            sev: Sev::Warn,
+        });
+        return Ok(false);
+    }
+
+    match name {
+        "" | "help" => state.push(Entry::Notice {
+            text: HELP_TEXT.into(),
+            sev: Sev::Info,
+        }),
+        "quit" | "exit" => return Ok(true),
+        "queue" => {
+            if state.queue.is_empty() {
+                state.push(Entry::Notice {
+                    text: "queue is empty".into(),
+                    sev: Sev::Info,
+                });
+            } else {
+                state.queue_open = true;
+                state.queue_sel = state.queue_sel.min(state.queue.len() - 1);
+            }
+        }
+        "plan" => {
+            state.plan_mode = !state.plan_mode;
+            state.pending_plan = None;
+            state.push(Entry::Notice {
+                text: format!(
+                    "plan mode {} · {}",
+                    if state.plan_mode { "on" } else { "off" },
+                    if state.plan_mode {
+                        "prompts compile only; /run executes the latest plan"
+                    } else {
+                        "prompts execute normally"
+                    }
+                ),
+                sev: Sev::Info,
+            });
+        }
+        "run" => {
+            if !state.plan_mode {
+                state.push(Entry::Notice {
+                    text: "plan mode is off · use /plan first".into(),
+                    sev: Sev::Warn,
+                });
+            } else if !state.queue.is_empty() {
+                state.push(Entry::Notice {
+                    text: "finish queued plan refinements before /run".into(),
+                    sev: Sev::Warn,
+                });
+            } else if let Some(plan) = state.pending_plan.take() {
+                *cancel = start_reviewed_plan(agent, tx, state, plan);
+            } else {
+                state.push(Entry::Notice {
+                    text: "no pending plan · describe a task first".into(),
+                    sev: Sev::Info,
+                });
+            }
+        }
+        "shell" => {
+            let was_on = flux_runtime::shell_opt_in();
+            flux_runtime::set_shell_opt_in(!was_on);
+            state.push(Entry::Notice {
+                text: format!(
+                    "shell (bash) {} from the next turn",
+                    if was_on { "off" } else { "on" }
+                ),
+                sev: Sev::Info,
+            });
+        }
+        "tools" => {
+            let engine = agent.read().await;
+            let mut names = engine.executor.registry().names();
+            names.sort();
+            state.push(Entry::Notice {
+                text: format!("tools ({}): {}", names.len(), names.join(", ")),
+                sev: Sev::Info,
+            });
+        }
+        "evidence" => {
+            let engine = agent.read().await;
+            match engine.events.observations(&state.session_id) {
+                Ok(observations) if observations.is_empty() => state.push(Entry::Notice {
+                    text: "no durable evidence in this session".into(),
+                    sev: Sev::Info,
+                }),
+                Ok(observations) => {
+                    let lines = observations
+                        .iter()
+                        .rev()
+                        .take(80)
+                        .rev()
+                        .map(|o| format!("{}  {}", o.kind, o.data))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    state.push(Entry::Notice {
+                        text: lines,
+                        sev: Sev::Info,
+                    });
+                }
+                Err(error) => state.push(Entry::Notice {
+                    text: format!("evidence: {error}"),
+                    sev: Sev::Err,
+                }),
+            }
+        }
+        "session" => state.push(Entry::Notice {
+            text: format!("session {} · model {}", state.session_id, state.model),
+            sev: Sev::Info,
+        }),
+        "sessions" if args == "--prune" => {
+            let engine = agent.read().await;
+            match engine
+                .events
+                .prune_empty_excluding(std::slice::from_ref(&state.session_id))
+            {
+                Ok(count) => state.push(Entry::Notice {
+                    text: format!(
+                        "pruned {count} empty session{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    sev: Sev::Info,
+                }),
+                Err(error) => state.push(Entry::Notice {
+                    text: format!("prune sessions: {error}"),
+                    sev: Sev::Err,
+                }),
+            }
+        }
+        "sessions" => {
+            let engine = agent.read().await;
+            match engine.events.list(30) {
+                Ok(sessions) if sessions.is_empty() => state.push(Entry::Notice {
+                    text: "no sessions yet".into(),
+                    sev: Sev::Info,
+                }),
+                Ok(sessions) => {
+                    state.session_sel = sessions
+                        .iter()
+                        .position(|session| session.id == state.session_id)
+                        .unwrap_or(0);
+                    state.session_picker = Some(sessions);
+                    state.queue_open = false;
+                }
+                Err(error) => state.push(Entry::Notice {
+                    text: format!("sessions: {error}"),
+                    sev: Sev::Err,
+                }),
+            }
+        }
+        "resume" => {
+            if args.is_empty() {
+                state.push(Entry::Notice {
+                    text: "usage: /resume <session_id>".into(),
+                    sev: Sev::Warn,
+                });
+            } else {
+                let engine = agent.read().await;
+                let active_model = engine.model.clone();
+                let events = engine.events.clone();
+                drop(engine);
+                match state.project_session(&events, args) {
+                    Ok(()) => {
+                        state.model = active_model;
+                        state.history = load_history(&events);
+                    }
+                    Err(error) => state.push(Entry::Notice {
+                        text: error.to_string(),
+                        sev: Sev::Err,
+                    }),
+                }
+            }
+        }
+        "new" | "clear" => {
+            let engine = agent.read().await;
+            let active_model = engine.model.clone();
+            let events = engine.events.clone();
+            match events.create_session(&active_model) {
+                Ok(session) => {
+                    drop(engine);
+                    match state.project_session(&events, &session) {
+                        Ok(()) => {
+                            state.model = active_model;
+                            state.history = load_history(&events);
+                        }
+                        Err(error) => state.push(Entry::Notice {
+                            text: format!("new session: {error}"),
+                            sev: Sev::Err,
+                        }),
+                    }
+                }
+                Err(error) => state.push(Entry::Notice {
+                    text: format!("new session: {error}"),
+                    sev: Sev::Err,
+                }),
+            }
+        }
+        "compact" => {
+            *cancel = start_compaction(agent, tx, state);
+        }
+        "model" if args.is_empty() => state.push(Entry::Notice {
+            text: format!(
+                "model: {}",
+                state.model_spec.as_deref().unwrap_or(&state.model)
+            ),
+            sev: Sev::Info,
+        }),
+        "model" => {
+            let Some(resolver) = model_resolver.cloned() else {
+                state.push(Entry::Notice {
+                    text: "model switching is unavailable on this embedding".into(),
+                    sev: Sev::Warn,
+                });
+                return Ok(false);
+            };
+            let spec = args.to_string();
+            let resolved = match tokio::task::spawn_blocking(move || resolver.resolve(&spec)).await
+            {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(error)) => {
+                    state.push(Entry::Notice {
+                        text: format!("model: {error}"),
+                        sev: Sev::Err,
+                    });
+                    return Ok(false);
+                }
+                Err(error) => {
+                    state.push(Entry::Notice {
+                        text: format!("model resolver crashed: {error}"),
+                        sev: Sev::Err,
+                    });
+                    return Ok(false);
+                }
+            };
+            let mut engine = agent.write().await;
+            if let Err(error) = engine.switch_model_for_session(
+                &state.session_id,
+                resolved.provider,
+                resolved.wire_model.clone(),
+            ) {
+                state.push(Entry::Notice {
+                    text: format!("switch model: {error}"),
+                    sev: Sev::Err,
+                });
+                return Ok(false);
+            }
+            state.model = resolved.wire_model;
+            state.model_spec = Some(resolved.model_spec.clone());
+            state.cost_model = Some((
+                resolved.model_spec.clone(),
+                flux_credentials::load_pricing_table(),
+            ));
+            state.push(Entry::Notice {
+                text: format!("switched to {}", resolved.model_spec),
+                sev: Sev::Info,
+            });
+        }
+        other => state.push(Entry::Notice {
+            text: format!("unknown command /{other} · try /help"),
+            sev: Sev::Warn,
+        }),
+    }
+    Ok(false)
+}
+
+fn command_is_read_only(name: &str, args: &str) -> bool {
+    matches!(name, "help" | "tools" | "evidence" | "session" | "queue")
+        || (name == "sessions" && args != "--prune")
+}
+
+fn start_reviewed_plan(
+    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    state: &mut ChatState,
+    plan: flux_flow::ast::DraftAst,
+) -> CancellationToken {
+    let action_id = state.begin_action();
+    state.phase = Phase::Thinking;
+    state.turn_start = Some(Instant::now());
+    state.steps = 0;
+    state.follow = true;
+    state.unread = 0;
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task_agent = agent.clone();
+    let task_tx = tx.clone();
+    let session = state.session_id.clone();
+    tokio::spawn(async move {
+        let inner_tx = task_tx.clone();
+        let run = tokio::spawn(async move {
+            let mut sink = ChannelSink {
+                tx: inner_tx,
+                action_id,
+            };
+            let engine = task_agent.read().await;
+            engine
+                .run_reviewed_plan_cancellable(&session, &plan, &mut sink, &task_cancel)
+                .await
+        });
+        let error = match run.await {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("run plan: {error}")),
+            Err(join) => Some(format!("reviewed plan crashed: {join}")),
+        };
+        if let Some(text) = error {
+            send_action_event(
+                &task_tx,
+                action_id,
+                UiEvent::Notice {
+                    text,
+                    sev: Sev::Err,
+                },
+            );
+        }
+        send_action_event(&task_tx, action_id, UiEvent::Finished);
+    });
+    cancel
+}
+
+fn start_compaction(
+    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    state: &mut ChatState,
+) -> CancellationToken {
+    let action_id = state.begin_action();
+    state.phase = Phase::Thinking;
+    state.turn_start = Some(Instant::now());
+    state.follow = true;
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task_agent = agent.clone();
+    let task_tx = tx.clone();
+    let session = state.session_id.clone();
+    tokio::spawn(async move {
+        let inner_tx = task_tx.clone();
+        let run = tokio::spawn(async move {
+            let mut sink = ChannelSink {
+                tx: inner_tx,
+                action_id,
+            };
+            let engine = task_agent.read().await;
+            engine
+                .maybe_compact(&session, &mut sink, &task_cancel)
+                .await
+        });
+        let notice = match run.await {
+            Ok(Ok(())) => ("compaction check complete".to_string(), Sev::Info),
+            Ok(Err(error)) => (format!("compact: {error}"), Sev::Err),
+            Err(join) => (format!("compaction crashed: {join}"), Sev::Err),
+        };
+        send_action_event(
+            &task_tx,
+            action_id,
+            UiEvent::Notice {
+                text: notice.0,
+                sev: notice.1,
+            },
+        );
+        send_action_event(&task_tx, action_id, UiEvent::Finished);
+    });
+    cancel
+}
+
 /// Push `input` as a user message and spawn the agent turn that streams back into the transcript.
 /// Returns the turn's cancellation token (Ctrl-C cancels it).
 fn start_turn(
-    agent: &Arc<FlowEngine>,
-    session_id: &str,
+    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
     tx: &mpsc::UnboundedSender<UiEvent>,
     state: &mut ChatState,
     input: String,
 ) -> CancellationToken {
+    let action_id = state.begin_action();
+    state.follow = true;
+    state.unread = 0;
     state.record_history(&input);
     state.push_user(input.clone());
     state.phase = Phase::Thinking;
     state.turn_start = Some(Instant::now());
     state.steps = 0;
-    state.follow = true;
+    state.plan_phase = None;
+    state.execute_rounds = 0;
+    state.gather_mode = false;
 
     let cancel = CancellationToken::new();
     let task_agent = agent.clone();
-    let task_sid = session_id.to_string();
+    let task_sid = state.session_id.clone();
+    let plan_mode = state.plan_mode;
     let task_tx = tx.clone();
     let task_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -1587,10 +3128,22 @@ fn start_turn(
         // output, no `Finished`, and the spinner spinning forever.
         let inner_tx = task_tx.clone();
         let run = tokio::spawn(async move {
-            let mut sink = ChannelSink { tx: inner_tx };
-            task_agent
-                .run_turn_cancellable(&task_sid, &input, &mut sink, &task_cancel)
-                .await
+            let mut sink = ChannelSink {
+                tx: inner_tx,
+                action_id,
+            };
+            let agent = task_agent.read().await;
+            if plan_mode {
+                let plan = agent
+                    .plan_turn(&task_sid, &input, &mut sink, &task_cancel)
+                    .await?;
+                sink.send(UiEvent::PlanReady(plan));
+                Ok(())
+            } else {
+                agent
+                    .run_turn_cancellable(&task_sid, &input, &mut sink, &task_cancel)
+                    .await
+            }
         });
         let note = match run.await {
             Ok(Ok(())) => None,
@@ -1599,12 +3152,16 @@ fn start_turn(
             Err(join) => Some(format!("the turn crashed: {join}")),
         };
         if let Some(text) = note {
-            let _ = task_tx.send(UiEvent::Notice {
-                text,
-                sev: Sev::Err,
-            });
+            send_action_event(
+                &task_tx,
+                action_id,
+                UiEvent::Notice {
+                    text,
+                    sev: Sev::Err,
+                },
+            );
         }
-        let _ = task_tx.send(UiEvent::Finished);
+        send_action_event(&task_tx, action_id, UiEvent::Finished);
     });
     cancel
 }
@@ -1627,6 +3184,9 @@ fn scroll_down(state: &mut ChatState, n: u16) {
     let next = (base + n).min(max);
     state.scroll = next;
     state.follow = next >= max;
+    if state.follow {
+        state.unread = 0;
+    }
 }
 
 #[cfg(test)]
@@ -1642,6 +3202,13 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    fn untag(event: UiEvent) -> UiEvent {
+        match event {
+            UiEvent::Tagged { event, .. } => *event,
+            event => event,
+        }
     }
 
     #[test]
@@ -1660,6 +3227,57 @@ mod tests {
         assert!(content.contains("hi there"));
         assert!(content.contains("next message"));
         assert!(content.contains("flux")); // border title + idle hint
+    }
+
+    #[test]
+    fn composer_is_background_only_without_border_or_padding() {
+        let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
+        let mut state = ChatState::new("mock".into());
+        state.input.insert_str("draft");
+        terminal.draw(|f| render(f, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let symbols: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            !symbols.contains('┌')
+                && !symbols.contains('┐')
+                && !symbols.contains('└')
+                && !symbols.contains('┘'),
+            "permanent transcript/composer boxes must be gone: {symbols}"
+        );
+        let draft = buffer
+            .content
+            .iter()
+            .find(|c| c.symbol() == "d")
+            .expect("draft cell");
+        assert_eq!(draft.bg, state.theme.composer_bg);
+        assert_eq!(buffer.cell((0, 8)).expect("composer origin").symbol(), "d");
+        assert!((0..48).all(|x| {
+            buffer
+                .cell((x, 8))
+                .is_some_and(|cell| cell.bg == state.theme.composer_bg)
+        }));
+    }
+
+    #[test]
+    fn responsive_layout_preserves_composer_at_36x10() {
+        let mut terminal = Terminal::new(TestBackend::new(36, 10)).unwrap();
+        let mut state = ChatState::new("mock".into());
+        state.push_user("a narrow transcript");
+        state.input.insert_str("narrow draft");
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("narrow transcript"));
+        assert!(content.contains("narrow draft"));
+        assert!(!content.contains('┌'));
+    }
+
+    #[test]
+    fn terminal_too_small_has_stable_fallback() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        let state = ChatState::new("mock".into());
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("terminal too small"));
     }
 
     #[test]
@@ -1743,6 +3361,361 @@ mod tests {
         assert!(state.push_history("b"));
         assert!(!state.push_history("")); // empty
         assert_eq!(state.history, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn queued_messages_are_fifo_editable_reorderable_and_never_overwritten() {
+        let mut state = ChatState::new("mock".into());
+        state.enqueue("first".into());
+        state.enqueue("second".into());
+        state.enqueue("third".into());
+        assert_eq!(
+            state.queue.iter().cloned().collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+
+        state.queue_sel = 1;
+        state.queue_move(-1);
+        assert_eq!(
+            state.queue.iter().cloned().collect::<Vec<_>>(),
+            ["second", "first", "third"]
+        );
+        assert_eq!(state.queue_remove_selected().as_deref(), Some("second"));
+        assert_eq!(
+            state.queue.iter().cloned().collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+    }
+
+    #[test]
+    fn editing_a_queued_message_preserves_its_fifo_position() {
+        let mut state = ChatState::new("mock".into());
+        state.enqueue("first".into());
+        state.enqueue("second".into());
+        state.enqueue("third".into());
+        state.queue_sel = 1;
+
+        assert_eq!(state.queue_begin_edit().as_deref(), Some("second"));
+        assert_eq!(
+            state.queue.iter().cloned().collect::<Vec<_>>(),
+            ["first", "second", "third"],
+            "beginning an edit must not remove or reorder the item"
+        );
+        assert!(state.queue_commit_edit("second refined".into()));
+        assert_eq!(
+            state.queue.iter().cloned().collect::<Vec<_>>(),
+            ["first", "second refined", "third"]
+        );
+        assert_eq!(state.queue.pop_front().as_deref(), Some("first"));
+        assert_eq!(state.queue.pop_front().as_deref(), Some("second refined"));
+    }
+
+    #[test]
+    fn stale_action_events_cannot_enter_the_next_turn() {
+        let mut state = ChatState::new("mock".into());
+        let old = state.begin_action();
+        let current = state.begin_action();
+        assert!(state
+            .accept_ui_event(UiEvent::Tagged {
+                action_id: old,
+                event: Box::new(UiEvent::Text("stale".into())),
+            })
+            .is_none());
+        assert!(matches!(
+            state.accept_ui_event(UiEvent::Tagged {
+                action_id: current,
+                event: Box::new(UiEvent::Text("current".into())),
+            }),
+            Some(UiEvent::Text(text)) if text == "current"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_an_approval_sheet_is_deny_by_default() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = ChannelApprover { tx };
+        let request = tokio::spawn(async move {
+            approver
+                .request("write", &["README.md".into()], &IntentSet::default())
+                .await
+        });
+        match rx.recv().await.expect("approval request") {
+            UiEvent::Approval { reply, .. } => drop(reply),
+            _ => panic!("expected approval event"),
+        }
+        assert!(matches!(request.await.unwrap(), ApprovalChoice::Deny));
+    }
+
+    #[test]
+    fn concurrent_approvals_are_presented_fifo() {
+        let mut state = ChatState::new("mock".into());
+        let mut current = None;
+        let mut queued = VecDeque::new();
+        let (first, _first_rx) = oneshot::channel();
+        let (second, _second_rx) = oneshot::channel();
+        queued.push_back(("write".into(), vec!["a".into()], first));
+        queued.push_back(("bash".into(), vec!["b".into()], second));
+
+        show_next_approval(&mut state, &mut current, &mut queued);
+        assert!(matches!(current.as_ref(), Some((tool, _)) if tool == "write"));
+        assert!(state
+            .modal
+            .as_deref()
+            .is_some_and(|text| text.contains("[\"a\"]")));
+        current.take();
+        state.modal = None;
+        show_next_approval(&mut state, &mut current, &mut queued);
+        assert!(matches!(current.as_ref(), Some((tool, _)) if tool == "bash"));
+        assert!(state
+            .modal
+            .as_deref()
+            .is_some_and(|text| text.contains("[\"b\"]")));
+    }
+
+    #[test]
+    fn resumed_session_projects_full_durable_activity() {
+        use flux_events::{EventStore, NewEvent, PlanAttempt};
+        use flux_flow::ast::{RunEvent, StepId};
+
+        let events = EventStore::in_memory().unwrap();
+        let sid = events.create_session("mock").unwrap();
+        events
+            .record_message(&sid, &flux_core::Message::user_text("inspect it"))
+            .unwrap();
+        let turn = events.begin_turn(&sid, "inspect it", "mock").unwrap();
+        events
+            .record_plan_attempt(
+                &sid,
+                turn,
+                PlanAttempt {
+                    step: 1,
+                    outcome: "accepted".into(),
+                    plan_text: Some("flow\n└─ read(\"README.md\")".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let step = StepId("step_read_fixture".into());
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepStarted {
+                    step: step.clone(),
+                    op: "read".into(),
+                    input_hash: "h".into(),
+                }),
+            )
+            .unwrap();
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::OpRecorded {
+                    seq: 0,
+                    step,
+                    op: "read".into(),
+                    input_hash: "h".into(),
+                    input_hash_redacted: None,
+                    input_view: Some(r#"{"path":"README.md"}"#.into()),
+                    input_view_truncated: false,
+                    content: "hello".into(),
+                    view: None,
+                    is_error: false,
+                    denied: false,
+                    redacted: false,
+                    truncated: false,
+                }),
+            )
+            .unwrap();
+        events
+            .record_message(&sid, &flux_core::Message::assistant_text("done"))
+            .unwrap();
+
+        let mut state = ChatState::for_session("mock".into(), String::new());
+        state.project_session(&events, &sid).unwrap();
+        state.expand_tools = true;
+        let text = state
+            .transcript_lines(80)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("inspect it"));
+        assert!(text.contains("README.md"));
+        assert!(text.contains("hello"));
+        assert!(text.contains("done"));
+        assert!(text.contains("plan"));
+    }
+
+    #[test]
+    fn resumed_session_projects_reduced_tool_cards_without_cassette_cells() {
+        use flux_events::{EventStore, NewEvent};
+        use flux_flow::ast::{RunEvent, StepId, ValueId};
+
+        let events = EventStore::in_memory().unwrap();
+        let sid = events.create_session("mock").unwrap();
+        let read = StepId("step_read_without_cell".into());
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepStarted {
+                    step: read.clone(),
+                    op: "read".into(),
+                    input_hash: "read-hash".into(),
+                }),
+            )
+            .unwrap();
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepSucceeded {
+                    step: read,
+                    output: ValueId("v_read".into()),
+                }),
+            )
+            .unwrap();
+
+        let write = StepId("step_write_without_cell".into());
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepStarted {
+                    step: write.clone(),
+                    op: "write".into(),
+                    input_hash: "write-hash".into(),
+                }),
+            )
+            .unwrap();
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepFailed {
+                    step: write,
+                    error: "disk full".into(),
+                }),
+            )
+            .unwrap();
+
+        let machinery = StepId("step_observe_without_cell".into());
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepStarted {
+                    step: machinery.clone(),
+                    op: "observe".into(),
+                    input_hash: "observe-hash".into(),
+                }),
+            )
+            .unwrap();
+        events
+            .append(
+                &sid,
+                NewEvent::run(RunEvent::StepSucceeded {
+                    step: machinery,
+                    output: ValueId("v_observe".into()),
+                }),
+            )
+            .unwrap();
+
+        let mut state = ChatState::new("mock".into());
+        state.project_session(&events, &sid).unwrap();
+        state.expand_tools = true;
+        let text = state
+            .transcript_lines(80)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|span| span.content.into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("read"));
+        assert!(text.contains("completed"));
+        assert!(text.contains("write"));
+        assert!(text.contains("disk full"));
+        assert!(!text.contains("observe"), "loop machinery stays hidden");
+    }
+
+    #[test]
+    fn compaction_snapshot_does_not_duplicate_visible_messages() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let sid = events.create_session("mock").unwrap();
+        let old = flux_core::Message::user_text("old request");
+        events.record_message(&sid, &old).unwrap();
+        events
+            .record_compaction(&sid, &[flux_core::Message::assistant_text("summary")])
+            .unwrap();
+        events
+            .record_message(&sid, &flux_core::Message::assistant_text("new answer"))
+            .unwrap();
+        let mut state = ChatState::new("mock".into());
+        state.project_session(&events, &sid).unwrap();
+        let text = state
+            .transcript_lines(80)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("old request").count(), 1);
+        assert!(
+            !text.contains("summary"),
+            "snapshot messages are model context, not new activity"
+        );
+        assert!(text.contains("context compacted"));
+        assert!(text.contains("new answer"));
+    }
+
+    #[test]
+    fn initial_session_projection_preserves_the_active_engine_model() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let sid = events.create_session("stored-old-model").unwrap();
+        let mut state = ChatState::for_session("active-new-model".into(), sid.clone());
+
+        state.project_session(&events, &sid).unwrap();
+
+        assert_eq!(state.model, "active-new-model");
+    }
+
+    #[test]
+    fn resumed_plan_uses_the_attempt_without_duplicate_context_message() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let sid = events.create_session("mock").unwrap();
+        let turn = events.begin_turn(&sid, "inspect", "mock").unwrap();
+        events
+            .record_plan_attempt(
+                &sid,
+                turn,
+                flux_events::PlanAttempt {
+                    outcome: "accepted".into(),
+                    plan_text: Some("flow\n└─ read(\"README.md\")".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        events
+            .record_message(
+                &sid,
+                &flux_core::Message::assistant_text("Proposed plan:\nflow\n└─ read(\"README.md\")"),
+            )
+            .unwrap();
+
+        let mut state = ChatState::new("mock".into());
+        state.project_session(&events, &sid).unwrap();
+        let text = state
+            .transcript_lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert_eq!(text.matches("README.md").count(), 1);
+        assert!(!text.contains("Proposed plan:"));
     }
 
     #[test]
@@ -1931,6 +3904,126 @@ mod tests {
     }
 
     #[test]
+    fn unicode_layout_uses_terminal_cell_width() {
+        assert_eq!(truncate("界界", 3), "界…");
+        assert!(UnicodeWidthStr::width(truncate("a界b", 3).as_str()) <= 3);
+
+        let wrapped = wrap_styled_lines(vec![Line::raw("a界bc")], 3);
+        let rows = wrapped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["a界", "bc"]);
+    }
+
+    #[test]
+    fn long_transcript_materializes_only_the_visible_viewport() {
+        let mut state = ChatState::new("mock".into());
+        for index in 0..100 {
+            state.push(Entry::Notice {
+                text: format!("row-{index}"),
+                sev: Sev::Info,
+            });
+        }
+        let visible = state.transcript_viewport(40, 5);
+        assert_eq!(visible.len(), 5);
+        assert!(visible.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("row-99"))));
+        assert!(state.last_max_scroll.get() > 5);
+
+        // A transcript mutation invalidates the cached layout before the next viewport read.
+        state.push(Entry::Notice {
+            text: "latest".into(),
+            sev: Sev::Info,
+        });
+        let visible = state.transcript_viewport(40, 5);
+        assert!(visible.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("latest"))));
+    }
+
+    #[test]
+    fn session_picker_is_dense_and_marks_the_active_session() {
+        let mut state = ChatState::for_session("mock".into(), "s_2".into());
+        state.session_picker = Some(vec![
+            flux_events::SessionSummary {
+                id: "s_2".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: 2,
+                messages: 4,
+                context: Default::default(),
+            },
+            flux_events::SessionSummary {
+                id: "s_1".into(),
+                model: "anthropic/sonnet".into(),
+                created_at_ms: 0,
+                updated_at_ms: 1,
+                messages: 2,
+                context: Default::default(),
+            },
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("sessions"));
+        assert!(content.contains("● s_2"));
+        assert!(!content.contains('┌'));
+    }
+
+    #[test]
+    fn only_non_mutating_commands_are_available_while_busy() {
+        assert!(command_is_read_only("sessions", ""));
+        assert!(!command_is_read_only("sessions", "--prune"));
+        assert!(command_is_read_only("evidence", ""));
+        assert!(!command_is_read_only("model", "mock"));
+        assert!(!command_is_read_only("shell", ""));
+    }
+
+    #[test]
+    fn durable_history_keeps_prompts_superseded_by_compaction() {
+        let events = flux_events::EventStore::in_memory().unwrap();
+        let sid = events.create_session("mock").unwrap();
+        events
+            .record_message(&sid, &flux_core::Message::user_text("before compact"))
+            .unwrap();
+        events
+            .record_compaction(&sid, &[flux_core::Message::assistant_text("summary")])
+            .unwrap();
+        events
+            .record_message(&sid, &flux_core::Message::user_text("after compact"))
+            .unwrap();
+        assert_eq!(load_history(&events), ["before compact", "after compact"]);
+    }
+
+    #[test]
+    fn historical_plan_never_recomputes_current_risk() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Plan(serde_json::json!({
+            "plan": "flow\n└─ read(\"README.md\")",
+            "historical": true,
+            "risk": "high · destructive",
+            "ops": 9,
+        })));
+        let text = state
+            .transcript_lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(text.contains("historical"));
+        assert!(!text.contains("high"));
+        assert!(!text.contains("9 ops"));
+    }
+
+    #[test]
     fn slash_menu_filters_and_renders() {
         let mut state = ChatState::new("opus".into());
         assert!(state.slash_query().is_none());
@@ -2098,14 +4191,14 @@ mod tests {
     #[test]
     fn channel_sink_forwards_phase_and_brief_observations() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut sink = ChannelSink { tx };
+        let mut sink = ChannelSink { tx, action_id: 1 };
 
         sink.observation(&flux_evidence::Observation::new(
             "loop.phase",
             flux_evidence::Phase::Turn,
             serde_json::json!({ "phase": "gather" }),
         ));
-        match rx.try_recv().expect("a Phase event was sent") {
+        match untag(rx.try_recv().expect("a Phase event was sent")) {
             UiEvent::Phase(p) => assert_eq!(p, "gather"),
             _ => panic!("expected UiEvent::Phase"),
         }
@@ -2115,7 +4208,7 @@ mod tests {
             flux_evidence::Phase::Turn,
             serde_json::json!({ "goal": "find the bug", "needs": ["stack trace"] }),
         ));
-        match rx.try_recv().expect("a Brief event was sent") {
+        match untag(rx.try_recv().expect("a Brief event was sent")) {
             UiEvent::Brief { goal, needs } => {
                 assert_eq!(goal, "find the bug");
                 assert_eq!(needs, vec!["stack trace".to_string()]);
@@ -2130,14 +4223,14 @@ mod tests {
     #[test]
     fn channel_sink_forwards_flow_halt_as_a_notice() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut sink = ChannelSink { tx };
+        let mut sink = ChannelSink { tx, action_id: 1 };
 
         sink.observation(&flux_evidence::Observation::new(
             "flow.halt",
             flux_evidence::Phase::Turn,
             serde_json::json!({ "step": 4, "of": 9, "op": "edit", "kind": "runtime", "fatal": false }),
         ));
-        match rx.try_recv().expect("a Notice event was sent") {
+        match untag(rx.try_recv().expect("a Notice event was sent")) {
             UiEvent::Notice { text, sev } => {
                 assert_eq!(text, "✗ step 4/9 edit failed — revising…");
                 assert_eq!(sev, Sev::Err);

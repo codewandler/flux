@@ -106,6 +106,26 @@ A plan-mode session looks like: type a task → see the plan → either `/run` i
 refine it** ("make it also back up the file first") and a new plan appears. `/plan` again returns to
 normal mode.
 
+## Terminal UI
+
+```bash
+flux tui                 # dense full-screen chat
+flux tui -c              # continue the newest session
+flux tui -m mock         # exercise the full UI offline
+```
+
+The TUI keeps the transcript borderless and separates its multiline composer only with a quiet
+background. Enter sends; `Ctrl-J`, `Alt-Enter`, or `Shift-Enter` inserts a newline. Bracketed paste is
+inserted atomically. While a turn runs, Enter adds a visible FIFO follow-up instead of replacing the
+previous one; `/queue` opens the editor (`Delete`, `Alt-Up`/`Alt-Down`, Enter to edit).
+
+`/plan`, `/run`, `/model`, `/shell`, `/tools`, `/evidence`, `/compact`, `/new`, and `/clear` mirror
+the REPL controls. `/sessions` opens a picker, and `/resume <id>` switches directly; either path
+reconstructs messages, plans, tool results, notices, and usage from the durable session log without
+re-running operations. Use PgUp/PgDn or the mouse wheel for scrollback and `Ctrl-End` to follow the
+latest activity. `Ctrl-E` expands thinking/tool details, `Ctrl-C` interrupts a turn, and `Ctrl-D` or
+`/quit` exits. Approvals use `y` once, `a` always, and any other key to deny.
+
 ## Approval & safety
 
 Every operation — whether from a one-shot prompt, a `/run`, or a normal turn — goes through the same
@@ -163,7 +183,7 @@ deny  = []                                    # always-blocked tools
 ```bash
 flux run -v "..."                # show tool output in full (no truncation); also FLUX_VERBOSE=1
 flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR unset; global flag)
-flux tui                         # ratatui chat UI (in-UI approval modal)
+flux tui                         # dense ratatui chat UI (queue, session replay, approval sheet)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux flow list                   # list saved flows + composite ops (alias: `flux flow ls`) from

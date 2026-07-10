@@ -1308,6 +1308,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm_winapi",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
@@ -2122,17 +2123,21 @@ dependencies = [
  "async-trait",
  "codewandler-flux-core",
  "codewandler-flux-credentials",
+ "codewandler-flux-events",
  "codewandler-flux-evidence",
  "codewandler-flux-flow",
  "codewandler-flux-markdown",
+ "codewandler-flux-provider",
  "codewandler-flux-runtime",
  "codewandler-flux-spec",
  "crossterm 0.28.1",
+ "futures-util",
  "ratatui",
  "serde_json",
  "tokio",
  "tokio-util",
  "tui-textarea",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

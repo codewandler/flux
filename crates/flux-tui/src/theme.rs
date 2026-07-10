@@ -28,6 +28,10 @@ pub struct Theme {
     pub accent: Color,
     /// Background for a selected row (slash menu, etc.).
     pub sel_bg: Color,
+    /// Quiet surface behind the composer. This is its only visual boundary.
+    pub composer_bg: Color,
+    /// Background for transient sheets (approval/help/session/queue).
+    pub panel_bg: Color,
 }
 
 impl Default for Theme {
@@ -48,6 +52,8 @@ impl Theme {
         muted: Color::DarkGray,
         accent: Color::Cyan,
         sel_bg: Color::Indexed(238),
+        composer_bg: Color::Indexed(236),
+        panel_bg: Color::Indexed(235),
     };
 
     pub fn user_style(&self) -> Style {
@@ -73,6 +79,12 @@ impl Theme {
     }
     pub fn accent_style(&self) -> Style {
         Style::default().fg(self.accent)
+    }
+    pub fn composer_style(&self) -> Style {
+        Style::default().fg(Color::Gray).bg(self.composer_bg)
+    }
+    pub fn panel_style(&self) -> Style {
+        Style::default().fg(Color::Gray).bg(self.panel_bg)
     }
 }
 

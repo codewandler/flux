@@ -117,7 +117,10 @@ trait EventBackend: Send + Sync {
         realm: &str,
     ) -> Result<Option<String>>;
     fn children_of(&self, stream: &str) -> Result<Vec<String>>;
-    fn prune_empty(&self) -> Result<usize>;
+    fn prune_empty(&self) -> Result<usize> {
+        self.prune_empty_excluding(&[])
+    }
+    fn prune_empty_excluding(&self, keep: &[String]) -> Result<usize>;
     fn prune_inactive(&self, agent_id: &str, cutoff_ms: i64) -> Result<usize> {
         self.prune_inactive_excluding(agent_id, cutoff_ms, &[])
     }
@@ -322,6 +325,13 @@ impl EventStore {
     /// worth preserving, so real deletion is append-only-safe.
     pub fn prune_empty(&self) -> Result<usize> {
         self.backend().prune_empty()
+    }
+
+    /// [`prune_empty`](Self::prune_empty) with a keep-list. A listed session is never removed even
+    /// when it has no messages, which lets interactive surfaces prune abandoned sessions without
+    /// invalidating the active fresh session.
+    pub fn prune_empty_excluding(&self, keep: &[String]) -> Result<usize> {
+        self.backend().prune_empty_excluding(keep)
     }
 
     /// Delete sessions tagged with `agent_id` whose last activity (`updated_at`) is strictly
@@ -1254,6 +1264,31 @@ mod tests {
         assert_eq!(store.latest_session().unwrap(), Some(a));
     }
 
+    fn prune_empty_excluding_preserves_active_empty_sessions(store: &EventStore) {
+        let active = store.create_session("active-model").unwrap();
+        let abandoned = store.create_session("old-model").unwrap();
+        let populated = store.create_session("kept-model").unwrap();
+        store
+            .record_message(&populated, &Message::user_text("keep me"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .prune_empty_excluding(std::slice::from_ref(&active))
+                .unwrap(),
+            1
+        );
+        assert!(
+            store.info(&active).is_ok(),
+            "the active empty session survives"
+        );
+        assert!(
+            store.info(&abandoned).is_err(),
+            "other empty sessions are pruned"
+        );
+        assert!(store.info(&populated).is_ok(), "non-empty sessions survive");
+    }
+
     fn prune_inactive_deletes_only_expired_streams_with_the_tag(store: &EventStore) {
         let a2a = EventContext {
             agent_id: Some("a2a".into()),
@@ -1903,6 +1938,7 @@ mod tests {
         sqlite_case!(cost_summary_all_aggregates_across_sessions);
         sqlite_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
         sqlite_case!(prune_empty_removes_zero_message_sessions);
+        sqlite_case!(prune_empty_excluding_preserves_active_empty_sessions);
         sqlite_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
         sqlite_case!(prune_inactive_excluding_protects_the_keep_list);
         sqlite_case!(roles_round_trip_through_the_conversation);
@@ -2037,6 +2073,7 @@ mod tests {
         pg_case!(cost_summary_all_aggregates_across_sessions);
         pg_case!(cost_summary_for_account_scopes_and_sums_through_the_shared_fold);
         pg_case!(prune_empty_removes_zero_message_sessions);
+        pg_case!(prune_empty_excluding_preserves_active_empty_sessions);
         pg_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
         pg_case!(prune_inactive_excluding_protects_the_keep_list);
         pg_case!(roles_round_trip_through_the_conversation);

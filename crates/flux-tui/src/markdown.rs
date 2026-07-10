@@ -1,10 +1,9 @@
 //! Render assistant Markdown to ratatui [`Text`].
 //!
-//! Delegates to [`flux_markdown::render`] (which wraps `markdown-stream` + `markdown-ratatui`). The
-//! whole transcript is one wrapped `Paragraph`, so the renderer pre-wraps to the transcript's inner
-//! width (with list hanging indents baked in) to keep line math honest. Only *finalized* assistant
-//! turns go through here — a streaming partial renders as plain text + a cursor (half-parsed Markdown
-//! flickers), which the caller handles.
+//! Delegates to [`flux_markdown::render`], pre-wrapped to the transcript width (including list
+//! hanging indents) before the TUI caches the layout and selects its visible viewport. Only
+//! *finalized* assistant turns go through here; streaming partials stay plain text so half-parsed
+//! Markdown does not flicker.
 
 use ratatui::text::Text;
 
