@@ -1,41 +1,55 @@
 ---
 id: D-117
-title: "Website: endpoints concept page, `flux endpoint` CLI reference, saved-flows page"
+title: "Website truth pass: endpoints, saved flows, and drift guards"
 pillar: Core
-status: ready
+status: done
 priority: 23
 design: docs/designs/datasource-discoverability.md
 epic: datasource-discoverability
-note: "the endpoint subsystem (D-25..D-32) has design/story/roadmap coverage but ZERO public docs — no concept page, `flux endpoint` absent from the CLI reference, one incidental line in plugins/gitlab.md; ~/.flux/flows + flow_list/flow_run + op.register have one paragraph in modules-and-programs.md"
+note: "public-doc audit found stale SDK/config/plugin instructions, over-broad security claims, invalid Flux examples, missing endpoint/improvement/skills coverage, and no drift guards for those mirrors"
 ---
 
-# Website: endpoints concept page, `flux endpoint` CLI reference, saved-flows page
+# Website truth pass: endpoints, saved flows, and drift guards
 
 ## Goal
-The three undocumented capability clusters this epic touches become public documentation: how
-endpoints work (and how the agent + operator register/enumerate/use them), the `flux endpoint` CLI,
-and user-defined deterministic actions (saved flows + composite ops). A reader can go from "I have
-a Postgres database" to "the agent queries it" using only the website.
+The public website becomes a release-aligned, executable source of truth: current install/config/
+security/plugin/operation instructions are correct, endpoints and deterministic reuse are discoverable,
+all three product pillars have an onboarding path, and CI catches future drift in copied commands,
+configuration, Flux-Lang examples, operation catalogs, plugin summaries, and release notes.
 
 ## Acceptance
-- [ ] New endpoints concept page (Agent section, sibling of `datasources.md`): the weak-reference
+- [x] New endpoints concept page (Agent section, sibling of `datasources.md`): the weak-reference
       model (`EndpointRef`, credential *location* never value, host-side resolution + injection),
       the five ops (`endpoint.discover/list/info/select/import`) and when they surface, the
-      operator lifecycle (`~/.flux/endpoints.toml`, `flux endpoint list/show/resolve/import` — plus
-      `add` once D-101 lands), and the sql-plugin end-to-end example (discover → select → `sql.query
-      {endpoint_ref}` with host-terminated SCRAM).
-- [ ] `flux endpoint` added to the website CLI reference (`website/docs/agent/cli.md`).
-- [ ] New saved-flows page: `.flux/flows` + `~/.flux/flows` (precedence, legacy ops dirs),
+      operator lifecycle (`~/.flux/endpoints.toml`, `flux endpoint add/list/show/resolve/import`,
+      and `[[endpoint.static]]`), and the sql-plugin end-to-end example (discover → select →
+      `sql.query {endpoint}` with host-terminated SCRAM).
+- [x] `flux endpoint` added to the website CLI reference (`website/docs/agent/cli.md`).
+- [x] New saved-flows page: `.flux/flows` + `~/.flux/flows` (precedence, legacy ops dirs),
       `flow_list`/`flow_run` from the agent side, `flux flow run` from the CLI side, agent-side
       `op.register` scopes (turn|session|project|global) and composite `expose` semantics.
-- [ ] `datasources.md` cross-links: "which sources exist" (points at the D-114 `sources` op once it
+- [x] `datasources.md` cross-links: "which sources exist" (points at the D-114 `sources` op once it
       ships — coordinate; a records-vs-endpoints disambiguation box distinguishing the knowledge
       index from live endpoints, naming D-62 as the future bridge).
-- [ ] Sidebar entries wired; any `.flux` snippets parser-validated per website conventions; no
+- [x] Sidebar entries wired; any `.flux` snippets parser-validated per website conventions; no
       dead links (site build green).
+- [x] Correct the audited truth gaps: crates.io SDK install/package selectors, `[private_net] web`,
+      plugin `--dry-run`, current GitLab manifest surface, current Flux-Lang syntax, native-web ops,
+      and the trusted-native/plugin-vs-host-capability security boundary (including the opt-in shell
+      exception to argv-only host launches).
+- [x] Add concise skills/roles and Improvement-loop entry points, make the CLI/config references
+      cover every stable public surface, and expose the customer changelog on the site.
+- [x] Generate or structurally check release notes, stable operation names, plugin-pack membership,
+      CLI command coverage, config examples, SDK examples, and complete Flux code fences.
+- [x] Public Pages deployment follows a published release; main/PR changes continue to build as
+      previews without silently replacing the stable documentation.
 
 ## Progress
 - 2026-07-09 filed from the datasource-discoverability grounding pass (see design doc).
+- 2026-07-10 expanded from the post-v0.14.4 public-doc audit and started by explicit user request.
+- 2026-07-10 completed: public IA and audited pages corrected; endpoint, saved-flow, skills/roles,
+  Improvement, and customer-changelog entry points added; executable drift guards and release-bound
+  Pages deployment added; Docusaurus production build and focused contract tests green.
 
 ## Notes
 - Docs-coverage audit lives in the design doc (`docs/designs/datasource-discoverability.md`).

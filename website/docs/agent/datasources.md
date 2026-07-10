@@ -27,6 +27,12 @@ So "datasource vs. operation" is not a choice between alternatives — a datasou
 operations. Plugins illustrate both sides at once: a plugin projects new operations (verbs) into
 the catalog **and** can contribute records (knowledge) into the datasource.
 
+:::note Datasources are not endpoints
+A datasource is indexed knowledge. An [endpoint](./endpoints.md) is a weak reference to a live
+service passed to an operation such as `sql.query`. Registering a database endpoint does not turn
+its rows into datasource records; that live, paged bridge is a separate capability.
+:::
+
 ## Records
 
 A datasource holds records, not files. Each record is addressed by `(source, entity, id)`:
@@ -107,6 +113,7 @@ indexed.
 ## Related docs
 
 - [Operations](../language/ops.md) — the full catalog the retrieval ops live in.
+- [Endpoints](./endpoints.md) — discover and consume live service connections as weak references.
 - [Multi-agent programs](./programs.md) — declaring `datasource` modules in a program file.
 - [Plugin authoring](../plugins/authoring.md) — contributing records from an integration.
 - [Storage](../reference/storage.md#datasource-records) — where datasource records persist.

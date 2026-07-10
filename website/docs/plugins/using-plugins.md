@@ -5,14 +5,18 @@ description: "Installing and running trusted plugins, including signatures, capa
 
 # Using plugins
 
-Plugins are trusted subprocess binaries that extend flux with new operations. Each declared operation
-is projected as a policy-gated tool, so the same authorization, approval, and guarded-IO chain that
-protects built-ins also protects plugin calls.
+Plugins are trusted subprocess binaries that extend flux with new operations. Each declared
+operation is projected as a policy-gated tool, so the same authorization, approval, and guarded-IO
+chain that protects built-ins also protects plugin calls.
 
-Plugins do **no privileged IO of their own**. Every side effect — HTTP, a subprocess, a socket, a
-secret read — is a capability callback the host executes on the plugin's behalf, and the plugin
-process is launched with a **cleared environment**: it gets only what its manifest declares.
-Undeclared capabilities, hosts, secrets, and programs are denied by default.
+First-party plugins follow a host-callback contract: HTTP, subprocess, connection, filesystem, and
+secret operations are requested from flux, which checks the manifest and performs the operation.
+The process also starts with a cleared, minimal environment, so it does not inherit provider or host
+secrets.
+
+That capability contract is **not an OS sandbox**. A plugin is a trusted native executable and could
+make direct system calls outside flux if it were malicious. Install plugins as dependencies you
+trust; the manifest gates constrain what conforming plugin code can reach *through flux*.
 
 ## Install from the signed pack
 
@@ -44,6 +48,7 @@ Bare `flux plugin install` (no names, no `--all`, no `--dir`) is an error — it
 | Messaging | `slack` |
 | Data | `sql` (PostgreSQL read-only query + introspection) |
 | Telephony | `asterisk` (AMI), `homer` (SIP search / QoS / PCAP) |
+| Secret management | `vault` (KV-v2 administration), `onepassword` (Connect server) |
 
 Run `flux plugin skill` for the live per-plugin operation reference generated from the manifests
 of what you actually have installed.
@@ -62,7 +67,8 @@ flux plugin uninstall <name>            # remove the descriptor; --purge also de
 Notes:
 
 - `call` merges repeatable `--arg key=value` flags (coerced to the op's input schema) over the JSON
-  input; `--dry-run` validates and prints the coerced input without spawning the plugin.
+  input. With `--dry-run`, the plugin process is still spawned once to read its manifest and schema,
+  but the selected operation is never invoked and no operation-level network or write occurs.
 - `pin` records the binary's sha256 and re-checks it at every spawn — drift refuses to run.
 - The versioned store keeps versions side by side, so `rollback` needs no network and a second
   `rollback` flips forward again.
@@ -84,14 +90,15 @@ version or hash recorded. From the repo root:
 flux plugin install --dir               # register every built flux-plugin-* binary
 ```
 
-`--dir` defaults to `plugins/target/release`; pass a path to scan elsewhere. To register a single
-arbitrary binary: `flux plugin add <name> <program> [args…]`.
+`--dir` defaults to `plugins/target/release`; attach a custom path with
+`--dir=/path/to/binaries`. To register a single arbitrary binary, use
+`flux plugin add <name> <program> [args…]`.
 
 ## Granting network and secret access
 
-Everything a plugin can touch is an explicit allow-list from its manifest: readable secret keys,
-HTTP hosts, runnable programs, connection targets. Private/loopback network hosts additionally
-require a grant in your config, per plugin (by manifest name):
+Every host capability a plugin can request is an explicit allow-list from its manifest: readable
+secret keys, HTTP hosts, runnable programs, connection targets. Private/loopback network hosts
+additionally require a grant in your config, per plugin (by manifest name):
 
 ```toml
 [private_net.plugins]
@@ -99,13 +106,13 @@ prometheus = ["prometheus.local"]   # intersected with the plugin's declared pri
 ```
 
 The grant is **intersected** with what the plugin itself declares — you cannot grant a host the
-manifest never named, and without a grant the private network is unreachable (deny-by-default).
-See [Configuration](../reference/config.md).
+manifest never named, and without a grant the private network is unreachable through host
+capabilities. See [Configuration](../reference/config.md).
 
 A plugin that talks to an OAuth-protected API is logged in with `flux auth login <name>` — flux runs
 the OAuth flow host-side and the plugin never sees the token. For the whole capability model,
 references-only IO, and the manifest fields behind these grants, see
-[Plugin capability sandbox](../security/plugin-sandbox.md); for the login flow and token storage, see
+[Plugin capability sandbox](../security/plugin-sandbox.md); for login and token storage, see
 [Credentials & secrets](../security/credentials.md).
 
 ## Trust model
@@ -113,11 +120,11 @@ references-only IO, and the manifest fields behind these grants, see
 The capability gates above are enforced on the **host** side; the plugin binary itself is trusted,
 pinned code — not OS-sandboxed. Review installed plugins the way you review dependencies. The
 signed pack, sha256 pinning, and spawn-time hash re-check tell you *which* code runs; the manifest
-gates and env-cleared spawn bound what that code can reach through flux.
+gates and env-cleared spawn bound what conforming code can reach through flux.
 
-Both halves are documented in depth under Security: [Plugin trust & signing](../security/plugin-trust.md)
-for *which* code runs, and [Plugin capability sandbox](../security/plugin-sandbox.md) for what it can
-reach.
+Both halves are documented under Security: [Plugin trust & signing](../security/plugin-trust.md)
+for *which* code runs, and [Plugin capability sandbox](../security/plugin-sandbox.md) for what host
+capabilities it can request.
 
 ## Writing your own
 

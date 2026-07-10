@@ -5,9 +5,13 @@ description: "The safety chain for every operation, including authorization, per
 
 # Safety & approvals
 
-flux is built so that no tool, plugin, sub-agent, or app surface can reach the real filesystem,
-start a process, or use the network without traversing one mandatory chain. This page explains that
-chain, what prompts, and how approval decisions interact with policy.
+flux is built so every model-emitted operation, built-in tool, sub-agent operation, app operation,
+and plugin **host-capability request** traverses one mandatory chain before flux performs real IO.
+This page explains that chain, what prompts, and how approval decisions interact with policy.
+
+Plugin executables are trusted native dependencies, not OS-sandboxed processes. The chain governs
+their projected operations and host callbacks; it cannot prevent a malicious binary from making a
+direct syscall. See [Plugin trust & signing](../security/plugin-trust.md).
 
 ## The one envelope
 
@@ -31,9 +35,11 @@ pre-tool hooks
    allow, otherwise prompt.
 4. **Approval gate** is forced for destructive intents and unscoped writes — even under an otherwise
    permissive rule.
-5. **Guarded IO** is the *only* place real filesystem, process, and network access happens. It is
-   workspace-confined, rejects symlink escapes, runs processes argv-only (no shell interpretation),
-   caps output, and resolves every URL through an SSRF guard.
+5. **Guarded IO** is the only production path used by flux operations and conforming plugin
+   callbacks. It is workspace-confined, rejects symlink escapes, launches processes with an argv
+   vector, caps output, and resolves every URL through an SSRF guard. The opt-in `bash` operation is
+   the explicit exception to “no shell interpretation”: it launches `sh -c` through that same
+   guarded process path and remains high-risk and approval-gated.
 
 ## What prompts, what doesn't
 
@@ -80,8 +86,9 @@ a role declared with `tools: []` gets **zero** tools.
 
 ## The invariant
 
-> No tool, plugin, sub-agent, or surface reaches real filesystem, process, or network IO without
-> traversing this single envelope.
+> No model-emitted operation, built-in tool, sub-agent operation, app operation, or plugin host
+> callback reaches real IO without traversing this envelope. Trusted native plugin code remains
+> outside that guarantee because it is not OS-sandboxed.
 
 This is enforced by construction, not by convention — see [Concepts](../concepts.md) for how it fits
 the plan-first model, and the [source on GitHub](https://github.com/codewandler/flux) for the

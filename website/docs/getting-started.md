@@ -26,11 +26,26 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/codewandler/flux/r
 **From source** — requires Rust 1.85+ (`rustup update stable`):
 
 ```bash
-cargo install --git https://github.com/codewandler/flux flux-cli
+cargo install --git https://github.com/codewandler/flux --package flux-cli
 ```
 
 Prebuilt binaries, installers, and checksums are attached to every
 [tagged release](https://github.com/codewandler/flux/releases/latest).
+
+Verify which executable and release you are using:
+
+```bash
+command -v flux
+flux --version
+flux changelog
+```
+
+To update a prebuilt installation, rerun the installer—it resolves the latest published release and
+replaces the existing binary. For a source installation, rerun the Cargo command with `--force`:
+
+```bash
+cargo install --force --git https://github.com/codewandler/flux --package flux-cli
+```
 
 ## Try it without an API key
 
@@ -119,3 +134,4 @@ repository's internal `docs/` map and `AGENTS.md`.
 - [Concepts](./concepts.md) — the plan-first execution model.
 - [CLI](./agent/cli.md) — the command surface after the first run.
 - [Safety and approvals](./agent/safety.md) — what prompts and why.
+- [What's new](./whats-new.md) — customer-facing release notes.

@@ -13,7 +13,7 @@
 //! parameterized flow builders (routing, lookup, the loop family, resilience).
 //!
 //! ```ignore
-//! // Runnable hermetic version: `cargo run -p flux-sdk --example client_basic`.
+//! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example client_basic`.
 //! # async fn ex() -> flux_core::Result<()> {
 //! use flux_sdk::Client;
 //! let provider = Box::new(flux_providers::anthropic::anthropic_from_env()?);

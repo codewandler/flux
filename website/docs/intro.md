@@ -32,6 +32,10 @@ runtime decides what is allowed and performs the work.
 This site is the public documentation for users and integrators. It covers stable concepts, the CLI,
 Flux-Lang, the SDK, plugins, and the security model.
 
+The deployed site follows the latest published release. Changes on `main` are built as previews but
+do not replace the stable site until a release is published. See [What's new](./whats-new.md) for the
+customer-facing history and `flux --version` for your installed version.
+
 The repository also contains internal contributor docs under `docs/` and crate-level `docs/`
 directories. Those are design records, story boards, roadmap notes, and implementation references.
 They are useful when contributing, but they are more detailed and more volatile than this site.
@@ -44,6 +48,7 @@ They are useful when contributing, but they are more detailed and more volatile 
 - What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
 - Interested in the language: read [Flux-Lang overview](./language/overview.md).
 - Embedding flux: read the [SDK overview](./sdk/overview.md).
+- Measuring and improving behavior: read [Evaluation and improvement](./agent/improvement.md).
 - Replay, fork, and diff past runs: read [Time Machine](./agent/time-machine.md).
 - Something not working: check [Troubleshooting](./troubleshooting.md).
 
@@ -52,3 +57,4 @@ They are useful when contributing, but they are more detailed and more volatile 
 - [Getting started](./getting-started.md) — install flux and run the mock provider.
 - [Concepts](./concepts.md) — understand plans, symbols, evidence, and the safety envelope.
 - [Infrastructure](./infrastructure.md) — see the runtime, safety boundary, and crate layers at a glance.
+- [What's new](./whats-new.md) — see release-by-release user-visible changes.

@@ -13,15 +13,18 @@ For the separate question of which plugin code is allowed to run at all, see
 [Plugin trust & signing](./plugin-trust.md). Both rely on the same
 [safety envelope](../agent/safety.md).
 
-## The plugin does no privileged IO
+## Host capabilities, not an OS sandbox
 
-A plugin never opens a socket, reads an environment variable, or builds an authorization header
-itself. Every side effect — an HTTP request, a subprocess, a secret read, a connection — is a
-**capability callback** the host executes on the plugin's behalf. The plugin process is launched with
-a **cleared environment**: it gets only what its manifest declares. Undeclared capabilities, hosts,
-secrets, and programs are denied by default.
+First-party plugins are written so every privileged effect — an HTTP request, subprocess, secret
+read, connection, or extra-workspace file read — is a **capability callback** the host executes on
+their behalf. The process is launched with a cleared, minimal environment, so provider and host
+secrets are not inherited. Undeclared host capabilities, hosts, secrets, and programs are denied by
+default.
 
-This means the host is the single IO boundary. The plugin asks; the host decides, and does.
+This confines what plugin code can reach *through flux*. Plugin binaries are trusted native code and
+are not OS-sandboxed; a malicious binary could bypass the callback protocol with direct syscalls.
+Within the plugin contract, the host is the single IO boundary: the plugin asks; the host decides
+and performs.
 
 ## Capabilities are deny-by-default
 

@@ -14,19 +14,18 @@ the `flux` binary.
 
 ## Install
 
-The crates are **not published to crates.io yet** (publication is planned, but not live). Until
-then, install straight from the repository as a git dependency — both crates are workspace
-members, and cargo resolves them by package name:
+The SDK and its dependency closure are published on crates.io under the `codewandler-` prefix (the
+short `flux-*` package names are owned by unrelated projects):
 
-```toml
-[dependencies]
-flux-sdk       = { git = "https://github.com/codewandler/flux", tag = "v0.6.0" }
-flux-providers = { git = "https://github.com/codewandler/flux", tag = "v0.6.0" }
+```bash
+cargo add codewandler-flux-sdk codewandler-flux-providers
 ```
 
-`flux-sdk` is provider-agnostic and has no cargo features of its own. The concrete backends live
-in `flux-providers` (Anthropic, OpenAI, OpenRouter, Ollama, AWS Bedrock, and the claude/codex
-subscription providers; the full-duplex voice provider sits behind its `realtime` feature).
+Package names are prefixed, but Rust import paths stay short: `use flux_sdk::…` and
+`use flux_providers::…`. `flux-sdk` is provider-agnostic and has no cargo features of its own. The
+concrete backends live in `flux-providers` (Anthropic, OpenAI, OpenRouter, Ollama, AWS Bedrock, and
+the claude/codex subscription providers; the full-duplex voice provider sits behind its `realtime`
+feature).
 
 ## The three front doors
 
@@ -117,9 +116,9 @@ impl Provider for OneShotMock {
 Every SDK example ships this way and runs with no API key:
 
 ```sh
-cargo run -p flux-sdk --example client_basic   # the classic agent loop
-cargo run -p flux-sdk --example flow_compile   # NL → AST → execute
-cargo run -p flux-sdk --example dsl_loops      # loops/control-flow via the DSL
+cargo run -p codewandler-flux-sdk --example client_basic   # the classic agent loop
+cargo run -p codewandler-flux-sdk --example flow_compile   # NL → AST → execute
+cargo run -p codewandler-flux-sdk --example dsl_loops      # loops/control-flow via the DSL
 ```
 
 `crates/flux-sdk/examples/client_basic.rs` is the full mock-provider turn;

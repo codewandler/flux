@@ -69,7 +69,8 @@ Four stories — one implement, two harden, one document:
 - **D-117 (document)** — website: an endpoints concept page (weak-ref model, discover/select/
   import, the sql-plugin end-to-end), `flux endpoint` in the CLI reference, a saved-flows page
   (`~/.flux/flows`, `flow_list`/`flow_run`, `op.register`), and cross-links from the datasources
-  page answering "how does the agent know which sources exist".
+  page answering "how does the agent know which sources exist". **Done 2026-07-10**, expanded into
+  a full public-doc truth pass with executable drift guards and release-bound Pages deployment.
 
 **Explicit non-goal:** making a live SQL database a first-class *knowledge* datasource (async paged
 backend). That is [D-62](../stories/D-62-async-live-datasource-seam.md) (design-first, backlog) and

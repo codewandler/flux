@@ -67,20 +67,22 @@ flux app run --serve 127.0.0.1:8787 --yes
 Every route except `GET /health` and the A2A discovery card then requires
 `Authorization: Bearer $FLUX_SERVER_TOKEN`.
 
-## web_fetch refuses to reach a host
+## A native web operation refuses to reach a host
 
 The SSRF guard rejects private, loopback, and link-local targets:
 `refusing to fetch private/loopback/link-local address <ip> (<host>)`, or
 `refusing to fetch internal host <host>`. This is deliberate — the guard resolves the hostname
 to IPs and blocks the request if *any* resolved address is internal.
 
-Grant the specific host in config if you really need it:
+Grant the specific host to the native web family if you really need it:
 
 ```toml
 # .flux/config.toml
 [private_net]
-web_fetch = ["localhost"]     # or `true` for any private host, web_fetch only
+web = ["localhost"]     # or `true` for any private host; covers http.request, web_fetch, browser.*
 ```
+
+The retired `web_fetch = …` key is ignored; use the family-wide `web` key shown above.
 
 See [Configuration](./reference/config.md) for the full grant shape (plugins are granted
 separately under `[private_net.plugins]`).

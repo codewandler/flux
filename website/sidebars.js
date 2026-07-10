@@ -4,6 +4,7 @@ const sidebars = {
   docs: [
     'intro',
     'getting-started',
+    'whats-new',
     'concepts',
     'infrastructure',
     'troubleshooting',
@@ -19,10 +20,18 @@ const sidebars = {
         'agent/a2a',
         'agent/programs',
         'agent/datasources',
+        'agent/endpoints',
+        'agent/saved-flows',
+        'agent/skills-and-roles',
         'agent/time-machine',
         'agent/cost',
         'agent/realtime',
       ],
+    },
+    {
+      type: 'category',
+      label: 'Improvement',
+      items: ['agent/improvement'],
     },
     {
       type: 'category',

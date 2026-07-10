@@ -10,6 +10,8 @@ on:
     paths:
       - 'website/**'
       - '.github/workflows/website.yml'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -37,12 +39,14 @@ jobs:
       - run: npm run build
         working-directory: website
       - uses: actions/upload-pages-artifact@v3
-        if: github.event_name != 'pull_request'
+        # `main` and pull requests are preview/build validation only. The public site follows the
+        # exact source tag of the latest published release; workflow_dispatch is the recovery hatch.
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         with:
           path: website/build
 
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     environment:

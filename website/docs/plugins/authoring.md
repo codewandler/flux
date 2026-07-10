@@ -5,9 +5,11 @@ description: "Author a capability-scoped plugin with manifest declarations, secu
 
 # Plugin authoring
 
-Plugins add operations to flux without giving plugin code ambient access to your machine. A plugin is
-a subprocess that speaks the flux plugin protocol; the host launches it, projects its operations into
-the tool catalog, and executes privileged IO on its behalf only when the manifest allows it.
+Plugins add operations as trusted native subprocesses that speak the flux plugin protocol. The host
+launches each process with a cleared environment, projects its operations into the tool catalog, and
+executes declared capability requests only when the manifest allows them. Plugins are not OS-sandboxed:
+direct system calls remain possible, so third-party binaries must be reviewed like any other native
+dependency.
 
 This public page is the short authoring contract. The full source-level guide is linked below.
 
@@ -18,6 +20,7 @@ This public page is the short authoring contract. The full source-level guide is
 - Secrets are requested through declared secret purposes.
 - Process and network access use host callbacks, not ambient environment access.
 - Tool effects, risk, and idempotency must be declared honestly.
+- Native code is trusted; the manifest governs host callbacks, not arbitrary syscalls.
 
 ## Full guide
 

@@ -33,9 +33,13 @@ non-bypassable chain:
 capability scope -> hooks -> authorization -> permission rules -> approval -> guarded IO
 ```
 
-`flux-system` owns the guarded edge. It is the only production path to real filesystem, process, and
-network IO. That keeps workspace confinement, argv-only process execution, network egress checks,
-approval, and secret redaction on one auditable route.
+`flux-system` owns the guarded edge. It is the only production path used by built-in operations and
+plugin host callbacks for real filesystem, process, and network IO. That keeps workspace
+confinement, argv-vector process launching, network egress checks, approval, and secret redaction on
+one auditable route. The opt-in `bash` operation deliberately runs `sh -c` through this path.
+
+Plugin executables themselves are trusted native dependencies and are not OS-sandboxed. Their
+manifest constrains host callbacks; it cannot constrain arbitrary syscalls from malicious code.
 
 ## Strict crate layers
 

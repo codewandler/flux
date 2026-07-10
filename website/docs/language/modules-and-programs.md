@@ -82,6 +82,9 @@ same catalog and `flux flow run <name>` runs a saved flow directly. Supply decla
 `--inputs '{"key":"value"}'` or repeatable `--arg key=value`; opt in to natural-language mapping only
 when wanted with `--map-inputs "…"`.
 
+The complete discovery, precedence, CLI-input, and `op.register` scope rules live in
+[Saved flows and custom operations](../agent/saved-flows.md).
+
 ## Program declarations
 
 Beyond flows and ops, a module may declare a whole multi-agent application: `agent`,
@@ -105,3 +108,4 @@ journeys (`emit`, `send`, `ask`, `spawn`) are listed in [Operations](./ops.md).
 - [Multi-agent programs](../agent/programs.md) — how program declarations run in the app host.
 - [Flows & syntax](./flows-and-syntax.md) — the base syntax used inside modules.
 - [Operations](./ops.md) — app-host operations such as `emit`, `send`, `ask`, and `spawn`.
+- [Saved flows and custom operations](../agent/saved-flows.md) — project/global reuse and dynamic registration.

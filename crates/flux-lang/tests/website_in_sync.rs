@@ -4,6 +4,8 @@
 //!    (`flux_lang::schema::node_kind_rows()`).
 //!  - `website/docs/language/types-and-effects.md` carries a generated `prelude-types` block
 //!    (`flux_lang::prelude::prelude_type_rows()`).
+//!  - `website/docs/whats-new.md` carries the customer-facing release history from the root
+//!    `WHATS-NEW.md` (minus its maintainer comment and duplicate H1).
 //!
 //! Both derive from the same catalogs as `tests/skill_in_sync.rs` (the language skill + the
 //! in-crate `docs/reference.md`), so the website can never carry a stale hand-edited mirror.
@@ -20,6 +22,8 @@ const BEGIN: &str = "<!-- BEGIN generated:node-kinds -->";
 const END: &str = "<!-- END generated:node-kinds -->";
 const BEGIN_PRELUDE: &str = "<!-- BEGIN generated:prelude-types -->";
 const END_PRELUDE: &str = "<!-- END generated:prelude-types -->";
+const BEGIN_WHATS_NEW: &str = "<!-- BEGIN generated:whats-new -->";
+const END_WHATS_NEW: &str = "<!-- END generated:whats-new -->";
 
 /// Resolve a path relative to the repo root (this crate lives at `crates/flux-lang`).
 fn repo_path(rel: &str) -> PathBuf {
@@ -53,6 +57,19 @@ fn website_prelude_type_table() -> String {
         out.push_str(&format!("| `{name}` | {} |\n", escape_table_pipes(&desc)));
     }
     out
+}
+
+fn website_whats_new() -> String {
+    let source = std::fs::read_to_string(repo_path("WHATS-NEW.md")).expect("read WHATS-NEW.md");
+    let after_comment = source
+        .split_once("-->")
+        .map_or(source.as_str(), |(_, rest)| rest)
+        .trim_start();
+    after_comment
+        .strip_prefix("# What's new in flux")
+        .expect("WHATS-NEW.md customer heading")
+        .trim()
+        .to_string()
 }
 
 /// Splice `block` in place of the existing `begin..=end` span. Panics if the markers are absent —
@@ -107,5 +124,28 @@ fn website_types_and_effects_prelude_types_block_is_in_sync() {
         content, expected,
         "website/docs/language/types-and-effects.md prelude-types block is out of date — \
          regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`"
+    );
+}
+
+#[test]
+fn website_customer_changelog_is_in_sync() {
+    let path = repo_path("website/docs/whats-new.md");
+    let block = format!(
+        "{BEGIN_WHATS_NEW}\n{}\n{END_WHATS_NEW}",
+        website_whats_new()
+    );
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let expected = splice(&content, BEGIN_WHATS_NEW, END_WHATS_NEW, &block);
+
+    if update() {
+        std::fs::write(&path, &expected)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        return;
+    }
+    assert_eq!(
+        content, expected,
+        "website/docs/whats-new.md is out of date — regenerate with `UPDATE=1 cargo test -p \
+         codewandler-flux-lang --test website_in_sync`"
     );
 }

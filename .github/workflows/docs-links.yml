@@ -1,0 +1,24 @@
+name: docs external links
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    name: public docs · external links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check external links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --verbose --no-progress
+            --exclude 'localhost|127\.0\.0\.1|agent\.example\.com|gitlab\.example\.com|prometheus\.local'
+            README.md website/docs/**/*.md
+          fail: true

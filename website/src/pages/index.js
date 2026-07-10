@@ -66,6 +66,10 @@ export default function Home() {
           <Card title="SDK" to="/docs/sdk/flow-client">
             Parse, analyze, optimize, and execute flows from Rust through the same safety envelope.
           </Card>
+          <Card title="Improvement" to="/docs/agent/improvement">
+            Measure repeatable tasks, inspect evidence, and keep harness changes only when evals show
+            a real gain.
+          </Card>
         </section>
       </main>
     </Layout>

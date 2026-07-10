@@ -74,3 +74,6 @@ slack = ["flux-channels/slack", "dep:rustls"]
 # Wire the semantic/embeddings datasource backend (the agent's `search` blends keyword + embeddings).
 # Off by default; needs an embeddings API key at runtime (see flux-capabilities `OpenAiEmbedder`).
 embeddings = ["flux-capabilities/embeddings"]
+
+[dev-dependencies]
+toml.workspace = true

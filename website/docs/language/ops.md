@@ -41,10 +41,21 @@ policy.
 | `list` | `source[, entity, offset, limit]` | low | Enumerate a datasource source's records, paged |
 | `relation` | `source, entity, id[, rel]` | low | Follow a datasource record's typed links |
 | `batch_get` | `source, entity, ids` | low | Fetch several datasource records in one call |
-| `web_fetch` | `url` | low | Fetch an HTTP(S) URL |
-| `web_search` | `query[, max_results]` | low | Web search (requires a search API key) |
+| `web_fetch` | `url[, raw]` | low | Read a URL as a document: HTML becomes condensed Markdown; `raw` preserves the body |
+| `html_to_markdown` | `html` | low | Pure conversion of an HTML string to condensed Markdown; no network access |
+| `http.request` | `url[, method, headers, body, timeout]` | medium, approval | Arbitrary HTTP request with capped response body; non-2xx remains a result |
+| `browser.open` | `[url]` | medium, approval | Start a headless-Chromium session and return a non-visual page digest |
+| `browser.goto` | `session, url` | medium, approval | Navigate an existing browser session and return a delta |
+| `browser.snapshot` | `session[, view]` | low | Re-observe a session (`full`, `actions`, or `content`) |
+| `browser.act` | `session, action[, ref, value, full]` | medium, approval | Click, type, fill, select, press, scroll, navigate, or go back using digest refs |
+| `browser.close` | `session` | low | Close a browser session and its Chromium child |
+| `web_search` | `query[, max_results]` | low | Tavily web search (requires `TAVILY_API_KEY`) |
 | `sqlite_query` | `db, sql[, params]` | low | Read-only SQLite query |
-| `now` / `cwd` / `sys_info` | | low | Clock, workspace root, host metadata — no shell needed |
+| `now` / `cwd` / `home_dir` / `sys_info` | | low | Clock, workspace/home paths, and host metadata — no shell needed |
+
+All native web operations share the `[private_net] web` scope. Public destinations are allowed by
+default; private/internal destinations require an explicit grant. Browser operations register in
+every host but are advertised only when a Chromium binary is discoverable.
 
 ## Processes and toolchains
 
@@ -115,41 +126,40 @@ Pure:
 
 ```flux
 // Deterministic list transforms
-let authors = map { items: issues, path: "author.username" };
-let open = filter { items: issues, where: "it.state == 'opened' && it.upvotes > min", vars: { min: 2 } };
-let all_pages = flatten { items: pages };
-let rest = skip { items: candidates, n: 1 };
-let report = join { items: lines, sep: "\n" };
-let hosts = split { s: raw_hosts, sep: ",", trim: true };
-let total = sum { items: invoices, path: "amount" };
-let by_status = count_by { items: issues, path: "state" };
-let grouped = group_by { items: issues, path: "author.username" };
-let has_bug = has { items: labels, value: "bug" };
-let all_green = all { items: checks, where: "it.status == 'ok'" };
-let slim_issues = pick { items: issues, keys: ["iid", "title", "state", "web_url"] };
-let public_issue = omit { items: issue, keys: ["author_email", "raw_payload"] };
-let merged = merge_obj { objects: [defaults, overrides] };
-let assignee = coalesce { values: [issue.assignee.username?, issue.author.username?], default: "unassigned" };
-let field_names = keys { item: issue };
-let field_values = values { item: issue };
+$authors = map({items: $issues, path: "author.username"})
+$open = filter({items: $issues, where: "it.state == 'opened' && it.upvotes > min", vars: {min: 2}})
+$all_pages = flatten($pages)
+$rest = skip({items: $candidates, n: 1})
+$report = join({items: $lines, sep: "\n"})
+$hosts = split({s: $raw_hosts, sep: ",", trim: true})
+$total = sum({items: $invoices, path: "amount"})
+$by_status = count_by({items: $issues, path: "state"})
+$grouped = group_by({items: $issues, path: "author.username"})
+$has_bug = has({items: $labels, value: "bug"})
+$all_green = all({items: $checks, where: "it.status == 'ok'"})
+$slim_issues = pick({items: $issues, keys: ["iid", "title", "state", "web_url"]})
+$public_issue = omit({items: $issue, keys: ["author_email", "raw_payload"]})
+$merged = merge_obj([ $defaults, $overrides ])
+$assignee = coalesce({values: [$issue.assignee.username?, $issue.author.username?], default: "unassigned"})
+$field_names = keys($issue)
+$field_values = values($issue)
 
 // Check if a log line contains ERROR
-let has_error = regex_match { s: log_line, pattern: "ERROR" };
-when { cond: has_error } call { op: "alert", msg: "Error detected" };
+$has_error = regex_match({s: $log_line, pattern: "ERROR"})
+when $has_error
+  alert({msg: "Error detected"})
 
 // Extract SemVer from a version string
-let version = regex_extract {
-  s: "flux-cli v1.2.3",
-  pattern: r"v(\d+\.\d+\.\d+)",
-  group: 1
-};  // returns "1.2.3"
+$version = regex_extract({
+  s: "flux-cli v1.2.3", pattern: r"v(\d+\.\d+\.\d+)", group: 1
+})  // returns "1.2.3"
 
 // Extract all email addresses from text
-let emails = regex_extract {
-  s: body_text,
-  pattern: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+$emails = regex_extract({
+  s: $body_text,
+  pattern: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
   all: true
-};  // returns array of email strings
+})  // returns an array of strings
 ```
 
 Model-backed:
@@ -178,6 +188,19 @@ Registered **only** by the `flux app run` host for [multi-agent programs](../age
 | `ask` | `channel, message` | Send and return a correlation id |
 | `spawn` | `run[, input]` | Run a named journey to completion and return its result |
 
+## Endpoints
+
+Registered as one evidence-gated group when a kubeconfig is present or the persisted endpoint store
+was non-empty at session startup. See [Endpoints](../agent/endpoints.md).
+
+| op | arguments | description |
+|---|---|---|
+| `endpoint.discover` | `product[, query, limit]` | Ask installed discovery providers for ranked weak endpoint references |
+| `endpoint.list` | | List endpoint records known in the session registry |
+| `endpoint.info` | `id` | Inspect one endpoint record and its credential location |
+| `endpoint.select` | `id` | Return one model-safe `EndpointRef` for reuse in another operation |
+| `endpoint.import` | `id` | Persist a known record to `~/.flux/endpoints.toml` (approval-gated local write) |
+
 ## Flows
 
 Discover and run reusable flows and composite ops stored under `.flux/flows` (project) and
@@ -187,6 +210,20 @@ Discover and run reusable flows and composite ops stored under `.flux/flows` (pr
 |---|---|---|
 | `flow_list` | | List the flows and composite ops in the flows home, each with its description and params |
 | `flow_run` | `name[, inputs]` | Run a stored flow by name; an `inputs` object is seeded as `$key` binds, then it runs in the current session |
+| `op.register` | `source, scope[, replace, expose]` | Validate and register one composite op for the turn, session, project, or global scope |
+
+## Evidence and strict-review helpers
+
+These deterministic helpers are registered with the built-ins. The default loop uses the evidence
+family internally; strict-review flows use the review family directly.
+
+| op | arguments | description |
+|---|---|---|
+| `observe` | `kind[, data]` | Append a structured observation to the current run's evidence log |
+| `evidence` | `[kind]` | Read all observations, or only one kind |
+| `metrics` | | Summarize tool calls, errors, and iterations from the evidence log |
+| `review.normalize` | `findings` | Normalize raw reviewer output and quarantine malformed entries as gaps |
+| `review.aggregate` | `findings[, files, reviewers]` | Deduplicate, rank, and summarize findings into a stable review report |
 
 ## The loop itself
 

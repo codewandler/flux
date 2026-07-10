@@ -23,6 +23,17 @@ All notable changes to this project are documented in this file. The format is b
   SCRAM). `flux_config::EndpointConfig` gains `static_endpoints` (`StaticEndpoint`); `run_endpoint`
   is refactored to a path-parameterized `run_endpoint_in` for testing.
 
+### Changed
+
+- **D-117: public website truth pass and drift guards.** Corrected stale SDK installation/package
+  selectors, private-network configuration, plugin dry-run behavior, GitLab surface counts,
+  Flux-Lang examples, native-web operations, and native-plugin trust-boundary claims. Added public
+  endpoint, saved-flow, skills/roles, Improvement-loop, complete CLI/config, and generated customer
+  changelog entry points. New executable docs contracts cover public CLI commands, registered
+  operations, TOML configuration, complete Flux fences, plugin-pack membership, SDK commands, and
+  security wording; the website workflow now builds previews from main/PRs but deploys stable Pages
+  only for a published release or an explicit dispatch.
+
 ## [0.14.5] - 2026-07-10
 
 ### Added

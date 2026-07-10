@@ -1,18 +1,15 @@
-<!--
-  WHATS-NEW.md — the CUSTOMER changelog. Audience: people who USE flux, not people who
-  build it. Voice rules:
-    - Plain language, feature-first. Say what the user can now do or what behaves
-      differently — never how it is implemented.
-    - NO story IDs, NO crate names, NO internal jargon (engineering detail lives in
-      CHANGELOG.md).
-    - Per release, use only the sections that apply: "### New", "### Improved",
-      "### Fixed", "### Action needed" (breaking or attention-worthy changes).
-  This file is embedded into the `flux` binary and shown by `flux changelog`.
-  `scripts/cut-release.sh` rolls [Unreleased] into the release section on every cut.
--->
+---
+title: What's new
+description: "Customer-facing Flux release notes, generated from the changelog embedded in the CLI."
+---
 
 # What's new in flux
 
+This is the same customer changelog embedded in the binary. From a terminal, use
+`flux changelog` for the latest release, `flux changelog --all` for the full history, or
+`flux changelog <version>` for one release.
+
+<!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
 ### New
@@ -282,3 +279,4 @@
 
 Engineering-level detail for every release lives in
 [CHANGELOG.md](https://github.com/codewandler/flux/blob/main/CHANGELOG.md).
+<!-- END generated:whats-new -->

@@ -69,6 +69,11 @@ const config = {
           position: 'left',
         },
         {
+          to: '/docs/whats-new',
+          label: "What's new",
+          position: 'left',
+        },
+        {
           href: 'https://github.com/codewandler/flux',
           label: 'GitHub',
           position: 'right',
@@ -84,6 +89,8 @@ const config = {
             { label: 'Getting started', to: '/docs/getting-started' },
             { label: 'Flux-Lang', to: '/docs/language/overview' },
             { label: 'SDK', to: '/docs/sdk/flow-client' },
+            { label: 'Improvement', to: '/docs/agent/improvement' },
+            { label: "What's new", to: '/docs/whats-new' },
           ],
         },
         {

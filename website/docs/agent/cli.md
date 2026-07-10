@@ -27,7 +27,7 @@ require human confirmation — see [Safety & approvals](./safety.md).
 | Command | What it does |
 |---|---|
 | `flux run "…"` | plan + run a turn (`--yes` auto-approves; `-c` continues the last session) |
-| `flux plan "…"` | show the plan without running it (`-o json\|yaml` prints and exits) |
+| `flux plan "…"` | preview a plan; a terminal offers to run it, while `-o json\|yaml` prints and exits |
 | `flux` | interactive REPL |
 | `flux tui` | ratatui chat UI with an in-UI approval modal |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
@@ -35,10 +35,19 @@ require human confirmation — see [Safety & approvals](./safety.md).
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
 | `flux flow run <name\|file>` | execute a saved flow by name or an existing Flux-Lang file (files win) |
 | `flux render <file.flux>` | render a `.flux` file as a syntax-highlighted SVG (`--view source\|tree`, `-o out.svg`) |
+| `flux review --files …` | run the embedded read-only multi-reviewer protocol; Markdown or JSON output |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
+| `flux fork …` / `flux replay …` / `flux diff …` | branch, replay, and compare recorded runs with [Time Machine](./time-machine.md) |
+| `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
-| `flux plugin …` / `flux preset …` | manage subprocess plugins / prebuilt flows |
+| `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
+| `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
+| `flux skill …` | render or install generated Flux skills; see [Skills & roles](./skills-and-roles.md) |
+| `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
+| `flux corpus export` | export accepted NL→Flux-Lang plan pairs as JSONL for advanced training/eval work |
+| `flux changelog [version]` | read the embedded customer changelog (`--all` / `--unreleased`) |
+| `flux completion [shell]` | generate a completion script (fish by default) |
 
 ## Saved flow inputs
 

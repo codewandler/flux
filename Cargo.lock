@@ -2019,6 +2019,7 @@ dependencies = [
  "serde_norway",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]

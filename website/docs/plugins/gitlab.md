@@ -25,7 +25,7 @@ flux plugin status gitlab
 
 ```text
 gitlab           ~/.flux/plugins/bin/gitlab/0.1.0/flux-plugin-gitlab   v0.1.0  [ok]  [verified]
-    manifest:  v0.1.0  64 op(s)  ·  1 auth purpose(s)  ·  1 endpoint(s)  ·  3 datasource(s)  ·  caps: http, secret(2), blob
+    manifest:  v0.1.0  79 op(s)  ·  1 auth purpose(s)  ·  1 endpoint(s)  ·  3 datasource(s)  ·  caps: http, secret(2), blob
     auth:      · personal_token — not configured (env: GITLAB_PERSONAL_TOKEN, GITLAB_PERSONAL_ACCESS_TOKEN)
     endpoint:  · gitlab.endpoint — env not set, defaults to https://gitlab.com
 ```
@@ -108,7 +108,7 @@ wiring reached the network guard but not GitLab yet.
 
 ## 5. Call a real operation
 
-Any of the plugin's 64 declared operations work the same way — `flux plugin call gitlab <op> [json]`,
+Any of the plugin's declared operations works the same way — `flux plugin call gitlab <op> [json]`,
 or let an agent call them once it's running with the plugin installed:
 
 ```bash
@@ -117,8 +117,9 @@ flux plugin call gitlab gitlab.mr.list '{"project": "group/project", "state": "o
 flux plugin call gitlab gitlab.issue.create '{"project": "group/project", "title": "…"}' --dry-run
 ```
 
-`--dry-run` validates the input against the op's schema without spawning the plugin or touching the
-network — useful for checking argument shape before a write operation.
+`--dry-run` spawns the plugin once to read its manifest and validates the input against the
+operation's schema, but it never invokes the operation or performs its operation-level network/write
+work. It is useful for checking argument shape before a write operation.
 
 ## Recap
 
