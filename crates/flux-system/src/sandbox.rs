@@ -1963,9 +1963,12 @@ mod tests {
     fn run_probe_caps_stderr_while_continuing_to_drain() {
         let dir = temp_dir("probe-capped-stderr");
         let script = dir.join("loud.sh");
+        // Emit 2 MiB of stderr with shell builtins only (`for`/assignment/`printf`): the earlier
+        // `head`/`tr` pipeline depended on those binaries resolving under the probe's scrubbed
+        // env, which fails on minimal-PATH CI runners ("head: not found"). 16 * 2^17 = 2097152.
         write_script(
             &script,
-            "#!/bin/sh\nhead -c 2097152 /dev/zero | tr '\\0' x >&2\nexit 4\n",
+            "#!/bin/sh\ns=xxxxxxxxxxxxxxxx\nfor _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do s=\"$s$s\"; done\nprintf '%s' \"$s\" >&2\nexit 4\n",
         );
         match run_probe(&script, &[], Duration::from_secs(2)) {
             ProbeOutcome::Broken(stderr) => {
