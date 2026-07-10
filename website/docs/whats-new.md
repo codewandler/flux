@@ -14,6 +14,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- GitLab results now tell you exactly what was cut, and nothing arrives broken. File previews
+  capped by size stay valid (no more undecodable base64 fragments), size caps are exact — the
+  returned text never exceeds the limit you set, marker included — and comparisons flag
+  truncation at the top level whenever files, diffs, or commits were cut (commits now have their
+  own cap too). Asking a merge request for one specific file finds it even in huge MRs (file
+  lookups previously stopped at the first 200 changed files), review comments can anchor on
+  deleted lines, listings accept an explicit page number to walk beyond a capped first page, and
+  repository archive downloads refuse to exceed a size limit (50 MB unless you raise it). Arrives
+  with the next plugin pack update.
+
 - GitLab reads now do exactly what you asked. Listing operations accept `per_page` as a synonym of
   `limit` instead of quietly ignoring it, and a zero or negative limit is rejected up front rather
   than silently returning the default page. Code search refuses an ambiguous project+group

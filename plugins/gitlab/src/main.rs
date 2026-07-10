@@ -185,11 +185,14 @@ struct ProjectListInput {
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
     membership: Option<bool>,
 }
 
@@ -210,11 +213,14 @@ struct MrListInput {
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
     source_branch: Option<String>,
     target_branch: Option<String>,
 }
@@ -239,11 +245,14 @@ struct IssueListInput {
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.pipeline.list`.
@@ -255,11 +264,14 @@ struct PipelineListInput {
     r#ref: Option<String>,
     source: Option<String>,
     username: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.test`.
@@ -437,11 +449,14 @@ struct IssueNoteListInput {
     iid: Option<i64>,
     sort: Option<String>,
     order_by: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.issue.note.create`.
@@ -551,11 +566,14 @@ struct RepositoryTreeInput {
     path: Option<String>,
     r#ref: Option<String>,
     recursive: Option<bool>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 2000))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 2000))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.repository.commit.create`.
@@ -585,11 +603,14 @@ struct RepositoryCommitListInput {
     author: Option<String>,
     since: Option<String>,
     until: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.repository.tag.create`.
@@ -611,11 +632,14 @@ struct RepositoryTagCreateInput {
 struct RepositoryTagListInput {
     project: String,
     search: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.repository.tag.show`.
@@ -675,11 +699,14 @@ struct SearchBlobsInput {
     project: Option<String>,
     group: Option<String>,
     r#ref: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 100))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
     #[schemars(range(min = 1))]
     max_data_bytes: Option<i64>,
 }
@@ -693,9 +720,9 @@ struct MrChangesInput {
     #[schemars(range(min = 1))]
     iid: Option<i64>,
     file: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     max_files: Option<i64>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 262144))]
     max_diff_bytes: Option<i64>,
 }
 
@@ -708,10 +735,15 @@ struct MrDiffLinesInput {
     #[schemars(range(min = 1))]
     iid: Option<i64>,
     file: String,
+    /// New-file line to anchor on (wins over `old_line` when both are set).
+    #[schemars(range(min = 1))]
     line: Option<i64>,
+    /// Old-file line to anchor on — addresses deleted/context lines (GL-047).
+    #[schemars(range(min = 1))]
+    old_line: Option<i64>,
     context: Option<i64>,
     search: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 2000))]
     limit: Option<i64>,
 }
 
@@ -723,10 +755,13 @@ struct CompareInput {
     from: String,
     to: String,
     straight: Option<bool>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     max_files: Option<i64>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 262144))]
     max_diff_bytes: Option<i64>,
+    /// Cap on returned commits (default 50, max 500); `commits_truncated` reports a cut (GL-045).
+    #[schemars(range(min = 1, max = 500))]
+    max_commits: Option<i64>,
 }
 
 /// `gitlab.mr.discussion.list`.
@@ -737,11 +772,14 @@ struct MrDiscussionListInput {
     project: Option<String>,
     #[schemars(range(min = 1))]
     iid: Option<i64>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.mr.note.create`.
@@ -878,11 +916,14 @@ struct JobListInput {
     #[schemars(range(min = 1))]
     pipeline_id: i64,
     scope: Option<Vec<JobScope>>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.environment.list`.
@@ -892,11 +933,14 @@ struct EnvironmentListInput {
     project: String,
     search: Option<String>,
     states: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.deployment.list`.
@@ -906,11 +950,14 @@ struct DeploymentListInput {
     project: String,
     environment: Option<String>,
     status: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.release.list`.
@@ -918,11 +965,14 @@ struct DeploymentListInput {
 #[allow(dead_code)]
 struct ReleaseListInput {
     project: String,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.release.create`.
@@ -987,11 +1037,14 @@ struct ReleaseLinkListInput {
     tag_name: Option<String>,
     /// Alias of `tag_name` (GL-028).
     tag: Option<String>,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 200))]
     per_page: Option<i64>,
+    /// 1-based results page (GL-019) — walk a list beyond a capped first page.
+    #[schemars(range(min = 1))]
+    page: Option<i64>,
 }
 
 /// `gitlab.release.link.create`.
@@ -1077,6 +1130,10 @@ struct RepositoryArchiveInput {
     r#ref: Option<String>,
     path: Option<String>,
     format: Option<ArchiveFormat>,
+    /// Refuse archives larger than this many bytes (default 52428800 = 50 MiB) so an
+    /// "archive read" cannot stage an unbounded blob (GL-023).
+    #[schemars(range(min = 1))]
+    max_bytes: Option<i64>,
 }
 
 /// `gitlab.ci.job_token.scope.show`.
@@ -1701,7 +1758,7 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             read_op_typed::<RepositoryArchiveInput>(
                 "gitlab.repository.archive",
-                "Download a repository archive (tar.gz/zip/tar) at a ref into the host blob store.",
+                "Download a repository archive (tar.gz/zip/tar) at a ref into the host blob store. Refuses archives over max_bytes (default 50 MiB) — raise it explicitly for bigger repos.",
             ),
             repository_archive,
         )
@@ -2200,6 +2257,13 @@ fn pf_index_build(input: &Value) -> Vec<String> {
     index_include(input).err().into_iter().collect()
 }
 
+/// `&page=N` when the caller asked for a specific 1-based results page (GL-019), else "".
+fn page_qs(input: &Value) -> String {
+    flex_i64(input, &["page"])
+        .map(|p| format!("&page={p}"))
+        .unwrap_or_default()
+}
+
 /// Clamp a 1-based `limit` to `[1, max]`, falling back to `default` when unset/non-positive.
 fn clamp(value: i64, default: i64, max: i64) -> i64 {
     if value <= 0 {
@@ -2270,6 +2334,12 @@ fn project_list(input: Value, host: &mut Host) -> Result<Value, String> {
         ("order_by", order_by),
         ("sort", sort),
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
     ];
     let projects = gl_get(host, &format!("/projects{}", qs(&pairs)))?;
     contribute_projects(host, &projects);
@@ -2302,6 +2372,12 @@ fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
         ("order_by", order_by),
         ("sort", sort),
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("source_branch", source_branch),
         ("target_branch", target_branch),
     ];
@@ -2340,6 +2416,12 @@ fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
         ("order_by", order_by),
         ("sort", sort),
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
     ];
     let issues = gl_get(
         host,
@@ -2366,6 +2448,12 @@ fn pipeline_list(input: Value, host: &mut Host) -> Result<Value, String> {
         ("source", source),
         ("username", username),
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
     ];
     gl_get(
         host,
@@ -2778,6 +2866,12 @@ fn issue_note_list(input: Value, host: &mut Host) -> Result<Value, String> {
     );
     let pairs = [
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("sort", flex_str(&input, "sort").unwrap_or_default()),
         ("order_by", flex_str(&input, "order_by").unwrap_or_default()),
     ];
@@ -2961,16 +3055,34 @@ fn repo_file_show(input: Value, host: &mut Host) -> Result<Value, String> {
     )?;
     if let Some(max_bytes) = flex_i64(&input, &["max_bytes"]) {
         if max_bytes > 0 {
+            let max = max_bytes as usize;
+            let is_b64 = file.get("encoding").and_then(|v| v.as_str()) == Some("base64");
+            let mut truncated = false;
             if let Some(Value::String(content)) = file.get_mut("content") {
-                let max = max_bytes as usize;
-                if content.len() > max {
+                if is_b64 {
+                    // GL-013: the cap applies to DECODED bytes and the prefix is re-encoded, so
+                    // `content` stays valid base64 — truncating the base64 string itself would
+                    // hand back an undecodable fragment.
+                    use base64::Engine as _;
+                    let engine = base64::engine::general_purpose::STANDARD;
+                    let compact: String = content.split_whitespace().collect();
+                    if let Ok(decoded) = engine.decode(compact) {
+                        if decoded.len() > max {
+                            *content = engine.encode(&decoded[..max]);
+                            truncated = true;
+                        }
+                    }
+                } else if content.len() > max {
                     let mut end = max;
                     while end > 0 && !content.is_char_boundary(end) {
                         end -= 1;
                     }
                     *content = content[..end].to_string();
-                    file["truncated"] = json!(true);
+                    truncated = true;
                 }
+            }
+            if truncated {
+                file["truncated"] = json!(true);
             }
         }
     }
@@ -2990,6 +3102,12 @@ fn repo_tree(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or(false);
     let pairs = [
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("path", flex_str(&input, "path").unwrap_or_default()),
         ("ref", flex_str(&input, "ref").unwrap_or_default()),
         (
@@ -3065,6 +3183,12 @@ fn commit_list(input: Value, host: &mut Host) -> Result<Value, String> {
     );
     let pairs = [
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("ref_name", flex_str(&input, "ref").unwrap_or_default()),
         ("path", flex_str(&input, "file_path").unwrap_or_default()),
         ("author", flex_str(&input, "author").unwrap_or_default()),
@@ -3111,6 +3235,12 @@ fn tag_list(input: Value, host: &mut Host) -> Result<Value, String> {
     );
     let pairs = [
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("search", flex_str(&input, "search").unwrap_or_default()),
     ];
     gl_get(
@@ -3194,7 +3324,8 @@ fn search_blobs(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = flex_str(&input, "project");
     let group = flex_str(&input, "group");
     let git_ref = flex_str(&input, "ref").unwrap_or_default();
-    let scope = format!("?scope=blobs&search={}&per_page={limit}", enc(&query));
+    let page = page_qs(&input);
+    let scope = format!("?scope=blobs&search={}&per_page={limit}{page}", enc(&query));
     let path = if let Some(p) = project {
         let r = if git_ref.is_empty() {
             String::new()
@@ -3215,11 +3346,23 @@ fn search_blobs(input: Value, host: &mut Host) -> Result<Value, String> {
                 for m in arr {
                     if let Some(Value::String(data)) = m.get_mut("data") {
                         if data.len() > max {
-                            let mut end = max;
+                            // The cap includes the marker (GL-035): the returned string never
+                            // exceeds the requested max_data_bytes.
+                            const MARKER: &str = "\n[snippet truncated]";
+                            let budget = max.saturating_sub(MARKER.len());
+                            let mut end = budget;
                             while end > 0 && !data.is_char_boundary(end) {
                                 end -= 1;
                             }
-                            *data = format!("{}\n[snippet truncated]", &data[..end]);
+                            *data = if end == 0 {
+                                let mut bare = max.min(data.len());
+                                while bare > 0 && !data.is_char_boundary(bare) {
+                                    bare -= 1;
+                                }
+                                data[..bare].to_string()
+                            } else {
+                                format!("{}{MARKER}", &data[..end])
+                            };
                             m["data_truncated"] = json!(true);
                         }
                     }
@@ -3236,35 +3379,42 @@ fn search_blobs(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn mr_changes(input: Value, host: &mut Host) -> Result<Value, String> {
     let (project, iid) = mr_address(&input)?;
-    let max_files = clamp(flex_i64(&input, &["max_files"]).unwrap_or(0), 50, 200);
+    let max_files = clamp(flex_i64(&input, &["max_files"]).unwrap_or(0), 50, 200) as usize;
     let max_diff_bytes = clamp(
         flex_i64(&input, &["max_diff_bytes"]).unwrap_or(0),
         16384,
         262144,
     ) as usize;
-    // Diffs (unique `/diffs` substring) before the MR detail (for diff_refs).
-    let diffs = gl_get(
-        host,
-        &format!(
-            "/projects/{}/merge_requests/{iid}/diffs?per_page={max_files}",
-            enc(&project)
-        ),
-    )?;
-    let detail = gl_get(
-        host,
-        &format!("/projects/{}/merge_requests/{iid}", enc(&project)),
-    )?;
-    let diff_refs = detail.get("diff_refs").cloned().unwrap_or(Value::Null);
     let file_filter = flex_str(&input, "file");
     let mut files = Vec::new();
-    if let Some(arr) = diffs.as_array() {
-        for f in arr {
+    let mut files_truncated = false;
+    // Paginate the diff list (unique `/diffs` substring, fetched before the MR detail) and apply
+    // the `file` filter BEFORE the file cap (GL-042) — asking for a specific file can never
+    // return empty just because it sits beyond the first page (GL-043).
+    let mut page = 1;
+    loop {
+        let diffs = gl_get(
+            host,
+            &format!(
+                "/projects/{}/merge_requests/{iid}/diffs?per_page=100&page={page}",
+                enc(&project)
+            ),
+        )?;
+        let arr = diffs.as_array().cloned().unwrap_or_default();
+        let page_len = arr.len();
+        for f in &arr {
             if let Some(ff) = &file_filter {
                 let np = f.get("new_path").and_then(|v| v.as_str()).unwrap_or("");
                 let op = f.get("old_path").and_then(|v| v.as_str()).unwrap_or("");
                 if np != ff && op != ff {
                     continue;
                 }
+            }
+            if files.len() >= max_files {
+                // GL-044: the file-count cut has its own top-level flag, distinct from the
+                // per-file `diff_truncated`.
+                files_truncated = true;
+                break;
             }
             let mut fc = f.clone();
             if let Some(d) = f.get("diff").and_then(|v| v.as_str()) {
@@ -3275,35 +3425,50 @@ fn mr_changes(input: Value, host: &mut Host) -> Result<Value, String> {
             }
             files.push(fc);
         }
+        let filter_satisfied = file_filter.is_some() && !files.is_empty();
+        if files_truncated || filter_satisfied || page_len < 100 {
+            break;
+        }
+        page += 1;
     }
+    let detail = gl_get(
+        host,
+        &format!("/projects/{}/merge_requests/{iid}", enc(&project)),
+    )?;
+    let diff_refs = detail.get("diff_refs").cloned().unwrap_or(Value::Null);
     let count = files.len();
-    Ok(
-        json!({ "project": project, "iid": iid, "diff_refs": diff_refs, "files": files, "count": count }),
-    )
+    Ok(json!({
+        "project": project, "iid": iid, "diff_refs": diff_refs, "files": files,
+        "count": count, "files_truncated": files_truncated
+    }))
 }
 
 fn mr_diff_lines(input: Value, host: &mut Host) -> Result<Value, String> {
     let (project, iid) = mr_address(&input)?;
     let file = flex_str(&input, "file").ok_or("`file` (string) required")?;
-    let diffs = gl_get(
-        host,
-        &format!(
-            "/projects/{}/merge_requests/{iid}/diffs?per_page=200",
-            enc(&project)
-        ),
-    )?;
-    let fd = find_file_diff(&diffs, &file)
+    let fd = fetch_file_diff(host, &project, iid, &file)?
         .ok_or_else(|| format!("file {file:?} is not part of this merge request"))?;
     let parsed = parse_unified_diff(fd.get("diff").and_then(|v| v.as_str()).unwrap_or(""));
     let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 200, 2000) as usize;
     let mut lines = Vec::new();
     let mut truncated = false;
-    if let Some(target) = flex_i64(&input, &["line"]) {
+    // Anchor on a new-file `line`, or an old-file `old_line` (GL-047 — deleted/context lines);
+    // `line` wins when both are set.
+    let anchor = flex_i64(&input, &["line"])
+        .map(|t| (t, false))
+        .or_else(|| flex_i64(&input, &["old_line"]).map(|t| (t, true)));
+    if let Some((target, on_old)) = anchor {
         let ctx = flex_i64(&input, &["context"]).unwrap_or(3).max(0) as usize;
-        match parsed
-            .iter()
-            .position(|l| l.new_line == target && l.kind != "deleted")
-        {
+        let pos = if on_old {
+            parsed
+                .iter()
+                .position(|l| l.old_line == target && l.kind != "added")
+        } else {
+            parsed
+                .iter()
+                .position(|l| l.new_line == target && l.kind != "deleted")
+        };
+        match pos {
             Some(idx) => {
                 let start = idx.saturating_sub(ctx);
                 let end = (idx + ctx + 1).min(parsed.len());
@@ -3316,9 +3481,10 @@ fn mr_diff_lines(input: Value, host: &mut Host) -> Result<Value, String> {
                 }
             }
             None => {
+                let side = if on_old { "old-file" } else { "new-file" };
                 return Ok(json!({
                     "project": project, "iid": iid, "file": file, "lines": [], "count": 0,
-                    "hint": format!("new-file line {target} is not part of this file's diff")
+                    "hint": format!("{side} line {target} is not part of this file's diff")
                 }));
             }
         }
@@ -3376,14 +3542,23 @@ fn compare(input: Value, host: &mut Host) -> Result<Value, String> {
             if straight { "&straight=true" } else { "" }
         ),
     )?;
-    let commits = result.get("commits").cloned().unwrap_or(json!([]));
-    let commit_count = commits.as_array().map(|a| a.len()).unwrap_or(0);
+    let max_commits = clamp(flex_i64(&input, &["max_commits"]).unwrap_or(0), 50, 500) as usize;
+    let commit_arr = result
+        .get("commits")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // GL-045: commits are capped with their own marker; `commit_count` stays the full total.
+    let commit_count = commit_arr.len();
+    let commits_truncated = commit_count > max_commits;
+    let commits: Vec<Value> = commit_arr.into_iter().take(max_commits).collect();
     let mut files = Vec::new();
-    let mut truncated = false;
+    let mut files_truncated = false;
+    let mut any_diff_truncated = false;
     if let Some(arr) = result.get("diffs").and_then(|v| v.as_array()) {
         for f in arr {
             if files.len() >= max_files {
-                truncated = true;
+                files_truncated = true;
                 break;
             }
             let mut fc = f.clone();
@@ -3391,17 +3566,23 @@ fn compare(input: Value, host: &mut Host) -> Result<Value, String> {
                 if let Some(capped) = cap_bytes(d, max_diff_bytes) {
                     fc["diff"] = json!(capped);
                     fc["diff_truncated"] = json!(true);
+                    any_diff_truncated = true;
                 }
             }
             files.push(fc);
         }
     }
     let file_count = files.len();
+    // GL-014: the top-level flag is true when ANYTHING was cut — dropped files, a capped
+    // per-file diff, or capped commits — with per-cause flags alongside.
     Ok(json!({
         "project": project, "from": from, "to": to,
         "web_url": result.get("web_url"),
         "commits": commits, "commit_count": commit_count,
-        "files": files, "file_count": file_count, "truncated": truncated
+        "commits_truncated": commits_truncated,
+        "files": files, "file_count": file_count,
+        "files_truncated": files_truncated,
+        "truncated": files_truncated || any_diff_truncated || commits_truncated
     }))
 }
 
@@ -3412,10 +3593,11 @@ fn mr_discussion_list(input: Value, host: &mut Host) -> Result<Value, String> {
         50,
         200,
     );
+    let page = page_qs(&input);
     gl_get(
         host,
         &format!(
-            "/projects/{}/merge_requests/{iid}/discussions?per_page={limit}",
+            "/projects/{}/merge_requests/{iid}/discussions?per_page={limit}{page}",
             enc(&project)
         ),
     )
@@ -3455,14 +3637,7 @@ fn mr_discussion_create(input: Value, host: &mut Host) -> Result<Value, String> 
             &format!("/projects/{}/merge_requests/{iid}", enc(&project)),
         )?;
         let refs = detail.get("diff_refs").cloned().unwrap_or(Value::Null);
-        let diffs = gl_get(
-            host,
-            &format!(
-                "/projects/{}/merge_requests/{iid}/diffs?per_page=200",
-                enc(&project)
-            ),
-        )?;
-        let fd = find_file_diff(&diffs, &path)
+        let fd = fetch_file_diff(host, &project, iid, &path)?
             .ok_or_else(|| format!("file {path:?} is not part of this merge request"))?;
         let old_path = fd
             .get("old_path")
@@ -3723,8 +3898,9 @@ fn job_list(input: Value, host: &mut Host) -> Result<Value, String> {
         50,
         200,
     );
+    let page = page_qs(&input);
     let mut path = format!(
-        "/projects/{}/pipelines/{id}/jobs?per_page={limit}",
+        "/projects/{}/pipelines/{id}/jobs?per_page={limit}{page}",
         enc(&project)
     );
     if let Some(scopes) = input.get("scope").and_then(|v| v.as_array()) {
@@ -3746,6 +3922,12 @@ fn environment_list(input: Value, host: &mut Host) -> Result<Value, String> {
     );
     let pairs = [
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("search", flex_str(&input, "search").unwrap_or_default()),
         ("states", flex_str(&input, "states").unwrap_or_default()),
     ];
@@ -3764,6 +3946,12 @@ fn deployment_list(input: Value, host: &mut Host) -> Result<Value, String> {
     );
     let pairs = [
         ("per_page", limit.to_string()),
+        (
+            "page",
+            flex_i64(&input, &["page"])
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+        ),
         ("order_by", "created_at".to_string()),
         ("sort", "desc".to_string()),
         (
@@ -3789,9 +3977,13 @@ fn release_list(input: Value, host: &mut Host) -> Result<Value, String> {
         20,
         200,
     );
+    let page = page_qs(&input);
     gl_get(
         host,
-        &format!("/projects/{}/releases?per_page={limit}", enc(&project)),
+        &format!(
+            "/projects/{}/releases?per_page={limit}{page}",
+            enc(&project)
+        ),
     )
 }
 
@@ -3861,10 +4053,11 @@ fn release_link_list(input: Value, host: &mut Host) -> Result<Value, String> {
         20,
         200,
     );
+    let page = page_qs(&input);
     gl_get(
         host,
         &format!(
-            "/projects/{}/releases/{}/assets/links?per_page={limit}",
+            "/projects/{}/releases/{}/assets/links?per_page={limit}{page}",
             enc(&project),
             enc(&tag)
         ),
@@ -3994,6 +4187,17 @@ fn repository_archive(input: Value, host: &mut Host) -> Result<Value, String> {
         qs(&pairs)
     );
     let bytes = gl_get_bytes(host, &path)?;
+    // GL-023: an "archive read" must not stage an unbounded blob — refuse oversized results
+    // (the caller raises max_bytes explicitly to accept a bigger archive).
+    let max_bytes = flex_i64(&input, &["max_bytes"])
+        .filter(|v| *v > 0)
+        .unwrap_or(52_428_800) as usize;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "archive is {} bytes, exceeding max_bytes {max_bytes} — pass a larger max_bytes to accept it",
+            bytes.len()
+        ));
+    }
     let mut name = project.replace(['/', ' '], "-");
     if let Some(r) = &git_ref {
         name.push('-');
@@ -4176,6 +4380,34 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffLine> {
 }
 
 /// Find one file's diff object within an MR/compare change set by `new_path` or `old_path`.
+/// The diff entry for `file`, paginating the MR diff list past a single page (GL-043) — a file
+/// beyond the first page of changed files is still addressable. `None` when the file is not part
+/// of the merge request.
+fn fetch_file_diff(
+    host: &mut Host,
+    project: &str,
+    iid: i64,
+    file: &str,
+) -> Result<Option<Value>, String> {
+    let mut page = 1;
+    loop {
+        let diffs = gl_get(
+            host,
+            &format!(
+                "/projects/{}/merge_requests/{iid}/diffs?per_page=100&page={page}",
+                enc(project)
+            ),
+        )?;
+        if let Some(fd) = find_file_diff(&diffs, file) {
+            return Ok(Some(fd.clone()));
+        }
+        if diffs.as_array().map(|a| a.len()).unwrap_or(0) < 100 {
+            return Ok(None);
+        }
+        page += 1;
+    }
+}
+
 fn find_file_diff<'a>(diffs: &'a Value, file: &str) -> Option<&'a Value> {
     diffs.as_array()?.iter().find(|f| {
         f.get("new_path").and_then(|v| v.as_str()) == Some(file)
@@ -4183,16 +4415,28 @@ fn find_file_diff<'a>(diffs: &'a Value, file: &str) -> Option<&'a Value> {
     })
 }
 
-/// Truncate `s` to at most `max` bytes on a char boundary, appending a marker; `None` if it fits.
+/// Truncate `s` so the RESULT — marker included — is at most `max` bytes on a char boundary;
+/// `None` if it fits. The cap is a promise about the returned string (GL-035); when `max` is too
+/// small to fit the marker, the bare capped prefix is returned (the caller's `*_truncated` flag
+/// still signals the cut).
 fn cap_bytes(s: &str, max: usize) -> Option<String> {
+    const MARKER: &str = "\n[diff truncated]";
     if max == 0 || s.len() <= max {
         return None;
     }
-    let mut end = max;
+    let budget = max.saturating_sub(MARKER.len());
+    let mut end = budget;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    Some(format!("{}\n[diff truncated]", &s[..end]))
+    if end == 0 {
+        let mut bare = max.min(s.len());
+        while bare > 0 && !s.is_char_boundary(bare) {
+            bare -= 1;
+        }
+        return Some(s[..bare].to_string());
+    }
+    Some(format!("{}{MARKER}", &s[..end]))
 }
 
 // ---------------------------------------------------------------------------
@@ -5377,7 +5621,12 @@ mod tests {
 
     #[test]
     fn repo_file_show_respects_max_bytes() {
-        let content = "a".repeat(1000);
+        // GL-013: `max_bytes` caps the DECODED bytes and re-encodes, so the returned `content`
+        // is always valid base64 (the old byte-cap on the base64 string yielded an undecodable
+        // fragment).
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let content = engine.encode("x".repeat(1000));
         let mut host = base().with_http(
             "/repository/files/big.txt?ref=main",
             json!({ "file_path": "big.txt", "content": content, "encoding": "base64" }),
@@ -5393,7 +5642,26 @@ mod tests {
             &mut host,
         );
         let got = out["content"].as_str().unwrap();
-        assert!(got.len() <= 100, "content len {} > 100", got.len());
+        let decoded = engine
+            .decode(got)
+            .expect("capped content stays valid base64");
+        assert_eq!(decoded.len(), 100, "cap applies to decoded bytes");
+        assert_eq!(decoded, "x".repeat(100).into_bytes());
+        assert_eq!(out["truncated"], true);
+    }
+
+    #[test]
+    fn repo_file_show_caps_plain_text_on_byte_boundary() {
+        let mut host = base().with_http(
+            "/repository/files/notes.txt?ref=main",
+            json!({ "file_path": "notes.txt", "content": "b".repeat(500), "encoding": "text" }),
+        );
+        let out = run(
+            "gitlab.repository.file.show",
+            json!({ "project": "group/app", "path": "notes.txt", "ref": "main", "max_bytes": 64 }),
+            &mut host,
+        );
+        assert_eq!(out["content"].as_str().unwrap().len(), 64);
         assert_eq!(out["truncated"], true);
     }
 
@@ -5409,15 +5677,15 @@ mod tests {
             json!({
                 "query": "fn main",
                 "project": "group/app",
-                "max_data_bytes": 10
+                "max_data_bytes": 40
             }),
             &mut host,
         );
+        // GL-035: the cap includes the marker — the returned string never exceeds the max.
         let got = out[0]["data"].as_str().unwrap();
-        let prefix = got
-            .strip_suffix("\n[snippet truncated]")
+        assert!(got.len() <= 40, "data len {} > 40", got.len());
+        got.strip_suffix("\n[snippet truncated]")
             .expect("truncated data should end with marker");
-        assert!(prefix.len() <= 10, "prefix len {} > 10", prefix.len());
         assert_eq!(out[0]["data_truncated"], true);
     }
 
@@ -5535,6 +5803,184 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("search:"), "unexpected error: {err}");
+    }
+
+    // ---- D-90: pagination & truncation truth ----
+
+    /// GL-042/GL-043: a `file` filter is applied BEFORE the file cap, paginating past the first
+    /// diff page — asking for a specific file can never return empty because of a hidden page
+    /// limit.
+    #[test]
+    fn mr_changes_finds_a_filtered_file_beyond_the_first_page() {
+        let page1: Vec<Value> = (0..100)
+            .map(|i| json!({ "new_path": format!("f{i}.rs"), "old_path": format!("f{i}.rs"), "diff": "@@\n" }))
+            .collect();
+        let host = base()
+            .with_http_seq("/diffs?per_page=100&page=1", json!(page1))
+            .with_http_seq(
+                "/diffs?per_page=100&page=2",
+                json!([{ "new_path": "deep.rs", "old_path": "deep.rs", "diff": "@@\n+x\n" }]),
+            );
+        let mut host = host.with_http(
+            "/merge_requests/7",
+            json!({ "diff_refs": { "head_sha": "h" } }),
+        );
+        let out = run(
+            "gitlab.mr.changes",
+            json!({ "ref": "group/app!7", "file": "deep.rs" }),
+            &mut host,
+        );
+        assert_eq!(out["count"], 1, "{out}");
+        assert_eq!(out["files"][0]["new_path"], "deep.rs");
+        assert_eq!(out["files_truncated"], false);
+    }
+
+    /// GL-044: the file-count cut has its own top-level flag, distinct from per-file
+    /// `diff_truncated`.
+    #[test]
+    fn mr_changes_reports_files_truncated() {
+        let page: Vec<Value> = (0..60)
+            .map(|i| json!({ "new_path": format!("f{i}.rs"), "old_path": format!("f{i}.rs"), "diff": "@@\n" }))
+            .collect();
+        let mut host = base()
+            .with_http("/diffs?per_page=100&page=1", json!(page))
+            .with_http("/merge_requests/7", json!({ "diff_refs": Value::Null }));
+        let out = run(
+            "gitlab.mr.changes",
+            json!({ "ref": "group/app!7", "max_files": 50 }),
+            &mut host,
+        );
+        assert_eq!(out["count"], 50);
+        assert_eq!(out["files_truncated"], true);
+    }
+
+    /// GL-045/GL-014: commits are capped with an honest marker, and the top-level `truncated`
+    /// is true when ANY part of the result was cut.
+    #[test]
+    fn compare_caps_commits_and_reports_truncation_truth() {
+        let commits: Vec<Value> = (0..60).map(|i| json!({ "id": format!("c{i}") })).collect();
+        let mut host = base().with_http(
+            "/repository/compare",
+            json!({ "web_url": "u", "commits": commits, "diffs": [] }),
+        );
+        let out = run(
+            "gitlab.compare",
+            json!({ "project": "group/app", "from": "main", "to": "feat", "max_commits": 10 }),
+            &mut host,
+        );
+        assert_eq!(out["commits"].as_array().unwrap().len(), 10);
+        assert_eq!(out["commit_count"], 60, "full total survives the cap");
+        assert_eq!(out["commits_truncated"], true);
+        assert_eq!(out["truncated"], true);
+
+        // A capped per-file diff also flips the aggregate flag (GL-014) — and the returned diff
+        // never exceeds the requested byte cap, marker included (GL-035). The byte cap floor is
+        // 16384, so build a diff bigger than that.
+        let big_diff = format!("@@\n+{}\n", "y".repeat(20000));
+        let mut host = base().with_http(
+            "/repository/compare",
+            json!({ "web_url": "u", "commits": [], "diffs": [{ "new_path": "a.rs", "diff": big_diff }] }),
+        );
+        let out = run(
+            "gitlab.compare",
+            json!({ "project": "group/app", "from": "main", "to": "feat", "max_diff_bytes": 16384 }),
+            &mut host,
+        );
+        assert_eq!(out["files"][0]["diff_truncated"], true);
+        assert!(
+            out["files"][0]["diff"].as_str().unwrap().len() <= 16384,
+            "cap includes the marker"
+        );
+        assert_eq!(out["files_truncated"], false);
+        assert_eq!(out["truncated"], true, "aggregate reflects the diff cut");
+    }
+
+    /// GL-047: a deleted line is addressable via `old_line` (it has no new-file number).
+    #[test]
+    fn mr_diff_lines_anchors_on_old_line() {
+        let mut host = base().with_http(
+            "/merge_requests/7/diffs",
+            json!([{ "new_path": "a.rs", "old_path": "a.rs", "diff": "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n" }]),
+        );
+        let out = run(
+            "gitlab.mr.diff.lines",
+            json!({ "ref": "group/app!7", "file": "a.rs", "old_line": 2, "context": 0 }),
+            &mut host,
+        );
+        let lines = out["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1, "{out}");
+        assert_eq!(lines[0]["type"], "deleted");
+        assert_eq!(lines[0]["target"], true);
+        // A missing old line reports an old-file hint, not a silent empty set.
+        let mut host = base().with_http(
+            "/merge_requests/7/diffs",
+            json!([{ "new_path": "a.rs", "old_path": "a.rs", "diff": "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n" }]),
+        );
+        let out = run(
+            "gitlab.mr.diff.lines",
+            json!({ "ref": "group/app!7", "file": "a.rs", "old_line": 99 }),
+            &mut host,
+        );
+        assert!(out["hint"].as_str().unwrap().contains("old-file line 99"));
+    }
+
+    /// GL-043: diff-line file resolution paginates past the first page of changed files.
+    #[test]
+    fn mr_diff_lines_resolves_a_file_beyond_the_first_page() {
+        let page1: Vec<Value> = (0..100)
+            .map(|i| json!({ "new_path": format!("f{i}.rs"), "old_path": format!("f{i}.rs"), "diff": "@@\n" }))
+            .collect();
+        let mut host = base()
+            .with_http_seq("/diffs?per_page=100&page=1", json!(page1))
+            .with_http_seq(
+                "/diffs?per_page=100&page=2",
+                json!([{ "new_path": "deep.rs", "old_path": "deep.rs", "diff": "@@ -1,1 +1,1 @@\n ctx\n" }]),
+            );
+        let out = run(
+            "gitlab.mr.diff.lines",
+            json!({ "ref": "group/app!7", "file": "deep.rs" }),
+            &mut host,
+        );
+        assert_eq!(out["count"], 1, "{out}");
+    }
+
+    /// GL-023: an oversized archive is refused instead of staged.
+    #[test]
+    fn repository_archive_refuses_an_oversized_download() {
+        let mut host = base().with_http_bytes("/repository/archive.tar.gz", vec![0u8; 4096]);
+        let err = manifest_builder()
+            .build()
+            .call(
+                "gitlab.repository.archive",
+                json!({ "project": "group/app", "max_bytes": 1024 }),
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(err.contains("exceeding max_bytes 1024"), "{err}");
+    }
+
+    /// GL-019: `page` walks beyond a capped first page, and an over-cap `limit` is rejected
+    /// instead of silently clamped.
+    #[test]
+    fn list_paging_is_explicit_and_over_cap_limits_reject() {
+        let mut host = base().with_http(
+            "/repository/tags?per_page=20&page=3",
+            json!([{ "name": "v3", "message": "" }]),
+        );
+        let out = run(
+            "gitlab.repository.tag.list",
+            json!({ "project": "group/app", "page": 3 }),
+            &mut host,
+        );
+        assert_eq!(out[0]["name"], "v3", "page reached the query");
+
+        let (valid, problems, _) =
+            validate("gitlab.mr.list", json!({ "project": "g/a", "limit": 500 }));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("<= 100")),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -6209,6 +6655,7 @@ mod schema_contract {
                         p("sort", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                         p("membership", Kind::Bool),
                     ],
                     vec![],
@@ -6230,6 +6677,7 @@ mod schema_contract {
                         p("sort", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                         p("source_branch", Kind::Str),
                         p("target_branch", Kind::Str),
                     ],
@@ -6259,6 +6707,7 @@ mod schema_contract {
                         p("sort", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6274,6 +6723,7 @@ mod schema_contract {
                         p("username", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6454,6 +6904,7 @@ mod schema_contract {
                         p("order_by", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec![],
                 ),
@@ -6586,6 +7037,7 @@ mod schema_contract {
                         p("recursive", Kind::Bool),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6620,6 +7072,7 @@ mod schema_contract {
                         p("until", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6647,6 +7100,7 @@ mod schema_contract {
                         p("search", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6701,6 +7155,7 @@ mod schema_contract {
                         p("ref", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                         p("max_data_bytes", Kind::Int),
                     ],
                     vec!["query"],
@@ -6729,6 +7184,7 @@ mod schema_contract {
                         p("iid", Kind::Int),
                         p("file", Kind::Str),
                         p("line", Kind::Int),
+                        p("old_line", Kind::Int),
                         p("context", Kind::Int),
                         p("search", Kind::Str),
                         p("limit", Kind::Int),
@@ -6746,6 +7202,7 @@ mod schema_contract {
                         p("straight", Kind::Bool),
                         p("max_files", Kind::Int),
                         p("max_diff_bytes", Kind::Int),
+                        p("max_commits", Kind::Int),
                     ],
                     vec!["project", "from", "to"],
                 ),
@@ -6759,6 +7216,7 @@ mod schema_contract {
                         p("iid", Kind::Int),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec![],
                 ),
@@ -6897,6 +7355,7 @@ mod schema_contract {
                         p("scope", Kind::ArrayAny),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project", "pipeline_id"],
                 ),
@@ -6910,6 +7369,7 @@ mod schema_contract {
                         p("states", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6923,6 +7383,7 @@ mod schema_contract {
                         p("status", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6934,6 +7395,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -7001,6 +7463,7 @@ mod schema_contract {
                         p("tag", Kind::Str),
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
+                        p("page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -7088,6 +7551,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("ref", Kind::Str),
                         p("path", Kind::Str),
+                        p("max_bytes", Kind::Int),
                         en(
                             "format",
                             &[

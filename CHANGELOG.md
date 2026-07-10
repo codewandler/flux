@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-90: gitlab pagination & truncation tell the truth.** Every bound-output gitlab op now
+  reports exactly what it returned. `file.show max_bytes` caps the DECODED bytes and re-encodes,
+  so `content` is always valid for its `encoding` instead of an undecodable base64 fragment
+  (GL-013). All byte caps (`max_diff_bytes`, `max_data_bytes`) are inclusive of their truncation
+  marker — the returned string never exceeds the requested maximum (GL-035). `compare` caps
+  commits (`max_commits`, default 50) and its top-level `truncated` is now true whenever ANYTHING
+  was cut — dropped files, a capped per-file diff, or capped commits — with per-cause
+  `files_truncated`/`commits_truncated` flags alongside (GL-014, GL-045). `mr.changes` paginates
+  the diff list and applies the `file` filter BEFORE the file cap, so a targeted file beyond the
+  first page can no longer come back empty, and reports `files_truncated` distinct from per-file
+  `diff_truncated` (GL-042, GL-044). `mr.diff.lines` and `mr.discussion.create` resolve files by
+  paginating ALL changed files instead of a hard-coded first 200 (GL-043), and `mr.diff.lines`
+  can anchor on a deleted line via `old_line` (GL-047). `repository.archive` refuses archives
+  over `max_bytes` (default 50 MiB) instead of staging an unbounded blob (GL-023). List ops take
+  an explicit 1-based `page` input and reject over-cap limits via the schema maximum instead of
+  silently clamping (GL-019).
+
 - **D-89: gitlab read defaults are honest — no silent scope-broadening or -narrowing.** `per_page`
   is now a documented alias of `limit` on every paginating gitlab op (previously accepted-but-ignored,
   GL-009), and non-positive `limit`/`per_page`/`max_bytes`/`max_files`/`max_diff_bytes`/
