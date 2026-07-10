@@ -2,7 +2,7 @@
 id: C-50
 title: Harden audited safety, correctness, and efficiency seams
 pillar: Core
-status: in-progress
+status: done
 design: docs/designs/audit-hardening-wave.md
 note: concurrent hardening wave from the 2026-07-10 repository audit
 ---
@@ -58,8 +58,9 @@ bounded, and auditable.
       demonstrates that changing it would regress intended behavior and records the disposition here.
 - [x] Terminal-bench token/cost telemetry is captured where the adapter exposes it, with unavailable
       fields represented as unavailable rather than zero.
-- [ ] CHANGELOG (and WHATS-NEW for user-visible changes), design/status documents, and the full workspace
-      gate are green.
+- [x] CHANGELOG (and WHATS-NEW for user-visible changes), design/status documents, and the full workspace
+      gate are green (re-verified 2026-07-10 alongside D-88: build, workspace tests, clippy -D warnings,
+      fmt --check, codegate all pass; the C-50 CHANGELOG entry shipped with 0.13.3).
 
 ## Progress
 
