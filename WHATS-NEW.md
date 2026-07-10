@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-07-10
+
 ### New
 
 - **Store an integration token once, use it in every session.** `flux auth set <plugin>

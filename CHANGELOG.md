@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-07-10
+
 ### Added
 
 - **D-126: `flux auth set <plugin> [<purpose>]` — stored bearer tokens for plugin auth purposes.**
