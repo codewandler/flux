@@ -3421,45 +3421,49 @@ mod tests {
     }
 
     /// Monotonic surfacing: once a group surfaces it stays advertised for the session, even after its
-    /// workspace marker disappears — so segment A's op catalog is a stable provider-cache prefix
-    /// (A-03) instead of flapping with `resolve_active_groups`'s stateless, per-turn result.
+    /// marker signal disappears — so segment A's op catalog is a stable provider-cache prefix (A-03)
+    /// instead of flapping with `resolve_active_groups`'s stateless, per-turn result.
     #[test]
     fn surfacing_is_monotonic_across_a_marker_flip() {
-        let dir = std::env::temp_dir().join(format!("flux-sticky-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let marker = dir.join("go.mod");
-        let _ = std::fs::remove_file(&marker); // clean slate from any prior run
+        // Use a synthetic ambient signal rather than a filesystem marker. `detect_signals` walks
+        // ancestors, so a host-owned marker such as `/tmp/.git` must not decide this test's state.
+        let dir = std::env::temp_dir();
+        let marker = "test_sticky_marker".to_string();
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         let groups = vec![flux_evidence::ToolGroup {
-            name: "go".into(),
+            name: "sticky-test".into(),
             description: String::new(),
             tools: vec!["echo".into()],
             surface_when: vec![flux_evidence::SignalMatch {
                 kind: flux_evidence::KIND_SIGNAL.to_string(),
-                signal: Some("go".into()),
+                signal: Some(marker.clone()),
             }],
         }];
         let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        // Turn A — no `go.mod`: the Go group is inactive, so `echo` is gated (not advertised).
+        // Turn A — no marker signal: the group is inactive, so `echo` is gated (not advertised).
         let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             !a.contains("echo"),
             "echo gated before the marker appears: {a:?}"
         );
 
-        // Turn B — `go.mod` present: the group surfaces, `echo` is advertised.
-        std::fs::write(&marker, "module test\n").unwrap();
-        let (b, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
+        // Turn B — marker signal present: the group surfaces, `echo` is advertised.
+        let (b, _) = surfaced_op_names(
+            &registry,
+            &groups,
+            &dir,
+            &sticky,
+            std::slice::from_ref(&marker),
+        );
         assert!(
             b.contains("echo"),
             "echo advertised once the marker is present: {b:?}"
         );
 
-        // Turn C — `go.mod` removed: stateless resolution would drop `echo`, but the sticky union keeps
-        // the group surfaced, so the advertised catalog never shrinks.
-        std::fs::remove_file(&marker).unwrap();
+        // Turn C — marker signal absent: stateless resolution would drop `echo`, but the sticky union
+        // keeps the group surfaced, so the advertised catalog never shrinks.
         let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             c.contains("echo"),
