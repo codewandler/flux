@@ -167,6 +167,40 @@ impl WorkspaceConfig {
     }
 }
 
+/// The `[sandbox]` table — OS-level process confinement (bubblewrap on Linux, Seatbelt on macOS)
+/// applied at `flux-system`'s process choke point (D-130). Opt-in and default off. Real backends
+/// ship on Linux (bubblewrap, D-131) and macOS (Seatbelt, D-132); on a platform without one
+/// (Windows), or when the backend is present but unusable, `enabled` degrades with a one-line
+/// startup warning and `require` fails closed at startup. `#[serde(deny_unknown_fields)]` turns a
+/// typo'd key (e.g. `requre = true`) into a hard parse error rather than a silently-dropped —
+/// and thus fail-open — setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// Turn on OS sandboxing for spawned processes (shell ops + plugin subprocesses).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fail closed instead of warn-and-continue when no sandbox backend is available. Implies
+    /// `enabled`.
+    #[serde(default)]
+    pub require: bool,
+    /// Whether sandboxed processes may reach the network. Absent means the unrestricted default;
+    /// `false` closes the sandbox's network namespace/profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
+    /// Extra writable paths sandboxed processes may write to, beyond the workspace root, named
+    /// roots, `/tmp`/`$TMPDIR`, and the toolchain caches. A leading `~/` expands to the home
+    /// directory (mirrors `[workspace] add_dirs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<String>,
+}
+
+impl SandboxConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled && !self.require && self.network.is_none() && self.writable.is_empty()
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,6 +244,10 @@ pub struct Config {
     /// a `PATH` search for well-known Chromium binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_bin: Option<String>,
+    /// OS-level process sandboxing (D-130): opt-in bubblewrap/Seatbelt confinement for spawned
+    /// processes.
+    #[serde(default, skip_serializing_if = "SandboxConfig::is_default")]
+    pub sandbox: SandboxConfig,
 }
 
 /// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
@@ -380,6 +418,37 @@ impl Config {
     pub fn workspace_allow_all(&self) -> bool {
         self.workspace.allow_all
     }
+
+    /// Whether the config turns on OS sandboxing for spawned processes (D-130). `require` implies
+    /// this even if `enabled` alone is unset.
+    pub fn sandbox_enabled(&self) -> bool {
+        self.sandbox.enabled || self.sandbox.require
+    }
+
+    /// Whether the config requires a working sandbox backend (fail closed rather than warn).
+    pub fn sandbox_require(&self) -> bool {
+        self.sandbox.require
+    }
+
+    /// The configured sandbox network posture. `None` means the unrestricted default.
+    pub fn sandbox_network(&self) -> Option<bool> {
+        self.sandbox.network
+    }
+
+    /// The configured extra sandbox-writable paths, with a leading `~/` expanded (mirrors
+    /// `workspace_add_dirs`). Relative paths are left relative (resolved against the cwd by the
+    /// caller).
+    pub fn sandbox_writable(&self) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.sandbox
+            .writable
+            .iter()
+            .map(|d| match (d.strip_prefix("~/"), &home) {
+                (Some(rest), Some(h)) => h.join(rest),
+                _ => PathBuf::from(d),
+            })
+            .collect()
+    }
 }
 
 fn home_config_path() -> Option<PathBuf> {
@@ -501,6 +570,26 @@ fn merge(user: Config, project: Config) -> Config {
         },
         // Scalar: a project value overrides the user's.
         browser_bin: project.browser_bin.or(user.browser_bin),
+        sandbox: merge_sandbox(user.sandbox, project.sandbox),
+    }
+}
+
+/// Security-directional merge for `[sandbox]`: `enabled`/`require` are OR'd (a project may tighten
+/// confinement the user didn't ask for, never loosen a user's `require`); `network` is
+/// strictest-wins (either side explicitly closing the network wins, matching `enabled`/`require`'s
+/// "either side may only tighten" direction); `writable` concatenates (a documented widening, like
+/// `[workspace] add_dirs` — a project may need to declare a build-output dir the sandbox must
+/// allow writes to).
+fn merge_sandbox(user: SandboxConfig, project: SandboxConfig) -> SandboxConfig {
+    SandboxConfig {
+        enabled: user.enabled || project.enabled,
+        require: user.require || project.require,
+        network: match (user.network, project.network) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (None, None) => None,
+        },
+        writable: dedupe([project.writable, user.writable].concat()),
     }
 }
 
@@ -1147,6 +1236,100 @@ gitlab = ["gitlab.internal"]
 
         std::fs::remove_dir_all(&project).ok();
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// D-130: `[sandbox]` parses, and the merge is security-directional — `enabled`/`require`
+    /// OR (a project may tighten confinement, never loosen a user's `require`), `writable`
+    /// concatenates (project first, deduplicated) like `[workspace] add_dirs`, and `~/` expands.
+    #[test]
+    fn sandbox_config_parses_and_merges_security_directional() {
+        let project = temp_dir();
+        let home = temp_dir();
+        let _home = crate::HOME_LOCK.lock().unwrap();
+        std::env::set_var("HOME", &home);
+        std::fs::write(
+            home.join(".flux").join("config.toml"),
+            "[sandbox]\nrequire = true\nwritable = [\"~/scratch\"]\n",
+        )
+        .unwrap();
+        write_project(
+            &project,
+            "[sandbox]\nenabled = true\nnetwork = false\nwritable = [\"/data/out\"]\n",
+        );
+
+        let cfg = load(&project).unwrap();
+        // The user's `require` survives even though the project only set `enabled`.
+        assert!(cfg.sandbox_enabled());
+        assert!(cfg.sandbox_require(), "user require is not lost");
+        assert_eq!(
+            cfg.sandbox_network(),
+            Some(false),
+            "an explicit false narrows the network posture"
+        );
+        assert_eq!(
+            cfg.sandbox.writable,
+            vec!["/data/out", "~/scratch"],
+            "project writable first, de-duplicated"
+        );
+        let paths = cfg.sandbox_writable();
+        assert_eq!(paths[0], PathBuf::from("/data/out"));
+        assert_eq!(paths[1], home.join("scratch"), "~/ expands against HOME");
+
+        // An absent `[sandbox]` table is the default: off, unrestricted network, no extras.
+        let default_cfg = Config::default();
+        assert!(!default_cfg.sandbox_enabled());
+        assert!(!default_cfg.sandbox_require());
+        assert_eq!(default_cfg.sandbox_network(), None);
+        assert!(default_cfg.sandbox_writable().is_empty());
+        assert!(default_cfg.sandbox.is_default());
+
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The strictest-wins direction for `network`: either side explicitly narrowing to `false`
+    /// wins over the other side explicitly widening to `true` — narrowing a security posture is
+    /// never overridden by a looser co-located config.
+    #[test]
+    fn sandbox_network_merge_is_strictest_wins() {
+        let closed = SandboxConfig {
+            network: Some(false),
+            ..Default::default()
+        };
+        let open = SandboxConfig {
+            network: Some(true),
+            ..Default::default()
+        };
+        let unset = SandboxConfig::default();
+
+        assert_eq!(
+            merge_sandbox(closed.clone(), open.clone()).network,
+            Some(false)
+        );
+        assert_eq!(
+            merge_sandbox(open.clone(), closed.clone()).network,
+            Some(false)
+        );
+        assert_eq!(
+            merge_sandbox(open.clone(), unset.clone()).network,
+            Some(true)
+        );
+        assert_eq!(merge_sandbox(unset.clone(), open).network, Some(true));
+        assert_eq!(merge_sandbox(unset.clone(), unset).network, None);
+    }
+
+    /// D-130 (finding 13): a typo'd key inside `[sandbox]` is a hard parse error, not a silently
+    /// dropped setting — otherwise `requre = true` would fail *open* (no `require`), the worst
+    /// possible direction for a security posture. `#[serde(deny_unknown_fields)]` enforces this.
+    #[test]
+    fn unknown_sandbox_key_is_rejected() {
+        let err = toml::from_str::<Config>("[sandbox]\nrequre = true\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+        // A malformed `[sandbox]` table therefore fails the whole load (caller surfaces it).
+        let dir = temp_dir();
+        write_project(&dir, "[sandbox]\nrequre = true\n");
+        assert!(load(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

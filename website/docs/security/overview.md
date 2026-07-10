@@ -28,6 +28,7 @@ There are three directions of trust to keep separate in your head:
 | The envelope | The agent can't touch fs/process/network except through one gated chain | [Safety & approvals](../agent/safety.md) |
 | Credentials & secrets | Provider and plugin tokens; secret values never reach the model | [Credentials & secrets](./credentials.md) |
 | Plugin capability sandbox | What a plugin's code can reach *through flux* | [Plugin capability sandbox](./plugin-sandbox.md) |
+| OS process sandbox | What a spawned process's raw syscalls can reach (opt-in) | [OS process sandboxing](./os-sandbox.md) |
 | Plugin trust & signing | *Which* plugin code runs — supply-chain integrity | [Plugin trust & signing](./plugin-trust.md) |
 | Server auth & tenancy | Who may drive a networked flux, and tenant isolation | [Server authentication & tenancy](./server-auth.md) |
 
@@ -40,10 +41,12 @@ you knowing them:
   default store is `~/.flux/credentials.toml`, written `0600` (owner-only) via an atomic write. That
   is the whole at-rest protection under the default backend. Encryption/externalization is an opt-in
   choice (a Vault-backed store) — see [Credentials & secrets](./credentials.md).
-- **Plugins are capability-confined and integrity-pinned — not OS-sandboxed.** A plugin binary is
-  trusted, pinned code, launched with a cleared environment and able to reach only what its manifest
-  declared *through flux*. flux does not run it in an OS sandbox. Review plugins the way you review
-  dependencies — see [Plugin trust & signing](./plugin-trust.md).
+- **Plugins are capability-confined and integrity-pinned — not OS-sandboxed by default.** A plugin
+  binary is trusted, pinned code, launched with a cleared environment and able to reach only what
+  its manifest declared *through flux*. flux does not run it in an OS sandbox unless you opt in via
+  `[sandbox]` (bubblewrap on Linux, Seatbelt on macOS) — see
+  [OS process sandboxing](./os-sandbox.md). Review plugins the way you review dependencies — see
+  [Plugin trust & signing](./plugin-trust.md).
 
 ## Where things live
 
@@ -58,4 +61,5 @@ Everything below is enforced in the runtime, not asked of you as convention.
 
 - [Safety & approvals](../agent/safety.md) — local filesystem/process/network access.
 - [Credentials and secrets](./credentials.md) — outbound tokens and redaction.
+- [OS process sandboxing](./os-sandbox.md) — opt-in confinement of spawned processes' raw syscalls.
 - [Server authentication & tenancy](./server-auth.md) — inbound callers and realm isolation.

@@ -9,9 +9,11 @@ flux is built so every model-emitted operation, built-in tool, sub-agent operati
 and plugin **host-capability request** traverses one mandatory chain before flux performs real IO.
 This page explains that chain, what prompts, and how approval decisions interact with policy.
 
-Plugin executables are trusted native dependencies, not OS-sandboxed processes. The chain governs
+Plugin executables are trusted native dependencies, not OS-sandboxed by default. The chain governs
 their projected operations and host callbacks; it cannot prevent a malicious binary from making a
-direct syscall. See [Plugin trust & signing](../security/plugin-trust.md).
+direct syscall unless opt-in OS-level sandboxing (`[sandbox]`) is enabled underneath the envelope.
+See [Plugin trust & signing](../security/plugin-trust.md) and
+[OS process sandboxing](../security/os-sandbox.md).
 
 ## The one envelope
 
@@ -88,7 +90,8 @@ a role declared with `tools: []` gets **zero** tools.
 
 > No model-emitted operation, built-in tool, sub-agent operation, app operation, or plugin host
 > callback reaches real IO without traversing this envelope. Trusted native plugin code remains
-> outside that guarantee because it is not OS-sandboxed.
+> outside that guarantee: it is not OS-sandboxed by default, though opt-in OS-level sandboxing
+> (`[sandbox]`) closes that gap — see [OS process sandboxing](../security/os-sandbox.md).
 
 This is enforced by construction, not by convention — see [Concepts](../concepts.md) for how it fits
 the plan-first model, and the [source on GitHub](https://github.com/codewandler/flux) for the
@@ -98,4 +101,5 @@ runtime that enforces it.
 
 - [Credentials and secrets](../security/credentials.md) — how secret values stay out of model-visible output.
 - [Plugin capability sandbox](../security/plugin-sandbox.md) — how plugin side effects are scoped.
+- [OS process sandboxing](../security/os-sandbox.md) — opt-in confinement underneath this envelope.
 - [Server authentication & tenancy](../security/server-auth.md) — who can drive a hosted flux server.

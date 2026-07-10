@@ -59,6 +59,7 @@ use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry,
 };
+use flux_system::sandbox::{Sandbox, SandboxSettings};
 use flux_system::{System, Workspace};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -94,6 +95,7 @@ pub struct FlowClientBuilder {
     approver: Option<Arc<dyn Approver>>,
     seed_prelude: bool,
     compile_opts: CompileOptions,
+    sandbox: Option<Sandbox>,
 }
 
 impl Default for FlowClientBuilder {
@@ -108,6 +110,8 @@ impl Default for FlowClientBuilder {
             // Seed the planner catalog `$defs` with the v1-core artifact ontology by default.
             seed_prelude: true,
             compile_opts: CompileOptions::default(),
+            // Unset ⇒ resolve the OS-sandbox posture from the environment at `build` (off ⇒ disabled).
+            sandbox: None,
         }
     }
 }
@@ -147,6 +151,15 @@ impl FlowClientBuilder {
         self.seed_prelude = false;
         self
     }
+    /// Inject an explicit OS-sandbox [`Sandbox`] that the built client's guarded `System` enforces on
+    /// every spawn. When left unset (the default), the posture is resolved from the environment at
+    /// [`build`](Self::build) via `Sandbox::resolve(SandboxSettings::from_env())` — so a consumer that
+    /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
+    /// Pass one only to pin a posture independent of ambient env.
+    pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
     /// Override the compile front-end's attempt/step/token budgets.
     pub fn compile_options(mut self, opts: CompileOptions) -> Self {
         self.compile_opts = opts;
@@ -160,7 +173,13 @@ impl FlowClientBuilder {
         provider: Arc<dyn Provider>,
         root: impl Into<PathBuf>,
     ) -> Result<FlowClient> {
-        let system = Arc::new(System::new(Workspace::new(root.into())?));
+        // Attach the OS-sandbox posture so a consumer's `FLUX_SANDBOX=require` is honored on this
+        // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
+        // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
+        let sandbox = self
+            .sandbox
+            .unwrap_or_else(|| Sandbox::resolve(SandboxSettings::from_env()));
+        let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = assemble_registry(provider.clone(), self.model.clone());
         let store = FlowStore::in_memory()?;
         let prelude_defs = if self.seed_prelude {

@@ -107,7 +107,13 @@ impl GitContext {
 /// config resolving), output captured + capped, and a wall-clock timeout so a wedged git can't hang
 /// startup. `-C <root>` keeps the query scoped to the repo regardless of the workspace-pinned cwd.
 async fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let system = flux_system::System::new(flux_system::Workspace::new(root).ok()?);
+    // Attach the env-resolved OS-sandbox posture (`FLUX_SANDBOX*`, exported by the CLI at startup) so
+    // this throwaway startup-context `System` honors `require` like every model-facing spawn; a bare
+    // `System::new` would default to `Sandbox::disabled()` and silently escape confinement. Read-only
+    // `git -C` runs fine confined.
+    let system = flux_system::System::new(flux_system::Workspace::new(root).ok()?).with_sandbox(
+        flux_system::sandbox::Sandbox::resolve(flux_system::sandbox::SandboxSettings::from_env()),
+    );
     let mut argv = vec![
         "git".to_string(),
         "-C".to_string(),

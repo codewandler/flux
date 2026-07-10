@@ -15,6 +15,31 @@
 
 ## [Unreleased]
 
+### New
+
+- **Opt-in OS-level process sandboxing.** flux can now confine shell commands and plugin
+  subprocesses at their spawn boundary inside an OS sandbox: bubblewrap on Linux, Seatbelt on
+  macOS. It's an extra, opt-in layer *underneath* flux's existing safety checks, not a replacement
+  for them: even a plugin that tries to bypass those checks with a raw system call is now confined
+  in what it can read, write, and reach on the network. Off by default. Turn it on with
+  `flux --sandbox`, a `[sandbox]` block in `.flux/config.toml`, or `FLUX_SANDBOX=on`; add
+  `require = true` (or `FLUX_SANDBOX=require`) to have flux refuse to run rather than continue
+  unconfined when no sandbox is available. A new "OS process sandboxing" security guide on the
+  docs site covers what it protects, what it doesn't yet (stated plainly, not oversold), and how
+  it composes with the existing plugin security model. macOS support is implemented and tested in
+  isolation but still awaiting verification on real Apple hardware; Windows support isn't built
+  yet — enabling the sandbox there prints a warning (or, under
+  `require`, refuses to start) rather than silently doing nothing.
+
+### Fixed
+
+- **Sandboxing now fails closed and preserves supported workflows.** A malformed config stops
+  startup before any plugin can run; backend checks cannot hang on forked children and work on
+  NixOS/Guix PATH layouts; DNS no longer re-exposes host IPC sockets; writable `/` is rejected and
+  missing configured output directories are created; linked Git worktrees can update their index
+  and objects; and local eval hosts retain provider access when their descendants use network-off
+  confinement.
+
 ### Improved
 
 - GitLab results now tell you exactly what was cut, and nothing arrives broken. File previews

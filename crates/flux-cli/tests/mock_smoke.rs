@@ -68,3 +68,62 @@ fn mock_run_writes_flux_mock_file() {
     );
     // `tmp` cleans itself up on drop (including on an earlier panic).
 }
+
+#[cfg(unix)]
+#[test]
+fn malformed_config_stops_plugin_status_before_native_spawn() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = TempDir::new("malformed-config-plugin-status");
+    let work = tmp.path().join("work");
+    let home = tmp.path().join("home");
+    let plugins = home.join(".flux/plugins");
+    std::fs::create_dir_all(work.join(".flux")).unwrap();
+    std::fs::create_dir_all(&plugins).unwrap();
+
+    // `require` is present, but the adjacent typo makes the deny-unknown-fields config fail as a
+    // whole. Startup must not replace it with the default-off posture and continue to a native
+    // plugin spawn.
+    std::fs::write(
+        work.join(".flux/config.toml"),
+        "[sandbox]\nrequire = true\nenabeld = true\n",
+    )
+    .unwrap();
+    let marker = tmp.path().join("plugin-was-spawned");
+    let plugin = tmp.path().join("probe-plugin.sh");
+    std::fs::write(
+        &plugin,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&plugin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin, perms).unwrap();
+    std::fs::write(
+        plugins.join("probe.toml"),
+        format!("program = {:?}\nargs = []\n", plugin.display().to_string()),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["plugin", "status", "probe"])
+        .current_dir(&work)
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env_remove("FLUX_SANDBOX")
+        .env_remove("FLUX_SANDBOXED")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn flux");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "malformed security config must stop startup: {stderr}"
+    );
+    assert!(stderr.contains("config.toml"), "{stderr}");
+    assert!(
+        !marker.exists(),
+        "plugin executed despite malformed config with a requested fail-closed posture"
+    );
+}

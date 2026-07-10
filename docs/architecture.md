@@ -202,7 +202,11 @@ provider is a small composition, never a fork of the loop. Streaming is a
   host as **capabilities the plugin declares in its manifest** (`process` allow-list, `secret` key
   allow-list, HTTP host allow-list, connection targets, private-network hosts) and the host checks
   every callback against that grant. A plugin gets no host capability by default; the plugin binary
-  itself is trusted, pinned code, not an OS-sandboxed workload.
+  itself is trusted, pinned code, not an OS-sandboxed workload by default. Opt-in OS-level process
+  sandboxing (`crates/flux-system/src/sandbox.rs`, `[sandbox]` config — bubblewrap on Linux,
+  Seatbelt on macOS, D-134..D-136) layers underneath as defense-in-depth: it confines what a
+  spawned process's raw syscalls can reach, whether or not the process honors the capability
+  protocol at all. See [designs/process-sandboxing.md](designs/process-sandboxing.md).
 - **Roles & skills**: markdown with frontmatter, discovered from `.flux/`.
 
 ## Surfaces

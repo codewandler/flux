@@ -38,8 +38,10 @@ plugin host callbacks for real filesystem, process, and network IO. That keeps w
 confinement, argv-vector process launching, network egress checks, approval, and secret redaction on
 one auditable route. The opt-in `bash` operation deliberately runs `sh -c` through this path.
 
-Plugin executables themselves are trusted native dependencies and are not OS-sandboxed. Their
-manifest constrains host callbacks; it cannot constrain arbitrary syscalls from malicious code.
+Plugin executables themselves are trusted native dependencies and are not OS-sandboxed by default.
+Their manifest constrains host callbacks; it cannot constrain arbitrary syscalls from malicious
+code unless opt-in OS-level sandboxing (`[sandbox]`) is enabled — see
+[OS process sandboxing](./security/os-sandbox.md).
 
 ## Strict crate layers
 
@@ -55,6 +57,8 @@ the **Improvement loop**.
 
 - [Concepts](./concepts.md) explains plans, symbols, evidence, and the agent loop.
 - [Safety & approvals](./agent/safety.md) describes policy, approval, and guarded IO in detail.
+- [OS process sandboxing](./security/os-sandbox.md) describes the opt-in bubblewrap/Seatbelt layer
+  underneath the envelope.
 - [Flux-Lang execution model](./language/execution-model.md) follows a plan from analysis through
   deterministic execution.
 - The repository's [contributor architecture](https://github.com/codewandler/flux/blob/main/docs/architecture.md)

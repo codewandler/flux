@@ -48,10 +48,12 @@ always tell verified pack binaries from your own dev builds.
 
 - **It does guarantee**: the binary you run is exactly the one the signed release published, byte for
   byte, and hasn't been swapped or corrupted since install.
-- **It does not guarantee** the code is harmless. Plugin binaries are **trusted, pinned code — not
-  OS-sandboxed.** Confinement of what the code can reach through flux is the
+- **It does not guarantee** the code is harmless. Plugin binaries are **trusted, pinned code — not OS-sandboxed by default.**
+  Confinement of what the code can reach through flux is the
   [capability sandbox](./plugin-sandbox.md)'s job (cleared environment, deny-by-default manifest,
-  host-does-all-IO). Review installed plugins the way you review dependencies.
+  host-does-all-IO); opt-in [OS process sandboxing](./os-sandbox.md) additionally confines what the
+  raw binary's syscalls can reach on disk and network. Review installed plugins the way you review
+  dependencies.
 - **Residual risk, stated honestly**: a compromised repository or CI pipeline could sign a malicious
   artifact, and the signature check would pass. The signing key lives only in a CI secret, never in
   the repo; stronger provenance (build attestation) is a named future hardening, not yet in place.
@@ -63,5 +65,6 @@ Together they are the plugin trust story; neither substitutes for the other.
 ## Related docs
 
 - [Plugin capability sandbox](./plugin-sandbox.md) — capability confinement after spawn.
+- [OS process sandboxing](./os-sandbox.md) — opt-in confinement of the raw plugin process.
 - [Using plugins](../plugins/using-plugins.md) — pack install, pinning, rollback, and local dev install.
 - [Credentials and secrets](./credentials.md) — plugin OAuth tokens and secret redaction.

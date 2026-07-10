@@ -78,6 +78,27 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
+### OS process sandboxing — bubblewrap · Seatbelt · graceful-Windows (epic) — **proposed 2026-07-10 (D-134…D-137)**
+
+The safety envelope governs what the *model* may request, but the processes flux ultimately spawns
+— shell commands and above all **stdio plugins** — run with the user's full OS access; five website
+pages honestly promise plugins are "not OS-sandboxed". This epic flips that disclaimer into a
+feature: an OS-level sandbox as defense-in-depth **underneath** the envelope, applied at flux's
+single spawn choke point (`System::build_command`), so shell ops and plugin subprocesses are
+confined by one seam. A concrete `Backend` enum (no trait) carries per-OS mechanics — **bubblewrap**
+on Linux (whole-fs read-only, writes confined to workspace/named-roots/tmp/toolchain-caches,
+network switchable via namespace), **Seatbelt** (`sandbox-exec` + generated SBPL profile) on macOS,
+**graceful degradation** on Windows (warn-and-run, or fail-closed under `require`; real backend is
+a follow-up). Opt-in default-off in v1 (`[sandbox]` config, `--sandbox`/`--no-sandbox`,
+`FLUX_SANDBOX` inheritance channel), orthogonal to the approval gate, browser `spawn_debug_pipe`
+deliberately exempt (Chrome's own sandbox is stronger than what would survive nesting). "Done" =
+the abstraction + both Unix backends landed with golden-argv/profile tests and live double-gated
+smokes ([D-134](stories/D-134-sandbox-abstraction-config-threading.md) ·
+[D-135](stories/D-135-bubblewrap-backend.md) · [D-136](stories/D-136-seatbelt-backend.md)), and the
+website security docs updated truthfully with the drift-guard test rewritten
+([D-137](stories/D-137-sandbox-docs-truth-pass.md)). Design:
+[designs/process-sandboxing.md](designs/process-sandboxing.md).
+
 ### Web capabilities — request · read · browse (epic) — **SHIPPED 2026-07-09 (D-98 + D-120…D-124 all done, in `[Unreleased]`)**
 
 Working with the web is **three fundamentally different capabilities** — distinguished by what the

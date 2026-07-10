@@ -120,9 +120,11 @@ capability model, references-only IO, and the manifest fields behind these grant
 ## Trust model
 
 The capability gates above are enforced on the **host** side; the plugin binary itself is trusted,
-pinned code — not OS-sandboxed. Review installed plugins the way you review dependencies. The
-signed pack, sha256 pinning, and spawn-time hash re-check tell you *which* code runs; the manifest
-gates and env-cleared spawn bound what conforming code can reach through flux.
+pinned code — not OS-sandboxed by default. Review installed plugins the way you review
+dependencies. The signed pack, sha256 pinning, and spawn-time hash re-check tell you *which* code
+runs; the manifest gates and env-cleared spawn bound what conforming code can reach through flux.
+Opt-in [OS process sandboxing](../security/os-sandbox.md) (`[sandbox]`) additionally confines what
+the raw plugin binary's syscalls can reach on disk and network.
 
 Both halves are documented under Security: [Plugin trust & signing](../security/plugin-trust.md)
 for *which* code runs, and [Plugin capability sandbox](../security/plugin-sandbox.md) for what host
@@ -137,3 +139,4 @@ See [Plugin authoring](./authoring.md).
 - [Plugin authoring](./authoring.md) — write a plugin and manifest.
 - [Plugin trust & signing](../security/plugin-trust.md) — signed index, hashes, and spawn-time checks.
 - [Plugin capability sandbox](../security/plugin-sandbox.md) — what a plugin may reach through flux.
+- [OS process sandboxing](../security/os-sandbox.md) — opt-in confinement of the raw plugin process.

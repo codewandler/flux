@@ -28,6 +28,11 @@ pub mod flow;
 
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
 
+/// The OS-sandbox posture types, re-exported so a consumer can inject an explicit sandbox into a
+/// builder via [`ClientBuilder::with_sandbox`]/[`flow::FlowClientBuilder::with_sandbox`] without
+/// taking a direct `flux-system` dependency.
+pub use flux_system::sandbox::{Sandbox, SandboxSettings};
+
 /// The Rust **embedded DSL** for authoring flows — builder primitives that compile to the Flux-Lang
 /// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
 /// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
@@ -71,6 +76,7 @@ pub struct ClientBuilder {
     deny: Vec<String>,
     auto_approve: bool,
     context: Vec<ContextBlock>,
+    sandbox: Option<Sandbox>,
 }
 
 impl Default for ClientBuilder {
@@ -85,6 +91,8 @@ impl Default for ClientBuilder {
             deny: Vec::new(),
             auto_approve: false,
             context: Vec::new(),
+            // Unset ⇒ resolve the posture from the environment at `build` (off ⇒ disabled).
+            sandbox: None,
         }
     }
 }
@@ -125,6 +133,15 @@ impl ClientBuilder {
         self.auto_approve = yes;
         self
     }
+    /// Inject an explicit OS-sandbox [`Sandbox`] that the built client's guarded `System` enforces on
+    /// every spawn. When left unset (the default), the posture is resolved from the environment at
+    /// [`build`](Self::build) via `Sandbox::resolve(SandboxSettings::from_env())` — so a consumer that
+    /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
+    /// Pass one only to pin a posture independent of ambient env.
+    pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
     /// Inject a knowledge block into the agent's system prompt as a `<knowledge-base>` section (A-19):
     /// grounds the agent on a small KB inline, with no retrieval round-trip. Chainable.
     pub fn add_context(
@@ -141,7 +158,13 @@ impl ClientBuilder {
     /// The turn runs on [`FlowEngine`] (the model plans, the runtime runs the flux-lang agent loop).
     pub fn build(self, provider: Box<dyn Provider>, root: impl Into<PathBuf>) -> Result<Client> {
         let root = root.into();
-        let system = Arc::new(System::new(Workspace::new(root.clone())?));
+        // Attach the OS-sandbox posture so a consumer's `FLUX_SANDBOX=require` is honored on this
+        // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
+        // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
+        let sandbox = self
+            .sandbox
+            .unwrap_or_else(|| Sandbox::resolve(SandboxSettings::from_env()));
+        let system = Arc::new(System::new(Workspace::new(root.clone())?).with_sandbox(sandbox));
         let mut registry = ToolRegistry::new();
         flux_tools::register_builtins(&mut registry);
         let approver: Arc<dyn Approver> = if self.auto_approve {

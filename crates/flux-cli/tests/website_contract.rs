@@ -223,6 +223,37 @@ fn plugin_and_sdk_docs_track_the_shipped_surfaces() {
     assert!(!sdk.contains("cargo run -p flux-sdk"));
 }
 
+/// Every occurrence of the "not OS-sandboxed" disclaimer must be immediately qualified "by
+/// default" — the D-133 truth pass. Before D-130..D-132, the claim was unconditionally true
+/// (`Backend::Unsupported` on every platform); now a real bubblewrap (Linux) / Seatbelt (macOS)
+/// backend exists behind opt-in `[sandbox]` config, so an unqualified "not OS-sandboxed" (whatever
+/// punctuation trails it — a colon, semicolon, period, or "processes.") would silently regress the
+/// docs back to the old overclaim. Scanning every occurrence (rather than banning one fixed old
+/// sentence) is what makes this robust to each page's own old phrasing without also needing to
+/// avoid colliding with the new one.
+fn assert_every_os_sandboxed_disclaimer_is_qualified(docs: &str, rel: &str) {
+    let phrase = "not OS-sandboxed";
+    let qualifier = " by default";
+    let mut search_from = 0;
+    let mut occurrences = 0;
+    while let Some(found) = docs[search_from..].find(phrase) {
+        let start = search_from + found;
+        let after = &docs[start + phrase.len()..];
+        assert!(
+            after.starts_with(qualifier),
+            "{rel}: found \"not OS-sandboxed\" not immediately followed by \" by default\" — the \
+             old unqualified claim regressed (context: {:?})",
+            &docs[start.saturating_sub(30)..(start + phrase.len() + 30).min(docs.len())]
+        );
+        occurrences += 1;
+        search_from = start + phrase.len();
+    }
+    assert!(
+        occurrences > 0,
+        "{rel} must state the trusted-native plugin boundary"
+    );
+}
+
 #[test]
 fn plugin_security_copy_keeps_the_native_code_trust_boundary_explicit() {
     for rel in [
@@ -233,11 +264,34 @@ fn plugin_security_copy_keeps_the_native_code_trust_boundary_explicit() {
         "website/docs/infrastructure.md",
     ] {
         let docs = read(rel);
-        assert!(
-            docs.contains("not OS-sandboxed"),
-            "{rel} must state the trusted-native plugin boundary"
-        );
+        assert_every_os_sandboxed_disclaimer_is_qualified(&docs, rel);
         assert!(!docs.contains("Plugins do **no privileged IO of their own**"));
         assert!(!docs.contains("A plugin never opens a socket"));
     }
+}
+
+/// D-133: the new OS-sandbox security page exists and carries its key claims — platform coverage,
+/// the config surface, the fail-closed `require` promise, and (verbatim, per the design doc) the
+/// honesty list of what v1 does not defend against.
+#[test]
+fn os_sandbox_page_exists_and_states_its_key_claims() {
+    let docs = read("website/docs/security/os-sandbox.md");
+    assert!(
+        docs.contains("What v1 does not defend against"),
+        "os-sandbox.md must carry the honesty-list heading"
+    );
+    assert!(docs.contains("bubblewrap"), "must name the Linux backend");
+    assert!(docs.contains("Seatbelt"), "must name the macOS backend");
+    assert!(
+        docs.contains("fails closed"),
+        "must state the require-mode fail-closed promise"
+    );
+    assert!(
+        docs.contains("[sandbox]"),
+        "must reference the `[sandbox]` config table"
+    );
+    assert!(
+        docs.contains("spawn_debug_pipe") || docs.contains("browser"),
+        "must document the browser exemption"
+    );
 }

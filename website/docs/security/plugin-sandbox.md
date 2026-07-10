@@ -13,7 +13,7 @@ For the separate question of which plugin code is allowed to run at all, see
 [Plugin trust & signing](./plugin-trust.md). Both rely on the same
 [safety envelope](../agent/safety.md).
 
-## Host capabilities, not an OS sandbox
+## Host capabilities, not an OS sandbox by default
 
 First-party plugins are written so every privileged effect — an HTTP request, subprocess, secret
 read, connection, or extra-workspace file read — is a **capability callback** the host executes on
@@ -22,9 +22,12 @@ secrets are not inherited. Undeclared host capabilities, hosts, secrets, and pro
 default.
 
 This confines what plugin code can reach *through flux*. Plugin binaries are trusted native code and
-are not OS-sandboxed; a malicious binary could bypass the callback protocol with direct syscalls.
-Within the plugin contract, the host is the single IO boundary: the plugin asks; the host decides
-and performs.
+are not OS-sandboxed by default; a malicious binary could bypass the callback protocol with direct
+syscalls. Within the plugin contract, the host is the single IO boundary: the plugin asks; the host
+decides and performs. Opt-in [OS process sandboxing](./os-sandbox.md) (`[sandbox]`) closes that gap
+as defense-in-depth **underneath** this capability model: it confines what a plugin process's raw
+syscalls can reach on disk and network, whether or not the process honors the callback protocol at
+all.
 
 ## Capabilities are deny-by-default
 
@@ -137,3 +140,4 @@ For authoring a plugin end to end, see [Plugin authoring](../plugins/authoring.m
 - [Plugin trust & signing](./plugin-trust.md) — identity and integrity of installed binaries.
 - [Using plugins](../plugins/using-plugins.md) — install, pin, and grant access.
 - [Plugin authoring](../plugins/authoring.md) — write manifests that declare capabilities honestly.
+- [OS process sandboxing](./os-sandbox.md) — opt-in confinement of the raw plugin process, underneath this capability model.

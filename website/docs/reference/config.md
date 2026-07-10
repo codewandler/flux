@@ -135,6 +135,45 @@ to the workspace. It mirrors repeatable `--add-dir`. `allow_all = true` mirrors
 `--allow-all-paths`, removes read and write confinement, and prints a warning—use it only when full
 host access is intentional.
 
+## OS-level process sandbox
+
+`[sandbox]` turns on opt-in OS-level confinement (bubblewrap on Linux, Seatbelt on macOS) for every
+process flux spawns — shell/exec ops and plugin subprocesses alike — as defense-in-depth
+underneath the safety envelope. Off by default:
+
+```toml
+[sandbox]
+enabled = true      # turn on OS sandboxing for spawned processes
+require = false     # fail closed instead of warn-and-continue when no backend is usable (implies enabled)
+network = true       # omit for the unrestricted default; false closes the sandbox's network namespace/profile
+writable = ["../shared-output"]   # extra writable paths beyond the workspace root and toolchain caches
+```
+
+| `[sandbox]` key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn on OS sandboxing for spawned processes. |
+| `require` | `false` | Fail closed (refuse to spawn) instead of warning when no sandbox backend is usable. Implies `enabled`. |
+| `network` | unset (unrestricted) | Whether sandboxed processes may reach the network. `false` closes the sandbox's network namespace/profile. |
+| `writable` | `[]` | Extra writable paths, beyond the workspace root, named/Git-worktree roots, `/tmp`/`$TMPDIR`, and the toolchain caches. A leading `~/` expands to the home directory. Missing configured paths are created as directories before launch; `/` is rejected (use the explicit `--allow-all-paths` hatch instead). |
+
+Merge is security-directional, not the ordinary "project wins" rule: `enabled`/`require` are OR'd
+(a project may tighten a user's posture, never loosen it), `network` is strictest-wins (`false`
+beats `true`/unset), and `writable` concatenates — the same documented widening as
+`[workspace] add_dirs`.
+
+The global `--sandbox`/`--no-sandbox` flags and the `FLUX_SANDBOX`/`FLUX_SANDBOX_NET`/
+`FLUX_SANDBOX_WRITABLE` environment variables resolve **tightest-wins**: the strictest posture any
+source asks for takes effect (`require` beats `on` beats off), so `--sandbox` layered over
+`[sandbox] require = true` stays `require` rather than weakening it. The one exception is the
+explicit kill switch — `--no-sandbox` or `FLUX_SANDBOX=off` — which forces sandboxing off outright.
+An unrecognized or empty `FLUX_SANDBOX` value is ignored (it never downgrades a configured posture),
+and a config file that fails to parse is a hard startup error rather than silently dropping a
+configured `require`.
+The CLI exports the resolved posture so a child flux invocation (`app run`, an eval sub-agent,
+`plugin call`) inherits it. See [OS process sandboxing](../security/os-sandbox.md) for the full
+reference — platform coverage, the posture matrix, the browser exemption, and what v1 does not
+defend against.
+
 ## Endpoint brokerage
 
 `[endpoint] cross_plugin_credentials` grants a consumer plugin permission to use a credential owned
@@ -170,9 +209,11 @@ listener.
 
 Common runtime overrides include `FLUX_VERBOSE=1`, `FLUX_SHOW_LOOP=1`,
 `FLUX_TURN_TOKEN_BUDGET`, `FLUX_COMPACT_CHARS`, `FLUX_ENABLE_BASH=1`,
-`FLUX_BROWSER_BIN`, `FLUX_ALLOW_PRIVATE_NET=1`, `OLLAMA_HOST`, and the provider API-key variables
-listed under [Providers and models](../agent/providers.md). Security-relevant booleans only enable on
-`1`, `true`, `yes`, or `on`; values such as `0` and `false` stay off.
+`FLUX_BROWSER_BIN`, `FLUX_ALLOW_PRIVATE_NET=1`, `OLLAMA_HOST`, `FLUX_SANDBOX` (`off`/`on`/`require`),
+`FLUX_SANDBOX_NET`, `FLUX_SANDBOX_WRITABLE`, `FLUX_BWRAP_BIN`, `FLUX_SANDBOX_EXEC_BIN`, and the
+provider API-key variables listed under [Providers and models](../agent/providers.md).
+Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values such as `0` and
+`false` stay off.
 
 ## Related docs
 
@@ -180,3 +221,4 @@ listed under [Providers and models](../agent/providers.md). Security-relevant bo
 - [Skills & roles](../agent/skills-and-roles.md) — discovery and precedence.
 - [Endpoints](../agent/endpoints.md) — weak references and cross-plugin credentials.
 - [Credentials & secrets](../security/credentials.md) — token storage and redaction.
+- [OS process sandboxing](../security/os-sandbox.md) — the full `[sandbox]` reference.

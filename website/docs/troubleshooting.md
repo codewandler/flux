@@ -149,8 +149,60 @@ unverified local path instead:
 
 See [Using plugins](./plugins/using-plugins.md).
 
+## sandbox unavailable: bubblewrap not found
+
+You turned on `[sandbox]`/`--sandbox` on Linux but flux warned (or, under `require`, refused to
+start) with `bubblewrap (bwrap) not found on PATH`. flux never falls back to an unconfined spawn
+silently — `on` mode warns once and continues unconfined, `require` mode is a hard startup error.
+
+Install bubblewrap with your distro's package manager (`apt install bubblewrap`, `dnf install
+bubblewrap`, `pacman -S bubblewrap`, …), or point flux at a binary that isn't on `PATH`:
+
+```bash
+FLUX_BWRAP_BIN=/opt/bwrap/bin/bwrap flux --sandbox run "…"
+```
+
+See [OS process sandboxing](./security/os-sandbox.md) for what the sandbox confines once it's
+active.
+
+## sandbox auto-degrades: unprivileged user namespaces are refused (NamespacesDenied)
+
+`bwrap` is installed but flux's preflight probe classifies it `NamespacesDenied` and — under `on`
+mode — auto-degrades to unconfined with a warning naming the reason (under `require`, this is a
+hard startup error instead). This means the kernel or a security policy is refusing the
+unprivileged user-namespace creation bubblewrap needs, not that bubblewrap itself is broken.
+
+This is the **expected** state in several common environments:
+
+- **Docker's default seccomp profile** blocks `unshare`/`clone` with `CLONE_NEWUSER` — this is why
+  the terminal-bench eval containers and most default `docker run` sandboxes land here.
+- **Hardened kernels / Debian ≤ 11** ship `kernel.unprivileged_userns_clone=0` by default; flip it
+  with `sysctl -w kernel.unprivileged_userns_clone=1` if you control the host.
+- **Ubuntu 23.10+'s AppArmor userns restriction** requires either an AppArmor profile permitting
+  unprivileged user namespaces or `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+
+If you need confinement rather than a warned auto-degrade in one of these environments, either fix
+the underlying policy (add `--privileged`/the right `--security-opt` to the container runtime, or
+flip the sysctl) or accept that `[sandbox] require = true` will refuse to start there. See
+[OS process sandboxing](./security/os-sandbox.md#posture-matrix) for the full off/on/require ×
+available/degraded matrix.
+
+## DNS fails only inside the sandbox
+
+A sandboxed process can't resolve hostnames (`curl`, `cargo fetch`, `git clone` fail with name
+resolution errors) while the same command works unsandboxed, and `[sandbox] network` is on. The
+sandbox replaces `/run` with a fresh tmpfs to hide host sockets like `docker.sock`, which also
+hides the resolver socket/config that most Linux distros keep under `/run`. flux re-exposes the
+common ones read-only when the network is on — systemd-resolved (`/run/systemd/resolve`),
+`resolvconf` (`/run/resolvconf`), and NetworkManager (`/run/NetworkManager`). If your distro keeps
+its resolver state somewhere else, add that path (or the directory `/etc/resolv.conf` symlinks
+into) to `[sandbox] writable` is *not* the fix — instead file it as a gap; the built-in re-bind
+list is what needs extending. As a workaround, a static `/etc/resolv.conf` (not a symlink into
+`/run`) resolves fine because the whole filesystem is visible read-only.
+
 ## Related docs
 
 - [Providers and models](./agent/providers.md) — credential sources and model routing.
 - [Configuration](./reference/config.md) — permissions, private-network grants, and overrides.
 - [Safety and approvals](./agent/safety.md) — approval behavior and destructive-operation checks.
+- [OS process sandboxing](./security/os-sandbox.md) — the `[sandbox]` config and posture matrix.

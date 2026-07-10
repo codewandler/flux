@@ -163,6 +163,29 @@ pub(crate) fn toolchain_env() -> Vec<(String, String)> {
     out
 }
 
+const SANDBOX_CHILD_ENV_KEYS: &[&str] = &[
+    "FLUX_SANDBOX",
+    "FLUX_SANDBOX_NET",
+    "FLUX_SANDBOX_WRITABLE",
+    "FLUX_BWRAP_BIN",
+    "FLUX_SANDBOX_EXEC_BIN",
+];
+
+/// Forward the already-resolved sandbox posture into the child flux *host*. The host itself is
+/// launched exempt so provider HTTP remains available when `network = false`; these variables make
+/// its own `System::from_env` construction confine shell/plugin descendants at the real spawn choke
+/// point. `FLUX_SANDBOXED` is intentionally absent because the exempt host was not wrapped.
+fn sandbox_child_env_from(mut read: impl FnMut(&str) -> Option<String>) -> Vec<(String, String)> {
+    SANDBOX_CHILD_ENV_KEYS
+        .iter()
+        .filter_map(|key| read(key).map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
+fn sandbox_child_env() -> Vec<(String, String)> {
+    sandbox_child_env_from(|key| std::env::var(key).ok())
+}
+
 /// Grade a criterion in the (already-finished) workspace. Reads/exec go through `sys`. Public so the
 /// `grade` op (and any evidence-based flow) can reuse the exact same pass/fail check the eval harness
 /// uses — one grading implementation, no divergence.
@@ -250,10 +273,17 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         .clone()
         .unwrap_or_else(|| ctx.default_model.to_string());
 
+    // Attach the environment's sandbox posture without pulling in FLUX_ADD_DIRS/FLUX_ALLOW_ALL,
+    // which would defeat the isolated eval workspace. The child *host* is launched through the
+    // explicit exemption below so network=false does not block its provider request; the resolved
+    // posture is forwarded into that host so only its shell/plugin descendants are confined.
     let sys = System::new(
         Workspace::new(&workdir)
             .map_err(|e| Error::Other(format!("eval workspace {}: {e}", workdir.display())))?,
-    );
+    )
+    .with_sandbox(flux_system::sandbox::Sandbox::resolve(
+        flux_system::sandbox::SandboxSettings::from_env(),
+    ));
 
     let argv = vec![
         ctx.flux_bin.to_string_lossy().to_string(),
@@ -285,6 +315,9 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     for (k, v) in &spec.env {
         env.push((k.clone(), v.clone()));
     }
+    // Add security posture last: benchmark-controlled `spec.env` must not be able to downgrade the
+    // parent CLI's resolved sandbox mode or redirect its backend after the harness decided it.
+    env.extend(sandbox_child_env());
     // In watch mode, reveal the loop machinery so the observer sees plan/run_plan/observe.
     if ctx.watch {
         env.push(("FLUX_SHOW_LOOP".to_string(), "1".to_string()));
@@ -292,10 +325,10 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
 
     let run = if ctx.watch {
         eprintln!("\n── {} ──", spec.id);
-        sys.run_with_env_streamed(&argv, &env, Duration::from_secs(spec.timeout_secs))
+        sys.run_with_env_streamed_exempt(&argv, &env, Duration::from_secs(spec.timeout_secs))
             .await
     } else {
-        sys.run_with_env(&argv, &env, Duration::from_secs(spec.timeout_secs))
+        sys.run_with_env_exempt(&argv, &env, Duration::from_secs(spec.timeout_secs))
             .await
     };
     let wall_ms = started.elapsed().as_millis() as u64;
@@ -370,6 +403,28 @@ mod tests {
         let dir = unique_temp_dir("flux-eval-runner-test").unwrap();
         let sys = System::new(Workspace::new(&dir).unwrap());
         (dir, sys)
+    }
+
+    #[test]
+    fn eval_child_gets_resolved_sandbox_posture_but_not_a_false_confinement_marker() {
+        let values = std::collections::HashMap::from([
+            ("FLUX_SANDBOX", "require"),
+            ("FLUX_SANDBOX_NET", "0"),
+            ("FLUX_SANDBOX_WRITABLE", "/output"),
+            ("FLUX_BWRAP_BIN", "/nix/store/example/bin/bwrap"),
+            ("FLUX_SANDBOXED", "1"),
+        ]);
+        let env = sandbox_child_env_from(|key| values.get(key).map(ToString::to_string));
+        assert!(env.contains(&("FLUX_SANDBOX".to_string(), "require".to_string())));
+        assert!(env.contains(&("FLUX_SANDBOX_NET".to_string(), "0".to_string())));
+        assert!(env.contains(&(
+            "FLUX_BWRAP_BIN".to_string(),
+            "/nix/store/example/bin/bwrap".to_string()
+        )));
+        assert!(
+            !env.iter().any(|(key, _)| key == "FLUX_SANDBOXED"),
+            "the network-capable host itself was deliberately not wrapped"
+        );
     }
 
     #[test]

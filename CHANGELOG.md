@@ -6,6 +6,138 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-134: OS-level process sandbox — abstraction, config, and threading (no backend yet).**
+  New `crates/flux-system/src/sandbox.rs` module: `SandboxSettings`/`SandboxMode` (Off/On/Require,
+  `from_env` reading `FLUX_SANDBOX`/`FLUX_SANDBOX_NET`/`FLUX_SANDBOX_WRITABLE`), a `Backend` enum
+  declaring all three eventual variants (`Bubblewrap`/`Seatbelt`/`Unsupported`) though `resolve()`
+  only ever yields `Unsupported` in this story, `Sandbox` (`disabled`/`resolve`/`is_active`/
+  `ensure_available`/`preflight`/`configure`/`wrap_argv`), `SpawnPolicy::for_workspace`, and
+  `Confinement::{Sandboxed, Exempt}`. `System::build_command` — the one process choke point — now
+  takes an explicit `Confinement`; all five spawn modes pass it (`spawn_debug_pipe` is `Exempt`,
+  documented as a deliberate v1 exception for Chrome's own sandbox; the rest are `Sandboxed`), and
+  wraps at the top so `current_dir`/`kill_on_drop`/`process_group`/`apply_safe_env` apply to the
+  future wrapper unchanged. A `Require`-mode sandbox with no usable backend refuses to spawn (the
+  fail-closed backstop); a genuinely-active sandboxed spawn injects `FLUX_SANDBOXED=1`, now part of
+  `SAFE_ENV` so the marker survives descendants' env-clear and `Sandbox::resolve` treats a nested
+  flux invocation as `Backend::AlreadyConfined` (confined by the parent; see the hardening pass
+  below). `flux-config` gains
+  `SandboxConfig { enabled, require, network, writable }` on `Config` with a security-directional
+  merge (`enabled`/`require` OR, `network` strictest-wins, `writable` concatenates). `flux-cli`
+  gains global `--sandbox`/`--no-sandbox` (conflicting) flags and `apply_sandbox_env`, resolving
+  the tightest posture across flag/env/config (with `--no-sandbox`/`FLUX_SANDBOX=off` as the kill
+  switch; see the hardening pass below) and exporting `FLUX_SANDBOX`/`FLUX_SANDBOX_NET`/
+  `FLUX_SANDBOX_WRITABLE` so child flux invocations inherit the posture; startup runs the preflight
+  (a hard error under `require`+unavailable, otherwise one styled warning). `System::from_env(cwd)`
+  (`Workspace::from_env` + `Sandbox::resolve`) replaces the production
+  `System::new(Workspace::from_env(..))` call sites; `with_sandbox` is the builder for
+  custom-workspace sites; `System::new` stays env-free and infallible. Opt-in and default off — on
+  every platform today this story's behavior (settings plumbing, warnings, fail-closed `require`)
+  IS the shipped behavior, since no real backend exists yet (bubblewrap lands in D-135, Seatbelt in
+  D-136).
+
+- **D-135/D-136: real bubblewrap (Linux) and Seatbelt (macOS) sandbox backends.** The D-134
+  `bubblewrap_argv`/`seatbelt_argv` stubs are now real, filling in the abstraction's two argv
+  builders. **Linux (bubblewrap)**: the verified baseline template —
+  `--die-with-parent --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try` (+
+  `--unshare-net` iff network is off), `--ro-bind / / --dev /dev --proc /proc --tmpfs /run` (+
+  narrow resolver-file rebinds when network is on), `--bind /tmp /tmp` + the workspace root (real
+  `--bind`, must exist) + automatic writable roots (`--bind-try`) and required configured roots
+  (`--bind`, created before launch), `--chdir <root> --`; `--allow-all-paths` collapses the fs binds
+  to a single `--bind / /` while keeping lifecycle/network/`/run`-masking flags. **macOS
+  (Seatbelt)**: `sandbox-exec -D WS_ROOT=<canon> -D TMP=<canon> -D W0=<canon>… -p <profile>
+  <argv>` — no `--` separator (`sandbox-exec`'s CLI grammar has none); the generated SBPL profile
+  is `(version 1)(allow default)(deny file-write*)` widened back open under `WS_ROOT`/`TMP`/the
+  fixed `/private/tmp`+`/private/var/tmp` roots/extras, with device carve-outs
+  (`/dev/null`/`/dev/zero`/ttys/`/dev/fd/`) and `(deny network*)` when network is off; writable
+  paths are canonicalized before emission, and any path containing a `"` or a control character is
+  rejected (`Sandbox::wrap_argv`, before the profile is built — a bwrap bind is a separate execv
+  argv entry with nothing to escape, so that backend has no equivalent check). Both backends share
+  one discovery shape (env override → PATH, always resolved to an **absolute** path — `bwrap`:
+  `FLUX_BWRAP_BIN`; `sandbox-exec`: `FLUX_SANDBOX_EXEC_BIN` → the fixed `/usr/bin/sandbox-exec`)
+  and one preflight probe (`bwrap`'s baseline flags / `sandbox-exec`'s minimal allow-all profile,
+  against `true`, ~2s timeout, cached by binary path): `Missing` (spawn failure),
+  `NamespacesDenied` (Linux-only — stderr matches known unprivileged-userns-refusal patterns;
+  expected inside default-seccomp Docker and hardened kernels), or `Broken(stderr)`. The probe now
+  runs *inside* `Sandbox::resolve()` itself (a deliberate departure from treating discovery as
+  presence-only): a backend that exists but doesn't functionally work resolves `Unsupported` with
+  the classified reason, so an `on`-mode sandbox auto-degrades to unconfined *before* any real
+  spawn is attempted, rather than genuinely trying and failing every subsequent command. `resolve()`
+  skips discovery entirely when the sandbox mode is `off`. `SpawnPolicy` gained an `unconfined`
+  field mirroring `Workspace::is_unconfined`. Verified live on this Linux dev machine against real
+  `bwrap 0.11.2`: sandboxed writes inside the workspace succeed, writes elsewhere under `$HOME`
+  fail, a network-off sandbox cannot reach a loopback listener the test itself opened, sandboxed
+  `spawn_interactive` round-trips stdin/stdout unchanged, killing a sandboxed background child
+  leaves no orphan (the `--die-with-parent`/`--unshare-pid` guarantee), and exit codes propagate.
+  The Seatbelt discovery/preflight code (macOS-only by `#[cfg]`) cross-checks clean — zero
+  warnings, `cargo check` and `cargo clippy -D warnings` — against a real `x86_64-apple-darwin`
+  target from this Linux box, but real-hardware verification is still outstanding (tracked as an
+  explicit unchecked "verify on macOS" checklist in D-136; no macOS CI exists yet).
+
+- **D-137: sandbox docs truth pass — shipping the process-sandboxing epic.** This closes
+  D-134…D-137: **opt-in OS-level process sandboxing** (bubblewrap on Linux, Seatbelt on macOS) now
+  confines shell/exec ops and plugin subprocesses at their spawn boundary — with documented
+  browser and trusted-host exemptions — as
+  defense-in-depth *underneath* the safety envelope and the plugin capability sandbox. Off by
+  default; turn it on with `--sandbox` / `[sandbox] enabled = true` / `FLUX_SANDBOX=on`, or fail
+  closed instead of silently degrading with `--sandbox`+`require = true` / `FLUX_SANDBOX=require`.
+  New `website/docs/security/os-sandbox.md` documents per-platform coverage (Linux verified live;
+  macOS code-complete, pending hardware verification; Windows degrades with a warning — no real
+  backend yet), the full `[sandbox]`/CLI-flag/env-var reference, the off/on/require × available/
+  degraded posture matrix, the browser (`spawn_debug_pipe`) exemption, and — stated plainly rather
+  than overclaimed — what v1 does not defend against (secret reads anywhere on the fs,
+  network-on exfiltration, shared-`/tmp` interference, cargo/rustup cache poisoning, anything on
+  Windows). The five website pages that promised plugins are "not OS-sandboxed" (`using-plugins`,
+  `authoring`, `plugin-sandbox`, `safety`, `infrastructure`), plus `security/overview`,
+  `security/plugin-trust`, and `docs/architecture.md`, now say "not OS-sandboxed **by default**"
+  and link the new page — the claim was true before this epic and is now only true absent
+  `[sandbox]`. `website/docs/reference/config.md` documents the `[sandbox]` table (fields,
+  defaults, security-directional merge); `troubleshooting.md` gains entries for a missing
+  `bwrap` binary and for `NamespacesDenied` (the expected auto-degrade inside default-seccomp
+  Docker, Debian ≤11, and Ubuntu 23.10+'s AppArmor userns restriction). The
+  `plugin_security_copy_keeps_the_native_code_trust_boundary_explicit` contract test now
+  drift-guards the qualified phrasing on every occurrence, not just a flat substring check, and a
+  new `os_sandbox_page_exists_and_states_its_key_claims` test locks in the new page's key claims.
+
+- **Process-sandboxing hardening pass (xhigh code review remediation).** A recall-mode review of
+  the epic surfaced and this closes a batch of correctness gaps before merge:
+  - **Posture no longer bypassed on major surfaces.** The env-resolved sandbox is now attached at
+    the `flux app run` (journey + sub-agent) and served-agent (`app run --serve`) systems, the SDK
+    (`Client`/`FlowClient` builders — default resolve-from-env plus an explicit `with_sandbox`),
+    and the runtime git-context spawns — all previously built via `System::new` and therefore
+    silently unconfined even under `--sandbox`/`require`. The terminal-bench eval harness stays
+    deliberately unsandboxed (it drives Docker; the task container is the boundary) and now says so
+    in code and docs.
+  - **Posture resolution is tightest-wins, not strict precedence.** `--sandbox` layered over
+    `[sandbox] require` stays `require`; an empty/unrecognized `FLUX_SANDBOX` no longer downgrades
+    a configured posture (a non-empty garbage value warns); `--no-sandbox`/`FLUX_SANDBOX=off` stay
+    the outright kill switch. A config file that fails to parse is now a hard startup error for
+    every command, so a typo beside `require = true` cannot reach plugin status/skill generation
+    with a default-off posture; clap still serves `--help`/`--version` before config loading.
+  - **Nested runs under `require` no longer brick.** A flux invocation genuinely confined by an
+    outer flux sandbox resolves the new `Backend::AlreadyConfined` (satisfies `require`, skips
+    re-wrapping) instead of failing closed; the `FLUX_SANDBOXED` marker is matched with truthy
+    semantics so a spoofed/stale value can't disable confinement.
+  - **Backend robustness and no second process path.** The macOS probe degrades instead of
+    `panic!`-ing on `Operation not permitted`; backend probes now use `System::build_command`'s
+    synchronous guarded mode (safe env, process group, bounded stderr, timeout, descendant cleanup)
+    instead of a raw `std::process::Command`. Bubblewrap's inner `true` is resolved to an absolute
+    executable from the caller's PATH before scrubbing, so NixOS/Guix layouts work.
+  - **Mount/write confinement closed.** Network-on DNS restores only resolver files after the
+    `/run` tmpfs, keeping D-Bus, NetworkManager, and systemd-resolved IPC sockets hidden. A writable
+    `/` from `TMPDIR`, toolchain env, a named root, or config is rejected unless the workspace is
+    explicitly unconfined (whose root bind is safely ordered before special mounts). Configured
+    writable directories are created and use required binds rather than silent `--bind-try` skips.
+    Linked Git worktrees add their reciprocally validated administrative and common directories to
+    the write set, restoring `git add`/ref/object updates without trusting an arbitrary `.git` pointer.
+  - **Online local evals keep provider access.** The child `flux` host is launched through an
+    explicit trusted-host exemption and receives the resolved sandbox variables; with
+    `network = false`, provider HTTP stays outside the child namespace while that host's shell and
+    plugin descendants are confined at `System::build_command`.
+  - `FLUX_SANDBOX_NET` truthiness, empty `CARGO_HOME`/`RUSTUP_HOME`, and unknown `[sandbox]` keys are
+    handled explicitly rather than silently widening or corrupting the profile.
+
 ### Changed
 
 - **D-90: gitlab pagination & truncation tell the truth.** Every bound-output gitlab op now

@@ -278,6 +278,12 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
         // Rebuild the static musl binary from the current (candidate) source so the container agent
         // installs the worker's edits, not a stale binary.
         let cwd = std::env::current_dir().map_err(|e| Error::Other(e.to_string()))?;
+        // Deliberately unsandboxed: this is a host-side `cargo build` of the flux-cli musl binary that
+        // the terminal-bench harness then installs into the task container. It drives the build
+        // toolchain (rustc/cargo, crate-fetch network, the host's `~/.cargo`/`target` caches) — not
+        // model work — and the real isolation boundary is the *task container* the built binary runs
+        // in, not this build step. Confining it (the sandbox masks `/run`, restricts writes/network)
+        // would break the toolchain, and `require` never reaches here (eval driver, not an agent spawn).
         let sys = System::new(
             Workspace::new(&cwd)
                 .map_err(|e| Error::Other(format!("musl rebuild workspace: {e}")))?,
@@ -382,6 +388,11 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
 
         // tb runs in the repo/worktree root (it manages its own dataset cache + Docker).
         let cwd = std::env::current_dir().map_err(|e| Error::Other(e.to_string()))?;
+        // Deliberately unsandboxed: `tb` drives Docker to run each task inside its own container — that
+        // container IS the isolation boundary here. The OS sandbox masks `/run` with a tmpfs (see
+        // `Sandbox`'s confinement), which would hide `/run/docker.sock` and break the harness outright,
+        // so this host-side driver must run unconfined. `require` never reaches here (eval driver, not
+        // an agent spawn).
         let sys = System::new(
             Workspace::new(&cwd).map_err(|e| Error::Other(format!("tb workspace: {e}")))?,
         );

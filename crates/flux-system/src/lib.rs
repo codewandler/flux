@@ -13,6 +13,9 @@ use std::time::Duration;
 use flux_core::{Error, Result};
 
 pub mod net;
+pub mod sandbox;
+
+use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
 
 // ---------------------------------------------------------------------------
 // Workspace
@@ -129,6 +132,13 @@ impl Workspace {
     /// Whether a named root is configured.
     pub fn has_named_root(&self, name: &str) -> bool {
         self.named.contains_key(name)
+    }
+
+    /// The paths of every registered `@named` root — the write-capable set alongside the primary
+    /// root. Used by [`sandbox::SpawnPolicy::for_workspace`] to derive a sandboxed spawn's
+    /// writable set.
+    pub fn named_roots(&self) -> impl Iterator<Item = &Path> {
+        self.named.values().map(PathBuf::as_path)
     }
 
     /// Resolve a workspace-relative (or `@name/...`) path for a **write** — confined to the primary root
@@ -431,6 +441,27 @@ impl BoundedCapture {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_bounded_blocking<R>(mut reader: R) -> std::io::Result<BoundedCapture>
+where
+    R: std::io::Read,
+{
+    let mut bytes = Vec::with_capacity(8192.min(PROCESS_OUTPUT_CAP));
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let room = PROCESS_OUTPUT_CAP.saturating_sub(bytes.len());
+        let keep = read.min(room);
+        bytes.extend_from_slice(&chunk[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(BoundedCapture { bytes, truncated })
+}
+
 async fn capture_bounded<R>(mut reader: R) -> std::io::Result<BoundedCapture>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -464,14 +495,18 @@ struct ProcessGroup {
 
 impl ProcessGroup {
     fn for_child(child: &tokio::process::Child) -> Self {
+        Self::for_id(child.id())
+    }
+
+    fn for_id(id: Option<u32>) -> Self {
         #[cfg(unix)]
         {
-            let id = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+            let id = id.and_then(|id| libc::pid_t::try_from(id).ok());
             Self { id }
         }
         #[cfg(not(unix))]
         {
-            let _ = child;
+            let _ = id;
             Self {}
         }
     }
@@ -483,6 +518,78 @@ impl ProcessGroup {
             // process group with PGID == PID. `SIGKILL` is used only for timeout/cancellation or to
             // clean up descendants after their direct parent has exited.
             let _ = unsafe { libc::killpg(id, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Result of the synchronous, startup-safe guarded launcher used for backend preflight probes.
+/// stderr is byte-capped exactly like normal captured runs; descendants are terminated before the
+/// pipe reader is joined, so a fork that inherits stderr cannot hold startup open indefinitely.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct GuardedProbeOutput {
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) enum GuardedProbeError {
+    Spawn(std::io::Error),
+    Other(String),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SyncGuardedChild {
+    child: std::process::Child,
+    group: ProcessGroup,
+    reaped: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl SyncGuardedChild {
+    fn new(child: std::process::Child) -> Self {
+        let group = ProcessGroup::for_id(Some(child.id()));
+        Self {
+            child,
+            group,
+            reaped: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    fn terminate_tree(&mut self) {
+        self.group.terminate();
+        let _ = self.child.kill();
+    }
+
+    fn terminate_descendants(&self) {
+        self.group.terminate();
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait();
+        if status.is_ok() {
+            self.reaped = true;
+        }
+        status
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for SyncGuardedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.terminate_tree();
+            let _ = self.child.wait();
+            self.reaped = true;
         }
     }
 }
@@ -819,15 +926,46 @@ pub struct PipeChild {
 #[derive(Debug, Clone)]
 pub struct System {
     workspace: Workspace,
+    sandbox: Sandbox,
 }
 
 impl System {
+    /// Build a `System` with the sandbox **disabled** — env-free and infallible, so every
+    /// hermetic test site (and any caller that doesn't want the environment consulted) is
+    /// unaffected by the sandbox seam. Production entry points should use
+    /// [`System::from_env`]/[`System::with_sandbox`] instead.
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            sandbox: Sandbox::disabled(),
+        }
+    }
+
+    /// Build a `System` from `cwd` the way every production entry point should: a [`Workspace`]
+    /// from the environment ([`Workspace::from_env`]) plus a [`Sandbox`] resolved from the
+    /// environment ([`Sandbox::resolve`] over [`SandboxSettings::from_env`]). Fails only if the
+    /// workspace root doesn't exist (sandbox resolution is infallible).
+    pub fn from_env(cwd: impl AsRef<Path>) -> Result<Self> {
+        let workspace = Workspace::from_env(cwd)?;
+        let sandbox = Sandbox::resolve(SandboxSettings::from_env());
+        Ok(Self { workspace, sandbox })
+    }
+
+    /// Attach an explicit sandbox posture — the builder counterpart to [`System::from_env`] for
+    /// call sites that need a custom [`Workspace`] (extra named roots, a non-cwd root, …) and so
+    /// cannot use `from_env`'s workspace construction directly.
+    pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// The resolved sandbox posture for this `System`.
+    pub fn sandbox(&self) -> &Sandbox {
+        &self.sandbox
     }
 
     /// Derive the physical permission identity for a caller-supplied workspace path.
@@ -1106,6 +1244,112 @@ impl System {
         std::env::var(key).ok()
     }
 
+    /// Run a sandbox-backend preflight synchronously through the same [`Self::build_command`]
+    /// choke point as every product subprocess. This exists because [`sandbox::Sandbox::resolve`]
+    /// runs before a Tokio runtime is guaranteed to exist. The probe itself is explicitly exempt
+    /// from sandbox wrapping (it *is* the wrapper being tested), but still gets argv-only launch,
+    /// safe-env clearing, a dedicated process group, bounded stderr, deadline enforcement, and
+    /// descendant cleanup.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn run_guarded_probe(
+        argv: &[String],
+        timeout: Duration,
+    ) -> std::result::Result<GuardedProbeOutput, GuardedProbeError> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let workspace = Workspace::new(&cwd)
+            .map_err(|err| GuardedProbeError::Other(format!("probe workspace: {err}")))?;
+        let system = Self::new(workspace);
+        let mut cmd = system
+            .build_command(argv, &[], true, Confinement::Exempt)
+            .map_err(|err| GuardedProbeError::Other(format!("build probe command: {err}")))?;
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut attempt = 0u32;
+        let mut child = loop {
+            match cmd.spawn() {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempt < 5
+                        && std::time::Instant::now() < deadline =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+                }
+                Err(err) => return Err(GuardedProbeError::Spawn(err)),
+                Ok(child) => break child,
+            }
+        };
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| GuardedProbeError::Other("probe stderr unavailable".to_string()))?;
+        let mut child = SyncGuardedChild::new(child);
+        let (capture_tx, capture_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("flux-probe-stderr".to_string())
+            .spawn(move || {
+                let _ = capture_tx.send(capture_bounded_blocking(stderr));
+            })
+            .map_err(|err| {
+                GuardedProbeError::Other(format!("start probe stderr capture: {err}"))
+            })?;
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // A failed wrapper may fork and exit while its descendant keeps stderr open.
+                    // Stop the whole group before awaiting EOF, matching `drive_process`'s normal
+                    // captured-run cleanup.
+                    child.terminate_descendants();
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let captured = capture_rx.recv_timeout(remaining).map_err(|err| {
+                        GuardedProbeError::Other(format!(
+                            "probe stderr did not close before the {timeout:?} deadline: {err}"
+                        ))
+                    })?;
+                    let stderr = captured
+                        .map_err(|err| {
+                            GuardedProbeError::Other(format!("read probe stderr: {err}"))
+                        })?
+                        .into_lossy();
+                    return Ok(GuardedProbeOutput {
+                        status: Some(status),
+                        stderr,
+                        timed_out: false,
+                    });
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    child.terminate_tree();
+                    child.wait().map_err(|err| {
+                        GuardedProbeError::Other(format!("reap timed-out probe: {err}"))
+                    })?;
+                    // Do not join the reader past the advertised deadline. Killing the process
+                    // group closes ordinary inherited pipes; an adversarial setsid escape may keep
+                    // the short-lived reader thread alive, but can no longer block startup.
+                    return Ok(GuardedProbeOutput {
+                        status: None,
+                        stderr: String::new(),
+                        timed_out: true,
+                    });
+                }
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                }
+                Err(err) => {
+                    child.terminate_tree();
+                    let _ = child.wait();
+                    return Err(GuardedProbeError::Other(format!(
+                        "wait on probe child failed: {err}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Execute a command as an explicit argv (NO shell). `argv[0]` is the program; the working
     /// directory is the workspace root.
     pub async fn run(&self, argv: &[String], timeout: Duration) -> Result<ProcessOutput> {
@@ -1126,7 +1370,33 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let mut cmd = self.build_command(argv, env, true)?;
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed)
+            .await
+    }
+
+    /// Launch a trusted host process outside this `System`'s child sandbox while retaining every
+    /// other guarded-process invariant. This narrowly supports hosts such as the local-eval child
+    /// `flux`: the host must keep network access for provider requests, while the sandbox posture is
+    /// passed into it so its own shell/plugin descendants are confined at their spawn choke point.
+    /// Model-selected executables must use [`Self::run_with_env`], never this exemption.
+    pub async fn run_with_env_exempt(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt)
+            .await
+    }
+
+    async fn run_with_env_confinement(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+        confinement: Confinement,
+    ) -> Result<ProcessOutput> {
+        let mut cmd = self.build_tokio_command(argv, env, true, confinement)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1159,7 +1429,7 @@ impl System {
     /// Scrub a command's environment to the minimal non-secret allow-list, then apply caller
     /// overrides (added last so they win). Shared by [`run_with_env`](Self::run_with_env) and
     /// [`run_with_env_streamed`](Self::run_with_env_streamed).
-    fn apply_safe_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
+    fn apply_safe_env(cmd: &mut std::process::Command, env: &[(String, String)]) {
         cmd.env_clear();
         const SAFE_ENV: &[&str] = &[
             "PATH",
@@ -1180,6 +1450,11 @@ impl System {
             "RUSTUP_HOME",
             "CARGO_HOME",
             "RUSTUP_TOOLCHAIN",
+            // The nested-sandbox marker (D-130): a truly-sandboxed spawn sets this (see
+            // `build_command`), and it must survive the env-clear so a child `flux` process sees
+            // it and skips re-wrapping (`Sandbox::resolve`) instead of attempting to nest inside
+            // its own containment.
+            "FLUX_SANDBOXED",
         ];
         for key in SAFE_ENV {
             if let Ok(val) = std::env::var(key) {
@@ -1199,28 +1474,72 @@ impl System {
     /// children remain in flux's process group because their callers own the raw child handle and
     /// cannot yet perform group-aware cleanup. This is the **one place** flux constructs an OS
     /// process — every spawn mode (`run_with_env`, `run_with_env_streamed`, `spawn_background`,
-    /// `spawn_interactive`) layers only its own stdio on top of the command this returns, so the
-    /// envelope has no bypass.
+    /// `spawn_interactive`, `spawn_debug_pipe`) layers only its own stdio on top of the command this
+    /// returns, so the envelope has no bypass.
+    ///
+    /// `confinement` (D-130) is the OS-sandbox seam: for [`Confinement::Sandboxed`],
+    /// [`Sandbox::ensure_available`] runs first (the fail-closed backstop — `require` + no usable
+    /// backend refuses to spawn even if a caller skipped the CLI's startup preflight), then — when
+    /// the sandbox is actually active — `argv` is rewritten to a backend-wrapper prefix via
+    /// [`Sandbox::wrap_argv`] **before** `argv.split_first()`, so `current_dir`/`kill_on_drop`/
+    /// `process_group`/`apply_safe_env` below apply to the wrapper process unchanged (it, not the
+    /// original program, is what actually gets spawned). [`Confinement::Exempt`] skips all of this
+    /// — the spawn is never wrapped and never subject to `require`.
     fn build_command(
         &self,
         argv: &[String],
         env: &[(String, String)],
         isolate_process_group: bool,
-    ) -> Result<tokio::process::Command> {
+        confinement: Confinement,
+    ) -> Result<std::process::Command> {
+        if confinement == Confinement::Sandboxed {
+            self.sandbox.ensure_available()?;
+        }
+        let wrapped;
+        let argv: &[String] = if confinement == Confinement::Sandboxed && self.sandbox.is_active() {
+            let policy = SpawnPolicy::for_workspace(&self.workspace, self.sandbox.settings());
+            wrapped = self.sandbox.wrap_argv(argv, &policy)?;
+            &wrapped
+        } else {
+            argv
+        };
         let Some((program, args)) = argv.split_first() else {
             return Err(Error::Other("empty command".to_string()));
         };
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(self.workspace.root())
-            .kill_on_drop(true);
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).current_dir(self.workspace.root());
         #[cfg(unix)]
-        if isolate_process_group {
-            cmd.process_group(0);
+        {
+            use std::os::unix::process::CommandExt as _;
+            if isolate_process_group {
+                cmd.process_group(0);
+            }
         }
         #[cfg(not(unix))]
         let _ = isolate_process_group;
+        if confinement == Confinement::Sandboxed && self.sandbox.is_active() {
+            self.sandbox.configure(&mut cmd)?;
+        }
         Self::apply_safe_env(&mut cmd, env);
+        if let Some((key, value)) = sandbox::sandbox_marker(confinement, &self.sandbox) {
+            cmd.env(key, value);
+        }
+        Ok(cmd)
+    }
+
+    /// Tokio adapter over [`Self::build_command`]. Process construction and every safety setting
+    /// stay owned by the synchronous base builder so startup-time backend probes can use the exact
+    /// same choke point without creating or nesting a Tokio runtime.
+    fn build_tokio_command(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        isolate_process_group: bool,
+        confinement: Confinement,
+    ) -> Result<tokio::process::Command> {
+        let cmd = self.build_command(argv, env, isolate_process_group, confinement)?;
+        let mut cmd = tokio::process::Command::from(cmd);
+        cmd.kill_on_drop(true);
         Ok(cmd)
     }
 
@@ -1235,7 +1554,30 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let mut cmd = self.build_command(argv, env, true)?;
+        self.run_with_env_streamed_confinement(argv, env, timeout, Confinement::Sandboxed)
+            .await
+    }
+
+    /// Streamed counterpart to [`Self::run_with_env_exempt`], for a trusted host whose terminal
+    /// output is intentionally inherited (local eval `--watch`).
+    pub async fn run_with_env_streamed_exempt(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_with_env_streamed_confinement(argv, env, timeout, Confinement::Exempt)
+            .await
+    }
+
+    async fn run_with_env_streamed_confinement(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+        confinement: Confinement,
+    ) -> Result<ProcessOutput> {
+        let mut cmd = self.build_tokio_command(argv, env, true, confinement)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
@@ -1262,7 +1604,7 @@ impl System {
         argv: &[String],
         env: &[(String, String)],
     ) -> Result<ManagedChild> {
-        let mut cmd = self.build_command(argv, env, true)?;
+        let mut cmd = self.build_tokio_command(argv, env, true, Confinement::Sandboxed)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1305,7 +1647,7 @@ impl System {
     /// restricted to the minimal allow-list — so the plugin process **cannot read the host's
     /// secrets**; it must request them back through the gated host capabilities. `kill_on_drop`.
     pub fn spawn_interactive(&self, argv: &[String]) -> Result<InteractiveChild> {
-        let mut cmd = self.build_command(argv, &[], false)?;
+        let mut cmd = self.build_tokio_command(argv, &[], false, Confinement::Sandboxed)?;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -1338,6 +1680,16 @@ impl System {
     ///
     /// The caller passes `--remote-debugging-pipe` in `argv`; this method only wires the fds. Must be
     /// called from within a Tokio runtime (it registers the parent socket with the reactor).
+    ///
+    /// **`Confinement::Exempt` (D-130), deliberately, v1-only:** Chrome runs its own content
+    /// sandbox, which needs to create a *nested* user namespace; forcing `--no-sandbox` on Chrome
+    /// so it fits inside an outer bwrap/Seatbelt wrapper would trade a strong, purpose-built
+    /// sandbox for a much weaker generic one — a net security loss, not a gain. It would also
+    /// break the fd-3/4 `pre_exec` wiring below, which maps the CDP socketpair onto the fds Chrome
+    /// itself expects to inherit — a wrapper's own `exec` of the real binary would need to
+    /// preserve those fds across two `exec`s instead of one. Browser confinement stays handled by
+    /// Chrome's own sandbox plus the env-clear spawn and CDP egress interception (D-124); revisit
+    /// in a follow-up story, not this epic (see `docs/designs/process-sandboxing.md`).
     #[cfg(unix)]
     pub fn spawn_debug_pipe(&self, argv: &[String], env: &[(String, String)]) -> Result<PipeChild> {
         use std::os::unix::io::AsRawFd;
@@ -1347,7 +1699,7 @@ impl System {
             .map_err(|e| Error::Other(format!("cdp socketpair: {e}")))?;
         let child_fd = child_end.as_raw_fd();
 
-        let mut cmd = self.build_command(argv, env, false)?;
+        let mut cmd = self.build_tokio_command(argv, env, false, Confinement::Exempt)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1789,6 +2141,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// D-130: `FLUX_SANDBOXED` is in `SAFE_ENV`, so a flux process that is itself already marked
+    /// (inherited from an outer real sandbox) forwards the marker to ITS OWN children even though
+    /// `apply_safe_env` clears the environment first — the nested-run detection
+    /// (`Sandbox::resolve`) depends on the marker surviving every hop down the process tree, not
+    /// just the first.
+    #[tokio::test]
+    async fn flux_sandboxed_marker_survives_env_clear_like_other_safe_env_entries() {
+        // FIX G: take the SAME lock the `sandbox::tests` use so a concurrent test mutating
+        // FLUX_SANDBOXED can't race the marker this test depends on. The guard is a struct wrapping
+        // the lock (not a raw `MutexGuard`), so holding it across the `.await` is sound and does not
+        // trip `clippy::await_holding_lock`; it restores FLUX_SANDBOXED on drop.
+        let _env = sandbox::EnvGuard::new(&["FLUX_SANDBOXED"]);
+        let (dir, sys) = temp_workspace();
+        std::env::set_var("FLUX_SANDBOXED", "1");
+        let out = sys
+            .run(&["env".to_string()], Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            out.stdout.contains("FLUX_SANDBOXED=1"),
+            "FLUX_SANDBOXED did not survive the env-clear: {}",
+            out.stdout
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn capped_lossy_truncates_huge_output() {
         let big = vec![b'a'; 2 * 1024 * 1024];
@@ -1822,6 +2200,72 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(out.exit_code, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-130 acceptance: the fail-closed backstop. A `Require`-mode sandbox with no usable backend
+    /// (D-130 never resolves one) refuses to spawn at all — `run` returns a config error naming the
+    /// unavailability reason — rather than silently falling back to running unconfined. This is the
+    /// per-spawn backstop behind the CLI's startup preflight: it must hold even for a caller that
+    /// somehow skipped that preflight (e.g. a `System` built directly with `with_sandbox`).
+    #[tokio::test]
+    async fn require_sandbox_with_unsupported_backend_fails_closed_on_run() {
+        let (dir, sys) = temp_workspace();
+
+        // Force discovery to fail on BOTH platforms regardless of whether *this* machine happens to
+        // have a real, working backend (D-131/D-132 landed real discovery+probing): point bwrap
+        // (Linux) AND sandbox-exec (macOS, FIX H — else macOS resolves a live Seatbelt backend and
+        // this test's premise breaks) at nonexistent paths, then require it. The env mutation and
+        // the synchronous `resolve()` run under the shared sandbox env lock (FIX G, via `EnvGuard`)
+        // and are fully restored when the guard drops at the end of this block — so no std
+        // `MutexGuard` is held across the `.await` further down. FLUX_SANDBOXED is cleared too, so a
+        // stray marker can't make `resolve()` report `AlreadyConfined` (which would satisfy
+        // `require` and defeat the test).
+        let sandbox = {
+            let _g = sandbox::EnvGuard::new(&[
+                "FLUX_BWRAP_BIN",
+                "FLUX_SANDBOX_EXEC_BIN",
+                "FLUX_SANDBOX",
+                "FLUX_SANDBOXED",
+            ]);
+            std::env::set_var(
+                "FLUX_BWRAP_BIN",
+                "/nonexistent/definitely-not-a-real-bwrap-d126",
+            );
+            std::env::set_var(
+                "FLUX_SANDBOX_EXEC_BIN",
+                "/nonexistent/definitely-not-a-real-sandbox-exec-d126",
+            );
+            std::env::set_var("FLUX_SANDBOX", "require");
+            sandbox::Sandbox::resolve(sandbox::SandboxSettings::from_env())
+        };
+        assert!(
+            !sandbox.is_active(),
+            "an unresolvable backend path must leave `require` unsatisfiable"
+        );
+        let reason = sandbox
+            .reason()
+            .expect("an inactive sandbox always names an unavailability reason")
+            .to_string();
+
+        let sys = sys.with_sandbox(sandbox);
+        let err = sys
+            .run(&["true".to_string()], Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(&reason),
+            "error should name the reason ({reason:?}): {err}"
+        );
+        let out = sys
+            .run_with_env_exempt(
+                &["true".to_string()],
+                &[("FLUX_SANDBOX".to_string(), "require".to_string())],
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the explicit trusted-host exemption bypasses only OS wrapping");
+        assert_eq!(out.exit_code, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2082,6 +2526,440 @@ mod tests {
         assert!(
             !out.contains("leak-me-not"),
             "background child inherited a parent secret: {out}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- D-131 live smokes: real bubblewrap confinement --------------------------------------
+    //
+    // Opt-in (`FLUX_LIVE_SANDBOX_SMOKE=1`), like every live-external test in this repo (mirrors
+    // `flux-web::browser::live_smoke_open_goto_snapshot_close_no_orphan`): CI runners and most
+    // dev machines either lack `bwrap` or run inside default-seccomp Docker where unprivileged
+    // user namespaces are refused, so an auto-run keyed only on discovery would be
+    // nondeterministic across environments. Double-gated: the env var AND a genuinely active
+    // backend, else `eprintln!` + skip.
+
+    /// Serializes the live smokes against **each other** (not the rest of this crate's — fully
+    /// parallel — test suite). A real `bwrap --ro-bind / /` spawn creates a fresh mount namespace
+    /// over the whole filesystem; running several concurrently under this binary's default
+    /// multi-threaded test harness was empirically observed to starve the system enough to cause
+    /// spurious failures even in unrelated, non-sandboxed tests (D-131 hardening). One at a time
+    /// keeps the smokes reliable without forcing the whole suite to `--test-threads=1`.
+    // `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held across `.await` points in
+    // every caller below, which `std::sync::MutexGuard` cannot do (not `Send`-safe across yields;
+    // `clippy::await_holding_lock` correctly rejects it).
+    static LIVE_SMOKE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn sandboxed_workspace(
+        network: bool,
+    ) -> Option<(tokio::sync::MutexGuard<'static, ()>, PathBuf, System)> {
+        let guard = LIVE_SMOKE_LOCK.lock().await;
+        if std::env::var("FLUX_LIVE_SANDBOX_SMOKE").is_err() {
+            eprintln!(
+                "SKIP live_smoke: set FLUX_LIVE_SANDBOX_SMOKE=1 to run against a real sandbox \
+                 backend"
+            );
+            return None;
+        }
+        let settings = sandbox::SandboxSettings {
+            mode: sandbox::SandboxMode::On,
+            network,
+            extra_writable: Vec::new(),
+        };
+        let sandbox = sandbox::Sandbox::resolve(settings);
+        if !sandbox.is_active() {
+            eprintln!(
+                "SKIP live_smoke: no usable sandbox backend discovered ({:?})",
+                sandbox.reason()
+            );
+            return None;
+        }
+        let (dir, sys) = temp_workspace();
+        Some((guard, dir, sys.with_sandbox(sandbox)))
+    }
+
+    #[tokio::test]
+    async fn live_smoke_sandboxed_run_writes_inside_workspace_ok() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        let out = sys
+            .run(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo hi > inside.txt && cat inside.txt".to_string(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert!(out.stdout.contains("hi"), "{}", out.stdout);
+        assert!(dir.join("inside.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn live_smoke_sandboxed_write_outside_workspace_under_home_fails() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        let home = std::env::var("HOME").expect("HOME set for this smoke");
+        let target = format!("{home}/.flux-sandbox-live-smoke-{}", std::process::id());
+        std::fs::remove_file(&target).ok();
+
+        let out = sys
+            .run(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo pwned > {target}"),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            out.exit_code, 0,
+            "write outside the workspace under $HOME must fail under sandbox: {}",
+            out.stderr
+        );
+        assert!(
+            !Path::new(&target).exists(),
+            "the file must not have been created outside the workspace"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_smoke_missing_configured_writable_is_created_and_usable() {
+        let Some((_serial, dir, discovered_sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        let home = std::env::var("HOME").expect("HOME set for this smoke");
+        let output_root = PathBuf::from(home).join(format!(
+            ".flux-sandbox-new-output-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&output_root).ok();
+        let sandbox = sandbox::Sandbox::resolve(sandbox::SandboxSettings {
+            mode: sandbox::SandboxMode::On,
+            network: true,
+            extra_writable: vec![output_root.clone()],
+        });
+        assert!(sandbox.is_active(), "{:?}", sandbox.reason());
+        let sys = System::new(Workspace::new(&dir).unwrap()).with_sandbox(sandbox);
+        let target = output_root.join("written.txt");
+        let out = sys
+            .run(
+                &["touch".to_string(), target.to_string_lossy().into_owned()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "{}", out.stderr);
+        assert!(target.is_file());
+        drop(discovered_sys);
+        std::fs::remove_dir_all(&output_root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn live_smoke_sandboxed_network_off_blocks_test_owned_loopback_listener() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(false).await else {
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+        // `curl` doesn't need shell involvement to hit a bare IP:port; a nonzero exit (typically 7,
+        // "Failed to connect") proves the sandboxed network namespace can't reach a listener that
+        // is genuinely open in the OUTER (host) namespace — namespace-fresh loopback, not a
+        // firewall rule.
+        let out = sys
+            .run(
+                &[
+                    "curl".to_string(),
+                    "--max-time".to_string(),
+                    "2".to_string(),
+                    "-sS".to_string(),
+                    format!("http://127.0.0.1:{port}/"),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            out.exit_code, 0,
+            "connecting to a host-owned loopback listener must fail with network=off: {}",
+            out.stderr
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn live_smoke_exempt_host_keeps_network_when_descendant_posture_is_closed() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(false).await else {
+            return;
+        };
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nprovider",
+                )
+                .await
+                .unwrap();
+        });
+        let out = sys
+            .run_with_env_exempt(
+                &[
+                    "curl".to_string(),
+                    "--max-time".to_string(),
+                    "2".to_string(),
+                    "-sS".to_string(),
+                    format!("http://127.0.0.1:{port}/"),
+                ],
+                &[
+                    ("FLUX_SANDBOX".to_string(), "on".to_string()),
+                    ("FLUX_SANDBOX_NET".to_string(), "0".to_string()),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(out.exit_code, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, "provider");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_smoke_network_on_keeps_dns_but_masks_host_ipc_sockets() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        let out = sys
+            .run(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "getent ahostsv4 example.com >/dev/null \
+                     && test ! -S /run/dbus/system_bus_socket \
+                     && test ! -S /run/systemd/resolve/io.systemd.Resolve \
+                     && test ! -S /run/systemd/resolve/io.systemd.Resolve.Monitor"
+                        .to_string(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.exit_code, 0,
+            "DNS should work without restoring host D-Bus/resolver sockets: {}",
+            out.stderr
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_smoke_linked_worktree_git_add_can_update_external_metadata() {
+        let Some((_serial, dir, parent_sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        let parent_sys_ref = &parent_sys;
+        let run = move |argv: Vec<String>| async move {
+            parent_sys_ref.run(&argv, Duration::from_secs(10)).await
+        };
+        let init = run(vec![
+            "git".into(),
+            "init".into(),
+            "-q".into(),
+            "main".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(init.exit_code, 0, "{}", init.stderr);
+        std::fs::write(dir.join("main/file.txt"), "base\n").unwrap();
+        let add = run(vec![
+            "git".into(),
+            "-C".into(),
+            "main".into(),
+            "add".into(),
+            "file.txt".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(add.exit_code, 0, "{}", add.stderr);
+        let commit = run(vec![
+            "git".into(),
+            "-C".into(),
+            "main".into(),
+            "-c".into(),
+            "user.name=Flux Test".into(),
+            "-c".into(),
+            "user.email=flux@example.invalid".into(),
+            "commit".into(),
+            "-q".into(),
+            "-m".into(),
+            "base".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(commit.exit_code, 0, "{}", commit.stderr);
+        let worktree = run(vec![
+            "git".into(),
+            "-C".into(),
+            "main".into(),
+            "worktree".into(),
+            "add".into(),
+            "-q".into(),
+            "--detach".into(),
+            "../linked".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(worktree.exit_code, 0, "{}", worktree.stderr);
+
+        let linked_sys = System::new(Workspace::new(dir.join("linked")).unwrap())
+            .with_sandbox(parent_sys.sandbox().clone());
+        let add = linked_sys
+            .run(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "echo changed >> file.txt && git add file.txt && git status --porcelain".into(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            add.exit_code, 0,
+            "linked-worktree index/object writes must reach the external common dir: {}",
+            add.stderr
+        );
+        assert!(add.stdout.contains("M  file.txt"), "{}", add.stdout);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn live_smoke_sandboxed_spawn_interactive_round_trips_stdin_stdout() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let InteractiveChild {
+            mut child,
+            mut stdin,
+            mut stdout,
+        } = sys.spawn_interactive(&["cat".to_string()]).unwrap();
+        stdin
+            .write_all(b"hello-through-the-sandbox\n")
+            .await
+            .unwrap();
+        drop(stdin); // close stdin so `cat` sees EOF and exits after echoing.
+
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello-through-the-sandbox\n");
+        let _ = child.wait().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_smoke_sandboxed_spawn_background_kill_leaves_no_orphan() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        // `--unshare-pid` gives the sandboxed tree its own pid namespace, so a pid written from
+        // *inside* it (e.g. via `$$`) is meaningless to the host's `/proc` — unlike
+        // `spawn_background_kill_stops_descendants` above. Identify the long-lived descendant by a
+        // unique marker in its argv instead, and check for it with the host's own `pgrep -f` (which
+        // sees every process regardless of pid-namespace nesting).
+        let marker = format!(
+            "flux-sandbox-orphan-smoke-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let script = format!("exec -a {marker} sleep 300");
+        let mut child = sys
+            .spawn_background(&["bash".to_string(), "-c".to_string(), script], &[])
+            .unwrap();
+
+        fn marker_visible_on_host(marker: &str) -> bool {
+            std::process::Command::new("pgrep")
+                .args(["-f", marker])
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false)
+        }
+
+        let mut seen = false;
+        for _ in 0..300 {
+            if marker_visible_on_host(&marker) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            seen,
+            "marked sandboxed process never became visible on the host"
+        );
+
+        child.kill();
+        for _ in 0..200 {
+            if !child.status().running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut gone = false;
+        for _ in 0..300 {
+            if !marker_visible_on_host(&marker) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            gone,
+            "sandboxed descendant survived the wrapper's death (orphaned): {marker}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn live_smoke_sandboxed_exit_code_propagates() {
+        let Some((_serial, dir, sys)) = sandboxed_workspace(true).await else {
+            return;
+        };
+        let out = sys
+            .run(
+                &["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.exit_code, 42,
+            "stdout={:?} stderr={:?}",
+            out.stdout, out.stderr
         );
         std::fs::remove_dir_all(&dir).ok();
     }

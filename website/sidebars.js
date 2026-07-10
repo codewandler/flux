@@ -86,6 +86,7 @@ const sidebars = {
         'security/overview',
         'security/credentials',
         'security/plugin-sandbox',
+        'security/os-sandbox',
         'security/plugin-trust',
         'security/server-auth',
         { type: 'ref', id: 'agent/safety' },

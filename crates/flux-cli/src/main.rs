@@ -85,6 +85,23 @@ struct Cli {
     /// anything recurring. Exported as `FLUX_ALLOW_PRIVATE_NET` so `app run`/`plugin call` inherit it.
     #[arg(long = "allow-private-net", global = true)]
     allow_private_net: bool,
+
+    /// Turn on OS-level process sandboxing (bubblewrap on Linux, Seatbelt on macOS) for spawned
+    /// shell/plugin processes — defense-in-depth underneath the safety envelope, orthogonal to
+    /// approvals. Off by default; layers over `[sandbox]` in .flux/config.toml (the strictest of
+    /// this flag, a pre-set `FLUX_SANDBOX`, and config wins). Exported as `FLUX_SANDBOX` so
+    /// `app run`/`plugin call` and other subprocess/child-flux paths inherit it. If no usable
+    /// backend is available (unsupported platform, or the wrapper is missing/blocked) this degrades
+    /// to a one-line warning and runs unconfined — unless `[sandbox] require` (or
+    /// `FLUX_SANDBOX=require`) is set, which fails closed at startup. `--no-sandbox` is the kill
+    /// switch. See docs/designs/process-sandboxing.md.
+    #[arg(long = "sandbox", global = true, conflicts_with = "no_sandbox")]
+    sandbox: bool,
+
+    /// Force OS-level sandboxing OFF for this invocation — the kill switch, overriding `--sandbox`,
+    /// a pre-set `FLUX_SANDBOX`, and `[sandbox]` config.
+    #[arg(long = "no-sandbox", global = true, conflicts_with = "sandbox")]
+    no_sandbox: bool,
 }
 
 /// The flags for running an agent turn — flattened into the agent-path subcommands (`run`, `plan`,
@@ -2256,6 +2273,15 @@ fn workspace_with_flow_roots(cwd: &std::path::Path, create_global: bool) -> Resu
     Ok(workspace)
 }
 
+/// The D-130 sandbox posture resolved from the environment — the counterpart to
+/// `workspace_with_flow_roots`'s custom [`Workspace`] construction. Call sites that build a
+/// `System` from a hand-assembled workspace (rather than `System::from_env`) attach this via
+/// `System::with_sandbox` so they still pick up `FLUX_SANDBOX`/`[sandbox]` like every other
+/// production entry point.
+fn resolved_sandbox() -> flux_system::sandbox::Sandbox {
+    flux_system::sandbox::Sandbox::resolve(flux_system::sandbox::SandboxSettings::from_env())
+}
+
 async fn build_agent_with(
     flags: &AgentFlags,
     eager_provider: bool,
@@ -2307,7 +2333,9 @@ async fn build_agent_with(
     // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
     // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
     // is the legacy location, still read during the ops→flows unification.
-    let system = Arc::new(System::new(workspace_with_flow_roots(&cwd, true)?));
+    let system = Arc::new(
+        System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
+    );
 
     // Project context folded into the system prompt: environment, git working-tree state, repo
     // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
@@ -2988,9 +3016,7 @@ fn should_fail(
 /// flux-tree-sitter repo's `scripts/render-example.mjs`). Builds the workspace from the
 /// environment like every production construction site, then delegates to [`run_render_in`].
 async fn run_render(file: &str, view: RenderView, out: Option<&str>) -> Result<()> {
-    let system = System::new(
-        Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
-    );
+    let system = System::from_env(std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?;
     run_render_in(&system, file, view, out).await
 }
 
@@ -3057,7 +3083,8 @@ struct LoadedCliFlow {
 /// and the shared catalog — no provider, event store, session, plugin process, or agent engine.
 fn run_flow_list() -> Result<()> {
     let cwd = std::env::current_dir().context("current dir")?;
-    let system = System::new(workspace_with_flow_roots(&cwd, false)?);
+    let system =
+        System::new(workspace_with_flow_roots(&cwd, false)?).with_sandbox(resolved_sandbox());
     println!("{}", flux_tools::StoredFlowCatalog::load(&system).render());
     Ok(())
 }
@@ -3106,7 +3133,8 @@ fn load_cli_flow_target(target: &str) -> Result<LoadedCliFlow> {
     }
 
     let cwd = std::env::current_dir().context("current dir")?;
-    let system = System::new(workspace_with_flow_roots(&cwd, false)?);
+    let system =
+        System::new(workspace_with_flow_roots(&cwd, false)?).with_sandbox(resolved_sandbox());
     let resolved = flux_tools::StoredFlowCatalog::load(&system)
         .resolve(target)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -6275,9 +6303,8 @@ fn parse_choice(line: &str, always: ApprovalChoice) -> ApprovalChoice {
 /// `[workspace]` config, so `Workspace::from_env` (used at every production construction site) picks it
 /// up. Sources are **additive**: `--add-dir` flags, `[workspace] add_dirs`, and any pre-set `FLUX_ADD_DIRS`
 /// all contribute; `--allow-all-paths`, `[workspace] allow_all`, or `FLUX_ALLOW_ALL` each enable the hatch.
-fn apply_workspace_access_env(cli: &Cli) {
+fn apply_workspace_access_env(cli: &Cli, cfg: &flux_config::Config) {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let cfg = flux_config::load(&cwd).unwrap_or_default();
     // Absolutize each dir against the cwd so downstream canonicalization is stable regardless of cwd.
     let abs = |p: &std::path::Path| -> String {
         let full = if p.is_absolute() {
@@ -6342,6 +6369,160 @@ fn apply_workspace_access_env(cli: &Cli) {
             style::red("warning:")
         );
     }
+}
+
+/// Export the D-130 sandbox posture to `FLUX_SANDBOX` / `FLUX_SANDBOX_NET` / `FLUX_SANDBOX_WRITABLE`
+/// from the CLI flags + `[sandbox]` config, so `Sandbox::resolve` (consulted by every
+/// `System::from_env` production site) picks it up and child flux invocations (`app run`, eval
+/// sub-agents, `plugin call`) inherit it — the same channel pattern as
+/// [`apply_workspace_access_env`].
+///
+/// Posture is resolved **tightest-wins**, NOT by a precedence chain: the strictest of
+/// `Require > On > Off` across every source that asks for confinement is what takes effect, so a
+/// laxer source can never silently downgrade a stricter one. Sources: `--sandbox` contributes `On`;
+/// a pre-set `FLUX_SANDBOX` contributes `Require`/`On` for those values (anything unrecognized —
+/// empty string, a typo like `requird` — contributes NOTHING and, if non-empty, earns a warning,
+/// rather than dropping to `Off`); config contributes `Require` when `[sandbox] require`, else `On`
+/// when `[sandbox] enabled`. The one exception is the explicit kill switch — `--no-sandbox`, or a
+/// pre-set `FLUX_SANDBOX=off` — which forces `Off` outright, mirroring `FLUX_OP_CACHE=off`. There is
+/// no `--require-sandbox` flag; `require` comes only from config or `FLUX_SANDBOX=require`.
+///
+/// When the resolved mode isn't `off`, this also runs the startup preflight: `require` + no usable
+/// backend is a hard startup error (fail-closed, mirroring `Sandbox::ensure_available`'s per-spawn
+/// backstop); otherwise an unavailable backend prints ONE styled warning naming the reason, in the
+/// same style as this function's `--allow-all-paths` warning above. A *nested* run (already confined
+/// by an outer flux sandbox → `Backend::AlreadyConfined`) is neither: it satisfies `require` and is
+/// not "unavailable", so no warning fires.
+fn apply_sandbox_env(cli: &Cli, cfg: &flux_config::Config) -> Result<()> {
+    use flux_system::sandbox::SandboxMode;
+
+    // Tightest-wins resolution: rank the postures so the strictest confinement request across every
+    // source takes effect (`Off` = 0). A laxer source must never be able to downgrade a stricter one
+    // (findings 6/7) — the sole override is the explicit kill switch handled below.
+    fn rank(m: SandboxMode) -> u8 {
+        match m {
+            SandboxMode::Off => 0,
+            SandboxMode::On => 1,
+            SandboxMode::Require => 2,
+        }
+    }
+    let stricter = |a: SandboxMode, b: SandboxMode| if rank(a) >= rank(b) { a } else { b };
+
+    let preset = std::env::var("FLUX_SANDBOX").ok();
+    let preset_lc = preset.as_deref().map(str::to_ascii_lowercase);
+    // The explicit kill switch still wins outright (mirrors `FLUX_OP_CACHE=off`): `--no-sandbox`, or
+    // a pre-set `FLUX_SANDBOX=off`, forces `Off` regardless of any confinement request.
+    let explicit_off = cli.no_sandbox || preset_lc.as_deref() == Some("off");
+
+    let mode = if explicit_off {
+        SandboxMode::Off
+    } else {
+        let mut mode = SandboxMode::Off;
+        // `--sandbox` asks for (at least) `On`.
+        if cli.sandbox {
+            mode = stricter(mode, SandboxMode::On);
+        }
+        // A pre-set env: recognized values raise the floor; `"off"` is the kill switch (handled
+        // above); ANYTHING else (empty / typo) contributes NOTHING — it must never downgrade a
+        // stricter source. A non-empty unrecognized value is almost certainly a typo, so warn.
+        match preset_lc.as_deref() {
+            Some("require") => mode = stricter(mode, SandboxMode::Require),
+            Some("on") => mode = stricter(mode, SandboxMode::On),
+            Some("off") | None => {}
+            Some(other) => {
+                if !other.is_empty() {
+                    eprintln!(
+                        "{} unrecognized FLUX_SANDBOX={:?} (expected off|on|require); ignoring it \
+                         for sandbox posture resolution — set one of those values to change it.",
+                        style::red("warning:"),
+                        preset.as_deref().unwrap_or_default()
+                    );
+                }
+            }
+        }
+        // Config: `require` (fail-closed) if set, else `enabled` (soft). `sandbox_require()` implies
+        // `sandbox_enabled()`, so the `else if` is exact.
+        if cfg.sandbox_require() {
+            mode = stricter(mode, SandboxMode::Require);
+        } else if cfg.sandbox_enabled() {
+            mode = stricter(mode, SandboxMode::On);
+        }
+        mode
+    };
+    std::env::set_var(
+        "FLUX_SANDBOX",
+        match mode {
+            SandboxMode::Off => "off",
+            SandboxMode::On => "on",
+            SandboxMode::Require => "require",
+        },
+    );
+
+    // Network: a pre-set env wins over config; an explicit narrowing to closed is only ever
+    // exported when it actually narrows (mirrors FLUX_ADD_DIRS/FLUX_ALLOW_ALL's "only set what
+    // changes" style) — the default stays open with nothing exported.
+    let network = std::env::var("FLUX_SANDBOX_NET")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or_else(|| cfg.sandbox_network().unwrap_or(true));
+    if !network {
+        std::env::set_var("FLUX_SANDBOX_NET", "0");
+    }
+
+    // Writable extras: additive like FLUX_ADD_DIRS, absolutized against cwd.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let abs = |p: &std::path::Path| -> String {
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        full.to_string_lossy().into_owned()
+    };
+    let mut writable: Vec<String> = Vec::new();
+    if let Ok(existing) = std::env::var("FLUX_SANDBOX_WRITABLE") {
+        writable.extend(
+            existing
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
+    }
+    writable.extend(cfg.sandbox_writable().iter().map(|p| abs(p)));
+    writable.sort();
+    writable.dedup();
+    if !writable.is_empty() {
+        std::env::set_var("FLUX_SANDBOX_WRITABLE", writable.join(":"));
+    }
+
+    if mode == SandboxMode::Off {
+        return Ok(());
+    }
+
+    let sandbox = resolved_sandbox();
+    sandbox
+        .ensure_available()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !sandbox.is_active() {
+        if let Some(reason) = sandbox.reason() {
+            eprintln!(
+                "{} OS sandbox requested but unavailable ({reason}): shell/plugin processes run \
+                 WITHOUT OS-level confinement this run. Set `[sandbox] require = true` (or \
+                 `FLUX_SANDBOX=require`) to fail closed instead.",
+                style::red("warning:")
+            );
+        } else if sandbox.confined_by_parent() {
+            // A nested flux run: an outer sandbox already confines this whole process tree, so this
+            // process adds no wrapper of its own — that satisfies `require` and is NOT an
+            // "unavailable" state, so the warning above (reason() == None here) rightly stays
+            // silent. A one-line dim note just makes the inherited confinement legible.
+            eprintln!(
+                "{}",
+                style::dim("sandbox: already confined by the outer flux run (nested).")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether `--allow-private-net` is in effect for this process. It is propagated as
@@ -6442,7 +6623,17 @@ fn main() -> Result<()> {
     // C-21: export the filesystem-access policy (extra read-only roots + the unconfined hatch) to the
     // environment so every workspace — including `app run` and subprocess paths — inherits it via
     // `Workspace::from_env`.
-    apply_workspace_access_env(&cli);
+    // Load once, before exporting any config-derived policy. A malformed config is a hard startup
+    // error: replacing it with `Config::default()` can erase a requested `[sandbox] require = true`
+    // posture and let spawn-capable commands such as `plugin status` execute native code
+    // unconfined. Clap handles `--help`/`--version` before this point, so those remain available even
+    // when the project config needs repair.
+    let cwd = std::env::current_dir().context("resolve current directory")?;
+    let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
+    apply_workspace_access_env(&cli, &cfg);
+    // D-130: export the OS-sandbox posture the same way, then run the startup preflight (hard
+    // error under `require` + unavailable; otherwise a one-line warning).
+    apply_sandbox_env(&cli, &cfg)?;
     // The per-turn env signals (`FLUX_VERBOSE`/`FLUX_SHOW_LOOP`/`FLUX_TRACE_LOOP`) the agent-path
     // subcommands honor — exported here, pre-runtime, for the same single-thread reason.
     if let Some(flags) = cli.command.as_ref().and_then(Commands::agent_flags) {
@@ -6824,12 +7015,15 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // Assemble the knowledge + integration tools the program's agent target (`trigger.agent`) and its
     // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
     let cwd = std::env::current_dir()?;
-    let system = Arc::new(System::new(
-        Workspace::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
-    ));
-    // Scoped SSRF egress opt-in, off by default. Program-serving plugin hosts use per-plugin grants;
-    // a missing or unreadable config keeps the safe default.
-    let cfg = flux_config::load(&cwd).unwrap_or_default();
+    let system = Arc::new(System::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?);
+    // Scoped SSRF egress opt-in, off by default. Program-serving plugin hosts use per-plugin grants.
+    // A *missing* config is fine (the safe default), but a *malformed* one is a hard error rather
+    // than a silent `unwrap_or_default()` (finding 7): `app run` is a real workload whose security
+    // (private-net grants, `[sandbox]` posture) is config-driven, so silently discarding a broken
+    // config and running with an empty one is fail-open. This matches the `run`/`plan`/`tui` agent
+    // paths, which already load the config with `?`. (The sandbox posture itself was already
+    // resolved and exported at startup, so `System::from_env` above still reflects it.)
+    let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
@@ -7563,9 +7757,7 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             // ungranted with no hint that the config failed to parse.
             let cwd = std::env::current_dir()?;
             let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
-            let system = Arc::new(System::new(
-                Workspace::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
-            ));
+            let system = Arc::new(System::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?);
             let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
                 Arc::new(flux_capabilities::MemoryBackend::new());
             let mut host = flux_plugin::PluginHost::spawn_verified(&system, &name, &desc)
@@ -7944,9 +8136,7 @@ async fn spawn_and_load_manifest(
     name: &str,
     d: &flux_plugin::PluginDescriptor,
 ) -> Result<flux_plugin::PluginManifest> {
-    let system = System::new(
-        Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
-    );
+    let system = System::from_env(std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut host = flux_plugin::PluginHost::spawn_verified(&system, name, d)
         .await
         .with_context(|| format!("spawn `{}`", d.program))?;
@@ -8467,9 +8657,7 @@ async fn load_plugin_manifests(
 ) -> Result<Vec<(String, flux_plugin::PluginManifest)>> {
     let mut plugins: Vec<(String, flux_plugin::PluginManifest)> = Vec::new();
     // Plugins launch through the one guarded spawn path, which needs a workspace-rooted System.
-    let system = System::new(
-        Workspace::from_env(&std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?,
-    );
+    let system = System::from_env(std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Same stale-registration handling as the agent-startup loops: dead descriptors get ONE
     // aggregated line instead of a doomed spawn attempt + per-plugin noise each.
     let (discovered, stale) = split_stale_plugins(flux_plugin::discover(dir));
@@ -12406,6 +12594,8 @@ mod tests {
         // review's scoped-down flags: the flags its FlowClient path ignores are parse errors.
         err(&["flux", "review", "--files", "x.rs", "--yes"]);
         err(&["flux", "review", "--files", "x.rs", "--continue"]);
+        // D-130: --sandbox and --no-sandbox are mutually exclusive.
+        err(&["flux", "--sandbox", "--no-sandbox", "run", "hi"]);
     }
 
     /// …and the legitimate forms of the same flags still parse.
@@ -12439,6 +12629,9 @@ mod tests {
         ok(&["flux", "replay", "--turn", "1"]);
         ok(&["flux", "eval", "terminal-bench"]);
         ok(&["flux", "eval", "multi", "--members", "synthetic,mock"]);
+        // D-130: --sandbox and --no-sandbox parse fine on their own (only combined do they conflict).
+        ok(&["flux", "--sandbox", "run", "hi"]);
+        ok(&["flux", "--no-sandbox", "run", "hi"]);
         // --serve's optional value: the common documented shape (no program, space-separated
         // address) still parses; a program BEFORE a bare --serve avoids the ambiguity entirely.
         ok(&["flux", "app", "run", "--serve", "0.0.0.0:1234", "--yes"]);
@@ -12977,6 +13170,149 @@ mod tests {
             super::private_net_grant_source_for("gitlab"),
             "cli:--allow-private-net"
         );
+    }
+
+    /// D-130 (findings 6/7/9b): `apply_sandbox_env` resolves posture **tightest-wins** — the
+    /// strictest of `Require > On > Off` across `--sandbox`, a pre-set `FLUX_SANDBOX`, and config —
+    /// so a laxer source can never silently downgrade a stricter one; the sole override is the
+    /// explicit kill switch (`--no-sandbox` / `FLUX_SANDBOX=off`). The startup preflight then fails
+    /// closed under `require` when no backend is usable.
+    ///
+    /// Real backends shipped (D-131 bubblewrap, D-132 Seatbelt), so this forces BOTH discovery
+    /// vars — `FLUX_BWRAP_BIN` (Linux) and `FLUX_SANDBOX_EXEC_BIN` (macOS) — at nonexistent paths so
+    /// the backend resolves `Unsupported` deterministically on either platform (finding 9b: forcing
+    /// only `FLUX_BWRAP_BIN` let macOS resolve a real Seatbelt backend and the `.unwrap_err()`
+    /// below panicked). `FLUX_SANDBOXED` is cleared too, so an ambient nested-run marker can't make
+    /// `resolve()` report `AlreadyConfined` (which would satisfy `require` and defeat the test).
+    #[test]
+    fn apply_sandbox_env_resolves_tightest_wins_and_fails_closed_under_require() {
+        use clap::Parser;
+
+        let _g_mode = EnvVarGuard::new("FLUX_SANDBOX");
+        let _g_net = EnvVarGuard::new("FLUX_SANDBOX_NET");
+        let _g_writable = EnvVarGuard::new("FLUX_SANDBOX_WRITABLE");
+        let _g_bwrap = EnvVarGuard::new("FLUX_BWRAP_BIN");
+        let _g_exec = EnvVarGuard::new("FLUX_SANDBOX_EXEC_BIN");
+        let _g_confined = EnvVarGuard::new("FLUX_SANDBOXED");
+        std::env::set_var(
+            "FLUX_BWRAP_BIN",
+            "/nonexistent/definitely-not-a-real-bwrap-d126",
+        );
+        std::env::set_var(
+            "FLUX_SANDBOX_EXEC_BIN",
+            "/nonexistent/definitely-not-a-real-sandbox-exec-d132",
+        );
+        // No ambient "already confined by a parent flux" marker — that would satisfy `require`.
+        std::env::remove_var("FLUX_SANDBOXED");
+
+        let bare = super::Cli::try_parse_from(["flux", "run", "hi"]).unwrap();
+        let sandboxed = super::Cli::try_parse_from(["flux", "--sandbox", "run", "hi"]).unwrap();
+        let no_sandbox = super::Cli::try_parse_from(["flux", "--no-sandbox", "run", "hi"]).unwrap();
+
+        let mut cfg_require = flux_config::Config::default();
+        cfg_require.sandbox.require = true;
+
+        // Nothing set anywhere: off, and no startup error.
+        std::env::remove_var("FLUX_SANDBOX");
+        super::apply_sandbox_env(&bare, &flux_config::Config::default()).unwrap();
+        assert_eq!(std::env::var("FLUX_SANDBOX").as_deref(), Ok("off"));
+
+        // Config alone (`require`) propagates when nothing else overrides it, and — with no usable
+        // backend (forced above) — fails closed at the startup preflight.
+        std::env::remove_var("FLUX_SANDBOX");
+        let err = super::apply_sandbox_env(&bare, &cfg_require).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+        assert_eq!(
+            std::env::var("FLUX_SANDBOX").as_deref(),
+            Ok("require"),
+            "the var is exported even though the call then errors"
+        );
+
+        // (a) TIGHTEST-WINS: `--sandbox` (asks for `On`) alongside config `require` resolves to
+        // `Require`, NOT `On` — the soft flag must not downgrade the fail-closed config posture
+        // (finding 6). So it still fails closed against the unavailable backend.
+        std::env::remove_var("FLUX_SANDBOX");
+        let err = super::apply_sandbox_env(&sandboxed, &cfg_require).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+        assert_eq!(
+            std::env::var("FLUX_SANDBOX").as_deref(),
+            Ok("require"),
+            "tightest-wins: --sandbox must not downgrade a configured `require` to `on`"
+        );
+
+        // (b) A pre-set `FLUX_SANDBOX` that is empty or a typo must NOT downgrade config `require` —
+        // the old `_ => Off` arm silently dropped a fail-closed posture (finding 6). Both still
+        // resolve to `Require` and fail closed.
+        for garbage in ["", "requird"] {
+            std::env::set_var("FLUX_SANDBOX", garbage);
+            let err = super::apply_sandbox_env(&bare, &cfg_require).unwrap_err();
+            assert!(err.to_string().contains("unavailable"), "{err}");
+            assert_eq!(
+                std::env::var("FLUX_SANDBOX").as_deref(),
+                Ok("require"),
+                "a garbage FLUX_SANDBOX={garbage:?} must not downgrade a configured `require`"
+            );
+        }
+
+        // A pre-set `on` with default config is a soft request: it only warns (Ok), never fails
+        // closed — `On`-mode auto-degrades against the unavailable backend.
+        std::env::set_var("FLUX_SANDBOX", "on");
+        super::apply_sandbox_env(&bare, &flux_config::Config::default()).unwrap();
+        assert_eq!(std::env::var("FLUX_SANDBOX").as_deref(), Ok("on"));
+
+        // (c) `--no-sandbox` is the kill switch: forces Off over a pre-set `require` env AND config.
+        std::env::set_var("FLUX_SANDBOX", "require");
+        super::apply_sandbox_env(&no_sandbox, &cfg_require).unwrap();
+        assert_eq!(std::env::var("FLUX_SANDBOX").as_deref(), Ok("off"));
+
+        // (c) A pre-set `FLUX_SANDBOX=off` is the other kill switch: forces Off even over config
+        // `require` (mirrors `FLUX_OP_CACHE=off`).
+        std::env::set_var("FLUX_SANDBOX", "off");
+        super::apply_sandbox_env(&bare, &cfg_require).unwrap();
+        assert_eq!(
+            std::env::var("FLUX_SANDBOX").as_deref(),
+            Ok("off"),
+            "FLUX_SANDBOX=off is the kill switch, even over config `require`"
+        );
+
+        // `--sandbox` with no pre-set env and default config resolves to `On` (soft): warns and
+        // runs unconfined against the unavailable backend, no error.
+        std::env::remove_var("FLUX_SANDBOX");
+        super::apply_sandbox_env(&sandboxed, &flux_config::Config::default()).unwrap();
+        assert_eq!(std::env::var("FLUX_SANDBOX").as_deref(), Ok("on"));
+
+        // Network: an explicit `false` in config narrows and is exported; the default stays open
+        // and exports nothing (mirrors FLUX_ADD_DIRS' "only set what changes" style). Applies
+        // regardless of mode.
+        std::env::remove_var("FLUX_SANDBOX");
+        std::env::remove_var("FLUX_SANDBOX_NET");
+        let mut cfg_net = flux_config::Config::default();
+        cfg_net.sandbox.network = Some(false);
+        super::apply_sandbox_env(&bare, &cfg_net).unwrap();
+        assert_eq!(std::env::var("FLUX_SANDBOX_NET").as_deref(), Ok("0"));
+
+        std::env::remove_var("FLUX_SANDBOX_NET");
+        super::apply_sandbox_env(&bare, &flux_config::Config::default()).unwrap();
+        assert!(
+            std::env::var("FLUX_SANDBOX_NET").is_err(),
+            "the unrestricted default exports nothing"
+        );
+
+        // Writable: config entries are absolutized against the cwd and exported as a `:`-list.
+        std::env::remove_var("FLUX_SANDBOX_WRITABLE");
+        let mut cfg_writable = flux_config::Config::default();
+        cfg_writable.sandbox.writable = vec!["relative-sandbox-dir".to_string()];
+        super::apply_sandbox_env(&bare, &cfg_writable).unwrap();
+        let exported = std::env::var("FLUX_SANDBOX_WRITABLE").unwrap();
+        assert!(
+            std::path::Path::new(&exported).is_absolute(),
+            "expected an absolutized path, got {exported:?}"
+        );
+        assert!(exported.ends_with("relative-sandbox-dir"), "{exported:?}");
+
+        std::env::remove_var("FLUX_SANDBOX");
+        std::env::remove_var("FLUX_SANDBOX_NET");
+        std::env::remove_var("FLUX_SANDBOX_WRITABLE");
     }
 
     /// Direct unit test of the `flux_capabilities::CrossPluginAudit` L6 binding

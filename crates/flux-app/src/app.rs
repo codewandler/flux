@@ -329,6 +329,19 @@ pub(crate) struct Engine {
     parks: Mutex<Vec<ParkedAsk>>,
 }
 
+/// Build the app's guarded [`System`] rooted at `workspace`, resolving the OS-sandbox posture from the
+/// environment (`FLUX_SANDBOX`/`FLUX_SANDBOX_NET`/`FLUX_SANDBOX_WRITABLE`, which the CLI exports into the
+/// process env at startup) via [`flux_system::sandbox::Sandbox::resolve`]. A bare `System::new` defaults
+/// to `Sandbox::disabled()` — no confinement and no fail-closed `require` enforcement — so without this
+/// the `app run` journey/sub-agent path and the agent-target (`app run --serve`) path would silently
+/// ignore `--sandbox`/`require` even though the docs promise those spawn paths inherit the posture.
+/// Resolves to off/disabled when nothing is set, so hermetic callers stay unconfined.
+fn guarded_system(workspace: Workspace) -> System {
+    System::new(workspace).with_sandbox(flux_system::sandbox::Sandbox::resolve(
+        flux_system::sandbox::SandboxSettings::from_env(),
+    ))
+}
+
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -352,7 +365,7 @@ impl Engine {
         // and, when `sub_agents` is set, the spawner it builds — so a journey and the sub-agents it
         // spawns always resolve paths against the identical workspace root (never two independent
         // `System`s from separate `current_dir()` calls).
-        let system = Arc::new(System::new(
+        let system = Arc::new(guarded_system(
             Workspace::from_env(std::env::current_dir().unwrap_or_else(|_| ".".into()))
                 .expect("flux-app: workspace"),
         ));
@@ -991,7 +1004,7 @@ async fn build_agent_engine(
 ) -> Result<FlowEngine> {
     let root = std::env::current_dir().map_err(other)?;
     let workspace = Workspace::from_env(&root).map_err(other)?;
-    let system = Arc::new(System::new(workspace));
+    let system = Arc::new(guarded_system(workspace));
     // Build the spec (which may read persona files through the guarded `system`) before moving the
     // `system` into the tool context.
     let spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
@@ -1700,5 +1713,80 @@ trigger tick
             reply.contains("2026-06-30T12:00:00Z"),
             "the turn carries the schedule `at`: {reply}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_posture_tests {
+    use super::*;
+    use flux_system::sandbox::SandboxMode;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `FLUX_SANDBOX` env var — two concurrent
+    /// `set_var`/`remove_var` calls on the same key race across parallel test threads (mirrors the
+    /// `SANDBOX_ENV_LOCK` guard in `flux-system`'s own sandbox tests).
+    static SANDBOX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores `FLUX_SANDBOX` to its prior value on drop — panic-safe so a failed assertion can't
+    /// leak a posture into a later test in the same process.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let lock = SANDBOX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = std::env::var_os("FLUX_SANDBOX");
+            std::env::set_var("FLUX_SANDBOX", value);
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("FLUX_SANDBOX", v),
+                None => std::env::remove_var("FLUX_SANDBOX"),
+            }
+        }
+    }
+
+    fn temp_workspace(tag: &str) -> Workspace {
+        let dir =
+            std::env::temp_dir().join(format!("flux-app-sandbox-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Workspace::new(&dir).unwrap()
+    }
+
+    /// The app's shared `System` (built by `guarded_system`, the backing for both the journey/sub-agent
+    /// path and the `app run --serve` agent-target path) must carry the env-resolved sandbox posture —
+    /// otherwise `FLUX_SANDBOX`/`--sandbox` would silently do nothing on those spawn paths.
+    #[test]
+    fn guarded_system_inherits_require_posture_from_env() {
+        let _guard = EnvGuard::set("require");
+        let system = guarded_system(temp_workspace("require"));
+        assert_eq!(
+            system.sandbox().settings().mode,
+            SandboxMode::Require,
+            "FLUX_SANDBOX=require must reach the app's System"
+        );
+        // `require` with no usable backend fails closed on `ensure_available` — the fail-safe the docs
+        // promise. (On a host with a working bwrap/sandbox-exec this instead resolves an active backend
+        // and is Ok; either way it is NOT the silent no-op a bare `System::new` would give.)
+        let disabled_default = flux_system::System::new(temp_workspace("default"));
+        assert_eq!(
+            disabled_default.sandbox().settings().mode,
+            SandboxMode::Off,
+            "a bare System::new stays disabled — proving guarded_system is what carries the posture"
+        );
+    }
+
+    /// With nothing set, `guarded_system` resolves to off/disabled so hermetic callers stay unconfined.
+    #[test]
+    fn guarded_system_defaults_off_when_env_unset() {
+        let _guard = EnvGuard::set("off");
+        let system = guarded_system(temp_workspace("off"));
+        assert_eq!(system.sandbox().settings().mode, SandboxMode::Off);
     }
 }
