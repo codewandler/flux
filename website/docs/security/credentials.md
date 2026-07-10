@@ -1,6 +1,6 @@
 ---
 title: Credentials & secrets
-description: How flux stores provider and plugin OAuth tokens, keeps secret values invisible to the model, and lets you log plugins in with flux auth login.
+description: How flux stores provider and plugin tokens, keeps secret values invisible to the model, and configures plugin auth with flux auth login / flux auth set.
 ---
 
 # Credentials & secrets
@@ -45,15 +45,16 @@ This is what "[secrets stay invisible to the model](../agent/safety.md)" means c
 
 ## Where credentials are stored
 
-flux stores OAuth tokens for both **providers** and **plugins** in a single file:
+flux stores tokens for both **providers** and **plugins** in a single file:
 
 ```text
 ~/.flux/credentials.toml
 ```
 
 Entries are keyed by purpose — `claude` and `codex` for provider subscriptions, and
-`plugin:<name>:<purpose>` for a plugin (for example `plugin:gitlab:api_token`). Each entry holds the
-access token, the refresh token, an expiry, and an optional account id.
+`plugin:<name>:<purpose>` for a plugin (for example `plugin:gitlab:api_token` or
+`plugin:slack:bot_token`). Each entry holds the access token and, for OAuth entries, the refresh
+token, an expiry, and an optional account id.
 
 :::note
 The default store is **plaintext, protected by file permissions — not encrypted at rest.** The file
@@ -114,6 +115,29 @@ The host:
 The plugin never touches the `/oauth/token` endpoint and never sees the resulting token — at call
 time the host injects a fresh bearer on the plugin's behalf. The declaration side of this
 (`oauth2` manifest fields) lives on the [Plugin capability sandbox](./plugin-sandbox.md) page.
+
+## Storing a plain plugin token (`flux auth set`)
+
+Most plugins authenticate with a plain bearer token (a Slack `xoxb-…`, a GitLab `glpat-…`) rather
+than an OAuth flow. Those purposes resolve from the env vars the manifest declares — or from a
+token you store **once, in advance**:
+
+```bash
+flux auth set slack bot_token        # hidden prompt; never echoed
+pass show slack/bot | flux auth set slack bot_token   # or pipe it from a secret manager
+flux auth set slack bot_token --clear                 # remove it again
+```
+
+`auth set` validates the plugin and purpose against the installed manifest (the purpose argument is
+optional when the plugin declares exactly one), then writes the token to the same
+`~/.flux/credentials.toml` store under `plugin:<name>:<purpose>`. Later sessions resolve it with no
+env var in the picture — useful when the shell that launches flux can't (or shouldn't) carry
+secrets in its environment.
+
+Resolution order for a plugin purpose: a **stored token wins**, the declared **env keys are the
+fallback** — the same order OAuth-backed purposes use. `flux plugin status <name>` always shows
+which source is active, without printing a value. Like every host-resolved secret, a stored token
+is registered with the redactor and reaches the wire only as a host-injected header.
 
 ## Related docs
 

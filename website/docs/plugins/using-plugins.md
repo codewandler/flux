@@ -110,8 +110,10 @@ manifest never named, and without a grant the private network is unreachable thr
 capabilities. See [Configuration](../reference/config.md).
 
 A plugin that talks to an OAuth-protected API is logged in with `flux auth login <name>` — flux runs
-the OAuth flow host-side and the plugin never sees the token. For the whole capability model,
-references-only IO, and the manifest fields behind these grants, see
+the OAuth flow host-side and the plugin never sees the token. A plain bearer token (the common case:
+Slack, GitLab) resolves from the env vars the manifest declares, or store it once with
+`flux auth set <name> <purpose>` and no env var is needed in any later session. For the whole
+capability model, references-only IO, and the manifest fields behind these grants, see
 [Plugin capability sandbox](../security/plugin-sandbox.md); for login and token storage, see
 [Credentials & secrets](../security/credentials.md).
 

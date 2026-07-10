@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### Improved
+
+- The docs now include a step-by-step Slack setup guide — install the plugin, provide bot/user
+  tokens (from your shell or stored once with `flux auth set`), verify with one command, and call
+  your first operation — and the credentials guide explains how stored integration tokens work.
+
 ## [0.14.7] - 2026-07-10
 
 ### New

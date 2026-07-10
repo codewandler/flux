@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Website: worked Slack plugin setup page** (`plugins/slack`) — install, bot/user tokens via env
+  or `flux auth set` (with the 0.14.7 version gate called out), `slack.test` verification, and real
+  operations; the first page of the per-plugin setup series alongside `plugins/gitlab`. The
+  *Credentials & secrets* page documents stored plain plugin tokens (`flux auth set`, stored-wins /
+  env-fallback precedence, `--clear`), and *Using plugins* points plain-bearer plugins at it.
+
 ## [0.14.7] - 2026-07-10
 
 ### Added
