@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-07-10
+
 ### Fixed
 
 - **gitlab plugin: CI job-token allowlist write ops 400'd on a `namespace/path` project.**

@@ -15,6 +15,14 @@
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-07-10
+
+### Fixed
+
+- The GitLab plugin's CI job-token allowlist commands (`gitlab.ci.job_token.allowlist.add`/`.remove`
+  and the `groups_allowlist` counterparts) no longer fail with a `400 "id is invalid"` error when the
+  project is given as a `namespace/path` rather than a numeric id.
+
 ## [0.14.2] - 2026-07-10
 
 ### Improved
