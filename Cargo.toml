@@ -120,7 +120,9 @@ async-stream = "0.3"
 # post OAuth token/introspection requests as form bodies).
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "rustls"] }
 eventsource-stream = "0.2"
-clap = { version = "4", features = ["derive"] }
+# `env` lets flag definitions own their env-var fallbacks (e.g. `flux a2a --token` ⇦ FLUX_A2A_TOKEN)
+# so precedence is declared once at the arg instead of hand-rolled in each handler.
+clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 # Held at 0.29/0.28 (range reqs so `task deps:upgrade` skips them): markdown-ratatui
 # (codewandler/markdown, git-pinned below in flux-markdown) requires ratatui ^0.29 — bumping here

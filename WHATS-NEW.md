@@ -15,6 +15,38 @@
 
 ## [Unreleased]
 
+### Improved
+
+- Flux-Lang editor diagnostics now recognize the built-in model, knowledge-search, and web-reading
+  operations available in the CLI. Files containing multiple flows or custom operations get live
+  diagnostics, completion, and hover for every declaration without mixing up their source locations.
+- Every flag the CLI accepts now does what its help says. Commands reject flags they can't honor
+  (instead of silently ignoring them), contradictory combinations are caught up front with a clear
+  usage error, and mistyped values — an unknown completion shell, a zero token limit, a malformed
+  budget variable — fail loudly instead of being quietly dropped.
+- `flux tui -v` now shows tool output in full, piped output (`flux usage > report.txt`) stays free
+  of color codes, and abandoning a `flux auth login codex` browser flow times out cleanly instead
+  of hanging forever.
+
+### Fixed
+
+- Setting the private-network variable to an "off" value (for example `FLUX_ALLOW_PRIVATE_NET=0`)
+  no longer opens private-network access — only explicit "on" values count, and flux now warns
+  whenever that access is active, naming what enabled it.
+- A prompt that happens to start with an existing file name (like `flux run Cargo.toml explain
+  this`) runs as a normal question again instead of being misread as a program file, and extra
+  words after a program path are rejected instead of silently thrown away.
+- `flux plugin status` no longer reports a working plugin as `missing` when its program is found
+  via PATH, and replaying a recorded session stays fully offline even with a cloud-credential
+  model configured.
+
+### Action needed
+
+- `flux review` now only accepts the flags it actually uses; scripts passing `--yes` or session
+  flags to it will get a usage error (remove those flags — review has always been read-only and
+  auto-approved). `flux app run --serve` and `flux plugin install --dir` now take their optional
+  value attached with `=` (`--serve=0.0.0.0:8787`, `--dir=path`).
+
 ## [0.13.3] - 2026-07-10
 
 ### Improved

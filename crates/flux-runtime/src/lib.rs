@@ -465,11 +465,30 @@ pub fn surface_all_override() -> bool {
     std::env::var("FLUX_SURFACE_ALL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-/// Whether the generic `bash` op is opted in: `FLUX_ENABLE_BASH=1` (or `true`). The CLI sets this
-/// from config `enable_shell` and the `/shell` toggle; [`detect_signals`] turns it into the `shell`
+/// In-process override for the shell opt-in (0 = unset, 1 = forced off, 2 = forced on). The CLI's
+/// config wiring and REPL `/shell` toggle flip this instead of mutating `FLUX_ENABLE_BASH`:
+/// `setenv` on a live multi-threaded runtime races any concurrent `getenv` (UB on glibc — the
+/// reason Rust 2024 marks `set_var` unsafe), while the env var itself stays the cross-process
+/// channel an operator exports.
+static SHELL_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the generic `bash` op on/off for this process (config `enable_shell`, REPL `/shell`),
+/// overriding `FLUX_ENABLE_BASH` in both directions. Takes effect at the next catalog
+/// recomputation ([`detect_signals`] runs per turn).
+pub fn set_shell_opt_in(on: bool) {
+    SHELL_OVERRIDE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the generic `bash` op is opted in: the in-process override ([`set_shell_opt_in`]) when
+/// set, else `FLUX_ENABLE_BASH=1` (or `true`). [`detect_signals`] turns it into the `shell`
 /// signal that surfaces the off-by-default `shell` group.
 pub fn shell_opt_in() -> bool {
-    std::env::var("FLUX_ENABLE_BASH").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    match SHELL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => std::env::var("FLUX_ENABLE_BASH")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+    }
 }
 
 /// The group tag for the reflexive loop-machinery ops (`plan`/`run_plan`). It is never surfaced by a

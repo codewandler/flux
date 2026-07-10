@@ -6,6 +6,86 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **CLI review wave — the flag surface is now honest.** (Some of these are CLI-surface breaking;
+  per the project SemVer rule the next release should be a MINOR bump.)
+  - `flux run <file>` program detection keys on the `.flux` extension ONLY — any other existing
+    file as the first prompt word no longer hijacks the turn into program mode (`flux run
+    Cargo.toml explain the workspace deps` is a turn about Cargo.toml again), and trailing words
+    after a program path are a loud error instead of silently dropped.
+  - `flux review` accepts only the flags it honors (`-m/--model`, `--max-tokens`). The turn/session
+    flags it silently ignored (`--yes`, `--continue`, `--resume`, `--skill-dir`, `--dev`,
+    `--turn-budget`, `-v`) are now parse errors — review always auto-approves its fixed read-only
+    flow. Likewise `flux fork` rejects `--continue`/`--resume`, and `flux app run <program>`
+    rejects `--continue`/`--resume`/`--dev`/`--skill-dir`/`--turn-budget` at runtime.
+  - Optional-value flags take `=` now: `flux app run --serve=ADDR`, `flux plugin install
+    --dir=PATH`. The space form swallowed a following positional (`--serve prog.flux` silently
+    served the built-in agent instead of the program).
+  - `--color auto` requires BOTH stdout and stderr to be terminals, so `flux usage > report.txt`
+    no longer embeds ANSI escapes in the file.
+
+### Fixed
+
+- Flux-Lang editor diagnostics now use the stable CLI cognition, datasource, and native-web
+  operation catalog, eliminating false `unknown operation` warnings for calls such as `ai.extract`,
+  `search`, and `web_fetch`. Multi-declaration modules are analyzed declaration-by-declaration with
+  module-local composite-op resolution and precise body ranges; module formatting stays disabled
+  until declaration order can be preserved safely.
+- **Boolean `FLUX_*` env signals are value-parsed, not presence-checked** (one owner:
+  `flux_system::env_truthy`). `FLUX_ALLOW_PRIVATE_NET=0` previously ENABLED private-network egress
+  for plugins and `web_fetch`; now only `1|true|yes|on` counts — same for `FLUX_VERBOSE`,
+  `FLUX_SHOW_LOOP`, `FLUX_TRACE_LOOP`. The private-net warning also fires when the grant arrives
+  via the env var, naming the actual source (ditto the sandbox-off warning, which no longer blames
+  `--allow-all-paths` for a config/env grant).
+- **Offline paths stay offline:** the lazy engine paths (`flux replay`, `flow run`) no longer
+  eagerly build the cognition pack's sibling provider — with an `aws/…` model that ran the
+  SSO/IMDS credential chain over the network during a "no live IO" replay. The sibling is now
+  deferred exactly like the engine's own provider.
+- **`flux plugin status` PATH-searches bare program names.** `Path::parent()` is `Some("")` for a
+  one-component name, so the PATH-search branch was unreachable and every bare-name plugin
+  rendered a red `missing` while `plugin call` spawned it fine.
+- **Config/limit errors are loud:** a malformed `FLUX_TURN_TOKEN_BUDGET` is a hard error instead
+  of silently removing the spend ceiling (`FLUX_COMPACT_CHARS` warns); a malformed
+  `.flux/config.toml` fails `flux plugin call` / `flux auth status` with the parse error instead
+  of silently dropping `[private_net]` grants / showing the wrong default model.
+- **Validation moved to clap where clap can own it:** `flux completion <shell>` is a `ValueEnum`
+  (unknown shell exits 2 instead of writing an empty script and exiting 0); fork `--prompt`
+  conflicts with `--inject`/`--edit`; `--resume-value` requires `--resume`; `changelog`
+  `<version>`/`--all`/`--unreleased` are mutually exclusive; `plugin install` modes are exclusive;
+  `plugin call --dry-run` conflicts with `--no-validate`; `skill --global` requires `--install`
+  on both surfaces and `plugin skill --out` conflicts with `--install`/`--global`; `auth login
+  claude|codex --password` is rejected; `eval` takes a typed adapter and `--members` must pair
+  with `multi`; zero is rejected for `--max-tokens`, `--turn-budget`, `--trials`, and the 1-based
+  `replay --turn`.
+- **`flux tui -v` works:** verbose now reaches the TUI — tool cards start expanded and the
+  30-line detail cap lifts. The flag was silently dead there.
+- **REPL/turn polish:** a failed `/run` ends the turn properly (cost line printed, spinner
+  stopped, instead of the spinner redrawing over the prompt); "always allow" choices persist even
+  when the turn later fails or `/clear` hits a store error; a `/model` switch reports a failed
+  persistence instead of silently mis-attributing usage; `flux plan --yes` in print-only mode
+  notes that `--yes` has no effect; a cassette-recording failure on `flow run` warns at record
+  time ("this run won't be replayable") instead of surfacing turns later in `flux replay`; a flow
+  store read error on resume propagates instead of masquerading as a bogus `unbound symbol`.
+- **OAuth logins are bounded and honest:** `flux auth login codex` times out after 300s like the
+  generic plugin flow (was: waited forever on an abandoned browser), callback socket read errors
+  are reported instead of masquerading as empty requests, and the interactive prompts run off the
+  runtime threads.
+- **Process-env hygiene:** every startup env export now happens before the tokio runtime spawns
+  worker threads, and the REPL `/shell` toggle + config `enable_shell` flip an in-process runtime
+  override instead of calling `set_var` on a live multi-threaded runtime (a data race with any
+  concurrent `getenv`; UB on glibc). `flux a2a --token`'s `FLUX_A2A_TOKEN` fallback is declared on
+  the flag (shows in `--help`).
+- **Smaller honesty fixes:** `plugin status` no longer claims an endpoint/auth is configured when
+  its env var is set but empty (matching resolution); `plugin call --dry-run` help states the
+  plugin process is spawned for its manifest (the op is never invoked); the workspace doc indexer
+  size-checks via metadata instead of reading oversized files fully on every agent construction;
+  `flux usage` survives an unreadable JSONL file (skip-counted, scan continues) and counts covered
+  days on calendar days; token counts hand off units cleanly (`1.0M`, never `1000.0k`);
+  `flux preset` rejects unknown keys and GNU-style flags instead of swallowing them, and errors on
+  `-o` with `--run` / `-m` without `--run`; the generated plugin-skill page emits the footnote its
+  `Medium*` risk marker references.
+
 ## [0.13.3] - 2026-07-10
 
 ### Documentation

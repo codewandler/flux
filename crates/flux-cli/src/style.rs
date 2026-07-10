@@ -8,7 +8,7 @@ static COLOR: AtomicBool = AtomicBool::new(false);
 /// `--color` choice.
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum ColorChoice {
-    /// Color when stderr is a terminal and `NO_COLOR` is unset.
+    /// Color when BOTH stdout and stderr are terminals and `NO_COLOR` is unset.
     #[default]
     Auto,
     Always,
@@ -16,13 +16,20 @@ pub enum ColorChoice {
 }
 
 /// Decide and store whether color is on (call once in `main`).
+///
+/// Auto requires BOTH streams to be terminals: the styled output goes to stdout (reports,
+/// dashboards) as well as stderr (status lines), and one process-wide toggle can only keep the
+/// module's no-ANSI-in-pipes promise by taking the conjunction — `flux usage > report.txt` must
+/// not embed escapes in the file just because stderr is still a tty.
 pub fn init(choice: ColorChoice) {
     use std::io::IsTerminal;
     let on = match choice {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
         ColorChoice::Auto => {
-            std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+            std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none()
         }
     };
     COLOR.store(on, Ordering::Relaxed);
@@ -87,12 +94,15 @@ pub fn plan_palette() -> flux_flow::render::Palette {
     }
 }
 
-/// Format a token count compactly: `940` / `5.4k` / `1.2M`.
+/// Format a token count compactly: `940` / `5.4k` / `1.2M`. Rounds to the display precision
+/// BEFORE picking the unit, so the boundary hands off cleanly: `999_950` reads `1.0M`, never
+/// `1000.0k`.
 pub fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+    let tenths_of_k = (n as f64 / 100.0).round();
+    if tenths_of_k >= 10_000.0 {
+        format!("{:.1}M", tenths_of_k / 10_000.0)
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        format!("{:.1}k", tenths_of_k / 10.0)
     } else {
         n.to_string()
     }
@@ -148,5 +158,12 @@ mod tests {
         assert_eq!(fmt_tokens(940), "940");
         assert_eq!(fmt_tokens(5_400), "5.4k");
         assert_eq!(fmt_tokens(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn fmt_tokens_hands_off_units_at_the_boundary() {
+        assert_eq!(fmt_tokens(999_949), "999.9k");
+        assert_eq!(fmt_tokens(999_999), "1.0M", "never `1000.0k`");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
     }
 }

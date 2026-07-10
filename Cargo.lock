@@ -2070,11 +2070,16 @@ dependencies = [
 name = "flux-lsp"
 version = "0.13.3"
 dependencies = [
+ "codewandler-flux-capabilities",
+ "codewandler-flux-cognition",
  "codewandler-flux-flow",
  "codewandler-flux-lang",
+ "codewandler-flux-provider",
  "codewandler-flux-runtime",
  "codewandler-flux-tools",
+ "codewandler-flux-web",
  "serde_json",
+ "text-size",
  "tokio",
  "tower-lsp",
 ]

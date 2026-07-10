@@ -37,6 +37,9 @@ use crate::theme::Theme;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Streaming cursor block appended to an in-progress assistant message.
 const CURSOR: &str = "▍";
+/// Max expanded-detail lines per tool card. Lifted entirely under verbose (`flux tui -v` /
+/// `FLUX_VERBOSE`), whose promise is tool output in full, no truncation.
+const MAX_DETAIL: usize = 30;
 
 /// The footer's planning-spinner label (A-15, mirrors the CLI's `phase_spinner_label`):
 /// phase-derived so it reads "orienting…"/"gathering…" for the collect passes and "planning…" for
@@ -251,6 +254,11 @@ pub struct ChatState {
     theme: Theme,
     /// Whether tool cards show their full detail (toggled with Ctrl-E).
     expand_tools: bool,
+    /// Verbose tool output (`flux tui -v` → `FLUX_VERBOSE`): expanded tool cards show their FULL
+    /// detail instead of capping at [`MAX_DETAIL`] lines, and cards start expanded so long output
+    /// is visible without pressing Ctrl-E (which still toggles). Set via
+    /// [`with_verbose`](Self::with_verbose).
+    verbose: bool,
     /// Selected row in the slash-command menu.
     slash_sel: usize,
     // --- session metrics (header/footer) ---
@@ -330,6 +338,7 @@ impl ChatState {
             model,
             theme: Theme::default(),
             expand_tools: false,
+            verbose: false,
             slash_sel: 0,
             tokens_in: 0,
             tokens_out: 0,
@@ -377,6 +386,15 @@ impl ChatState {
     /// dollar cost alongside tokens (C-06) — mirrors the CLI's `CliSink::with_cost`.
     pub fn with_cost(mut self, model_spec: String, pricing: flux_core::PricingTable) -> Self {
         self.cost_model = Some((model_spec, pricing));
+        self
+    }
+
+    /// Enable verbose tool output (`flux tui -v`, which flux-cli exports as `FLUX_VERBOSE` before
+    /// launching the TUI): tool cards start expanded and their detail renders in full instead of
+    /// capping at [`MAX_DETAIL`] lines. Ctrl-E still collapses/re-expands the cards.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self.expand_tools = self.expand_tools || verbose;
         self
     }
 
@@ -677,9 +695,8 @@ impl ChatState {
 
     /// Render one tool card: a `→ verb arg … [badge]` header, a one-line summary, and — when
     /// `expand_tools` is set — the full detail (a unified diff for `edit`/`write`, else the output,
-    /// capped).
+    /// capped at [`MAX_DETAIL`] lines unless `verbose`).
     fn tool_lines(&self, tool: &ToolEntry, width: u16) -> Vec<Line<'static>> {
-        const MAX_DETAIL: usize = 30;
         let t = &self.theme;
         let mut out: Vec<Line> = Vec::new();
 
@@ -727,12 +744,18 @@ impl ChatState {
                 Span::styled(truncate(&summary, width.saturating_sub(2) as usize), style),
             ]));
 
-            // Full detail, when expanded.
+            // Full detail, when expanded. Verbose (`-v`/`FLUX_VERBOSE`) lifts the line cap —
+            // "tool output in full (no truncation)" is the flag's promise.
             if self.expand_tools {
                 let detail =
                     toolview::format_detail(&tool.name, &tool.input, &o.content, o.is_error);
-                let shown = detail.len().min(MAX_DETAIL);
-                for (kind, text) in detail.iter().take(MAX_DETAIL) {
+                let cap = if self.verbose {
+                    detail.len()
+                } else {
+                    MAX_DETAIL
+                };
+                let shown = detail.len().min(cap);
+                for (kind, text) in detail.iter().take(cap) {
                     let style = match kind {
                         toolview::DetailKind::Add => t.ok_style(),
                         toolview::DetailKind::Del => t.err_style(),
@@ -872,6 +895,16 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Whether a `FLUX_*` boolean env value is ON: `1`/`true`/`yes`/`on`, case-insensitive. Mere
+/// presence with any other value (e.g. `FLUX_VERBOSE=0`) is OFF — env flags are value-parsed,
+/// not presence-tested.
+fn flag_on(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Format an elapsed duration compactly: `820µs` / `12ms` / `1.4s` (mirrors `flux-cli`'s helper).
@@ -1203,7 +1236,9 @@ type Tui = Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 /// terminal (raw mode + alternate screen + mouse capture) even on error. `model_spec` is the
 /// resolved `provider/model` (e.g. `codex/gpt-5.5`, mirroring the CLI's `CliSink::with_cost`); when
 /// given, the header shows a running dollar cost alongside tokens (C-06). Pricing is the builtin
-/// table overlaid by `~/.flux/pricing.toml` (same loader the CLI uses).
+/// table overlaid by `~/.flux/pricing.toml` (same loader the CLI uses). Reads `FLUX_VERBOSE`
+/// (exported by `flux tui -v`, value-parsed — see [`flag_on`]) once at startup: verbose starts
+/// tool cards expanded and shows their output in full instead of capped at [`MAX_DETAIL`] lines.
 pub async fn run(
     agent: FlowEngine,
     session_id: String,
@@ -1236,7 +1271,8 @@ pub async fn run(
     crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
 
-    let mut state = ChatState::new(model);
+    let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
+    let mut state = ChatState::new(model).with_verbose(verbose);
     if let Some(spec) = model_spec {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
@@ -1928,6 +1964,75 @@ mod tests {
         let content = screen(&terminal);
         assert!(content.contains("- old line"));
         assert!(content.contains("+ new line"));
+    }
+
+    /// `flux tui -v` promises "tool output in full (no truncation)": verbose lifts the expanded
+    /// cards' [`MAX_DETAIL`] line cap and starts cards expanded, so a long tool output is fully
+    /// visible instead of eliding past 30 lines behind an "… N more lines" note.
+    #[test]
+    fn verbose_shows_long_tool_output_in_full() {
+        let output: String = (1..=40).map(|i| format!("out line {i}\n")).collect();
+        let transcript = |state: &ChatState| -> String {
+            state
+                .transcript_lines(80)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Default (no -v): the expanded detail is capped at MAX_DETAIL lines with an elision note.
+        let mut capped = ChatState::new("opus".into());
+        assert!(!capped.expand_tools, "cards start collapsed without -v");
+        capped.expand_tools = true;
+        capped.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "seq 40"}),
+        )));
+        capped.finish_tool("bash", output.clone(), false);
+        let content = transcript(&capped);
+        assert!(content.contains("out line 30"));
+        assert!(
+            !content.contains("out line 31"),
+            "without -v the detail keeps the {MAX_DETAIL}-line cap: {content}"
+        );
+        assert!(content.contains("… 10 more lines"));
+
+        // Verbose: cards start expanded and the cap is lifted — the full output is shown.
+        let mut verbose = ChatState::new("opus".into()).with_verbose(true);
+        assert!(
+            verbose.expand_tools,
+            "verbose starts tool cards expanded so the output is visible without Ctrl-E"
+        );
+        verbose.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "seq 40"}),
+        )));
+        verbose.finish_tool("bash", output, false);
+        let content = transcript(&verbose);
+        assert!(content.contains("out line 31"));
+        assert!(
+            content.contains("out line 40"),
+            "verbose must show the tool output in full: {content}"
+        );
+        assert!(!content.contains("more lines"));
+    }
+
+    /// `FLUX_VERBOSE` is value-parsed, not presence-tested: only `1|true|yes|on`
+    /// (case-insensitive) turn verbose on — `FLUX_VERBOSE=0` must stay off.
+    #[test]
+    fn verbose_env_flag_is_value_parsed() {
+        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(flag_on(on), "{on:?} must be ON");
+        }
+        for off in ["", "0", "false", "no", "off", "2", "verbose"] {
+            assert!(!flag_on(off), "{off:?} must be OFF");
+        }
     }
 
     #[test]

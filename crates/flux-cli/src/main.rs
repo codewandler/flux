@@ -61,7 +61,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// When to colorize output: auto (a terminal, `NO_COLOR` unset), always, or never.
+    /// When to colorize output: auto (stdout AND stderr are terminals, `NO_COLOR` unset),
+    /// always, or never.
     #[arg(long, value_enum, default_value_t, global = true)]
     color: style::ColorChoice,
 
@@ -86,9 +87,11 @@ struct Cli {
     allow_private_net: bool,
 }
 
-/// The flags for running an agent turn — flattened into each agent-path subcommand (`run`, `plan`,
-/// `tui`, `serve`), so they live on those commands and stay off every other subcommand's help.
-/// (`--color` is `global` on [`Cli`] instead; it applies to every command.)
+/// The flags for running an agent turn — flattened into the agent-path subcommands (`run`, `plan`,
+/// `tui`, `fork`, `app run`), so they live on those commands and stay off every other subcommand's
+/// help. (`--color` is `global` on [`Cli`] instead; it applies to every command. `review` carries
+/// its own smaller [`ReviewFlags`].) `fork` and `app run <program>` reject the session/turn flags
+/// their paths can't honor at runtime (see `run_fork`/`run_app`).
 #[derive(clap::Args, Debug)]
 struct AgentFlags {
     /// (Hidden) Non-interactive print mode — a bare prompt is already one-shot, so this is a no-op alias.
@@ -112,27 +115,32 @@ struct AgentFlags {
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// (Hidden) Adaptive thinking — only wired on the `-p` raw path; a no-op for the engine for now.
+    /// (Hidden) Adaptive thinking — accepted for CLI compatibility; currently a no-op (the raw
+    /// `-p` path that consumed it was removed with the engine cutover).
     #[arg(long, hide = true)]
     think: bool,
 
-    /// (Hidden) Reasoning effort — only wired on the `-p` raw path; a no-op for the engine for now.
+    /// (Hidden) Reasoning effort — accepted for CLI compatibility; currently a no-op (the raw
+    /// `-p` path that consumed it was removed with the engine cutover).
     #[arg(long, value_enum, hide = true)]
     effort: Option<EffortArg>,
 
     /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
     /// so it is generous by default; a turn truncated here fails loudly rather than silently stopping.
-    #[arg(long, default_value_t = 16384)]
+    /// Zero would fail at the provider, so it is rejected at parse time.
+    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
 
     /// Per-turn token budget (all tiers, summed across the turn's model calls): once crossed, the
     /// turn ends honestly with a budget-exceeded answer instead of consulting the model again.
     /// Overrides `FLUX_TURN_TOKEN_BUDGET` and `[limits] turn_token_budget` in .flux/config.toml.
-    /// Off by default (no ceiling).
-    #[arg(long)]
+    /// Off by default (no ceiling) — 0 would mean "instantly exceeded", not "off", so it is
+    /// rejected at parse time.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     turn_budget: Option<u64>,
 
-    /// (Hidden) Print token usage — only wired on the `-p` raw path.
+    /// (Hidden) Print token usage — accepted for CLI compatibility; currently a no-op (usage/cost
+    /// is always shown on the turn-end rule; see also `flux usage`).
     #[arg(long, hide = true)]
     usage: bool,
 
@@ -180,6 +188,22 @@ struct AgentFlags {
     dev: bool,
 }
 
+/// The flags `flux review` actually consumes — deliberately NOT the full [`AgentFlags`] set.
+/// Review runs the embedded strict-review flow through `flux_sdk::FlowClient`, so the turn flags
+/// (`--continue`/`--resume`, `--turn-budget`, `--skill-dir`, `--dev`, `-v`, `--yes`, …) have no
+/// effect on that path; offering them would accept-and-ignore, so they are rejected at parse time
+/// instead. (Review always auto-approves its own fixed, read-only flow — see `run_review`.)
+#[derive(clap::Args, Debug)]
+struct ReviewFlags {
+    /// Fully-qualified `provider/model` spec the reviewer sub-agents run (same forms as `flux run -m`).
+    #[arg(short = 'm', long)]
+    model: Option<String>,
+
+    /// Maximum tokens per reviewer model call.
+    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..))]
+    max_tokens: u32,
+}
+
 /// A standalone parser wrapper used only to materialize a default-populated [`AgentFlags`] from
 /// synthesized args (see [`AgentFlags::from_model_yes`]). Going through clap preserves field defaults
 /// like `max_tokens` that a hand-built `Default` would zero out.
@@ -212,6 +236,8 @@ impl AgentFlags {
 /// stray word never launches an autonomous turn — use `flux run <prompt>`).
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
+    // NOTE: `agent_flags` (below the enum) must cover every variant that flattens [`AgentFlags`] —
+    // it feeds the pre-runtime `apply_agent_env` export in `main`.
     /// Run the agent on a prompt, or a multi-agent program: `flux run <prompt…>` / `flux run <app.flux>`.
     Run {
         #[command(flatten)]
@@ -257,9 +283,10 @@ enum Commands {
         /// Mode B (default): let the model re-plan the tail live from the forked state.
         #[arg(long)]
         replan: bool,
-        /// With --replan: the instruction for the re-planned tail (default: continue the
-        /// recorded task).
-        #[arg(long)]
+        /// With --replan (mode B, the default): the instruction for the re-planned tail
+        /// (default: continue the recorded task). Meaningless for --inject/--edit, so those
+        /// combinations are rejected.
+        #[arg(long, conflicts_with_all = ["inject", "edit"])]
         prompt: Option<String>,
         #[command(flatten)]
         agent: AgentFlags,
@@ -272,7 +299,7 @@ enum Commands {
         /// Optional one-shot prompt. If empty and stdin is a TTY, the REPL opens instead.
         prompt: Vec<String>,
         /// Bearer token for a gated endpoint (falls back to `FLUX_A2A_TOKEN`).
-        #[arg(long)]
+        #[arg(long, env = "FLUX_A2A_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
     /// Run a benchmark suite against flux and print a summary.
@@ -280,22 +307,24 @@ enum Commands {
         after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter-anthropic/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench"
     )]
     Eval {
-        /// Which suite to run: synthetic | mock | terminal-bench | multi.
-        adapter: String,
+        /// Which suite to run.
+        #[arg(value_enum)]
+        adapter: EvalAdapter,
         /// Model the suite's agent runs (e.g. `-m mock`, `-m openrouter-anthropic/anthropic/claude-sonnet-4.6`).
         #[arg(short = 'm', long)]
         model: Option<String>,
         /// Restrict to these task ids (comma-separated).
         #[arg(long, value_delimiter = ',')]
         tasks: Vec<String>,
-        /// For `multi`: the member adapters to combine (comma-separated).
+        /// For `multi`: the member adapters to combine (comma-separated). Only meaningful with
+        /// the `multi` adapter (checked at startup).
         #[arg(long, value_delimiter = ',')]
         members: Vec<String>,
         /// Cap the number of tasks (0 = all).
         #[arg(long, default_value_t = 0)]
         limit: u64,
         /// Trials per task (>1 averages out single-run model noise).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
         trials: u64,
         /// Write a categorized Markdown report to this path.
         #[arg(long)]
@@ -340,7 +369,7 @@ enum Commands {
     /// posts anywhere, it only prints to stdout.
     Review {
         #[command(flatten)]
-        agent: AgentFlags,
+        flags: ReviewFlags,
         /// Files to review (at least one).
         #[arg(long = "files", required = true, num_args = 1..)]
         files: Vec<String>,
@@ -373,9 +402,10 @@ enum Commands {
         /// Session id (`s_42`), or `last` for the most recent session.
         #[arg(default_value = "last")]
         session: String,
-        /// Replay only this turn's plans (1-based). Cross-turn symbol references fail honestly.
-        #[arg(long)]
-        turn: Option<usize>,
+        /// Replay only this turn's plans (1-based — turn 0 is a usage error, not an alias for
+        /// the first turn). Cross-turn symbol references fail honestly.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn: Option<u64>,
         /// Also replay this session's sub-agent child streams (A-08 correlation), in spawn order.
         #[arg(long)]
         sub_agents: bool,
@@ -429,15 +459,16 @@ enum Commands {
         #[arg(long)]
         install: bool,
         /// With `--install`, target the user-global `~/.claude/skills` instead of project `.flux/skills`.
-        #[arg(long)]
+        #[arg(long, requires = "install")]
         global: bool,
     },
     /// Show what changed in flux, in plain language (the customer changelog).
     Changelog {
         /// Show a specific version's section (e.g. `0.11.6`).
+        #[arg(conflicts_with_all = ["all", "unreleased"])]
         version: Option<String>,
         /// Show every recorded release.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "unreleased")]
         all: bool,
         /// Show the not-yet-released section (development builds).
         #[arg(long)]
@@ -445,8 +476,10 @@ enum Commands {
     },
     /// Print a shell completion script to stdout (defaults to fish).
     Completion {
-        /// Shell to generate for: bash | zsh | fish | powershell | elvish.
-        shell: Option<String>,
+        /// Shell to generate for (defaults to fish). An unknown shell is a usage error (exit 2),
+        /// so a scripted `flux completion <shell> > file` can't silently install an empty script.
+        #[arg(value_enum)]
+        shell: Option<clap_complete::Shell>,
     },
     /// Scaffold or run a parameterized flow recipe.
     Preset {
@@ -454,6 +487,24 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+impl Commands {
+    /// The flattened [`AgentFlags`] of an agent-path subcommand (`run`/`plan`/`tui`/`fork`/
+    /// `app run`), if this is one. `main` uses this to export the flags' env signals BEFORE the
+    /// tokio runtime exists — `set_var` must not race worker-thread `getenv`s.
+    fn agent_flags(&self) -> Option<&AgentFlags> {
+        match self {
+            Self::Run { agent, .. }
+            | Self::Plan { agent, .. }
+            | Self::Tui { agent }
+            | Self::Fork { agent, .. }
+            | Self::App {
+                action: AppAction::Run { agent, .. },
+            } => Some(agent),
+            _ => None,
+        }
+    }
 }
 
 /// `flux app …`
@@ -472,11 +523,15 @@ enum AppAction {
         /// built-in coding agent is served).
         program: Option<String>,
         /// Expose an agent over the HTTP/A2A API at this address (defaults to `127.0.0.1:8787`). With a
-        /// program, serves its agent; with none, serves the built-in coding agent. Requires `--yes`.
+        /// program, serves its agent; with none, serves the built-in coding agent — that no-program
+        /// form requires `--yes` (HTTP requests have no interactive approver). A custom address must
+        /// be attached with `=` (`--serve=0.0.0.0:8787`) — an optional-value flag would otherwise
+        /// swallow a following `<program>` positional as its address.
         #[arg(
             long,
             value_name = "ADDR",
             num_args = 0..=1,
+            require_equals = true,
             default_missing_value = "127.0.0.1:8787"
         )]
         serve: Option<String>,
@@ -514,8 +569,9 @@ enum FlowAction {
         /// a bare word is a JSON string (`--resume-value hi` binds `"hi"`) and `--resume-value 42`
         /// binds the number. Required when `--resume`-ing a session that halted awaiting a value; omit
         /// it for a plain checkpoint/failure resume. Without it, resuming past an unbound await refuses
-        /// with a clear error instead of failing later on `unbound symbol`.
-        #[arg(long, value_name = "JSON")]
+        /// with a clear error instead of failing later on `unbound symbol`. Only meaningful with
+        /// `--resume` (a fresh run has no halted await to bind), so that pairing is enforced.
+        #[arg(long, value_name = "JSON", requires = "resume")]
         resume_value: Option<String>,
     },
 }
@@ -591,8 +647,9 @@ enum PluginAction {
     /// Invoke one operation of an installed plugin directly: `call <name> <op> [json-input]`
     /// (alias: `run`). Input is built from the optional `<json-input>` object plus any
     /// `--arg key=value` flags (coerced to the op's declared `input_schema` types and merged
-    /// over the JSON base). `--dry-run` validates locally against the schema and prints the
-    /// coerced input without spawning the plugin; `--no-validate` skips schema coercion/validation.
+    /// over the JSON base). `--dry-run` validates against the op's schema and prints the coerced
+    /// input without invoking the op (the plugin process IS spawned to read its manifest);
+    /// `--no-validate` skips schema coercion/validation.
     #[command(alias = "run")]
     Call {
         name: String,
@@ -603,9 +660,11 @@ enum PluginAction {
         /// array/object). Repeatable; values merge over `<json-input>`.
         #[arg(long = "arg", value_name = "KEY=VALUE")]
         arg: Vec<String>,
-        /// Validate the input against the op's schema locally and print the coerced input +
-        /// any problems — never spawn the plugin.
-        #[arg(long = "dry-run")]
+        /// Validate the input against the op's schema and print the coerced input + any
+        /// problems — the op is never invoked. (The plugin process is still spawned once to
+        /// read its manifest, which carries the schema.) Contradicts `--no-validate`, so the
+        /// combination is rejected.
+        #[arg(long = "dry-run", conflicts_with = "no_validate")]
         dry_run: bool,
         /// Skip schema coercion/validation of `--arg` values (pass them through as strings).
         #[arg(long = "no-validate")]
@@ -625,16 +684,19 @@ enum PluginAction {
         /// Plugin name(s) to install, each optionally pinned to `@<version>` (remote mode).
         names: Vec<String>,
         /// Install every plugin in the pack (remote mode).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "names")]
         all: bool,
         /// Scan a local directory for already-built `flux-plugin-*` binaries instead of the
         /// remote pack channel (local-scan mode; defaults to `plugins/target/release` when given
-        /// with no value).
+        /// with no value). The path must be attached with `=` (`--dir=path`) — an optional-value
+        /// flag would otherwise swallow a following plugin name as its path.
         #[arg(
             long,
             value_name = "PATH",
             num_args = 0..=1,
-            default_missing_value = "plugins/target/release"
+            require_equals = true,
+            default_missing_value = "plugins/target/release",
+            conflicts_with_all = ["names", "all"]
         )]
         dir: Option<String>,
     },
@@ -669,10 +731,11 @@ enum PluginAction {
         #[arg(long)]
         install: bool,
         /// With `--install`, target the user-global `~/.claude/skills/flux-plugin` instead.
-        #[arg(long)]
+        #[arg(long, requires = "install")]
         global: bool,
         /// Write the SKILL.md to this single file (references go in a sibling `references/`).
-        #[arg(long)]
+        /// A different destination than `--install`, so combining them is rejected.
+        #[arg(long, conflicts_with_all = ["install", "global"])]
         out: Option<String>,
     },
 }
@@ -705,6 +768,32 @@ enum EndpointAction {
         #[arg(long, value_name = "JSON")]
         from_json: Option<String>,
     },
+}
+
+/// `flux eval <adapter>` — the benchmark suites flux-eval can drive. A typo'd adapter is a parse
+/// error listing these, instead of a deep `build_adapter` failure after startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum EvalAdapter {
+    /// Real-model coding riddles (fast, no Docker).
+    Synthetic,
+    /// Offline CI fixture (drives `-m mock`).
+    Mock,
+    /// The real Docker benchmark.
+    TerminalBench,
+    /// Several suites behind one combined score (with `--members`).
+    Multi,
+}
+
+impl EvalAdapter {
+    /// The wire name flux-eval's `build_adapter` expects — identical to the clap value name.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::Mock => "mock",
+            Self::TerminalBench => "terminal-bench",
+            Self::Multi => "multi",
+        }
+    }
 }
 
 /// Reasoning effort, as a CLI value-enum mirroring [`Effort`].
@@ -981,10 +1070,13 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
         if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
             continue;
         }
+        // Size-check via metadata BEFORE reading: this runs on every agent construction, and a
+        // stray 500 MB `notes.txt` must not cost a whole-file read+alloc just to be discarded.
+        if !matches!(system.file_size(&f).await, Ok(n) if n as usize <= MAX_BYTES) {
+            continue;
+        }
         if let Ok(text) = system.read_file(&f).await {
-            if text.len() <= MAX_BYTES {
-                docs.push((f, text));
-            }
+            docs.push((f, text));
         }
     }
     // Index under the `local` source as `file.document` records via the markdown ingester.
@@ -1019,10 +1111,12 @@ async fn build_datasources(
                     if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
                         continue;
                     }
+                    // Metadata size-check before the read, as in `build_doc_index`.
+                    if !matches!(system.file_size(&f).await, Ok(n) if n as usize <= MAX_BYTES) {
+                        continue;
+                    }
                     if let Ok(text) = system.read_file(&f).await {
-                        if text.len() <= MAX_BYTES {
-                            docs.push((f, text));
-                        }
+                        docs.push((f, text));
                     }
                 }
                 flux_capabilities::ingest_markdown(&*backend, &d.name, &docs)
@@ -1078,10 +1172,19 @@ fn datasource_backend(
 /// Session size (serialized chars) past which the agent summarizes old turns. Override with
 /// `FLUX_COMPACT_CHARS` (`0` disables compaction).
 fn compact_threshold() -> usize {
-    std::env::var("FLUX_COMPACT_CHARS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48_000)
+    match std::env::var("FLUX_COMPACT_CHARS") {
+        Ok(s) => s.parse().unwrap_or_else(|_| {
+            // Warn instead of silently reverting: the user set the knob, so a typo'd value
+            // (`48k`) falling back to the default would contradict the documented 0-disables
+            // contract without a trace.
+            eprintln!(
+                "{} FLUX_COMPACT_CHARS is not a number ({s:?}); using the default 48000",
+                style::yellow("warning:")
+            );
+            48_000
+        }),
+        Err(_) => 48_000,
+    }
 }
 
 /// Discover skills from the project's `.flux/skills` and `.claude/skills` plus the user/global dirs
@@ -1307,6 +1410,11 @@ async fn run_fork(
     flags: &AgentFlags,
 ) -> Result<()> {
     let _ = replan; // mode B is the default; the flag exists for explicitness.
+                    // The fork session is always minted from `session_arg` — the session flags can't apply here
+                    // and silently accepting them would suggest they did something.
+    if flags.continue_ || flags.resume {
+        bail!("`flux fork` always forks the given session — `--continue`/`--resume` don't apply");
+    }
     let events = Arc::new(open_event_store()?);
     let sid = if session_arg == "last" {
         events
@@ -2085,11 +2193,11 @@ async fn build_agent_with(
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
-    // Opt into the generic `bash` op when config enables it — exported as the env signal the runtime's
-    // off-by-default `shell` group surfaces on. A user who set `FLUX_ENABLE_BASH` directly is honored
-    // too (we only ever turn it on here, never off).
+    // Opt into the generic `bash` op when config enables it — via the runtime's in-process
+    // override, NOT `set_var` (we're on a live multi-threaded runtime here). A user who set
+    // `FLUX_ENABLE_BASH` directly is honored too (we only ever turn it on here, never off).
     if cfg.enable_shell {
-        std::env::set_var("FLUX_ENABLE_BASH", "1");
+        flux_runtime::set_shell_opt_in(true);
     }
     let model_spec = resolve_model_spec(&flags.model, &cfg);
 
@@ -2202,17 +2310,35 @@ async fn build_agent_with(
     // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
     // `CognitionPack` needs an `Arc<dyn Provider>`, but `provider` is moved into the `FlowEngine`
     // below, so build a sibling provider instance from the same spec for the pack to own (for
-    // `mock` this is a fresh, hermetic `MockCliProvider`). If the sibling can't be built we skip the
-    // pack rather than fail startup — the rest of the agent is unaffected.
-    match provider_for(&model_spec) {
-        Ok(cog_provider) => {
-            flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.clone())
-                .register(&mut registry);
-        }
-        Err(e) => eprintln!(
-            "{}",
-            style::dim(&format!("(cognition pack not wired: {e})"))
-        ),
+    // `mock` this is a fresh, hermetic `MockCliProvider`).
+    let cog_provider: Option<Box<dyn Provider>> =
+        if model_spec == "mock" || model_spec.starts_with("mock/") {
+            Some(Box::<MockCliProvider>::default())
+        } else if !eager_provider {
+            // C-11: the lazy path must honor its "no credential read, no chain resolution at
+            // startup" guarantee for the sibling too — an eager `provider_for` here made
+            // `flux replay` (which advertises "no model call, no live IO") run the aws
+            // credential chain over the network. Deferred like the engine's own provider; the
+            // construction error, when a flow DOES call an ai.* op, is the same one the eager
+            // path raises.
+            Some(Box::new(LazyProvider::new(model_spec.clone())))
+        } else {
+            // Eager path: if the sibling can't be built we skip the pack rather than fail
+            // startup — the rest of the agent is unaffected.
+            match provider_for(&model_spec) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!("(cognition pack not wired: {e})"))
+                    );
+                    None
+                }
+            }
+        };
+    if let Some(cog_provider) = cog_provider {
+        flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.clone())
+            .register(&mut registry);
     }
 
     // Eval / self-improvement ops (the ones the improve flows orchestrate). Registered on the
@@ -2515,14 +2641,18 @@ async fn build_agent_with(
         .into_engine(Arc::from(provider), executor, events, flow)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Per-turn token ceiling (A-10), default OFF. Precedence: --turn-budget > FLUX_TURN_TOKEN_BUDGET
-    // > config [limits] turn_token_budget.
+    // > config [limits] turn_token_budget. A malformed env value is a hard error, not a silent
+    // fall-through: this is a spend/safety ceiling, and `FLUX_TURN_TOKEN_BUDGET=1_000_000` quietly
+    // running unbounded is exactly the failure the ceiling exists to prevent.
+    let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
+        Ok(v) => Some(v.trim().parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("FLUX_TURN_TOKEN_BUDGET is not a token count ({v:?}): {e}")
+        })?),
+        Err(_) => None,
+    };
     let turn_budget = flags
         .turn_budget
-        .or_else(|| {
-            std::env::var("FLUX_TURN_TOKEN_BUDGET")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-        })
+        .or(env_budget)
         .or(cfg.limits.turn_token_budget);
     agent.loop_host.set_token_budget(turn_budget);
     // Read-only-round breadth ladder (A-29): config-only overrides of the built-in defaults —
@@ -2544,11 +2674,11 @@ async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
     let initial_rules = agent.executor.allow_rules();
     let pricing = flux_credentials::load_pricing_table();
     let mut sink = CliSink::new(agent.max_iterations).with_cost(model_spec, pricing);
-    agent
-        .run_turn(&session_id, &prompt, &mut sink)
-        .await
-        .context("agent turn")?;
+    let outcome = agent.run_turn(&session_id, &prompt, &mut sink).await;
+    // Persist "always allow" choices made DURING the turn even when the turn itself later fails —
+    // the user answered the prompt either way, and losing the choice means re-prompting next run.
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
+    outcome.context("agent turn")?;
     Ok(())
 }
 
@@ -2564,7 +2694,7 @@ async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
 /// agent activity live; `--report` writes the categorized Markdown report.
 #[allow(clippy::too_many_arguments)]
 async fn run_eval_cmd(
-    adapter: String,
+    adapter: EvalAdapter,
     tasks: Vec<String>,
     members: Vec<String>,
     limit: u64,
@@ -2573,8 +2703,19 @@ async fn run_eval_cmd(
     watch: bool,
     model: Option<String>,
 ) -> Result<()> {
+    // `--members` only means something to the `multi` adapter — reject the pairing errors up
+    // front instead of silently ignoring the list (or failing deep inside flux-eval).
+    if adapter == EvalAdapter::Multi && members.is_empty() {
+        bail!("the `multi` adapter needs `--members <adapter,adapter,…>` to combine");
+    }
+    if adapter != EvalAdapter::Multi && !members.is_empty() {
+        bail!(
+            "`--members` only applies to the `multi` adapter (got `{}`)",
+            adapter.as_str()
+        );
+    }
     let mut params = serde_json::json!({
-        "adapter": adapter,
+        "adapter": adapter.as_str(),
         "tasks": tasks,
         "limit": limit,
         "trials": trials,
@@ -2653,7 +2794,7 @@ fn build_review_sub_agents(
 /// repo. Read-only: `strict_review`'s reviewer roles all declare `tools: []`, and this command never
 /// writes anywhere but stdout.
 async fn run_review(
-    flags: &AgentFlags,
+    flags: &ReviewFlags,
     files: Vec<String>,
     format: ReviewFormat,
     fail_on: Option<ReviewSeverity>,
@@ -2677,7 +2818,7 @@ async fn run_review(
     // `strict_review`'s core is read-only by construction (git_status/git_diff/read_many + `task`
     // against `tools: []` reviewer roles — see the design's security considerations); auto-approving
     // this specific, fixed flow's own ops is not the same authority `--yes` grants an arbitrary
-    // prompt-compiled plan, so it does not consult `flags.yes`.
+    // prompt-compiled plan, so `review` doesn't offer `--yes` at all (see [`ReviewFlags`]).
     let mut client = flux_sdk::FlowClient::builder()
         .model(model)
         .auto_approve(true)
@@ -2970,27 +3111,36 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
             .set_cassette(Some(Arc::new(flux_flow::cassette::CassetteScope::Record(
                 flux_flow::cassette::RecordScope::new(engine.events.clone(), &session_id),
             ))));
-        if let Ok(turn_id) = engine
+        // A recording failure (locked/full events.db) must be VISIBLE at record time — silently
+        // dropping it would only surface later as replay's "no stored plan_source … skipped",
+        // with the cause long gone.
+        let recorded = engine
             .events
             .begin_turn(&session_id, "<flow run>", &engine.model)
-        {
-            let source = flux_lang::format::format(ast);
-            let redactor = &engine.executor.context().redactor;
-            let _ = engine.events.record_plan_attempt(
-                &session_id,
-                turn_id,
-                flux_events::PlanAttempt {
-                    step: 1,
-                    outcome: "accepted".into(),
-                    error: None,
-                    fingerprint: Some(flux_lang::runtime::sha256_hex(
-                        &serde_json::to_string(ast).unwrap_or_default(),
-                    )),
-                    plan_text: None,
-                    phase: None,
-                    plan_source: Some(redactor.redact(&source)),
-                    delta_source: None,
-                },
+            .and_then(|turn_id| {
+                let source = flux_lang::format::format(ast);
+                let redactor = &engine.executor.context().redactor;
+                engine.events.record_plan_attempt(
+                    &session_id,
+                    turn_id,
+                    flux_events::PlanAttempt {
+                        step: 1,
+                        outcome: "accepted".into(),
+                        error: None,
+                        fingerprint: Some(flux_lang::runtime::sha256_hex(
+                            &serde_json::to_string(ast).unwrap_or_default(),
+                        )),
+                        plan_text: None,
+                        phase: None,
+                        plan_source: Some(redactor.redact(&source)),
+                        delta_source: None,
+                    },
+                )
+            });
+        if let Err(e) = recorded {
+            eprintln!(
+                "{} this run won't be replayable — recording the plan failed: {e}",
+                style::yellow("warning:")
             );
         }
     }
@@ -3012,11 +3162,13 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         .with_composites(&active_composites);
     // Typed gate (L-16/F9): full structural analysis + lowering, with the session's already-bound
     // symbols satisfying definedness (a resumed session may legitimately reference prior turns).
+    // A store read error must propagate — swallowed into an empty set it would resurface as a
+    // bogus "unbound symbol" diagnostic on resume, pointing at the flow instead of the store.
     let session_symbols: std::collections::HashSet<String> = engine
         .flow
         .view(&session_id)
         .map(|v| v.symbols.into_iter().map(|s| s.name.0).collect())
-        .unwrap_or_default();
+        .map_err(|e| anyhow::anyhow!("read session symbols from flow store: {e}"))?;
     if let Err(diags) = flux_flow::analyze::lower(ast, &oreg, &session_symbols) {
         print_diagnostics(&diags);
         bail!("flow validation failed — see diagnostics above");
@@ -3306,6 +3458,14 @@ async fn run_plan(
 
     // Non-interactive (`-o json|yaml`, or piped stdout): print the plan and exit — never run.
     if output.is_some() || !std::io::stdout().is_terminal() {
+        // `--yes` pre-approves a run, but this mode never runs — say so instead of letting the
+        // contradictory combo pass as if it had executed something.
+        if flags.yes {
+            eprintln!(
+                "{}",
+                style::dim("(--yes has no effect here: plan output mode never runs the plan — use `flux run`)")
+            );
+        }
         let rendered = match output.unwrap_or_default() {
             OutputFormat::Json => {
                 serde_json::to_string_pretty(&compiled.ast).context("render json")?
@@ -3661,8 +3821,8 @@ async fn a2a_turn(
 }
 
 /// `flux a2a <URL>` — connect to a remote A2A agent and drive it from the CLI like a local agent.
+/// (`token` already carries the `FLUX_A2A_TOKEN` fallback — clap owns that env wiring.)
 async fn run_a2a(url: String, prompt_words: Vec<String>, token: Option<String>) -> Result<()> {
-    let token = token.or_else(|| std::env::var("FLUX_A2A_TOKEN").ok());
     let mut client = flux_a2a::A2aClient::new(&url)
         .map_err(|e| anyhow::anyhow!("invalid a2a url `{url}`: {e}"))?
         .with_token(token);
@@ -3711,9 +3871,16 @@ async fn run_a2a(url: String, prompt_words: Vec<String>, token: Option<String>) 
         let prompt = if !prompt_words.is_empty() {
             prompt_words.join(" ")
         } else {
-            let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
-            buf.trim().to_string()
+            // Read piped stdin off the runtime thread (the codebase convention — see
+            // `read_stdin_line`): a fifo that never closes must not park a worker forever.
+            tokio::task::spawn_blocking(|| {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map(|_| buf)
+            })
+            .await
+            .context("stdin reader task")??
+            .trim()
+            .to_string()
         };
         if prompt.is_empty() {
             return Ok(());
@@ -3930,16 +4097,12 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                     ),
                 },
                 "shell" => {
-                    // Toggle the generic `bash` op for the session by flipping the env signal the
-                    // runtime's `shell` group surfaces on; it takes effect from the next turn (the
-                    // advertised catalog is recomputed per turn from `detect_signals`).
-                    let currently_on = std::env::var("FLUX_ENABLE_BASH")
-                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                    if currently_on {
-                        std::env::remove_var("FLUX_ENABLE_BASH");
-                    } else {
-                        std::env::set_var("FLUX_ENABLE_BASH", "1");
-                    }
+                    // Toggle the generic `bash` op for the session via the runtime's in-process
+                    // override — mid-session `set_var`/`remove_var` would race worker-thread
+                    // `getenv`s (UB on glibc). Takes effect from the next turn (the advertised
+                    // catalog is recomputed per turn from `detect_signals`).
+                    let currently_on = flux_runtime::shell_opt_in();
+                    flux_runtime::set_shell_opt_in(!currently_on);
                     eprintln!(
                         "{}",
                         style::dim(&format!(
@@ -3964,7 +4127,16 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                                 agent.model = model.clone();
                                 // The loop host holds its own planner handle — swap it too.
                                 agent.loop_host.set_model(provider, model);
-                                let _ = agent.events.set_model(&session_id, &agent.model);
+                                // The switch is live either way; if persisting it failed, say
+                                // so — stored usage/`flux usage` attribution would otherwise
+                                // silently stay keyed to the old model.
+                                if let Err(e) = agent.events.set_model(&session_id, &agent.model) {
+                                    eprintln!(
+                                        "{} switched, but persisting the model failed ({e}) — \
+                                         usage attribution for this session may stay on the old model",
+                                        style::yellow("warning:")
+                                    );
+                                }
                                 eprintln!("switched to {}", agent.model);
                             }
                             Err(e) => eprintln!("cannot switch model: {e}"),
@@ -4110,11 +4282,16 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                     }
                 }
                 "clear" => {
-                    session_id = agent
-                        .events
-                        .create_session(&agent.model)
-                        .context("new session")?;
-                    eprintln!("started new session {session_id}");
+                    // Don't `?`-abort the REPL on a store error: that would also skip the
+                    // loop-exit `persist_new_rules`, silently dropping every "always allow"
+                    // choice granted this session. Report and keep the current session instead.
+                    match agent.events.create_session(&agent.model) {
+                        Ok(sid) => {
+                            session_id = sid;
+                            eprintln!("started new session {session_id}");
+                        }
+                        Err(e) => eprintln!("{} new session: {e}", style::red("error:")),
+                    }
                 }
                 other => eprintln!("unknown command /{other} (try /help)"),
             }
@@ -4235,7 +4412,13 @@ async fn run_pending_plan(
             }
             end_with_usage();
         }
-        Some(Err(e)) => eprintln!("{} {e}", style::red("error:")),
+        Some(Err(e)) => {
+            // A failed plan still ends the turn: without `turn_end` the spend on model ops the
+            // plan DID reach is never displayed, and an active spinner keeps redrawing its
+            // stderr line over the REPL prompt (CliSink has no Drop guard).
+            end_with_usage();
+            eprintln!("{} {e}", style::red("error:"));
+        }
         None => {
             // Cancelled: stop the in-flight op's spinner and return to the prompt.
             end_with_usage();
@@ -4371,7 +4554,7 @@ fn parse_loop_args(args: &str) -> (usize, String) {
 
 /// Whether tool output is shown in full (set by `-v`/`--verbose`, which exports `FLUX_VERBOSE`).
 fn verbose() -> bool {
-    std::env::var_os("FLUX_VERBOSE").is_some()
+    flux_system::env_truthy("FLUX_VERBOSE")
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -5652,26 +5835,39 @@ fn apply_workspace_access_env(cli: &Cli) {
         std::env::set_var("FLUX_ADD_DIRS", dirs.join(":"));
     }
 
-    let allow_all = cli.allow_all_paths
-        || cfg.workspace_allow_all()
-        || std::env::var("FLUX_ALLOW_ALL")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-    if allow_all {
+    // Name the source that actually disabled the sandbox, so the operator knows what to remove.
+    let allow_all_source = if cli.allow_all_paths {
+        Some("--allow-all-paths")
+    } else if cfg.workspace_allow_all() {
+        Some("[workspace] allow_all in .flux/config.toml")
+    } else if flux_system::env_truthy("FLUX_ALLOW_ALL") {
+        Some("FLUX_ALLOW_ALL")
+    } else {
+        None
+    };
+    if let Some(source) = allow_all_source {
         std::env::set_var("FLUX_ALLOW_ALL", "1");
         eprintln!(
-            "{} filesystem sandbox disabled (--allow-all-paths): the agent can read AND write anywhere \
+            "{} filesystem sandbox disabled ({source}): the agent can read AND write anywhere \
              on disk",
             style::red("warning:")
         );
     }
 
     // Ephemeral private-network egress grant for this invocation (D-96). Exported so surfaces that do
-    // not receive the `Cli` (e.g. `flux plugin call`, `app run`) observe the same override.
-    if cli.allow_private_net {
+    // not receive the `Cli` (e.g. `flux plugin call`, `app run`) observe the same override. A truthy
+    // pre-set FLUX_ALLOW_PRIVATE_NET (e.g. inherited from a parent flux) gets the same warning — the
+    // grant is live either way, and staying silent about open private-net egress is worse than
+    // repeating the note in a child process.
+    if cli.allow_private_net || private_net_cli_override() {
+        let source = if cli.allow_private_net {
+            "--allow-private-net"
+        } else {
+            "FLUX_ALLOW_PRIVATE_NET"
+        };
         std::env::set_var("FLUX_ALLOW_PRIVATE_NET", "1");
         eprintln!(
-            "{} private-network egress allowed for this run (--allow-private-net): plugins may reach \
+            "{} private-network egress allowed for this run ({source}): plugins may reach \
              the private hosts their manifest declares, and web_fetch may reach any private/loopback \
              address (incl. cloud metadata). Prefer a scoped [private_net.plugins] grant for recurring use.",
             style::red("warning:")
@@ -5681,9 +5877,11 @@ fn apply_workspace_access_env(cli: &Cli) {
 
 /// Whether `--allow-private-net` is in effect for this process. It is propagated as
 /// `FLUX_ALLOW_PRIVATE_NET` by [`apply_workspace_access_env`], so surfaces that never receive the
-/// [`Cli`] (notably `flux plugin call`) observe it too.
+/// [`Cli`] (notably `flux plugin call`) observe it too. Truthy-value semantics (not mere presence):
+/// `FLUX_ALLOW_PRIVATE_NET=0` keeps private-net egress CLOSED — an SSRF-relevant grant must never
+/// turn on because an operator set the variable to an explicit "off" value.
 fn private_net_cli_override() -> bool {
-    std::env::var_os("FLUX_ALLOW_PRIVATE_NET").is_some()
+    flux_system::env_truthy("FLUX_ALLOW_PRIVATE_NET")
 }
 
 /// The per-plugin private-net host grant, widened to `*` when `--allow-private-net` is active. This
@@ -5741,8 +5939,12 @@ fn reset_sigpipe() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Sync entry point: everything that must happen BEFORE the tokio runtime exists lives here —
+/// signal disposition, the rustls provider, clap, and every process-env export. `setenv` racing a
+/// concurrent `getenv` (any worker thread resolving DNS or reading config) is undefined behavior
+/// on glibc — the reason Rust 2024 marks `set_var` unsafe — so the env mutation happens while this
+/// is still the only thread, and only then does the runtime spin up worker threads.
+fn main() -> Result<()> {
     // A-61 / F-006: Rust's std sets SIGPIPE to SIG_IGN at startup, so writing to a closed pipe returns
     // EPIPE and `println!`/`writeln!` panic ("failed printing to stdout: Broken pipe"). Piping a
     // streaming subcommand into `head`/`less`/`grep -q` is routine, so restore the default disposition
@@ -5765,25 +5967,36 @@ async fn main() -> Result<()> {
     style::init(style::ColorChoice::Auto);
     // One clap parse handles every subcommand + `--help`/`-h`/`--version`/`help`. The top level carries
     // only `--color` (global) + the command list; the agent (turn) flags live on the agent-path
-    // subcommands (`run`/`plan`/`tui`/`serve`). With no subcommand, `flux` opens the REPL.
+    // subcommands (`run`/`plan`/`tui`/`fork`/`app run`). With no subcommand, `flux` opens the REPL.
     let cli = Cli::parse();
     style::init(cli.color);
     // C-21: export the filesystem-access policy (extra read-only roots + the unconfined hatch) to the
     // environment so every workspace — including `app run` and subprocess paths — inherits it via
     // `Workspace::from_env`.
     apply_workspace_access_env(&cli);
+    // The per-turn env signals (`FLUX_VERBOSE`/`FLUX_SHOW_LOOP`/`FLUX_TRACE_LOOP`) the agent-path
+    // subcommands honor — exported here, pre-runtime, for the same single-thread reason.
+    if let Some(flags) = cli.command.as_ref().and_then(Commands::agent_flags) {
+        apply_agent_env(flags);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?
+        .block_on(async_main(cli))
+}
 
+/// The async dispatch — runs on the runtime `main` builds after all env exports are done.
+async fn async_main(cli: Cli) -> Result<()> {
     let run = async {
         match cli.command {
-            // The agent-path subcommands. Each exports its own verbose/show-loop env first.
+            // The agent-path subcommands.
             Some(Commands::Run { agent, prompt }) => {
-                apply_agent_env(&agent);
                 // `flux run <app.flux>` runs a multi-agent program; `flux run <prompt…>` runs a turn.
-                if prompt
-                    .first()
-                    .map(|p| p.ends_with(".flux") || std::path::Path::new(p).is_file())
-                    .unwrap_or(false)
-                {
+                // Program mode keys on the `.flux` extension ONLY — matching any existing file would
+                // hijack prompts that happen to start with a filename (`flux run Cargo.toml explain …`
+                // must be a turn about Cargo.toml, not a parse of it as a Program).
+                if prompt.first().is_some_and(|p| p.ends_with(".flux")) {
                     return run_app_cmd(prompt, &agent).await;
                 }
                 // `flux run` with no prompt drops into the REPL (with the given agent flags).
@@ -5796,14 +6009,8 @@ async fn main() -> Result<()> {
                 agent,
                 output,
                 prompt,
-            }) => {
-                apply_agent_env(&agent);
-                run_plan(agent, output, prompt).await
-            }
-            Some(Commands::Tui { agent }) => {
-                apply_agent_env(&agent);
-                run_tui(agent).await
-            }
+            }) => run_plan(agent, output, prompt).await,
+            Some(Commands::Tui { agent }) => run_tui(agent).await,
             Some(Commands::Fork {
                 session,
                 at,
@@ -5812,10 +6019,7 @@ async fn main() -> Result<()> {
                 replan,
                 prompt,
                 agent,
-            }) => {
-                apply_agent_env(&agent);
-                run_fork(&session, at, inject, edit, replan, prompt, &agent).await
-            }
+            }) => run_fork(&session, at, inject, edit, replan, prompt, &agent).await,
             // Non-agent subcommands.
             Some(Commands::A2a { url, prompt, token }) => run_a2a(url, prompt, token).await,
             Some(Commands::Eval {
@@ -5835,10 +6039,7 @@ async fn main() -> Result<()> {
                         program,
                         serve,
                     },
-            }) => {
-                apply_agent_env(&agent);
-                run_app(program.as_deref(), &agent, serve).await
-            }
+            }) => run_app(program.as_deref(), &agent, serve).await,
             Some(Commands::Flow {
                 action:
                     FlowAction::Run {
@@ -5854,14 +6055,11 @@ async fn main() -> Result<()> {
                 run_render(&file, view, out.as_deref()).await
             }
             Some(Commands::Review {
-                agent,
+                flags,
                 files,
                 format,
                 fail_on,
-            }) => {
-                apply_agent_env(&agent);
-                run_review(&agent, files, format, fail_on).await
-            }
+            }) => run_review(&flags, files, format, fail_on).await,
             Some(Commands::Loop { action }) => run_loop_cmd(action),
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Usage(args)) => run_usage(args),
@@ -5870,7 +6068,7 @@ async fn main() -> Result<()> {
                 turn,
                 sub_agents,
                 json,
-            }) => run_replay(&session, turn, sub_agents, json).await,
+            }) => run_replay(&session, turn.map(|t| t as usize), sub_agents, json).await,
             Some(Commands::Diff { a, b, json }) => run_diff_cmd(&a, &b, json),
             Some(Commands::Corpus { action }) => run_corpus(action),
             Some(Commands::Auth { action }) => run_auth(action).await,
@@ -5881,7 +6079,7 @@ async fn main() -> Result<()> {
                 install,
                 global,
             }) => run_skill(type_, install, global).await,
-            Some(Commands::Completion { shell }) => run_completion(shell.as_deref()),
+            Some(Commands::Completion { shell }) => run_completion(shell),
             Some(Commands::Changelog {
                 version,
                 all,
@@ -5915,23 +6113,11 @@ fn apply_agent_env(flags: &AgentFlags) {
 
 /// `flux completion <shell>` — print a shell completion script to stdout and exit. Pure output, no
 /// side effects: a shell sources this as you type, so it must never touch the network or start a
-/// turn. Supports bash/zsh/fish/powershell/elvish; defaults to fish.
-fn run_completion(shell: Option<&str>) -> Result<()> {
+/// turn. The shell is a clap `ValueEnum` (bash/elvish/fish/powershell/zsh), so an unknown value is
+/// rejected at parse time; defaults to fish.
+fn run_completion(shell: Option<clap_complete::Shell>) -> Result<()> {
     use clap::CommandFactory;
-    use clap_complete::Shell;
-    let shell = match shell {
-        Some("bash") => Shell::Bash,
-        Some("zsh") => Shell::Zsh,
-        Some("powershell" | "pwsh") => Shell::PowerShell,
-        Some("elvish") => Shell::Elvish,
-        Some("fish") | None => Shell::Fish,
-        Some(other) => {
-            eprintln!(
-                "flux completion: unsupported shell {other:?} (bash|zsh|fish|powershell|elvish)"
-            );
-            return Ok(());
-        }
-    };
+    let shell = shell.unwrap_or(clap_complete::Shell::Fish);
     clap_complete::generate(shell, &mut Cli::command(), "flux", &mut std::io::stdout());
     Ok(())
 }
@@ -5946,6 +6132,15 @@ async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Result<()> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| anyhow::anyhow!("usage: flux run <app.flux> [-m provider/model] [--yes]"))?;
+    // A program takes no trailing words — dropping them silently would swallow what the user
+    // clearly meant to pass (`flux run app.flux with these inputs`).
+    if prompt.len() > 1 {
+        bail!(
+            "`flux run {path}` runs the program and takes no further arguments (got: {}) — to run \
+             a prompt that starts with a `.flux` filename, quote the whole prompt",
+            prompt[1..].join(" ")
+        );
+    }
     run_app(Some(path), flags, None).await
 }
 
@@ -6063,6 +6258,24 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         return flux_server::serve(&addr, agent, auth).await;
     };
 
+    // Program mode runs the program's OWN agents: the built-in coding agent's session/turn flags
+    // have nothing to attach to, so reject them instead of accepting-and-ignoring (they all work
+    // on `flux run`/`flux plan`/`flux tui` and on `app run --serve` without a program).
+    if flags.continue_ || flags.resume {
+        bail!("`flux app run <program>` starts the program fresh — `--continue`/`--resume` don't apply");
+    }
+    if flags.dev {
+        bail!("`--dev` only applies to the built-in coding agent, not `flux app run <program>`");
+    }
+    if !flags.skill_dirs.is_empty() {
+        bail!(
+            "`--skill-dir` only applies to the built-in coding agent, not `flux app run <program>`"
+        );
+    }
+    if flags.turn_budget.is_some() {
+        bail!("`--turn-budget` only applies to the built-in coding agent, not `flux app run <program>`");
+    }
+
     let auto_approve = flags.yes;
     // The bare `sonnet` alias, so the default model has ONE owner
     // (`flux_providers::anthropic::resolve_model`) — `app_provider_for` resolves it below.
@@ -6079,7 +6292,8 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     let mut program = if is_builtin_strict_review {
         flux_app::review::strict_review_program().map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
-        let src = std::fs::read_to_string(path)
+        let src = tokio::fs::read_to_string(path)
+            .await
             .map_err(|e| anyhow::anyhow!("read program `{path}`: {e}"))?;
         match Module::parse_str(&src).map_err(|e| anyhow::anyhow!("{e}"))? {
             Module::Program(p) => p,
@@ -6680,8 +6894,11 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                 None => None,
             };
             // The same guarded boundary + datasource bridge the agent path uses, over a scratch index.
+            // Propagate a malformed config like the agent paths do — swallowing it here would
+            // silently drop the user's `[private_net]` plugin grants and refuse the call as
+            // ungranted with no hint that the config failed to parse.
             let cwd = std::env::current_dir()?;
-            let cfg = flux_config::load(&cwd).unwrap_or_default();
+            let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
             let system = Arc::new(System::new(
                 Workspace::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?,
             ));
@@ -6949,7 +7166,10 @@ struct PluginStatusReport {
 /// Used for the `missing` vs `unloadable` split in `status` without spawning a process.
 fn program_resolves(program: &str) -> bool {
     let p = std::path::Path::new(program);
-    if p.parent().is_some() {
+    // NOTE: `parent()` is `Some("")` even for a bare one-component name, so it cannot detect
+    // "has a separator" — count components instead, or the PATH search below is unreachable
+    // and a bare-name plugin that spawns fine gets misreported as `missing`.
+    if p.is_absolute() || p.components().count() > 1 {
         // Absolute or relative path with a separator — check the file directly.
         return p.is_file();
     }
@@ -7148,8 +7368,10 @@ fn describe_auth_resolution(plugin: &str, m: &flux_plugin::AuthMethod) -> String
             );
         }
     }
+    // An EMPTY env value counts as unset — matching `resolve_manifest_endpoint`, so `status`
+    // never claims "configured" for a value resolution will skip.
     for key in &m.env {
-        if std::env::var(key).is_ok() {
+        if std::env::var(key).is_ok_and(|v| !v.is_empty()) {
             return format!("✓ {} — env ${key}", m.purpose);
         }
     }
@@ -7175,9 +7397,12 @@ fn describe_auth_resolution(plugin: &str, m: &flux_plugin::AuthMethod) -> String
 /// Describe how a declared endpoint would resolve right now. Base URLs are not secret, so the
 /// resolved value itself is shown (the plugin-declared `default` fallback is likewise not secret).
 fn describe_endpoint_resolution(ep: &flux_plugin::EndpointSpec) -> String {
+    // Empty counts as unset, matching `resolve_manifest_endpoint` (which falls to the default).
     for key in &ep.env {
         if let Ok(v) = std::env::var(key) {
-            return format!("✓ {} — {v} (env ${key})", ep.name);
+            if !v.is_empty() {
+                return format!("✓ {} — {v} (env ${key})", ep.name);
+            }
         }
     }
     match &ep.default {
@@ -7417,11 +7642,8 @@ fn available_plugin_operations(manifest: &flux_plugin::PluginManifest) -> String
 }
 
 /// `flux skill [type] [--install] [--global]`: render or install the generated Flux skills.
+/// (`--global` without `--install` is a clap-level `requires` error, not checked here.)
 async fn run_skill(type_: Option<skill_cmd::SkillType>, install: bool, global: bool) -> Result<()> {
-    if global && !install {
-        bail!("--global requires --install");
-    }
-
     if !install {
         let rendered = match type_ {
             Some(kind) => render_generated_skill(kind).await?,
@@ -7800,7 +8022,8 @@ async fn run_auth(action: Option<AuthAction>) -> Result<()> {
     match action.unwrap_or(AuthAction::Status) {
         AuthAction::Status => {
             let cwd = std::env::current_dir().unwrap_or_default();
-            let cfg = flux_config::load(&cwd).unwrap_or_default();
+            // A malformed config must not silently report the wrong "default model" as configured.
+            let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
             let default_spec = resolve_model_spec(&None, &cfg);
             let active = auth_row_for_spec(&default_spec);
             let rows = flux_credentials::auth_status();
@@ -7808,6 +8031,11 @@ async fn run_auth(action: Option<AuthAction>) -> Result<()> {
             Ok(())
         }
         AuthAction::Login { provider, password } => match provider.as_str() {
+            // The built-in providers only speak their PKCE flows — reject `--password` instead
+            // of silently ignoring it (it is the plugin-OAuth password grant, D-82).
+            name @ ("claude" | "codex") if password => {
+                bail!("--password only applies to an installed OAuth2 plugin — `{name}` uses its browser PKCE flow")
+            }
             "claude" => login_claude().await,
             "codex" => login_codex().await,
             // Any other name is treated as an installed OAuth2 plugin (plugin-oauth, D-82).
@@ -7824,10 +8052,10 @@ async fn login_claude() -> Result<()> {
     println!(
         "Open this URL, approve access, then paste the code from the callback page:\n\n{url}\n"
     );
-    print!("code: ");
-    std::io::stdout().flush().ok();
-    let mut code = String::new();
-    std::io::stdin().read_line(&mut code)?;
+    // Off the runtime thread: the user can sit on this prompt indefinitely.
+    let code = tokio::task::spawn_blocking(|| prompt_line("code: "))
+        .await
+        .context("code prompt task")??;
     flux_credentials::anthropic_exchange_and_store(code.trim(), &state, &pkce.verifier)
         .await
         .context("exchange authorization code")?;
@@ -7872,8 +8100,10 @@ where
 
 /// Bind the codex client's registered redirect address (`localhost:1455`) and wait for the OAuth
 /// redirect, answering the browser with a small confirmation page. Non-callback requests (e.g.
-/// `/favicon.ico`) get a 404 and the wait continues. Returns the callback as `code#state` — the
-/// shape `codex_exchange_and_store` binds against the login's CSRF state.
+/// `/favicon.ico`) get a 404 and the wait continues. Bounded at 300s like its generic sibling
+/// [`wait_for_oauth_callback`] — an abandoned browser flow must not hang the login forever.
+/// Returns the callback as `code#state` — the shape `codex_exchange_and_store` binds against the
+/// login's CSRF state.
 async fn wait_for_codex_callback() -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener =
@@ -7885,40 +8115,57 @@ async fn wait_for_codex_callback() -> Result<String> {
             flux_credentials::CODEX_REDIRECT_PORT
         )
             })?;
-    loop {
-        let (mut sock, _) = listener.accept().await.context("accept OAuth callback")?;
-        // The callback is a small GET; one read is enough for the request line we parse.
-        let mut buf = vec![0u8; 8192];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-        // "GET <target> HTTP/1.1" — take the target.
-        let target = req.split_whitespace().nth(1).unwrap_or("");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        if path != flux_credentials::CODEX_REDIRECT_PATH {
+    let accept = async {
+        loop {
+            let (mut sock, _) = listener.accept().await.context("accept OAuth callback")?;
+            // The callback is a small GET; one read is enough for the request line we parse.
+            let mut buf = vec![0u8; 8192];
+            let n = match sock.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // A failed read is this connection's problem, not the login's — say so and
+                    // keep listening rather than silently 404-ing an empty request.
+                    eprintln!("{}", style::dim(&format!("(callback read failed: {e})")));
+                    continue;
+                }
+            };
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            // "GET <target> HTTP/1.1" — take the target.
+            let target = req.split_whitespace().nth(1).unwrap_or("");
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            if path != flux_credentials::CODEX_REDIRECT_PATH {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                continue;
+            }
+            let result = parse_codex_callback(query);
+            let page = match &result {
+                Ok(_) => "Login complete — you can return to the terminal.",
+                Err(_) => "Login failed — see the terminal for details.",
+            };
+            let body = format!("<!doctype html><html><body><p>{page}</p></body></html>");
             let _ = sock
                 .write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
                 )
                 .await;
-            continue;
+            let (code, state) = result?;
+            return Ok(format!("{code}#{state}"));
         }
-        let result = parse_codex_callback(query);
-        let page = match &result {
-            Ok(_) => "Login complete — you can return to the terminal.",
-            Err(_) => "Login failed — see the terminal for details.",
-        };
-        let body = format!("<!doctype html><html><body><p>{page}</p></body></html>");
-        let _ = sock
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await;
-        let (code, state) = result?;
-        return Ok(format!("{code}#{state}"));
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(300), accept).await {
+        Ok(r) => r,
+        Err(_) => bail!(
+            "timed out waiting for the OAuth callback on localhost:{}",
+            flux_credentials::CODEX_REDIRECT_PORT
+        ),
     }
 }
 
@@ -7971,8 +8218,14 @@ async fn login_plugin(name: &str, password: bool) -> Result<()> {
     let scope = oauth.scopes.join(" ");
 
     let token = if password {
-        let username = prompt_line("username: ")?;
-        let secret = rpassword::prompt_password("password: ").context("read password")?;
+        // Both prompts block on user think-time — keep them off the runtime thread.
+        let (username, secret) = tokio::task::spawn_blocking(|| -> Result<(String, String)> {
+            let username = prompt_line("username: ")?;
+            let secret = rpassword::prompt_password("password: ").context("read password")?;
+            Ok((username, secret))
+        })
+        .await
+        .context("credential prompt task")??;
         flux_credentials::oauth_token_grant(
             &token_url,
             &[
@@ -8107,7 +8360,13 @@ async fn wait_for_oauth_callback(port: u16, path: &str) -> Result<String> {
         loop {
             let (mut sock, _) = listener.accept().await.context("accept OAuth callback")?;
             let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let n = match sock.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("{}", style::dim(&format!("(callback read failed: {e})")));
+                    continue;
+                }
+            };
             let req = String::from_utf8_lossy(&buf[..n]).into_owned();
             let target = req.split_whitespace().nth(1).unwrap_or("");
             let (req_path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -9151,7 +9410,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // A sentinel file *outside* `dir`, reachable via `..`. An unsanitized `uninstall` would
-        // delete `<dir>/../../flux-uninstall-traversal-sentinel.toml`.
+        // delete `<dir>/../flux-uninstall-traversal-sentinel.toml` — the traversal name below
+        // MUST point exactly at this sentinel (one `..`), or a regression would `remove_file` a
+        // non-existent path, return "no such plugin", and both assertions would pass vacuously.
         let outside = dir
             .parent()
             .unwrap()
@@ -9161,7 +9422,7 @@ mod tests {
         let err = run_plugin_in(
             &dir,
             Some(PluginAction::Uninstall {
-                name: "../../flux-uninstall-traversal-sentinel".into(),
+                name: "../flux-uninstall-traversal-sentinel".into(),
                 purge: false,
             }),
         )
@@ -10015,8 +10276,8 @@ mod tests {
     /// A `CliSink` with an attached model spec + pricing table prices a turn's usage through the
     /// cost model end-to-end (the wiring that makes C-05's `cost()` live, not dead code). The codex
     /// path resolves on `gpt-5.5` and is labelled subscription spend (C-03 model resolution + C-05).
-    #[tokio::test]
-    async fn sink_prices_a_codex_turn_as_subscription() {
+    #[test]
+    fn sink_prices_a_codex_turn_as_subscription() {
         use flux_core::Usage;
         let sink = super::CliSink::new(0).with_cost(
             "codex/gpt-5.5".to_string(),
@@ -10054,8 +10315,8 @@ mod tests {
     /// C-30: an attached METERED CLOUD model missing from the pricing table renders the visible
     /// ` · $? (unpriced)` marker — never silent nothing (silence hid real spend); local
     /// (`ollama*`) and unknown/mock specs stay silent so hermetic e2e output is byte-identical.
-    #[tokio::test]
-    async fn unpriced_model_renders_visible_marker() {
+    #[test]
+    fn unpriced_model_renders_visible_marker() {
         use flux_core::Usage;
         let u = Usage {
             input_tokens: 1_000,
@@ -10086,8 +10347,8 @@ mod tests {
     /// static builtin table has no row for it — the `$? (unpriced)` marker (and its once-per-run
     /// note) must NOT fire; `cost_suffix` takes the `Some(money) => cost_annotation` branch, never
     /// reaching `unpriced_marker_applies`/`note_unpriced_once` at all.
-    #[tokio::test]
-    async fn cost_suffix_prefers_reported_cost_over_unpriced_marker() {
+    #[test]
+    fn cost_suffix_prefers_reported_cost_over_unpriced_marker() {
         use flux_core::Usage;
         let u = Usage {
             input_tokens: 1_000,
@@ -10668,41 +10929,234 @@ mod tests {
         }
     }
 
-    /// The turn flags are scoped to the agent path (`run` + top-level), not leaked onto other
-    /// subcommands' help — and `eval` carries only its own `-m`, not the full turn-flag set.
+    /// The turn flags are scoped to the agent path, not leaked onto other subcommands — checked
+    /// against the DECLARED arguments (not rendered help text), like
+    /// `top_level_has_only_the_color_flag`, so a subcommand description that merely *mentions*
+    /// `--continue` can't false-trip this.
     #[test]
     fn agent_flags_are_scoped_off_other_subcommands() {
         use clap::CommandFactory;
         let cmd = super::Cli::command();
-        let help_of = |name: &str| {
+        let longs_of = |name: &str| -> Vec<String> {
             cmd.find_subcommand(name)
                 .unwrap_or_else(|| panic!("subcommand {name}"))
-                .clone()
-                .render_long_help()
-                .to_string()
+                .get_arguments()
+                .filter_map(|a| a.get_long().map(String::from))
+                .collect()
         };
+        let has = |longs: &[String], flag: &str| longs.iter().any(|l| l == flag);
         for sub in ["sessions", "loop", "completion", "auth", "plugin"] {
-            let h = help_of(sub);
+            let longs = longs_of(sub);
             assert!(
-                !h.contains("--max-tokens"),
-                "`{sub} --help` leaks --max-tokens"
+                !has(&longs, "max-tokens"),
+                "`{sub}` declares --max-tokens: {longs:?}"
             );
-            assert!(!h.contains("--continue"), "`{sub} --help` leaks --continue");
-        }
-        // The agent-path subcommands (`run`/`plan`/`tui`/`review`) carry the turn flags; `eval` has
-        // its own `-m` but not `--max-tokens`.
-        for agent_cmd in ["run", "plan", "tui", "review"] {
             assert!(
-                help_of(agent_cmd).contains("--max-tokens"),
-                "`{agent_cmd} --help` should carry the turn flags"
+                !has(&longs, "continue"),
+                "`{sub}` declares --continue: {longs:?}"
             );
         }
-        let eval = help_of("eval");
-        assert!(eval.contains("--model"), "eval should keep its own --model");
+        // The agent-path subcommands carry the full turn-flag set.
+        for agent_cmd in ["run", "plan", "tui"] {
+            let longs = longs_of(agent_cmd);
+            assert!(
+                has(&longs, "max-tokens") && has(&longs, "continue"),
+                "`{agent_cmd}` should carry the turn flags: {longs:?}"
+            );
+        }
+        // `review` carries only its scoped-down ReviewFlags: the session/approval flags its
+        // FlowClient path can't honor are parse errors, not accepted-and-ignored.
+        let review = longs_of("review");
+        assert!(has(&review, "max-tokens"));
         assert!(
-            !eval.contains("--max-tokens"),
+            !has(&review, "continue") && !has(&review, "resume"),
+            "review must not accept session flags it ignores: {review:?}"
+        );
+        assert!(
+            !has(&review, "yes"),
+            "review must not accept --yes (it always auto-approves its fixed read-only flow)"
+        );
+        // `eval` has its own `-m` but not the turn-flag set.
+        let eval = longs_of("eval");
+        assert!(has(&eval, "model"), "eval should keep its own --model");
+        assert!(
+            !has(&eval, "max-tokens"),
             "eval should not carry the turn flags"
         );
+    }
+
+    /// The clap-level constraints reject contradictory or path-dead flag combinations at parse
+    /// time (exit 2 + usage), instead of accepting-and-ignoring or failing deep in a handler.
+    #[test]
+    fn contradictory_flag_combinations_are_parse_errors() {
+        use clap::Parser;
+        let err = |args: &[&str]| {
+            super::Cli::try_parse_from(args)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} should be rejected at parse time"));
+        };
+        // completion: an unknown shell is a usage error, not a silent empty script + exit 0.
+        err(&["flux", "completion", "bassh"]);
+        // fork: --prompt belongs to mode B (replan) only.
+        err(&[
+            "flux", "fork", "s_1", "--at", "2", "--inject", "1", "--prompt", "x",
+        ]);
+        err(&[
+            "flux", "fork", "s_1", "--at", "2", "--edit", "f.flux", "--prompt", "x",
+        ]);
+        // flow run: --resume-value binds a halted await — meaningless without --resume.
+        err(&["flux", "flow", "run", "f.flux", "--resume-value", "42"]);
+        // changelog: one selection mode at a time.
+        err(&["flux", "changelog", "0.11.6", "--all"]);
+        err(&["flux", "changelog", "0.11.6", "--unreleased"]);
+        err(&["flux", "changelog", "--all", "--unreleased"]);
+        // plugin install: local-scan and remote modes are exclusive.
+        err(&["flux", "plugin", "install", "--dir=some/dir", "gitlab"]);
+        err(&["flux", "plugin", "install", "--all", "gitlab"]);
+        // plugin call: --dry-run validates; --no-validate skips validation.
+        err(&[
+            "flux",
+            "plugin",
+            "call",
+            "p",
+            "op",
+            "--dry-run",
+            "--no-validate",
+        ]);
+        // skill surfaces: --global picks the install destination; --out is a different one.
+        err(&["flux", "skill", "--global"]);
+        err(&["flux", "plugin", "skill", "--global"]);
+        err(&["flux", "plugin", "skill", "--install", "--out", "x.md"]);
+        // Zero is invalid where it would alias (1-based --turn) or instantly fail/mislead.
+        err(&["flux", "replay", "--turn", "0"]);
+        err(&["flux", "run", "--max-tokens", "0", "hi"]);
+        err(&["flux", "run", "--turn-budget", "0", "hi"]);
+        err(&["flux", "eval", "not-an-adapter"]);
+        err(&["flux", "eval", "synthetic", "--trials", "0"]);
+        // review's scoped-down flags: the flags its FlowClient path ignores are parse errors.
+        err(&["flux", "review", "--files", "x.rs", "--yes"]);
+        err(&["flux", "review", "--files", "x.rs", "--continue"]);
+    }
+
+    /// …and the legitimate forms of the same flags still parse.
+    #[test]
+    fn valid_flag_combinations_parse() {
+        use clap::Parser;
+        let ok = |args: &[&str]| {
+            super::Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        };
+        ok(&["flux", "completion", "zsh"]);
+        ok(&["flux", "completion"]);
+        ok(&[
+            "flux", "fork", "s_1", "--at", "2", "--replan", "--prompt", "x",
+        ]);
+        ok(&[
+            "flux",
+            "flow",
+            "run",
+            "f.flux",
+            "--resume",
+            "last",
+            "--resume-value",
+            "42",
+        ]);
+        ok(&["flux", "changelog", "0.11.6"]);
+        ok(&["flux", "plugin", "install", "--dir"]);
+        ok(&["flux", "plugin", "install", "--dir=plugins/target/release"]);
+        ok(&["flux", "plugin", "install", "gitlab", "slack@1.2.0"]);
+        ok(&["flux", "plugin", "install", "--all"]);
+        ok(&["flux", "skill", "--install", "--global"]);
+        ok(&["flux", "replay", "--turn", "1"]);
+        ok(&["flux", "eval", "terminal-bench"]);
+        ok(&["flux", "eval", "multi", "--members", "synthetic,mock"]);
+        // require_equals: the attached form binds the address; the positional stays the program.
+        ok(&[
+            "flux",
+            "app",
+            "run",
+            "--serve=0.0.0.0:1234",
+            "p.flux",
+            "--yes",
+        ]);
+        ok(&["flux", "app", "run", "--serve", "p.flux", "--yes"]);
+        ok(&["flux", "review", "--files", "x.rs", "-m", "mock"]);
+    }
+
+    /// `program_resolves` PATH-searches a bare name. A one-component relative path has
+    /// `Path::parent() == Some("")`, which must not be mistaken for "has a directory component" —
+    /// that pre-fix bug reported every bare-name plugin as `missing` in `flux plugin status`
+    /// while `call` (which spawns via PATH) worked fine.
+    #[test]
+    fn program_resolves_finds_bare_names_on_path() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-program-resolves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("flux-plugin-resolve-probe");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let _guard = EnvVarGuard::new("PATH");
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", dir.display()));
+
+        assert!(
+            super::program_resolves("flux-plugin-resolve-probe"),
+            "bare name on PATH must resolve"
+        );
+        assert!(!super::program_resolves("flux-plugin-definitely-absent"));
+        // A path with a separator is checked directly, never PATH-searched.
+        assert!(super::program_resolves(bin.to_str().unwrap()));
+        assert!(!super::program_resolves("./flux-plugin-resolve-probe"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `flux run <app.flux> extra words` errors loudly — before the fix, everything after the
+    /// program path was silently discarded.
+    #[tokio::test]
+    async fn run_app_cmd_rejects_trailing_words() {
+        let flags = super::AgentFlags::from_model_yes(Some("mock"), true);
+        let err = super::run_app_cmd(
+            vec!["app.flux".into(), "with".into(), "inputs".into()],
+            &flags,
+        )
+        .await
+        .expect_err("trailing words after a program path must error");
+        assert!(
+            err.to_string().contains("takes no further arguments"),
+            "got: {err:#}"
+        );
+    }
+
+    /// `--members` pairs with the `multi` adapter only — both mismatches are caught before any
+    /// suite runs (previously: multi-without-members failed deep in flux-eval, members-without-
+    /// multi was silently ignored).
+    #[tokio::test]
+    async fn eval_members_pairing_is_validated_up_front() {
+        let err = super::run_eval_cmd(
+            super::EvalAdapter::Multi,
+            vec![],
+            vec![],
+            0,
+            1,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("multi without --members");
+        assert!(err.to_string().contains("--members"), "got: {err:#}");
+        let err = super::run_eval_cmd(
+            super::EvalAdapter::Synthetic,
+            vec![],
+            vec!["mock".into()],
+            0,
+            1,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect_err("--members without multi");
+        assert!(err.to_string().contains("--members"), "got: {err:#}");
     }
 
     #[test]
@@ -11079,14 +11533,41 @@ mod tests {
         }
     }
 
+    /// Restores (or removes) an env var on drop — panic-safe cleanup for env-mutating tests, so a
+    /// failed assertion can't leak a widened grant into every later test in the process.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                prior: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// D-96: the ephemeral `--allow-private-net` override widens the *operator* grant to `*` for this
     /// process and stamps a distinct `cli:--allow-private-net` audit grant-source, while its absence
     /// preserves deny-by-default (an empty config yields no private grant). The manifest-declaration
     /// intersection that still gates each plugin lives in `flux_plugin::SystemHostCaps` and is covered
-    /// there; this pins the CLI-surface wiring.
+    /// there; this pins the CLI-surface wiring — including the truthy-value semantics: an explicit
+    /// "off" value (`0`) must never widen an SSRF-relevant grant.
     #[test]
     fn allow_private_net_override_widens_grant_and_labels_audit() {
         let cfg = flux_config::Config::default();
+        let _guard = EnvVarGuard::new("FLUX_ALLOW_PRIVATE_NET");
 
         // Off (default): deny-by-default. Empty config → no private grant; audit source is the normal
         // per-plugin config label (matching SystemHostCaps::with_manifest's default).
@@ -11098,6 +11579,16 @@ mod tests {
             super::private_net_grant_source_for("gitlab"),
             "config:plugin/gitlab"
         );
+
+        // An explicit "off" value stays OFF — presence alone must not grant (the pre-fix bug).
+        for off in ["0", "false", "no", "off", ""] {
+            std::env::set_var("FLUX_ALLOW_PRIVATE_NET", off);
+            assert!(
+                !super::private_net_cli_override(),
+                "FLUX_ALLOW_PRIVATE_NET={off:?} must not widen the grant"
+            );
+            assert!(super::effective_plugin_private_hosts(&cfg, "gitlab").is_empty());
+        }
 
         // On: the operator grant widens to `*` and the audit source becomes the CLI-flag label.
         std::env::set_var("FLUX_ALLOW_PRIVATE_NET", "1");
@@ -11114,8 +11605,6 @@ mod tests {
             super::private_net_grant_source_for("gitlab"),
             "cli:--allow-private-net"
         );
-
-        std::env::remove_var("FLUX_ALLOW_PRIVATE_NET");
     }
 
     /// Direct unit test of the `flux_capabilities::CrossPluginAudit` L6 binding

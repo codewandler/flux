@@ -106,10 +106,7 @@ impl Workspace {
                 let _ = ws.add_read_root(&expanded);
             }
         }
-        if std::env::var("FLUX_ALLOW_ALL")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-        {
+        if env_truthy("FLUX_ALLOW_ALL") {
             ws.set_unconfined(true);
         }
         Ok(ws)
@@ -299,6 +296,16 @@ fn path_to_utf8(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_string)
         .ok_or_else(|| Error::Config(format!("resolved path {:?} is not valid UTF-8", path)))
+}
+
+/// Whether the environment variable `key` is set to a truthy value (`1`/`true`/`yes`/`on`).
+/// The one owner of boolean `FLUX_*` env semantics: mere presence is NOT truthy, so an operator
+/// exporting `FLUX_ALLOW_PRIVATE_NET=0` (or `FLUX_VERBOSE=false`) disables the signal instead of
+/// silently enabling it.
+pub fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Lexically normalize an absolute path (resolve `.`/`..` without touching the filesystem),
@@ -926,6 +933,13 @@ impl System {
         Ok(tokio::fs::read(&p).await?)
     }
 
+    /// Byte size of a file within the workspace/read-roots — a metadata call, so a caller
+    /// enforcing a size cap can skip an oversized file WITHOUT paying a whole-file read first.
+    pub async fn file_size(&self, path: &str) -> Result<u64> {
+        let p = self.workspace.resolve_read(path)?;
+        Ok(tokio::fs::metadata(&p).await?.len())
+    }
+
     /// Whether `path` (resolved within the workspace/read-roots) is a directory — lets a read tool
     /// give actionable guidance ("list it with glob first") instead of failing on the raw `Is a
     /// directory` io error (C-32). Read-only, so it uses the same `resolve_read` jail as
@@ -1390,6 +1404,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ws = Workspace::new(&dir).unwrap();
         (dir, System::new(ws))
+    }
+
+    /// `env_truthy` requires an explicit truthy VALUE — presence alone (or an explicit "off"
+    /// value) must never count, since security-relevant grants (`FLUX_ALLOW_PRIVATE_NET`) gate
+    /// on it. Uses a probe key no other test reads, so parallel test threads don't race it.
+    #[test]
+    fn env_truthy_requires_a_truthy_value() {
+        let key = "FLUX_SYSTEM_ENV_TRUTHY_PROBE";
+        std::env::remove_var(key);
+        assert!(!env_truthy(key), "unset is off");
+        for on in ["1", "true", "yes", "on"] {
+            std::env::set_var(key, on);
+            assert!(env_truthy(key), "{on:?} is on");
+        }
+        for off in ["0", "false", "no", "off", ""] {
+            std::env::set_var(key, off);
+            assert!(
+                !env_truthy(key),
+                "{off:?} is off — presence alone must not grant"
+            );
+        }
+        std::env::remove_var(key);
+    }
+
+    /// `file_size` reports the jailed file's byte size without reading it, and refuses a path
+    /// outside the workspace like every other read.
+    #[tokio::test]
+    async fn file_size_is_jailed_metadata() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file("a.txt", "hello").await.unwrap();
+        assert_eq!(sys.file_size("a.txt").await.unwrap(), 5);
+        assert!(sys.file_size("../outside.txt").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

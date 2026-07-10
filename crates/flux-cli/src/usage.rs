@@ -22,7 +22,6 @@ use crate::style;
 
 const MAX_JSONL_FILES: usize = 20_000;
 const MAX_JSONL_FILE_BYTES: u64 = 200 * 1024 * 1024;
-const DAY_MS: i64 = 86_400_000;
 
 /// Flags for `flux usage`.
 #[derive(Args, Clone, Debug, Default)]
@@ -47,7 +46,7 @@ pub struct UsageArgs {
     #[arg(long)]
     pub last: Option<String>,
 
-    /// Show scan progress on stderr: auto, always, or never.
+    /// Show scan progress on stderr: auto, always, or never (--json output always suppresses progress).
     #[arg(long, value_enum, default_value_t)]
     pub progress: ProgressMode,
 
@@ -443,8 +442,14 @@ impl UsageMetrics {
     fn recompute_derived(&mut self) {
         self.active_days = self.active_day_keys.len() as u64;
         self.workspaces = self.workspace_keys.len() as u64;
+        // `covered_days` counts the local calendar days spanned by first..last inclusive — the same
+        // day arithmetic `active_days` uses — so covered >= active always holds. An elapsed-time
+        // quotient would render "1d covered · 2 active d" for records at 23:59 and 00:01.
         self.covered_days = match (self.first_ms, self.last_ms) {
-            (Some(first), Some(last)) => (((last - first).max(0) / DAY_MS) + 1) as u64,
+            (Some(first), Some(last)) => match (local_day(first), local_day(last.max(first))) {
+                (Some(first_day), Some(last_day)) => ((last_day - first_day).num_days() + 1) as u64,
+                _ => 0,
+            },
             _ => 0,
         };
         self.sessions_per_day = if self.active_days == 0 {
@@ -469,7 +474,7 @@ impl TimeFilter {
             let duration = parse_duration_ms(last)?;
             Some(now_ms.saturating_sub(duration))
         } else if let Some(since) = &args.since {
-            parse_since_ms(since, now_ms)?
+            Some(parse_since_ms(since, now_ms)?)
         } else {
             None
         };
@@ -900,11 +905,10 @@ fn parse_claude_projects(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let files = jsonl_files(projects)?;
+    let (files, mut skipped) = jsonl_files(projects)?;
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     let mut sessions = BTreeMap::<String, SessionBuild>::new();
-    let mut skipped = 0;
 
     progress.begin(HarnessKind::Claude.label(), files.len());
     for (idx, file) in files.iter().enumerate() {
@@ -913,7 +917,13 @@ fn parse_claude_projects(
             progress.tick(HarnessKind::Claude.label(), idx + 1, files.len(), skipped);
             continue;
         }
-        let reader = BufReader::new(File::open(file)?);
+        // One unreadable file must not abort the scan: skip it like a bad line and keep the rest.
+        let Ok(open) = File::open(file) else {
+            skipped += 1;
+            progress.tick(HarnessKind::Claude.label(), idx + 1, files.len(), skipped);
+            continue;
+        };
+        let reader = BufReader::new(open);
         let fallback_session = file_stem(file);
         for line in reader.lines() {
             let line = match line {
@@ -1009,10 +1019,9 @@ fn parse_codex_sessions(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let files = jsonl_files(sessions_root)?;
+    let (files, mut skipped) = jsonl_files(sessions_root)?;
     let mut records = Vec::new();
     let mut session_records = Vec::new();
-    let mut skipped = 0;
 
     progress.begin(HarnessKind::Codex.label(), files.len());
     for (idx, file) in files.iter().enumerate() {
@@ -1021,7 +1030,13 @@ fn parse_codex_sessions(
             progress.tick(HarnessKind::Codex.label(), idx + 1, files.len(), skipped);
             continue;
         }
-        let reader = BufReader::new(File::open(file)?);
+        // One unreadable file must not abort the scan: skip it like a bad line and keep the rest.
+        let Ok(open) = File::open(file) else {
+            skipped += 1;
+            progress.tick(HarnessKind::Codex.label(), idx + 1, files.len(), skipped);
+            continue;
+        };
+        let reader = BufReader::new(open);
         let mut session_id = file_stem(file);
         let mut build = SessionBuild::default();
         let mut model = "codex/gpt-5.5".to_string();
@@ -1554,7 +1569,7 @@ fn render_summary(out: &mut String, rows: &[SummaryRow]) {
     for row in rows {
         out.push_str(&format!(
             "  {:<16} {:>9} {:>8} {:>12} {:>7} {:>13} {:>9}\n",
-            truncate_summary_label(&row.label, 16),
+            truncate_cell(&row.label, 16),
             row.metrics.sessions,
             row.metrics.calls,
             style::fmt_tokens(row.metrics.usage.total()),
@@ -1646,7 +1661,7 @@ fn render_table(out: &mut String, rows: &[UsageRow]) {
     for row in rows {
         out.push_str(&format!(
             "  {:<model_width$} {:>6} {:>9} {:>9} {:>11} {:>12} {:>10} {:>18}\n",
-            truncate_model(&row.model, model_width),
+            truncate_cell(&row.model, model_width),
             row.calls,
             style::fmt_tokens(row.usage.context_tokens()),
             style::fmt_tokens(row.usage.output_tokens),
@@ -2027,11 +2042,11 @@ fn normalize_epoch_ms(n: i64) -> i64 {
     }
 }
 
-fn parse_since_ms(s: &str, now_ms: i64) -> Result<Option<i64>> {
+fn parse_since_ms(s: &str, now_ms: i64) -> Result<i64> {
     if let Some(duration) = parse_duration_ms_if_duration(s)? {
-        return Ok(Some(now_ms.saturating_sub(duration)));
+        return Ok(now_ms.saturating_sub(duration));
     }
-    Ok(Some(parse_bound_ms(s, false)?))
+    parse_bound_ms(s, false)
 }
 
 fn parse_until_ms(s: &str) -> Result<i64> {
@@ -2118,11 +2133,15 @@ fn fmt_ts_short(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
-fn local_day_key(ms: Option<i64>) -> Option<String> {
+fn local_day(ms: i64) -> Option<NaiveDate> {
     Local
-        .timestamp_millis_opt(ms?)
+        .timestamp_millis_opt(ms)
         .earliest()
-        .map(|dt| dt.date_naive().to_string())
+        .map(|dt| dt.date_naive())
+}
+
+fn local_day_key(ms: Option<i64>) -> Option<String> {
+    local_day(ms?).map(|day| day.to_string())
 }
 
 fn fmt_duration_ms(ms: u64) -> String {
@@ -2199,28 +2218,15 @@ fn summary_unpriced(n: u64) -> String {
     }
 }
 
-fn truncate_model(model: &str, width: usize) -> String {
-    let len = model.chars().count();
+fn truncate_cell(text: &str, width: usize) -> String {
+    let len = text.chars().count();
     if len <= width {
-        return model.to_string();
+        return text.to_string();
     }
     if width <= 1 {
         return "…".to_string();
     }
-    let mut s: String = model.chars().take(width - 1).collect();
-    s.push('…');
-    s
-}
-
-fn truncate_summary_label(label: &str, width: usize) -> String {
-    let len = label.chars().count();
-    if len <= width {
-        return label.to_string();
-    }
-    if width <= 1 {
-        return "…".to_string();
-    }
-    let mut s: String = label.chars().take(width - 1).collect();
+    let mut s: String = text.chars().take(width - 1).collect();
     s.push('…');
     s
 }
@@ -2292,29 +2298,45 @@ fn plural(n: u64) -> &'static str {
     }
 }
 
-fn jsonl_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// Collect `.jsonl` files under `root`, returning the files plus the count of unreadable entries
+/// skipped along the way. Only an unreadable root propagates as an error (it becomes the harness
+/// note); below the root, unreadable subdirectories and entries get the same per-item tolerance as
+/// bad lines and oversized files, so one permission-denied path cannot blank out the whole scan.
+fn jsonl_files(root: &Path) -> Result<(Vec<PathBuf>, usize)> {
+    let read = fs::read_dir(root).with_context(|| format!("read {}", root.display()))?;
     let mut out = Vec::new();
-    collect_jsonl_files(root, &mut out)?;
+    let mut skipped = 0usize;
+    collect_jsonl_files(read, &mut out, &mut skipped);
     out.sort();
     if out.len() > MAX_JSONL_FILES {
         out.truncate(MAX_JSONL_FILES);
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
-fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_jsonl_files(read: fs::ReadDir, out: &mut Vec<PathBuf>, skipped: &mut usize) {
     if out.len() >= MAX_JSONL_FILES {
-        return Ok(());
+        return;
     }
-    let mut entries = fs::read_dir(dir)
-        .with_context(|| format!("read {}", dir.display()))?
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut entries = Vec::new();
+    for entry in read {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(_) => *skipped += 1,
+        }
+    }
     entries.sort_by_key(|e| e.path());
     for entry in entries {
         let path = entry.path();
-        let ty = entry.file_type()?;
+        let Ok(ty) = entry.file_type() else {
+            *skipped += 1;
+            continue;
+        };
         if ty.is_dir() {
-            collect_jsonl_files(&path, out)?;
+            match fs::read_dir(&path) {
+                Ok(read) => collect_jsonl_files(read, out, skipped),
+                Err(_) => *skipped += 1,
+            }
         } else if ty.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
@@ -2322,7 +2344,6 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             break;
         }
     }
-    Ok(())
 }
 
 fn too_large(path: &Path) -> bool {
@@ -2392,6 +2413,8 @@ fn home_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    const DAY_MS: i64 = 86_400_000;
+
     fn test_path(name: &str) -> PathBuf {
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2420,6 +2443,15 @@ mod tests {
         assert_eq!(parse_duration_ms("24h").unwrap(), DAY_MS);
         assert_eq!(parse_duration_ms("7d").unwrap(), 7 * DAY_MS);
         assert!(parse_duration_ms("bad").is_err());
+
+        // `parse_since_ms` resolves every accepted form to a concrete bound and rejects the rest.
+        let now = 1_772_000_000_000;
+        assert_eq!(parse_since_ms("24h", now).unwrap(), now - DAY_MS);
+        assert_eq!(
+            parse_since_ms("2026-07-08", now).unwrap(),
+            parse_bound_ms("2026-07-08", false).unwrap()
+        );
+        assert!(parse_since_ms("not-a-time", now).is_err());
     }
 
     #[test]
@@ -2659,6 +2691,39 @@ mod tests {
     }
 
     #[test]
+    fn covered_days_uses_calendar_days_and_never_undercounts_active_days() {
+        // Records at 23:59 and 00:01 the next local day span two calendar days. The old
+        // elapsed-time quotient reported 1 covered day beside 2 active days.
+        let first = Local
+            .with_ymd_and_hms(2026, 7, 8, 23, 59, 0)
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        let last = Local
+            .with_ymd_and_hms(2026, 7, 9, 0, 1, 0)
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        let mut metrics = UsageMetrics {
+            first_ms: Some(first),
+            last_ms: Some(last),
+            active_day_keys: BTreeSet::from([
+                local_day_key(Some(first)).unwrap(),
+                local_day_key(Some(last)).unwrap(),
+            ]),
+            ..Default::default()
+        };
+        metrics.recompute_derived();
+        assert_eq!(metrics.covered_days, 2);
+        assert!(metrics.covered_days >= metrics.active_days);
+
+        // A single instant still covers exactly the one calendar day it falls on.
+        metrics.last_ms = Some(first);
+        metrics.recompute_derived();
+        assert_eq!(metrics.covered_days, 1);
+    }
+
+    #[test]
     fn flux_efficiency_attaches_only_on_the_unbounded_window() {
         // The efficiency projection is a whole-history aggregate: it is surfaced on `all time` but
         // withheld under a `--since`/`--until` window so it is never shown beside filtered metrics.
@@ -2727,6 +2792,52 @@ mod tests {
         assert_eq!(records[0].cost_status, CostStatus::SubscriptionEquivalent);
         assert!(records[0].started_at_ms.is_some());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_scan_skips_unreadable_files_and_dirs_and_keeps_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A permission-denied file or subdirectory must be counted as skipped like a bad line, not
+        // abort the scan and blank out every record already parsed from readable files.
+        let root = test_path("claude-unreadable");
+        let project = root.join("projects").join("p");
+        fs::create_dir_all(&project).unwrap();
+        let line = r#"{"type":"assistant","timestamp":"2026-07-08T12:00:00Z","message":{"id":"msg_1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":3}},"sessionId":"s"}"#;
+        fs::write(project.join("good.jsonl"), format!("{line}\n")).unwrap();
+        let bad = project.join("locked.jsonl");
+        fs::write(&bad, format!("{line}\n")).unwrap();
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        let locked_dir = project.join("locked-dir");
+        fs::create_dir_all(&locked_dir).unwrap();
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&bad).is_ok() {
+            // Running as root: permission bits cannot make paths unreadable, so the scenario is
+            // untestable here.
+            let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let mut progress = quiet_progress();
+        let (records, sessions, scanned, skipped) = parse_claude_projects(
+            &root.join("projects"),
+            &PricingTable::builtin(),
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(scanned, 2, "both jsonl files are listed");
+        assert_eq!(skipped, 2, "the unreadable file and directory are skipped");
+        assert_eq!(
+            records.len(),
+            1,
+            "the readable file still yields its record"
+        );
+        assert_eq!(sessions.len(), 1);
+
+        let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
         let _ = fs::remove_dir_all(root);
     }
 

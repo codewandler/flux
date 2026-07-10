@@ -115,6 +115,7 @@ fn reference_md(name: &str, m: &PluginManifest) -> String {
     } else {
         s.push_str("| Operation | Description | Required input | Risk |\n");
         s.push_str("|---|---|---|---|\n");
+        let mut defaulted_risk = false;
         for op in &m.operations {
             let req = required_fields(&op.input_schema);
             let req = if req.is_empty() {
@@ -122,10 +123,13 @@ fn reference_md(name: &str, m: &PluginManifest) -> String {
             } else {
                 req.join(", ")
             };
-            let risk = op
-                .risk
-                .map(|r| format!("{r:?}"))
-                .unwrap_or_else(|| "Medium*".into());
+            let risk = match op.risk {
+                Some(r) => format!("{r:?}"),
+                None => {
+                    defaulted_risk = true;
+                    "Medium*".into()
+                }
+            };
             s.push_str(&format!(
                 "| `{}` | {} | {} | {} |\n",
                 cell(&op.name),
@@ -135,6 +139,10 @@ fn reference_md(name: &str, m: &PluginManifest) -> String {
             ));
         }
         s.push('\n');
+        if defaulted_risk {
+            // Explain the `*` the table above just used — only when it was actually used.
+            s.push_str("\\* risk not declared by the plugin; defaulted to medium\n\n");
+        }
     }
 
     if !m.auth.is_empty() {
@@ -279,6 +287,33 @@ mod tests {
         let (_, gl_md) = r.references.iter().find(|(n, _)| n == "gitlab").unwrap();
         assert!(gl_md.contains("personal_token") && gl_md.contains("GITLAB_PERSONAL_TOKEN"));
         assert!(gl_md.contains("gitlab.endpoint"));
+    }
+
+    #[test]
+    fn defaulted_risk_footnote_only_when_used() {
+        // The fixture ops declare no risk → the table shows `Medium*` and the footnote explains it.
+        let r = render_plugin_skill(&fixture());
+        let (_, gl_md) = r.references.iter().find(|(n, _)| n == "gitlab").unwrap();
+        assert!(gl_md.contains("Medium*"));
+        assert!(
+            gl_md.contains("\\* risk not declared by the plugin; defaulted to medium"),
+            "footnote missing: {gl_md}"
+        );
+        // A manifest whose every op declares its risk gets neither the marker nor the footnote.
+        let declared = PluginManifest {
+            name: "declared".into(),
+            operations: vec![OperationSpec {
+                name: "declared.op".into(),
+                description: "Fully declared".into(),
+                risk: Some(flux_spec::Risk::Low),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let r = render_plugin_skill(&[("declared".into(), declared)]);
+        let (_, md) = &r.references[0];
+        assert!(md.contains("| Low |"), "declared risk should render: {md}");
+        assert!(!md.contains("Medium*") && !md.contains("risk not declared"));
     }
 
     #[test]

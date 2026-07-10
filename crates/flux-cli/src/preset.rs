@@ -31,6 +31,10 @@ struct PresetInfo {
     deterministic: bool,
     /// Human usage hint — the keys this preset consumes.
     keys: &'static str,
+    /// The closed set of keys [`build_flow`] consumes for this preset. No preset takes free-form
+    /// keys, so anything outside this list is a typo and rejected up front. Kept in lock-step with
+    /// `keys` (and with the dispatch table) by the tests.
+    accepted: &'static [&'static str],
     blurb: &'static str,
 }
 
@@ -40,6 +44,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "batch",
         deterministic: true,
         keys: "item= source= op= collect=",
+        accepted: &["item", "source", "op", "collect"],
         blurb: "map an op over each element of a list",
     },
     PresetInfo {
@@ -47,6 +52,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "batch",
         deterministic: true,
         keys: "max= op= input= bind= until=",
+        accepted: &["max", "op", "input", "bind", "until"],
         blurb: "retry an op until a condition holds",
     },
     PresetInfo {
@@ -54,6 +60,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "batch",
         deterministic: true,
         keys: "for_ms= every_ms= op= input=",
+        accepted: &["for_ms", "every_ms", "op", "input"],
         blurb: "poll an op on an interval for a duration",
     },
     PresetInfo {
@@ -61,6 +68,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "batch",
         deterministic: true,
         keys: "timeout_ms= op= op=… input= bind=",
+        accepted: &["timeout_ms", "op", "input", "bind"],
         blurb: "race ops, take the first to finish",
     },
     PresetInfo {
@@ -68,6 +76,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "resilience",
         deterministic: true,
         keys: "max= backoff= delay_ms= op= input= bind=",
+        accepted: &["max", "backoff", "delay_ms", "op", "input", "bind"],
         blurb: "retry on error with backoff",
     },
     PresetInfo {
@@ -75,6 +84,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "resilience",
         deterministic: true,
         keys: "ms= op= input= bind=",
+        accepted: &["ms", "op", "input", "bind"],
         blurb: "bound an op by a deadline",
     },
     PresetInfo {
@@ -82,6 +92,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "resilience",
         deterministic: true,
         keys: "limit= op= input= bind=",
+        accepted: &["limit", "op", "input", "bind"],
         blurb: "cap the op dispatches an op may make",
     },
     PresetInfo {
@@ -89,6 +100,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "resilience",
         deterministic: true,
         keys: "op= input= catch= handler=",
+        accepted: &["op", "input", "catch", "handler"],
         blurb: "run an op, recover via a handler on error",
     },
     PresetInfo {
@@ -96,6 +108,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "fanout",
         deterministic: true,
         keys: "op= op=… input=",
+        accepted: &["op", "input"],
         blurb: "run ops concurrently, replay in order",
     },
     PresetInfo {
@@ -103,6 +116,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "dispatch",
         deterministic: true,
         keys: "subject_op= input= arm=value:handler… default=",
+        accepted: &["subject_op", "input", "arm", "default"],
         blurb: "dispatch on a computed value",
     },
     PresetInfo {
@@ -110,6 +124,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "model",
         deterministic: false,
         keys: "classify_op= input= arm=label:handler… default=",
+        accepted: &["classify_op", "input", "arm", "default"],
         blurb: "classify once, then route",
     },
     PresetInfo {
@@ -117,6 +132,7 @@ const CATALOG: &[PresetInfo] = &[
         category: "model",
         deterministic: false,
         keys: "primary_op= escalate_op= synth_op= question=",
+        accepted: &["primary_op", "escalate_op", "synth_op", "question"],
         blurb: "degrade gracefully into an answer",
     },
     PresetInfo {
@@ -124,6 +140,16 @@ const CATALOG: &[PresetInfo] = &[
         category: "compose",
         deterministic: false,
         keys: "max= backoff= delay_ms= timeout_ms= primary= backup= input= bind=",
+        accepted: &[
+            "max",
+            "backoff",
+            "delay_ms",
+            "timeout_ms",
+            "primary",
+            "backup",
+            "input",
+            "bind",
+        ],
         blurb: "retry { timeout { fallback {…} } }, nested",
     },
 ];
@@ -144,6 +170,7 @@ fn parse_node(spec: &str) -> Node {
 }
 
 /// The parsed `key=value` arguments — a multimap, since list params (`op=`, `arm=`) repeat their key.
+#[derive(Debug)]
 struct ArgMap {
     map: BTreeMap<String, Vec<String>>,
 }
@@ -327,6 +354,92 @@ fn build_flow(name: &str, kv: &ArgMap) -> Result<DraftAst> {
     })
 }
 
+/// One validated `flux preset <name> …` invocation — split from [`run_preset`] so the flag/key
+/// rejection paths are unit-testable.
+#[derive(Debug)]
+struct Invocation {
+    kv: ArgMap,
+    run: bool,
+    yes: bool,
+    /// `-o` — `Some` only when the user passed it; scaffold-only, so `--run` rejects it.
+    output: Option<String>,
+    /// `-m` — `Some` only when the user passed it; only `--run` contacts a provider.
+    model: Option<String>,
+}
+
+/// Parse + validate the tokens after the preset name: recognized flags, then `key=value` pairs
+/// checked against the preset's closed key set. Anything else errors instead of vanishing.
+fn parse_invocation(name: &str, args: &[String]) -> Result<Invocation> {
+    let Some(info) = find(name) else {
+        bail!("unknown preset `{name}` — try `flux preset list`");
+    };
+    let mut pairs: Vec<String> = Vec::new();
+    let mut run = false;
+    let mut yes = false;
+    let mut output: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--run" => run = true,
+            "--yes" | "-y" => yes = true,
+            "-o" | "--output" => {
+                output = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`-o` needs a format: pretty|json"))?,
+                )
+            }
+            "-m" | "--model" => {
+                model = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("`-m` needs a provider/model spec"))?,
+                )
+            }
+            // A dash token is a flag, not a `key=value` — reject it even when it contains `=`
+            // so GNU-style spellings (`--output=json`) don't get swallowed as preset keys.
+            s if s.starts_with('-') => bail!(
+                "preset {name}: unknown flag `{s}` — flags are --run, --yes/-y, -o/--output \
+                 <fmt>, -m/--model <spec>; preset arguments are key=value"
+            ),
+            s if s.contains('=') => pairs.push(s.to_string()),
+            other => bail!(
+                "preset {name}: unexpected argument `{other}` (try `flux preset help {name}`)"
+            ),
+        }
+    }
+    // `-o` shapes the scaffold print and `-m` picks the provider for `--run`; each is dead weight
+    // on the other path, so passing it there errors rather than becoming a silent no-op.
+    if run && output.is_some() {
+        bail!("preset {name}: `-o` only applies to scaffolding — remove it or drop `--run`");
+    }
+    if !run && model.is_some() {
+        bail!("preset {name}: `-m` only applies to `--run` — add `--run` or drop `-m`");
+    }
+    let kv = ArgMap::parse(&pairs)?;
+    // Every preset has a closed key set (CATALOG `accepted`), so an unknown key is a typo.
+    for k in kv.map.keys() {
+        if !info.accepted.contains(&k.as_str()) {
+            bail!(
+                "preset {name}: unknown key `{k}=` (accepted: {})",
+                info.accepted
+                    .iter()
+                    .map(|k| format!("{k}="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+    Ok(Invocation {
+        kv,
+        run,
+        yes,
+        output,
+        model,
+    })
+}
+
 /// Entry point: `argv` after `flux preset`.
 pub async fn run_preset(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
@@ -336,46 +449,16 @@ pub async fn run_preset(args: &[String]) -> Result<()> {
     }
     let name = args[0].as_str();
 
-    let mut pairs: Vec<String> = Vec::new();
-    let mut run = false;
-    let mut yes = false;
-    let mut output = String::from("pretty");
-    let mut model: Option<String> = None;
-    let mut it = args[1..].iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--run" => run = true,
-            "--yes" | "-y" => yes = true,
-            "-o" | "--output" => {
-                output = it
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("`-o` needs a format: pretty|json"))?
-            }
-            "-m" | "--model" => {
-                model = Some(
-                    it.next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("`-m` needs a provider/model spec"))?,
-                )
-            }
-            s if s.contains('=') => pairs.push(s.to_string()),
-            other => bail!(
-                "preset {name}: unexpected argument `{other}` (try `flux preset help {name}`)"
-            ),
-        }
-    }
+    let inv = parse_invocation(name, &args[1..])?;
+    let ast = build_flow(name, &inv.kv).with_context(|| format!("build preset `{name}`"))?;
 
-    let kv = ArgMap::parse(&pairs)?;
-    let ast = build_flow(name, &kv).with_context(|| format!("build preset `{name}`"))?;
-
-    if run {
+    if inv.run {
         // Build the agent flags from the recipe's flags and reuse the shared execute core
         // (build_agent → analyze → risk → approver → execute_flow), exactly as `flux flow run` does.
-        let flags = crate::AgentFlags::from_model_yes(model.as_deref(), yes);
+        let flags = crate::AgentFlags::from_model_yes(inv.model.as_deref(), inv.yes);
         crate::run_draft_ast(&flags, &ast).await
     } else {
-        print_scaffold(&ast, &output)
+        print_scaffold(&ast, inv.output.as_deref().unwrap_or("pretty"))
     }
 }
 
@@ -415,7 +498,7 @@ fn print_list() -> Result<()> {
     println!(
         "  {}",
         crate::style::dim(
-            "flux preset help <name>   ·   flux preset <name> key=value … [--run] [-o pretty|json]"
+            "flux preset help <name>   ·   flux preset <name> key=value … [--run | -o pretty|json]"
         )
     );
     Ok(())
@@ -464,6 +547,13 @@ mod tests {
 
     fn argmap(pairs: &[&str]) -> ArgMap {
         ArgMap::parse(&pairs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn parse_inv(name: &str, args: &[&str]) -> Result<Invocation> {
+        parse_invocation(
+            name,
+            &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
     }
 
     #[test]
@@ -573,9 +663,103 @@ mod tests {
             "a preset is in the catalog but untested (or vice versa)"
         );
         for (name, args) in cases {
-            assert!(find(name).is_some(), "`{name}` tested but not in CATALOG");
+            let info = find(name).unwrap_or_else(|| panic!("`{name}` tested but not in CATALOG"));
+            // The representative args exercise exactly the accepted key set — guards `accepted`
+            // from drifting away from what `build_flow` actually consumes.
+            let used: std::collections::BTreeSet<&str> =
+                args.iter().filter_map(|a| a.split('=').next()).collect();
+            let accepted: std::collections::BTreeSet<&str> =
+                info.accepted.iter().copied().collect();
+            assert_eq!(used, accepted, "`{name}`: args vs accepted keys drift");
             build_flow(name, &argmap(args)).unwrap_or_else(|e| panic!("build `{name}`: {e:#}"));
         }
+    }
+
+    #[test]
+    fn catalog_keys_hint_matches_accepted() {
+        // The human `keys` hint and the machine-checked `accepted` list must name the same keys.
+        for p in CATALOG {
+            let hinted: std::collections::BTreeSet<&str> = p
+                .keys
+                .split_whitespace()
+                .filter_map(|t| t.split('=').next())
+                .collect();
+            let accepted: std::collections::BTreeSet<&str> = p.accepted.iter().copied().collect();
+            assert_eq!(
+                hinted, accepted,
+                "`{}`: keys hint vs accepted drift",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn gnu_style_flags_are_rejected_not_swallowed() {
+        // `--output=json` used to slip through as a bogus `--output=json` key=value pair.
+        let err = parse_inv("map_each", &["--output=json"]).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown flag `--output=json`"),
+            "{err:#}"
+        );
+        let err = parse_inv("map_each", &["--frobnicate"]).unwrap_err();
+        assert!(err.to_string().contains("unknown flag"), "{err:#}");
+    }
+
+    #[test]
+    fn unknown_keys_error_listing_accepted() {
+        // A typo'd key must not become an invisible no-op.
+        let err = parse_inv("map_each", &["item=f", "sorce=[\"a\"]"]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown key `sorce=`"), "{msg}");
+        assert!(
+            msg.contains("item=") && msg.contains("source=") && msg.contains("collect="),
+            "should list the accepted keys: {msg}"
+        );
+    }
+
+    #[test]
+    fn output_flag_is_rejected_under_run() {
+        // `-o` is scaffold-only; with `--run` it used to be parsed then silently ignored.
+        let err = parse_inv("map_each", &["-o", "json", "--run"]).unwrap_err();
+        assert!(
+            err.to_string().contains("`-o` only applies to scaffolding"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn model_flag_is_rejected_without_run() {
+        // `-m` only matters under `--run`; on the scaffold path it used to be dropped.
+        let err = parse_inv("map_each", &["-m", "ollama/llama"]).unwrap_err();
+        assert!(
+            err.to_string().contains("`-m` only applies to `--run`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn recognized_flags_and_keys_still_parse() {
+        // The happy paths around the new rejections: scaffold takes `-o`, run takes `-m`/`--yes`.
+        let inv = parse_inv(
+            "map_each",
+            &[
+                "item=f",
+                "source=[\"a\"]",
+                "op=read",
+                "collect=out",
+                "-o",
+                "json",
+            ],
+        )
+        .unwrap();
+        assert!(!inv.run && inv.output.as_deref() == Some("json"));
+        let inv = parse_inv(
+            "map_each",
+            &["op=read", "--run", "-m", "ollama/llama", "-y"],
+        )
+        .unwrap();
+        assert!(inv.run && inv.yes && inv.model.as_deref() == Some("ollama/llama"));
+        assert_eq!(inv.kv.req("op").unwrap(), "read");
     }
 
     #[test]

@@ -1439,7 +1439,7 @@ const MACHINERY_OPS: &[&str] = &[
 /// `FLUX_SHOW_LOOP` so the engine reads it without new plumbing. When set, the user watches the loop
 /// iterate (`plan → run_plan → observe`) instead of only the work the inner plan performs.
 pub fn show_loop() -> bool {
-    std::env::var_os("FLUX_SHOW_LOOP").is_some()
+    flux_system::env_truthy("FLUX_SHOW_LOOP")
 }
 
 /// Whether the OUTER agent loop's structure is traced (A-39) — the CLI `--trace-loop`, exported as
@@ -1448,7 +1448,7 @@ pub fn show_loop() -> bool {
 /// executed. Scoped to the outer loop ONLY: inner `run_plan`, `flow run`, and resume paths call
 /// plain `execute_flow` and never see this flag.
 pub fn trace_loop() -> bool {
-    std::env::var_os("FLUX_TRACE_LOOP").is_some()
+    flux_system::env_truthy("FLUX_TRACE_LOOP")
 }
 
 /// Drain one captured sink event onto the real sink. By default the loop-machinery tool calls/results
