@@ -190,7 +190,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codewandler-flux-core"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-credentials"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "async-trait",
  "base64",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-datasource"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-evidence"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-host-kit"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "base64",
  "codewandler-flux-datasource",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-plugin"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "async-trait",
  "base64",
@@ -275,14 +275,14 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-policy"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "codewandler-flux-provider"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-runtime"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
@@ -314,14 +314,14 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-secret"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "codewandler-flux-spec"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "schemars",
  "serde",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-system"
-version = "0.14.7"
+version = "0.14.8"
 dependencies = [
  "codewandler-flux-core",
  "libc",

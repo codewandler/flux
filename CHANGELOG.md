@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-07-10
+
 ### Added
 
 - **D-130: Kubernetes-authenticated Vault credential stores.** Host applications can now construct

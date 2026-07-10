@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.14.8] - 2026-07-10
+
 ### New
 
 - **A dry run now tells you the truth.** `flux plugin call … --dry-run` used to check an
