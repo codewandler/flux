@@ -524,16 +524,11 @@ enum AppAction {
         program: Option<String>,
         /// Expose an agent over the HTTP/A2A API at this address (defaults to `127.0.0.1:8787`). With a
         /// program, serves its agent; with none, serves the built-in coding agent — that no-program
-        /// form requires `--yes` (HTTP requests have no interactive approver). A custom address must
-        /// be attached with `=` (`--serve=0.0.0.0:8787`) — an optional-value flag would otherwise
-        /// swallow a following `<program>` positional as its address.
-        #[arg(
-            long,
-            value_name = "ADDR",
-            num_args = 0..=1,
-            require_equals = true,
-            default_missing_value = "127.0.0.1:8787"
-        )]
+        /// form requires `--yes` (HTTP requests have no interactive approver). Give `<program>` BEFORE
+        /// a bare `--serve` (`flux app run prog.flux --serve`) or attach a custom address with `=`
+        /// (`--serve=0.0.0.0:8787`) — `--serve <addr>` followed by a program path swallows the path as
+        /// the address instead (clap's usual optional-value-flag ambiguity).
+        #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:8787")]
         serve: Option<String>,
     },
 }
@@ -11069,16 +11064,18 @@ mod tests {
         ok(&["flux", "replay", "--turn", "1"]);
         ok(&["flux", "eval", "terminal-bench"]);
         ok(&["flux", "eval", "multi", "--members", "synthetic,mock"]);
-        // require_equals: the attached form binds the address; the positional stays the program.
+        // --serve's optional value: the common documented shape (no program, space-separated
+        // address) still parses; a program BEFORE a bare --serve avoids the ambiguity entirely.
+        ok(&["flux", "app", "run", "--serve", "0.0.0.0:1234", "--yes"]);
+        ok(&["flux", "app", "run", "p.flux", "--serve", "--yes"]);
         ok(&[
             "flux",
             "app",
             "run",
-            "--serve=0.0.0.0:1234",
             "p.flux",
+            "--serve=0.0.0.0:1234",
             "--yes",
         ]);
-        ok(&["flux", "app", "run", "--serve", "p.flux", "--yes"]);
         ok(&["flux", "review", "--files", "x.rs", "-m", "mock"]);
     }
 
