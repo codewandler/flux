@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-07-11
+
 ### Added
 
 - **D-134: OS-level process sandbox — abstraction, config, and threading (no backend yet).**

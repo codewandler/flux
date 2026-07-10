@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.14.9] - 2026-07-11
+
 ### New
 
 - **Opt-in OS-level process sandboxing.** flux can now confine shell commands and plugin
