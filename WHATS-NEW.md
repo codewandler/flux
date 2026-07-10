@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-07-10
+
 ### Improved
 
 - Helix highlighting setup and updates now use one safe, repeatable installer command. The editor

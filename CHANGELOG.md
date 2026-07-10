@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-07-10
+
 ### Changed
 
 - Flux-Lang editor onboarding now uses the tested `flux-tree-sitter` Helix installer as its single
