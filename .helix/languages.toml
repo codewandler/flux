@@ -4,14 +4,14 @@
 # `flux` and `flux-lsp` to ~/.cargo/bin) or `cargo install --path crates/flux-lsp`, or point
 # `command` at a built binary (e.g. `target/debug/flux-lsp` after `cargo build -p flux-lsp`).
 #
-# Highlighting: Helix colours via tree-sitter ONLY (it does not render LSP semantic tokens), so
-# colour comes from the grammar below. After `hx --grammar fetch && hx --grammar build`, copy the
-# grammar repo's queries where Helix looks for them:
-#   mkdir -p ~/.config/helix/runtime/queries/flux
-#   cp <flux-tree-sitter>/queries/*.scm ~/.config/helix/runtime/queries/flux/
-# Full instructions: https://github.com/codewandler/flux-tree-sitter
+# Highlighting: install/update the pinned grammar and matching queries with the idempotent command
+# at https://codewandler.github.io/flux/docs/language/editors. Helix colours via tree-sitter only;
+# it does not render LSP semantic tokens.
 #
 # This repo-local file is merged over your global `~/.config/helix/languages.toml`.
+
+# Limit `hx --grammar fetch/build` run from this checkout to the one custom grammar declared here.
+use-grammars = { only = ["flux"] }
 
 [language-server.flux-lsp]
 command = "flux-lsp"
@@ -26,4 +26,5 @@ language-servers = ["flux-lsp"]
 
 [[grammar]]
 name = "flux"
-source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "main" }
+# Immutable revision containing the tested parser, queries, and Helix installer.
+source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "29cff6c992b706a4a18009f4335e81101416671a" }

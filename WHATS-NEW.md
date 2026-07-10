@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### Improved
+
+- Helix highlighting setup and updates now use one safe, repeatable installer command. The editor
+  guide also explains how to verify the semantic role under the cursor, why a successful health
+  check does not prove which revision is active, and when a colour comes from the theme rather than
+  the Flux grammar.
+
 ## [0.14.1] - 2026-07-10
 
 ### New

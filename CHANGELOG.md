@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- Flux-Lang editor onboarding now uses the tested `flux-tree-sitter` Helix installer as its single
+  setup/update path. The public guide covers immutable grammar revisions, matched parser/query
+  updates, Flux-only builds, health-vs-version checks, semantic capture inspection, theme-controlled
+  colours, and expected optional-query gaps; the repository-local Helix config pins the verified
+  grammar revision and links back to that guide.
+
 ## [0.14.1] - 2026-07-10
 
 ### Added

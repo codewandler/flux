@@ -15,8 +15,8 @@ the work:
   **`flux-lsp`** language server, built from the flux repository.
 
 The two never compete: Helix, for instance, renders colour via tree-sitter *only* (it does not
-apply LSP semantic tokens, as of 25.07). So the natural order is **set up highlighting first,
-then layer the language server on top** — each section below follows that shape.
+apply LSP semantic tokens, as of 25.07). The sections below keep those responsibilities explicit:
+set up highlighting, then connect the language server where the editor supports it.
 
 ## Install the language server
 
@@ -48,70 +48,64 @@ The reference recipe — Helix needs config only, no extension (verified on Heli
 
 ### Syntax highlighting
 
-Add to `~/.config/helix/languages.toml`:
-
-```toml
-[[language]]
-name = "flux"
-scope = "source.flux"
-file-types = ["flux"]
-comment-token = "#"
-indent = { tab-width = 2, unit = "  " }
-
-[[grammar]]
-name = "flux"
-source = { git = "https://github.com/codewandler/flux-tree-sitter", rev = "main" }
-```
-
-> **Tip:** if your Helix came from a distro package, it ships all default grammars prebuilt —
-> put `use-grammars = { only = ["flux"] }` at the top of `languages.toml` before the next step
-> so Helix doesn't clone and compile ~200 grammars you already have, and remove the line
-> afterwards.
-
-Fetch and build the grammar:
+Run the supported installer:
 
 ```bash
-hx --grammar fetch
-hx --grammar build
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/codewandler/flux-tree-sitter/main/scripts/install-helix.sh | bash
 ```
 
-Then install the highlight queries, copied from the exact grammar source Helix just fetched (so
-queries and compiled grammar can never drift apart):
+The installer resolves the moving grammar branch to an immutable commit, registers or updates Flux
+without replacing an existing Flux/LSP block, fetches and builds only that grammar, installs the
+matching highlight/injection/locals queries, and runs `hx --health flux`. If a fetch or build fails,
+your original `languages.toml` is restored.
 
-```bash
-mkdir -p ~/.config/helix/runtime/queries/flux
-cp ~/.config/helix/runtime/grammars/sources/flux/queries/*.scm ~/.config/helix/runtime/queries/flux/
-```
-
-Opening any `.flux` file now shows full colour.
+Run the same command whenever you want to update, then restart Helix so open buffers reload the
+parser and queries. The implementation and manual fallback live in the
+[`flux-tree-sitter` README](https://github.com/codewandler/flux-tree-sitter#helix).
 
 ### Add the language server
 
-[Install `flux-lsp`](#install-the-language-server), then extend the same `languages.toml` —
-declare the server and reference it from the language:
+[Install `flux-lsp`](#install-the-language-server), then declare the server once:
 
 ```toml
 [language-server.flux-lsp]
 command = "flux-lsp"
+```
 
-[[language]]
-name = "flux"
-scope = "source.flux"
-file-types = ["flux"]
-comment-token = "#"
-indent = { tab-width = 2, unit = "  " }
+In the Flux `[[language]]` block created or preserved by the installer, add:
+
+```toml
 language-servers = ["flux-lsp"]
 ```
 
-### Verify
+Do not add a second Flux `[[language]]` block. Re-running the highlighting installer preserves this
+line and the language-server table.
+
+### Verify and troubleshoot
 
 ```bash
 hx --health flux
 ```
 
-should report the tree-sitter parser ✓, highlight queries ✓, and `flux-lsp` found. Open a
-`.flux` file and check the live experience: colour everywhere, squiggles on a deliberate typo,
-hover on an op name, completion after typing `$`, and `:format`.
+This should report the tree-sitter parser ✓, highlight queries ✓, and `flux-lsp` found. Missing
+textobject, indent, tags, or rainbow queries are expected: Flux does not ship those optional query
+families yet.
+
+`--health` checks presence, not the installed revision or visible colours. To inspect the semantic
+role beneath the cursor, use this command inside Helix:
+
+```text
+:tree-sitter-highlight-name
+```
+
+All callables (`now`, `fmt`, `parse`, dotted/plugin/composite operations) report `function`, while
+`$symbols` report `variable`. The active theme maps those roles to colours; for example, Monokai Pro
+Spectrum deliberately renders variables as white. If an update appears unchanged, restart Helix and
+compare the capture names rather than using colour alone as a version check.
+
+Finally, open a `.flux` file and check the complete experience: colour everywhere, squiggles on a
+deliberate typo, hover on an op name, completion after typing `$`, and `:format`.
 
 Diagnostics, completion, and hover understand multi-declaration modules and the stable cognition,
 datasource, and native-web operations provided by the CLI. Formatting currently applies only to a
@@ -122,7 +116,8 @@ bare single-flow file; modules are left unchanged so declaration order is never 
 The repository ships a repo-local
 [`.helix/languages.toml`](https://github.com/codewandler/flux/blob/main/.helix/languages.toml)
 that Helix merges over your global config, so inside a checkout the wiring above is already
-declared — you still need the grammar built and `flux-lsp` on `$PATH` (both per-machine steps).
+declared and pinned to a tested grammar revision. You still need to run the installer once per
+machine and put `flux-lsp` on `$PATH`.
 
 ## Neovim
 
