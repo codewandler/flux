@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **D-127: slack mrkdwn→Markdown renderer no longer mangles or panics on multi-byte chars.** The
+  converter's fallthrough copied one *byte* per iteration (`bytes[i] as char`), turning every
+  multi-byte UTF-8 char into mojibake and leaving the index mid-sequence, so the next slice
+  panicked (`byte index … is not a char boundary; it is inside '—'`) and killed the plugin process
+  — `slack.message.list`/`slack.thread`/`slack.mentions` default to Markdown conversion, so
+  reading any channel containing an em-dash, umlaut, or emoji crashed. The fallthrough now
+  advances char-wise. (Ships with the next plugins pack cut; until then `text_format: "mrkdwn"`
+  is the workaround.)
+- **D-128: `slack.file.upload` completes against the real Slack API.** The pre-signed-URL bytes
+  leg used PUT — `files.slack.com` answers with a 302 redirect and the upload never landed — and
+  `alt_text` was sent inside the `files.completeUploadExternal` files entry, which accepts only
+  `id`/`title` (`invalid_arguments`). The bytes leg now POSTs per the `files.getUploadURLExternal`
+  contract (the upload unit test asserts the verb via the MockHost call log) and alt text rides
+  the reserve call as `alt_txt`. (Ships with the next plugins pack cut.)
+
 ### Added
 
 - **Website: worked Slack plugin setup page** (`plugins/slack`) — install, bot/user tokens via env

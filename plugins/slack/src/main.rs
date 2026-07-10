@@ -1016,8 +1016,13 @@ fn mrkdwn_to_markdown(text: &str) -> String {
             i += 5;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy the current char verbatim — CHAR-wise, not byte-wise: pushing `bytes[i] as char`
+        // mangled every multi-byte char into mojibake and left `i` mid-sequence, so the next
+        // `text[i..]` slice panicked on a non-boundary (D-127). Every other branch advances by
+        // whole tokens found at char boundaries, so `i` stays a boundary from here on.
+        let ch = text[i..].chars().next().expect("i is on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -1894,12 +1899,17 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
         return Err("file content is empty".into());
     }
 
-    // 1. Reserve an external upload URL.
-    let reserve_path = format!(
+    // 1. Reserve an external upload URL. Alt text rides here as `alt_txt` — it is a
+    //    getUploadURLExternal parameter; completeUploadExternal's `files` entries accept only
+    //    `id`/`title` and answer anything else with `invalid_arguments` (D-128).
+    let mut reserve_path = format!(
         "/files.getUploadURLExternal?filename={}&length={}",
         urlencode(&filename),
         bytes.len(),
     );
+    if let Some(alt) = opt_str(&input, "alt_text") {
+        reserve_path.push_str(&format!("&alt_txt={}", urlencode(alt)));
+    }
     let reserved = check_ok(sl_get(host, &reserve_path, Some("bot_token"))?)?;
     let upload_url = reserved
         .get("upload_url")
@@ -1914,7 +1924,9 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
 
     // 2. Send the bytes to the pre-signed URL byte-exact (no auth; the URL carries its own token).
     //    `http_bytes` ships the raw body so binary files round-trip without UTF-8 corruption.
-    let resp = host.http_bytes("PUT", &upload_url, None, &[], Some(&bytes), false)?;
+    //    POST, per the files.getUploadURLExternal contract — files.slack.com answers a PUT with a
+    //    302 redirect and the upload never lands (D-128).
+    let resp = host.http_bytes("POST", &upload_url, None, &[], Some(&bytes), false)?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
             "slack file upload → {} {}",
@@ -1924,10 +1936,7 @@ fn file_upload(input: Value, host: &mut Host) -> Result<Value, String> {
     }
 
     // 3. Complete the upload, attaching the file to the channel/thread.
-    let mut file_entry = json!({ "id": file_id, "title": filename });
-    if let Some(alt) = opt_str(&input, "alt_text") {
-        file_entry["alt_text"] = json!(alt);
-    }
+    let file_entry = json!({ "id": file_id, "title": filename });
     let mut complete = json!({
         "files": [file_entry],
         "channel_id": channel,
@@ -2997,6 +3006,26 @@ mod tests {
         assert_eq!(out["ok"], true);
     }
 
+    /// D-127: the mrkdwn→Markdown fallthrough must copy CHARS, not bytes — the byte-wise walk
+    /// mangled every multi-byte char into mojibake and panicked on the next `text[i..]` slice
+    /// (`byte index … is not a char boundary; it is inside '—'`), killing the plugin process on
+    /// any `message.list`/`thread`/`mentions` read of a channel containing an em-dash or emoji.
+    #[test]
+    fn mrkdwn_to_markdown_preserves_multibyte_chars() {
+        // The live repro: an em-dash mid-sentence (panicked at byte 13, inside '—').
+        assert_eq!(
+            mrkdwn_to_markdown("flux 0.14.2 — the hardening release"),
+            "flux 0.14.2 — the hardening release"
+        );
+        // Umlauts and emoji round-trip unmangled.
+        assert_eq!(mrkdwn_to_markdown("größer 🚀 fertig"), "größer 🚀 fertig");
+        // Conversion still applies around multi-byte chars in the same string.
+        assert_eq!(
+            mrkdwn_to_markdown("*bold* — <https://x.example|link>"),
+            "**bold** — [link](https://x.example)"
+        );
+    }
+
     #[test]
     fn file_upload_reads_blob_and_runs_the_external_flow() {
         let mut h = host()
@@ -3010,7 +3039,7 @@ mod tests {
                 json!({ "ok": true, "files": [{ "id": "F1", "title": "hello.txt" }] }),
             );
         // Stage non-UTF-8 source bytes directly into the host's blob store, then upload by ref —
-        // the byte-exact `http_bytes` PUT must carry them verbatim (no `from_utf8_lossy`).
+        // the byte-exact `http_bytes` send must carry them verbatim (no `from_utf8_lossy`).
         let raw: Vec<u8> = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
         h.blobs
             .borrow_mut()
@@ -3026,6 +3055,19 @@ mod tests {
         assert_eq!(out["file_id"], "F1");
         assert_eq!(out["size"], raw.len());
         assert_eq!(out["files"][0]["id"], "F1");
+        // The pre-signed-URL leg must POST: files.slack.com answers a PUT with a 302 redirect and
+        // the upload never lands (D-128).
+        let calls = h.calls.borrow();
+        let (_, bytes_leg) = calls
+            .iter()
+            .find(|(cmd, payload)| {
+                cmd == "http.do"
+                    && payload["url"]
+                        .as_str()
+                        .is_some_and(|u| u.contains("files.slack.test/up"))
+            })
+            .expect("pre-signed upload call recorded");
+        assert_eq!(bytes_leg["method"], "POST");
     }
 
     #[test]

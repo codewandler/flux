@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Two Slack plugin fixes, arriving with the next plugin pack update: reading messages from a
+  channel whose history contains special characters (an em-dash, umlauts, emoji) no longer crashes
+  the plugin — until you update, pass `text_format: "mrkdwn"` as a workaround — and file uploads
+  now complete instead of failing against Slack's upload service.
+
 ### Improved
 
 - The docs now include a step-by-step Slack setup guide — install the plugin, provide bot/user
