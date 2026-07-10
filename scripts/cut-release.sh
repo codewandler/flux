@@ -42,9 +42,8 @@ echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad target version:
 
 echo "== cutting $OLD -> $NEW =="
 
-# 1) bump every flux version string in the root manifest (workspace.package.version + the publish
-#    closure's dependency versions all read "$OLD") and the plugins workspace (flux-* dep versions
-#    that host-kit resolves from crates.io on publish).
+# 1a) bump every flux version string in the root manifest (workspace.package.version reads "$OLD")
+#     and the plugins workspace. On a patch bump this is the only substitution needed.
 before=$(grep -c "\"$OLD\"" Cargo.toml || true)
 sed -i "s/\"$OLD\"/\"$NEW\"/g" Cargo.toml
 echo "   bumped $before version string(s) in Cargo.toml"
@@ -52,6 +51,28 @@ plugins_before=$(grep -c "\"$OLD\"" plugins/Cargo.toml || true)
 if [ "$plugins_before" -gt 0 ]; then
   sed -i "s/\"$OLD\"/\"$NEW\"/g" plugins/Cargo.toml
   echo "   bumped $plugins_before version string(s) in plugins/Cargo.toml"
+fi
+
+# 1b) the `[workspace.dependencies]` publish-closure pins (`flux-core = { version = "0.MI.0", ... }`)
+#     deliberately stay at MINOR.0 across patch releases — the loosest correct `^0.MI.0` requirement
+#     for that minor line, so they don't need touching on every patch cut. A minor/major bump DOES
+#     need them moved to the new MINOR.0 (the old requirement no longer resolves against a local
+#     crate now reporting the new minor). Read IFS='.' above already parsed $NEW into $MA/$MI/$PA
+#     only for OLD; re-derive both pins from the version strings themselves.
+old_pin="$MA.$MI.0"
+IFS='.' read -r NMA NMI _ <<<"$NEW"
+new_pin="$NMA.$NMI.0"
+if [ "$old_pin" != "$new_pin" ]; then
+  pin_before=$(grep -c "version = \"$old_pin\"" Cargo.toml || true)
+  if [ "$pin_before" -gt 0 ]; then
+    sed -i "s/version = \"$old_pin\"/version = \"$new_pin\"/g" Cargo.toml
+    echo "   bumped $pin_before publish-closure pin(s) $old_pin -> $new_pin in Cargo.toml"
+  fi
+  plugins_pin_before=$(grep -c "version = \"$old_pin\"" plugins/Cargo.toml || true)
+  if [ "$plugins_pin_before" -gt 0 ]; then
+    sed -i "s/version = \"$old_pin\"/version = \"$new_pin\"/g" plugins/Cargo.toml
+    echo "   bumped $plugins_pin_before publish-closure pin(s) $old_pin -> $new_pin in plugins/Cargo.toml"
+  fi
 fi
 
 # 2) re-lock both workspaces (root + the nested plugins pack) so the lockfiles carry $NEW.
