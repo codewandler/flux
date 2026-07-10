@@ -1,6 +1,6 @@
 # Flux TUI makeover
 
-**Story:** [A-65](../stories/A-65-tui-daily-driver-makeover.md)  
+**Story:** [A-65](../stories/A-65-tui-daily-driver-makeover.md)
 **Pillar:** Agent · **Layer:** L6 (`flux-tui`, `flux-cli`) with small additive L3/L0 seams
 
 **Status:** implemented and fully gated on 2026-07-10.
