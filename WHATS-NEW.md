@@ -20,6 +20,11 @@
 - The public docs now include a visual Infrastructure guide showing how requests become typed plans,
   how every real effect crosses the safety envelope, and how the project fits together from core
   contracts to user-facing surfaces.
+- Network redirects are checked at every hop, credentials do not cross to another origin, large
+  responses and command output are bounded while streaming, and timed-out commands are cleaned up.
+- Plugin callbacks and filesystem reads now recover safely from cancellation and cannot follow a
+  symlink outside the granted directory. Evaluation runs can bound trial concurrency while keeping
+  results reproducible.
 
 ## [0.13.2] - 2026-07-09
 

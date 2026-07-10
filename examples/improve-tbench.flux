@@ -161,34 +161,53 @@
         },
         {
           "kind": "bind",
-          "name": "guard",
+          "name": "implemented_count",
           "value": {
-            "kind": "call",
-            "op": "guard_protected",
-            "args": [
-              {
-                "kind": "var",
-                "name": "snapshot"
-              }
-            ]
-          }
-        },
-        {
-          "kind": "bind",
-          "name": "gate",
-          "value": {
-            "kind": "call",
-            "op": "gate_check",
-            "args": []
+            "kind": "jq",
+            "path": ".implemented",
+            "input": {
+              "kind": "var",
+              "name": "implemented"
+            }
           }
         },
         {
           "kind": "when",
           "cond": {
             "kind": "var",
-            "name": "gate"
+            "name": "implemented_count"
           },
           "then": [
+            {
+              "kind": "bind",
+              "name": "guard",
+              "value": {
+                "kind": "call",
+                "op": "guard_protected",
+                "args": [
+                  {
+                    "kind": "var",
+                    "name": "snapshot"
+                  }
+                ]
+              }
+            },
+            {
+              "kind": "bind",
+              "name": "gate",
+              "value": {
+                "kind": "call",
+                "op": "gate_check",
+                "args": []
+              }
+            },
+            {
+              "kind": "when",
+              "cond": {
+                "kind": "var",
+                "name": "gate"
+              },
+              "then": [
             {
               "kind": "bind",
               "name": "candidate",
@@ -353,8 +372,8 @@
                 }
               ]
             }
-          ],
-          "otherwise": [
+              ],
+              "otherwise": [
             {
               "kind": "call",
               "op": "git_revert",
@@ -380,6 +399,29 @@
                       "guard": "{{guard}}",
                       "gate": "{{gate}}",
                       "tasks": "{{tasks}}"
+                    }
+                  }
+                }
+              ]
+            }
+              ]
+            }
+          ],
+          "otherwise": [
+            {
+              "kind": "call",
+              "op": "improve_log",
+              "args": [
+                {
+                  "kind": "lit",
+                  "value": {
+                    "record": {
+                      "bench": "terminal-bench",
+                      "decision": "reverted",
+                      "reason": "no_implementation",
+                      "base_score": "{{base_score}}",
+                      "tasks": "{{tasks}}",
+                      "implemented": "{{implemented}}"
                     }
                   }
                 }

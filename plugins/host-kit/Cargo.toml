@@ -1,6 +1,7 @@
 [package]
 name = "codewandler-flux-host-kit"
 edition.workspace = true
+rust-version.workspace = true
 # Own version line, decoupled from the plugin-pack workspace version: this crate releases to
 # crates.io whenever the SDK surface (or its flux dep line) changes, not per pack cut. Successor to
 # the misnamed `codewandler-host-kit` (0.1.0, built against the flux 0.10 line, yanked).

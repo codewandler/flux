@@ -272,6 +272,30 @@ pub fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Apply a server-provided `Retry-After` delay when it is usable, otherwise use exponential
+/// backoff. A small bounded jitter prevents a fleet of callers from retrying in lockstep; the
+/// delay remains capped so an untrusted header cannot stall a turn indefinitely.
+fn retry_delay(response: Option<&reqwest::Response>, attempt: u32) -> std::time::Duration {
+    let server_ms = response
+        .and_then(|r| r.headers().get(reqwest::header::RETRY_AFTER))
+        .and_then(|v| v.to_str().ok())
+        .and_then(retry_after_ms);
+    let base = server_ms.unwrap_or_else(|| backoff_delay(attempt).as_millis() as u64);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() as u64 % 251)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(base.saturating_add(jitter).min(30_000))
+}
+
+fn retry_after_ms(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1000).min(30_000))
+}
+
 /// Composes a [`WireCodec`] (axis a) with a [`Credential`] (axis b) into a [`Provider`].
 /// This is the single generic HTTP path; every concrete provider is one (codec, credential) cell.
 /// The connection attempt (POST + status check) is retried with exponential backoff on transient
@@ -437,7 +461,7 @@ impl Provider for NativeProvider {
                         }
                     }
                     if is_retryable_status(status.as_u16()) && attempt < self.max_retries {
-                        let delay = backoff_delay(attempt);
+                        let delay = retry_delay(Some(&resp), attempt);
                         tracing::warn!(
                             status = status.as_u16(),
                             attempt,
@@ -456,7 +480,7 @@ impl Provider for NativeProvider {
                 }
                 Err(e) => {
                     if attempt < self.max_retries {
-                        let delay = backoff_delay(attempt);
+                        let delay = retry_delay(None, attempt);
                         tracing::warn!(
                             error = %e,
                             attempt,
@@ -502,6 +526,13 @@ mod tests {
         assert_eq!(backoff_delay(1).as_millis(), 1000);
         assert_eq!(backoff_delay(2).as_millis(), 2000);
         assert!(backoff_delay(20).as_millis() <= 30_000);
+    }
+
+    #[test]
+    fn retry_after_is_bounded_and_invalid_values_fall_back() {
+        assert_eq!(retry_after_ms("2"), Some(2_000));
+        assert_eq!(retry_after_ms("999999"), Some(30_000));
+        assert_eq!(retry_after_ms("tomorrow"), None);
     }
 
     /// A codec that ignores the request and yields no chunks (we only test the connection path).

@@ -10,6 +10,9 @@ use crate::metrics::{CaseOutcome, RunResult};
 /// An aggregate score over a suite run.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct SuiteScore {
+    /// False when any requested trial failed to produce a complete benchmark observation.
+    pub valid: bool,
+    pub invalid_trials: u32,
     /// Weighted mean of per-task pass-rates, in `[0,1]`.
     pub pass_rate: f64,
     /// Weighted mean of per-task sub-check pass-rates (partial credit), in `[0,1]`. Equals
@@ -21,7 +24,8 @@ pub struct SuiteScore {
     pub total_weight: f64,
     pub mean_tool_errors: f64,
     pub mean_iterations: f64,
-    pub mean_tokens: f64,
+    /// Mean tokens only when every valid case reported usage; unavailable is not zero cost.
+    pub mean_tokens: Option<f64>,
     pub mean_wall_ms: f64,
 }
 
@@ -37,8 +41,13 @@ impl SuiteScore {
         let mut sum_iterations = 0u64;
         let mut sum_wall_ms = 0u64;
         let mut sum_tokens = 0.0;
+        let mut token_samples = 0usize;
+        let mut invalid_trials = 0u32;
         let mut passed = 0u32;
         for r in results {
+            if !r.valid {
+                invalid_trials += 1;
+            }
             let w = weight_of(&r.task_id);
             total_weight += w;
             if r.passed {
@@ -56,9 +65,14 @@ impl SuiteScore {
             sum_tool_errors += r.tool_errors as u64;
             sum_iterations += r.iterations as u64;
             sum_wall_ms += r.wall_ms;
-            sum_tokens += r.tokens.as_ref().map(|u| u.total() as f64).unwrap_or(0.0);
+            if let Some(tokens) = &r.tokens {
+                sum_tokens += tokens.total() as f64;
+                token_samples += 1;
+            }
         }
         SuiteScore {
+            valid: !results.is_empty() && invalid_trials == 0,
+            invalid_trials,
             pass_rate: if total_weight > 0.0 {
                 weighted_pass / total_weight
             } else {
@@ -82,7 +96,7 @@ impl SuiteScore {
             } else {
                 0.0
             },
-            mean_tokens: if n > 0.0 { sum_tokens / n } else { 0.0 },
+            mean_tokens: (n > 0.0 && token_samples == results.len()).then_some(sum_tokens / n),
             mean_wall_ms: if n > 0.0 { sum_wall_ms as f64 / n } else { 0.0 },
         }
     }
@@ -95,21 +109,29 @@ impl SuiteScore {
         let mut weighted_pass = 0.0;
         let mut weighted_check = 0.0;
         let (mut e, mut it, mut tok, mut wall) = (0.0, 0.0, 0.0, 0.0);
+        let mut token_cases = 0usize;
+        let mut invalid_trials = 0u32;
         let mut passed = 0u32;
         for c in cases {
+            invalid_trials = invalid_trials.saturating_add(c.invalid_trials);
             let w = weight_of(&c.task_id);
             total_weight += w;
             weighted_pass += w * c.pass_rate;
             weighted_check += w * c.mean_check_pass_rate;
             e += c.mean_tool_errors;
             it += c.mean_iterations;
-            tok += c.mean_tokens;
+            if let Some(tokens) = c.mean_tokens {
+                tok += tokens;
+                token_cases += 1;
+            }
             wall += c.mean_wall_ms;
             if c.pass_rate >= 1.0 - 1e-9 {
                 passed += 1;
             }
         }
         SuiteScore {
+            valid: !cases.is_empty() && invalid_trials == 0 && cases.iter().all(|case| case.valid),
+            invalid_trials,
             pass_rate: if total_weight > 0.0 {
                 weighted_pass / total_weight
             } else {
@@ -125,7 +147,7 @@ impl SuiteScore {
             total_weight,
             mean_tool_errors: if n > 0.0 { e / n } else { 0.0 },
             mean_iterations: if n > 0.0 { it / n } else { 0.0 },
-            mean_tokens: if n > 0.0 { tok / n } else { 0.0 },
+            mean_tokens: (n > 0.0 && token_cases == cases.len()).then_some(tok / n),
             mean_wall_ms: if n > 0.0 { wall / n } else { 0.0 },
         }
     }
@@ -145,6 +167,9 @@ impl SuiteScore {
     /// iterations; then fewer tokens. A small epsilon absorbs float noise on the rate comparisons.
     pub fn is_better(&self, baseline: &SuiteScore) -> bool {
         const EPS: f64 = 1e-9;
+        if !self.valid || !baseline.valid {
+            return false;
+        }
         if self.pass_rate > baseline.pass_rate + EPS {
             return true;
         }
@@ -173,7 +198,10 @@ impl SuiteScore {
             return false;
         }
         // equal iterations too → fewer tokens (cost)
-        self.mean_tokens + EPS < baseline.mean_tokens
+        match (self.mean_tokens, baseline.mean_tokens) {
+            (Some(candidate), Some(base)) => candidate + EPS < base,
+            _ => false,
+        }
     }
 }
 
@@ -182,11 +210,26 @@ impl SuiteScore {
 /// [`SuiteScore::is_better`] — this is what the improve loop's `score_compare` op uses on the
 /// report objects the flow passes around.
 pub fn report_is_better(candidate: &serde_json::Value, baseline: &serde_json::Value) -> bool {
-    fn f(v: &serde_json::Value, k: &str) -> f64 {
-        v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
+    fn metrics(v: &serde_json::Value) -> Option<[f64; 4]> {
+        if v.get("valid").and_then(|x| x.as_bool()) != Some(true)
+            || !v
+                .get("mean_tokens")
+                .is_some_and(|x| x.is_null() || x.is_number())
+        {
+            return None;
+        }
+        Some([
+            v.get("pass_rate")?.as_f64()?,
+            v.get("mean_check_pass_rate")?.as_f64()?,
+            v.get("mean_tool_errors")?.as_f64()?,
+            v.get("mean_iterations")?.as_f64()?,
+        ])
     }
     const EPS: f64 = 1e-9;
-    let (cp, bp) = (f(candidate, "pass_rate"), f(baseline, "pass_rate"));
+    let (Some([cp, cc, ce, ci]), Some([bp, bc, be, bi])) = (metrics(candidate), metrics(baseline))
+    else {
+        return false;
+    };
     if cp > bp + EPS {
         return true;
     }
@@ -194,30 +237,18 @@ pub fn report_is_better(candidate: &serde_json::Value, baseline: &serde_json::Va
         return false;
     }
     // equal full-pass-rate → more sub-checks passing (partial progress)
-    let (cc, bc) = (
-        f(candidate, "mean_check_pass_rate"),
-        f(baseline, "mean_check_pass_rate"),
-    );
     if cc > bc + EPS {
         return true;
     }
     if cc + EPS < bc {
         return false;
     }
-    let (ce, be) = (
-        f(candidate, "mean_tool_errors"),
-        f(baseline, "mean_tool_errors"),
-    );
     if ce + EPS < be {
         return true;
     }
     if ce > be + EPS {
         return false;
     }
-    let (ci, bi) = (
-        f(candidate, "mean_iterations"),
-        f(baseline, "mean_iterations"),
-    );
     if ci + EPS < bi {
         return true;
     }
@@ -225,16 +256,34 @@ pub fn report_is_better(candidate: &serde_json::Value, baseline: &serde_json::Va
         return false;
     }
     // equal iterations → fewer tokens (cost)
-    f(candidate, "mean_tokens") + EPS < f(baseline, "mean_tokens")
+    match (
+        candidate.get("mean_tokens").and_then(|v| v.as_f64()),
+        baseline.get("mean_tokens").and_then(|v| v.as_f64()),
+    ) {
+        (Some(candidate), Some(base)) => candidate + EPS < base,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn report(pass_rate: f64, check_rate: f64, errors: f64, iters: f64) -> serde_json::Value {
+        serde_json::json!({
+            "valid": true,
+            "pass_rate": pass_rate,
+            "mean_check_pass_rate": check_rate,
+            "mean_tool_errors": errors,
+            "mean_iterations": iters,
+            "mean_tokens": null,
+        })
+    }
+
     fn result(id: &str, passed: bool, tool_errors: u32, iterations: u32) -> RunResult {
         RunResult {
             task_id: id.into(),
+            valid: true,
             passed,
             checks_passed: 0,
             checks_total: 0,
@@ -305,30 +354,68 @@ mod tests {
     #[test]
     fn partial_credit_breaks_a_full_pass_tie() {
         // Same full-pass-rate (both 0), but the candidate passes more sub-checks → strictly better.
-        let base = serde_json::json!({"pass_rate": 0.0, "mean_check_pass_rate": 0.50});
-        let partial = serde_json::json!({"pass_rate": 0.0, "mean_check_pass_rate": 0.83});
+        let base = report(0.0, 0.50, 0.0, 1.0);
+        let partial = report(0.0, 0.83, 0.0, 1.0);
         assert!(report_is_better(&partial, &base));
         assert!(!report_is_better(&base, &partial));
         // but a real full-pass regression is never masked by better partial credit.
-        let regressed = serde_json::json!({"pass_rate": 0.0, "mean_check_pass_rate": 1.0});
-        let full = serde_json::json!({"pass_rate": 1.0, "mean_check_pass_rate": 1.0});
+        let regressed = report(0.0, 1.0, 0.0, 1.0);
+        let full = report(1.0, 1.0, 0.0, 1.0);
         assert!(!report_is_better(&regressed, &full));
     }
 
     #[test]
     fn report_is_better_compares_report_json() {
-        let base =
-            serde_json::json!({"pass_rate": 0.5, "mean_tool_errors": 2.0, "mean_iterations": 4.0});
-        let higher =
-            serde_json::json!({"pass_rate": 0.6, "mean_tool_errors": 9.0, "mean_iterations": 9.0});
-        let tie_fewer_errors =
-            serde_json::json!({"pass_rate": 0.5, "mean_tool_errors": 1.0, "mean_iterations": 4.0});
-        let worse =
-            serde_json::json!({"pass_rate": 0.4, "mean_tool_errors": 0.0, "mean_iterations": 1.0});
+        let base = report(0.5, 0.5, 2.0, 4.0);
+        let higher = report(0.6, 0.6, 9.0, 9.0);
+        let tie_fewer_errors = report(0.5, 0.5, 1.0, 4.0);
+        let worse = report(0.4, 0.4, 0.0, 1.0);
         assert!(report_is_better(&higher, &base));
         assert!(report_is_better(&tie_fewer_errors, &base));
         assert!(!report_is_better(&worse, &base));
         assert!(!report_is_better(&base, &base));
+    }
+
+    #[test]
+    fn failed_candidate_does_not_win_on_zeroed_telemetry() {
+        let baseline = serde_json::json!({
+            "valid": true,
+            "pass_rate": 0.0,
+            "mean_check_pass_rate": 0.0,
+            "mean_tool_errors": 2.0,
+            "mean_iterations": 4.0,
+            "mean_tokens": 100.0,
+        });
+        // This is the old failure shape: adapter errors became an all-zero result, which won the
+        // efficiency tiebreakers despite producing no valid benchmark observation.
+        let crashed = serde_json::json!({
+            "valid": false,
+            "pass_rate": 0.0,
+            "mean_check_pass_rate": 0.0,
+            "mean_tool_errors": 0.0,
+            "mean_iterations": 0.0,
+            "mean_tokens": 0.0,
+        });
+        assert!(!report_is_better(&crashed, &baseline));
+    }
+
+    #[test]
+    fn malformed_report_missing_metrics_is_invalid() {
+        let baseline = serde_json::json!({
+            "valid": true,
+            "pass_rate": 0.5,
+            "mean_check_pass_rate": 0.5,
+            "mean_tool_errors": 2.0,
+            "mean_iterations": 4.0,
+            "mean_tokens": 100.0,
+        });
+        let missing_cost_metrics = serde_json::json!({
+            "valid": true,
+            "pass_rate": 0.5,
+            "mean_check_pass_rate": 0.5,
+        });
+        assert!(!report_is_better(&missing_cost_metrics, &baseline));
+        assert!(!report_is_better(&baseline, &missing_cost_metrics));
     }
 
     #[test]
@@ -337,14 +424,17 @@ mod tests {
         fn case(id: &str, passes: u32, trials: u32) -> CaseOutcome {
             CaseOutcome {
                 task_id: id.into(),
+                valid: true,
                 trials,
+                valid_trials: trials,
+                invalid_trials: 0,
                 passes,
                 pass_rate: passes as f64 / trials as f64,
                 mean_check_pass_rate: passes as f64 / trials as f64,
                 failed_checks: Vec::new(),
                 mean_tool_errors: 0.0,
                 mean_iterations: 1.0,
-                mean_tokens: 0.0,
+                mean_tokens: Some(0.0),
                 mean_wall_ms: 1.0,
                 timed_out_any: false,
                 sessions: vec![],
@@ -359,8 +449,8 @@ mod tests {
         assert_eq!(s.passed, 1); // only b passed all trials
 
         // tokens break a full tie (same pass-rate / errors / iters).
-        let cheap = serde_json::json!({"pass_rate":1.0,"mean_tool_errors":0.0,"mean_iterations":1.0,"mean_tokens":100.0});
-        let dear = serde_json::json!({"pass_rate":1.0,"mean_tool_errors":0.0,"mean_iterations":1.0,"mean_tokens":200.0});
+        let cheap = serde_json::json!({"valid":true,"pass_rate":1.0,"mean_check_pass_rate":1.0,"mean_tool_errors":0.0,"mean_iterations":1.0,"mean_tokens":100.0});
+        let dear = serde_json::json!({"valid":true,"pass_rate":1.0,"mean_check_pass_rate":1.0,"mean_tool_errors":0.0,"mean_iterations":1.0,"mean_tokens":200.0});
         assert!(report_is_better(&cheap, &dear));
         assert!(!report_is_better(&dear, &cheap));
     }

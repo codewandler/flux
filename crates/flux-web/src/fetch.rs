@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
@@ -24,7 +25,7 @@ use flux_spec::{
 };
 use flux_system::net::PrivateNetAllow;
 
-use crate::{condense, RecordSink, WebOptions};
+use crate::{condense, egress, RecordSink, WebOptions};
 
 /// Cap on the returned document (bytes, char-boundary safe) — applied *after* condensation so the
 /// budget buys content, not tags. Mirrors the historical `web_fetch` `MAX_BYTES`.
@@ -45,7 +46,7 @@ pub struct WebFetchTool {
 impl WebFetchTool {
     pub fn new(opts: &WebOptions) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: egress::redirect_disabled_client(),
             private_net: opts.private_net.clone(),
             audit: opts.audit.clone(),
             grant_source: opts
@@ -119,50 +120,65 @@ impl Tool for WebFetchTool {
         let raw_body = params.get("raw").and_then(Value::as_bool).unwrap_or(false);
 
         let url = flux_system::net::guard_url_scoped(raw_url, &self.private_net)?;
-        let resp = self
-            .http
-            .get(url.clone())
-            .timeout(Duration::from_secs(
-                DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS),
-            ))
-            .send()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+        let response = egress::send_guarded(
+            &self.http,
+            egress::GuardedRequest {
+                url,
+                method: reqwest::Method::GET,
+                headers: HeaderMap::new(),
+                body: None,
+                timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
+            },
+            "web_fetch",
+            |raw| flux_system::net::guard_url_scoped(raw, &self.private_net),
+            |url| {
+                if let Some(host) = url.host_str() {
+                    self.audit_admit(host);
+                }
+            },
+        )
+        .await?;
 
-        if let Some(host) = url.host_str() {
-            self.audit_admit(host);
-        }
-
-        let status = resp.status();
-        let content_type = resp
+        let status = response.status();
+        let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = resp.bytes().await.map_err(|e| Error::Http(e.to_string()))?;
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let capped = egress::read_body_capped(response, MAX_BYTES, "web_fetch").await?;
+        let body = cap_str(
+            String::from_utf8_lossy(&capped.bytes).into_owned(),
+            MAX_BYTES,
+        );
 
         let is_html = !raw_body && (content_type.contains("text/html") || looks_like_html(&body));
 
-        let rendered = if is_html {
+        let mut rendered = if is_html {
             let md = condense::html_to_markdown(&body);
-            // Contribute the page as a groundable record (title/url/content), before capping.
+            cap_str(md, MAX_BYTES)
+        } else {
+            cap_str(body, MAX_BYTES)
+        };
+        if capped.truncated && !rendered.ends_with("…[truncated]") {
+            rendered.push_str("\n…[truncated]");
+        }
+
+        // Contribute HTML as a groundable record after the input and output caps are applied.
+        if is_html {
             if let Some(sink) = &self.records {
-                let title = condense::page_title(&body).unwrap_or_else(|| raw_url.to_string());
+                let title = condense::page_title(&String::from_utf8_lossy(&capped.bytes))
+                    .unwrap_or_else(|| raw_url.to_string());
                 let record = Record::new(
                     Source::new("web"),
                     "web.page",
                     raw_url,
                     title,
-                    cap_str(md.clone(), MAX_BYTES),
+                    rendered.clone(),
                 );
                 sink.contribute(&[record]);
             }
-            cap_str(md, MAX_BYTES)
-        } else {
-            cap_str(body, MAX_BYTES)
-        };
+        }
 
         Ok(ToolResult {
             content: format!("[{status}]\n{rendered}"),
@@ -277,6 +293,82 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn redirect_to_ungranted_loopback() -> String {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = target.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 7\r\n\r\nreached",
+                    )
+                    .await;
+            }
+        });
+
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_port = source.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = source.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: http://{target_addr}/private\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://localhost:{source_port}/start")
+    }
+
+    async fn same_origin_redirect() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut first, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = first.read(&mut buf).await;
+                let _ = first
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nlocation: /final\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+            if let Ok((mut second, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = second.read(&mut buf).await;
+                let _ = second
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\nconnection: close\r\n\r\nfinal",
+                    )
+                    .await;
+            }
+        });
+        format!("http://{addr}/start")
+    }
+
+    async fn oversized_body_with_delayed_eof() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut request = [0u8; 2048];
+                let _ = sock.read(&mut request).await;
+                let declared = MAX_BYTES + 64 * 1024;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {declared}\r\n\r\n"
+                );
+                let _ = sock.write_all(headers.as_bytes()).await;
+                let _ = sock.write_all(&vec![b'x'; MAX_BYTES + 4096]).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        format!("http://{addr}/large")
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         records: Mutex<Vec<Record>>,
@@ -366,6 +458,40 @@ mod tests {
             "json kept raw: {}",
             r.content
         );
+    }
+
+    #[tokio::test]
+    async fn every_redirect_hop_is_guarded() {
+        let url = redirect_to_ungranted_loopback().await;
+        let t = tool(PrivateNetAllow::from_hosts(["localhost".to_string()]), None);
+        let err = t
+            .execute(&ctx(), json!({ "url": url }))
+            .await
+            .expect_err("the redirect target is outside the scoped private-net grant");
+        assert!(err.to_string().contains("private/loopback"));
+    }
+
+    #[tokio::test]
+    async fn bounded_same_origin_redirect_is_followed() {
+        let url = same_origin_redirect().await;
+        let t = tool(PrivateNetAllow::Any, None);
+        let result = t.execute(&ctx(), json!({ "url": url })).await.unwrap();
+        assert_eq!(result.content, "[200 OK]\nfinal");
+    }
+
+    #[tokio::test]
+    async fn response_cap_returns_without_waiting_for_the_whole_body() {
+        let url = oversized_body_with_delayed_eof().await;
+        let t = tool(PrivateNetAllow::Any, None);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            t.execute(&ctx(), json!({ "url": url })),
+        )
+        .await
+        .expect("the reader stops at the byte cap before the server closes")
+        .unwrap();
+        assert!(result.content.ends_with("…[truncated]"));
+        assert!(result.content.len() <= MAX_BYTES + 64);
     }
 
     #[tokio::test]

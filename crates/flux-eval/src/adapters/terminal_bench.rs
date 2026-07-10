@@ -414,6 +414,7 @@ impl BenchmarkAdapter for TerminalBenchAdapter {
                     };
                     Ok(RunResult {
                         task_id: task_id.to_string(),
+                        valid: true,
                         passed: p.resolved,
                         checks_passed: p.checks_passed,
                         checks_total: p.checks_total,

@@ -33,8 +33,8 @@ use flux_policy::{
     Request as PolicyRequest, ResourceKind, ResourceRef, Trust, TrustKind, TrustLevel,
 };
 use flux_secret::Redactor;
-use flux_spec::{Effect, Idempotency, IntentSet, Risk, ToolSpec};
-use flux_system::System;
+use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, ToolSpec};
+use flux_system::{PathAccess, System};
 
 /// The result of executing a tool.
 ///
@@ -1239,6 +1239,33 @@ impl Executor {
 
         let spec = tool.spec();
         let subjects = tool.permission_subjects(&params);
+        // Filesystem grants bind to the physical target, not the caller's lexical alias. Without
+        // this normalization an allow like `read(allowed/**)` could reach `secret/**` through an
+        // in-workspace symlink even though guarded IO correctly kept both paths inside the workspace.
+        let subjects = if spec.access.contains(&AccessKind::Filesystem) {
+            let access = if spec.effects.contains(&Effect::Write) {
+                PathAccess::Write
+            } else {
+                PathAccess::Read
+            };
+            let mut physical = Vec::with_capacity(subjects.len());
+            for subject in subjects {
+                match self.ctx.system.path_identity(&subject, access) {
+                    Ok(subject) => physical.push(subject),
+                    Err(err) => {
+                        return DispatchOutcome {
+                            result: ToolResult::error(format!(
+                                "`{name}` denied by filesystem path guard: {err}"
+                            )),
+                            denied: true,
+                        };
+                    }
+                }
+            }
+            physical
+        } else {
+            subjects
+        };
         let intents = tool.intents(&params);
 
         // 1. Authorization-policy floor (if configured): default-deny on any ungranted effect. A
@@ -1483,6 +1510,34 @@ mod tests {
             Ok(ToolResult::ok(
                 params["text"].as_str().unwrap_or("").to_string(),
             ))
+        }
+    }
+
+    /// Minimal guarded filesystem reader used to prove that permission subjects name the physical
+    /// target, not a symlink alias supplied by the caller.
+    struct FileReadTool;
+
+    #[async_trait]
+    impl Tool for FileReadTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("file_read", "read a file", json!({"type": "object"}))
+                .with_access(vec![flux_spec::AccessKind::Filesystem])
+        }
+
+        fn permission_subjects(&self, params: &Value) -> Vec<String> {
+            params
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| vec![path.to_string()])
+                .unwrap_or_default()
+        }
+
+        async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+            let path = params
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Ok(ToolResult::ok(ctx.system.read_file(path).await?))
         }
     }
 
@@ -1745,6 +1800,63 @@ mod tests {
         assert!(r.is_error);
         assert!(r.content.contains("denied by permission rules"));
         assert!(!approver.asked.load(Ordering::Relaxed), "deny must not ask");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_permission_denies_granted_alias_to_ungranted_target() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("flux-rt-path-identity-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(dir.join("allowed")).unwrap();
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        std::fs::write(dir.join("secret/value.txt"), "classified").unwrap();
+        std::os::unix::fs::symlink("../secret", dir.join("allowed/alias")).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FileReadTool));
+        let perms = PermissionManager::from_rules(
+            &["file_read(allowed/**)".to_string()],
+            &["file_read(secret/**)".to_string()],
+        );
+        let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+        let executor = Executor::new(registry, perms, Arc::new(DenyApprover), ctx);
+
+        let result = executor
+            .dispatch("file_read", json!({"path": "allowed/alias/value.txt"}))
+            .await;
+        assert!(result.is_error, "the physical target's deny must win");
+        assert!(
+            result.content.contains("denied by permission rules"),
+            "unexpected denial: {}",
+            result.content
+        );
+        assert!(!result.content.contains("classified"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_permission_allows_symlink_that_stays_in_granted_tree() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("flux-rt-path-alias-ok-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(dir.join("allowed/real")).unwrap();
+        std::fs::write(dir.join("allowed/real/value.txt"), "safe").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("allowed/alias")).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FileReadTool));
+        let perms = PermissionManager::from_rules(&["file_read(allowed/**)".to_string()], &[]);
+        let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+        let executor = Executor::new(registry, perms, Arc::new(DenyApprover), ctx);
+
+        let result = executor
+            .dispatch("file_read", json!({"path": "allowed/alias/value.txt"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "safe");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

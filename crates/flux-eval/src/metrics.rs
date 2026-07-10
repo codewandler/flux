@@ -13,6 +13,9 @@ use flux_flow::ast::RunEvent;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunResult {
     pub task_id: String,
+    /// Whether this trial produced a complete, gradeable benchmark observation. Infrastructure
+    /// failures are invalid rather than cheap failures: they must never win cost tie-breakers.
+    pub valid: bool,
     pub passed: bool,
     /// Sub-checks passed this trial (e.g. terminal-bench `parser_results`) — enables partial credit.
     pub checks_passed: u32,
@@ -50,6 +53,7 @@ impl RunResult {
     pub fn failed(task_id: impl Into<String>, wall_ms: u64, note: impl Into<String>) -> Self {
         Self {
             task_id: task_id.into(),
+            valid: false,
             passed: false,
             checks_passed: 0,
             checks_total: 0,
@@ -83,7 +87,11 @@ pub struct SessionRef {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CaseOutcome {
     pub task_id: String,
+    /// True only when every requested trial produced a complete benchmark observation.
+    pub valid: bool,
     pub trials: u32,
+    pub valid_trials: u32,
+    pub invalid_trials: u32,
     pub passes: u32,
     /// `passes / trials` — the per-task signal that absorbs single-run model noise.
     pub pass_rate: f64,
@@ -95,7 +103,8 @@ pub struct CaseOutcome {
     pub failed_checks: Vec<String>,
     pub mean_tool_errors: f64,
     pub mean_iterations: f64,
-    pub mean_tokens: f64,
+    /// Mean token usage when every trial reported it; `None` means unavailable, never zero-cost.
+    pub mean_tokens: Option<f64>,
     pub mean_wall_ms: f64,
     pub timed_out_any: bool,
     pub sessions: Vec<SessionRef>,
@@ -110,7 +119,9 @@ impl CaseOutcome {
     /// Aggregate one task's trial results.
     pub fn from_trials(task_id: &str, runs: &[RunResult]) -> Self {
         let trials = runs.len() as u32;
-        let n = (trials.max(1)) as f64;
+        let valid_trials = runs.iter().filter(|r| r.valid).count() as u32;
+        let invalid_trials = trials.saturating_sub(valid_trials);
+        let n_valid = valid_trials.max(1) as f64;
         let passes = runs.iter().filter(|r| r.passed).count() as u32;
         // Per-trial sub-check rate; when an adapter reports no sub-checks, fall back to binary pass/fail
         // so partial credit never changes behaviour for binary-only adapters.
@@ -123,7 +134,7 @@ impl CaseOutcome {
                 0.0
             }
         };
-        let sum_check_rate: f64 = runs.iter().map(check_rate).sum();
+        let sum_check_rate: f64 = runs.iter().filter(|r| r.valid).map(check_rate).sum();
         let mut failed_checks: Vec<String> = Vec::new();
         for r in runs {
             for c in &r.failed_checks {
@@ -132,13 +143,26 @@ impl CaseOutcome {
                 }
             }
         }
-        let sum_errors: u64 = runs.iter().map(|r| r.tool_errors as u64).sum();
-        let sum_iters: u64 = runs.iter().map(|r| r.iterations as u64).sum();
-        let sum_wall: u64 = runs.iter().map(|r| r.wall_ms).sum();
+        let sum_errors: u64 = runs
+            .iter()
+            .filter(|r| r.valid)
+            .map(|r| r.tool_errors as u64)
+            .sum();
+        let sum_iters: u64 = runs
+            .iter()
+            .filter(|r| r.valid)
+            .map(|r| r.iterations as u64)
+            .sum();
+        let sum_wall: u64 = runs.iter().filter(|r| r.valid).map(|r| r.wall_ms).sum();
         let sum_tokens: f64 = runs
             .iter()
+            .filter(|r| r.valid)
             .filter_map(|r| r.tokens.as_ref().map(|u| u.total() as f64))
             .sum();
+        let token_samples = runs
+            .iter()
+            .filter(|r| r.valid && r.tokens.is_some())
+            .count() as u32;
         let sessions = runs
             .iter()
             .filter_map(|r| match (&r.session_id, &r.flow_db) {
@@ -152,19 +176,23 @@ impl CaseOutcome {
             .collect();
         CaseOutcome {
             task_id: task_id.to_string(),
+            valid: trials > 0 && invalid_trials == 0,
             trials,
+            valid_trials,
+            invalid_trials,
             passes,
             pass_rate: if trials > 0 {
                 passes as f64 / trials as f64
             } else {
                 0.0
             },
-            mean_check_pass_rate: sum_check_rate / n,
+            mean_check_pass_rate: sum_check_rate / n_valid,
             failed_checks,
-            mean_tool_errors: sum_errors as f64 / n,
-            mean_iterations: sum_iters as f64 / n,
-            mean_tokens: sum_tokens / n,
-            mean_wall_ms: sum_wall as f64 / n,
+            mean_tool_errors: sum_errors as f64 / n_valid,
+            mean_iterations: sum_iters as f64 / n_valid,
+            mean_tokens: (valid_trials > 0 && token_samples == valid_trials)
+                .then_some(sum_tokens / n_valid),
+            mean_wall_ms: sum_wall as f64 / n_valid,
             timed_out_any: runs.iter().any(|r| r.timed_out),
             sessions,
             note: runs.iter().find_map(|r| r.note.clone()),
@@ -236,6 +264,7 @@ mod tests {
     fn case_outcome_aggregates_trials() {
         let mk = |passed, errors, iters, id: &str, db: &str| RunResult {
             task_id: "t".into(),
+            valid: true,
             passed,
             checks_passed: 0,
             checks_total: 0,
@@ -272,6 +301,7 @@ mod tests {
     fn case_outcome_partial_credit_from_subchecks() {
         let mk = |passed, cp: u32, ct: u32, failed: &[&str]| RunResult {
             task_id: "t".into(),
+            valid: true,
             passed,
             checks_passed: cp,
             checks_total: ct,

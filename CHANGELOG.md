@@ -11,6 +11,18 @@ All notable changes to this project are documented in this file. The format is b
 - Added a public Infrastructure page with an architecture diagram and a concise guide to flux's
   planner/runtime split, mandatory safety envelope, three pillars, and L0-L6 crate layering.
 
+### Fixed
+
+- **C-50 audit hardening wave.** Native web and plugin HTTP now re-authorize every redirect hop,
+  strip credentials across origins, reject HTTPS-to-HTTP downgrades, and stream bounded response
+  bodies. Guarded subprocesses drain output while running and kill/reap their process group on
+  timeout or cancellation. Flow compaction keeps provider-valid sessions and usage accounting,
+  configured iteration limits control the real loop, and invalid eval candidates cannot win through
+  zeroed telemetry. Filesystem permission subjects now follow physical symlink identity, plugin
+  protocol cancellation poisons and restarts an ambiguous child, Flux-Lang rejects unsafe cleanup
+  scopes in cancellable branches, retries honor bounded `Retry-After` delays, eval trials support
+  deterministic bounded concurrency, and the plugin workspace inherits the declared MSRV.
+
 ## [0.13.2] - 2026-07-09
 
 ### Added

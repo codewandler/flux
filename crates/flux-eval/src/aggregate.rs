@@ -27,10 +27,13 @@ pub fn extract_array(v: &Value) -> Vec<Value> {
         if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(s) {
             return a;
         }
-        // Fall back to the first '[' … last ']' span.
-        if let (Some(i), Some(j)) = (s.find('['), s.rfind(']')) {
-            if j > i {
-                if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&s[i..=j]) {
+        // LLMs sometimes put a fabricated transcript or code fragment before the requested final
+        // array. Search starts from the tail: the answer contract puts the task array last, while a
+        // first-`[` span can be trapped by earlier `#[cfg(...)]` or prose. Keep the final `]` fixed
+        // so nested arrays inside the answer do not get mistaken for the outer task list.
+        if let Some(end) = s.rfind(']') {
+            for (start, _) in s[..end].rmatch_indices('[') {
+                if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&s[start..=end]) {
                     return a;
                 }
             }
@@ -312,6 +315,15 @@ mod tests {
             2
         );
         assert!(extract_array(&json!("no array here")).is_empty());
+    }
+
+    #[test]
+    fn extract_array_prefers_a_valid_array_at_the_end() {
+        let answer = r#"I inspected #[cfg(test)] and then produced the requested answer.
+[{"id":"grounded","task":"Fix it","files":["crates/flux-tools/src/lib.rs"]}]"#;
+        let extracted = extract_array(&json!(answer));
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0]["id"], "grounded");
     }
 
     #[tokio::test]

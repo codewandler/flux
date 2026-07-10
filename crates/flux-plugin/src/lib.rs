@@ -744,6 +744,9 @@ pub trait SecretSink: Send + Sync {
 /// nothing — call [`with_grants`](Self::with_grants).
 pub struct SystemHostCaps {
     system: Arc<flux_system::System>,
+    /// Redirect-disabled client for `http.do`. Redirects are handled manually so every target is
+    /// re-checked against both the shared SSRF guard and this plugin's manifest host scope.
+    http: reqwest::Client,
     private_net_grants: Vec<String>,
     grants: PluginCapabilities,
     auth: Vec<AuthMethod>,
@@ -803,6 +806,10 @@ impl SystemHostCaps {
     pub fn new(system: Arc<flux_system::System>) -> Self {
         Self {
             system,
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("the plugin HTTP client uses only static options"),
             private_net_grants: Vec::new(),
             grants: PluginCapabilities::default(),
             auth: Vec::new(),
@@ -1087,18 +1094,6 @@ impl SystemHostCaps {
         Ok(out)
     }
 
-    /// Find the manifest-declared [`FsReadScope`] matching an expanded absolute path, returning
-    /// `(scope.path, scope.secret)`. Deny-by-default: `None` if no scope matches (the `fs.read`
-    /// handler refuses the read). The scope's `path` is home-expanded before matching, so manifest
-    /// authors write `~/.aws/sso/cache/**`.
-    fn fs_scope_for(&self, abs_path: &str) -> Option<(&String, bool)> {
-        self.grants
-            .fs
-            .iter()
-            .find(|s| fs_path_matches(&expand_home(&s.path), abs_path))
-            .map(|s| (&s.path, s.secret))
-    }
-
     fn private_net_allow(&self) -> PrivateNetAllow {
         let declared = normalize_patterns(&self.grants.private_hosts);
         let grants = normalize_patterns(&self.private_net_grants);
@@ -1204,6 +1199,74 @@ impl SystemHostCaps {
                 value: secret,
             },
         })
+    }
+
+    /// Send an `http.do` request through a redirect loop the host controls. Only GET/HEAD redirects
+    /// are followed; request bodies are never replayed. Each target passes through the shared SSRF
+    /// guard and this plugin's manifest host allow-list before any bytes leave the process.
+    async fn send_http_guarded(
+        &self,
+        initial_url: url::Url,
+        method: reqwest::Method,
+        mut headers: reqwest::header::HeaderMap,
+        mut body: Option<Vec<u8>>,
+        query_auth_name: Option<&str>,
+    ) -> std::result::Result<reqwest::Response, String> {
+        const MAX_REDIRECTS: usize = 5;
+
+        let follows_redirects = method == reqwest::Method::GET || method == reqwest::Method::HEAD;
+        let mut url = initial_url;
+        let mut redirects = 0usize;
+        loop {
+            let mut request = self
+                .http
+                .request(method.clone(), url.clone())
+                .headers(headers.clone());
+            if let Some(bytes) = &body {
+                request = request.body(bytes.clone());
+            }
+            let response = request.send().await.map_err(|e| format!("http.do: {e}"))?;
+            if let Some(host) = url.host_str() {
+                self.audit_admit(host);
+            }
+
+            if !follows_redirects || !is_followed_http_redirect(response.status()) {
+                return Ok(response);
+            }
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Ok(response);
+            };
+            if redirects == MAX_REDIRECTS {
+                return Err(format!(
+                    "http.do: too many redirects (maximum {MAX_REDIRECTS})"
+                ));
+            }
+            let location = location
+                .to_str()
+                .map_err(|_| "http.do: redirect Location is not valid text".to_string())?;
+            let joined = url
+                .join(location)
+                .map_err(|e| format!("http.do: invalid redirect Location: {e}"))?;
+            let mut next = guard_http_url(joined.as_str(), &self.private_net_allow())?;
+            self.ensure_http_host_allowed(&next)?;
+            if url.scheme() == "https" && next.scheme() == "http" {
+                return Err(format!(
+                    "http.do: refusing HTTPS-to-HTTP redirect to {next}"
+                ));
+            }
+            if !same_http_origin(&url, &next) {
+                // The host cannot reliably classify arbitrary custom headers as credentials, so a
+                // cross-origin redirect gets none of them — including caller, endpoint-ref, and
+                // auth-purpose headers. Query auth is host-injected too and is removed explicitly.
+                headers.clear();
+                if let Some(name) = query_auth_name {
+                    remove_query_pair(&mut next, name);
+                }
+            }
+            body = None;
+            url = next;
+            redirects += 1;
+        }
     }
 }
 
@@ -1534,28 +1597,44 @@ impl HostCapabilities for SystemHostCaps {
                         "fs.read: path `{raw_path}` contains a `..` traversal; denied"
                     ));
                 }
-                let (scope, secret) = match self.fs_scope_for(&expanded) {
-                    Some(s) => (s.0.clone(), s.1),
-                    None => {
-                        return Err(format!(
-                            "fs.read: path `{raw_path}` not in this plugin's fs.read scope"
-                        ))
+                const MAX_FS_READ: usize = 256 * 1024;
+                let mut admitted = None;
+                for grant in &self.grants.fs {
+                    let expanded_scope = expand_home(&grant.path);
+                    match self
+                        .system
+                        .read_file_scoped(&expanded, &expanded_scope, MAX_FS_READ)
+                        .await
+                    {
+                        Ok(read) => {
+                            admitted = Some((grant.path.clone(), grant.secret, read));
+                            break;
+                        }
+                        Err(flux_core::Error::Config(_)) => {}
+                        Err(err) => {
+                            return Err(format!(
+                                "fs.read: {raw_path}: {err} (scope: {})",
+                                grant.path
+                            ))
+                        }
                     }
+                }
+                let Some((_scope, secret, read)) = admitted else {
+                    return Err(format!(
+                        "fs.read: path `{raw_path}` not in this plugin's fs.read scope"
+                    ));
                 };
-                let bytes = match tokio::fs::read(&expanded).await {
-                    Ok(b) => b,
-                    Err(e) => return Err(format!("fs.read: {raw_path}: {e} (scope: {scope})")),
-                };
-                let size = bytes.len();
+                let size = read.size;
+                let truncated = read.truncated;
+                let bytes = read.bytes;
                 // Binary (NUL-bearing or invalid UTF-8) -> base64; else UTF-8 text. Same shape as
                 // `http.do`'s body/body_b64 split, and byte-capped on a char boundary.
-                let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+                let utf8 = std::str::from_utf8(&bytes);
+                let incomplete_utf8_tail =
+                    truncated && utf8.as_ref().is_err_and(|err| err.error_len().is_none());
+                let is_binary = bytes.contains(&0) || (utf8.is_err() && !incomplete_utf8_tail);
                 if is_binary {
-                    let capped = if size > 256 * 1024 {
-                        bytes[..256 * 1024].to_vec()
-                    } else {
-                        bytes
-                    };
+                    let capped = bytes;
                     let body_b64 = base64::engine::general_purpose::STANDARD.encode(&capped);
                     if secret {
                         if let Some(sink) = &self.secret_sink {
@@ -1564,8 +1643,16 @@ impl HostCapabilities for SystemHostCaps {
                     }
                     Ok(json!({ "path": raw_path, "size": size, "body_b64": body_b64 }))
                 } else {
-                    let text = String::from_utf8(bytes).expect("checked UTF-8 above");
-                    let text = truncate_on_char_boundary(text, 256 * 1024);
+                    let text = if incomplete_utf8_tail {
+                        let valid_up_to = utf8
+                            .as_ref()
+                            .err()
+                            .map_or(bytes.len(), |err| err.valid_up_to());
+                        String::from_utf8_lossy(&bytes[..valid_up_to]).into_owned()
+                    } else {
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    };
+                    let text = truncate_on_char_boundary(text, MAX_FS_READ);
                     if secret {
                         if let Some(sink) = &self.secret_sink {
                             sink.register_secret(&text);
@@ -1620,11 +1707,6 @@ impl HostCapabilities for SystemHostCaps {
                     self.ensure_http_host_allowed(&url)?;
                     url
                 };
-                // The request is admitted. If the (now-allowed) host is private/internal, the scoped
-                // grant just let through what the bare SSRF guard would refuse — audit it.
-                if let Some(host) = url.host_str() {
-                    self.audit_admit(host);
-                }
                 let method = payload
                     .get("method")
                     .and_then(|v| v.as_str())
@@ -1636,14 +1718,18 @@ impl HostCapabilities for SystemHostCaps {
                 // method's declared scheme — the plugin never sees raw tokens on this path. `Query`
                 // mutates the URL, so resolve before building the request.
                 let inject = self.resolve_auth(payload).await?;
+                let query_auth_name = match &inject {
+                    AuthInjection::Query { name, .. } => Some(name.clone()),
+                    _ => None,
+                };
                 if let AuthInjection::Query { name, value } = &inject {
                     url.query_pairs_mut().append_pair(name, value);
                 }
-                let mut req = reqwest::Client::new().request(m, url);
-                if let Some(headers) = payload.get("headers").and_then(|v| v.as_object()) {
-                    for (k, v) in headers {
+                let mut headers = reqwest::header::HeaderMap::new();
+                if let Some(requested) = payload.get("headers").and_then(|v| v.as_object()) {
+                    for (k, v) in requested {
                         if let Some(s) = v.as_str() {
-                            req = req.header(k.as_str(), s);
+                            insert_http_header(&mut headers, k, s)?;
                         }
                     }
                 }
@@ -1651,45 +1737,73 @@ impl HostCapabilities for SystemHostCaps {
                 // host-side BEFORE the legacy `auth_purpose` injection, so a ref-resolved credential
                 // reaches the wire without the plugin ever holding the value.
                 for (name, value) in ref_injected {
-                    req = req.header(name.as_str(), value);
+                    insert_http_header(&mut headers, &name, &value)?;
                 }
                 match inject {
                     AuthInjection::None | AuthInjection::Query { .. } => {}
-                    AuthInjection::Bearer(t) => req = req.bearer_auth(t),
+                    AuthInjection::Bearer(token) => insert_http_header(
+                        &mut headers,
+                        "Authorization",
+                        &format!("Bearer {token}"),
+                    )?,
                     AuthInjection::Basic { user, secret } => {
-                        req = req.basic_auth(user, Some(secret))
+                        let encoded = base64::engine::general_purpose::STANDARD
+                            .encode(format!("{user}:{secret}"));
+                        insert_http_header(
+                            &mut headers,
+                            "Authorization",
+                            &format!("Basic {encoded}"),
+                        )?;
                     }
-                    AuthInjection::Header { name, value } => req = req.header(name.as_str(), value),
+                    AuthInjection::Header { name, value } => {
+                        insert_http_header(&mut headers, &name, &value)?;
+                    }
                 }
                 // Request body: a base64 `body_b64` (byte-exact upload) wins over the text `body`;
                 // either one (never both) becomes the request body.
-                if let Some(b64) = payload.get("body_b64").and_then(|v| v.as_str()) {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(b64)
-                        .map_err(|e| format!("http.do: bad body_b64: {e}"))?;
-                    req = req.body(bytes);
-                } else if let Some(body) = payload.get("body").and_then(|v| v.as_str()) {
-                    req = req.body(body.to_string());
-                }
-                let resp = req.send().await.map_err(|e| e.to_string())?;
-                let status = resp.status().as_u16();
-                // Binary download path (`response_binary: true`): return the raw bytes base64-encoded,
-                // capped (NOT char-truncated) so a byte-exact download survives. Default keeps the
-                // text path unchanged.
-                if payload
+                let body = if let Some(b64) = payload.get("body_b64").and_then(|v| v.as_str()) {
+                    Some(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|e| format!("http.do: bad body_b64: {e}"))?,
+                    )
+                } else {
+                    payload
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .map(|body| body.as_bytes().to_vec())
+                };
+                let response_binary = payload
                     .get("response_binary")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                let timeout_ms = http_do_timeout_ms(payload)?;
+                let exchange = async move {
+                    let resp = self
+                        .send_http_guarded(url, m, headers, body, query_auth_name.as_deref())
+                        .await?;
+                    let status = resp.status().as_u16();
+                    // Binary download path (`response_binary: true`): return raw base64 bytes,
+                    // capped without character truncation so a byte-exact download survives.
+                    if response_binary {
+                        const MAX_BIN_BODY: usize = 16 * 1024 * 1024;
+                        let (bytes, _) = read_http_body_capped(resp, MAX_BIN_BODY).await?;
+                        let body_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        return Ok(json!({ "status": status, "body_b64": body_b64 }));
+                    }
+                    let (bytes, _) = read_http_body_capped(resp, 256 * 1024).await?;
+                    let body = truncate_on_char_boundary(
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                        256 * 1024,
+                    );
+                    Ok(json!({ "status": status, "body": body }))
+                };
+                match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), exchange)
+                    .await
                 {
-                    const MAX_BIN_BODY: usize = 16 * 1024 * 1024;
-                    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-                    let capped = &bytes[..bytes.len().min(MAX_BIN_BODY)];
-                    let body_b64 = base64::engine::general_purpose::STANDARD.encode(capped);
-                    return Ok(json!({ "status": status, "body_b64": body_b64 }));
+                    Ok(result) => result,
+                    Err(_) => Err(format!("http.do: timed out after {timeout_ms}ms")),
                 }
-                let body = resp.text().await.unwrap_or_default();
-                let body = truncate_on_char_boundary(body, 256 * 1024);
-                Ok(json!({ "status": status, "body": body }))
             }
             "conn.dial" => {
                 // Ref-based dial (D-27): when the plugin passes an `endpoint_ref`, the host resolves
@@ -1940,6 +2054,108 @@ fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
     s
 }
 
+fn insert_http_header(
+    headers: &mut reqwest::header::HeaderMap,
+    name: &str,
+    value: &str,
+) -> std::result::Result<(), String> {
+    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|e| format!("http.do: invalid header name `{name}`: {e}"))?;
+    let value = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|e| format!("http.do: invalid value for header `{name}`: {e}"))?;
+    headers.insert(name, value);
+    Ok(())
+}
+
+fn is_followed_http_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::MOVED_PERMANENTLY
+            | reqwest::StatusCode::FOUND
+            | reqwest::StatusCode::SEE_OTHER
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn same_http_origin(a: &url::Url, b: &url::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str()
+            .zip(b.host_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn remove_query_pair(url: &mut url::Url, name: &str) {
+    let kept = url
+        .query_pairs()
+        .filter(|(key, _)| key != name)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !kept.is_empty() {
+        url.query_pairs_mut().extend_pairs(kept);
+    }
+}
+
+/// Overall `http.do` deadline. Plugins may configure milliseconds directly (or seconds for parity
+/// with `process.run`); absent configuration gets a finite default, and hostile values cannot
+/// create an effectively unbounded request.
+fn http_do_timeout_ms(payload: &Value) -> std::result::Result<u64, String> {
+    const DEFAULT_MS: u64 = 30_000;
+    const MAX_MS: u64 = 300_000;
+
+    let requested = if let Some(value) = payload.get("timeout_ms") {
+        value
+            .as_u64()
+            .ok_or_else(|| "http.do: `timeout_ms` must be a non-negative integer".to_string())?
+    } else if let Some(value) = payload.get("timeout_secs") {
+        value
+            .as_u64()
+            .ok_or_else(|| "http.do: `timeout_secs` must be a non-negative integer".to_string())?
+            .saturating_mul(1_000)
+    } else {
+        DEFAULT_MS
+    };
+    Ok(requested.clamp(1, MAX_MS))
+}
+
+/// Incrementally retain at most `max` bytes from an HTTP response. The response is dropped as soon
+/// as the budget fills instead of first allocating an attacker-controlled whole body.
+async fn read_http_body_capped(
+    mut response: reqwest::Response,
+    max: usize,
+) -> std::result::Result<(Vec<u8>, bool), String> {
+    let declared_over_cap = response
+        .content_length()
+        .is_some_and(|len| len > max as u64);
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .map(|len| len.min(max as u64) as usize)
+            .unwrap_or(0),
+    );
+    let mut truncated = false;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("http.do: response body read failed: {e}"))?
+    {
+        let remaining = max.saturating_sub(bytes.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() || (declared_over_cap && bytes.len() == max) {
+            truncated = true;
+            break;
+        }
+    }
+    Ok((bytes, truncated))
+}
+
 /// Reject non-HTTP(S) schemes and (unless `allow_private`) private/loopback/link-local hosts —
 /// delegating to the shared egress guard in `flux-system` (host→IP resolution, IPv6/IPv4-mapped
 /// coverage), the same SSRF policy the agent's own `web_fetch` uses.
@@ -2041,30 +2257,6 @@ fn path_has_traversal(path: &str) -> bool {
         .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
-/// Match an expanded absolute path against a `/**` / `/*` / exact glob. `/**` matches the dir
-/// itself + everything under it (incl. nested subdirs); `/*` matches direct children only; an
-/// exact path matches itself. Trailing-slash-insensitive.
-fn fs_path_matches(pattern: &str, abs_path: &str) -> bool {
-    let pat = pattern.trim_end_matches('/');
-    let p = abs_path.trim_end_matches('/');
-    if pat == p {
-        return true;
-    }
-    if let Some(dir) = pat.strip_suffix("/**") {
-        let dir = dir.trim_end_matches('/');
-        p == dir || p.starts_with(&format!("{dir}/"))
-    } else if let Some(dir) = pat.strip_suffix("/*") {
-        let dir = dir.trim_end_matches('/');
-        if !p.starts_with(&format!("{dir}/")) || p.len() <= dir.len() + 1 {
-            return false;
-        }
-        let rest = &p[dir.len() + 1..];
-        !rest.contains('/')
-    } else {
-        false
-    }
-}
-
 fn host_matches(patterns: &[String], host: &str) -> bool {
     let host = host
         .trim()
@@ -2097,6 +2289,40 @@ pub struct PluginHost {
     stdin: tokio::process::ChildStdin,
     reader: tokio::io::BufReader<tokio::process::ChildStdout>,
     next_id: u64,
+    system: flux_system::System,
+    argv: Vec<String>,
+    verified_spawn: Option<(String, PluginDescriptor)>,
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Marks an in-flight framed exchange unhealthy unless it reaches a complete response. Async
+/// cancellation drops futures at an arbitrary await; this guard makes that observable to the next
+/// owner of the host mutex, which restarts the subprocess before writing another request.
+struct ProtocolExchange {
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+    complete: bool,
+}
+
+impl ProtocolExchange {
+    fn new(poisoned: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            poisoned,
+            complete: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for ProtocolExchange {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 impl PluginHost {
@@ -2125,6 +2351,10 @@ impl PluginHost {
             stdin,
             reader: tokio::io::BufReader::new(stdout),
             next_id: 0,
+            system: system.clone(),
+            argv,
+            verified_spawn: None,
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -2147,7 +2377,45 @@ impl PluginHost {
                 d.program
             )));
         }
-        Self::spawn(system, &d.program, &d.args).await
+        let mut host = Self::spawn(system, &d.program, &d.args).await?;
+        host.verified_spawn = Some((name.to_string(), d.clone()));
+        Ok(host)
+    }
+
+    /// Replace a protocol session abandoned by cancellation or transport failure. The old process
+    /// is killed before a fresh one starts through the same guarded System path; descriptor-backed
+    /// plugins repeat their hash verification before every restart.
+    async fn restart_if_poisoned(&mut self) -> Result<()> {
+        if !self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some((name, descriptor)) = &self.verified_spawn {
+            if let Verification::HashDrift { expected, actual } = verify_descriptor(descriptor) {
+                return Err(Error::Other(format!(
+                    "plugin `{name}`: refusing to restart after an interrupted protocol exchange — \
+                     binary hash drift: expected {expected}, got {actual}"
+                )));
+            }
+        }
+
+        // `kill` also waits/reaps. Ignore an already-exited error: either way the old framed stream
+        // is never reused.
+        let _ = self.child.kill().await;
+        let flux_system::InteractiveChild {
+            child,
+            stdin,
+            stdout,
+        } = self
+            .system
+            .spawn_interactive(&self.argv)
+            .map_err(|e| Error::Other(format!("restart plugin {}: {e}", self.argv[0])))?;
+        self.child = child;
+        self.stdin = stdin;
+        self.reader = tokio::io::BufReader::new(stdout);
+        self.next_id = 0;
+        self.poisoned
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
@@ -2187,10 +2455,14 @@ impl PluginHost {
     }
 
     async fn request(&mut self, command: &str, payload: Value) -> Result<Frame> {
+        let mut exchange = ProtocolExchange::new(self.poisoned.clone());
+        self.restart_if_poisoned().await?;
         self.next_id += 1;
         let frame = Frame::request(format!("r{}", self.next_id), command, payload);
         self.write_frame(&frame).await?;
-        self.read_frame().await
+        let response = self.read_frame().await?;
+        exchange.complete();
+        Ok(response)
     }
 
     /// Fetch the plugin's manifest.
@@ -2216,6 +2488,8 @@ impl PluginHost {
         input: Value,
         host: &dyn HostCapabilities,
     ) -> Result<Value> {
+        let mut exchange = ProtocolExchange::new(self.poisoned.clone());
+        self.restart_if_poisoned().await?;
         self.next_id += 1;
         let call_id = format!("r{}", self.next_id);
         let frame = Frame::request(
@@ -2238,6 +2512,7 @@ impl PluginHost {
                 }
                 FrameKind::Response => {
                     if f.id == call_id {
+                        exchange.complete();
                         return if f.ok {
                             Ok(f.result)
                         } else {
@@ -2897,6 +3172,76 @@ mod tests {
             err.contains("not in this plugin's fs.read scope"),
             "out-of-scope read must be denied with a clear error, got: {err}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_read_denies_symlink_escape_from_declared_scope() {
+        let dir = std::env::temp_dir().join(format!("flux-fs-symlink-deny-{}", std::process::id()));
+        let granted = dir.join("granted");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOPSECRET").unwrap();
+        std::os::unix::fs::symlink(&outside, granted.join("alias")).unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            fs: vec![FsReadScope {
+                path: format!("{}/**", granted.display()),
+                secret: false,
+            }],
+            ..Default::default()
+        });
+
+        let requested = granted.join("alias/secret.txt");
+        let err = caps
+            .handle(
+                "fs.read",
+                &serde_json::json!({"path": requested.to_str().unwrap()}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not in this plugin's fs.read scope"),
+            "symlink escape must be denied by physical path identity, got: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_read_allows_symlink_that_resolves_inside_declared_scope() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-fs-symlink-allow-{}", std::process::id()));
+        let granted = dir.join("granted");
+        std::fs::create_dir_all(granted.join("real")).unwrap();
+        std::fs::write(granted.join("real/config"), "safe").unwrap();
+        std::os::unix::fs::symlink("real", granted.join("alias")).unwrap();
+
+        let sys = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+        let caps = SystemHostCaps::new(sys).with_grants(PluginCapabilities {
+            fs: vec![FsReadScope {
+                path: format!("{}/**", granted.display()),
+                secret: false,
+            }],
+            ..Default::default()
+        });
+
+        let requested = granted.join("alias/config");
+        let got = caps
+            .handle(
+                "fs.read",
+                &serde_json::json!({"path": requested.to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got["body"], "safe");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4108,6 +4453,220 @@ mod tests {
             }
         });
         port
+    }
+
+    async fn spawn_cross_origin_redirect() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = target.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_port = source.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = source.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: http://{target_addr}/final\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (source_port, seen_rx)
+    }
+
+    async fn spawn_same_origin_redirect() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut first, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = first.read(&mut buf).await;
+                let _ = first
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nlocation: /final\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+            if let Ok((mut second, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = second.read(&mut buf).await;
+                let _ = second
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nfinal")
+                    .await;
+            }
+        });
+        port
+    }
+
+    async fn spawn_stalled_http_server() -> u16 {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                // Keep the connection open without producing response headers or a body.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn http_do_guards_every_redirect_target() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!(
+            "flux-http-redirect-guard-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let (port, _seen) = spawn_cross_origin_redirect().await;
+        let caps = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["localhost".into()])
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+                private_hosts: vec!["localhost".into()],
+                ..Default::default()
+            });
+        let err = caps
+            .handle(
+                "http.do",
+                &json!({"url": format!("http://localhost:{port}/start")}),
+            )
+            .await
+            .expect_err("127.0.0.1 is outside the scoped private-net grant");
+        assert!(
+            err.contains("private/loopback"),
+            "shared guard denial: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn http_do_cross_origin_redirect_strips_all_credentials() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!(
+            "flux-http-redirect-header-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let (port, seen) = spawn_cross_origin_redirect().await;
+        let caps = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["127.0.0.1".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            });
+        let result = caps
+            .handle(
+                "http.do",
+                &json!({
+                    "url": format!("http://127.0.0.1:{port}/start"),
+                    "headers": {
+                        "Authorization": "Bearer plugin-secret",
+                        "Cookie": "session=plugin-secret",
+                        "Proxy-Authorization": "Basic plugin-secret",
+                        "X-Api-Key": "plugin-secret",
+                        "X-Custom": "also-sensitive"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"], "ok");
+        let request = seen.await.expect("redirect target received the request");
+        let lower = request.to_ascii_lowercase();
+        for name in [
+            "authorization:",
+            "cookie:",
+            "proxy-authorization:",
+            "x-api-key:",
+            "x-custom:",
+        ] {
+            assert!(!lower.contains(name), "forwarded {name}: {request}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn http_do_follows_bounded_same_origin_redirect() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!(
+            "flux-http-same-origin-redirect-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let port = spawn_same_origin_redirect().await;
+        let caps = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["127.0.0.1".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            });
+        let result = caps
+            .handle(
+                "http.do",
+                &json!({"url": format!("http://127.0.0.1:{port}/start")}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"status": 200, "body": "final"}));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn http_do_timeout_covers_server_that_never_responds() {
+        use flux_system::{System, Workspace};
+        let dir =
+            std::env::temp_dir().join(format!("flux-http-timeout-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let port = spawn_stalled_http_server().await;
+        let caps = SystemHostCaps::new(sys)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_grants(PluginCapabilities {
+                http: true,
+                http_hosts: vec!["127.0.0.1".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            });
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            caps.handle(
+                "http.do",
+                &json!({
+                    "url": format!("http://127.0.0.1:{port}/stall"),
+                    "timeout_ms": 25
+                }),
+            ),
+        )
+        .await
+        .expect("http.do enforces its own timeout")
+        .expect_err("a stalled response is a timeout error");
+        assert!(err.contains("timed out after 25ms"), "clear timeout: {err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ pub mod browser;
 pub mod cdp;
 pub mod condense;
 pub mod digest;
+mod egress;
 pub mod fetch;
 pub mod http;
 

@@ -137,7 +137,7 @@ impl FlowEngine {
         // `run_plan`/`observe`. The inner ops a plan runs still gate individually.
         executor.allow(&["plan", "run_plan", "observe", "evidence", "metrics"]);
         composites.validate_base(executor.registry())?;
-        let agent_loop = load_agent_loop(&cwd)?;
+        let agent_loop = load_agent_loop_with_iterations(&cwd, max_iterations)?;
         Ok(FlowEngine {
             provider,
             executor,
@@ -225,9 +225,6 @@ impl FlowEngine {
         // advertised op set to the loop host, so every planner iteration sees the gated catalog.
         let advertised = self.surfaced_for_turn(sink);
 
-        // Compact the persisted session if it has grown past the budget.
-        self.maybe_compact(session_id, sink, cancel).await?;
-
         // Drive the flux-lang agent loop (`agent_loop`) through an OWNED channel sink — the `'static`
         // loop host holds it for reentrant `run_plan` — draining its events onto the borrowed `sink`
         // LIVE (inner ops stream as they happen; the loop-machinery ops are filtered, see `drain_event`).
@@ -242,6 +239,36 @@ impl FlowEngine {
             Some(advertised),
             Some((self.events.clone(), turn_id)),
         );
+
+        // Snapshot per-turn evidence BEFORE compaction: a failed/cancelled compaction is still this
+        // turn and must close with correctly scoped telemetry through the same finalization path.
+        let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
+        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
+
+        // Compact only after `set_turn` reset the host's accounting. Summary generation is a real
+        // provider call, and usage that arrives before a stream error must be charged exactly once.
+        // Any error occurs after the user message + TurnStarted are durable, so close the turn with
+        // one assistant message instead of `?`-returning an invalid user tail / pending turn.
+        let (compaction, compaction_usage) =
+            self.compaction_attempt(session_id, sink, cancel).await;
+        if let Some(usage) = compaction_usage {
+            self.loop_host
+                .record_external_call(self.provider.name(), &self.model, usage);
+        }
+        if let Err(error) = compaction {
+            let answer = format!(
+                "I couldn't compact the conversation before continuing — {}",
+                planner_error(&error)
+            );
+            sink.text_delta(&answer);
+            let subagent_calls = self.subagent_calls_since(subagent_base);
+            self.record_call_usage_events(session_id, turn_id, &subagent_calls);
+            let usage = self.turn_usage(&subagent_calls);
+            let _ = self
+                .events
+                .end_turn(session_id, turn_id, "error", 0, &answer, usage.clone());
+            return self.finish_turn(session_id, turn_id, sink, &answer, false, usage);
+        }
         // Thread this turn's cancellation into the tool context so a spawning tool (`task`) can hand a
         // child token to its sub-agent — cancelling the parent turn then cancels the child. The session
         // id rides along so `task` can correlate the child's audit stream to THIS turn (A-08).
@@ -262,17 +289,6 @@ impl FlowEngine {
         } else {
             self.flow.set_cassette(None);
         }
-
-        // Per-turn iteration count: snapshot the cumulative `turn.iteration` evidence now so we can
-        // report only THIS turn's rounds. The executor (and its evidence log) is shared and persists
-        // across turns, so an unscoped count grows monotonically over a long-lived served agent.
-        let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
-        // Same scoping trick for sub-agent usage (C-06 rollup): `task` (flux-orchestrate) records a
-        // `subagent.usage` observation per completed sub-agent call onto this SAME shared evidence
-        // log — the cross-crate side-channel `ToolResult` (a plain string) can't carry structured
-        // usage through. Snapshotting the count now (not after the turn) means only sub-agents
-        // spawned by THIS turn are folded in, never a prior turn's.
-        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
 
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());
         let flow_fut = execute_flow_traced(
@@ -1111,19 +1127,35 @@ impl FlowEngine {
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        self.compaction_attempt(session_id, sink, cancel).await.0
+    }
+
+    /// The compaction result plus usage for its optional provider call. Usage is outside the
+    /// `Result`, mirroring `compile_turn`: a stream can report tokens before failing, and those
+    /// tokens remain billable. `None` means no summary request was needed; `Some(default())` means a
+    /// request was attempted but the provider reported no usage.
+    async fn compaction_attempt(
+        &self,
+        session_id: &str,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+    ) -> (Result<()>, Option<Usage>) {
         if self.compact_threshold_chars == 0 {
-            return Ok(());
+            return (Ok(()), None);
         }
-        let messages = self.events.conversation(session_id)?;
+        let messages = match self.events.conversation(session_id) {
+            Ok(messages) => messages,
+            Err(error) => return (Err(error), None),
+        };
         if messages.len() < 4 {
-            return Ok(());
+            return (Ok(()), None);
         }
         let total: usize = messages
             .iter()
             .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
             .sum();
         if total <= self.compact_threshold_chars {
-            return Ok(());
+            return (Ok(()), None);
         }
 
         let keep = 2.min(messages.len());
@@ -1132,7 +1164,7 @@ impl FlowEngine {
             split -= 1;
         }
         if split == 0 {
-            return Ok(()); // can't summarize without splitting a tool_use/tool_result pair
+            return (Ok(()), None); // can't summarize without splitting a tool_use/tool_result pair
         }
         let (old, recent) = messages.split_at(split);
 
@@ -1149,22 +1181,30 @@ impl FlowEngine {
              open threads. Preserve file paths, names, and numbers. Be terse.\n\n{transcript}"
         );
         let req = Request::new(self.model.clone(), prompt).with_max_tokens(1024);
-        let mut stream = self.provider.stream(req).await?;
+        let mut usage = Usage::default();
+        let mut stream = match self.provider.stream(req).await {
+            Ok(stream) => stream,
+            Err(error) => return (Err(error), Some(usage)),
+        };
         let mut summary = String::new();
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => return (Ok(()), Some(usage)),
                 chunk = stream.next() => {
                     let Some(chunk) = chunk else { break };
-                    if let Chunk::TextDelta(t) = chunk? {
-                        summary.push_str(&t);
+                    match chunk {
+                        Ok(Chunk::TextDelta(text)) => summary.push_str(&text),
+                        // Provider usage chunks are cumulative within one call: last wins.
+                        Ok(Chunk::Usage(call_usage)) => usage = call_usage,
+                        Ok(_) => {}
+                        Err(error) => return (Err(error), Some(usage)),
                     }
                 }
             }
         }
         if summary.trim().is_empty() {
-            return Ok(());
+            return (Ok(()), Some(usage));
         }
 
         let mut new_msgs = vec![Message::user_text(format!(
@@ -1173,7 +1213,9 @@ impl FlowEngine {
         ))];
         new_msgs.extend(recent.iter().cloned());
         let to = new_msgs.len();
-        self.events.record_compaction(session_id, &new_msgs)?;
+        if let Err(error) = self.events.record_compaction(session_id, &new_msgs) {
+            return (Err(error), Some(usage));
+        }
 
         let obs = flux_evidence::Observation::new(
             "context.compacted",
@@ -1186,7 +1228,7 @@ impl FlowEngine {
         );
         self.executor.observe(obs.clone());
         sink.observation(&obs);
-        Ok(())
+        (Ok(()), Some(usage))
     }
 }
 
@@ -1352,6 +1394,40 @@ pub fn load_agent_loop(cwd: &std::path::Path) -> Result<DraftAst> {
         .map_err(|e| flux_core::Error::Other(format!("agent-loop.flux: invalid flow: {e}")))
 }
 
+/// Load the one checked-in/overridden agent loop and replace its execute-pass `repeat … until
+/// $done` budget with the engine setting. Flux-Lang repeat bounds are literals by design, so this is
+/// configuration of the parsed program, not a second Rust turn loop. Custom loops without that
+/// conventional execute pass remain byte-for-byte as authored.
+fn load_agent_loop_with_iterations(
+    cwd: &std::path::Path,
+    max_iterations: usize,
+) -> Result<DraftAst> {
+    let max = u32::try_from(max_iterations).map_err(|_| {
+        flux_core::Error::Other(format!(
+            "max_iterations {max_iterations} exceeds Flux-Lang's u32 repeat bound"
+        ))
+    })?;
+    if max == 0 {
+        return Err(flux_core::Error::Other(
+            "max_iterations must be greater than zero".into(),
+        ));
+    }
+    let mut ast = load_agent_loop(cwd)?;
+    for node in &mut ast.body {
+        if let crate::ast::Node::Repeat {
+            max: repeat_max,
+            until: Some(until),
+            ..
+        } = node
+        {
+            if matches!(until.as_ref(), crate::ast::Node::Var { name } if name.0 == "done") {
+                *repeat_max = max;
+            }
+        }
+    }
+    Ok(ast)
+}
+
 /// The loop-machinery ops a turn dispatches to *drive* the loop (not to do the user's work). Their
 /// tool-call/result events are filtered out of the user-facing sink so the surface shows the actual
 /// operations (`read`/`edit`/`bash`/…) the inner `run_plan` performs, not the plumbing.
@@ -1428,6 +1504,7 @@ pub fn planner_error(e: &flux_core::Error) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -1667,6 +1744,67 @@ mod tests {
         }
     }
 
+    /// A provider that changes its emitted plan on every request, so the loop's identical-plan
+    /// guard cannot shorten the configured-iteration regression below. Each request binds a fresh
+    /// symbol through `echo`, making the number of actual inner dispatches observable too.
+    struct FreshPlanProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for FreshPlanProvider {
+        fn name(&self) -> &str {
+            "fresh-plan"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = emit_plan(json!({
+                "body": [{
+                    "kind": "bind",
+                    "name": format!("value_{n}"),
+                    "value": {
+                        "kind": "call",
+                        "op": "echo",
+                        "args": [{ "kind": "lit", "value": format!("round-{n}") }]
+                    }
+                }]
+            }));
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// The compaction request either fails before a stream exists or reports usage and then fails
+    /// mid-stream. A second request would return prose, making an accidental fallback visible in
+    /// the request count instead of hanging the regression.
+    struct CompactionFailProvider {
+        calls: Arc<AtomicUsize>,
+        fail_midstream: bool,
+        usage: Usage,
+    }
+
+    #[async_trait]
+    impl Provider for CompactionFailProvider {
+        fn name(&self) -> &str {
+            "compact-fail"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0 {
+                let chunks = prose("fallback response");
+                return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            }
+            if !self.fail_midstream {
+                return Err(Error::Other("compaction provider unavailable".into()));
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(Chunk::Usage(self.usage.clone())),
+                Err(Error::StreamDecode("broken compaction stream".into())),
+            ])))
+        }
+    }
+
     fn engine_with(responses: VecDeque<Vec<Chunk>>, events: Arc<EventStore>) -> FlowEngine {
         engine_with_provider(
             Box::new(MockProvider {
@@ -1684,6 +1822,15 @@ mod tests {
         provider: Box<dyn Provider>,
         events: Arc<EventStore>,
         groups: Vec<flux_evidence::ToolGroup>,
+    ) -> FlowEngine {
+        engine_with_groups_and_iterations(provider, events, groups, 5)
+    }
+
+    fn engine_with_groups_and_iterations(
+        provider: Box<dyn Provider>,
+        events: Arc<EventStore>,
+        groups: Vec<flux_evidence::ToolGroup>,
+        max_iterations: usize,
     ) -> FlowEngine {
         let dir = std::env::temp_dir().join(format!(
             "flux-flow-engine-{}-{}",
@@ -1722,7 +1869,7 @@ mod tests {
             "mock".into(),
             "test".into(),
             1024,
-            5,
+            max_iterations,
             Vec::new(),
             0,
             groups,
@@ -1820,6 +1967,27 @@ mod tests {
              `compile::GATHER_ROUND_BUDGET` so normal-mode and plan-mode gather stay bounded \
              identically"
         );
+    }
+
+    /// C-50: the checked-in source's `repeat 25` is only its readable default template; engine
+    /// assembly rewrites the execute pass to the configured value in the actual AST it runs.
+    #[test]
+    fn configured_agent_loop_replaces_the_literal_execute_budget() {
+        let dir = std::env::temp_dir().join(format!("flux-loop-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ast = load_agent_loop_with_iterations(&dir, 7).unwrap();
+        let execute_max = ast.body.iter().find_map(|node| match node {
+            crate::ast::Node::Repeat {
+                max,
+                until: Some(until),
+                ..
+            } if matches!(until.as_ref(), crate::ast::Node::Var { name } if name.0 == "done") => {
+                Some(*max)
+            }
+            _ => None,
+        });
+        assert_eq!(execute_max, Some(7));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// `drain_event` hides the loop machinery by default and reveals it under `--show-loop`: a `plan`
@@ -2775,6 +2943,141 @@ mod tests {
             after < before,
             "compaction bounded the conversation: {before} -> {after}"
         );
+    }
+
+    fn seed_provider_valid_history(store: &EventStore, sid: &str) {
+        for n in 0..2 {
+            store
+                .record_message(sid, &Message::user_text(format!("old question {n}")))
+                .unwrap();
+            store
+                .record_message(sid, &Message::assistant_text(format!("old answer {n}")))
+                .unwrap();
+        }
+    }
+
+    fn assert_provider_valid_history(messages: &[Message]) {
+        for (index, message) in messages.iter().enumerate() {
+            assert!(!message.content.is_empty(), "message {index} is empty");
+            assert!(
+                !(message.role == flux_core::Role::Assistant && message.text().trim().is_empty()),
+                "assistant message {index} is empty"
+            );
+            if let Some(previous) = index.checked_sub(1) {
+                assert_ne!(
+                    messages[previous].role, message.role,
+                    "messages {previous} and {index} have the same role"
+                );
+            }
+        }
+    }
+
+    /// C-50: a provider failure while STARTING compaction occurs after the user's message and the
+    /// turn-start event are durable. It must still close through the one assistant-finalization path
+    /// rather than returning an open user tail / pending turn.
+    #[tokio::test]
+    async fn compaction_provider_start_error_finishes_a_provider_valid_turn() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        seed_provider_valid_history(&store, &sid);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(CompactionFailProvider {
+            calls: calls.clone(),
+            fail_midstream: false,
+            usage: Usage::default(),
+        });
+        let mut engine = engine_with_provider(provider, store.clone());
+        engine.compact_threshold_chars = 1;
+
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn(&sid, "new question", &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "turn stopped at compaction"
+        );
+        assert_provider_valid_history(&store.conversation(&sid).unwrap());
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_ne!(turns[0].outcome, "pending", "the opened turn was closed");
+        assert!(turns[0].answer.as_deref().is_some_and(|a| !a.is_empty()));
+    }
+
+    /// C-50: usage emitted before a compaction stream error is real spend. It is included in the
+    /// turn total and emitted as exactly one per-call attribution record even though the summary did
+    /// not complete, while the persisted conversation still ends in a valid assistant message.
+    #[tokio::test]
+    async fn compaction_stream_error_finishes_turn_and_counts_attempt_usage_once() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        seed_provider_valid_history(&store, &sid);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compact_usage = Usage {
+            input_tokens: 321,
+            output_tokens: 7,
+            ..Default::default()
+        };
+        let provider = Box::new(CompactionFailProvider {
+            calls: calls.clone(),
+            fail_midstream: true,
+            usage: compact_usage.clone(),
+        });
+        let mut engine = engine_with_provider(provider, store.clone());
+        engine.compact_threshold_chars = 1;
+
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn(&sid, "new question", &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "turn stopped at compaction"
+        );
+        assert_provider_valid_history(&store.conversation(&sid).unwrap());
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].calls, 1, "one compaction request, counted once");
+        assert_eq!(turns[0].call_usage, compact_usage);
+        assert_eq!(turns[0].usage, Some(compact_usage));
+        assert_ne!(turns[0].outcome, "pending", "the opened turn was closed");
+    }
+
+    /// C-50: `max_iterations` is an executable limit on the checked-in Flux-Lang loop. Different
+    /// configured values change both provider consultations and actual plan dispatches; this does
+    /// not merely assert that the final max-iteration sentence interpolates the configured number.
+    #[tokio::test]
+    async fn configured_max_iterations_changes_real_loop_bound() {
+        async fn run(max_iterations: usize) -> (usize, usize, u32) {
+            let store = Arc::new(EventStore::in_memory().unwrap());
+            let sid = store.create_session("mock").unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Box::new(FreshPlanProvider {
+                calls: calls.clone(),
+            });
+            let engine = engine_with_groups_and_iterations(
+                provider,
+                store.clone(),
+                Vec::new(),
+                max_iterations,
+            );
+            let mut sink = CollectSink::default();
+            engine
+                .run_turn(&sid, "keep planning", &mut sink)
+                .await
+                .unwrap();
+            let iterations = store.turns(&sid).unwrap()[0].iterations;
+            (calls.load(Ordering::SeqCst), sink.tools.len(), iterations)
+        }
+
+        assert_eq!(run(1).await, (2, 1, 1));
+        assert_eq!(run(2).await, (3, 2, 2));
     }
 
     /// C-26: a resumed (reply-parked) continuation is a first-class turn. Before the fix

@@ -117,6 +117,7 @@ pub fn analyze_flow(
     check_await_position(&ast.body, &mut d);
     check_checkpoint_position(&ast.body, &mut d);
     check_cap_scope_position(&ast.body, &mut d);
+    check_cancellation_cleanup_position(&ast.body, &mut d);
     check_cap_scopes(&ast.body, None, &mut d);
     if d.items.is_empty() {
         Ok(())
@@ -374,6 +375,62 @@ fn branch_contains_cap_scope(body: &[Node]) -> bool {
     let mut found = false;
     for_each_node(body, &mut |n| {
         if matches!(n, Node::CapScope { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// `timeout` and `race` cancel work by dropping the unfinished body/loser future. An async
+/// `scope.finally` or `with_tools` pop cannot run from `Drop`, so placing either cleanup-bearing
+/// node inside a cancellation boundary would violate its unconditional-unwind contract. Reject
+/// that shape in v1; wrapping the timeout/race *inside* a cleanup scope remains safe because the
+/// outer scope observes the cancellation error and unwinds normally.
+fn check_cancellation_cleanup_position(body: &[Node], d: &mut Diags) {
+    for (i, node) in body.iter().enumerate() {
+        let mut timeout_cleanup = false;
+        let mut race_cleanup = false;
+        for_each_node(std::slice::from_ref(node), &mut |nested| match nested {
+            Node::Timeout { body, .. } => {
+                timeout_cleanup |= branch_contains_cleanup_scope(body);
+            }
+            Node::Race { branches, .. } => {
+                race_cleanup |= branches
+                    .iter()
+                    .any(|branch| branch_contains_cleanup_scope(&branch.body));
+            }
+            _ => {}
+        });
+        if timeout_cleanup {
+            d.with(format!("body[{i}]"), |d| {
+                d.add(
+                    "a cleanup scope (`scope`/`with_tools`) cannot be nested inside `timeout` — \
+                     timeout cancels by dropping unfinished work, so async cleanup could not be \
+                     guaranteed (wrap the timeout in the cleanup scope instead)",
+                )
+            });
+        }
+        if race_cleanup {
+            d.with(format!("body[{i}]"), |d| {
+                d.add(
+                    "a cleanup scope (`scope`/`with_tools`) cannot be nested inside a `race` \
+                     branch — losing branches are cancelled by dropping their futures, so async \
+                     cleanup could not be guaranteed (wrap the race in the cleanup scope instead)",
+                )
+            });
+        }
+    }
+}
+
+fn branch_contains_cleanup_scope(body: &[Node]) -> bool {
+    let mut found = false;
+    for_each_node(body, &mut |node| {
+        let has_cleanup = match node {
+            Node::CapScope { .. } => true,
+            Node::Scope { finally, .. } => !finally.is_empty(),
+            _ => false,
+        };
+        if has_cleanup {
             found = true;
         }
     });
@@ -1289,6 +1346,7 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
         Node::Race { branches, bind, .. } => {
             check_opt_decl_name(bind, "`race` `bind`", d);
             let mut seen: HashSet<&str> = HashSet::new();
+            let mut bound_by: HashMap<String, &str> = HashMap::new();
             for (i, b) in branches.iter().enumerate() {
                 d.with(format!("branches[{i}]"), |d| {
                     check_decl_name(&b.name, "a `race` branch", d);
@@ -1301,6 +1359,29 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
                              produce a value; put the op(s) in `body`",
                             b.name.0
                         ));
+                    }
+                    let mut binds: HashSet<String> = HashSet::new();
+                    binds.insert(b.name.0.clone());
+                    collect_bound_symbols(&b.body, &mut binds);
+                    let mut binds: Vec<String> = binds.into_iter().collect();
+                    binds.sort();
+                    for sym in binds {
+                        match bound_by.entry(sym) {
+                            std::collections::hash_map::Entry::Occupied(entry) => {
+                                if *entry.get() != b.name.0.as_str() {
+                                    d.add(format!(
+                                        "`race` branches `${}` and `${}` both bind `${}` — \
+                                         concurrent branches must bind disjoint symbols",
+                                        entry.get(),
+                                        b.name.0,
+                                        entry.key()
+                                    ));
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(b.name.0.as_str());
+                            }
+                        }
                     }
                     check_body(&b.body, "body", ops, bound, d);
                 });
@@ -2824,6 +2905,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cleanup_scopes_inside_timeout_are_rejected() {
+        let ops = catalog();
+        for cleanup in [
+            Node::CapScope {
+                tools: vec!["read".into()],
+                body: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                }],
+                bind: None,
+            },
+            Node::Scope {
+                acquire: None,
+                bind: None,
+                body: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                }],
+                finally: vec![Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                }],
+            },
+        ] {
+            let bad = DraftAst {
+                body: vec![Node::Timeout {
+                    ms: 10,
+                    body: vec![cleanup],
+                    bind: None,
+                }],
+                ..Default::default()
+            };
+            let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+            assert!(
+                err.iter().any(|d| d.message.contains("cleanup scope")
+                    && d.message.contains("`timeout`")),
+                "expected timeout cleanup-safety diagnostic, got: {:?}",
+                err.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn scope_with_finally_inside_race_branch_is_rejected() {
+        use crate::ast::Branch;
+        let ops = catalog();
+        let bad = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 100,
+                branches: vec![Branch {
+                    name: "cleanup".into(),
+                    body: vec![Node::Scope {
+                        acquire: None,
+                        bind: None,
+                        body: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                        finally: vec![Node::Call {
+                            op: "read".into(),
+                            args: vec![],
+                        }],
+                    }],
+                }],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("cleanup scope") && d.message.contains("`race`")),
+            "expected race cleanup-safety diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     /// A sequential `with_tools` — nested inside `when`, a non-concurrent control construct — is
     /// unaffected by this guard and still analyzes clean.
     #[test]
@@ -3766,6 +3925,63 @@ mod tests {
                         }],
                     },
                 ],
+            }],
+            ..Default::default()
+        };
+        assert!(analyze_flow(&good, &ops, &HashSet::new()).is_ok());
+    }
+
+    #[test]
+    fn race_cross_branch_binds_are_rejected() {
+        use crate::ast::Branch;
+        let ops = catalog();
+        let bind = |name: &str, value: i64| Node::Bind {
+            name: name.into(),
+            value: Box::new(Node::Lit {
+                value: serde_json::json!(value),
+            }),
+            ty: None,
+            effect: None,
+        };
+        let bad = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 100,
+                branches: vec![
+                    Branch {
+                        name: "first".into(),
+                        body: vec![bind("shared", 1)],
+                    },
+                    Branch {
+                        name: "second".into(),
+                        body: vec![bind("shared", 2)],
+                    },
+                ],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&bad, &ops, &HashSet::new()).unwrap_err();
+        assert!(
+            err.iter().any(|d| d.message.contains("`race` branches")
+                && d.message.contains("both bind `$shared`")),
+            "expected a race bind-disjointness diagnostic, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let good = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 100,
+                branches: vec![
+                    Branch {
+                        name: "first".into(),
+                        body: vec![bind("left", 1)],
+                    },
+                    Branch {
+                        name: "second".into(),
+                        body: vec![bind("right", 2)],
+                    },
+                ],
+                bind: Some("winner".into()),
             }],
             ..Default::default()
         };

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
@@ -19,7 +20,7 @@ use flux_spec::{
 };
 use flux_system::net::PrivateNetAllow;
 
-use crate::WebOptions;
+use crate::{egress, WebOptions};
 
 /// Cap on the response body handed to the model (bytes, cut on a char boundary). Mirrors the
 /// `web_fetch` `MAX_BYTES` precedent.
@@ -44,7 +45,7 @@ pub struct HttpRequestTool {
 impl HttpRequestTool {
     pub fn new(opts: &WebOptions) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: egress::redirect_disabled_client(),
             private_net: opts.private_net.clone(),
             audit: opts.audit.clone(),
             grant_source: opts
@@ -152,34 +153,57 @@ impl Tool for HttpRequestTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        let mut req = self
-            .http
-            .request(method, url.clone())
-            .timeout(Duration::from_secs(timeout));
-
         // Headers — resolving `{"$secret": "ENV"}` markers to their env values and seeding the
         // redactor so a token in a header never surfaces readable in output or persisted events.
+        let mut request_headers = HeaderMap::new();
         if let Some(headers) = params.get("headers").and_then(Value::as_object) {
             for (name, val) in headers {
                 let resolved = resolve_header_value(val, ctx)?;
-                req = req.header(name, resolved);
+                let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    Error::Other(format!("http.request: invalid header name `{name}`: {e}"))
+                })?;
+                let value = HeaderValue::from_str(&resolved).map_err(|e| {
+                    Error::Other(format!(
+                        "http.request: invalid value for header `{name}`: {e}"
+                    ))
+                })?;
+                request_headers.insert(name, value);
             }
         }
-        if let Some(body) = params.get("body").and_then(Value::as_str) {
-            req = req.body(body.to_string());
+        let body = params
+            .get("body")
+            .and_then(Value::as_str)
+            .map(|body| body.as_bytes().to_vec());
+
+        let response = egress::send_guarded(
+            &self.http,
+            egress::GuardedRequest {
+                url,
+                method,
+                headers: request_headers,
+                body,
+                timeout: Duration::from_secs(timeout),
+            },
+            "http.request",
+            |raw| flux_system::net::guard_url_scoped(raw, &self.private_net),
+            |url| {
+                if let Some(host) = url.host_str() {
+                    self.audit_admit(host);
+                }
+            },
+        )
+        .await?;
+
+        let status = response.status();
+        let headers_text = render_headers(response.headers());
+        let capped = egress::read_body_capped(response, MAX_BODY_BYTES, "http.request").await?;
+        let mut body = cap_str(
+            String::from_utf8_lossy(&capped.bytes).into_owned(),
+            MAX_BODY_BYTES,
+        );
+        if capped.truncated && !body.ends_with("…[truncated]") {
+            body.push_str("\n…[truncated]");
         }
-
-        let resp = req.send().await.map_err(|e| Error::Http(e.to_string()))?;
-
-        // The request went out; if the guard admitted a private host, that's the auditable event.
-        if let Some(host) = url.host_str() {
-            self.audit_admit(host);
-        }
-
-        let status = resp.status();
-        let headers_text = render_headers(resp.headers());
-        let bytes = resp.bytes().await.map_err(|e| Error::Http(e.to_string()))?;
-        let body = cap_str(String::from_utf8_lossy(&bytes).into_owned(), MAX_BODY_BYTES);
 
         // A completed request is a successful op: the HTTP status (incl. 4xx/5xx) is *data*, carried
         // in the first line — never a tool-level error.
@@ -293,6 +317,47 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Two one-shot servers: the first redirects to the second, which returns `final_body` and
+    /// reports the raw request headers it received. `initial_host` controls the spelling used for
+    /// the first URL so tests can grant `localhost` without also granting the `127.0.0.1` target.
+    async fn redirect_to_loopback(
+        initial_host: &str,
+        final_body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = target.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{final_body}",
+                    final_body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_port = source.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = source.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: http://{target_addr}/final\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (
+            format!("http://{initial_host}:{source_port}/start"),
+            seen_rx,
+        )
+    }
+
     fn tool(private_net: PrivateNetAllow) -> HttpRequestTool {
         HttpRequestTool::new(&WebOptions {
             private_net,
@@ -322,6 +387,57 @@ mod tests {
             err.is_err(),
             "a loopback target must be refused without a `web` grant"
         );
+    }
+
+    #[tokio::test]
+    async fn redirect_target_is_guarded_before_the_second_request() {
+        let (url, _seen) = redirect_to_loopback("localhost", "must not arrive").await;
+        let t = tool(PrivateNetAllow::from_hosts(["localhost".to_string()]));
+        let err = t
+            .execute(&ctx(), json!({ "url": url }))
+            .await
+            .expect_err("the ungranted loopback redirect target must be refused");
+        assert!(
+            err.to_string().contains("private/loopback"),
+            "the shared SSRF guard names the denial: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_drops_all_caller_headers() {
+        let (url, seen) = redirect_to_loopback("127.0.0.1", "ok").await;
+        let t = tool(PrivateNetAllow::Any);
+        let result = t
+            .execute(
+                &ctx(),
+                json!({
+                    "url": url,
+                    "headers": {
+                        "Authorization": "Bearer caller-secret",
+                        "Cookie": "session=caller-secret",
+                        "Proxy-Authorization": "Basic caller-secret",
+                        "X-Api-Key": "caller-secret",
+                        "X-Custom": "also-sensitive"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.content.ends_with("ok"));
+        let request = seen.await.expect("redirect destination received a request");
+        let lower = request.to_ascii_lowercase();
+        for name in [
+            "authorization:",
+            "cookie:",
+            "proxy-authorization:",
+            "x-api-key:",
+            "x-custom:",
+        ] {
+            assert!(
+                !lower.contains(name),
+                "cross-origin redirect forwarded {name}: {request}"
+            );
+        }
     }
 
     /// Records `record_private_admit` calls so the audit path can be asserted without an event store.

@@ -70,6 +70,71 @@ async fn host_services_plugin_capability_callback() {
     host.shutdown().await.unwrap();
 }
 
+struct BlockingCaps {
+    entered: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl HostCapabilities for BlockingCaps {
+    async fn handle(&self, _command: &str, _payload: &Value) -> Result<Value, String> {
+        self.entered.add_permits(1);
+        std::future::pending().await
+    }
+}
+
+/// Cancelling an operation while its plugin is blocked in a host callback must not leave the
+/// callback frame half-consumed. The next dispatch either owns a clean protocol session or restarts
+/// one; it must never feed an operation request to the guest's callback-response reader and hang.
+#[tokio::test]
+async fn cancellation_during_callback_does_not_desynchronize_next_dispatch() {
+    let exe = env!("CARGO_BIN_EXE_caps_plugin");
+    let system = test_system();
+    let host = Arc::new(tokio::sync::Mutex::new(
+        PluginHost::spawn(&system, exe, &[]).await.unwrap(),
+    ));
+    let blocking = Arc::new(BlockingCaps {
+        entered: tokio::sync::Semaphore::new(0),
+    });
+
+    let cancelled = tokio::spawn({
+        let host = host.clone();
+        let blocking = blocking.clone();
+        async move {
+            host.lock()
+                .await
+                .call_with_host("viahost", json!({"msg": "cancel me"}), blocking.as_ref())
+                .await
+        }
+    });
+    blocking
+        .entered
+        .acquire()
+        .await
+        .expect("callback entered")
+        .forget();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        host.lock()
+            .await
+            .call_with_host("viahost", json!({"msg": "after cancel"}), &PingCaps)
+            .await
+    })
+    .await
+    .expect("next dispatch must not deadlock on the abandoned callback")
+    .expect("a fresh protocol session handles the next dispatch");
+    assert_eq!(next["host_said"]["pong"], "after cancel");
+
+    Arc::try_unwrap(host)
+        .ok()
+        .expect("host is sole owner")
+        .into_inner()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn plugin_cannot_read_host_env() {
     // The invariant D-22 enforces: a plugin process is launched env-cleared (the single guarded spawn

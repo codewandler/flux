@@ -137,6 +137,7 @@ impl WorkspaceConfig {
 
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Default `provider/model` spec (a CLI `--model` flag overrides this).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +683,12 @@ mod tests {
 
     fn write_project(cwd: &Path, body: &str) {
         std::fs::write(cwd.join(".flux").join("config.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn unknown_top_level_config_key_is_rejected() {
+        let err = toml::from_str::<Config>("future_knob = true").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

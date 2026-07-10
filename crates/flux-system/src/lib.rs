@@ -18,6 +18,14 @@ pub mod net;
 // Workspace
 // ---------------------------------------------------------------------------
 
+/// Whether a filesystem permission subject will be used for a read or a write. Reads may resolve
+/// through configured read-only roots; writes remain confined to writable workspace roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccess {
+    Read,
+    Write,
+}
+
 /// A bounded filesystem view: a primary root plus optional `@named` roots. All access is confined
 /// to these roots.
 ///
@@ -139,6 +147,48 @@ impl Workspace {
         self.resolve_in(input, true)
     }
 
+    /// Return the physical permission identity for `input`, following every existing symlink while
+    /// preserving a not-yet-existing tail for create paths. Workspace-relative inputs stay relative
+    /// (so existing permission rules keep their shape); absolute inputs stay absolute; `@named`
+    /// inputs retain that namespace when the physical target remains under the named root.
+    pub fn path_identity(&self, input: &str, access: PathAccess) -> Result<String> {
+        let resolved = match access {
+            PathAccess::Read => self.resolve_read(input)?,
+            PathAccess::Write => self.resolve(input)?,
+        };
+        let physical = canonicalize_existing_ancestor(&resolved)?;
+        self.render_path_identity(input, &physical)
+    }
+
+    fn render_path_identity(&self, input: &str, physical: &Path) -> Result<String> {
+        if let Some(rest) = input.strip_prefix('@') {
+            let name = rest.split('/').next().unwrap_or(rest);
+            if let Some(base) = self.named.get(name) {
+                if let Ok(rel) = physical.strip_prefix(base) {
+                    let rel = path_to_utf8(rel)?;
+                    return Ok(if rel.is_empty() {
+                        format!("@{name}")
+                    } else {
+                        format!("@{name}/{rel}")
+                    });
+                }
+            }
+        }
+
+        let expanded = expand_home_input(input);
+        if Path::new(expanded.as_ref()).is_absolute() {
+            return path_to_utf8(physical);
+        }
+        if let Ok(rel) = physical.strip_prefix(&self.root) {
+            let rel = path_to_utf8(rel)?;
+            return Ok(if rel.is_empty() { ".".to_string() } else { rel });
+        }
+        // This is reachable only for an unconfined workspace or a named/read root whose namespace
+        // could not be preserved. Keep the physical absolute identity rather than falling back to
+        // the caller's alias.
+        path_to_utf8(physical)
+    }
+
     /// The shared resolver. `read_extra` widens the acceptable roots to include the read-only roots (the
     /// read path). When `unconfined` is set, confinement is lifted entirely.
     fn resolve_in(&self, input: &str, read_extra: bool) -> Result<PathBuf> {
@@ -150,18 +200,7 @@ impl Workspace {
         // Reject it loudly here instead of silently writing a poltergeist file.
         // Expand a leading `~` to the home directory so callers can write
         // `~/.flux/sessions.db` instead of needing the literal absolute path.
-        let input = if let Some(rest) = input.strip_prefix('~') {
-            // `~` alone or `~/...` — expand to $HOME.
-            if rest.is_empty() || rest.starts_with('/') {
-                let home = std::env::var("HOME").unwrap_or_default();
-                std::borrow::Cow::Owned(format!("{home}{rest}"))
-            } else {
-                // `~username/...` — not supported; leave as-is.
-                std::borrow::Cow::Borrowed(input)
-            }
-        } else {
-            std::borrow::Cow::Borrowed(input)
-        };
+        let input = expand_home_input(input);
         let input = input.as_ref();
 
         if let Some(pos) = input.bytes().position(|b| b.is_ascii_control()) {
@@ -215,9 +254,20 @@ impl Workspace {
         // `Path::exists()` (which follows links, so a *dangling* symlink to an outside target reads
         // as "not existing"), this uses `symlink_metadata` and so also catches symlinks whose
         // targets don't exist yet — the case a plain parent-canonicalize misses on write.
-        resolve_within_root(base, &norm).map_err(|_| {
+        let resolved = resolve_within_root(base, &norm).map_err(|_| {
             Error::Config(format!("path {input:?} resolves outside the allowed roots"))
-        })
+        })?;
+        // A symlink target may itself contain an intermediate symlink. Canonicalizing the longest
+        // existing ancestor catches that second-order alias while retaining a missing create tail.
+        let physical = canonicalize_existing_ancestor(&resolved).map_err(|_| {
+            Error::Config(format!("path {input:?} resolves outside the allowed roots"))
+        })?;
+        if !physical.starts_with(base) {
+            return Err(Error::Config(format!(
+                "path {input:?} resolves outside the allowed roots"
+            )));
+        }
+        Ok(physical)
     }
 
     fn base_for<'a>(&self, input: &'a str) -> (PathBuf, &'a str) {
@@ -233,6 +283,22 @@ impl Workspace {
         }
         (self.root.clone(), input)
     }
+}
+
+fn expand_home_input(input: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = input.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            return std::borrow::Cow::Owned(format!("{home}{rest}"));
+        }
+    }
+    std::borrow::Cow::Borrowed(input)
+}
+
+fn path_to_utf8(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| Error::Config(format!("resolved path {:?} is not valid UTF-8", path)))
 }
 
 /// Lexically normalize an absolute path (resolve `.`/`..` without touching the filesystem),
@@ -296,17 +362,275 @@ fn resolve_within_root(base: &Path, norm: &Path) -> std::result::Result<PathBuf,
     Ok(real)
 }
 
+/// Canonicalize the longest existing ancestor and append any missing tail unchanged. This gives
+/// create paths the same physical identity as existing paths without requiring the leaf to exist.
+fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut physical) => {
+                for component in missing.iter().rev() {
+                    physical.push(component);
+                }
+                return Ok(normalize_lexically(&physical));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name() else {
+                    return Err(Error::Io(err));
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = cursor.parent() else {
+                    return Err(Error::Io(err));
+                };
+                cursor = parent;
+            }
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+}
+
+const PROCESS_OUTPUT_CAP: usize = 1024 * 1024;
+const OUTPUT_TRUNCATION_NOTICE: &str = "\n…[output truncated]";
+
 /// Decode captured subprocess output, capping it at `max` bytes so a runaway command can't OOM the
 /// host. Truncating a byte slice mid-codepoint is safe: `from_utf8_lossy` emits replacement chars
 /// rather than panicking (unlike `String::truncate`, which panics off a char boundary).
+#[cfg(test)]
 fn capped_lossy(bytes: &[u8], max: usize) -> String {
     if bytes.len() <= max {
         String::from_utf8_lossy(bytes).into_owned()
     } else {
         let mut s = String::from_utf8_lossy(&bytes[..max]).into_owned();
-        s.push_str("\n…[output truncated]");
+        s.push_str(OUTPUT_TRUNCATION_NOTICE);
         s
     }
+}
+
+/// A stream captured while the child is running. `bytes` never exceeds [`PROCESS_OUTPUT_CAP`]; the
+/// reader continues draining after the cap so a full pipe cannot deadlock the child.
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedCapture {
+    fn into_lossy(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.truncated {
+            text.push_str(OUTPUT_TRUNCATION_NOTICE);
+        }
+        text
+    }
+}
+
+async fn capture_bounded<R>(mut reader: R) -> std::io::Result<BoundedCapture>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut bytes = Vec::with_capacity(8192.min(PROCESS_OUTPUT_CAP));
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let room = PROCESS_OUTPUT_CAP.saturating_sub(bytes.len());
+        let keep = read.min(room);
+        bytes.extend_from_slice(&chunk[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(BoundedCapture { bytes, truncated })
+}
+
+/// A process group created for one guarded child. On Unix every child starts as the leader of its
+/// own group, allowing timeout/cancellation cleanup to stop descendants without signalling flux's
+/// own process group. Other platforms retain direct-child `kill_on_drop` cleanup.
+#[derive(Clone, Copy)]
+struct ProcessGroup {
+    #[cfg(unix)]
+    id: Option<libc::pid_t>,
+}
+
+impl ProcessGroup {
+    fn for_child(child: &tokio::process::Child) -> Self {
+        #[cfg(unix)]
+        {
+            let id = child.id().and_then(|id| libc::pid_t::try_from(id).ok());
+            Self { id }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Self {}
+        }
+    }
+
+    fn terminate(self) {
+        #[cfg(unix)]
+        if let Some(id) = self.id.filter(|id| *id > 0) {
+            // SAFETY: `id` is the positive PID of a child that `build_command` placed in a fresh
+            // process group with PGID == PID. `SIGKILL` is used only for timeout/cancellation or to
+            // clean up descendants after their direct parent has exited.
+            let _ = unsafe { libc::killpg(id, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Owns a child until it has been reaped. Its drop path is cancellation-safe: it terminates the
+/// dedicated process group before Tokio's `kill_on_drop` handles the direct child.
+struct GuardedChild {
+    child: tokio::process::Child,
+    group: ProcessGroup,
+    reaped: bool,
+}
+
+impl GuardedChild {
+    fn new(child: tokio::process::Child) -> Self {
+        let group = ProcessGroup::for_child(&child);
+        Self {
+            child,
+            group,
+            reaped: false,
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        if status.is_ok() {
+            self.reaped = true;
+        }
+        status
+    }
+
+    fn terminate_tree(&mut self) {
+        self.group.terminate();
+        let _ = self.child.start_kill();
+    }
+
+    fn terminate_descendants(&self) {
+        self.group.terminate();
+    }
+}
+
+impl Drop for GuardedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.terminate_tree();
+        }
+    }
+}
+
+enum ProcessStop {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    CallerDropped,
+}
+
+type CaptureTask = tokio::task::JoinHandle<std::io::Result<BoundedCapture>>;
+
+async fn capture_result(task: Option<CaptureTask>, stream: &str) -> Result<String> {
+    let Some(task) = task else {
+        return Ok(String::new());
+    };
+    let captured = task
+        .await
+        .map_err(|e| Error::Other(format!("{stream} capture task failed: {e}")))?
+        .map_err(|e| Error::Other(format!("read child {stream}: {e}")))?;
+    Ok(captured.into_lossy())
+}
+
+async fn discard_capture(task: Option<CaptureTask>) {
+    if let Some(task) = task {
+        let _ = task.await;
+    }
+}
+
+/// Drive one child independently of its caller's future. The result channel closing is an explicit
+/// cancellation signal, so dropping/aborting `run*` still leaves this task alive long enough to
+/// kill the process group and reap the direct child.
+async fn drive_process(
+    child: tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    program: String,
+    timeout: Duration,
+    mut result_tx: tokio::sync::oneshot::Sender<Result<ProcessOutput>>,
+) {
+    let stdout_task = stdout.map(|stream| tokio::spawn(capture_bounded(stream)));
+    let stderr_task = stderr.map(|stream| tokio::spawn(capture_bounded(stream)));
+    let mut child = GuardedChild::new(child);
+
+    let stop = tokio::select! {
+        _ = result_tx.closed() => ProcessStop::CallerDropped,
+        _ = tokio::time::sleep(timeout) => ProcessStop::TimedOut,
+        status = child.wait() => ProcessStop::Exited(status),
+    };
+
+    match stop {
+        ProcessStop::Exited(Ok(status)) => {
+            // A command that backgrounds work can exit while descendants still hold the pipes.
+            // Stop that work before awaiting EOF; the direct child has already been reaped.
+            child.terminate_descendants();
+            let stdout = capture_result(stdout_task, "stdout").await;
+            let stderr = capture_result(stderr_task, "stderr").await;
+            let result = match (stdout, stderr) {
+                (Ok(stdout), Ok(stderr)) => Ok(ProcessOutput {
+                    stdout,
+                    stderr,
+                    exit_code: status.code().unwrap_or(-1),
+                }),
+                (Err(err), _) | (_, Err(err)) => Err(err),
+            };
+            let _ = result_tx.send(result);
+        }
+        ProcessStop::Exited(Err(err)) => {
+            child.terminate_tree();
+            let _ = child.wait().await;
+            discard_capture(stdout_task).await;
+            discard_capture(stderr_task).await;
+            let _ = result_tx.send(Err(Error::Other(format!("wait {program}: {err}"))));
+        }
+        ProcessStop::TimedOut => {
+            child.terminate_tree();
+            let cleanup = child.wait().await;
+            discard_capture(stdout_task).await;
+            discard_capture(stderr_task).await;
+            let message = match cleanup {
+                Ok(_) => format!("command timed out after {}s", timeout.as_secs()),
+                Err(err) => format!(
+                    "command timed out after {}s (failed to reap {program}: {err})",
+                    timeout.as_secs()
+                ),
+            };
+            let _ = result_tx.send(Err(Error::Other(message)));
+        }
+        ProcessStop::CallerDropped => {
+            child.terminate_tree();
+            let _ = child.wait().await;
+            discard_capture(stdout_task).await;
+            discard_capture(stderr_task).await;
+        }
+    }
+}
+
+async fn await_process(
+    child: tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    program: String,
+    timeout: Duration,
+) -> Result<ProcessOutput> {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(drive_process(
+        child, stdout, stderr, program, timeout, result_tx,
+    ));
+    result_rx
+        .await
+        .map_err(|_| Error::Other("process driver stopped without a result".to_string()))?
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +643,14 @@ pub struct ProcessOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+/// A bounded host-file read admitted by an explicit physical path scope.
+#[derive(Debug, Clone)]
+pub struct ScopedFileRead {
+    pub bytes: Vec<u8>,
+    pub size: u64,
+    pub truncated: bool,
 }
 
 /// Liveness of a [`ManagedChild`] (non-blocking snapshot from [`ManagedChild::status`]).
@@ -345,6 +677,7 @@ const MANAGED_OUTPUT_CAP: usize = 256 * 1024;
 /// tasks. Dropping the handle kills the child (`kill_on_drop`).
 pub struct ManagedChild {
     child: tokio::process::Child,
+    group: Option<ProcessGroup>,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
     stdout_task: Option<tokio::task::JoinHandle<()>>,
@@ -354,7 +687,7 @@ pub struct ManagedChild {
 impl ManagedChild {
     /// Drain and return whatever stdout/stderr has accumulated since the last call, clearing the
     /// buffers. Bytes are decoded with `from_utf8_lossy` (never panics off a UTF-8 boundary, the same
-    /// guarantee as [`capped_lossy`]); a multibyte codepoint straddling two reads degrades to a
+    /// guarantee as `String::from_utf8_lossy`; a multibyte codepoint straddling two reads degrades to a
     /// replacement char rather than erroring.
     pub fn read_output(&mut self) -> (String, String) {
         let out = drain_locked(&self.stdout_buf);
@@ -368,10 +701,17 @@ impl ManagedChild {
     /// Non-blocking liveness check (via `try_wait`): does not reap-block on a still-running child.
     pub fn status(&mut self) -> ChildStatus {
         match self.child.try_wait() {
-            Ok(Some(es)) => ChildStatus {
-                running: false,
-                exit_code: es.code(),
-            },
+            Ok(Some(es)) => {
+                // Reaping makes the numeric PID available for reuse. Stop any descendants now,
+                // then forget the group so a much later handle drop can never signal a reused ID.
+                if let Some(group) = self.group.take() {
+                    group.terminate();
+                }
+                ChildStatus {
+                    running: false,
+                    exit_code: es.code(),
+                }
+            }
             Ok(None) => ChildStatus {
                 running: true,
                 exit_code: None,
@@ -387,6 +727,9 @@ impl ManagedChild {
 
     /// Kill the child and abort the stdout/stderr drain tasks. Idempotent.
     pub fn kill(&mut self) {
+        if let Some(group) = self.group {
+            group.terminate();
+        }
         let _ = self.child.start_kill();
         if let Some(t) = self.stdout_task.take() {
             t.abort();
@@ -394,6 +737,12 @@ impl ManagedChild {
         if let Some(t) = self.stderr_task.take() {
             t.abort();
         }
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -472,6 +821,85 @@ impl System {
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// Derive the physical permission identity for a caller-supplied workspace path.
+    pub fn path_identity(&self, path: &str, access: PathAccess) -> Result<String> {
+        self.workspace.path_identity(path, access)
+    }
+
+    /// Read a host file through an explicit exact, `/*`, or `/**` scope. Both the scope anchor and
+    /// requested path are reduced to physical identities before matching, so a lexical in-scope
+    /// symlink cannot reach an out-of-scope target. This is the guarded host-file seam used by
+    /// plugin `fs.read`; it deliberately does not widen the workspace itself.
+    pub async fn read_file_scoped(
+        &self,
+        path: &str,
+        scope: &str,
+        max_bytes: usize,
+    ) -> Result<ScopedFileRead> {
+        use tokio::io::AsyncReadExt as _;
+
+        let requested = canonicalize_existing_ancestor(&self.host_path(path)?)?;
+        let (scope_root, recursive, direct_children) = if let Some(root) = scope.strip_suffix("/**")
+        {
+            (root, true, false)
+        } else if let Some(root) = scope.strip_suffix("/*") {
+            (root, false, true)
+        } else {
+            (scope.trim_end_matches('/'), false, false)
+        };
+        let scope_root = canonicalize_existing_ancestor(&self.host_path(scope_root)?)?;
+        let admitted = if recursive {
+            requested == scope_root || requested.starts_with(&scope_root)
+        } else if direct_children {
+            requested
+                .strip_prefix(&scope_root)
+                .ok()
+                .is_some_and(|rel| rel.components().count() == 1)
+        } else {
+            requested == scope_root
+        };
+        if !admitted {
+            return Err(Error::Config(format!(
+                "path {path:?} resolves outside scoped path {scope:?}"
+            )));
+        }
+
+        let file = tokio::fs::File::open(&requested).await?;
+        let metadata = file.metadata().await?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(usize::MAX)
+                .min(max_bytes.saturating_add(1)),
+        );
+        let mut limited = file.take((max_bytes as u64).saturating_add(1));
+        limited.read_to_end(&mut bytes).await?;
+        let truncated = bytes.len() > max_bytes || metadata.len() > max_bytes as u64;
+        bytes.truncate(max_bytes);
+        Ok(ScopedFileRead {
+            size: metadata.len().max(bytes.len() as u64),
+            bytes,
+            truncated,
+        })
+    }
+
+    fn host_path(&self, input: &str) -> Result<PathBuf> {
+        let expanded = expand_home_input(input);
+        if let Some(pos) = expanded.bytes().position(|byte| byte.is_ascii_control()) {
+            return Err(Error::Config(format!(
+                "path {input:?} contains a control byte at offset {pos}"
+            )));
+        }
+        let path = Path::new(expanded.as_ref());
+        let joined;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            joined = self.workspace.root().join(path);
+            &joined
+        };
+        Ok(normalize_lexically(path))
     }
 
     /// Read a UTF-8 file from within the workspace (or any read-only root, C-21).
@@ -684,27 +1112,34 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let mut cmd = self.build_command(argv, env)?;
-        cmd.stdin(std::process::Stdio::null());
-        let program = &argv[0];
+        let mut cmd = self.build_command(argv, env, true)?;
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let program = argv[0].clone();
 
-        let fut = cmd.output();
-        let output = match tokio::time::timeout(timeout, fut).await {
-            Ok(r) => r.map_err(|e| Error::Other(format!("spawn {program}: {e}")))?,
-            Err(_) => {
-                return Err(Error::Other(format!(
-                    "command timed out after {}s",
-                    timeout.as_secs()
-                )))
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let mut child = GuardedChild::new(child);
+                child.terminate_tree();
+                let _ = child.wait().await;
+                return Err(Error::Other("child stdout unavailable".to_string()));
             }
         };
-        // Cap captured output so a command emitting gigabytes can't exhaust host memory.
-        const MAX_OUTPUT: usize = 1024 * 1024;
-        Ok(ProcessOutput {
-            stdout: capped_lossy(&output.stdout, MAX_OUTPUT),
-            stderr: capped_lossy(&output.stderr, MAX_OUTPUT),
-            exit_code: output.status.code().unwrap_or(-1),
-        })
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let mut child = GuardedChild::new(child);
+                child.terminate_tree();
+                let _ = child.wait().await;
+                return Err(Error::Other("child stderr unavailable".to_string()));
+            }
+        };
+        await_process(child, Some(stdout), Some(stderr), program, timeout).await
     }
 
     /// Scrub a command's environment to the minimal non-secret allow-list, then apply caller
@@ -745,19 +1180,32 @@ impl System {
     /// Build a child process command with flux's **single safety envelope** applied: argv-only (no
     /// shell; `program = argv[0]`), working directory pinned to the workspace root, and the
     /// environment cleared then restricted to the minimal non-secret allow-list plus the caller's
-    /// explicit (non-model) overrides. This is the **one place** flux constructs an OS process — every
-    /// spawn mode (`run_with_env`, `run_with_env_streamed`, `spawn_background`, `spawn_interactive`)
-    /// layers only its own stdio on top of the command this returns, so the envelope has no bypass.
+    /// explicit (non-model) overrides. Children are `kill_on_drop`; controlled run/background paths
+    /// request a fresh Unix process group so they can terminate descendants. Interactive/debug-pipe
+    /// children remain in flux's process group because their callers own the raw child handle and
+    /// cannot yet perform group-aware cleanup. This is the **one place** flux constructs an OS
+    /// process — every spawn mode (`run_with_env`, `run_with_env_streamed`, `spawn_background`,
+    /// `spawn_interactive`) layers only its own stdio on top of the command this returns, so the
+    /// envelope has no bypass.
     fn build_command(
         &self,
         argv: &[String],
         env: &[(String, String)],
+        isolate_process_group: bool,
     ) -> Result<tokio::process::Command> {
         let Some((program, args)) = argv.split_first() else {
             return Err(Error::Other("empty command".to_string()));
         };
         let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args).current_dir(self.workspace.root());
+        cmd.args(args)
+            .current_dir(self.workspace.root())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        if isolate_process_group {
+            cmd.process_group(0);
+        }
+        #[cfg(not(unix))]
+        let _ = isolate_process_group;
         Self::apply_safe_env(&mut cmd, env);
         Ok(cmd)
     }
@@ -773,31 +1221,16 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let mut cmd = self.build_command(argv, env)?;
+        let mut cmd = self.build_command(argv, env, true)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
-        let program = &argv[0];
+            .stderr(std::process::Stdio::inherit());
+        let program = argv[0].clone();
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
-        let status = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(r) => r.map_err(|e| Error::Other(format!("wait {program}: {e}")))?,
-            Err(_) => {
-                let _ = child.start_kill();
-                return Err(Error::Other(format!(
-                    "command timed out after {}s",
-                    timeout.as_secs()
-                )));
-            }
-        };
-        Ok(ProcessOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: status.code().unwrap_or(-1),
-        })
+        await_process(child, None, None, program, timeout).await
     }
 
     /// Spawn a **long-lived background** child without awaiting it — for host-managed processes such
@@ -815,7 +1248,7 @@ impl System {
         argv: &[String],
         env: &[(String, String)],
     ) -> Result<ManagedChild> {
-        let mut cmd = self.build_command(argv, env)?;
+        let mut cmd = self.build_command(argv, env, true)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -825,6 +1258,7 @@ impl System {
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
+        let group = ProcessGroup::for_child(&child);
         let stdout = child
             .stdout
             .take()
@@ -841,6 +1275,7 @@ impl System {
             tokio::spawn(drain_stream(stderr, stderr_buf.clone(), MANAGED_OUTPUT_CAP));
         Ok(ManagedChild {
             child,
+            group: Some(group),
             stdout_buf,
             stderr_buf,
             stdout_task: Some(stdout_task),
@@ -856,7 +1291,7 @@ impl System {
     /// restricted to the minimal allow-list — so the plugin process **cannot read the host's
     /// secrets**; it must request them back through the gated host capabilities. `kill_on_drop`.
     pub fn spawn_interactive(&self, argv: &[String]) -> Result<InteractiveChild> {
-        let mut cmd = self.build_command(argv, &[])?;
+        let mut cmd = self.build_command(argv, &[], false)?;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -898,7 +1333,7 @@ impl System {
             .map_err(|e| Error::Other(format!("cdp socketpair: {e}")))?;
         let child_fd = child_end.as_raw_fd();
 
-        let mut cmd = self.build_command(argv, env)?;
+        let mut cmd = self.build_command(argv, env, false)?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1191,6 +1626,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_escape_hidden_in_symlink_targets_intermediate_component() {
+        let (dir, sys) = temp_workspace();
+        std::os::unix::fs::symlink("/etc", dir.join("stage")).unwrap();
+        std::os::unix::fs::symlink("stage/hostname", dir.join("indirect")).unwrap();
+        assert!(
+            sys.read_file("indirect").await.is_err(),
+            "an intermediate symlink inside another link target must not escape confinement"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn rejects_dangling_symlink_escape_on_write() {
         let (dir, sys) = temp_workspace();
@@ -1223,6 +1671,24 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("realdir"), dir.join("link")).unwrap();
         sys.write_file("link/a.txt", "hi").await.unwrap();
         assert_eq!(sys.read_file("realdir/a.txt").await.unwrap(), "hi");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_follows_symlink_and_preserves_missing_create_tail() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("flux-sys-path-id-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(dir.join("allowed/real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("allowed/alias")).unwrap();
+        let workspace = Workspace::new(&dir).unwrap();
+
+        assert_eq!(
+            workspace
+                .path_identity("allowed/alias/new/deep.txt", PathAccess::Write)
+                .unwrap(),
+            "allowed/real/new/deep.txt"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1312,6 +1778,161 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid_file(path: &Path) -> i32 {
+        for _ in 0..200 {
+            if let Ok(raw) = tokio::fs::read_to_string(path).await {
+                if let Ok(pid) = raw.parse::<i32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("process did not publish its pid at {}", path.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_exists(pid: i32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_live(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // The command name is parenthesized and may contain spaces; the state is the first token
+        // after the final `) `. A zombie has stopped executing even if PID 1 has not reaped it yet.
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_process_tree_stopped(parent: i32, descendant: i32) {
+        for _ in 0..200 {
+            if !process_exists(parent) && !process_is_live(descendant) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !process_exists(parent),
+            "direct child {parent} was not killed and reaped"
+        );
+        assert!(
+            !process_is_live(descendant),
+            "descendant {descendant} survived process-tree cleanup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sleeping_process_tree_argv() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$$\" > parent.pid; sleep 30 & printf '%s' \"$!\" > child.pid; wait"
+                .to_string(),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_timeout_kills_reaps_child_and_stops_descendants() {
+        let (dir, sys) = temp_workspace();
+        let err = sys
+            .run(&sleeping_process_tree_argv(), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let parent = wait_for_pid_file(&dir.join("parent.pid")).await;
+        let descendant = wait_for_pid_file(&dir.join("child.pid")).await;
+        assert_process_tree_stopped(parent, descendant).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_run_kills_reaps_child_and_stops_descendants() {
+        let (dir, sys) = temp_workspace();
+        let task = tokio::spawn(async move {
+            sys.run(&sleeping_process_tree_argv(), Duration::from_secs(30))
+                .await
+        });
+        let parent = wait_for_pid_file(&dir.join("parent.pid")).await;
+        let descendant = wait_for_pid_file(&dir.join("child.pid")).await;
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_process_tree_stopped(parent, descendant).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn streamed_run_timeout_kills_reaps_child_and_stops_descendants() {
+        let (dir, sys) = temp_workspace();
+        let err = sys
+            .run_with_env_streamed(
+                &sleeping_process_tree_argv(),
+                &[],
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let parent = wait_for_pid_file(&dir.join("parent.pid")).await;
+        let descendant = wait_for_pid_file(&dir.join("child.pid")).await;
+        assert_process_tree_stopped(parent, descendant).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_caps_and_drains_both_output_streams_without_deadlock() {
+        let (dir, sys) = temp_workspace();
+        let out = sys
+            .run(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "(head -c 4194304 /dev/zero | tr '\\0' o) & \
+                     (head -c 4194304 /dev/zero | tr '\\0' e >&2) & wait"
+                        .to_string(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.contains("[output truncated]"));
+        assert!(out.stderr.contains("[output truncated]"));
+        assert!(out.stdout.len() < 2 * 1024 * 1024);
+        assert!(out.stderr.len() < 2 * 1024 * 1024);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_truncation_is_safe_across_a_utf8_boundary() {
+        let (dir, sys) = temp_workspace();
+        let out = sys
+            .run(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "head -c 1048575 /dev/zero | tr '\\0' a; printf '\\303\\251z'".to_string(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.contains('\u{fffd}'));
+        assert!(out.stdout.ends_with("\n…[output truncated]"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn spawn_background_reads_output_and_exit_code() {
         let (dir, sys) = temp_workspace();
@@ -1361,6 +1982,27 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(stopped, "killed child should stop running");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_background_kill_stops_descendants() {
+        let (dir, sys) = temp_workspace();
+        let mut child = sys
+            .spawn_background(&sleeping_process_tree_argv(), &[])
+            .unwrap();
+        let parent = wait_for_pid_file(&dir.join("parent.pid")).await;
+        let descendant = wait_for_pid_file(&dir.join("child.pid")).await;
+
+        child.kill();
+        for _ in 0..200 {
+            if !child.status().running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_process_tree_stopped(parent, descendant).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 

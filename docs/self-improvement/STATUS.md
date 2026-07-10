@@ -1,12 +1,17 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-07-06._
+_Last updated: 2026-07-10._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
 including the bugs each live run surfaced, the first kept gain, and the caveats that keep the claims
 defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
 
 ## TL;DR
+
+- **2026-07-10 audit hardening:** the improve-tbench flow now fails closed when no implementation is
+  produced, accepts fenced/prose-wrapped candidate arrays, and the eval keep-gate rejects malformed
+  or invalid telemetry instead of treating it as a cheap zero. Trial concurrency is bounded and
+  deterministic, and terminal-bench usage remains unavailable rather than falsely zero when absent.
 
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →

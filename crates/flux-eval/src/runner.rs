@@ -323,22 +323,23 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         .as_deref()
         .and_then(|id| load_usage(&events_db, id));
 
-    let passed = if timed_out {
-        false
+    let (passed, valid) = if timed_out {
+        (false, true)
     } else {
         match grade(&spec.criterion, &sys).await {
-            Ok(p) => p,
+            Ok(p) => (p, true),
             Err(e) => {
                 if note.is_none() {
                     note = Some(format!("grade error: {e}"));
                 }
-                false
+                (false, false)
             }
         }
     };
 
     Ok(RunResult {
         task_id: spec.id.clone(),
+        valid,
         passed,
         // The local adapter grades a task as a single pass/fail (no sub-checks); partial credit
         // falls back to this binary outcome in aggregation.

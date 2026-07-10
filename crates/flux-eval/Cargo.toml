@@ -19,6 +19,7 @@ schemars.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+futures.workspace = true
 toml.workspace = true
 regex.workspace = true
 

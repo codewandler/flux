@@ -122,6 +122,57 @@ fn cap_loop_feedback_with_cap(transcript: String, cap: usize) -> String {
     if total <= cap {
         return transcript;
     }
+
+    // A failed/rejected plan appends its actionable contract AFTER the often-large operation
+    // transcript. Prefix-only truncation kept old stdout and silently deleted the failure kind,
+    // failed step, and retry guidance the next planner round needs to behave correctly. Preserve
+    // the newest structured tail intact whenever it fits; ordinary success transcripts retain the
+    // historical prefix-capping behavior for cache/prompt stability.
+    const STRUCTURED_TAILS: &[&str] = &[
+        "[plan halted at step ",
+        "[plan rejected by user]",
+        "[plan error]",
+        "[loop-guard] STOP",
+    ];
+    if let Some(start) = STRUCTURED_TAILS
+        .iter()
+        .filter_map(|marker| transcript.rfind(marker))
+        .max()
+    {
+        let tail = &transcript[start..];
+        let tail_chars = tail.chars().count();
+        if tail_chars < cap {
+            let head_budget = cap - tail_chars;
+            let head: String = transcript[..start].chars().take(head_budget).collect();
+            let kept = head.chars().count() + tail_chars;
+            let omitted = total - kept;
+            return format!(
+                "{head}\n[loop-feedback truncated: {omitted} of {total} chars omitted - newest \
+                 structured failure preserved]\n{tail}"
+            );
+        }
+
+        // An unusually huge structured contract cannot fit whole. Keep its identifying prefix AND
+        // its newest guidance suffix; dropping either would turn a typed failure back into opaque
+        // output. (The truncation marker itself intentionally sits outside the content budget, as
+        // it did before.)
+        let prefix_budget = (cap / 3).max(1);
+        let suffix_budget = cap.saturating_sub(prefix_budget);
+        let prefix: String = tail.chars().take(prefix_budget).collect();
+        let suffix: String = tail
+            .chars()
+            .rev()
+            .take(suffix_budget)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let omitted = total.saturating_sub(prefix.chars().count() + suffix.chars().count());
+        return format!(
+            "{prefix}\n[loop-feedback truncated: {omitted} of {total} chars omitted inside newest \
+             structured failure]\n{suffix}"
+        );
+    }
     let kept: String = transcript.chars().take(cap).collect();
     let omitted = total - cap;
     format!(
@@ -616,6 +667,16 @@ impl EngineLoopHost {
     /// per-model attribution `turn_usage`'s single replace-style total can't express (C-06).
     pub fn turn_calls(&self) -> Vec<(String, Usage)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Account for a provider call made by turn bootstrap code outside [`Self::plan`] — currently
+    /// the pre-turn compaction summary. It joins the same replace-style turn total and per-call
+    /// attribution ledger as planner consultations, including on a mid-stream failure where usage
+    /// arrived before the error.
+    pub(crate) fn record_external_call(&self, provider: &str, model: &str, usage: Usage) {
+        self.usage.lock().unwrap().accumulate(&usage);
+        let spec = flux_core::canonical_model_spec(Some(provider), model);
+        self.calls.lock().unwrap().push((spec, usage));
     }
 
     /// Cumulative BILLED tokens across every planner call this turn (A-26): each call's OWN
@@ -2132,6 +2193,25 @@ mod tests {
         assert_eq!(
             cap_loop_feedback_with_cap("abcdef".to_string(), 0),
             "abcdef"
+        );
+    }
+
+    #[test]
+    fn loop_feedback_cap_preserves_newest_structured_failure_tail() {
+        let failure = "[plan halted at step 2 of 2] permission denied\n\
+                       step 1: completed\n\
+                       step 2: failed\n\
+                       Do not retry this denied operation unchanged.";
+        let transcript = format!("{}\n\n{failure}", "old output ".repeat(100));
+        let capped = cap_loop_feedback_with_cap(transcript, 180);
+        assert!(capped.contains("[loop-feedback truncated:"), "{capped}");
+        assert!(
+            capped.contains(failure),
+            "the newest structured failure contract must survive intact: {capped}"
+        );
+        assert!(
+            !capped.starts_with(&"old output ".repeat(20)),
+            "old bulk was capped"
         );
     }
 

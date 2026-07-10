@@ -2056,6 +2056,7 @@ dependencies = [
  "codewandler-flux-spec",
  "codewandler-flux-system",
  "codewandler-flux-tools",
+ "futures",
  "regex",
  "schemars",
  "serde",

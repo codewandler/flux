@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use futures::{stream, StreamExt};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -163,6 +164,11 @@ pub async fn run_eval(params: Value) -> Result<Value> {
         .and_then(|v| v.as_u64())
         .unwrap_or(1)
         .max(1) as usize;
+    let concurrency = params
+        .get("concurrency")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 16) as usize;
 
     // Per-eval setup (e.g. the terminal-bench adapter rebuilds the static musl binary so a candidate
     // eval reflects the worker's edits).
@@ -172,24 +178,41 @@ pub async fn run_eval(params: Value) -> Result<Value> {
         .map_err(|e| Error::Other(format!("eval_run: adapter prepare failed: {e}")))?;
 
     let task_ids = adapter.list_tasks(&filter)?;
+    // Bounded concurrency keeps expensive suites from stampeding Docker/providers. `buffered`
+    // preserves input order, so reports and audit logs remain deterministic even when trials finish
+    // out of order.
+    let jobs: Vec<String> = task_ids
+        .iter()
+        .flat_map(|id| std::iter::repeat_n(id.clone(), trials))
+        .collect();
+    let runs: Vec<RunResult> = stream::iter(jobs)
+        .map(|id| {
+            let adapter = &adapter;
+            let rc = &rc;
+            async move {
+                match adapter.run_task(&id, rc).await {
+                    Ok(r) => r,
+                    Err(e) => RunResult::failed(&id, 0, e.to_string()),
+                }
+            }
+        })
+        .buffered(concurrency)
+        .collect()
+        .await;
     let mut cases: Vec<CaseOutcome> = Vec::with_capacity(task_ids.len());
-    for id in &task_ids {
-        let mut runs: Vec<RunResult> = Vec::with_capacity(trials);
-        for _ in 0..trials {
-            let r = match adapter.run_task(id, &rc).await {
-                Ok(r) => r,
-                Err(e) => RunResult::failed(id, 0, e.to_string()),
-            };
-            runs.push(r);
-        }
-        cases.push(CaseOutcome::from_trials(id, &runs));
+    for (offset, id) in task_ids.iter().enumerate() {
+        let start = offset * trials;
+        cases.push(CaseOutcome::from_trials(id, &runs[start..start + trials]));
     }
 
     let score = SuiteScore::from_cases(&cases, |id| adapter.weight_of(id));
+    let invalid_trials: u32 = cases.iter().map(|case| case.invalid_trials).sum();
     let cases_json = serde_json::to_value(&cases).map_err(|e| Error::Other(e.to_string()))?;
     let mut report = json!({
         "adapter": adapter.name(),
         "trials": trials,
+        "valid": score.valid,
+        "invalid_trials": invalid_trials,
         "pass_rate": score.pass_rate,
         "mean_check_pass_rate": score.mean_check_pass_rate,
         "scalar": score.scalar(),
@@ -245,6 +268,8 @@ fn member_scores(cases: &[CaseOutcome], adapter: &dyn BenchmarkAdapter) -> Value
             json!({
                 "pass_rate": s.pass_rate,
                 "mean_check_pass_rate": s.mean_check_pass_rate,
+                "valid": s.valid,
+                "invalid_trials": s.invalid_trials,
                 "scalar": s.scalar(),
                 "total": s.total,
                 "passed": s.passed,
@@ -262,8 +287,13 @@ pub fn report_view(report: &Value) -> String {
         .get("adapter")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
+    let validity = if report.get("valid").and_then(Value::as_bool) == Some(true) {
+        "valid".to_string()
+    } else {
+        format!("INVALID/{} failed trial(s)", u("invalid_trials"))
+    };
     format!(
-        "eval[{}] {}/{} tasks pass-all · checks {:.0}% · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1}",
+        "eval[{}] {}/{} tasks pass-all · checks {:.0}% · score {} · {} trial(s) · mean_iters {:.1} · mean_errors {:.1} · {}",
         adapter,
         u("passed"),
         u("total"),
@@ -272,6 +302,7 @@ pub fn report_view(report: &Value) -> String {
         u("trials"),
         f("mean_iterations"),
         f("mean_tool_errors"),
+        validity,
     )
 }
 
@@ -681,7 +712,15 @@ impl Tool for ScoreCompareTool {
 /// not drop, and no member may disappear). Extracted from the op so it is unit-testable.
 fn multi_keep(baseline: &Value, candidate: &Value) -> (bool, Option<String>) {
     const EPS: f64 = 1e-9;
-    let f = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let member_metrics = |v: &Value| -> Option<(f64, f64)> {
+        if v.get("valid").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        Some((
+            v.get("pass_rate")?.as_f64()?,
+            v.get("mean_check_pass_rate")?.as_f64()?,
+        ))
+    };
     let empty = serde_json::Map::new();
     let base_members = baseline
         .get("members")
@@ -692,12 +731,16 @@ fn multi_keep(baseline: &Value, candidate: &Value) -> (bool, Option<String>) {
         .and_then(|v| v.as_object())
         .unwrap_or(&empty);
     for (name, bscore) in base_members {
+        let Some((base_pass, base_checks)) = member_metrics(bscore) else {
+            return (false, Some(format!("{name} (invalid baseline)")));
+        };
         match cand_members.get(name) {
             None => return (false, Some(format!("{name} (missing)"))),
             Some(cscore) => {
-                if f(cscore, "pass_rate") + EPS < f(bscore, "pass_rate")
-                    || f(cscore, "mean_check_pass_rate") + EPS < f(bscore, "mean_check_pass_rate")
-                {
+                let Some((candidate_pass, candidate_checks)) = member_metrics(cscore) else {
+                    return (false, Some(format!("{name} (invalid candidate)")));
+                };
+                if candidate_pass + EPS < base_pass || candidate_checks + EPS < base_checks {
                     return (false, Some(name.clone()));
                 }
             }
@@ -853,18 +896,28 @@ mod tests {
     #[test]
     fn multi_keep_rejects_a_masked_member_regression() {
         let base = serde_json::json!({
+            "valid": true,
             "pass_rate": 0.5,
+            "mean_check_pass_rate": 0.5,
+            "mean_tool_errors": 0.0,
+            "mean_iterations": 1.0,
+            "mean_tokens": null,
             "members": {
-                "syn": {"pass_rate": 0.4, "mean_check_pass_rate": 0.4},
-                "tb":  {"pass_rate": 0.6, "mean_check_pass_rate": 0.6}
+                "syn": {"valid": true, "pass_rate": 0.4, "mean_check_pass_rate": 0.4},
+                "tb":  {"valid": true, "pass_rate": 0.6, "mean_check_pass_rate": 0.6}
             }
         });
         // Combined mean rises, but `tb` regressed (0.6 → 0.3) — must be rejected.
         let masked = serde_json::json!({
+            "valid": true,
             "pass_rate": 0.6,
+            "mean_check_pass_rate": 0.6,
+            "mean_tool_errors": 0.0,
+            "mean_iterations": 1.0,
+            "mean_tokens": null,
             "members": {
-                "syn": {"pass_rate": 0.9, "mean_check_pass_rate": 0.9},
-                "tb":  {"pass_rate": 0.3, "mean_check_pass_rate": 0.3}
+                "syn": {"valid": true, "pass_rate": 0.9, "mean_check_pass_rate": 0.9},
+                "tb":  {"valid": true, "pass_rate": 0.3, "mean_check_pass_rate": 0.3}
             }
         });
         let (keep, who) = multi_keep(&base, &masked);
@@ -873,10 +926,15 @@ mod tests {
 
         // A candidate that improves overall and regresses nothing is kept.
         let good = serde_json::json!({
+            "valid": true,
             "pass_rate": 0.7,
+            "mean_check_pass_rate": 0.7,
+            "mean_tool_errors": 0.0,
+            "mean_iterations": 1.0,
+            "mean_tokens": null,
             "members": {
-                "syn": {"pass_rate": 0.5, "mean_check_pass_rate": 0.5},
-                "tb":  {"pass_rate": 0.9, "mean_check_pass_rate": 0.9}
+                "syn": {"valid": true, "pass_rate": 0.5, "mean_check_pass_rate": 0.5},
+                "tb":  {"valid": true, "pass_rate": 0.9, "mean_check_pass_rate": 0.9}
             }
         });
         let (keep2, who2) = multi_keep(&base, &good);

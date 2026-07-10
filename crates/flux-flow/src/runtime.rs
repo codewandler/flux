@@ -1355,6 +1355,23 @@ mod tests {
         }
     }
 
+    struct SlowTool;
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("slow", "slow read", json!({"type": "object"}))
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> flux_core::Result<ToolResult> {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(ToolResult::ok("slow"))
+        }
+    }
+
     /// A tool whose canonical content ("RAW") differs from its model-facing view ("VIEW").
     struct TwoFaceTool;
 
@@ -1412,6 +1429,25 @@ mod tests {
         reg.register(Arc::new(EchoTool));
         reg.register(Arc::new(GrepTool));
         let perms = PermissionManager::from_rules(&["echo".into(), "grep".into()], &[]);
+        Executor::new(
+            reg,
+            perms,
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        )
+    }
+
+    fn temp_executor_with_slow_tool() -> Executor {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-cancel-scope-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(SlowTool));
+        let perms = PermissionManager::from_rules(&["echo".into(), "slow".into()], &[]);
         Executor::new(
             reg,
             perms,
@@ -3131,6 +3167,47 @@ mod tests {
         let exit_i = kinds.iter().position(|k| *k == "cap_scope_exit").unwrap();
         assert!(enter_i < denied_i, "enter must come before the denial");
         assert!(denied_i < exit_i, "denial must come before exit");
+    }
+
+    /// Dropping the whole interpreter future (the engine's external cancellation mechanism) also
+    /// drops `ExecutorHost`, whose stored RAII guards must restore the executor's capability stack.
+    #[tokio::test]
+    async fn external_cancellation_drops_the_capability_scope_guard() {
+        let store = FlowStore::in_memory().unwrap();
+        let ex = temp_executor_with_slow_tool();
+        let ast = DraftAst {
+            body: vec![Node::CapScope {
+                tools: vec!["slow".into()],
+                body: vec![flow_bind("pending", "slow", vec![])],
+                bind: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            execute_flow(&store, &ex, "sess_cancel_scope", &ast, &mut sink),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the outer driver cancelled the flow");
+
+        // `echo` was absent from the cancelled scope. Its success proves the guard was dropped.
+        let after = DraftAst {
+            body: vec![flow_bind("after", "echo", vec![flow_lit(json!("outside"))])],
+            ..Default::default()
+        };
+        let outcome = execute_flow(&store, &ex, "sess_cancel_scope_after", &after, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "outside");
+        let kinds: Vec<String> = ex
+            .evidence()
+            .all()
+            .iter()
+            .map(|observation| observation.kind.clone())
+            .collect();
+        assert!(kinds.iter().any(|kind| kind == "cap_scope_enter"));
+        assert!(kinds.iter().any(|kind| kind == "cap_scope_exit"));
     }
 
     /// **Nesting narrows, never widens.** An inner `with_tools` cannot re-grant a tool the outer scope
