@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-07-10
+
 ### Added
 
 - **L-79 — run saved flows directly from the CLI.** `flux flow list` (alias `ls`) now prints the

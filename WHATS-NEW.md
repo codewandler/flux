@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-07-10
+
 ### New
 
 - Saved flows are now directly scriptable from the terminal. `flux flow list` shows project and
