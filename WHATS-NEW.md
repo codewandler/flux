@@ -35,6 +35,10 @@
 
 ### Improved
 
+- Self-hosted platforms can authenticate flux's Vault-backed integration credential store with a
+  Kubernetes service account instead of mounting a long-lived Vault token. Vault sessions renew and
+  recover from projected-token rotation automatically; local and CLI credential storage is unchanged.
+
 - The docs now include a step-by-step Slack setup guide — install the plugin, provide bot/user
   tokens (from your shell or stored once with `flux auth set`), verify with one command, and call
   your first operation — and the credentials guide explains how stored integration tokens work.

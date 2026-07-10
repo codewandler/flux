@@ -10,7 +10,9 @@
 //! `llm/provider/codex/auth.go`).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -571,13 +573,88 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
+/// Configuration for authenticating a [`VaultCredentialStore`] through Vault's Kubernetes auth
+/// method. The projected service-account JWT is read for every login, so kubelet token rotation is
+/// honored when a Vault lease expires or is rejected (D-130).
+#[derive(Debug, Clone)]
+pub struct VaultKubernetesConfig {
+    pub addr: String,
+    pub role: String,
+    pub auth_mount: String,
+    pub service_account_token_path: PathBuf,
+    pub mount: String,
+    pub prefix: String,
+}
+
+impl VaultKubernetesConfig {
+    /// Build the deployment defaults: auth mount `kubernetes`, the standard projected
+    /// service-account token path, KV-v2 mount `secret`, and credential prefix `flux`.
+    pub fn new(addr: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            role: role.into(),
+            auth_mount: "kubernetes".to_string(),
+            service_account_token_path: PathBuf::from(
+                "/var/run/secrets/kubernetes.io/serviceaccount/token",
+            ),
+            mount: "secret".to_string(),
+            prefix: "flux".to_string(),
+        }
+    }
+
+    /// Override the Vault auth-method mount (default `kubernetes`).
+    pub fn with_auth_mount(mut self, mount: impl Into<String>) -> Self {
+        self.auth_mount = mount.into();
+        self
+    }
+
+    /// Override the projected Kubernetes service-account JWT path.
+    pub fn with_service_account_token_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.service_account_token_path = path.into();
+        self
+    }
+
+    /// Override the KV-v2 secrets-engine mount (default `secret`).
+    pub fn with_mount(mut self, mount: impl Into<String>) -> Self {
+        self.mount = mount.into();
+        self
+    }
+
+    /// Override the path prefix beneath the KV-v2 mount (default `flux`).
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+}
+
+struct VaultSession {
+    token: String,
+    expires_at: Instant,
+    renewable: bool,
+}
+
+struct KubernetesVaultAuth {
+    role: String,
+    auth_mount: String,
+    service_account_token_path: PathBuf,
+    session: tokio::sync::Mutex<Option<VaultSession>>,
+}
+
+enum VaultAuth {
+    Static(String),
+    Kubernetes(KubernetesVaultAuth),
+}
+
+const VAULT_RENEW_BUFFER: Duration = Duration::from_secs(60);
+
 /// A HashiCorp Vault KV-v2 backend (plugin-oauth, D-83): tokens are read/written at
 /// `<addr>/v1/<mount>/data/<prefix>/<key>` with an `X-Vault-Token` header. Host-injectable for a
 /// deployment where per-customer tokens must live in Vault, not a file on a pod. Key `:` separators
-/// map to Vault path segments.
+/// map to Vault path segments. It supports either the original static token or an eagerly-validated,
+/// renewable Kubernetes-auth session (D-130).
 pub struct VaultCredentialStore {
     addr: String,
-    token: String,
+    auth: VaultAuth,
     mount: String,
     prefix: String,
     http: reqwest::Client,
@@ -594,7 +671,7 @@ impl VaultCredentialStore {
     ) -> Self {
         Self {
             addr: addr.into().trim_end_matches('/').to_string(),
-            token: token.into(),
+            auth: VaultAuth::Static(token.into()),
             mount: mount.into(),
             prefix: prefix.into(),
             http: reqwest::Client::new(),
@@ -614,6 +691,38 @@ impl VaultCredentialStore {
         Some(Self::new(addr, token, mount, prefix))
     }
 
+    /// Authenticate eagerly through Vault's Kubernetes auth method and return a KV-v2 store whose
+    /// Vault token renews before lease expiry. A failed renewal or a 401/403 re-reads the projected
+    /// service-account JWT and logs in again; construction fails rather than leaving a deployment
+    /// to discover invalid Vault configuration on its first customer request.
+    pub async fn connect_kubernetes(config: VaultKubernetesConfig) -> Result<Self> {
+        for (name, value) in [
+            ("Vault address", config.addr.as_str()),
+            ("Vault Kubernetes role", config.role.as_str()),
+            ("Vault auth mount", config.auth_mount.as_str()),
+            ("Vault KV mount", config.mount.as_str()),
+            ("Vault credential prefix", config.prefix.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::Config(format!("{name} must not be empty")));
+            }
+        }
+        let store = Self {
+            addr: config.addr.trim_end_matches('/').to_string(),
+            auth: VaultAuth::Kubernetes(KubernetesVaultAuth {
+                role: config.role,
+                auth_mount: config.auth_mount,
+                service_account_token_path: config.service_account_token_path,
+                session: tokio::sync::Mutex::new(None),
+            }),
+            mount: config.mount,
+            prefix: config.prefix,
+            http: reqwest::Client::new(),
+        };
+        store.vault_token().await?;
+        Ok(store)
+    }
+
     fn data_url(&self, key: &str) -> String {
         let path = key.replace(':', "/");
         format!(
@@ -621,16 +730,189 @@ impl VaultCredentialStore {
             self.addr, self.mount, self.prefix, path
         )
     }
+
+    async fn login_kubernetes(&self, auth: &KubernetesVaultAuth) -> Result<VaultSession> {
+        let jwt = tokio::fs::read_to_string(&auth.service_account_token_path)
+            .await
+            .map_err(|e| {
+                Error::Auth(format!(
+                    "read projected Kubernetes service-account token at {}: {e}",
+                    auth.service_account_token_path.display()
+                ))
+            })?;
+        let jwt = jwt.trim();
+        if jwt.is_empty() {
+            return Err(Error::Auth(
+                "projected Kubernetes service-account token is empty".to_string(),
+            ));
+        }
+        let url = format!(
+            "{}/v1/auth/{}/login",
+            self.addr,
+            auth.auth_mount.trim_matches('/')
+        );
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "role": auth.role, "jwt": jwt }))
+            .send()
+            .await
+            .map_err(|e| Error::Http(format!("Vault Kubernetes login failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::Auth(format!(
+                "Vault Kubernetes login returned {}",
+                resp.status()
+            )));
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Auth(format!("decode Vault Kubernetes login response: {e}")))?;
+        Self::session_from_response(&value, None)
+    }
+
+    async fn renew_kubernetes(&self, previous: &VaultSession) -> Result<VaultSession> {
+        let url = format!("{}/v1/auth/token/renew-self", self.addr);
+        let resp = self
+            .http
+            .post(url)
+            .header("X-Vault-Token", &previous.token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| Error::Http(format!("Vault token renewal failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::Auth(format!(
+                "Vault token renewal returned {}",
+                resp.status()
+            )));
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Auth(format!("decode Vault token renewal response: {e}")))?;
+        Self::session_from_response(&value, Some(&previous.token))
+    }
+
+    fn session_from_response(
+        value: &serde_json::Value,
+        previous: Option<&str>,
+    ) -> Result<VaultSession> {
+        let auth = value
+            .get("auth")
+            .ok_or_else(|| Error::Auth("Vault auth response had no `auth` object".to_string()))?;
+        let token = auth
+            .get("client_token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or(previous)
+            .ok_or_else(|| Error::Auth("Vault auth response had no client token".to_string()))?;
+        let lease = auth
+            .get("lease_duration")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::Auth("Vault auth response had no lease duration".to_string()))?;
+        let expires_at = Instant::now()
+            .checked_add(Duration::from_secs(lease))
+            .ok_or_else(|| Error::Auth("Vault auth lease duration overflowed".to_string()))?;
+        Ok(VaultSession {
+            token: token.to_string(),
+            expires_at,
+            renewable: auth
+                .get("renewable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    async fn vault_token(&self) -> Result<String> {
+        match &self.auth {
+            VaultAuth::Static(token) => Ok(token.clone()),
+            VaultAuth::Kubernetes(auth) => {
+                let mut session = auth.session.lock().await;
+                let expiring = session
+                    .as_ref()
+                    .map(|current| {
+                        current.expires_at.saturating_duration_since(Instant::now())
+                            <= VAULT_RENEW_BUFFER
+                    })
+                    .unwrap_or(true);
+                if expiring {
+                    let next = match session.as_ref() {
+                        Some(current) if current.renewable => {
+                            match self.renew_kubernetes(current).await {
+                                Ok(renewed) => renewed,
+                                Err(_) => self.login_kubernetes(auth).await?,
+                            }
+                        }
+                        _ => self.login_kubernetes(auth).await?,
+                    };
+                    *session = Some(next);
+                }
+                Ok(session
+                    .as_ref()
+                    .expect("an authenticated Vault session")
+                    .token
+                    .clone())
+            }
+        }
+    }
+
+    async fn invalidate_kubernetes_token(&self, rejected: &str) {
+        if let VaultAuth::Kubernetes(auth) = &self.auth {
+            let mut session = auth.session.lock().await;
+            if session.as_ref().map(|s| s.token.as_str()) == Some(rejected) {
+                *session = None;
+            }
+        }
+    }
+
+    async fn send_vault(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let token = self.vault_token().await?;
+        let response = self
+            .send_vault_once(method.clone(), url, body, &token)
+            .await?;
+        if matches!(response.status().as_u16(), 401 | 403)
+            && matches!(self.auth, VaultAuth::Kubernetes(_))
+        {
+            self.invalidate_kubernetes_token(&token).await;
+            let fresh = self.vault_token().await?;
+            return self.send_vault_once(method, url, body, &fresh).await;
+        }
+        Ok(response)
+    }
+
+    async fn send_vault_once(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&serde_json::Value>,
+        token: &str,
+    ) -> Result<reqwest::Response> {
+        let request = self
+            .http
+            .request(method, url)
+            .header("X-Vault-Token", token);
+        let request = match body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        request
+            .send()
+            .await
+            .map_err(|e| Error::Http(format!("Vault request failed: {e}")))
+    }
 }
 
 #[async_trait]
 impl CredentialStore for VaultCredentialStore {
     async fn load(&self, key: &str) -> Option<OAuthToken> {
         let resp = self
-            .http
-            .get(self.data_url(key))
-            .header("X-Vault-Token", &self.token)
-            .send()
+            .send_vault(reqwest::Method::GET, &self.data_url(key), None)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -646,13 +928,8 @@ impl CredentialStore for VaultCredentialStore {
             "data": { "token": serde_json::to_string(token).map_err(|e| Error::Config(e.to_string()))? }
         });
         let resp = self
-            .http
-            .post(self.data_url(key))
-            .header("X-Vault-Token", &self.token)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .send_vault(reqwest::Method::POST, &self.data_url(key), Some(&payload))
+            .await?;
         if !resp.status().is_success() {
             return Err(Error::Http(format!(
                 "vault write failed: {}",
@@ -1282,6 +1559,48 @@ mod tests {
         String::from_utf8_lossy(&req).into_owned()
     }
 
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut req = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&tmp[..n]);
+            let text = String::from_utf8_lossy(&req);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let content_length = text
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if req.len() >= head_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&req).into_owned()
+    }
+
+    async fn write_http_json(sock: &mut tokio::net::TcpStream, status: u16, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let reason = match status {
+            200 => "OK",
+            403 => "Forbidden",
+            _ => "Error",
+        };
+        let resp = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    }
+
     #[tokio::test]
     // HOME must stay repointed across the exchange (save_stored writes ~/.flux); current-thread
     // test runtime, so holding the std guard across await is safe (same pattern as the C-04 test).
@@ -1538,6 +1857,221 @@ mod tests {
         assert_eq!(got.access, "va");
         assert_eq!(got.refresh.as_deref(), Some("vr"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vault_kubernetes_auth_logs_in_and_round_trips_via_kv_v2() {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-vault-k8s-login-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jwt_path = dir.join("token");
+        std::fs::write(&jwt_path, "projected-jwt-one").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut saved = None;
+            for step in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let req = read_http_request(&mut sock).await;
+                match step {
+                    0 => {
+                        assert!(req.starts_with("POST /v1/auth/kubernetes/login "));
+                        assert!(req.contains(r#""role":"ai-agent-platform""#));
+                        assert!(req.contains(r#""jwt":"projected-jwt-one""#));
+                        write_http_json(
+                            &mut sock,
+                            200,
+                            r#"{"auth":{"client_token":"vault-one","lease_duration":3600,"renewable":true}}"#,
+                        )
+                        .await;
+                    }
+                    1 => {
+                        assert!(req.starts_with("POST /v1/secret/data/flux/plugin/acme/api "));
+                        assert!(req
+                            .to_ascii_lowercase()
+                            .contains("x-vault-token: vault-one"));
+                        let sent = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let value: serde_json::Value = serde_json::from_str(sent).unwrap();
+                        saved = value["data"]["token"].as_str().map(ToOwned::to_owned);
+                        write_http_json(&mut sock, 200, "{}").await;
+                    }
+                    _ => {
+                        assert!(req.starts_with("GET /v1/secret/data/flux/plugin/acme/api "));
+                        assert!(req
+                            .to_ascii_lowercase()
+                            .contains("x-vault-token: vault-one"));
+                        let body = serde_json::json!({
+                            "data": { "data": { "token": saved.as_deref().expect("saved token") } }
+                        })
+                        .to_string();
+                        write_http_json(&mut sock, 200, &body).await;
+                    }
+                }
+            }
+        });
+
+        let config = VaultKubernetesConfig::new(format!("http://{addr}"), "ai-agent-platform")
+            .with_service_account_token_path(&jwt_path);
+        let store = VaultCredentialStore::connect_kubernetes(config)
+            .await
+            .expect("Kubernetes login succeeds eagerly");
+        let token = OAuthToken {
+            access: "customer-access".into(),
+            refresh: Some("customer-refresh".into()),
+            expires_at_ms: None,
+            account_id: Some("acme".into()),
+        };
+        store.save("plugin:acme:api", &token).await.unwrap();
+        assert_eq!(
+            store.load("plugin:acme:api").await.unwrap().access,
+            "customer-access"
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn vault_kubernetes_auth_renews_an_expiring_lease() {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-vault-k8s-renew-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jwt_path = dir.join("token");
+        std::fs::write(&jwt_path, "projected-jwt").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let req = read_http_request(&mut sock).await;
+                match step {
+                    0 => write_http_json(
+                        &mut sock,
+                        200,
+                        r#"{"auth":{"client_token":"vault-short","lease_duration":0,"renewable":true}}"#,
+                    )
+                    .await,
+                    1 => {
+                        assert!(req.starts_with("POST /v1/auth/token/renew-self "));
+                        assert!(req.to_ascii_lowercase().contains("x-vault-token: vault-short"));
+                        write_http_json(
+                            &mut sock,
+                            200,
+                            r#"{"auth":{"client_token":"vault-renewed","lease_duration":3600,"renewable":true}}"#,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        assert!(req.starts_with("POST /v1/secret/data/flux/plugin/acme/api "));
+                        assert!(req
+                            .to_ascii_lowercase()
+                            .contains("x-vault-token: vault-renewed"));
+                        write_http_json(&mut sock, 200, "{}").await;
+                    }
+                }
+            }
+        });
+
+        let config = VaultKubernetesConfig::new(format!("http://{addr}"), "role")
+            .with_service_account_token_path(&jwt_path);
+        let store = VaultCredentialStore::connect_kubernetes(config)
+            .await
+            .unwrap();
+        store
+            .save(
+                "plugin:acme:api",
+                &OAuthToken {
+                    access: "value".into(),
+                    refresh: None,
+                    expires_at_ms: None,
+                    account_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn vault_kubernetes_auth_reloads_rotated_jwt_after_forbidden() {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-vault-k8s-reauth-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jwt_path = dir.join("token");
+        std::fs::write(&jwt_path, "projected-jwt-one").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rotated_path = jwt_path.clone();
+        let server = tokio::spawn(async move {
+            for step in 0..4 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let req = read_http_request(&mut sock).await;
+                match step {
+                    0 => write_http_json(
+                        &mut sock,
+                        200,
+                        r#"{"auth":{"client_token":"vault-one","lease_duration":3600,"renewable":true}}"#,
+                    )
+                    .await,
+                    1 => {
+                        assert!(req.starts_with("GET /v1/secret/data/flux/plugin/acme/api "));
+                        assert!(req.to_ascii_lowercase().contains("x-vault-token: vault-one"));
+                        std::fs::write(&rotated_path, "projected-jwt-two").unwrap();
+                        write_http_json(&mut sock, 403, r#"{"errors":["expired"]}"#).await;
+                    }
+                    2 => {
+                        assert!(req.starts_with("POST /v1/auth/kubernetes/login "));
+                        assert!(req.contains(r#""jwt":"projected-jwt-two""#));
+                        write_http_json(
+                            &mut sock,
+                            200,
+                            r#"{"auth":{"client_token":"vault-two","lease_duration":3600,"renewable":true}}"#,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        assert!(req.starts_with("GET /v1/secret/data/flux/plugin/acme/api "));
+                        assert!(req.to_ascii_lowercase().contains("x-vault-token: vault-two"));
+                        let stored = serde_json::to_string(&OAuthToken {
+                            access: "rotated-access".into(),
+                            refresh: None,
+                            expires_at_ms: None,
+                            account_id: None,
+                        })
+                        .unwrap();
+                        let body = serde_json::json!({
+                            "data": { "data": { "token": stored } }
+                        })
+                        .to_string();
+                        write_http_json(&mut sock, 200, &body).await;
+                    }
+                }
+            }
+        });
+
+        let config = VaultKubernetesConfig::new(format!("http://{addr}"), "role")
+            .with_service_account_token_path(&jwt_path);
+        let store = VaultCredentialStore::connect_kubernetes(config)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load("plugin:acme:api").await.unwrap().access,
+            "rotated-access"
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

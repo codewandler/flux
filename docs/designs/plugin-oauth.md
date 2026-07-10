@@ -1,6 +1,7 @@
 # Design — Plugin OAuth (generalize the provider-only auth flow to plugins)
 
-**Status:** ✅ implemented 2026-07-08 (D-80..D-83 all done; full gate green) · **Pillar:** Core · **Epic:** `plugin-oauth` · **Stories:** D-80..D-83
+**Status:** ✅ implemented 2026-07-08 (D-80..D-83; Kubernetes Vault auth added by D-130) ·
+**Pillar:** Core · **Epic:** `plugin-oauth` · **Stories:** D-80..D-83, D-130
 
 ## Why
 
@@ -50,6 +51,12 @@ fresh bearer.
   it supplies custom `HostCapabilities`). Generalize `save_stored`/`store_path`/the `TokenSource` keying
   (`crates/flux-credentials/src/lib.rs`) to `plugin+purpose[+account]`. Also unblocks the UI-configured
   Integrations pillar (per-customer OAuth tokens → Vault, never a file on a pod).
+- **D-130 — Kubernetes-authenticated Vault deployment.** The Vault backend retains its static-token
+  constructor for CLI/dev consumers and gains an additive eager Kubernetes-auth constructor. It
+  exchanges the pod's projected service-account JWT at `auth/<mount>/login`, renews the Vault token
+  before lease expiry, and re-reads the rotated JWT before a one-shot re-login/retry after 401/403.
+  Host applications select and configure this deployment mode; flux never silently switches a failed
+  Vault-backed host to the file store.
 
 ## Relates to
 

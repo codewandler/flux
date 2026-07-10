@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **D-130: Kubernetes-authenticated Vault credential stores.** Host applications can now construct
+  `VaultCredentialStore` with a Vault Kubernetes role and projected service-account JWT instead of
+  mounting a long-lived `VAULT_TOKEN`. Construction logs in eagerly; the store serializes lease
+  renewal, re-reads kubelet's rotated JWT when re-authenticating, and retries one KV-v2 request after
+  a 401/403. The existing static-token constructor, `from_env`, KV-v2 wire shape, and local
+  `FileCredentialStore` default remain compatible. Loopback tests cover login, read/write, renewal,
+  rotated-JWT re-login, and the static-token regression. Downstream ai-agent-platform C-27 is the
+  first deployment consumer.
+
 - **D-88: shared dry-run/runtime validation layer for plugins.** host-kit plugins now run ONE
   preflight in both the CLI's `--dry-run` and runtime dispatch, closing the gap where `--dry-run`
   trusted only the generated JSON schema while handlers enforced more (a beta pass found ~14
