@@ -152,6 +152,9 @@ flux run -m openai/gpt-5 "..."           # provider/model
 flux run -m openrouter/anthropic/claude-... "..."
 flux auth status                         # which providers are configured
 flux auth login claude                   # Claude subscription (OAuth)
+flux auth set slack bot_token            # store a plugin bearer token (~/.flux/credentials.toml,
+                                         #   0600) so sessions resolve it WITHOUT the env var;
+                                         #   prompts hidden, or pipe it in; --clear removes it
 ```
 
 Default model is `sonnet`, overridable in `.flux/config.toml` (`model = "..."`) or per-call with `-m`.

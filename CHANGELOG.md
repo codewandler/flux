@@ -6,6 +6,43 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-126: `flux auth set <plugin> [<purpose>]` — stored bearer tokens for plugin auth purposes.**
+  Plain (non-OAuth2) auth methods resolved ONLY from the host process environment; there was no way
+  to configure a plugin credential in advance for a session whose env can't carry the secret.
+  `flux auth set` validates the plugin + purpose against the live manifest (purpose optional when
+  exactly one is declared), prompts hidden for the token (reads one stdin line when piped, so it
+  scripts), and stores it under `plugin:<name>:<purpose>` in `~/.flux/credentials.toml` (0600) —
+  the same key/store plugin OAuth logins (D-82) use. `SystemHostCaps::resolve_purpose` now consults
+  the credential store first for plain methods (a stored token wins over env, matching the OAuth2
+  store-first rule; the resolved value is registered with the secret sink), falling back to the
+  declared env keys. `--clear` removes a stored token (new `flux_credentials::delete_token`).
+  `flux plugin status` shows a stored plain bearer as the active resolution and points
+  `not configured` purposes at the right configure command (`auth set` vs `auth login`).
+
+### Changed
+
+- **`codewandler-flux-host-kit` now versions in LOCKSTEP with the flux workspace.** The plugin
+  SDK's independent version line (0.2.x → flux 0.13; a short-lived unpublished 0.3.0) silently
+  froze whenever nothing remembered to bump it, leaving consumers on stale flux dep lines.
+  `scripts/cut-release.sh` now bumps `plugins/host-kit/Cargo.toml` (and stages it) on every cut, so
+  each flux release publishes a host-kit whose version and flux dep line match the flux crates
+  exactly — host-kit X.Y.Z is compatible with flux X.Y.Z by construction. External consumers
+  should repin `codewandler-flux-host-kit` from `^0.2` to the current flux minor (e.g. `^0.14`).
+
+### Fixed
+
+- **D-125: ref-based `http.do` no longer drops a path-bearing endpoint base.** `compose_url` joined
+  the plugin-supplied op path onto the resolved endpoint base with RFC-3986 `Url::join`, so a
+  leading-slash path *replaced* the base's path — `slack.endpoint`'s default `https://slack.com/api`
+  + `/auth.test` composed to `https://slack.com/auth.test`, 404ing **every** op of any plugin whose
+  endpoint base carries a path segment (host-kit's `MockHost` joins by concatenation, so plugin
+  tests never caught the divergence). The join is now slash-normalized concatenation — the same
+  semantic as `MockHost::join_url` and the OAuth `token_path` join — which also means a full-URL
+  `path` can no longer swap out the pinned endpoint base (it fails the egress guard's URL parse
+  instead). Host-only bases (the gitlab/jira shape) compose identically before and after.
+
 ## [0.14.6] - 2026-07-10
 
 ### Added

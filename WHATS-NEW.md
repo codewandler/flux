@@ -15,6 +15,20 @@
 
 ## [Unreleased]
 
+### New
+
+- **Store an integration token once, use it in every session.** `flux auth set <plugin>
+  [<purpose>]` (e.g. `flux auth set slack bot_token`) prompts for the token — hidden, or pipe it
+  in from a secret manager — and stores it securely, so integrations work in any later session
+  without exporting the token in your shell environment. `--clear` removes it, and
+  `flux plugin status <plugin>` shows what's configured without ever printing a secret.
+
+### Fixed
+
+- **Slack operations work again.** Requests to an integration whose API base URL includes a path
+  (Slack's `https://slack.com/api`) dropped that path when composing the request URL, so every
+  Slack operation failed with a 404. Fixed for all integrations — no plugin update needed.
+
 ## [0.14.6] - 2026-07-10
 
 ### New

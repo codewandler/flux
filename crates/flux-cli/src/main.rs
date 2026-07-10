@@ -430,7 +430,7 @@ enum Commands {
         #[command(subcommand)]
         action: CorpusAction,
     },
-    /// Provider authentication (status / login).
+    /// Provider and plugin authentication (status / login / set).
     Auth {
         #[command(subcommand)]
         action: Option<AuthAction>,
@@ -626,6 +626,19 @@ enum AuthAction {
         /// PKCE flow — for a plugin whose OAuth2 method supports it.
         #[arg(long)]
         password: bool,
+    },
+    /// Store a bearer token for an installed plugin's auth purpose (D-126): prompts for the token
+    /// (hidden; reads one line from stdin when piped, so it scripts) and writes
+    /// `~/.flux/credentials.toml` (0600) — a later session then resolves the purpose WITHOUT the
+    /// secret in the process environment. A stored token wins over the declared env keys.
+    Set {
+        /// Installed plugin name (e.g. `slack`).
+        plugin: String,
+        /// Manifest auth purpose (e.g. `bot_token`); optional when the plugin declares exactly one.
+        purpose: Option<String>,
+        /// Remove the stored token for this purpose instead of setting one.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -8007,17 +8020,23 @@ fn print_plugin_status_report(r: &PluginStatusReport) {
     }
 }
 
-/// Describe how a declared auth purpose would resolve right now — which env key (if any) is set,
-/// or whether a stored OAuth token exists — without ever printing the resolved secret value.
+/// Describe how a declared auth purpose would resolve right now — a stored token (OAuth login or
+/// `flux auth set`), or which env key (if any) is set — without ever printing the resolved secret
+/// value. Mirrors the host's resolution order: stored token first, declared env keys second.
 fn describe_auth_resolution(plugin: &str, m: &flux_plugin::AuthMethod) -> String {
-    if m.oauth2.is_some() {
-        let key = format!("plugin:{plugin}:{}", m.purpose);
-        if flux_credentials::load_token(&key).is_some() {
-            return format!(
+    let key = format!("plugin:{plugin}:{}", m.purpose);
+    if flux_credentials::load_token(&key).is_some() {
+        return if m.oauth2.is_some() {
+            format!(
                 "✓ {} — stored OAuth token (`flux auth login {plugin}`)",
                 m.purpose
-            );
-        }
+            )
+        } else {
+            format!(
+                "✓ {} — stored token (`flux auth set {plugin} {}`)",
+                m.purpose, m.purpose
+            )
+        };
     }
     // An EMPTY env value counts as unset — matching `resolve_manifest_endpoint`, so `status`
     // never claims "configured" for a value resolution will skip.
@@ -8026,22 +8045,19 @@ fn describe_auth_resolution(plugin: &str, m: &flux_plugin::AuthMethod) -> String
             return format!("✓ {} — env ${key}", m.purpose);
         }
     }
-    match (m.oauth2.is_some(), m.env.is_empty()) {
-        (true, true) => format!(
-            "· {} — not configured (`flux auth login {plugin}`)",
-            m.purpose
-        ),
-        (true, false) => format!(
-            "· {} — not configured (env: {}, or `flux auth login {plugin}`)",
+    let configure = if m.oauth2.is_some() {
+        format!("`flux auth login {plugin}`")
+    } else {
+        format!("`flux auth set {plugin} {}`", m.purpose)
+    };
+    if m.env.is_empty() {
+        format!("· {} — not configured ({configure})", m.purpose)
+    } else {
+        format!(
+            "· {} — not configured (env: {}, or {configure})",
             m.purpose,
             m.env.join(", ")
-        ),
-        (false, true) => format!("· {} — no env keys declared", m.purpose),
-        (false, false) => format!(
-            "· {} — not configured (env: {})",
-            m.purpose,
-            m.env.join(", ")
-        ),
+        )
     }
 }
 
@@ -8692,7 +8708,96 @@ async fn run_auth(action: Option<AuthAction>) -> Result<()> {
             // Any other name is treated as an installed OAuth2 plugin (plugin-oauth, D-82).
             name => login_plugin(name, password).await,
         },
+        AuthAction::Set {
+            plugin,
+            purpose,
+            clear,
+        } => auth_set(&plugin, purpose.as_deref(), clear).await,
     }
+}
+
+/// Store (or `--clear`) a plain bearer for an installed plugin's auth purpose (D-126): validate the
+/// plugin + purpose against the live manifest, prompt hidden for the token (read one stdin line
+/// when piped, so `printf '%s' "$TOK" | flux auth set …` scripts), and persist it under
+/// `plugin:<name>:<purpose>` — the same store key the host's purpose resolution consults before
+/// falling back to the declared env keys. The token value is never echoed.
+async fn auth_set(name: &str, purpose: Option<&str>, clear: bool) -> Result<()> {
+    let dir = plugins_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set — no plugin store"))?;
+    let desc = flux_plugin::load_descriptor(&dir, name)
+        .context("load plugin descriptor")?
+        .ok_or_else(|| anyhow::anyhow!("no such plugin `{name}` — install it first"))?;
+    let manifest = spawn_and_load_manifest(name, &desc).await?;
+    let declared = || {
+        manifest
+            .auth
+            .iter()
+            .map(|a| a.purpose.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let method = match purpose {
+        Some(p) => manifest
+            .auth
+            .iter()
+            .find(|a| a.purpose == p)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "plugin `{name}` declares no auth purpose `{p}` (declared: {})",
+                    declared()
+                )
+            })?,
+        None => match manifest.auth.as_slice() {
+            [] => bail!("plugin `{name}` declares no auth methods"),
+            [only] => only,
+            _ => bail!(
+                "plugin `{name}` declares {} auth purposes — name one: {}",
+                manifest.auth.len(),
+                declared()
+            ),
+        },
+    };
+    let key = format!("plugin:{name}:{}", method.purpose);
+    if clear {
+        flux_credentials::delete_token(&key)?;
+        println!(
+            "\u{2713} cleared stored token for plugin `{name}` (purpose `{}`)",
+            method.purpose
+        );
+        return Ok(());
+    }
+    let prompt = format!("{} for `{name}`: ", method.purpose);
+    // The prompt blocks on user think-time — keep it off the runtime thread.
+    let token = tokio::task::spawn_blocking(move || -> Result<String> {
+        if std::io::stdin().is_terminal() {
+            rpassword::prompt_password(&prompt).context("read token")
+        } else {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("read token from stdin")?;
+            Ok(line)
+        }
+    })
+    .await
+    .context("token prompt task")??;
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("empty token — nothing stored");
+    }
+    flux_credentials::save_token(
+        &key,
+        &flux_credentials::OAuthToken {
+            access: token.to_string(),
+            refresh: None,
+            expires_at_ms: None,
+            account_id: None,
+        },
+    )?;
+    println!(
+        "\u{2713} stored token for plugin `{name}` (purpose `{}`) in ~/.flux/credentials.toml",
+        method.purpose
+    );
+    Ok(())
 }
 
 /// Interactive Anthropic (Claude subscription) PKCE login.

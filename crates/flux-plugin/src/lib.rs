@@ -920,8 +920,10 @@ impl SystemHostCaps {
 
     /// Resolve a secret **by purpose**. An OAuth2-backed method (plugin-oauth, D-81) resolves a fresh
     /// bearer from the credential store — refreshing via the declared `token_path` when stale — and
-    /// falls back to the declared env keys until a login stores tokens. A plain method just tries its
-    /// env keys in order (each must also be a granted `secret`), returning the first value set.
+    /// falls back to the declared env keys until a login stores tokens. A plain method consults the
+    /// same store first (`flux auth set <plugin> <purpose>`, D-126 — the configure-in-advance path
+    /// for a session whose environment can't carry the secret), then tries its declared env keys in
+    /// order (each must also be a granted `secret`), returning the first value set.
     async fn resolve_purpose(&self, purpose: &str) -> std::result::Result<String, String> {
         let method = self
             .auth
@@ -965,6 +967,20 @@ impl SystemHostCaps {
                 Err(e) => return Err(format!("oauth resolve for purpose `{purpose}`: {e}")),
             }
         }
+        // Plain (non-OAuth2) method: a stored bearer (`flux auth set <plugin> <purpose>`, D-126)
+        // wins, matching the OAuth2 store-first rule above; the declared env keys are the fallback.
+        if method.oauth2.is_none() {
+            let key = format!("plugin:{}:{}", self.caller, purpose);
+            let file_store = flux_credentials::FileCredentialStore;
+            let store: &dyn flux_credentials::CredentialStore =
+                self.cred_store.as_deref().unwrap_or(&file_store);
+            if let Some(tok) = store.load(&key).await {
+                if let Some(sink) = &self.secret_sink {
+                    sink.register_secret(&tok.access);
+                }
+                return Ok(tok.access);
+            }
+        }
         for key in &method.env {
             if !self.grants.secrets.iter().any(|k| k == key) {
                 continue; // not a granted secret — skip
@@ -974,8 +990,9 @@ impl SystemHostCaps {
             }
         }
         Err(format!(
-            "no granted env value for purpose `{purpose}` (tried {:?})",
-            method.env
+            "no credential for purpose `{purpose}` — set a declared env key (tried {:?}) or store \
+             one with `flux auth set {} {purpose}`",
+            method.env, self.caller
         ))
     }
 
@@ -2164,18 +2181,25 @@ fn guard_http_url(raw: &str, allow: &PrivateNetAllow) -> std::result::Result<url
 }
 
 /// Compose an absolute request URL from a resolved base and an optional plugin-supplied `path`.
-/// The base is the host-resolved endpoint URL (already credential-free); `path` joins onto it
-/// (relative-resolved against the base, so a base `…/v1/` + path `query` → `…/v1/query`). A `None`
-/// or empty path returns the base unchanged.
+/// The base is the host-resolved endpoint URL (already credential-free); `path` is APPENDED with
+/// slash-normalized concatenation (base `…/api` + `/auth.test` → `…/api/auth.test`) — the same
+/// join the host-kit `MockHost` and the OAuth `token_path` resolution use. Deliberately NOT
+/// RFC-3986 `Url::join` (D-125): under join semantics a leading-slash path REPLACES a path-bearing
+/// base's path (dropping slack's `/api` and 404ing every op), and a full-URL path could swap out
+/// the pinned endpoint base entirely. The composed string still re-parses through the egress guard
+/// at the call site, so a malformed concat fails loudly there. A `None` or empty path returns the
+/// base unchanged.
 fn compose_url(base: &str, path: Option<&str>) -> std::result::Result<String, String> {
     match path {
         None | Some("") => Ok(base.to_string()),
         Some(p) => {
-            let base = url::Url::parse(base).map_err(|e| format!("http.do: bad base url: {e}"))?;
-            let joined = base
-                .join(p)
-                .map_err(|e| format!("http.do: bad path `{p}`: {e}"))?;
-            Ok(joined.to_string())
+            // Parse-check the base so a broken endpoint binding still surfaces as a base error.
+            url::Url::parse(base).map_err(|e| format!("http.do: bad base url: {e}"))?;
+            Ok(format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                p.trim_start_matches('/')
+            ))
         }
     }
 }
@@ -3548,6 +3572,122 @@ mod tests {
 
         std::env::remove_var("HOME");
         std::env::remove_var("FLUX_TEST_OAUTH_ENV");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-125: the ref-based `http.do` join must APPEND the op path onto the resolved endpoint
+    /// base. RFC-3986 `Url::join` semantics made a leading-slash path REPLACE a path-bearing
+    /// base's path (slack's `https://slack.com/api` + `/auth.test` → `https://slack.com/auth.test`),
+    /// 404ing every op of any plugin whose endpoint base carries a path segment.
+    #[test]
+    fn compose_url_appends_path_onto_path_bearing_base() {
+        // The slack shape: path-bearing base + leading-slash op path.
+        assert_eq!(
+            compose_url("https://slack.com/api", Some("/auth.test")).unwrap(),
+            "https://slack.com/api/auth.test"
+        );
+        // Host-only base + absolute path (the gitlab shape) — unchanged by the fix.
+        assert_eq!(
+            compose_url("https://gitlab.com", Some("/api/v4/projects")).unwrap(),
+            "https://gitlab.com/api/v4/projects"
+        );
+        // Trailing-slash base + relative path — exactly one separating slash.
+        assert_eq!(
+            compose_url("https://api.example.com/v1/", Some("query")).unwrap(),
+            "https://api.example.com/v1/query"
+        );
+        // None/empty path returns the base unchanged.
+        assert_eq!(
+            compose_url("https://api.example.com/v1", None).unwrap(),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            compose_url("https://api.example.com/v1", Some("")).unwrap(),
+            "https://api.example.com/v1"
+        );
+        // A non-URL base still errors (the endpoint binding is broken, not the path).
+        assert!(compose_url("not a url", Some("/x")).is_err());
+    }
+
+    /// D-126: a PLAIN (non-OAuth2) auth method resolves a stored bearer (`flux auth set`) when
+    /// present — the stored token wins over the declared env keys, matching the OAuth2 store-first
+    /// rule — and the resolved value is registered with the secret sink for redaction.
+    #[tokio::test]
+    async fn plain_purpose_resolves_stored_bearer_over_env() {
+        use flux_system::{System, Workspace};
+        use std::collections::HashMap;
+        struct MemStore(HashMap<String, flux_credentials::OAuthToken>);
+        #[async_trait]
+        impl flux_credentials::CredentialStore for MemStore {
+            async fn load(&self, key: &str) -> Option<flux_credentials::OAuthToken> {
+                self.0.get(key).cloned()
+            }
+            async fn save(
+                &self,
+                _key: &str,
+                _token: &flux_credentials::OAuthToken,
+            ) -> flux_core::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Default)]
+        struct SinkSpy(std::sync::Mutex<Vec<String>>);
+        impl SecretSink for SinkSpy {
+            fn register_secret(&self, value: &str) {
+                self.0.lock().unwrap().push(value.to_string());
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("flux-plain-d126-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        std::env::set_var("FLUX_TEST_PLAIN_ENV_D126", "env-tok");
+
+        let manifest = PluginManifest {
+            name: "acme".into(),
+            auth: vec![AuthMethod::bearer(
+                "api_token",
+                vec!["FLUX_TEST_PLAIN_ENV_D126".into()],
+            )],
+            capabilities: PluginCapabilities {
+                secrets: vec!["FLUX_TEST_PLAIN_ENV_D126".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sink = Arc::new(SinkSpy::default());
+        let stored = MemStore(HashMap::from([(
+            "plugin:acme:api_token".to_string(),
+            flux_credentials::OAuthToken {
+                access: "stored-tok".into(),
+                refresh: None,
+                expires_at_ms: None,
+                account_id: None,
+            },
+        )]));
+
+        // Stored token wins over the set env key, and is registered with the secret sink.
+        let caps = SystemHostCaps::new(sys.clone())
+            .with_manifest(&manifest)
+            .with_credential_store(Arc::new(stored))
+            .with_secret_sink(sink.clone());
+        let got = caps
+            .handle("secret", &json!({"purpose": "api_token"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "stored-tok");
+        assert!(sink.0.lock().unwrap().contains(&"stored-tok".to_string()));
+
+        // Nothing stored → the declared env key resolves (the pre-D-126 behavior).
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_credential_store(Arc::new(MemStore(HashMap::new())));
+        let got = caps
+            .handle("secret", &json!({"purpose": "api_token"}))
+            .await
+            .unwrap();
+        assert_eq!(got["value"], "env-tok");
+
+        std::env::remove_var("FLUX_TEST_PLAIN_ENV_D126");
         std::fs::remove_dir_all(&dir).ok();
     }
 

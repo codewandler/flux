@@ -163,18 +163,33 @@ fn load_stored(provider: &str) -> Option<OAuthToken> {
     load_store().ok()?.entries.remove(provider)
 }
 
-/// Persist one provider's token to the store, creating `~/.flux` and forcing 0600. Writes
-/// atomically (temp file created 0600 + rename) so there is no world-readable window and a crash
-/// mid-write can't truncate the existing credentials.
+/// Persist one provider's token to the store (see [`write_store`] for the atomic-write contract).
 fn save_stored(provider: &str, token: &OAuthToken) -> Result<()> {
+    // Propagates a corrupt-store error rather than silently dropping the other providers' tokens.
+    let mut store = load_store()?;
+    store.entries.insert(provider.to_string(), token.clone());
+    write_store(&store)
+}
+
+/// Remove `provider`'s entry from the store (e.g. `flux auth set --clear`). A missing entry (or a
+/// missing store file) is a no-op, not an error.
+fn delete_stored(provider: &str) -> Result<()> {
+    let mut store = load_store()?;
+    if store.entries.remove(provider).is_none() {
+        return Ok(());
+    }
+    write_store(&store)
+}
+
+/// Persist the whole store to `~/.flux/credentials.toml`, creating `~/.flux` and forcing 0600.
+/// Writes atomically (temp file created 0600 + rename) so there is no world-readable window and a
+/// crash mid-write can't truncate the existing credentials.
+fn write_store(store: &Store) -> Result<()> {
     let path = store_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // Propagates a corrupt-store error rather than silently dropping the other providers' tokens.
-    let mut store = load_store()?;
-    store.entries.insert(provider.to_string(), token.clone());
-    let body = toml::to_string_pretty(&store)
+    let body = toml::to_string_pretty(store)
         .map_err(|e| Error::Config(format!("serialize credentials: {e}")))?;
 
     let tmp = path.with_extension("toml.tmp");
@@ -476,6 +491,11 @@ pub fn save_token(key: &str, token: &OAuthToken) -> Result<()> {
 /// Load a stored token for `key`, if any.
 pub fn load_token(key: &str) -> Option<OAuthToken> {
     load_stored(key)
+}
+
+/// Delete the token stored under `key` (`flux auth set --clear`). Missing entries are a no-op.
+pub fn delete_token(key: &str) -> Result<()> {
+    delete_stored(key)
 }
 
 /// Resolve a fresh bearer access token for `key` from the credential store, refreshing it via a
