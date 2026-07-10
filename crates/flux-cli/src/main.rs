@@ -7582,16 +7582,63 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                 .map(|o| o.input_schema.clone())
                 .unwrap_or_else(|| serde_json::json!({}));
             let validate = !no_validate;
-            let (input, problems) = build_invoke_input(&schema, base, &arg, validate);
+            let (input, mut problems) = build_invoke_input(&schema, base, &arg, validate);
+            let caps = flux_capabilities::DatasourceHostCaps::new(
+                flux_plugin::SystemHostCaps::new(system)
+                    .with_manifest(&manifest)
+                    .with_private_net_grants(effective_plugin_private_hosts(&cfg, &manifest.name))
+                    .with_grant_source(private_net_grant_source_for(&manifest.name)),
+                backend.clone(),
+            );
 
             if dry_run {
-                // Validate-locally: print the coerced input + problems; never call the op.
+                // Validate locally, then merge the plugin's own preflight verdict (D-88) when it
+                // serves the reserved `plugin.validate` op. That verdict is the SAME check the
+                // plugin's runtime dispatch enforces, so a green dry-run can no longer fail the
+                // identical validation on the live call. Older plugins without the op keep the
+                // schema-only verdict.
+                let mut warnings: Vec<String> = Vec::new();
+                if manifest
+                    .operations
+                    .iter()
+                    .any(|o| o.name == flux_plugin::VALIDATE_OP)
+                {
+                    let ask = serde_json::json!({ "operation": resolved_op, "input": input });
+                    match host
+                        .call_with_host(flux_plugin::VALIDATE_OP, ask, &caps)
+                        .await
+                    {
+                        Ok(verdict) => {
+                            let take = |key: &str| -> Vec<String> {
+                                verdict
+                                    .get(key)
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|p| p.as_str())
+                                            .map(String::from)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            problems.extend(take("problems"));
+                            warnings.extend(take("warnings"));
+                        }
+                        Err(e) => eprintln!(
+                            "{}",
+                            style::dim(&format!(
+                                "(plugin preflight unavailable — schema-only verdict: {e})"
+                            ))
+                        ),
+                    }
+                }
                 let _ = host.shutdown().await;
                 let dry = serde_json::json!({
                     "plugin": name,
                     "operation": resolved_op,
                     "valid": problems.is_empty(),
                     "problems": problems,
+                    "warnings": warnings,
                     "input": input,
                 });
                 println!(
@@ -7608,13 +7655,6 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     problems.join("\n  - ")
                 );
             }
-            let caps = flux_capabilities::DatasourceHostCaps::new(
-                flux_plugin::SystemHostCaps::new(system)
-                    .with_manifest(&manifest)
-                    .with_private_net_grants(effective_plugin_private_hosts(&cfg, &manifest.name))
-                    .with_grant_source(private_net_grant_source_for(&manifest.name)),
-                backend.clone(),
-            );
             let result = host.call_with_host(&resolved_op, input, &caps).await;
             let _ = host.shutdown().await;
             let value =

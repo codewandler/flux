@@ -3157,7 +3157,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_and_kubectl_capability() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 24);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 24);
         assert_eq!(m.capabilities.process, vec!["kubectl".to_string()]);
         assert!(m
             .datasources
@@ -3533,6 +3533,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

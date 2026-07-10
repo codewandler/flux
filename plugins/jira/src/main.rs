@@ -3038,7 +3038,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_dual_auth_and_datasources() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 21);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 21);
         // Two auth methods: primary Bearer (api_token) + Basic fallback (basic).
         assert_eq!(m.auth.len(), 2);
         let bearer = m.auth.iter().find(|a| a.purpose == "api_token").unwrap();
@@ -3729,6 +3729,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

@@ -24,6 +24,129 @@ use serde::Deserialize;
 // `write_op_typed::<T>`) instead of a hand-written `so(json!{...}, json![...])` literal,
 // so the schema the model sees cannot drift. The structs are schema-only: handlers
 // keep their existing `flex_str`/`flex_i64`/`Value` extraction (D-34 precedent).
+// The enum/bound/typed-element constraints below are enforced by host-kit's shared
+// preflight in BOTH `--dry-run` and runtime dispatch (D-88), so a green dry-run can
+// no longer fail the same check at runtime.
+
+/// Issue state filter (GL-011).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum IssueStateFilter {
+    Opened,
+    Closed,
+    All,
+}
+
+/// Project/snippet visibility level (GL-011).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum Visibility {
+    Private,
+    Internal,
+    Public,
+}
+
+/// Release asset link type (GL-011).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum LinkType {
+    Other,
+    Runbook,
+    Image,
+    Package,
+}
+
+/// CI/pipeline variable type (GL-011).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum VariableType {
+    EnvVar,
+    File,
+}
+
+/// Repository archive format (GL-022) — a closed set, so an arbitrary string is never
+/// interpolated into the archive URL/filename.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+enum ArchiveFormat {
+    #[serde(rename = "tar.gz")]
+    TarGz,
+    #[serde(rename = "tar.bz2")]
+    TarBz2,
+    #[serde(rename = "tbz")]
+    Tbz,
+    #[serde(rename = "tbz2")]
+    Tbz2,
+    #[serde(rename = "tb2")]
+    Tb2,
+    #[serde(rename = "bz2")]
+    Bz2,
+    #[serde(rename = "tar")]
+    Tar,
+    #[serde(rename = "zip")]
+    Zip,
+}
+
+/// One `gitlab.repository.commit.create` action (GL-012).
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct CommitAction {
+    action: CommitActionKind,
+    file_path: String,
+    /// File content (`create`/`update`).
+    content: Option<String>,
+    /// Source path (`move`).
+    previous_path: Option<String>,
+    /// `text` (default) or `base64`.
+    encoding: Option<ContentEncoding>,
+    execute_filemode: Option<bool>,
+    last_commit_id: Option<String>,
+}
+
+/// A commit action verb (GL-012).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum CommitActionKind {
+    Create,
+    Delete,
+    Move,
+    Update,
+    Chmod,
+}
+
+/// Commit-action content encoding (GL-012).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum ContentEncoding {
+    Text,
+    Base64,
+}
+
+/// One `gitlab.snippet.create` file (GL-012).
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct SnippetFile {
+    file_path: String,
+    content: String,
+}
+
+/// One `gitlab.pipeline.create` variable (GL-012).
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct PipelineVariable {
+    key: String,
+    value: Option<Value>,
+    variable_type: Option<VariableType>,
+}
 
 /// `gitlab.project.list`.
 #[derive(Deserialize, JsonSchema)]
@@ -65,6 +188,7 @@ struct MrListInput {
 struct MrShowInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
 }
 
@@ -73,7 +197,7 @@ struct MrShowInput {
 #[allow(dead_code)]
 struct IssueListInput {
     project: String,
-    state: Option<String>,
+    state: Option<IssueStateFilter>,
     search: Option<String>,
     query: Option<String>,
     order_by: Option<String>,
@@ -142,7 +266,7 @@ struct ProjectCreateInput {
     path: Option<String>,
     namespace: Option<String>,
     description: Option<String>,
-    visibility: Option<String>,
+    visibility: Option<Visibility>,
     initialize_with_readme: Option<bool>,
 }
 
@@ -155,11 +279,14 @@ struct MrCreateInput {
     source_branch: String,
     target_branch: String,
     description: Option<String>,
-    labels: Option<Vec<Value>>,
+    labels: Option<Vec<String>>,
+    #[schemars(range(min = 1))]
     assignee_id: Option<i64>,
-    assignee_ids: Option<Vec<Value>>,
-    reviewer_ids: Option<Vec<Value>>,
+    assignee_ids: Option<Vec<i64>>,
+    reviewer_ids: Option<Vec<i64>>,
+    #[schemars(range(min = 1))]
     target_project_id: Option<i64>,
+    #[schemars(range(min = 1))]
     milestone_id: Option<i64>,
     remove_source_branch: Option<bool>,
     squash: Option<bool>,
@@ -172,12 +299,13 @@ struct MrCreateInput {
 struct MrUpdateInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     title: Option<String>,
     description: Option<String>,
     target_branch: Option<String>,
     state_event: Option<String>,
-    labels: Option<Vec<Value>>,
+    labels: Option<Vec<String>>,
 }
 
 /// `gitlab.mr.approve`.
@@ -186,6 +314,7 @@ struct MrUpdateInput {
 struct MrApproveInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     sha: Option<String>,
 }
@@ -196,6 +325,7 @@ struct MrApproveInput {
 struct MrMergeInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     auto_merge: Option<bool>,
     merge_commit_message: Option<String>,
@@ -212,6 +342,7 @@ struct MrMergeInput {
 struct IssueShowInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
 }
 
@@ -222,8 +353,9 @@ struct IssueCreateInput {
     project: String,
     title: String,
     description: Option<String>,
-    labels: Option<Vec<Value>>,
-    assignee_ids: Option<Vec<Value>>,
+    labels: Option<Vec<String>>,
+    assignee_ids: Option<Vec<i64>>,
+    #[schemars(range(min = 1))]
     milestone_id: Option<i64>,
     confidential: Option<bool>,
 }
@@ -234,14 +366,15 @@ struct IssueCreateInput {
 struct IssueUpdateInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     title: Option<String>,
     description: Option<String>,
-    labels: Option<Vec<Value>>,
-    add_labels: Option<Vec<Value>>,
-    remove_labels: Option<Vec<Value>>,
+    labels: Option<Vec<String>>,
+    add_labels: Option<Vec<String>>,
+    remove_labels: Option<Vec<String>>,
     state_event: Option<String>,
-    assignee_ids: Option<Vec<Value>>,
+    assignee_ids: Option<Vec<i64>>,
 }
 
 /// `gitlab.issue.note.list`.
@@ -250,6 +383,7 @@ struct IssueUpdateInput {
 struct IssueNoteListInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     sort: Option<String>,
     order_by: Option<String>,
@@ -262,6 +396,7 @@ struct IssueNoteListInput {
 struct IssueNoteCreateInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     body: String,
 }
@@ -271,7 +406,10 @@ struct IssueNoteCreateInput {
 #[allow(dead_code)]
 struct BranchCreateInput {
     project: String,
-    branch: String,
+    /// The new branch name (or use the `name` alias). One of the two is required.
+    branch: Option<String>,
+    /// Alias of `branch` (GL-028).
+    name: Option<String>,
     r#ref: String,
 }
 
@@ -280,7 +418,10 @@ struct BranchCreateInput {
 #[allow(dead_code)]
 struct BranchDeleteInput {
     project: String,
-    branch: String,
+    /// The branch to delete (or use the `name` alias). One of the two is required.
+    branch: Option<String>,
+    /// Alias of `branch` (GL-028).
+    name: Option<String>,
 }
 
 /// `gitlab.branch.delete_merged`.
@@ -365,7 +506,8 @@ struct RepositoryCommitCreateInput {
     project: String,
     branch: String,
     commit_message: String,
-    actions: Vec<Value>,
+    #[schemars(length(min = 1))]
+    actions: Vec<CommitAction>,
     start_branch: Option<String>,
     start_sha: Option<String>,
     start_project: Option<String>,
@@ -392,7 +534,10 @@ struct RepositoryCommitListInput {
 #[allow(dead_code)]
 struct RepositoryTagCreateInput {
     project: String,
-    tag_name: String,
+    /// The new tag name (or use the `name` alias). One of the two is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    name: Option<String>,
     r#ref: String,
     message: Option<String>,
 }
@@ -411,7 +556,12 @@ struct RepositoryTagListInput {
 #[allow(dead_code)]
 struct RepositoryTagShowInput {
     project: String,
-    tag_name: String,
+    /// The tag name (or use the `tag`/`name` aliases). One of the three is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    name: Option<String>,
 }
 
 /// `gitlab.repository.tag.delete`.
@@ -419,7 +569,12 @@ struct RepositoryTagShowInput {
 #[allow(dead_code)]
 struct RepositoryTagDeleteInput {
     project: String,
-    tag_name: String,
+    /// The tag to delete (or use the `tag`/`name` aliases). One of the three is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    name: Option<String>,
 }
 
 /// `gitlab.snippet.create`.
@@ -428,15 +583,21 @@ struct RepositoryTagDeleteInput {
 struct SnippetCreateInput {
     title: String,
     description: Option<String>,
-    visibility: Option<String>,
-    files: Vec<Value>,
+    visibility: Option<Visibility>,
+    #[schemars(length(min = 1))]
+    files: Vec<SnippetFile>,
 }
 
 /// `gitlab.snippet.delete`.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct SnippetDeleteInput {
+    /// The snippet id (or use the `id` alias). One of the two is required (GL-029).
+    #[schemars(range(min = 1))]
     snippet_id: Option<i64>,
+    /// Alias of `snippet_id` (GL-028).
+    #[schemars(range(min = 1))]
+    id: Option<i64>,
 }
 
 /// `gitlab.search.blobs`.
@@ -457,6 +618,7 @@ struct SearchBlobsInput {
 struct MrChangesInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     file: Option<String>,
     max_files: Option<i64>,
@@ -469,6 +631,7 @@ struct MrChangesInput {
 struct MrDiffLinesInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     file: String,
     line: Option<i64>,
@@ -495,6 +658,7 @@ struct CompareInput {
 struct MrDiscussionListInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     limit: Option<i64>,
 }
@@ -505,6 +669,7 @@ struct MrDiscussionListInput {
 struct MrNoteCreateInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     body: String,
 }
@@ -515,11 +680,21 @@ struct MrNoteCreateInput {
 struct MrDiscussionCreateInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     body: String,
+    /// File to anchor a line-level comment to; required when `new_line`/`old_line` is set.
     path: Option<String>,
+    /// New-file line for the anchor; `path` plus `new_line` or `old_line` is required for a
+    /// line-level comment.
+    #[schemars(range(min = 1))]
     new_line: Option<i64>,
+    /// Old-file line for the anchor (deleted/context lines).
+    #[schemars(range(min = 1))]
     old_line: Option<i64>,
+    /// Server-side preview (GL-025): resolve the line anchor via the GitLab API and return the
+    /// would-be discussion `position` WITHOUT posting. Distinct from the CLI's `--dry-run`,
+    /// which only validates the input locally and never contacts GitLab.
     dry_run: Option<bool>,
 }
 
@@ -529,6 +704,7 @@ struct MrDiscussionCreateInput {
 struct MrDiscussionReplyInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     discussion_id: String,
     body: String,
@@ -540,6 +716,7 @@ struct MrDiscussionReplyInput {
 struct MrDiscussionResolveInput {
     r#ref: Option<String>,
     project: Option<String>,
+    #[schemars(range(min = 1))]
     iid: Option<i64>,
     discussion_id: String,
     resolved: Option<bool>,
@@ -558,7 +735,7 @@ struct CiVariableCreateInput {
     masked_and_hidden: Option<bool>,
     protected: Option<bool>,
     raw: Option<bool>,
-    variable_type: Option<String>,
+    variable_type: Option<VariableType>,
 }
 
 /// `gitlab.ci.variable.update`.
@@ -573,7 +750,7 @@ struct CiVariableUpdateInput {
     masked: Option<bool>,
     protected: Option<bool>,
     raw: Option<bool>,
-    variable_type: Option<String>,
+    variable_type: Option<VariableType>,
 }
 
 /// `gitlab.ci.variable.delete`.
@@ -591,7 +768,7 @@ struct CiVariableDeleteInput {
 struct PipelineCreateInput {
     project: String,
     r#ref: String,
-    variables: Option<Vec<Value>>,
+    variables: Option<Vec<PipelineVariable>>,
 }
 
 /// `gitlab.pipeline.retry`.
@@ -599,6 +776,7 @@ struct PipelineCreateInput {
 #[allow(dead_code)]
 struct PipelineRetryInput {
     project: String,
+    #[schemars(range(min = 1))]
     pipeline_id: i64,
 }
 
@@ -607,6 +785,7 @@ struct PipelineRetryInput {
 #[allow(dead_code)]
 struct PipelineCancelInput {
     project: String,
+    #[schemars(range(min = 1))]
     pipeline_id: i64,
 }
 
@@ -615,6 +794,7 @@ struct PipelineCancelInput {
 #[allow(dead_code)]
 struct JobListInput {
     project: String,
+    #[schemars(range(min = 1))]
     pipeline_id: i64,
     scope: Option<Vec<Value>>,
     limit: Option<i64>,
@@ -658,7 +838,7 @@ struct ReleaseCreateInput {
     name: Option<String>,
     description: Option<String>,
     tag_message: Option<String>,
-    milestones: Option<Vec<Value>>,
+    milestones: Option<Vec<String>>,
     released_at: Option<String>,
     assets_links: Option<Vec<Value>>,
 }
@@ -668,7 +848,10 @@ struct ReleaseCreateInput {
 #[allow(dead_code)]
 struct ReleaseShowInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
 }
 
 /// `gitlab.release.update`.
@@ -676,10 +859,14 @@ struct ReleaseShowInput {
 #[allow(dead_code)]
 struct ReleaseUpdateInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required — `name` is the
+    /// release's display name, never the tag.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
     name: Option<String>,
     description: Option<String>,
-    milestones: Option<Vec<Value>>,
+    milestones: Option<Vec<String>>,
     released_at: Option<String>,
 }
 
@@ -688,7 +875,10 @@ struct ReleaseUpdateInput {
 #[allow(dead_code)]
 struct ReleaseDeleteInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
 }
 
 /// `gitlab.release.link.list`.
@@ -696,7 +886,10 @@ struct ReleaseDeleteInput {
 #[allow(dead_code)]
 struct ReleaseLinkListInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
     limit: Option<i64>,
 }
 
@@ -705,11 +898,15 @@ struct ReleaseLinkListInput {
 #[allow(dead_code)]
 struct ReleaseLinkCreateInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required — `name` is the
+    /// link's display name, never the tag.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
     name: String,
     url: String,
     direct_asset_path: Option<String>,
-    link_type: Option<String>,
+    link_type: Option<LinkType>,
 }
 
 /// `gitlab.release.link.update`.
@@ -717,12 +914,16 @@ struct ReleaseLinkCreateInput {
 #[allow(dead_code)]
 struct ReleaseLinkUpdateInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
+    #[schemars(range(min = 1))]
     link_id: i64,
     name: Option<String>,
     url: Option<String>,
     direct_asset_path: Option<String>,
-    link_type: Option<String>,
+    link_type: Option<LinkType>,
 }
 
 /// `gitlab.release.link.delete`.
@@ -730,7 +931,11 @@ struct ReleaseLinkUpdateInput {
 #[allow(dead_code)]
 struct ReleaseLinkDeleteInput {
     project: String,
-    tag_name: String,
+    /// The release tag (or use the `tag` alias). One of the two is required.
+    tag_name: Option<String>,
+    /// Alias of `tag_name` (GL-028).
+    tag: Option<String>,
+    #[schemars(range(min = 1))]
     link_id: i64,
 }
 
@@ -770,7 +975,7 @@ struct RepositoryArchiveInput {
     project: String,
     r#ref: Option<String>,
     path: Option<String>,
-    format: Option<String>,
+    format: Option<ArchiveFormat>,
 }
 
 /// `gitlab.ci.job_token.scope.show`.
@@ -1230,7 +1435,7 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             write_op_typed::<MrDiscussionCreateInput>(
                 "gitlab.mr.discussion.create",
-                "Open a merge request discussion, optionally anchored to a diff line (path + new_line/old_line). dry_run previews the resolved position without posting.",
+                "Open a merge request discussion, optionally anchored to a diff line (path + new_line/old_line). dry_run=true is a SERVER-SIDE preview: it resolves the line anchor via the GitLab API and returns the would-be position without posting (the CLI's --dry-run flag, by contrast, only validates the input locally).",
             ),
             mr_discussion_create,
         )
@@ -1522,6 +1727,66 @@ fn manifest_builder() -> PluginBuilder {
             ),
             deploy_token_revoke,
         )
+        // ---- custom preflight rules (D-88) ----
+        // Conditional targets, aliases, regex validity, and empty-update guards the schemas
+        // cannot express; host-kit runs them in both --dry-run and runtime dispatch.
+        .preflight("gitlab.mr.show", pf_mr_address)
+        .preflight("gitlab.mr.update", |i| {
+            let mut p = pf_mr_address(i);
+            p.extend(pf_any_update(
+                i,
+                &["title", "description", "target_branch", "state_event", "labels"],
+            ));
+            p
+        })
+        .preflight("gitlab.mr.approve", pf_mr_address)
+        .preflight("gitlab.mr.merge", pf_mr_address)
+        .preflight("gitlab.mr.changes", pf_mr_address)
+        .preflight("gitlab.mr.diff.lines", pf_mr_diff_lines)
+        .preflight("gitlab.mr.discussion.list", pf_mr_address)
+        .preflight("gitlab.mr.note.create", pf_mr_address)
+        .preflight("gitlab.mr.discussion.create", pf_mr_discussion_create)
+        .preflight("gitlab.mr.discussion.reply", pf_mr_address)
+        .preflight("gitlab.mr.discussion.resolve", pf_mr_address)
+        .preflight("gitlab.issue.show", pf_issue_address)
+        .preflight("gitlab.issue.update", |i| {
+            let mut p = pf_issue_address(i);
+            p.extend(pf_any_update(
+                i,
+                &[
+                    "title",
+                    "description",
+                    "labels",
+                    "add_labels",
+                    "remove_labels",
+                    "state_event",
+                    "assignee_ids",
+                ],
+            ));
+            p
+        })
+        .preflight("gitlab.issue.note.list", pf_issue_address)
+        .preflight("gitlab.issue.note.create", pf_issue_address)
+        .preflight("gitlab.branch.create", pf_branch)
+        .preflight("gitlab.branch.delete", pf_branch)
+        .preflight("gitlab.repository.tag.create", pf_tag_name)
+        .preflight("gitlab.repository.tag.show", pf_tag_name)
+        .preflight("gitlab.repository.tag.delete", pf_tag_name)
+        .preflight("gitlab.snippet.delete", pf_snippet_delete)
+        .preflight("gitlab.release.show", pf_release_tag)
+        .preflight("gitlab.release.update", |i| {
+            let mut p = pf_release_tag(i);
+            p.extend(pf_any_update(
+                i,
+                &["name", "description", "milestones", "released_at"],
+            ));
+            p
+        })
+        .preflight("gitlab.release.delete", pf_release_tag)
+        .preflight("gitlab.release.link.list", pf_release_tag)
+        .preflight("gitlab.release.link.create", pf_release_tag)
+        .preflight("gitlab.release.link.update", pf_release_tag)
+        .preflight("gitlab.release.link.delete", pf_release_tag)
 }
 
 fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
@@ -1724,6 +1989,90 @@ fn issue_address(input: &Value) -> Result<(String, i64), String> {
     let project = req_project(input)?;
     let iid = flex_i64(input, &["iid", "issue_iid"]).ok_or("`iid` (integer) required")?;
     Ok((project, iid))
+}
+
+// ─── custom preflight rules (D-88) ──────────────────────────────────────────
+// Constraints the generated schemas cannot express, attached via `PluginBuilder::preflight` so
+// host-kit runs them in BOTH `--dry-run` (`plugin.validate`) and runtime dispatch. Each rule
+// reuses the SAME resolution helper its handler calls, so the two verdicts cannot drift.
+
+/// GL-004: a merge-request target — `ref`/`id` (PROJECT!IID) or `project` + `iid`.
+fn pf_mr_address(input: &Value) -> Vec<String> {
+    mr_address(input).err().into_iter().collect()
+}
+
+/// GL-004: an issue target — `ref`/`id` (PROJECT#IID) or `project` + `iid`.
+fn pf_issue_address(input: &Value) -> Vec<String> {
+    issue_address(input).err().into_iter().collect()
+}
+
+/// GL-021: an update op must carry at least one updatable field.
+fn pf_any_update(input: &Value, keys: &[&str]) -> Vec<String> {
+    if body_from(input, keys).is_empty() {
+        vec![format!("nothing to update: pass {}", keys.join(", "))]
+    } else {
+        Vec::new()
+    }
+}
+
+/// GL-027: `mr.diff.lines` — the MR target, plus `search` must be a compilable regex.
+fn pf_mr_diff_lines(input: &Value) -> Vec<String> {
+    let mut problems = pf_mr_address(input);
+    if let Some(s) = flex_str(input, "search") {
+        if let Err(e) = Regex::new(&s) {
+            problems.push(format!("search: {e}"));
+        }
+    }
+    problems
+}
+
+/// GL-036: `mr.discussion.create` — the MR target, plus the line-anchor conditionals
+/// (`path` + `new_line`/`old_line` travel together).
+fn pf_mr_discussion_create(input: &Value) -> Vec<String> {
+    let mut problems = pf_mr_address(input);
+    let path = flex_str(input, "path");
+    let new_line = flex_i64(input, &["new_line"]);
+    let old_line = flex_i64(input, &["old_line"]);
+    if path.is_some() || new_line.is_some() || old_line.is_some() {
+        if path.is_none() {
+            problems.push("`path` is required for a line-level comment".into());
+        }
+        if new_line.is_none() && old_line.is_none() {
+            problems.push("`new_line` or `old_line` is required for a line-level comment".into());
+        }
+    }
+    problems
+}
+
+/// GL-029: `snippet.delete` — `snippet_id` (or its `id` alias) is required.
+fn pf_snippet_delete(input: &Value) -> Vec<String> {
+    if flex_i64(input, &["snippet_id", "id"]).is_none() {
+        vec!["`snippet_id` (integer) required".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// GL-028: `branch` (or its `name` alias) is required.
+fn pf_branch(input: &Value) -> Vec<String> {
+    if flex_str(input, "branch")
+        .or_else(|| flex_str(input, "name"))
+        .is_none()
+    {
+        vec!["`branch` (string) required".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// GL-028: a tag op's `tag_name` (or a documented alias) is required.
+fn pf_tag_name(input: &Value) -> Vec<String> {
+    tag_name(input).err().into_iter().collect()
+}
+
+/// GL-028: a release op's `tag_name`/`tag` is required (`name` is a display name, never the tag).
+fn pf_release_tag(input: &Value) -> Vec<String> {
+    release_tag(input).err().into_iter().collect()
 }
 
 /// Clamp a 1-based `limit` to `[1, max]`, falling back to `default` when unset/non-positive.
@@ -2624,11 +2973,20 @@ fn tag_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     Ok(json!({ "project": project, "tag_name": tag, "message": "tag deleted" }))
 }
 
-/// A tag name from `tag_name`/`tag`/`name` aliases.
+/// A tag name from `tag_name`/`tag`/`name` aliases (tag ops only — see [`release_tag`]).
 fn tag_name(input: &Value) -> Result<String, String> {
     flex_str(input, "tag_name")
         .or_else(|| flex_str(input, "tag"))
         .or_else(|| flex_str(input, "name"))
+        .ok_or_else(|| "`tag_name` (string) required".into())
+}
+
+/// The release tag from `tag_name`/`tag` — deliberately NOT `name`, which is the release/link
+/// display-name field on the release ops (GL-028: the old `name` fallback could silently treat
+/// a display name as the tag).
+fn release_tag(input: &Value) -> Result<String, String> {
+    flex_str(input, "tag_name")
+        .or_else(|| flex_str(input, "tag"))
         .ok_or_else(|| "`tag_name` (string) required".into())
 }
 
@@ -3275,7 +3633,7 @@ fn release_create(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_show(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     gl_get(
         host,
         &format!("/projects/{}/releases/{}", enc(&project), enc(&tag)),
@@ -3284,7 +3642,7 @@ fn release_show(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_update(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     let body = body_from(
         &input,
         &["name", "description", "milestones", "released_at"],
@@ -3298,7 +3656,7 @@ fn release_update(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     gl_delete(
         host,
         &format!("/projects/{}/releases/{}", enc(&project), enc(&tag)),
@@ -3308,7 +3666,7 @@ fn release_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_link_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
     gl_get(
         host,
@@ -3322,7 +3680,7 @@ fn release_link_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_link_create(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     require_keys(&input, &["name", "url"])?;
     let body = body_from(&input, &["name", "url", "direct_asset_path", "link_type"]);
     gl_post(
@@ -3338,7 +3696,7 @@ fn release_link_create(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_link_update(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     let link_id = flex_i64(&input, &["link_id"]).ok_or("`link_id` (integer) required")?;
     let body = body_from(&input, &["name", "url", "direct_asset_path", "link_type"]);
     gl_put(
@@ -3354,7 +3712,7 @@ fn release_link_update(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_link_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let tag = tag_name(&input)?;
+    let tag = release_tag(&input)?;
     let link_id = flex_i64(&input, &["link_id"]).ok_or("`link_id` (integer) required")?;
     gl_delete(
         host,
@@ -3858,6 +4216,321 @@ mod tests {
 
     fn run(op: &str, input: Value, host: &mut MockHost) -> Value {
         manifest_builder().build().call(op, input, host).unwrap()
+    }
+
+    /// The verdict the CLI `--dry-run` path gets from the auto-registered `plugin.validate`
+    /// (D-88): `(valid, problems, warnings)` for one op input.
+    fn validate(op: &str, input: Value) -> (bool, Vec<String>, Vec<String>) {
+        let mut host = MockHost::default();
+        let v = manifest_builder()
+            .build()
+            .call(
+                VALIDATE_OP,
+                json!({ "operation": op, "input": input }),
+                &mut host,
+            )
+            .expect("plugin.validate answers");
+        let strings = |key: &str| -> Vec<String> {
+            v[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_string())
+                .collect()
+        };
+        (
+            v["valid"].as_bool().unwrap(),
+            strings("problems"),
+            strings("warnings"),
+        )
+    }
+
+    // ---- D-88: shared dry-run/runtime preflight ----
+
+    /// The keystone failing-first pair: inputs that used to pass the schema-only dry-run and
+    /// then fail at runtime now fail `plugin.validate` too — with the SAME problem the runtime
+    /// dispatch reports, and without any HTTP.
+    #[test]
+    fn preflight_dry_run_and_runtime_share_one_verdict() {
+        // GL-021: an empty mr.update passed the old dry-run, then the handler rejected it.
+        let empty_update = json!({ "project": "group/app", "iid": 5 });
+        let (valid, problems, _) = validate("gitlab.mr.update", empty_update.clone());
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("nothing to update")),
+            "{problems:?}"
+        );
+        let runtime_err = manifest_builder()
+            .build()
+            .call("gitlab.mr.update", empty_update, &mut MockHost::default())
+            .unwrap_err();
+        assert!(runtime_err.contains("nothing to update"), "{runtime_err}");
+
+        // GL-030: a blank required string passed the old dry-run, then failed flex extraction.
+        let (valid, problems, _) = validate("gitlab.project.show", json!({ "project": "   " }));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("`project` is blank")),
+            "{problems:?}"
+        );
+    }
+
+    /// GL-011/GL-022: enum-like fields validate against their allowed set locally.
+    #[test]
+    fn preflight_enforces_enum_values() {
+        let (valid, problems, _) = validate(
+            "gitlab.issue.list",
+            json!({ "project": "g/a", "state": "wontfix" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("state") && p.contains("must be one of")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate(
+            "gitlab.issue.list",
+            json!({ "project": "g/a", "state": "opened" }),
+        );
+        assert!(valid);
+        // The archive format is a closed set, so an arbitrary string can never reach the URL.
+        let (valid, _, _) = validate(
+            "gitlab.repository.archive",
+            json!({ "project": "g/a", "format": "../../etc" }),
+        );
+        assert!(!valid);
+        let (valid, _, _) = validate(
+            "gitlab.repository.archive",
+            json!({ "project": "g/a", "format": "zip" }),
+        );
+        assert!(valid);
+        // The remaining GL-011 enum fields reject out-of-set values the same way.
+        for (op, input) in [
+            (
+                "gitlab.project.create",
+                json!({ "name": "app", "visibility": "hidden" }),
+            ),
+            (
+                "gitlab.ci.variable.create",
+                json!({ "project": "g/a", "key": "K", "value": "v", "variable_type": "blob" }),
+            ),
+            (
+                "gitlab.release.link.create",
+                json!({ "project": "g/a", "tag_name": "v1", "name": "installer", "url": "https://x", "link_type": "binary" }),
+            ),
+        ] {
+            let (valid, problems, _) = validate(op, input);
+            assert!(!valid, "{op}");
+            assert!(
+                problems.iter().any(|p| p.contains("must be one of")),
+                "{op}: {problems:?}"
+            );
+        }
+    }
+
+    /// GL-020/GL-012: non-empty arrays and typed nested payload elements.
+    #[test]
+    fn preflight_enforces_arrays_and_nested_payloads() {
+        let base = json!({ "project": "g/a", "branch": "main", "commit_message": "msg" });
+        let with = |actions: Value| {
+            let mut v = base.clone();
+            v["actions"] = actions;
+            v
+        };
+        let (valid, problems, _) = validate("gitlab.repository.commit.create", with(json!([])));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("at least 1 item")),
+            "{problems:?}"
+        );
+        let (valid, problems, _) = validate(
+            "gitlab.repository.commit.create",
+            with(json!([{ "action": "explode", "file_path": "a" }])),
+        );
+        assert!(!valid);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("action") && p.contains("must be one of")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate(
+            "gitlab.repository.commit.create",
+            with(json!([{ "action": "create", "file_path": "a", "content": "x" }])),
+        );
+        assert!(valid);
+        let (valid, problems, _) = validate(
+            "gitlab.snippet.create",
+            json!({ "title": "t", "files": [] }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("at least 1 item")),
+            "{problems:?}"
+        );
+    }
+
+    /// GL-024/GL-029: non-positive ids are rejected; snippet.delete requires an id at all.
+    #[test]
+    fn preflight_enforces_positive_ids_and_snippet_target() {
+        let (valid, problems, _) =
+            validate("gitlab.mr.show", json!({ "project": "g/a", "iid": 0 }));
+        assert!(!valid);
+        assert!(problems.iter().any(|p| p.contains(">= 1")), "{problems:?}");
+        let (valid, problems, _) = validate("gitlab.snippet.delete", json!({}));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("`snippet_id`")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate("gitlab.snippet.delete", json!({ "id": 12 }));
+        assert!(valid, "the documented `id` alias satisfies the target");
+    }
+
+    /// GL-004: conditional targets — `ref` OR `project`+`iid` — are enforced locally.
+    #[test]
+    fn preflight_enforces_conditional_targets() {
+        let (valid, problems, _) = validate("gitlab.mr.show", json!({}));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("`project`")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate("gitlab.mr.show", json!({ "ref": "group/app!5" }));
+        assert!(valid);
+        let (valid, _, _) = validate("gitlab.issue.show", json!({ "project": "g/a", "iid": 3 }));
+        assert!(valid);
+        let (valid, problems, _) = validate("gitlab.issue.show", json!({ "project": "g/a" }));
+        assert!(!valid);
+        assert!(problems.iter().any(|p| p.contains("`iid`")), "{problems:?}");
+    }
+
+    /// GL-027: an invalid `mr.diff.lines` search regex is reported at validate time.
+    #[test]
+    fn preflight_compiles_diff_lines_regex() {
+        let (valid, problems, _) = validate(
+            "gitlab.mr.diff.lines",
+            json!({ "ref": "g/a!5", "file": "src/x.rs", "search": "[unclosed" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.starts_with("search:")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate(
+            "gitlab.mr.diff.lines",
+            json!({ "ref": "g/a!5", "file": "src/x.rs", "search": "fn \\w+" }),
+        );
+        assert!(valid);
+    }
+
+    /// GL-036: MR line-anchor conditionals — `path` + `new_line`/`old_line` travel together.
+    #[test]
+    fn preflight_enforces_line_anchor_conditionals() {
+        let (valid, problems, _) = validate(
+            "gitlab.mr.discussion.create",
+            json!({ "ref": "g/a!5", "body": "hm", "new_line": 3 }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("`path` is required")),
+            "{problems:?}"
+        );
+        let (valid, problems, _) = validate(
+            "gitlab.mr.discussion.create",
+            json!({ "ref": "g/a!5", "body": "hm", "path": "src/x.rs" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("`new_line` or `old_line`")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate(
+            "gitlab.mr.discussion.create",
+            json!({ "ref": "g/a!5", "body": "hm", "path": "src/x.rs", "new_line": 3 }),
+        );
+        assert!(valid);
+    }
+
+    /// GL-021: issue.update and release.update gained the empty-update guard mr.update had.
+    #[test]
+    fn preflight_empty_update_guards_are_consistent() {
+        for (op, target) in [
+            ("gitlab.issue.update", json!({ "ref": "g/a#3" })),
+            (
+                "gitlab.release.update",
+                json!({ "project": "g/a", "tag_name": "v1" }),
+            ),
+        ] {
+            let (valid, problems, _) = validate(op, target);
+            assert!(!valid, "{op} accepts an empty update");
+            assert!(
+                problems.iter().any(|p| p.contains("nothing to update")),
+                "{op}: {problems:?}"
+            );
+        }
+    }
+
+    /// GL-028: the documented aliases satisfy their targets — and `name` is never a release tag.
+    #[test]
+    fn preflight_alias_requirements() {
+        let (valid, _, _) = validate(
+            "gitlab.repository.tag.show",
+            json!({ "project": "g/a", "tag": "v1" }),
+        );
+        assert!(valid);
+        let (valid, problems, _) =
+            validate("gitlab.repository.tag.show", json!({ "project": "g/a" }));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("`tag_name`")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate(
+            "gitlab.branch.create",
+            json!({ "project": "g/a", "name": "feat/x", "ref": "main" }),
+        );
+        assert!(valid, "`name` is a documented branch alias");
+        // release.update: `name` is the display name — it must NOT satisfy the tag target
+        // (the old `name` fallback silently treated a display name as the tag).
+        let (valid, problems, _) = validate(
+            "gitlab.release.update",
+            json!({ "project": "g/a", "name": "Renamed release" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("`tag_name`")),
+            "{problems:?}"
+        );
+        let runtime_err = manifest_builder()
+            .build()
+            .call(
+                "gitlab.release.update",
+                json!({ "project": "g/a", "name": "Renamed release" }),
+                &mut MockHost::default(),
+            )
+            .unwrap_err();
+        assert!(runtime_err.contains("`tag_name`"), "{runtime_err}");
+    }
+
+    /// GL-008: unknown fields are clearly warned (the schema is open — handlers may read
+    /// undocumented aliases — so this is advisory, not a rejection).
+    #[test]
+    fn preflight_warns_on_unknown_fields() {
+        let (valid, problems, warnings) = validate(
+            "gitlab.issue.list",
+            json!({ "project": "g/a", "stat": "opened" }),
+        );
+        assert!(valid, "{problems:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`stat`") && w.contains("not in the op schema")),
+            "{warnings:?}"
+        );
     }
 
     // ---- original surface ----
@@ -4677,7 +5350,7 @@ mod tests {
             &mut host,
         );
         assert_eq!(ok["id"], 6);
-        // A missing key is rejected before any HTTP call.
+        // A missing key is rejected before any HTTP call (by the shared preflight since D-88).
         let bad_key = manifest_builder()
             .build()
             .call(
@@ -4686,7 +5359,10 @@ mod tests {
                 &mut host,
             )
             .unwrap_err();
-        assert!(bad_key.contains("key is required"), "got: {bad_key}");
+        assert!(
+            bad_key.contains("missing required field `key`"),
+            "got: {bad_key}"
+        );
         // An invalid variable_type is rejected.
         let bad_type = manifest_builder()
             .build()
@@ -4697,7 +5373,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            bad_type.contains("invalid variable_type"),
+            bad_type.contains("variable_type") && bad_type.contains("must be one of"),
             "got: {bad_type}"
         );
     }
@@ -4868,7 +5544,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_auth_and_datasources() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 79);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 79);
         assert_eq!(m.auth[0].purpose, "personal_token");
         assert_eq!(m.endpoints[0].name, "gitlab.endpoint");
         assert_eq!(
@@ -5143,6 +5819,9 @@ mod schema_contract {
         Int,
         Bool,
         ArrayAny,
+        /// A closed string set (D-88): the schema carries `enum`, so dry-run and runtime both
+        /// reject out-of-set values locally.
+        Enum(Vec<String>),
     }
 
     #[derive(Clone)]
@@ -5156,6 +5835,12 @@ mod schema_contract {
     }
     fn p(name: &'static str, kind: Kind) -> Prop {
         Prop { name, kind }
+    }
+    fn en(name: &'static str, values: &[&str]) -> Prop {
+        p(
+            name,
+            Kind::Enum(values.iter().map(|s| s.to_string()).collect()),
+        )
     }
     fn c(props: Vec<Prop>, required: Vec<&'static str>) -> OpContract {
         OpContract { props, required }
@@ -5214,7 +5899,7 @@ mod schema_contract {
                 c(
                     vec![
                         p("project", Kind::Str),
-                        p("state", Kind::Str),
+                        en("state", &["opened", "closed", "all"]),
                         p("search", Kind::Str),
                         p("query", Kind::Str),
                         p("order_by", Kind::Str),
@@ -5285,7 +5970,7 @@ mod schema_contract {
                         p("path", Kind::Str),
                         p("namespace", Kind::Str),
                         p("description", Kind::Str),
-                        p("visibility", Kind::Str),
+                        en("visibility", &["private", "internal", "public"]),
                         p("initialize_with_readme", Kind::Bool),
                     ],
                     vec!["name"],
@@ -5435,16 +6120,23 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("branch", Kind::Str),
+                        p("name", Kind::Str),
                         p("ref", Kind::Str),
                     ],
-                    vec!["project", "branch", "ref"],
+                    // `branch` is conditionally required (or its `name` alias) via the
+                    // custom preflight (GL-028).
+                    vec!["project", "ref"],
                 ),
             ),
             (
                 "gitlab.branch.delete",
                 c(
-                    vec![p("project", Kind::Str), p("branch", Kind::Str)],
-                    vec!["project", "branch"],
+                    vec![
+                        p("project", Kind::Str),
+                        p("branch", Kind::Str),
+                        p("name", Kind::Str),
+                    ],
+                    vec!["project"],
                 ),
             ),
             (
@@ -5580,10 +6272,13 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
+                        p("name", Kind::Str),
                         p("ref", Kind::Str),
                         p("message", Kind::Str),
                     ],
-                    vec!["project", "tag_name", "ref"],
+                    // `tag_name` is conditionally required (or its `name` alias) via the
+                    // custom preflight (GL-028).
+                    vec!["project", "ref"],
                 ),
             ),
             (
@@ -5600,15 +6295,25 @@ mod schema_contract {
             (
                 "gitlab.repository.tag.show",
                 c(
-                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
-                    vec!["project", "tag_name"],
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
+                        p("name", Kind::Str),
+                    ],
+                    vec!["project"],
                 ),
             ),
             (
                 "gitlab.repository.tag.delete",
                 c(
-                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
-                    vec!["project", "tag_name"],
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
+                        p("name", Kind::Str),
+                    ],
+                    vec!["project"],
                 ),
             ),
             (
@@ -5617,7 +6322,7 @@ mod schema_contract {
                     vec![
                         p("title", Kind::Str),
                         p("description", Kind::Str),
-                        p("visibility", Kind::Str),
+                        en("visibility", &["private", "internal", "public"]),
                         p("files", Kind::ArrayAny),
                     ],
                     vec!["title", "files"],
@@ -5625,7 +6330,7 @@ mod schema_contract {
             ),
             (
                 "gitlab.snippet.delete",
-                c(vec![p("snippet_id", Kind::Int)], vec![]),
+                c(vec![p("snippet_id", Kind::Int), p("id", Kind::Int)], vec![]),
             ),
             (
                 "gitlab.search.blobs",
@@ -5764,7 +6469,7 @@ mod schema_contract {
                         p("masked_and_hidden", Kind::Bool),
                         p("protected", Kind::Bool),
                         p("raw", Kind::Bool),
-                        p("variable_type", Kind::Str),
+                        en("variable_type", &["env_var", "file"]),
                     ],
                     vec!["project", "key", "value"],
                 ),
@@ -5781,7 +6486,7 @@ mod schema_contract {
                         p("masked", Kind::Bool),
                         p("protected", Kind::Bool),
                         p("raw", Kind::Bool),
-                        p("variable_type", Kind::Str),
+                        en("variable_type", &["env_var", "file"]),
                     ],
                     vec!["project", "key", "value"],
                 ),
@@ -5885,8 +6590,12 @@ mod schema_contract {
             (
                 "gitlab.release.show",
                 c(
-                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
-                    vec!["project", "tag_name"],
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
+                    ],
+                    vec!["project"],
                 ),
             ),
             (
@@ -5895,19 +6604,24 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
                         p("name", Kind::Str),
                         p("description", Kind::Str),
                         p("milestones", Kind::ArrayAny),
                         p("released_at", Kind::Str),
                     ],
-                    vec!["project", "tag_name"],
+                    vec!["project"],
                 ),
             ),
             (
                 "gitlab.release.delete",
                 c(
-                    vec![p("project", Kind::Str), p("tag_name", Kind::Str)],
-                    vec!["project", "tag_name"],
+                    vec![
+                        p("project", Kind::Str),
+                        p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
+                    ],
+                    vec!["project"],
                 ),
             ),
             (
@@ -5916,9 +6630,10 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
                         p("limit", Kind::Int),
                     ],
-                    vec!["project", "tag_name"],
+                    vec!["project"],
                 ),
             ),
             (
@@ -5927,12 +6642,13 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
                         p("name", Kind::Str),
                         p("url", Kind::Str),
                         p("direct_asset_path", Kind::Str),
-                        p("link_type", Kind::Str),
+                        en("link_type", &["other", "runbook", "image", "package"]),
                     ],
-                    vec!["project", "tag_name", "name", "url"],
+                    vec!["project", "name", "url"],
                 ),
             ),
             (
@@ -5941,13 +6657,14 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
                         p("link_id", Kind::Int),
                         p("name", Kind::Str),
                         p("url", Kind::Str),
                         p("direct_asset_path", Kind::Str),
-                        p("link_type", Kind::Str),
+                        en("link_type", &["other", "runbook", "image", "package"]),
                     ],
-                    vec!["project", "tag_name", "link_id"],
+                    vec!["project", "link_id"],
                 ),
             ),
             (
@@ -5956,9 +6673,10 @@ mod schema_contract {
                     vec![
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
+                        p("tag", Kind::Str),
                         p("link_id", Kind::Int),
                     ],
-                    vec!["project", "tag_name", "link_id"],
+                    vec!["project", "link_id"],
                 ),
             ),
             (
@@ -6001,7 +6719,12 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("ref", Kind::Str),
                         p("path", Kind::Str),
-                        p("format", Kind::Str),
+                        en(
+                            "format",
+                            &[
+                                "tar.gz", "tar.bz2", "tbz", "tbz2", "tb2", "bz2", "tar", "zip",
+                            ],
+                        ),
                     ],
                     vec!["project"],
                 ),
@@ -6125,7 +6848,30 @@ mod schema_contract {
         ]
     }
 
-    fn kind_of(node: &Value) -> Kind {
+    fn kind_of(root: &Value, node: &Value) -> Kind {
+        // Enum fields land in `$defs` behind a `$ref` (possibly wrapped in `anyOf` for Option).
+        if let Some(r) = node.get("$ref").and_then(|v| v.as_str()) {
+            let resolved = r
+                .strip_prefix("#/$defs/")
+                .and_then(|name| root.get("$defs").and_then(|d| d.get(name)))
+                .unwrap_or_else(|| panic!("unresolvable $ref: {r}"));
+            return kind_of(root, resolved);
+        }
+        if let Some(branches) = node.get("anyOf").and_then(|v| v.as_array()) {
+            let branch = branches
+                .iter()
+                .find(|b| b.get("type").and_then(|t| t.as_str()) != Some("null"))
+                .expect("anyOf with a non-null branch");
+            return kind_of(root, branch);
+        }
+        if let Some(vals) = node.get("enum").and_then(|v| v.as_array()) {
+            return Kind::Enum(
+                vals.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(String::from)
+                    .collect(),
+            );
+        }
         let t = node.get("type");
         if let Some(arr) = t.and_then(|v| v.as_array()) {
             let first = arr
@@ -6154,7 +6900,7 @@ mod schema_contract {
         let mut got: BTreeMap<&str, Kind> = BTreeMap::new();
         if let Some(props) = props_obj {
             for (k, v) in props {
-                got.insert(k.as_str(), kind_of(v));
+                got.insert(k.as_str(), kind_of(schema, v));
             }
         }
         let want: BTreeMap<&str, Kind> = contract
@@ -6188,6 +6934,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

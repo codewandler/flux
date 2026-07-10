@@ -3673,7 +3673,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_auth_and_datasources() {
         let m = plugin().manifest();
-        assert_eq!(m.operations.len(), 30);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 30);
         assert_eq!(m.auth[0].purpose, "bot_token");
         assert!(m.auth.iter().any(|a| a.purpose == "user_token"));
         assert!(m.capabilities.blob);
@@ -4076,6 +4076,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

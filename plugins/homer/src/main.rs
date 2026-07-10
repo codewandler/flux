@@ -2480,6 +2480,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

@@ -28,12 +28,15 @@ use std::collections::HashMap;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+pub mod preflight;
+pub use preflight::schema_preflight;
+
 // Re-export the protocol vocabulary so a plugin depends only on host-kit.
 pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, Source};
 pub use flux_plugin::{
     AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OAuth2Spec, OAuthGrant,
     OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
-    ToolGroup,
+    ToolGroup, VALIDATE_OP,
 };
 pub use flux_spec::{Effect, Idempotency, Risk};
 
@@ -817,10 +820,16 @@ impl std::io::Write for ConnStream<'_, '_> {
 /// A handler closure for one operation: `(input, host) -> result`.
 type OpFn = Box<dyn Fn(Value, &mut Host) -> Result<Value, String> + Send + Sync>;
 
+/// A custom preflight rule for one operation: `input -> problems` (empty = valid). Runs alongside
+/// the generic [`schema_preflight`] in both the `--dry-run` path (via [`VALIDATE_OP`]) and runtime
+/// dispatch — see [`PluginBuilder::preflight`].
+type PreflightFn = Box<dyn Fn(&Value) -> Vec<String> + Send + Sync>;
+
 /// Collects a manifest + op handlers, then [`serve`](Plugin::serve)s them over the plugin protocol.
 pub struct PluginBuilder {
     manifest: PluginManifest,
     ops: HashMap<String, OpFn>,
+    preflights: HashMap<String, PreflightFn>,
 }
 
 impl PluginBuilder {
@@ -833,6 +842,7 @@ impl PluginBuilder {
                 ..Default::default()
             },
             ops: HashMap::new(),
+            preflights: HashMap::new(),
         }
     }
 
@@ -893,16 +903,59 @@ impl PluginBuilder {
         self
     }
 
+    /// Attach a **custom preflight rule** to a registered operation (D-88), for constraints the
+    /// JSON schema cannot express: conditional targets (`ref` OR `project`+`iid`), alias
+    /// requirements, regex compilation, empty-update guards. The rule runs *in addition to* the
+    /// generic [`schema_preflight`] every op gets, in both the `--dry-run` path (via the
+    /// auto-registered [`VALIDATE_OP`]) and runtime dispatch — so the two verdicts can never
+    /// disagree. Return every problem found (empty = valid).
+    pub fn preflight(
+        mut self,
+        op: impl Into<String>,
+        rule: impl Fn(&Value) -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.preflights.insert(op.into(), Box::new(rule));
+        self
+    }
+
     /// Return a clone of the manifest accumulated so far, useful for plugin manifest tests.
     pub fn manifest(&self) -> PluginManifest {
         self.manifest.clone()
     }
 
     /// Finish building (without serving) — used by tests to call ops against a mock host.
+    ///
+    /// Panics if a [`preflight`](Self::preflight) rule names an unregistered op (a developer
+    /// error any test constructing the plugin catches). Auto-registers the [`VALIDATE_OP`]
+    /// internal op unless the plugin declared its own.
     pub fn build(self) -> Plugin {
+        for op in self.preflights.keys() {
+            assert!(
+                self.ops.contains_key(op),
+                "preflight rule for unregistered op `{op}`"
+            );
+        }
+        let mut manifest = self.manifest;
+        if !manifest.operations.iter().any(|o| o.name == VALIDATE_OP) {
+            manifest.operations.push(internal_op(
+                VALIDATE_OP,
+                "Validate an operation input without executing it: {operation, input} -> \
+                 {operation, valid, problems}. The host's --dry-run path calls this so local \
+                 validation and runtime dispatch share one preflight verdict.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": { "type": "string", "description": "The op name to validate against." },
+                        "input": { "type": "object", "description": "The op input to validate." },
+                    },
+                    "required": ["operation"],
+                }),
+            ));
+        }
         Plugin {
-            manifest: self.manifest,
+            manifest,
             ops: self.ops,
+            preflights: self.preflights,
         }
     }
 
@@ -916,6 +969,29 @@ impl PluginBuilder {
 pub struct Plugin {
     manifest: PluginManifest,
     ops: HashMap<String, OpFn>,
+    preflights: HashMap<String, PreflightFn>,
+}
+
+impl Plugin {
+    /// The combined preflight verdict for one op input (D-88): the generic [`schema_preflight`]
+    /// against the op's declared `input_schema`, plus any custom
+    /// [`preflight`](PluginBuilder::preflight) rule. This is what runtime dispatch enforces and
+    /// what [`VALIDATE_OP`] answers — the single source of the dry-run/runtime verdict.
+    pub fn validate_input(&self, operation: &str, input: &Value) -> preflight::PreflightReport {
+        let mut report = preflight::PreflightReport::default();
+        if let Some(spec) = self
+            .manifest
+            .operations
+            .iter()
+            .find(|o| o.name == operation)
+        {
+            report = schema_preflight(&spec.input_schema, input);
+        }
+        if let Some(rule) = self.preflights.get(operation) {
+            report.problems.extend(rule(input));
+        }
+        report
+    }
 }
 
 impl PluginHandler for Plugin {
@@ -929,10 +1005,39 @@ impl PluginHandler for Plugin {
         input: Value,
         host: &mut dyn GuestHost,
     ) -> Result<Value, String> {
+        // The auto-registered validate op (D-88): answer with the preflight verdict, never
+        // executing anything. A plugin that registered its own op under this name wins below.
+        if operation == VALIDATE_OP && !self.ops.contains_key(VALIDATE_OP) {
+            let target = input
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .ok_or("plugin.validate: `operation` (string) required")?;
+            if !self.ops.contains_key(target) {
+                return Err(format!("unknown operation: {target}"));
+            }
+            let op_input = input.get("input").cloned().unwrap_or_else(|| json!({}));
+            let report = self.validate_input(target, &op_input);
+            return Ok(json!({
+                "operation": target,
+                "valid": report.problems.is_empty(),
+                "problems": report.problems,
+                "warnings": report.warnings,
+            }));
+        }
         let op = self
             .ops
             .get(operation)
             .ok_or_else(|| format!("unknown operation: {operation}"))?;
+        // Runtime dispatch runs the same preflight the dry-run path sees, so the two verdicts
+        // can never disagree (D-88). Warnings stay advisory — only problems block dispatch.
+        let problems = self.validate_input(operation, &input).problems;
+        if !problems.is_empty() {
+            return Err(format!(
+                "invalid input for `{operation}` ({} problem(s)):\n  - {}",
+                problems.len(),
+                problems.join("\n  - ")
+            ));
+        }
         let mut h = Host { inner: host };
         op(input, &mut h)
     }
@@ -1544,9 +1649,10 @@ mod tests {
             )
             .build();
 
-        // manifest carries the op + auth + endpoint
+        // manifest carries the op + auth + endpoint (+ the auto-registered validate op, D-88)
         let m = plugin.manifest();
-        assert_eq!(m.operations.len(), 1);
+        assert_eq!(m.operations.len(), 2);
+        assert!(m.operations.iter().any(|o| o.name == VALIDATE_OP));
         assert_eq!(m.auth[0].purpose, "api_token");
 
         let mut host = MockHost::default()
@@ -1790,5 +1896,118 @@ mod tests {
             .operations
             .iter()
             .any(|o| o.name == "aws-bedrock.auth"));
+    }
+
+    /// D-88: `build()` auto-registers the reserved `plugin.validate` internal op — present in the
+    /// manifest for the host's `--dry-run` path to feature-detect, but never projected as a tool.
+    #[test]
+    fn validate_op_is_auto_registered_and_internal() {
+        let plugin = PluginBuilder::new("acme", "0.1.0")
+            .operation(read_op("acme.ping", "ping", json!({})), |_, _| {
+                Ok(json!({"ok": true}))
+            })
+            .build();
+        let m = plugin.manifest();
+        let spec = m
+            .operations
+            .iter()
+            .find(|o| o.name == VALIDATE_OP)
+            .expect("validate op registered");
+        assert!(spec.internal, "validate op is host-only");
+        let visible: Vec<&str> = flux_plugin::visible_ops(&m)
+            .map(|o| o.name.as_str())
+            .collect();
+        assert_eq!(visible, vec!["acme.ping"]);
+    }
+
+    /// D-88 keystone: runtime dispatch and the `plugin.validate` answer share one preflight, so a
+    /// dry-run verdict and a live call can never disagree.
+    #[test]
+    fn dispatch_and_validate_op_share_the_preflight_verdict() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "state": { "type": ["string", "null"], "enum": ["open", "closed", null] },
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        });
+        let plugin = PluginBuilder::new("acme", "0.1.0")
+            .operation(read_op("acme.thing", "fetch", schema), |_, _| {
+                Ok(json!({"fetched": true}))
+            })
+            // A custom rule the schema can't express: `name` may not be "root".
+            .preflight("acme.thing", |input| {
+                match input.get("name").and_then(|v| v.as_str()) {
+                    Some("root") => vec!["`name`: \"root\" is reserved".into()],
+                    _ => Vec::new(),
+                }
+            })
+            .build();
+        let mut host = MockHost::default();
+
+        // A conforming input dispatches to the handler.
+        let ok = plugin
+            .call(
+                "acme.thing",
+                json!({"name": "x", "state": "open"}),
+                &mut host,
+            )
+            .expect("valid input runs");
+        assert_eq!(ok["fetched"], true);
+
+        // Schema problems (blank required, bad enum, unknown field) block dispatch...
+        let err = plugin
+            .call(
+                "acme.thing",
+                json!({"name": "  ", "state": "weird", "typo": 1}),
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(err.contains("invalid input for `acme.thing`"), "{err}");
+        assert!(err.contains("blank"), "{err}");
+        // ...and the validate op reports the SAME problems without executing anything.
+        let verdict = plugin
+            .call(
+                VALIDATE_OP,
+                json!({"operation": "acme.thing", "input": {"name": "  ", "state": "weird", "typo": 1}}),
+                &mut host,
+            )
+            .expect("validate answers");
+        assert_eq!(verdict["valid"], false);
+        assert_eq!(verdict["problems"].as_array().unwrap().len(), 3);
+
+        // The custom rule fires in both paths too.
+        let err = plugin
+            .call("acme.thing", json!({"name": "root"}), &mut host)
+            .unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        let verdict = plugin
+            .call(
+                VALIDATE_OP,
+                json!({"operation": "acme.thing", "input": {"name": "root"}}),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(verdict["valid"], false);
+
+        // Validating an unknown op is an error (mirrors dispatch), not a verdict.
+        assert!(plugin
+            .call(VALIDATE_OP, json!({"operation": "acme.nope"}), &mut host)
+            .is_err());
+        // Omitted `input` validates as an empty object.
+        let verdict = plugin
+            .call(VALIDATE_OP, json!({"operation": "acme.thing"}), &mut host)
+            .unwrap();
+        assert_eq!(verdict["valid"], false, "missing required `name`");
+    }
+
+    #[test]
+    #[should_panic(expected = "preflight rule for unregistered op")]
+    fn preflight_rule_for_unregistered_op_panics_at_build() {
+        let _ = PluginBuilder::new("acme", "0.1.0")
+            .preflight("acme.nope", |_| Vec::new())
+            .build();
     }
 }

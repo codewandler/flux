@@ -12,6 +12,17 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **A dry run now tells you the truth.** `flux plugin call … --dry-run` used to check an
+  integration call only against its declared input shape, so a "valid" preview could still fail
+  the moment you ran it for real. Plugins now run the exact same validation in both places: the
+  dry run reports every problem the live call would reject (a bad option value, an empty file
+  list, a zero id, a missing target, an invalid search pattern, an update with nothing to change)
+  plus warnings for input fields the operation doesn't recognize — and the live call refuses the
+  same inputs with the same messages before anything leaves your machine. Arrives for GitLab with
+  the next plugin pack update; other integrations pick it up as they rebuild.
+
 ### Fixed
 
 - Two Slack plugin fixes, arriving with the next plugin pack update: reading messages from a

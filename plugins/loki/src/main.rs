@@ -1214,7 +1214,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_auth_and_datasources() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 5);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 5);
         assert_eq!(m.auth[0].purpose, "basic_password");
         assert_eq!(m.auth[0].scheme, AuthScheme::Basic);
         assert_eq!(m.auth[1].purpose, "tenant_id");
@@ -1222,7 +1222,11 @@ mod tests {
         assert_eq!(m.endpoints[0].name, "loki.endpoint");
         assert!(m.datasources.iter().any(|d| d.entity == "loki.log_entry"));
         assert!(m.datasources.iter().any(|d| d.entity == "loki.label"));
-        assert!(m.operations.iter().all(|o| o.effects == vec![Effect::Read]));
+        assert!(m
+            .operations
+            .iter()
+            .filter(|o| !o.internal)
+            .all(|o| o.effects == vec![Effect::Read]));
     }
 }
 
@@ -1414,7 +1418,7 @@ mod schema_contract {
     fn derived_schemas_match_legacy_contract() {
         let manifest = manifest_builder().build().manifest();
         let mut schemas: BTreeMap<&str, Value> = BTreeMap::new();
-        for op in &manifest.operations {
+        for op in manifest.operations.iter().filter(|o| !o.internal) {
             schemas.insert(op.name.as_str(), op.input_schema.clone());
         }
         for (op_name, contract) in contracts() {

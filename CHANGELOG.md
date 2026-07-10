@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-88: shared dry-run/runtime validation layer for plugins.** host-kit plugins now run ONE
+  preflight in both the CLI's `--dry-run` and runtime dispatch, closing the gap where `--dry-run`
+  trusted only the generated JSON schema while handlers enforced more (a beta pass found ~14
+  gitlab ops answering `valid: true` for inputs guaranteed to fail before any HTTP). host-kit
+  gains a flex-aware schema validator (required + blank-string rejection, enum membership,
+  positive-id ranges, non-empty arrays, typed nested payload elements, `$defs` refs; unknown
+  fields *warn* on open schemas and hard-fail under `additionalProperties: false`), a
+  `PluginBuilder::preflight(op, rule)` hook for constraints schemas cannot express, and an
+  auto-registered internal `plugin.validate` op (never projected as a model tool). `flux plugin
+  call --dry-run` feature-detects that op and merges its verdict (plus a new `warnings` array)
+  into the printed result; runtime dispatch rejects the same problems before the handler runs, so
+  the two paths cannot disagree. The gitlab plugin adopts the layer end-to-end: enum-validated
+  `state`/`visibility`/`link_type`/`variable_type`/archive `format`, non-empty + element-typed
+  commit `actions`/snippet `files`/pipeline `variables`, typed `labels`/`assignee_ids`, positive
+  id/iid bounds, conditional-target rules (`ref` OR `project`+`iid`, `snippet_id`/`id`), regex
+  compilation for `mr.diff.lines search`, consistent empty-update guards on
+  `mr.update`/`issue.update`/`release.update`, and schema-surfaced aliases (`tag`/`name`→
+  `tag_name`, `name`→`branch`, `id`→`snippet_id`). The release ops' undocumented `name`→`tag_name`
+  fallback is dropped — `name` is the release/link display-name field there, and the old chain
+  could silently treat a display name as the tag. `mr.discussion.create` now documents its
+  `dry_run` field as a server-side anchor preview, distinct from the CLI's local `--dry-run`
+  (GL-004/008/011/012/020/021/022/024/025/027/028/029/030/036).
+
 ### Fixed
 
 - **D-127: slack mrkdwn→Markdown renderer no longer mangles or panics on multi-byte chars.** The

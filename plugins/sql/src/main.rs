@@ -1796,7 +1796,7 @@ mod tests {
     #[test]
     fn manifest_declares_six_read_ops_and_conn_caps() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 6);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 6);
         let names: Vec<&str> = m.operations.iter().map(|o| o.name.as_str()).collect();
         for want in [
             "sql.test",
@@ -1828,7 +1828,7 @@ mod tests {
         assert!(m.config.iter().any(|c| c.name == "dsn"));
         assert!(m.endpoints.iter().any(|e| e.name == "sql.endpoint"));
         // All read ops are idempotent reads.
-        for op in &m.operations {
+        for op in m.operations.iter().filter(|o| !o.internal) {
             assert_eq!(op.effects, vec![Effect::Read]);
         }
     }
@@ -2559,6 +2559,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

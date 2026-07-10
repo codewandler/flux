@@ -128,6 +128,16 @@ never base64 in-plugin, never read the token from env — declare the scheme and
 6. **Contribute knowledge** — for list ops, `host.contribute(&records)` so results feed the search
    index (optional but expected where natural).
 7. **Test hermetically** — one `MockHost` test per op (below). No network/subprocess in unit tests.
+8. **Declare constraints in the schema; preflight the rest (D-88)** — every op gets a shared
+   preflight that host-kit runs in BOTH the CLI's `--dry-run` (via the auto-registered internal
+   `plugin.validate` op) and runtime dispatch, so the two verdicts can never disagree. What the
+   derived schema declares is enforced locally: `required` (blank strings count as missing, matching
+   flex extraction), `enum` (use a Rust enum field), `range(min = 1)` on ids, `length(min = 1)` on
+   arrays, typed element structs, and `additionalProperties: false` (via `deny_unknown_fields`) to
+   hard-reject unknown fields — on open schemas unknown fields only *warn*. For constraints a schema
+   cannot express (conditional targets, aliases, regex validity, empty-update guards), attach
+   `.preflight("<op>", rule)` on the builder and have the rule call the SAME helper the handler
+   uses.
 
 ## Authoring recipe (one op, end-to-end)
 

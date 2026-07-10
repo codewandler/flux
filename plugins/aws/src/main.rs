@@ -1865,7 +1865,7 @@ mod tests {
     #[test]
     fn manifest_declares_11_ops_and_aws_capability() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 11);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 11);
         assert_eq!(m.capabilities.process, vec!["aws".to_string()]);
         assert!(m
             .capabilities
@@ -2189,6 +2189,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");

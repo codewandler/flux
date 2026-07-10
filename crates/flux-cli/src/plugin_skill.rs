@@ -79,10 +79,8 @@ fn skill_body(plugins: &[(String, PluginManifest)]) -> String {
         return s;
     }
     for (name, m) in plugins {
-        let n = m.operations.len();
-        let sample: Vec<&str> = m
-            .operations
-            .iter()
+        let n = flux_plugin::visible_ops(m).count();
+        let sample: Vec<&str> = flux_plugin::visible_ops(m)
             .take(3)
             .map(|o| o.name.as_str())
             .collect();
@@ -110,13 +108,15 @@ fn reference_md(name: &str, m: &PluginManifest) -> String {
     ));
 
     s.push_str("## Operations\n\n");
-    if m.operations.is_empty() {
+    // Host-only ops (`internal: true`, e.g. the D-88 `plugin.validate` preflight) are not part
+    // of the callable surface — same filter as the projected tool catalog.
+    if flux_plugin::visible_ops(m).count() == 0 {
         s.push_str("_none declared_\n\n");
     } else {
         s.push_str("| Operation | Description | Required input | Risk |\n");
         s.push_str("|---|---|---|---|\n");
         let mut defaulted_risk = false;
-        for op in &m.operations {
+        for op in flux_plugin::visible_ops(m) {
             let req = required_fields(&op.input_schema);
             let req = if req.is_empty() {
                 "—".into()

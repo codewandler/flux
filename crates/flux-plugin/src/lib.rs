@@ -151,6 +151,13 @@ pub fn visible_ops(manifest: &PluginManifest) -> impl Iterator<Item = &Operation
     manifest.operations.iter().filter(|op| !op.internal)
 }
 
+/// The reserved internal preflight op a plugin may serve (D-88): `{operation, input}` →
+/// `{operation, valid, problems, warnings}`. host-kit's `PluginBuilder::build` auto-registers it,
+/// and its verdict is the SAME check the plugin's runtime dispatch enforces — so a host's
+/// `--dry-run` path that merges this verdict can never disagree with a live call. Hosts
+/// feature-detect it by presence in the manifest (older plugins simply don't serve it).
+pub const VALIDATE_OP: &str = "plugin.validate";
+
 /// How the host injects a resolved secret into an `http.do` request for an auth method. Default
 /// `Bearer`, so manifests written before this field — and the legacy `bearer_purpose` call path —
 /// behave unchanged.

@@ -3050,7 +3050,7 @@ mod tests {
     #[test]
     fn manifest_declares_dual_auth_ops_datasources_and_blob() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.len(), 15);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 15);
         // Primary Bearer api_token + Basic fallback — and nothing else: the old `cloud_id` /
         // `basic_email` config probes are NOT auth methods (D-32 replaced them with `config`).
         assert_eq!(m.auth.len(), 2);
@@ -3393,6 +3393,7 @@ mod schema_contract {
         let by_name: BTreeMap<&str, &OperationSpec> = manifest
             .operations
             .iter()
+            .filter(|o| !o.internal)
             .map(|o| (o.name.as_str(), o))
             .collect();
         assert_eq!(by_name.len(), ops.len(), "op count changed");
