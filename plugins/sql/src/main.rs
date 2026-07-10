@@ -167,7 +167,7 @@ struct IndexListInput {
 // ===========================================================================
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("sql", "0.1.0")
+    PluginBuilder::new("sql", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             // Sockets only — the conn allow-list covers the two SQL ports. (SSRF-guarded host-side.)
             // Every dial goes **by reference** (`host.conn_dial_ref`): the host resolves the named

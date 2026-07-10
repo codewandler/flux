@@ -303,7 +303,7 @@ struct EmojiListInput {
 struct IndexBuildInput {}
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("slack", "0.1.0")
+    PluginBuilder::new("slack", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["slack.com".into(), "*.slack.com".into()],

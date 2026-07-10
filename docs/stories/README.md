@@ -23,6 +23,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Now (in progress)
 - [C-50 — Harden audited safety, correctness, and efficiency seams](C-50-audit-hardening-wave.md) · Core · concurrent hardening wave from the 2026-07-10 repository audit
+- [D-129 — Plugins pack 0.1.1 — ship the slack fixes; manifests inherit the workspace version](D-129-plugins-pack-0-1-1-version-inheritance.md) · Core · delivery vehicle for D-127/D-128; also kills the hand-maintained per-plugin manifest version strings (kubernetes already drifted to 0.2.0 vs its 0.1.0 descriptor)
 
 ## Next (ready — take the top one unless the user named a story)
 _None._

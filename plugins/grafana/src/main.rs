@@ -229,7 +229,7 @@ struct TempoTraceGetInput {
 // ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("grafana", "0.1.0")
+    PluginBuilder::new("grafana", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             private_hosts: vec!["*".into()],

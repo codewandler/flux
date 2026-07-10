@@ -75,7 +75,7 @@ struct KvVersionsInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("vault", "0.1.0")
+    PluginBuilder::new("vault", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             secrets: vec!["VAULT_TOKEN".into()],

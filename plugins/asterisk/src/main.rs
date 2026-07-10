@@ -167,7 +167,7 @@ struct CommandInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("asterisk", "0.1.0")
+    PluginBuilder::new("asterisk", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             conn: vec!["tcp:*:5038".into()],
             private_hosts: vec!["*".into()],

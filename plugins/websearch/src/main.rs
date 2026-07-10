@@ -45,7 +45,7 @@ struct SearchInput {
 struct ProviderListInput {}
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("websearch", "0.1.0")
+    PluginBuilder::new("websearch", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["api.tavily.com".into(), "api.duckduckgo.com".into()],

@@ -709,7 +709,7 @@ fn short_id(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("docker", "0.1.0")
+    PluginBuilder::new("docker", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             conn: vec![
                 "unix:/var/run/docker.sock".into(),

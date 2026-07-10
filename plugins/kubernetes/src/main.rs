@@ -246,7 +246,7 @@ struct PodExecInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("kubernetes", "0.2.0")
+    PluginBuilder::new("kubernetes", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             process: vec!["kubectl".into()],
             ..Default::default()

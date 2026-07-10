@@ -80,7 +80,7 @@ struct FileContentInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("onepassword", "0.1.0")
+    PluginBuilder::new("onepassword", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             blob: true,

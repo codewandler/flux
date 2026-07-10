@@ -897,7 +897,7 @@ struct DeployTokenRevokeInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("gitlab", "0.1.0")
+    PluginBuilder::new("gitlab", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["gitlab.com".into()],

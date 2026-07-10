@@ -126,7 +126,7 @@ struct EmbedInput {
 // ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("huggingface", "0.1.0")
+    PluginBuilder::new("huggingface", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["huggingface.co".into(), "router.huggingface.co".into()],

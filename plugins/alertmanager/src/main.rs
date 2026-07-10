@@ -98,7 +98,7 @@ struct SilenceDeleteInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("alertmanager", "0.1.0")
+    PluginBuilder::new("alertmanager", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             private_hosts: vec!["*".into()],

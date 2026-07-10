@@ -408,7 +408,7 @@ struct UserSearchInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("jira", "0.1.0")
+    PluginBuilder::new("jira", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["api.atlassian.com".into()],

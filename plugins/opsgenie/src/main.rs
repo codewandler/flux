@@ -91,7 +91,7 @@ struct OnCallInput {
 // ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("opsgenie", "0.1.0")
+    PluginBuilder::new("opsgenie", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["api.eu.opsgenie.com".into(), "api.opsgenie.com".into()],

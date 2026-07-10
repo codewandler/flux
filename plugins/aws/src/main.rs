@@ -148,7 +148,7 @@ struct CloudWatchMetricsInput {
 // ---------------------------------------------------------------------------
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("aws", "0.1.0")
+    PluginBuilder::new("aws", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             process: vec!["aws".into()],
             secrets: vec![

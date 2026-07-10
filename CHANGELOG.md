@@ -23,6 +23,15 @@ All notable changes to this project are documented in this file. The format is b
   contract (the upload unit test asserts the verb via the MockHost call log) and alt text rides
   the reserve call as `alt_txt`. (Ships with the next plugins pack cut.)
 
+### Changed
+
+- **D-129: plugin manifests inherit the pack workspace version.** All 19 integration plugins now
+  report `env!("CARGO_PKG_VERSION")` as their manifest version instead of hand-maintained string
+  literals (kubernetes had already drifted to a self-reported `0.2.0` against its `0.1.0`
+  descriptor — the exact mismatch `flux plugin status` warns about). The plugins workspace is
+  bumped to **0.1.1** and released as pack `plugins-v0.1.1`, delivering the D-127/D-128 slack
+  fixes; descriptor, index, and manifest versions now agree by construction on every future cut.
+
 ### Added
 
 - **Website: worked Slack plugin setup page** (`plugins/slack`) — install, bot/user tokens via env

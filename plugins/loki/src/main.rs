@@ -119,7 +119,7 @@ struct RecentLogsInput {
 }
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("loki", "0.1.0")
+    PluginBuilder::new("loki", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             private_hosts: vec!["*".into()],

@@ -88,7 +88,7 @@ const MAX_POINTS_PER_SERIES: usize = 500;
 const ENDPOINT: &str = "prometheus.endpoint";
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("prometheus", "0.1.0")
+    PluginBuilder::new("prometheus", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             private_hosts: vec!["*".into()],

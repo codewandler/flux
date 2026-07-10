@@ -143,7 +143,7 @@ enum Render {
 // ─── manifest ────────────────────────────────────────────────────────────────
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("homer", "0.1.0")
+    PluginBuilder::new("homer", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["localhost".into(), "127.0.0.1".into()],
