@@ -1672,6 +1672,22 @@ fn req_project(input: &Value) -> Result<String, String> {
     Err("`project` (string) required".into())
 }
 
+/// Resolve `project` (already numeric, or a `namespace/path`) to its numeric project id.
+///
+/// GitLab's `job_token_scope/allowlist` and `groups_allowlist` POST/DELETE handlers reject the
+/// URL-encoded `namespace%2Fproject` path form with `400 {"error":"id is invalid"}`, even though the
+/// matching GET accepts it — they want the numeric id. Resolve it via `/projects/:id` (which does
+/// accept the encoded path) rather than encoding a path into these endpoints.
+fn resolve_project_id(host: &mut Host, project: &str) -> Result<i64, String> {
+    if let Ok(id) = project.parse::<i64>() {
+        return Ok(id);
+    }
+    let obj = gl_get(host, &format!("/projects/{}", enc(project)))?;
+    obj.get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| format!("could not resolve project `{project}` to a numeric id"))
+}
+
 /// Resolve a merge request to (project, iid) from a `ref`/`id` (PROJECT!IID) or project + iid.
 fn mr_address(input: &Value) -> Result<(String, i64), String> {
     if let Some(r) = flex_str(input, "ref").or_else(|| flex_str(input, "id")) {
@@ -3691,9 +3707,10 @@ fn ci_job_token_allowlist_add(input: Value, host: &mut Host) -> Result<Value, St
     let project = req_project(&input)?;
     let target =
         flex_i64(&input, &["target_project_id"]).ok_or("`target_project_id` (integer) required")?;
+    let project_id = resolve_project_id(host, &project)?;
     gl_post(
         host,
-        &format!("/projects/{}/job_token_scope/allowlist", enc(&project)),
+        &format!("/projects/{project_id}/job_token_scope/allowlist"),
         &json!({ "target_project_id": target }),
     )
 }
@@ -3703,12 +3720,10 @@ fn ci_job_token_allowlist_remove(input: Value, host: &mut Host) -> Result<Value,
     let target =
         flex_i64(&input, &["target_project_id"]).ok_or("`target_project_id` (integer) required")?;
     confirm_i64(&input, "confirm_target_project_id", target)?;
+    let project_id = resolve_project_id(host, &project)?;
     gl_delete(
         host,
-        &format!(
-            "/projects/{}/job_token_scope/allowlist/{target}",
-            enc(&project)
-        ),
+        &format!("/projects/{project_id}/job_token_scope/allowlist/{target}"),
     )?;
     Ok(json!({
         "project": project,
@@ -3732,12 +3747,10 @@ fn ci_job_token_groups_allowlist_add(input: Value, host: &mut Host) -> Result<Va
     let project = req_project(&input)?;
     let target =
         flex_i64(&input, &["target_group_id"]).ok_or("`target_group_id` (integer) required")?;
+    let project_id = resolve_project_id(host, &project)?;
     gl_post(
         host,
-        &format!(
-            "/projects/{}/job_token_scope/groups_allowlist",
-            enc(&project)
-        ),
+        &format!("/projects/{project_id}/job_token_scope/groups_allowlist"),
         &json!({ "target_group_id": target }),
     )
 }
@@ -3747,12 +3760,10 @@ fn ci_job_token_groups_allowlist_remove(input: Value, host: &mut Host) -> Result
     let target =
         flex_i64(&input, &["target_group_id"]).ok_or("`target_group_id` (integer) required")?;
     confirm_i64(&input, "confirm_target_group_id", target)?;
+    let project_id = resolve_project_id(host, &project)?;
     gl_delete(
         host,
-        &format!(
-            "/projects/{}/job_token_scope/groups_allowlist/{target}",
-            enc(&project)
-        ),
+        &format!("/projects/{project_id}/job_token_scope/groups_allowlist/{target}"),
     )?;
     Ok(json!({
         "project": project,
@@ -4901,15 +4912,14 @@ mod tests {
 
     #[test]
     fn job_token_allowlist_lifecycle() {
-        // The add-then-list pair hits the same URL, so use the sequential mock; the DELETE has a
-        // distinct id-suffixed path. Project path is URL-encoded (group%2Fapp) throughout.
+        // add/remove resolve `project` to its numeric id first (GitLab's allowlist POST/DELETE
+        // reject the URL-encoded `namespace%2Fproject` path form — see `resolve_project_id`);
+        // list is unaffected and still hits the encoded path directly.
         let mut host = base()
-            .with_http(
-                "/api/v4/projects/group%2Fapp/job_token_scope/allowlist/123",
-                json!({ "removed": true }),
-            )
+            .with_http("/api/v4/projects/group%2Fapp", json!({ "id": 42 }))
+            .with_http("/job_token_scope/allowlist/123", json!({ "removed": true }))
             .with_http_seq(
-                "/api/v4/projects/group%2Fapp/job_token_scope/allowlist",
+                "/job_token_scope/allowlist",
                 json!({ "target_project_id": 123, "target_project_path": "grp/b" }),
             )
             .with_http_seq(
@@ -4937,8 +4947,31 @@ mod tests {
     }
 
     #[test]
-    fn job_token_groups_allowlist_lifecycle() {
+    fn job_token_allowlist_add_uses_numeric_project_id_not_encoded_path() {
+        // Regression for the reported bug: GitLab 400s `{"error":"id is invalid"}` on this write
+        // endpoint when given the URL-encoded path form, so the POST must target the numeric id
+        // resolved via `/projects/:id`, not `/projects/group%2Fapp/...`.
         let mut host = base()
+            .with_http("/api/v4/projects/group%2Fapp", json!({ "id": 42 }))
+            .with_http(
+                "/api/v4/projects/42/job_token_scope/allowlist",
+                json!({ "target_project_id": 123 }),
+            );
+        let added = run(
+            "gitlab.ci.job_token.allowlist.add",
+            json!({ "project": "group/app", "target_project_id": 123 }),
+            &mut host,
+        );
+        assert_eq!(added["target_project_id"], 123);
+    }
+
+    #[test]
+    fn job_token_groups_allowlist_lifecycle() {
+        // add/remove resolve `project` to its numeric id first (see `resolve_project_id`); list is
+        // unaffected. The write mocks below are project-agnostic (bare suffix), so they match
+        // regardless of whether the numeric id or the encoded path is used in the URL.
+        let mut host = base()
+            .with_http("/api/v4/projects/group%2Fapp", json!({ "id": 42 }))
             .with_http(
                 "/job_token_scope/groups_allowlist/456",
                 json!({ "removed": true }),
@@ -5045,6 +5078,7 @@ mod tests {
         // Canned responses are present, so the ONLY reason these fail is the confirm guard firing
         // before the HTTP call — a matching confirm proceeds.
         let mut host = base()
+            .with_http("/api/v4/projects/group%2Fapp", json!({ "id": 42 }))
             .with_http("/job_token_scope/allowlist/123", json!({ "ok": true }))
             .with_http("/deploy_tokens/7", json!({ "ok": true }))
             .with_http("/protected_tags/v%2A", json!({ "ok": true }));

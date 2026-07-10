@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **gitlab plugin: CI job-token allowlist write ops 400'd on a `namespace/path` project.**
+  `gitlab.ci.job_token.allowlist.{add,remove}` and `.groups_allowlist.{add,remove}` sent the
+  URL-encoded `namespace%2Fproject` path form to GitLab's `job_token_scope/allowlist` and
+  `groups_allowlist` POST/DELETE endpoints, which reject it with `400 {"error":"id is invalid"}` —
+  unlike the matching GET, which accepts it. These four ops now resolve `project` to its numeric id
+  via `/projects/:id` first and use that in the write path.
+
 ## [0.14.2] - 2026-07-10
 
 ### Changed
