@@ -68,6 +68,35 @@ enum VariableType {
     File,
 }
 
+/// Merge-request state filter (GL-038).
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum MrStateFilter {
+    Opened,
+    Closed,
+    Locked,
+    Merged,
+    All,
+}
+
+/// CI job status scope entry (GL-033) — typed so a non-string or unknown entry is rejected
+/// instead of silently skipped.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum JobScope {
+    Created,
+    Pending,
+    Running,
+    Failed,
+    Success,
+    Canceled,
+    Skipped,
+    WaitingForResource,
+    Manual,
+}
+
 /// Repository archive format (GL-022) — a closed set, so an arbitrary string is never
 /// interpolated into the archive URL/filename.
 #[derive(Deserialize, JsonSchema)]
@@ -156,7 +185,11 @@ struct ProjectListInput {
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
     membership: Option<bool>,
 }
 
@@ -172,12 +205,16 @@ struct ProjectShowInput {
 #[allow(dead_code)]
 struct MrListInput {
     project: String,
-    state: Option<String>,
+    state: Option<MrStateFilter>,
     search: Option<String>,
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
     source_branch: Option<String>,
     target_branch: Option<String>,
 }
@@ -202,7 +239,11 @@ struct IssueListInput {
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.pipeline.list`.
@@ -214,7 +255,11 @@ struct PipelineListInput {
     r#ref: Option<String>,
     source: Option<String>,
     username: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.test`.
@@ -230,27 +275,32 @@ struct IndexBuildInput {
     indexes: Option<Vec<String>>,
     entity: Option<String>,
     entities: Option<Vec<String>>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
     search: Option<String>,
     query: Option<String>,
     order_by: Option<String>,
     sort: Option<String>,
     membership: Option<bool>,
+    #[schemars(range(min = 1))]
     user_limit: Option<i64>,
     user_search: Option<String>,
     active_users: Option<bool>,
+    #[schemars(range(min = 1))]
     group_limit: Option<i64>,
     group_search: Option<String>,
     group_order_by: Option<String>,
     group_sort: Option<String>,
     active_groups: Option<bool>,
     all_visible_groups: Option<bool>,
+    #[schemars(range(min = 1))]
     issue_limit: Option<i64>,
     issue_search: Option<String>,
     issue_state: Option<String>,
     issue_order_by: Option<String>,
     issue_sort: Option<String>,
     mr_project: Option<String>,
+    #[schemars(range(min = 1))]
     mr_limit: Option<i64>,
     mr_search: Option<String>,
     mr_state: Option<String>,
@@ -387,7 +437,11 @@ struct IssueNoteListInput {
     iid: Option<i64>,
     sort: Option<String>,
     order_by: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.issue.note.create`.
@@ -485,6 +539,7 @@ struct RepositoryFileShowInput {
     project: String,
     path: String,
     r#ref: Option<String>,
+    #[schemars(range(min = 1))]
     max_bytes: Option<i64>,
 }
 
@@ -496,7 +551,11 @@ struct RepositoryTreeInput {
     path: Option<String>,
     r#ref: Option<String>,
     recursive: Option<bool>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.repository.commit.create`.
@@ -526,7 +585,11 @@ struct RepositoryCommitListInput {
     author: Option<String>,
     since: Option<String>,
     until: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.repository.tag.create`.
@@ -548,7 +611,11 @@ struct RepositoryTagCreateInput {
 struct RepositoryTagListInput {
     project: String,
     search: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.repository.tag.show`.
@@ -608,7 +675,12 @@ struct SearchBlobsInput {
     project: Option<String>,
     group: Option<String>,
     r#ref: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
+    #[schemars(range(min = 1))]
     max_data_bytes: Option<i64>,
 }
 
@@ -621,7 +693,9 @@ struct MrChangesInput {
     #[schemars(range(min = 1))]
     iid: Option<i64>,
     file: Option<String>,
+    #[schemars(range(min = 1))]
     max_files: Option<i64>,
+    #[schemars(range(min = 1))]
     max_diff_bytes: Option<i64>,
 }
 
@@ -637,6 +711,7 @@ struct MrDiffLinesInput {
     line: Option<i64>,
     context: Option<i64>,
     search: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
 }
 
@@ -648,7 +723,9 @@ struct CompareInput {
     from: String,
     to: String,
     straight: Option<bool>,
+    #[schemars(range(min = 1))]
     max_files: Option<i64>,
+    #[schemars(range(min = 1))]
     max_diff_bytes: Option<i64>,
 }
 
@@ -660,7 +737,11 @@ struct MrDiscussionListInput {
     project: Option<String>,
     #[schemars(range(min = 1))]
     iid: Option<i64>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.mr.note.create`.
@@ -796,8 +877,12 @@ struct JobListInput {
     project: String,
     #[schemars(range(min = 1))]
     pipeline_id: i64,
-    scope: Option<Vec<Value>>,
+    scope: Option<Vec<JobScope>>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.environment.list`.
@@ -807,7 +892,11 @@ struct EnvironmentListInput {
     project: String,
     search: Option<String>,
     states: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.deployment.list`.
@@ -817,7 +906,11 @@ struct DeploymentListInput {
     project: String,
     environment: Option<String>,
     status: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.release.list`.
@@ -825,7 +918,11 @@ struct DeploymentListInput {
 #[allow(dead_code)]
 struct ReleaseListInput {
     project: String,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.release.create`.
@@ -890,7 +987,11 @@ struct ReleaseLinkListInput {
     tag_name: Option<String>,
     /// Alias of `tag_name` (GL-028).
     tag: Option<String>,
+    #[schemars(range(min = 1))]
     limit: Option<i64>,
+    /// Alias of `limit` (GL-009); `limit` wins when both are set.
+    #[schemars(range(min = 1))]
+    per_page: Option<i64>,
 }
 
 /// `gitlab.release.link.create`.
@@ -1144,7 +1245,7 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             read_op_typed::<ProjectListInput>(
                 "gitlab.project.list",
-                "List/search projects the token can see.",
+                "List/search projects you are a MEMBER of by default (membership=true); pass membership=false to widen to every project the token can see.",
             ),
             project_list,
         )
@@ -1158,7 +1259,7 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             read_op_typed::<MrListInput>(
                 "gitlab.mr.list",
-                "List a project's merge requests (state: opened|closed|merged|all).",
+                "List a project's merge requests (state: opened|closed|locked|merged|all). Defaults to state=opened — pass state=all to include closed/merged (index.build indexes all states).",
             ),
             mr_list,
         )
@@ -1172,7 +1273,7 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             read_op_typed::<IssueListInput>(
                 "gitlab.issue.list",
-                "List a project's issues (state: opened|closed|all).",
+                "List a project's issues (state: opened|closed|all). Defaults to state=opened — pass state=all to include closed issues (index.build indexes all states).",
             ),
             issue_list,
         )
@@ -1392,7 +1493,7 @@ fn manifest_builder() -> PluginBuilder {
         .operation(
             read_op_typed::<SearchBlobsInput>(
                 "gitlab.search.blobs",
-                "Search file contents (GitLab scope=blobs) across a project, a group, or the instance.",
+                "Search file contents (GitLab scope=blobs) in ONE scope: a project (supports ref), a group (no ref), or — with neither — the whole instance, which requires GitLab advanced/exact code search (Elasticsearch/Zoekt) and fails on instances without it.",
             ),
             search_blobs,
         )
@@ -1773,6 +1874,8 @@ fn manifest_builder() -> PluginBuilder {
         .preflight("gitlab.repository.tag.show", pf_tag_name)
         .preflight("gitlab.repository.tag.delete", pf_tag_name)
         .preflight("gitlab.snippet.delete", pf_snippet_delete)
+        .preflight("gitlab.search.blobs", pf_search_blobs)
+        .preflight("gitlab.index.build", pf_index_build)
         .preflight("gitlab.release.show", pf_release_tag)
         .preflight("gitlab.release.update", |i| {
             let mut p = pf_release_tag(i);
@@ -2075,6 +2178,28 @@ fn pf_release_tag(input: &Value) -> Vec<String> {
     release_tag(input).err().into_iter().collect()
 }
 
+/// GL-032/GL-041: blob-search scope must be unambiguous — `project` OR `group`, never both —
+/// and `ref` only exists project-scoped.
+fn pf_search_blobs(input: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    let project = flex_str(input, "project");
+    let group = flex_str(input, "group");
+    if project.is_some() && group.is_some() {
+        problems.push("pass `project` OR `group`, not both (ambiguous search scope)".into());
+    }
+    if group.is_some() && flex_str(input, "ref").is_some() {
+        problems.push(
+            "`ref` is not supported for group-scoped blob search (project scope only)".into(),
+        );
+    }
+    problems
+}
+
+/// GL-034: index selectors must resolve to at least one known index.
+fn pf_index_build(input: &Value) -> Vec<String> {
+    index_include(input).err().into_iter().collect()
+}
+
 /// Clamp a 1-based `limit` to `[1, max]`, falling back to `default` when unset/non-positive.
 fn clamp(value: i64, default: i64, max: i64) -> i64 {
     if value <= 0 {
@@ -2127,7 +2252,11 @@ fn project_list(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_default();
     let order_by = flex_str(&input, "order_by").unwrap_or_else(|| "last_activity_at".into());
     let sort = flex_str(&input, "sort").unwrap_or_else(|| "desc".into());
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        100,
+    );
     let pairs = [
         (
             "membership",
@@ -2160,7 +2289,11 @@ fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_default();
     let order_by = flex_str(&input, "order_by").unwrap_or_else(|| "updated_at".into());
     let sort = flex_str(&input, "sort").unwrap_or_else(|| "desc".into());
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        100,
+    );
     let source_branch = flex_str(&input, "source_branch").unwrap_or_default();
     let target_branch = flex_str(&input, "target_branch").unwrap_or_default();
     let pairs = [
@@ -2196,7 +2329,11 @@ fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
         .unwrap_or_default();
     let order_by = flex_str(&input, "order_by").unwrap_or_default();
     let sort = flex_str(&input, "sort").unwrap_or_default();
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        100,
+    );
     let pairs = [
         ("state", state),
         ("search", search),
@@ -2218,7 +2355,11 @@ fn pipeline_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let git_ref = flex_str(&input, "ref").unwrap_or_default();
     let source = flex_str(&input, "source").unwrap_or_default();
     let username = flex_str(&input, "username").unwrap_or_default();
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     let pairs = [
         ("status", status),
         ("ref", git_ref),
@@ -2249,7 +2390,7 @@ struct IndexInclude {
     issues: bool,
 }
 
-fn index_include(input: &Value) -> IndexInclude {
+fn index_include(input: &Value) -> Result<IndexInclude, String> {
     let mut raw = Vec::new();
     for key in ["index", "indexes", "entity", "entities"] {
         match input.get(key) {
@@ -2270,13 +2411,14 @@ fn index_include(input: &Value) -> IndexInclude {
     }
     let raw: Vec<String> = raw.into_iter().filter(|s| !s.is_empty()).collect();
     if raw.is_empty() {
-        return IndexInclude {
+        return Ok(IndexInclude {
             projects: true,
             merge_requests: true,
             issues: true,
-        };
+        });
     }
     let mut inc = IndexInclude::default();
+    let mut unknown = Vec::new();
     for v in raw {
         match v.as_str() {
             "projects" | "project" | "gitlab.projects" | "gitlab.project" => inc.projects = true,
@@ -2287,10 +2429,17 @@ fn index_include(input: &Value) -> IndexInclude {
             | "gitlab.merge_requests"
             | "gitlab.merge_request" => inc.merge_requests = true,
             "issues" | "issue" | "gitlab.issues" | "gitlab.issue" => inc.issues = true,
-            _ => {}
+            other => unknown.push(other.to_string()),
         }
     }
-    inc
+    // GL-034: a selector typo must be an error, not an empty `indexed: 0` success.
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown index selector(s): {} (known: projects, merge_requests/mrs, issues)",
+            unknown.join(", ")
+        ));
+    }
+    Ok(inc)
 }
 
 /// Resolve a 1-based `limit` into `(all_pages, per_page)` for index paging.
@@ -2305,7 +2454,7 @@ fn page_plan(input: &Value, limit_key: &str, max_per_page: i64) -> (bool, i64) {
 /// Drive datasource contribution over the requested selectors. Each category pages via
 /// `per_page`/`page` unless a datasource-specific limit pins it to a single page.
 fn index_build(input: Value, host: &mut Host) -> Result<Value, String> {
-    let include = index_include(&input);
+    let include = index_include(&input)?;
     let mut total = 0;
     if include.projects {
         total += index_projects(host, &input);
@@ -2622,7 +2771,11 @@ fn issue_update(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn issue_note_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let (project, iid) = issue_address(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        100,
+    );
     let pairs = [
         ("per_page", limit.to_string()),
         ("sort", flex_str(&input, "sort").unwrap_or_default()),
@@ -2826,7 +2979,11 @@ fn repo_file_show(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn repo_tree(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 200, 2000);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        200,
+        2000,
+    );
     let recursive = input
         .get("recursive")
         .and_then(|v| v.as_bool())
@@ -2901,7 +3058,11 @@ fn commit_create(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn commit_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     let pairs = [
         ("per_page", limit.to_string()),
         ("ref_name", flex_str(&input, "ref").unwrap_or_default()),
@@ -2943,7 +3104,11 @@ fn tag_create(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn tag_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     let pairs = [
         ("per_page", limit.to_string()),
         ("search", flex_str(&input, "search").unwrap_or_default()),
@@ -3021,7 +3186,11 @@ fn snippet_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn search_blobs(input: Value, host: &mut Host) -> Result<Value, String> {
     let query = flex_str(&input, "query").ok_or("`query` (string) required")?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 100);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        100,
+    );
     let project = flex_str(&input, "project");
     let group = flex_str(&input, "group");
     let git_ref = flex_str(&input, "ref").unwrap_or_default();
@@ -3238,7 +3407,11 @@ fn compare(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn mr_discussion_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let (project, iid) = mr_address(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 50, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        50,
+        200,
+    );
     gl_get(
         host,
         &format!(
@@ -3545,7 +3718,11 @@ fn pipeline_cancel(input: Value, host: &mut Host) -> Result<Value, String> {
 fn job_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let id = flex_i64(&input, &["pipeline_id"]).ok_or("`pipeline_id` (integer) required")?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 50, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        50,
+        200,
+    );
     let mut path = format!(
         "/projects/{}/pipelines/{id}/jobs?per_page={limit}",
         enc(&project)
@@ -3562,7 +3739,11 @@ fn job_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn environment_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     let pairs = [
         ("per_page", limit.to_string()),
         ("search", flex_str(&input, "search").unwrap_or_default()),
@@ -3576,7 +3757,11 @@ fn environment_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn deployment_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     let pairs = [
         ("per_page", limit.to_string()),
         ("order_by", "created_at".to_string()),
@@ -3599,7 +3784,11 @@ fn deployment_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn release_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     gl_get(
         host,
         &format!("/projects/{}/releases?per_page={limit}", enc(&project)),
@@ -3667,7 +3856,11 @@ fn release_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 fn release_link_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let tag = release_tag(&input)?;
-    let limit = clamp(flex_i64(&input, &["limit"]).unwrap_or(0), 20, 200);
+    let limit = clamp(
+        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
+        20,
+        200,
+    );
     gl_get(
         host,
         &format!(
@@ -4531,6 +4724,164 @@ mod tests {
                 .any(|w| w.contains("`stat`") && w.contains("not in the op schema")),
             "{warnings:?}"
         );
+    }
+
+    // ---- D-89: honest read defaults ----
+
+    /// GL-010 failing-first: a non-positive `limit`/`per_page`/`max_bytes` is REJECTED — it no
+    /// longer silently expands to the default page size / no limit.
+    #[test]
+    fn preflight_rejects_non_positive_limits() {
+        for (op, input) in [
+            ("gitlab.mr.list", json!({ "project": "g/a", "limit": 0 })),
+            (
+                "gitlab.issue.list",
+                json!({ "project": "g/a", "per_page": -1 }),
+            ),
+            (
+                "gitlab.repository.file.show",
+                json!({ "project": "g/a", "path": "x", "max_bytes": 0 }),
+            ),
+            ("gitlab.index.build", json!({ "mr_limit": -5 })),
+        ] {
+            let (valid, problems, _) = validate(op, input);
+            assert!(!valid, "{op} accepted a non-positive limit");
+            assert!(
+                problems.iter().any(|p| p.contains(">= 1")),
+                "{op}: {problems:?}"
+            );
+        }
+        // Runtime dispatch agrees.
+        let err = manifest_builder()
+            .build()
+            .call(
+                "gitlab.mr.list",
+                json!({ "project": "g/a", "limit": 0 }),
+                &mut MockHost::default(),
+            )
+            .unwrap_err();
+        assert!(err.contains(">= 1"), "{err}");
+    }
+
+    /// GL-009: `per_page` is honored as a documented alias of `limit`, not silently dropped.
+    #[test]
+    fn per_page_is_honored_as_limit_alias() {
+        let mut host = base().with_http(
+            "/repository/tags?per_page=7",
+            json!([{ "name": "v1", "message": "" }]),
+        );
+        let out = run(
+            "gitlab.repository.tag.list",
+            json!({ "project": "g/a", "per_page": 7 }),
+            &mut host,
+        );
+        assert_eq!(out[0]["name"], "v1", "per_page drove the query");
+        // `limit` wins when both are set.
+        let mut host = base().with_http(
+            "/repository/tags?per_page=3",
+            json!([{ "name": "v2", "message": "" }]),
+        );
+        let out = run(
+            "gitlab.repository.tag.list",
+            json!({ "project": "g/a", "limit": 3, "per_page": 9 }),
+            &mut host,
+        );
+        assert_eq!(out[0]["name"], "v2");
+    }
+
+    /// GL-032/GL-041: blob-search scope is unambiguous, and `ref` is project-scope only.
+    #[test]
+    fn search_blobs_scope_is_unambiguous() {
+        let (valid, problems, _) = validate(
+            "gitlab.search.blobs",
+            json!({ "query": "q", "project": "g/a", "group": "g" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("not both")),
+            "{problems:?}"
+        );
+        let (valid, problems, _) = validate(
+            "gitlab.search.blobs",
+            json!({ "query": "q", "group": "g", "ref": "main" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("group-scoped")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate("gitlab.search.blobs", json!({ "query": "q", "group": "g" }));
+        assert!(valid);
+        let (valid, _, _) = validate(
+            "gitlab.search.blobs",
+            json!({ "query": "q", "project": "g/a", "ref": "main" }),
+        );
+        assert!(valid);
+    }
+
+    /// GL-033: `job.list scope` entries are validated — a non-string or unknown status is a
+    /// problem, not a silently-skipped entry.
+    #[test]
+    fn job_list_scope_entries_are_validated() {
+        let target = json!({ "project": "g/a", "pipeline_id": 5 });
+        let with_scope = |scope: Value| {
+            let mut v = target.clone();
+            v["scope"] = scope;
+            v
+        };
+        let (valid, problems, _) = validate("gitlab.job.list", with_scope(json!(["running", 5])));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("scope[1]")),
+            "{problems:?}"
+        );
+        let (valid, problems, _) =
+            validate("gitlab.job.list", with_scope(json!(["running", "bogus"])));
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("must be one of")),
+            "{problems:?}"
+        );
+        let (valid, _, _) = validate(
+            "gitlab.job.list",
+            with_scope(json!(["running", "waiting_for_resource"])),
+        );
+        assert!(valid);
+    }
+
+    /// GL-034: an index selector typo is a validation error, never an `indexed: 0` success.
+    #[test]
+    fn index_build_rejects_unknown_selectors() {
+        let (valid, problems, _) =
+            validate("gitlab.index.build", json!({ "indexes": ["porjects"] }));
+        assert!(!valid);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("porjects") && p.contains("unknown index selector")),
+            "{problems:?}"
+        );
+        // A mixed list with a typo is also rejected — partial silent under-indexing is the trap.
+        let (valid, _, _) = validate(
+            "gitlab.index.build",
+            json!({ "indexes": ["projects", "porjects"] }),
+        );
+        assert!(!valid);
+        // Runtime dispatch agrees (no HTTP happens).
+        let err = manifest_builder()
+            .build()
+            .call(
+                "gitlab.index.build",
+                json!({ "indexes": ["porjects"] }),
+                &mut MockHost::default(),
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown index selector"), "{err}");
+        // Known selectors and the empty default remain valid.
+        let (valid, _, _) = validate("gitlab.index.build", json!({ "indexes": ["mrs"] }));
+        assert!(valid);
+        let (valid, _, _) = validate("gitlab.index.build", json!({}));
+        assert!(valid);
     }
 
     // ---- original surface ----
@@ -5857,6 +6208,7 @@ mod schema_contract {
                         p("order_by", Kind::Str),
                         p("sort", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                         p("membership", Kind::Bool),
                     ],
                     vec![],
@@ -5871,12 +6223,13 @@ mod schema_contract {
                 c(
                     vec![
                         p("project", Kind::Str),
-                        p("state", Kind::Str),
+                        en("state", &["opened", "closed", "locked", "merged", "all"]),
                         p("search", Kind::Str),
                         p("query", Kind::Str),
                         p("order_by", Kind::Str),
                         p("sort", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                         p("source_branch", Kind::Str),
                         p("target_branch", Kind::Str),
                     ],
@@ -5905,6 +6258,7 @@ mod schema_contract {
                         p("order_by", Kind::Str),
                         p("sort", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -5919,6 +6273,7 @@ mod schema_contract {
                         p("source", Kind::Str),
                         p("username", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6098,6 +6453,7 @@ mod schema_contract {
                         p("sort", Kind::Str),
                         p("order_by", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec![],
                 ),
@@ -6229,6 +6585,7 @@ mod schema_contract {
                         p("ref", Kind::Str),
                         p("recursive", Kind::Bool),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6262,6 +6619,7 @@ mod schema_contract {
                         p("since", Kind::Str),
                         p("until", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6288,6 +6646,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("search", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6341,6 +6700,7 @@ mod schema_contract {
                         p("group", Kind::Str),
                         p("ref", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                         p("max_data_bytes", Kind::Int),
                     ],
                     vec!["query"],
@@ -6398,6 +6758,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("iid", Kind::Int),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec![],
                 ),
@@ -6535,6 +6896,7 @@ mod schema_contract {
                         p("pipeline_id", Kind::Int),
                         p("scope", Kind::ArrayAny),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project", "pipeline_id"],
                 ),
@@ -6547,6 +6909,7 @@ mod schema_contract {
                         p("search", Kind::Str),
                         p("states", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6559,6 +6922,7 @@ mod schema_contract {
                         p("environment", Kind::Str),
                         p("status", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),
@@ -6566,7 +6930,11 @@ mod schema_contract {
             (
                 "gitlab.release.list",
                 c(
-                    vec![p("project", Kind::Str), p("limit", Kind::Int)],
+                    vec![
+                        p("project", Kind::Str),
+                        p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
+                    ],
                     vec!["project"],
                 ),
             ),
@@ -6632,6 +7000,7 @@ mod schema_contract {
                         p("tag_name", Kind::Str),
                         p("tag", Kind::Str),
                         p("limit", Kind::Int),
+                        p("per_page", Kind::Int),
                     ],
                     vec!["project"],
                 ),

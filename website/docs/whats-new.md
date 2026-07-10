@@ -12,6 +12,18 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- GitLab reads now do exactly what you asked. Listing operations accept `per_page` as a synonym of
+  `limit` instead of quietly ignoring it, and a zero or negative limit is rejected up front rather
+  than silently returning the default page. Code search refuses an ambiguous project+group
+  combination (and a branch filter on group searches, which GitLab doesn't support) instead of
+  quietly picking one, and its description now says when instance-wide search needs GitLab's
+  advanced code search. A typo in an index-build selector is an error instead of a successful
+  "indexed 0 items", a job-status filter rejects unknown statuses instead of skipping them, and the
+  merge-request/issue/project listings state plainly that they default to open items and
+  your own memberships. Arrives with the next plugin pack update.
+
 ## [0.14.8] - 2026-07-10
 
 ### New

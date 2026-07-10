@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **D-89: gitlab read defaults are honest — no silent scope-broadening or -narrowing.** `per_page`
+  is now a documented alias of `limit` on every paginating gitlab op (previously accepted-but-ignored,
+  GL-009), and non-positive `limit`/`per_page`/`max_bytes`/`max_files`/`max_diff_bytes`/
+  `max_data_bytes` values are rejected by the shared D-88 preflight instead of silently expanding to
+  the default page size / no cap (GL-010, GL-024). `search.blobs` rejects the ambiguous
+  `project`+`group` combination and a group-scoped `ref` (previously project silently won and `ref`
+  was dropped, GL-032/GL-041), and its description documents that instance-global search needs
+  GitLab advanced/exact code search (GL-007). `job.list scope` entries are typed against the CI
+  status set, so a non-string or unknown status is a validation error, not a silently-skipped entry
+  (GL-033). `index.build` with an unknown selector (a typo like `porjects`) is a validation error in
+  both dry-run and the live call instead of an empty `indexed: 0` success — mixed lists with a typo
+  are rejected too (GL-034). `mr.list` gains a typed state filter (opened|closed|locked|merged|all)
+  and, with `issue.list` and `project.list`, documents its default scope: state defaults to `opened`
+  (index.build indexes all states) and project listing is membership-only unless `membership=false`
+  (GL-018, GL-038).
+
 ## [0.14.8] - 2026-07-10
 
 ### Added
