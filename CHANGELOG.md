@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-07-10
+
 ### Documentation
 
 - Added a public Infrastructure page with an architecture diagram and a concise guide to flux's

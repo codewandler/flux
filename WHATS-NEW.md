@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-07-10
+
 ### Improved
 
 - The public docs now include a visual Infrastructure guide showing how requests become typed plans,
