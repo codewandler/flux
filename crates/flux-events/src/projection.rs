@@ -1997,6 +1997,8 @@ mod tests {
                 op: op.into(),
                 input_hash: "h".into(),
                 input_hash_redacted: None,
+                input_view: None,
+                input_view_truncated: false,
                 content: content.into(),
                 view: None,
                 is_error: false,

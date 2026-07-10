@@ -171,6 +171,8 @@ Sub-agents inherit the same safety chain; their plans are validated with the sam
 - Plugin operations are manifest-scoped; privileges are explicit and enforced.
 - Approval and policy hooks (`.flux/hooks/*.js`) can validate/transform/deny calls.
 - REPL slash commands include `/plan`, `/run`, `/tools`, `/session`, `/compact`, `/evidence`, and more.
+- `flux tui` provides the same daily-driver controls in a dense borderless UI, with a visible FIFO
+  follow-up queue, session picker/replay, multiline paste, and live model switching.
 
 ## HTTP API
 

@@ -4628,21 +4628,12 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                         match build_provider(spec) {
                             Ok((native, _provider, model)) => {
                                 let provider: Arc<dyn Provider> = Arc::new(native);
-                                agent.provider = provider.clone();
-                                agent.model = model.clone();
-                                // The loop host holds its own planner handle — swap it too.
-                                agent.loop_host.set_model(provider, model);
-                                // The switch is live either way; if persisting it failed, say
-                                // so — stored usage/`flux usage` attribution would otherwise
-                                // silently stay keyed to the old model.
-                                if let Err(e) = agent.events.set_model(&session_id, &agent.model) {
-                                    eprintln!(
-                                        "{} switched, but persisting the model failed ({e}) — \
-                                         usage attribution for this session may stay on the old model",
-                                        style::yellow("warning:")
-                                    );
+                                match agent.switch_model_for_session(&session_id, provider, model) {
+                                    Ok(()) => eprintln!("switched to {}", agent.model),
+                                    Err(error) => {
+                                        eprintln!("cannot persist model switch: {error}")
+                                    }
                                 }
-                                eprintln!("switched to {}", agent.model);
                             }
                             Err(e) => eprintln!("cannot switch model: {e}"),
                         }
@@ -4864,70 +4855,17 @@ async fn run_pending_plan(
     ast: &flux_flow::ast::DraftAst,
     cancel: &tokio_util::sync::CancellationToken,
 ) {
-    // The human reviewed the rendered plan (tree + risk badge) in `/plan` mode, so the disclosure
-    // follows what that preview showed: a destructive op the user saw doesn't re-prompt per-op,
-    // while a destructive command assembled at runtime (invisible to the preview) still does.
-    let composites = agent.composites.active_for_session(session_id);
-    let risk =
-        flux_flow::runtime::plan_risk_with_composites(ast, agent.executor.registry(), &composites);
-    let _scope = agent.executor.enter_approved_scope(risk.destructive);
-    // Scope the loop host to THIS run (C-30): a plan may call `plan`/`run_plan`, which re-enter
-    // through the same executor — without `set_turn` they'd stream onto the STALE prior turn's
-    // ctx — and scoping is also what lets `turn_usage()` report this run's real model spend
-    // (billed only when the plan reaches a model op) instead of `turn_end(None)` forever.
-    let shared: Arc<std::sync::Mutex<dyn AgentSink>> =
-        Arc::new(std::sync::Mutex::new(cost.sink(agent, 0)));
-    agent.loop_host.set_turn(
-        session_id.to_string(),
-        Some(agent.system_prompt.clone()),
-        shared.clone(),
-        None,
-        None,
-    );
-    let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
-    // Race execution against `cancel`: `execute_flow` has no cancellation of its own, so Ctrl-C is
-    // honored by dropping the in-flight flow future (which aborts the current op's IO). The future
-    // borrows `sink`, so scope it in a block and read its result out as owned data; `None` => cancelled.
-    let result: Option<Result<String>> = {
-        let fut = flux_flow::runtime::execute_flow(
-            &agent.flow,
-            &agent.executor,
-            session_id,
-            ast,
-            &mut sink,
-        );
-        tokio::pin!(fut);
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => None,
-            res = &mut fut => Some(res.map(|o| o.result).map_err(|e| anyhow::anyhow!("{e:#}"))),
-        }
-    };
-    let end_with_usage = || {
-        let u = agent.loop_host.turn_usage();
-        shared
-            .lock()
-            .unwrap()
-            .turn_end((u.total() > 0).then_some(u));
-    };
-    match result {
-        Some(Ok(out)) => {
-            if !out.trim().is_empty() {
-                println!("{out}");
-            }
-            end_with_usage();
-        }
-        Some(Err(e)) => {
-            // A failed plan still ends the turn: without `turn_end` the spend on model ops the
-            // plan DID reach is never displayed, and an active spinner keeps redrawing its
-            // stderr line over the REPL prompt (CliSink has no Drop guard).
-            end_with_usage();
-            eprintln!("{} {e}", style::red("error:"));
-        }
-        None => {
-            // Cancelled: stop the in-flight op's spinner and return to the prompt.
-            end_with_usage();
+    let mut sink = cost.sink(agent, 0);
+    match agent
+        .run_reviewed_plan_cancellable(session_id, ast, &mut sink, cancel)
+        .await
+    {
+        Ok(flux_flow::engine::ReviewedPlanOutcome::Completed) => {}
+        Ok(flux_flow::engine::ReviewedPlanOutcome::Cancelled) => {
             eprintln!("{}", style::dim("(cancelled)"));
+        }
+        Err(error) => {
+            eprintln!("{} {error}", style::red("error:"));
         }
     }
 }
@@ -7111,10 +7049,38 @@ fn addr_is_loopback(addr: &str) -> bool {
 
 /// Launch the ratatui chat TUI. The TUI installs its own modal approver unless `--yes` was passed,
 /// in which case all tool calls are auto-approved (no modal).
+struct CliTuiModelResolver;
+
+impl flux_tui::ModelResolver for CliTuiModelResolver {
+    fn resolve(&self, spec: &str) -> anyhow::Result<flux_tui::ResolvedModel> {
+        if spec == "mock" || spec.starts_with("mock/") {
+            return Ok(flux_tui::ResolvedModel {
+                provider: Arc::new(MockCliProvider::default()),
+                wire_model: "mock".into(),
+                model_spec: "mock".into(),
+            });
+        }
+        let (provider, provider_name, model) = build_provider(spec)?;
+        Ok(flux_tui::ResolvedModel {
+            provider: Arc::new(provider),
+            wire_model: model.clone(),
+            model_spec: format!("{provider_name}/{model}"),
+        })
+    }
+}
+
 async fn run_tui(flags: AgentFlags) -> Result<()> {
     let auto_approve = flags.yes;
     let (agent, session_id, model_spec, _spawner) = build_agent(&flags).await?;
-    flux_tui::run(agent, session_id, auto_approve, Some(model_spec)).await
+    let initial_rules = agent.executor.allow_rules();
+    let mut options = flux_tui::TuiRunOptions::new(auto_approve, Some(model_spec));
+    options.model_resolver = Some(Arc::new(CliTuiModelResolver));
+    // Persist even when the TUI returns an error: an earlier "always allow" choice remains a user
+    // decision and must not vanish because terminal restoration or a later turn failed.
+    let executor = agent.executor.clone();
+    let result = flux_tui::run_with_options(agent, session_id, options).await;
+    persist_new_rules(&initial_rules, &executor.allow_rules());
+    result
 }
 
 /// The credential-ref **location** column for a record — the `Ref` location string (e.g.
@@ -9169,6 +9135,15 @@ mod tests {
         use flux_provider::Provider as _;
         let p = super::LazyProvider::new("anthropic/claude-sonnet-4-6".to_string());
         assert_eq!(p.name(), "anthropic");
+    }
+
+    #[test]
+    fn tui_model_resolver_routes_mock_to_the_offline_provider() {
+        let resolved = flux_tui::ModelResolver::resolve(&super::CliTuiModelResolver, "mock")
+            .expect("mock resolution is credential-free");
+        assert_eq!(resolved.provider.name(), "mock");
+        assert_eq!(resolved.wire_model, "mock");
+        assert_eq!(resolved.model_spec, "mock");
     }
 
     /// L-77: `flux render` is an explicit subcommand — positional `.flux` file, `--view

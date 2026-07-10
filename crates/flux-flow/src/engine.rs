@@ -22,7 +22,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::AgentSink;
-use flux_core::{Chunk, ContentBlock, Message, Result, Usage};
+use flux_core::{Chunk, ContentBlock, Error, Message, Result, Usage};
 use flux_events::EventStore;
 use flux_provider::{Provider, Request};
 use flux_runtime::Executor;
@@ -90,6 +90,13 @@ pub struct FlowEngine {
     /// executor's log is append-only and shared across this engine's turns, so a plain high-water
     /// mark attributes each tail to the turn that just ended.
     evidence_flushed: std::sync::atomic::AtomicUsize,
+}
+
+/// Outcome of executing a plan the user already reviewed through a surface's plan mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewedPlanOutcome {
+    Completed,
+    Cancelled,
 }
 
 impl FlowEngine {
@@ -167,6 +174,96 @@ impl FlowEngine {
     pub fn with_ambient_signals(mut self, signals: Vec<String>) -> Self {
         self.ambient_signals = signals;
         self
+    }
+
+    /// Atomically switch the live planner and the session's durable model attribution. Persistence
+    /// happens first; if it fails, the in-memory engine remains unchanged.
+    pub fn switch_model_for_session(
+        &mut self,
+        session_id: &str,
+        provider: Arc<dyn Provider>,
+        model: String,
+    ) -> Result<()> {
+        self.events.set_model(session_id, &model)?;
+        self.loop_host.set_model(provider.clone(), model.clone());
+        self.provider = provider;
+        self.model = model;
+        Ok(())
+    }
+
+    /// Execute a plan explicitly reviewed by the user (`/plan` then `/run`). The reviewed graph is
+    /// one approved scope; dynamically assembled destructive behavior that was not visible in that
+    /// graph still re-prompts through the executor. Output and usage stream through `sink` on every
+    /// termination path.
+    pub async fn run_reviewed_plan_cancellable(
+        &self,
+        session_id: &str,
+        ast: &DraftAst,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+    ) -> Result<ReviewedPlanOutcome> {
+        let composites = self.composites.active_for_session(session_id);
+        let risk =
+            crate::runtime::plan_risk_with_composites(ast, self.executor.registry(), &composites);
+        let _scope = self.executor.enter_approved_scope(risk.destructive);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(tx),
+        ));
+        self.loop_host.set_turn(
+            session_id.to_string(),
+            Some(self.system_prompt.clone()),
+            channel.clone(),
+            None,
+            None,
+        );
+        let mut shared = crate::loop_host::SharedSink::new(channel);
+        let result = {
+            let fut = crate::runtime::execute_flow(
+                &self.flow,
+                &self.executor,
+                session_id,
+                ast,
+                &mut shared,
+            );
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    maybe = rx.recv() => {
+                        if let Some(ev) = maybe {
+                            drain_event(ev, sink, show_loop());
+                        }
+                    }
+                    res = &mut fut => break Some(res),
+                }
+            }
+        };
+        while let Ok(ev) = rx.try_recv() {
+            drain_event(ev, sink, show_loop());
+        }
+        let usage = self.loop_host.turn_usage();
+        let usage = (usage.total() > 0).then_some(usage);
+
+        match result {
+            Some(Ok(outcome)) => {
+                if !outcome.result.trim().is_empty() {
+                    sink.text_delta(outcome.result.trim());
+                }
+                sink.turn_end(usage);
+                Ok(ReviewedPlanOutcome::Completed)
+            }
+            Some(Err(error)) => {
+                sink.turn_end(usage);
+                Err(Error::Other(error.to_string()))
+            }
+            None => {
+                sink.turn_end(usage);
+                Ok(ReviewedPlanOutcome::Cancelled)
+            }
+        }
     }
 
     /// Run one user turn to completion, uninterruptible.
@@ -1435,6 +1532,12 @@ const MACHINERY_OPS: &[&str] = &[
     "plan", "run_plan", "observe", "evidence", "metrics", "grade",
 ];
 
+/// Whether an op is internal agent-loop machinery rather than user-requested work. Surfaces use
+/// this when reconstructing durable traces so their historical view matches the live sink filter.
+pub fn is_loop_machinery_op(name: &str) -> bool {
+    MACHINERY_OPS.contains(&name)
+}
+
 /// Whether the loop-machinery ops are revealed on the surface — the CLI `--show-loop`, exported as
 /// `FLUX_SHOW_LOOP` so the engine reads it without new plumbing. When set, the user watches the loop
 /// iterate (`plan → run_plan → observe`) instead of only the work the inner plan performs.
@@ -1457,9 +1560,7 @@ pub fn trace_loop() -> bool {
 fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink, reveal: bool) {
     use crate::loop_host::SinkEvent;
     let machinery = match &ev {
-        SinkEvent::ToolCall(name, _) | SinkEvent::ToolResult(name, _) => {
-            MACHINERY_OPS.contains(&name.as_str())
-        }
+        SinkEvent::ToolCall(name, _) | SinkEvent::ToolResult(name, _) => is_loop_machinery_op(name),
         _ => false,
     };
     if reveal || !machinery {
@@ -1576,6 +1677,7 @@ mod tests {
         /// assert a gather round's dispatch streamed both the call AND its result live, not just
         /// one half of the pair.
         results: Vec<String>,
+        turn_ends: Vec<Option<Usage>>,
     }
     impl AgentSink for CollectSink {
         fn text_delta(&mut self, t: &str) {
@@ -1586,6 +1688,9 @@ mod tests {
         }
         fn tool_result(&mut self, name: &str, _result: &ToolResult) {
             self.results.push(name.to_string());
+        }
+        fn turn_end(&mut self, usage: Option<Usage>) {
+            self.turn_ends.push(usage);
         }
     }
 
@@ -3316,44 +3421,49 @@ mod tests {
     }
 
     /// Monotonic surfacing: once a group surfaces it stays advertised for the session, even after its
-    /// workspace marker disappears — so segment A's op catalog is a stable provider-cache prefix
-    /// (A-03) instead of flapping with `resolve_active_groups`'s stateless, per-turn result.
+    /// marker signal disappears — so segment A's op catalog is a stable provider-cache prefix (A-03)
+    /// instead of flapping with `resolve_active_groups`'s stateless, per-turn result.
     #[test]
     fn surfacing_is_monotonic_across_a_marker_flip() {
-        let dir = std::env::temp_dir().join(format!("flux-sticky-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(dir.join(".git")); // clean slate from any prior run
+        // Use a synthetic ambient signal rather than a filesystem marker. `detect_signals` walks
+        // ancestors, so a host-owned marker such as `/tmp/.git` must not decide this test's state.
+        let dir = std::env::temp_dir();
+        let marker = "test_sticky_marker".to_string();
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         let groups = vec![flux_evidence::ToolGroup {
-            name: "git".into(),
+            name: "sticky-test".into(),
             description: String::new(),
             tools: vec!["echo".into()],
             surface_when: vec![flux_evidence::SignalMatch {
                 kind: flux_evidence::KIND_SIGNAL.to_string(),
-                signal: Some("git_repo".into()),
+                signal: Some(marker.clone()),
             }],
         }];
         let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        // Turn A — no `.git`: the git group is inactive, so `echo` is gated (not advertised).
+        // Turn A — no marker signal: the group is inactive, so `echo` is gated (not advertised).
         let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             !a.contains("echo"),
             "echo gated before the marker appears: {a:?}"
         );
 
-        // Turn B — `.git` present: the group surfaces, `echo` is advertised.
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let (b, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
+        // Turn B — marker signal present: the group surfaces, `echo` is advertised.
+        let (b, _) = surfaced_op_names(
+            &registry,
+            &groups,
+            &dir,
+            &sticky,
+            std::slice::from_ref(&marker),
+        );
         assert!(
             b.contains("echo"),
             "echo advertised once the marker is present: {b:?}"
         );
 
-        // Turn C — `.git` removed: stateless resolution would drop `echo`, but the sticky union keeps
-        // the group surfaced, so the advertised catalog never shrinks.
-        std::fs::remove_dir_all(dir.join(".git")).unwrap();
+        // Turn C — marker signal absent: stateless resolution would drop `echo`, but the sticky union
+        // keeps the group surfaced, so the advertised catalog never shrinks.
         let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
         assert!(
             c.contains("echo"),
@@ -3488,6 +3598,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reviewed_plan_runs_through_shared_engine_path() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let engine = engine_with(VecDeque::new(), store);
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "bind",
+                "name": "answer",
+                "value": {
+                    "kind": "call",
+                    "op": "echo",
+                    "args": [{"kind": "lit", "value": {"text": "reviewed"}}]
+                }
+            }]
+        }))
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let outcome = engine
+            .run_reviewed_plan_cancellable(&sid, &ast, &mut sink, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReviewedPlanOutcome::Completed);
+        assert_eq!(sink.tools, vec!["echo"]);
+        assert_eq!(sink.turn_ends.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviewed_plan_cancellation_still_ends_the_surface_turn() {
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let engine = engine_with(VecDeque::new(), store);
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "call",
+                "op": "echo",
+                "args": [{"kind": "lit", "value": {"text": "must not run"}}]
+            }]
+        }))
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut sink = CollectSink::default();
+        let outcome = engine
+            .run_reviewed_plan_cancellable(&sid, &ast, &mut sink, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReviewedPlanOutcome::Cancelled);
+        assert!(sink.tools.is_empty());
+        assert_eq!(sink.turn_ends, [None]);
+    }
+
+    #[tokio::test]
     async fn provider_error_is_surfaced_not_silent() {
         // A provider/API failure during planning (e.g. credit exhausted) must reach the user — the
         // turn used to store the answer but never emit it, ending the turn in silence.
@@ -3545,7 +3707,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let engine = engine_with(responses, store.clone());
+        let mut engine = engine_with(responses, store.clone());
         let mut sink = CollectSink::default();
         engine.run_turn(&sid, "first", &mut sink).await.unwrap();
 
@@ -3562,9 +3724,8 @@ mod tests {
             )])),
         });
         engine
-            .loop_host
-            .set_model(provider_b, "model-b".to_string());
-        store.set_model(&sid, "model-b").unwrap();
+            .switch_model_for_session(&sid, provider_b, "model-b".to_string())
+            .unwrap();
 
         engine.run_turn(&sid, "second", &mut sink).await.unwrap();
 

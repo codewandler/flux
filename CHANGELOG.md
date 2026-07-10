@@ -23,6 +23,26 @@ All notable changes to this project are documented in this file. The format is b
   SCRAM). `flux_config::EndpointConfig` gains `static_endpoints` (`StaticEndpoint`); `run_endpoint`
   is refactored to a path-parameterized `run_endpoint_in` for testing.
 
+## [0.14.5] - 2026-07-10
+
+### Added
+
+- **A-65 — dense daily-driver TUI makeover.** `flux-tui` now uses a borderless, viewport-cached
+  transcript and background-only multiline composer; async terminal input adds atomic bracketed
+  paste without idle polling, a visible editable FIFO follow-up queue, contextual scroll/follow
+  status, a session picker, real `/new`/`/clear`, durable `/resume` reconstruction, and in-place
+  `/model`, `/plan`/`/run`, `/shell`, `/tools`, `/evidence`, and `/compact` controls. CLI and TUI now
+  share `FlowEngine`'s cancellable reviewed-plan execution and atomic model-switch seams. Durable
+  `RunEvent::OpRecorded` cells carry an optional redacted/capped display input (serde-defaulted for
+  old logs and kept separate from replay hashes/result truncation), so resumed tool cards remain
+  useful without re-executing effects. Terminal setup unwinds raw/alternate/mouse/paste/cursor state
+  in reverse order, late action events are rejected by generation id, and `always allow` choices are
+  persisted even when a later TUI error occurs. Review hardening keeps queue edits in their original
+  FIFO slot, protects the active empty session from pruning, routes `/model mock` to the offline
+  provider, preserves the active engine model during projection, reconstructs reduced historical
+  cards when cassette capture was disabled, and redacts decoded JSON string leaves so escaped
+  secrets cannot survive in durable input views.
+
 ## [0.14.4] - 2026-07-10
 
 ### Fixed

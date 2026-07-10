@@ -62,6 +62,64 @@ fn truncate_chars(s: &str, cap: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
+/// Redact string leaves after parsing the dispatch input. Redacting the serialized JSON directly
+/// misses registered values whose spelling changes under JSON escaping (quotes, backslashes, and
+/// newlines), which would make `input_view` a recoverable durable secret leak.
+fn redacted_input_view(redactor: &Redactor, input_json: &str) -> (String, bool) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input_json) else {
+        let redacted = redactor.redact(input_json);
+        let changed = redacted != input_json;
+        return (redacted, changed);
+    };
+    let mut replacements = Vec::new();
+    collect_json_redactions(redactor, &value, &mut replacements);
+    if replacements.is_empty() {
+        return (input_json.to_string(), false);
+    }
+
+    // Replace complete encoded string tokens in the original serialization. This preserves field
+    // order and whitespace (useful when the bounded view keeps only the head) while still matching
+    // secrets against their decoded spelling.
+    replacements.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
+    replacements.dedup();
+    let mut rendered = input_json.to_string();
+    for (raw, redacted) in replacements {
+        rendered = rendered.replace(&raw, &redacted);
+    }
+    (rendered, true)
+}
+
+fn collect_json_redactions(
+    redactor: &Redactor,
+    value: &serde_json::Value,
+    replacements: &mut Vec<(String, String)>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            let redacted = redactor.redact(text);
+            if redacted != *text {
+                if let (Ok(raw), Ok(redacted)) = (
+                    serde_json::to_string(text),
+                    serde_json::to_string(&redacted),
+                ) {
+                    replacements.push((raw, redacted));
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_redactions(redactor, item, replacements);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values() {
+                collect_json_redactions(redactor, value, replacements);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The active cassette mode, installed on the `FlowStore` by the engine (record, every turn), the
 /// replay driver (replay), or the fork engine (replay for the prefix, then record for the tail).
 pub enum CassetteScope {
@@ -98,6 +156,8 @@ impl RecordScope {
         let input_hash = sha256_hex(input_json);
         let red_input = redactor.redact(input_json);
         let input_hash_redacted = (red_input != input_json).then(|| sha256_hex(&red_input));
+        let (safe_input_view, input_view_redacted) = redacted_input_view(redactor, input_json);
+        let (input_view, input_view_truncated) = truncate_chars(&safe_input_view, self.cap);
 
         let red_content = redactor.redact(&outcome.content);
         let content_redacted = red_content != outcome.content;
@@ -122,8 +182,13 @@ impl RecordScope {
             step: StepId(format!("step_{op}_{}", &input_hash[..16])),
             op: op.to_string(),
             input_hash,
-            redacted: content_redacted || v_redacted || input_hash_redacted.is_some(),
+            redacted: content_redacted
+                || v_redacted
+                || input_hash_redacted.is_some()
+                || input_view_redacted,
             input_hash_redacted,
+            input_view: Some(input_view),
+            input_view_truncated,
             content,
             view,
             is_error: outcome.is_error,
@@ -270,6 +335,74 @@ impl ReplayTape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_input_view_is_redacted_capped_and_backward_compatible() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let scope = RecordScope {
+            events: events.clone(),
+            session: session.clone(),
+            seq: AtomicU32::new(0),
+            cap: 24,
+        };
+        let redactor = Redactor::new();
+        redactor.add_secret("SUPERSECRET");
+        scope.record(
+            &redactor,
+            "echo",
+            r#"{"token":"SUPERSECRET","tail":"abcdefghijklmnopqrstuvwxyz"}"#,
+            &OpOutcome::ok("done"),
+        );
+
+        let trace = events.run_trace(&session).unwrap();
+        match &trace[0] {
+            RunEvent::OpRecorded {
+                input_view,
+                input_view_truncated,
+                truncated,
+                ..
+            } => {
+                let input = input_view.as_deref().expect("presentation input recorded");
+                assert!(!input.contains("SUPERSECRET"));
+                assert!(input.contains("[redacted]"));
+                assert!(*input_view_truncated);
+                assert!(!truncated, "input truncation does not poison replayability");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recorded_input_view_redacts_json_escaped_secrets() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let scope = RecordScope {
+            events: events.clone(),
+            session: session.clone(),
+            seq: AtomicU32::new(0),
+            cap: 1024,
+        };
+        let secret = "quote\" backslash\\ embedded\nnewline secret";
+        let redactor = Redactor::new();
+        redactor.add_secret(secret);
+        let input = serde_json::to_string(&serde_json::json!({ "token": secret })).unwrap();
+
+        scope.record(&redactor, "echo", &input, &OpOutcome::ok("done"));
+
+        let trace = events.run_trace(&session).unwrap();
+        let RunEvent::OpRecorded {
+            input_view: Some(input_view),
+            redacted,
+            ..
+        } = &trace[0]
+        else {
+            panic!("expected a recorded input view");
+        };
+        let decoded: serde_json::Value = serde_json::from_str(input_view).unwrap();
+        assert_eq!(decoded["token"], "[redacted]");
+        assert!(*redacted, "structured input redaction marks the cell");
+    }
 
     fn cell(op: &str, input: &str, content: &str) -> Cell {
         Cell {

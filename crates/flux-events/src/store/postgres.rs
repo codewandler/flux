@@ -482,13 +482,18 @@ impl EventBackend for PgEvents {
         })
     }
 
-    fn prune_empty(&self) -> Result<usize> {
+    fn prune_empty_excluding(&self, keep: &[String]) -> Result<usize> {
+        let keep: std::collections::HashSet<i64> = keep
+            .iter()
+            .filter_map(|stream| parse_id(stream).ok())
+            .collect();
         let pool = self.handle.pool().clone();
         self.handle.block_on(async move {
-            let ns: Vec<i64> = sqlx::query_scalar("SELECT n FROM streams WHERE msg_count = 0")
+            let mut ns: Vec<i64> = sqlx::query_scalar("SELECT n FROM streams WHERE msg_count = 0")
                 .fetch_all(&pool)
                 .await
                 .map_err(map_sql)?;
+            ns.retain(|n| !keep.contains(n));
             delete_streams(&pool, ns).await
         })
     }

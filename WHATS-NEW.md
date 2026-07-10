@@ -27,6 +27,20 @@
   resolve at connect time exactly like cluster-discovered ones — previously a statically-registered
   endpoint was recorded but never actually bound.
 
+## [0.14.5] - 2026-07-10
+
+### Improved
+
+- The terminal UI is now a dense daily driver: the transcript is borderless, the multiline input is
+  separated only by a quiet background, pasted text stays intact, and long sessions remain smooth.
+  Follow-ups typed during a turn form a visible editable queue instead of replacing one another.
+  You can switch models, review and run plans, toggle shell access, inspect tools/evidence, compact
+  context, create sessions, and pick or resume old sessions without leaving the UI. Resumed sessions
+  reconstruct their messages, plans, tool activity, notices, and usage without running anything
+  again—even for older sessions without detailed tool recordings—and the terminal is restored
+  cleanly after exit or failure. Editing a queued follow-up keeps its place, pruning cannot remove
+  the session you are using, and switching to the mock model remains fully offline.
+
 ## [0.14.4] - 2026-07-10
 
 ### Fixed

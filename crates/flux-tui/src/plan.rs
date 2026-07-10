@@ -20,20 +20,28 @@ use crate::theme::{self, Theme};
 pub fn render(data: &Value, theme: &Theme) -> Vec<Line<'static>> {
     let risk = data.get("risk").and_then(|v| v.as_str()).unwrap_or("");
     let ops = data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+    let historical = data
+        .get("historical")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut header = vec![Span::styled(
         "plan",
         Style::default().add_modifier(Modifier::BOLD),
     )];
-    if !risk.is_empty() {
+    if historical {
+        header.push(Span::styled("  · historical", theme.muted_style()));
+    } else if !risk.is_empty() {
         header.push(Span::raw("  "));
         header.push(Span::styled(risk.to_string(), risk_style(risk, theme)));
     }
-    let plural = if ops == 1 { "" } else { "s" };
-    header.push(Span::styled(
-        format!("  · {ops} op{plural}"),
-        theme.muted_style(),
-    ));
+    if !historical {
+        let plural = if ops == 1 { "" } else { "s" };
+        header.push(Span::styled(
+            format!("  · {ops} op{plural}"),
+            theme.muted_style(),
+        ));
+    }
 
     let resumed = data
         .get("resumed")
