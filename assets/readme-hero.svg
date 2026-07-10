@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">flux — the model proposes, the runtime disposes</title>
+  <desc id="desc">Flux wordmark beside an execution-gate symbol on a dark technical field.</desc>
+
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0v40" fill="none" stroke="#6e8179" stroke-width="1" opacity=".14"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="360" rx="24" fill="#0d1110"/>
+  <rect width="1200" height="360" rx="24" fill="url(#grid)"/>
+  <path d="M720 48v264" stroke="#53625c" stroke-width="1" opacity=".55"/>
+
+  <g transform="translate(92 46)">
+    <text x="0" y="19" fill="#2be6a5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="16" font-weight="700" letter-spacing="3">DETERMINISTIC AGENT PLATFORM</text>
+
+    <!-- Custom path wordmark. -->
+    <g fill="#f2f6f4" transform="translate(0 36) scale(1.25)">
+      <path d="M0 150V72c0-30 17-47 49-47h24v24H52c-16 0-23 7-23 23v9h40v23H29v46z"/>
+      <path d="M91 25h29v125H91z"/>
+      <path d="M143 81h29v43c0 10 5 15 15 15 11 0 17-7 17-18V81h29v69h-28v-11c-6 9-16 14-28 14-22 0-34-13-34-37z"/>
+      <path d="M251 81h33l16 21 16-21h33l-32 34 34 35h-34l-17-22-17 22h-34l34-35z"/>
+    </g>
+
+    <text x="0" y="282" fill="#aab8b2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="22" font-weight="600" letter-spacing=".8">THE MODEL PROPOSES. THE RUNTIME DISPOSES.</text>
+  </g>
+
+  <!-- Enlarged gate glyph: three plan rails, one runtime boundary, one output. -->
+  <g transform="translate(798 76) scale(1.42)">
+    <path fill="#f2f6f4" d="M0 16h45c21 0 35 6 50 21l25 25v25L80 51c-9-8-18-11-33-11H0z"/>
+    <path fill="#f2f6f4" d="M0 62h88v24H0z"/>
+    <path fill="#f2f6f4" d="M0 108h47c15 0 24-3 33-11l40-36v25l-25 25c-15 15-29 21-50 21H0z"/>
+    <path fill="#2be6a5" d="M132 50h22v79h-22z"/>
+    <path fill="#f2f6f4" d="M166 62h30l20 24-20 24h-30z"/>
+  </g>
+
+  <g fill="#71827a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+     font-size="13" font-weight="700" letter-spacing="2">
+    <text x="805" y="310">TYPED PLAN</text>
+    <text x="972" y="310" fill="#2be6a5">GATE</text>
+    <text x="1052" y="310">EFFECT</text>
+  </g>
+</svg>

@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **A clearer front door for flux.** The project page now leads with what makes flux different—the
+  model proposes a typed plan and the runtime controls execution—and uses a restrained new identity
+  built around that explicit boundary instead of generic AI imagery.
+
 ## [0.14.9] - 2026-07-11
 
 ### New

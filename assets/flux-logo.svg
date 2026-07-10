@@ -1,50 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 470 180" fill="none">
-  <defs>
-    <linearGradient id="g" x1="20" y1="30" x2="430" y2="160" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset="0.5" stop-color="#3b82f6"/>
-      <stop offset="1" stop-color="#8b5cf6"/>
-    </linearGradient>
-    <!-- knock the connecting strokes out of the node interiors for clean rings -->
-    <mask id="nodeMask" maskUnits="userSpaceOnUse" x="0" y="0" width="470" height="180">
-      <rect x="0" y="0" width="470" height="180" fill="white"/>
-      <circle cx="62" cy="40" r="11" fill="black"/>
-      <circle cx="36" cy="90" r="11" fill="black"/>
-      <circle cx="62" cy="140" r="11" fill="black"/>
-    </mask>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 180" role="img" aria-labelledby="title desc">
+  <title id="title">flux</title>
+  <desc id="desc">Three plan rails cross a signal-green execution gate and resolve into one output.</desc>
+  <style>
+    .ink { fill: #141a18; }
+    .signal { fill: #0bbf83; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #f2f6f4; }
+      .signal { fill: #2be6a5; }
+    }
+  </style>
 
-  <!-- ===== mark: all arcs lie on one circle, center (98,90) r=62 ===== -->
-  <g stroke="url(#g)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
-    <g mask="url(#nodeMask)">
-      <!-- left dashed arc: top node -> left node -> bottom node -->
-      <path d="M 62 40 A 62 62 0 0 0 62 140" stroke-dasharray="2 11"/>
-      <!-- top flow arc: top node, over the top, down to the square -->
-      <path d="M 62 40 A 62 62 0 0 1 157 72"/>
-      <path d="M 148 64.5 L 157 72 L 159.4 60.6"/>
-      <!-- bottom flow arc: bottom node, under the bottom, up to the square -->
-      <path d="M 62 140 A 62 62 0 0 0 157 108"/>
-      <path d="M 148 115.5 L 157 108 L 159.4 119.4"/>
-      <!-- middle flow: dotted line -> lambda -> arrow into square -->
-      <path d="M 48 90 L 82 90" stroke-dasharray="1 9"/>
-      <path d="M 95 72 L 109 108"/>
-      <path d="M 102 90 L 89 108"/>
-      <path d="M 114 90 L 129 90"/>
-      <path d="M 122 84 L 130 90 L 122 96"/>
-    </g>
-
-    <!-- input nodes (drawn on top, unmasked) -->
-    <circle cx="62" cy="40" r="9"/>
-    <circle cx="36" cy="90" r="9"/>
-    <circle cx="62" cy="140" r="9"/>
-
-    <!-- output square, nested in the right opening of the circle -->
-    <rect x="132" y="72" width="36" height="36" rx="7"/>
+  <!--
+    The gate glyph: model intent enters as three plan rails, crosses one
+    explicit runtime boundary, and leaves as a single deterministic output.
+  -->
+  <g transform="translate(18 16)">
+    <path class="ink" d="M0 16h45c21 0 35 6 50 21l25 25v25L80 51c-9-8-18-11-33-11H0z"/>
+    <path class="ink" d="M0 62h88v24H0z"/>
+    <path class="ink" d="M0 108h47c15 0 24-3 33-11l40-36v25l-25 25c-15 15-29 21-50 21H0z"/>
+    <path class="signal" d="M132 50h22v79h-22z"/>
+    <path class="ink" d="M166 62h30l20 24-20 24h-30z"/>
   </g>
 
-  <!-- ===== wordmark ===== -->
-  <text x="205" y="110" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
-        font-size="92" fill="url(#g)">Flux</text>
-  <text x="208" y="146" font-family="Liberation Sans, DejaVu Sans, sans-serif" font-weight="bold"
-        font-size="29" letter-spacing="7" fill="url(#g)">flux-flow</text>
+  <!-- Custom path wordmark: no webfont dependency. -->
+  <g class="ink" transform="translate(270 10)">
+    <path d="M0 150V72c0-30 17-47 49-47h24v24H52c-16 0-23 7-23 23v9h40v23H29v46z"/>
+    <path d="M91 25h29v125H91z"/>
+    <path d="M143 81h29v43c0 10 5 15 15 15 11 0 17-7 17-18V81h29v69h-28v-11c-6 9-16 14-28 14-22 0-34-13-34-37z"/>
+    <path d="M251 81h33l16 21 16-21h33l-32 34 34 35h-34l-17-22-17 22h-34l34-35z"/>
+  </g>
 </svg>

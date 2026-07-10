@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **README identity and first-screen refresh.** Replaced the gradient orbit/lambda logo with a flat,
+  dark-mode-aware execution-gate mark and path-based wordmark, then rebuilt the repository header as
+  a theme-safe technical hero around flux's actual promise: models produce typed plans while the
+  deterministic runtime owns effects. Added standalone vector/raster mark assets and documented the
+  production brand system.
+
 ## [0.14.9] - 2026-07-11
 
 ### Added

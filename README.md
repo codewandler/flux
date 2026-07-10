@@ -1,27 +1,39 @@
-# flux
+<h1 align="center">
+  <img src="assets/readme-hero.svg" alt="flux — the model proposes, the runtime disposes" width="960">
+</h1>
 
 <p align="center">
-  <img src="assets/flux-logo.png" alt="Flux logo" width="420">
+  A Rust agent platform for typed plans, guarded execution, and replayable evidence.
 </p>
 
-[![CI](https://github.com/codewandler/flux/actions/workflows/ci.yml/badge.svg)](https://github.com/codewandler/flux/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/codewandler/flux)](https://github.com/codewandler/flux/releases/latest)
-[![Docs](https://img.shields.io/badge/docs-codewandler.github.io%2Fflux-blue)](https://codewandler.github.io/flux/)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+<p align="center">
+  <a href="https://github.com/codewandler/flux/actions/workflows/ci.yml"><img src="https://github.com/codewandler/flux/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/codewandler/flux/releases/latest"><img src="https://img.shields.io/github/v/release/codewandler/flux" alt="Latest release"></a>
+  <a href="https://codewandler.github.io/flux/"><img src="https://img.shields.io/badge/docs-codewandler.github.io%2Fflux-0bbf83" alt="Documentation"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-141a18" alt="MIT or Apache 2.0 license"></a>
+</p>
 
-flux is a deterministic agent platform built around one thesis:
+<p align="center">
+  <a href="#install"><strong>Install</strong></a> ·
+  <a href="#quickstart"><strong>Quickstart</strong></a> ·
+  <a href="https://codewandler.github.io/flux/"><strong>Documentation</strong></a> ·
+  <a href="docs/architecture.md"><strong>Architecture</strong></a>
+</p>
 
-**the LLM is not the runtime.**
+---
 
-The model turns requests into a typed, inspectable Flux-Lang plan. A deterministic Rust runtime
-executes that plan through one mandatory safety chain:
+## The LLM is not the runtime
+
+In flux, the model never becomes the execution engine. It turns a request into a typed, inspectable
+Flux-Lang plan; a deterministic Rust runtime owns what happens next.
 
 ```text
-authorization -> approval -> guarded IO
+request  ── model ──▶  typed plan  ── runtime ──▶  authorization → approval → guarded IO
 ```
 
-That gives you reproducibility, reviewability, and a consistent security posture across CLI, tools,
-and integrations.
+That hard boundary makes plans reviewable before they run, repeatable after they run, and governable
+at every effect. The same execution envelope covers local tools, plugins, sub-agents, the SDK, and
+the server.
 
 ## What flux includes
 

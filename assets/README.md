@@ -1,36 +1,36 @@
 # Flux brand assets
 
-Logo, icon, and mascot artwork for the **Flux** / *flux-flow* project.
+Flux uses one visual idea: **plans cross an explicit execution gate**. Three input rails represent a
+typed plan, the signal-green bar is the runtime boundary, and one resolved output leaves it. The mark
+is deliberately flat and mechanical—no robot, orbit, lambda, glow, or generic “AI” decoration.
 
-The shared motif is the **flow graph** — input nodes (on a dashed arc) flowing through a transform
-(`λ`) into an output square — representing Flux's typed-AST, LLM-as-compiler execution model.
+## Production assets
 
-`flux-logo.svg` is the **source of truth**: a hand-built vector with crisp edges, true transparency,
-and a gradient that reads on both light and dark backgrounds. `flux-logo.png` is rendered from it for
-the project `README.md`. The remaining `logo-*` / `icon` PNGs are the original generated variants.
+| Preview | File | Dimensions | Use |
+| --- | --- | --- | --- |
+| <img src="readme-hero.svg" alt="flux README hero" width="280"> | `readme-hero.svg` | Vector, 1200×360 viewBox | **README hero.** Fixed dark field with the positioning line and a labeled plan → gate → effect visual. |
+| <img src="flux-logo.svg" alt="flux wordmark" width="220"> | `flux-logo.svg` | Vector | **Primary lockup and source of truth.** Uses vector paths only and adapts its ink/signal colors to light and dark mode. |
+| <img src="flux-logo.png" alt="flux wordmark" width="220"> | `flux-logo.png` | 1240×360 | Light-background raster fallback. |
+| <img src="flux-mark.svg" alt="flux execution-gate mark" width="140"> | `flux-mark.svg` | Vector | Standalone execution-gate mark for compact placements. |
+| <img src="flux-mark.png" alt="flux execution-gate mark" width="140"> | `flux-mark.png` | 1008×656 | Light-background raster fallback for the standalone mark. |
 
-## Images
+The original generated exploration that informed the gate geometry is retained at
+`source/flux-mark-concept.png`; it is design provenance, not a production asset.
 
-| Preview | File | Dimensions | Background | Purpose / when to use |
-| --- | --- | --- | --- | --- |
-| <img src="flux-logo.png" alt="flux-logo" width="180"> | `flux-logo.svg` / `flux-logo.png` | vector / 1508×570 | Transparent | **Primary logo / README hero.** Sharp, flat (no glow) horizontal lockup: flow mark + "Flux / flux-flow" wordmark. Edit the `.svg` and re-render the `.png` (`rsvg-convert -h 700 flux-logo.svg \| magick - -trim +repage -bordercolor none -border 36 flux-logo.png`). |
-| <img src="logo-neon.png" alt="logo-neon" width="150"> | `logo-neon.png` | 1254×1254 | Transparent | Icon-only neon `λ` mark (generated). Reads best on dark surfaces. |
-| <img src="logo-horizontal.png" alt="logo-horizontal" width="150"> | `logo-horizontal.png` | 1448×1086 | Transparent | Generated horizontal lockup: circular flow icon (3 nodes + dotted arrow → square) left of the wordmark. |
-| <img src="logo-horizontal-dashed.png" alt="logo-horizontal-dashed" width="150"> | `logo-horizontal-dashed.png` | 1448×1086 | Transparent | Horizontal lockup variant with an open **dashed-arc** flow icon. Airier feel. |
-| <img src="logo-horizontal-bold.png" alt="logo-horizontal-bold" width="150"> | `logo-horizontal-bold.png` | 1448×1086 | Transparent | Horizontal lockup variant with a **bold solid-circle** icon. Stronger at small sizes. |
-| <img src="logo-stacked.png" alt="logo-stacked" width="150"> | `logo-stacked.png` | 1254×1254 | Transparent | Flow icon centered **above** the wordmark. Use in square/portrait slots. |
-| <img src="icon.png" alt="icon" width="150"> | `icon.png` | 1254×1254 | Transparent | Clean cyan→purple flow mark, no wordmark. Source for favicons / app icons. |
-| <img src="avatar.png" alt="avatar" width="150"> | `avatar.png` | 1254×1254 | Dark (scene) | Friendly Flux assistant/agent character. Use as the agent persona avatar in chat UIs and social profiles — **not** as the project logo. |
+## Usage
 
-> The generated `logo-*` / `icon` PNGs were delivered flattened (a fake checkerboard painted in place
-> of a real alpha layer); their transparency was recovered by color-keying, so their edges are not
-> pixel-perfect. Prefer `flux-logo.svg`, or re-export the others from the design source with a true
-> alpha channel.
+- Use `readme-hero.svg` for the repository front page and `flux-logo.svg` for other horizontal placements.
+- Use `flux-mark.svg` when the wordmark would be unreadable or redundant.
+- Keep clear space around the mark of at least half the signal bar's height.
+- Prefer the adaptive SVGs. The PNGs contain the light-mode palette.
+- Do not add gradients, shadows, glow, mascots, or orbital graph decoration to the core identity.
 
-## Choosing one
+The older `logo-*`, `icon.png`, and `avatar.png` files are legacy generated explorations. They are
+kept only so downstream consumers do not break without notice; do not use them for new work.
 
-- **README / general logo →** `flux-logo.svg` (or `flux-logo.png`)
-- **Icon-only on a dark surface →** `logo-neon.png`
-- **Square / centered slot →** `logo-stacked.png`
-- **Favicon / app icon / inline mark →** `icon.png`
-- **Representing the agent itself →** `avatar.png`
+## Exporting raster fallbacks
+
+```bash
+rsvg-convert -w 1240 -h 360 flux-logo.svg -o flux-logo.png
+rsvg-convert -w 1008 -h 656 flux-mark.svg -o flux-mark.png
+```
