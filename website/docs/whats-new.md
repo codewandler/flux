@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.15.1] - 2026-07-11
+
 ## [0.15.0] - 2026-07-11
 
 ### New

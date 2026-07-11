@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-07-11
+
 ### Changed
 
 - **Docs caught up with the 0.15.0 flows-arc.** `ai_segment` joins the reflexive-op documentation
