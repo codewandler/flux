@@ -19,8 +19,13 @@ use flux_spec::{Effect, Risk, ToolSpec};
 use flux_system::{System, Workspace};
 
 use super::{
-    tool_defs_from_registry, UsageRecording, VoiceSessionDriver, VoiceSink, VoiceTurnHandler,
+    tool_defs_from_registry, EngineVoiceHandler, UsageRecording, VoiceReply, VoiceSessionDriver,
+    VoiceSink, VoiceTurnHandler,
 };
+use crate::ast::{DraftAst, Node, SymbolName};
+use crate::engine::FlowEngine;
+use crate::state::FlowStore;
+use flux_provider::{ChunkStream, Provider, Request};
 
 // --- mock session --------------------------------------------------------------------------------
 
@@ -379,9 +384,9 @@ struct ScriptHandler {
 
 #[async_trait]
 impl VoiceTurnHandler for ScriptHandler {
-    async fn turn(&self, _user_text: &str) -> String {
+    async fn turn(&self, _user_text: &str) -> VoiceReply {
         let i = self.n.fetch_add(1, Ordering::SeqCst);
-        self.replies.get(i).cloned().unwrap_or_default()
+        VoiceReply::Continue(self.replies.get(i).cloned().unwrap_or_default())
     }
 }
 
@@ -422,6 +427,161 @@ async fn flow_owns_two_voice_turns() {
     assert_eq!(
         log.lock().unwrap().spoken,
         vec!["what day?".to_string(), "booked for friday".to_string()]
+    );
+}
+
+// --- D-132: flow-driven voice (a FlowEngine owns the whole call) ---------------------------------
+
+/// A provider that must NOT be called on the deterministic flow-driven path — counts calls so the
+/// test can assert zero planner invocations (D-132 invariant 1).
+struct CountingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for CountingProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    async fn stream(&self, _req: Request) -> flux_core::Result<ChunkStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+/// A sink that records the flow-driven session's terminal hangup hook (`session_ended`).
+#[derive(Default)]
+struct EndSink {
+    ended: Option<String>,
+}
+
+impl VoiceSink for EndSink {
+    fn session_ended(&mut self, result: &str) {
+        self.ended = Some(result.to_string());
+    }
+}
+
+/// Build a `FlowEngine` over a never-called counting provider, with `echo` registered (the flow's
+/// authored-prompt op). The shared `events` store lets the test read back recorded turns.
+fn flow_engine(events: Arc<EventStore>, calls: Arc<AtomicUsize>) -> FlowEngine {
+    let dir = std::env::temp_dir().join(format!("flux-voice-d132-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EchoTool));
+    flux_tools::register_reflect(&mut reg);
+    flux_tools::register_evidence(&mut reg);
+    let exec = Executor::new(
+        reg,
+        PermissionManager::from_rules(&["echo".into()], &[]),
+        Arc::new(AllowApprover),
+        ToolContext::new(system),
+    );
+    let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+    FlowEngine::assemble(
+        Arc::new(CountingProvider { calls }),
+        exec,
+        events,
+        flow,
+        "mock".into(),
+        "test".into(),
+        1024,
+        5,
+        Vec::new(),
+        0,
+        Vec::new(),
+        dir,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn flow_driven_voice_session_speaks_authored_prompts_and_hangs_up() {
+    // A two-`await` flow owns the whole call: it speaks first, resumes on each caller turn, and ends
+    // the call when it completes — with ZERO planner invocations (echo + await only).
+    let events = Arc::new(EventStore::in_memory().unwrap());
+    let sid = events.create_session("mock").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(flow_engine(events.clone(), calls.clone()));
+    let driver_exec = engine.executor.clone(); // unused in flow mode, but the driver still needs one
+
+    // A lone object arg maps to the op's named input (the voice `EchoTool` has no positional schema).
+    let prompt = |t: &str| Node::Call {
+        op: "echo".into(),
+        args: vec![Node::Obj {
+            fields: std::collections::BTreeMap::from([(
+                "text".to_string(),
+                Box::new(Node::Lit { value: json!(t) }),
+            )]),
+        }],
+    };
+    let await_reply = |name: &str| Node::Await {
+        binding: Some(SymbolName(name.into())),
+        source: "user_input".into(),
+        as_type: None,
+    };
+    let flow = DraftAst {
+        body: vec![
+            prompt("What day?"),
+            await_reply("day"),
+            prompt("Which time?"),
+            await_reply("time"),
+            prompt("Booked!"),
+        ],
+        ..Default::default()
+    };
+    let handler = EngineVoiceHandler::new(engine, sid.clone(), flow);
+
+    let log = Arc::new(Mutex::new(SessionLog::default()));
+    let evs = scripted(vec![
+        RealtimeEvent::SessionReady, // speak-first → "What day?"
+        RealtimeEvent::InputTranscriptDone("friday".into()), // resume → "Which time?"
+        RealtimeEvent::InputTranscriptDone("noon".into()), // resume → complete → "Booked!" + hangup
+    ]);
+    let session: Arc<dyn RealtimeSession> = Arc::new(MockSession { log: log.clone() });
+    let conn = RealtimeConnection {
+        session,
+        events: evs,
+    };
+    let cancel = CancellationToken::new();
+    let mut sink = EndSink::default();
+    let driver = VoiceSessionDriver::new(driver_exec);
+
+    let controller = {
+        let cancel = cancel.clone();
+        let log = log.clone();
+        async move {
+            wait_until(move || log.lock().unwrap().spoken.len() == 3).await;
+            cancel.cancel();
+        }
+    };
+    tokio::join!(
+        driver.run_flow_turns(conn, &mut sink, &handler, &cancel),
+        controller,
+    );
+
+    // The flow spoke its OWN authored prompts, in order, ending on completion — no model improvisation.
+    assert_eq!(
+        log.lock().unwrap().spoken,
+        vec![
+            "What day?".to_string(),
+            "Which time?".to_string(),
+            "Booked!".to_string()
+        ]
+    );
+    // Invariant 1: the deterministic skeleton never called the planner.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "flow-driven voice invoked no planner"
+    );
+    // Invariant 4: completion fired the terminal hangup hook with the final line.
+    assert_eq!(sink.ended.as_deref(), Some("Booked!"));
+    // Invariant 5 (telemetry parity): each spoken prompt is a recorded first-class turn.
+    assert_eq!(
+        events.turns(&sid).unwrap().len(),
+        3,
+        "one first-class turn per driven prompt"
     );
 }
 

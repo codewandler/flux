@@ -498,6 +498,23 @@ impl FlowStore {
         Ok(())
     }
 
+    /// Whether a session has a pending suspension — a **non-consuming** peek (unlike
+    /// [`take_suspension`](Self::take_suspension), which loads and deletes). Used by a flow-driven
+    /// voice session (D-132) to tell a re-suspended flow (keep speaking prompts) from a completed one
+    /// (speak the final line, then hang up), after a turn has run.
+    pub fn has_suspension(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT 1 FROM suspensions WHERE session_id = ?1 LIMIT 1",
+            rusqlite::params![session_id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(map_sql(e)),
+        }
+    }
+
     /// Take (load **and** remove) a session's pending suspension, if any — a one-shot resume point.
     /// Returns the persisted flow name (if the suspended flow was named), body, the suspended
     /// `await` node, and the awaited source.

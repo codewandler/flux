@@ -11,7 +11,9 @@ mod sink;
 mod tests;
 mod transcript;
 
-pub use driver::{UsageRecording, VoiceSessionDriver, VoiceTurnHandler};
+pub use driver::{
+    EngineVoiceHandler, UsageRecording, VoiceReply, VoiceSessionDriver, VoiceTurnHandler,
+};
 pub use sink::VoiceSink;
 pub use transcript::TranscriptAccumulator;
 

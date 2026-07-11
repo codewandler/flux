@@ -14,6 +14,9 @@ use flux_provider::{RealtimeConnection, RealtimeEvent};
 use flux_runtime::{Executor, ToolResult};
 
 use super::sink::VoiceSink;
+use crate::ast::DraftAst;
+use crate::engine::FlowEngine;
+use crate::AgentSink;
 
 /// Optional `CallUsage` persistence for a [`VoiceSessionDriver`] (C-38) — the voice analogue of the
 /// engine emitting one `EventKind::CallUsage` per provider call (see `flux-flow`'s engine). Configure
@@ -31,13 +34,31 @@ pub struct UsageRecording {
     pub model_spec: String,
 }
 
-/// A flux-side handler that owns one voice **turn** — in production, a wrapper over
-/// `FlowEngine::run_turn` (the same `session_id` across turns accumulates the conversation) so a
-/// flux-lang flow decides each reply. The Phase-2 *engine-owned-turns* seam.
+/// What a [`VoiceTurnHandler`] turn resolves to: keep the call open, or end it. A flow-driven
+/// session (D-132) maps a re-suspended flow to [`Continue`](VoiceReply::Continue) (speak the next
+/// authored prompt, await the caller) and a completed flow to [`Complete`](VoiceReply::Complete)
+/// (speak the final line, then hang up).
+pub enum VoiceReply {
+    /// Speak this, then await the caller's next turn.
+    Continue(String),
+    /// Speak this final line, then end the session (the flow completed).
+    Complete(String),
+}
+
+/// A flux-side handler that owns the voice conversation — in production [`EngineVoiceHandler`], a
+/// wrapper over `FlowEngine` so an authored flux-lang flow drives each turn (D-132). The realtime
+/// model is the acoustic front-end (STT in, TTS out); the flow owns the logic and speaks first.
 #[async_trait]
 pub trait VoiceTurnHandler: Send + Sync {
-    /// Handle one completed user turn (their transcript); return what the agent should say next.
-    async fn turn(&self, user_text: &str) -> String;
+    /// The opening line spoken **before** any caller input — a flow-driven session runs its flow to
+    /// the first `await` and speaks that authored prompt. Default: nothing (the caller speaks first,
+    /// the pre-D-132 reactive behavior).
+    async fn start(&self) -> Option<VoiceReply> {
+        None
+    }
+    /// Handle one completed user turn (their transcript); return what the agent should say next and
+    /// whether the session continues.
+    async fn turn(&self, user_text: &str) -> VoiceReply;
 }
 
 /// Drives a realtime voice session: forwards audio/transcripts to a [`VoiceSink`] and routes the
@@ -224,11 +245,24 @@ impl VoiceSessionDriver {
                             sink.output_transcript(&t);
                         }
                         RealtimeEvent::InputTranscriptDelta(t) => sink.input_transcript(&t),
+                        // The flow speaks first (D-132): run it to its first `await` and speak the
+                        // authored prompt before any caller utterance. A no-op for a reactive
+                        // (caller-speaks-first) handler, whose `start` defaults to `None`.
+                        RealtimeEvent::SessionReady => {
+                            if let Some(reply) = handler.start().await {
+                                if speak_reply(session.as_ref(), sink, reply).await {
+                                    break;
+                                }
+                            }
+                        }
                         RealtimeEvent::InputTranscriptDone(t) => {
                             sink.input_transcript(&t);
-                            // The flow advances one turn and decides the reply; speak it.
+                            // The flow advances one turn (resumes its suspension) and decides the
+                            // reply; speak it, and end the session if the flow completed.
                             let reply = handler.turn(&t).await;
-                            let _ = session.send_text(&reply).await;
+                            if speak_reply(session.as_ref(), sink, reply).await {
+                                break;
+                            }
                         }
                         RealtimeEvent::SpeechStarted => {
                             if response_active {
@@ -245,7 +279,6 @@ impl VoiceSessionDriver {
                         }
                         // In engine mode the flow owns tools; the model is STT/TTS only.
                         RealtimeEvent::SpeechStopped
-                        | RealtimeEvent::SessionReady
                         | RealtimeEvent::ToolCall { .. } => {}
                         RealtimeEvent::Error { message, .. } => sink.error(&message),
                     },
@@ -254,5 +287,96 @@ impl VoiceSessionDriver {
         }
 
         session.close();
+    }
+}
+
+/// Speak a [`VoiceReply`] over the realtime session. Returns `true` when the session should end (the
+/// flow completed): the final line is spoken, the consumer is signalled via
+/// [`VoiceSink::session_ended`] (its hangup/handoff hook), and the driver loop breaks into
+/// `session.close()`.
+async fn speak_reply(
+    session: &dyn flux_provider::RealtimeSession,
+    sink: &mut dyn VoiceSink,
+    reply: VoiceReply,
+) -> bool {
+    match reply {
+        VoiceReply::Continue(text) => {
+            let _ = session.send_text(&text).await;
+            false
+        }
+        VoiceReply::Complete(text) => {
+            if !text.trim().is_empty() {
+                let _ = session.send_text(&text).await;
+            }
+            sink.session_ended(&text);
+            true
+        }
+    }
+}
+
+/// A [`VoiceTurnHandler`] backed by a [`FlowEngine`] running an authored flow — the production bridge
+/// for a flow-driven voice session (D-132). `start` runs the flow to its first `await` and speaks the
+/// authored prompt; each caller turn resumes the suspension (the engine's suspension-first routing);
+/// the flow completing ends the call. Model cognition runs only where the flow calls it (an
+/// `ai_segment`), through the engine's shared safety envelope — the driver's own executor is unused.
+pub struct EngineVoiceHandler {
+    engine: Arc<FlowEngine>,
+    session_id: String,
+    flow: DraftAst,
+}
+
+impl EngineVoiceHandler {
+    /// Bridge a `FlowEngine` + an authored flow into the voice driver's [`VoiceTurnHandler`] seam.
+    pub fn new(engine: Arc<FlowEngine>, session_id: impl Into<String>, flow: DraftAst) -> Self {
+        Self {
+            engine,
+            session_id: session_id.into(),
+            flow,
+        }
+    }
+
+    /// Classify the just-run turn from the store: a re-suspended flow keeps the call open (speak the
+    /// next authored prompt), a completed flow ends it (speak the final line, then hang up).
+    fn classify(&self, spoken: String) -> VoiceReply {
+        let spoken = spoken.trim().to_string();
+        match self.engine.flow.has_suspension(&self.session_id) {
+            Ok(true) => VoiceReply::Continue(spoken),
+            _ => VoiceReply::Complete(spoken),
+        }
+    }
+}
+
+#[async_trait]
+impl VoiceTurnHandler for EngineVoiceHandler {
+    async fn start(&self) -> Option<VoiceReply> {
+        let mut cap = PromptCapture::default();
+        let _ = self
+            .engine
+            .start_flow_turn(&self.session_id, &self.flow, &mut cap)
+            .await;
+        Some(self.classify(cap.text))
+    }
+
+    async fn turn(&self, user_text: &str) -> VoiceReply {
+        let mut cap = PromptCapture::default();
+        let _ = self
+            .engine
+            .run_turn(&self.session_id, user_text, &mut cap)
+            .await;
+        self.classify(cap.text)
+    }
+}
+
+/// A tiny [`AgentSink`] that captures a turn's spoken text — the flow's authored prompt, surfaced by
+/// the engine via `text_delta` (D-131) — so an [`EngineVoiceHandler`] can hand it to the realtime
+/// channel. Everything else (tool activity, observations) is ignored: voice speaks only the prompt.
+#[derive(Default)]
+struct PromptCapture {
+    text: String,
+}
+
+impl AgentSink for PromptCapture {
+    fn text_delta(&mut self, text: &str) {
+        self.text.push_str(text);
     }
 }

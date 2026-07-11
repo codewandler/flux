@@ -29,6 +29,23 @@ All notable changes to this project are documented in this file. The format is b
   fold a segment's planner spend into the turn's usage/telemetry. Design:
   `docs/designs/flow-driven-session.md`.
 
+- **D-132: Flow-driven voice — the realtime driver defers to flow suspensions.** Extends D-131 to the
+  realtime/voice channel: an authored flow drives the call, the driver **speaks the flow's authored
+  prompts** (TTS) and **resumes the suspension on caller input**, with model cognition only where the
+  flow calls it (an `ai_segment`). The voice driver's Phase-2 `VoiceTurnHandler` seam is now real —
+  **BREAKING:** `VoiceTurnHandler::turn` changes its return type from `String` to `VoiceReply`
+  (`Continue`/`Complete`); external implementors return `VoiceReply::Continue(text)` for the old
+  behavior. The trait also gains `start()` (the flow speaks first) and `VoiceSink` gains
+  `session_ended` — both additive, with defaults.
+  `VoiceSessionDriver::run_flow_turns` speaks the opening prompt at `SessionReady` and, on completion,
+  fires the new `VoiceSink::session_ended` hangup/handoff hook before ending the session loop. The
+  bridge is `EngineVoiceHandler` — a `FlowEngine`-backed handler that runs `start_flow_turn`/`run_turn`
+  through a `PromptCapture` sink and classifies continue-vs-complete via the new non-consuming
+  `FlowStore::has_suspension`. Barge-in and the authorization → approval → guarded-IO envelope are
+  untouched (ops dispatch through the engine's shared executor; the driver's own executor is unused in
+  flow mode), and turns/usage record exactly as for a text turn. No `realtime` feature needed for the
+  bridge or its test. Design: `docs/designs/flow-driven-voice.md`.
+
 - **D-133: `annotate_effects` — per-node effect/risk annotation over an analyzed flow.** New
   `flux_lang::analyze::annotate_effects(ast, ops)` walks a flow and returns, per `call` node, an
   `EffectAnnotation` (`{effects, risk, idempotency}`) keyed by the same JSON-pointer-style node path

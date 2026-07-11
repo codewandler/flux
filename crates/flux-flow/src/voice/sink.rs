@@ -27,4 +27,9 @@ pub trait VoiceSink: Send {
     fn response_done(&mut self, _usage: Option<&Usage>) {}
     /// A provider/session error.
     fn error(&mut self, _message: &str) {}
+    /// The flow-driven session (D-132) completed: the final line was spoken and the session is
+    /// ending. A telephony consumer hangs up / hands off here — the voice analog of a text turn
+    /// returning the flow result. Default no-op (pre-1.0 additive, like the other callbacks); only a
+    /// flow-driven session (`run_flow_turns`) ever fires it.
+    fn session_ended(&mut self, _result: &str) {}
 }
