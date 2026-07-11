@@ -1,8 +1,11 @@
 # Publishing to crates.io — runbook
 
-The publish closure is **24 crates**: the `flux-sdk` + `flux-providers` SDK surface (20 crates), plus the
-plugin authoring surface — `flux-datasource`, `flux-credentials`, `flux-plugin`, and `host-kit` (4
-crates). Publishing in dependency order means every dependent resolves its deps from the index.
+The publish closure is **28 crates**: the `flux-sdk` + `flux-providers` SDK surface, the plugin
+authoring surface (`flux-datasource`, `flux-credentials`, `flux-plugin`, `host-kit`), and the
+standalone capability crates that external consumers depend on directly — `flux-a2a`, `flux-audio`,
+`flux-capabilities`, and `flux-web` (the web pack: `http.request`, `web_fetch`, `web.crawl`,
+`browser.*`). Publishing in dependency order means every dependent resolves its deps from the index.
+The authoritative list is the `CRATES` array in `scripts/publish-crates-io.sh` — this doc mirrors it.
 
 > Status: **live.** The SDK closure (20 crates) shipped in v0.9.3. The plugin authoring surface (4
 > crates: datasource, credentials, plugin, host-kit) ships with v0.9.4. All vanity-prefixed
@@ -32,40 +35,44 @@ flux-core = { package = "codewandler-flux-core", version = "0.9.3", path = "crat
 
 The nested `plugins/` workspace carries the same `package =` key for the closure crates it references by
 path. `flux-codegate` strips the `codewandler-` prefix before layer classification. Non-closure crates
-(`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-a2a`, `flux-auth`, `flux-capabilities`,
-`flux-channels`, `flux-audio`, `flux-config`, `flux-eval`, `flux-codegate`) stay **bare and path-only** —
-not published.
+(`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-auth`, `flux-channels`, `flux-config`,
+`flux-eval`, `flux-codegate`, `flux-lsp`) stay **bare and path-only** — not published.
 
 ## 2. The closure & topological publish order
 
-**24 crates.** Each crate's dependencies precede it (verified against `cargo tree`). The list lives in
-`scripts/publish-crates-io.sh`; keep the two in sync. Publish the `codewandler-*` package for each:
+**28 crates.** Each crate's dependencies precede it (verified against `cargo tree`). This list mirrors
+the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two in sync. Publish the
+`codewandler-*` package for each:
 
 ```
 1.  flux-core          ← root (no flux-* deps)
-2.  flux-markdown       (pure leaf — no flux-* deps; enters via flux-skill/flux-agent)
-3.  flux-datasource     (pure leaf — no flux-* deps; enters via flux-plugin + host-kit)
-4.  flux-spec
-5.  flux-policy
-6.  flux-secret
-7.  flux-evidence
-8.  flux-skill          (→ markdown)
-9.  flux-system
-10. flux-provider       (the abstraction, singular)
-11. flux-credentials    (→ core, provider)
-12. flux-pg             (→ core)   — the sole sqlx owner; flux-events' optional `postgres` backend
-13. flux-lang
-14. flux-events         (→ core, lang; optional → flux-pg behind `postgres`)
-15. flux-runtime
-16. flux-tools
-17. flux-cognition
-18. flux-plugin         (→ datasource, credentials, runtime, system, spec, secret, evidence, core)
-19. host-kit            (→ plugin, datasource, spec)  — in the nested plugins/ workspace
-20. flux-flow           (→ lang, events, runtime, provider, skill, evidence, system, spec, secret, core)
-21. flux-agent          (→ flow, markdown, skill, tools, runtime, provider, events, evidence, core)
-22. flux-orchestrate    (→ agent, flow, …)
-23. flux-sdk            (→ orchestrate, agent, flow, cognition, …)
-24. flux-providers      (→ core, provider)  — the concrete clients (plural)
+2.  flux-audio          (pure leaf — no flux-* deps)
+3.  flux-a2a            (pure leaf — no flux-* deps)
+4.  flux-markdown       (pure leaf — no flux-* deps; enters via flux-skill/flux-agent)
+5.  flux-datasource     (pure leaf — no flux-* deps; enters via flux-plugin + host-kit)
+6.  flux-spec
+7.  flux-policy
+8.  flux-secret
+9.  flux-evidence
+10. flux-skill          (→ markdown)
+11. flux-system
+12. flux-provider       (the abstraction, singular)
+13. flux-credentials    (→ core, provider)
+14. flux-pg             (→ core)   — the sole sqlx owner; flux-events' optional `postgres` backend
+15. flux-lang
+16. flux-events         (→ core, lang; optional → flux-pg behind `postgres`)
+17. flux-runtime
+18. flux-tools
+19. flux-cognition
+20. flux-plugin         (→ datasource, credentials, runtime, system, spec, secret, evidence, core)
+21. flux-capabilities   (→ core, datasource, pg, plugin, runtime, secret, spec, system)
+22. host-kit            (→ plugin, datasource, spec)  — in the nested plugins/ workspace
+23. flux-flow           (→ lang, events, runtime, provider, skill, evidence, system, spec, secret, core)
+24. flux-agent          (→ flow, markdown, skill, tools, runtime, provider, events, evidence, core)
+25. flux-orchestrate    (→ agent, flow, …)
+26. flux-sdk            (→ orchestrate, agent, flow, cognition, …)
+27. flux-providers      (→ core, provider)  — the concrete clients (plural)
+28. flux-web            (→ core, runtime, spec, system, plugin, markdown, datasource, evidence)  — the web pack
 ```
 
 Why `flux-pg` is in the closure: crates.io requires **every** dependency — including optional ones — to
@@ -160,6 +167,6 @@ scripts/verify-github-release.sh --repo codewandler/flux "$tag"
 
 ## 7. Follow-on (out of scope here)
 
-The rest of the platform (`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-auth`, `flux-a2a`,
-`flux-capabilities`, `flux-channels`, `flux-audio`, `flux-config`, `flux-eval`) stays path-only and
+The rest of the platform (`flux-cli`, `flux-app`, `flux-server`, `flux-tui`, `flux-auth`,
+`flux-channels`, `flux-config`, `flux-eval`, `flux-codegate`, `flux-lsp`) stays path-only and
 unpublished — a separate, later decision.

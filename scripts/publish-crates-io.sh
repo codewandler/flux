@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Publish the flux crates.io closure — the 24 `codewandler-*` crates — in strict dependency order.
+# Publish the flux crates.io closure — every `codewandler-*` crate — in strict dependency order.
 # See crates/flux-sdk/PUBLISHING.md for the why.
 #
 #   - Idempotent: a crate@version already on crates.io is treated as done and skipped, so the script is
@@ -46,6 +46,7 @@ CRATES=(
   codewandler-flux-orchestrate
   codewandler-flux-sdk
   codewandler-flux-providers
+  codewandler-flux-web
 )
 
 failed=""

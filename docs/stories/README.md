@@ -25,7 +25,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-- [C-51 — Add flux-web to the crates.io publish closure](C-51-flux-web-publish-closure.md) · Core · prerequisite for downstream consumption of the web capabilities (D-160 web.crawl + D-161 PDF now land in flux-web): add codewandler-flux-web to the crates.io publish closure — a version pin + a publish-script entry; all its flux deps are already published
 
 ### SDK surface — a standard agent SDK, the flux way
 - [D-147 — Flow-driven sessions front door — Session::start_flow + suspended](D-147-sdk-flow-driven-session-front-door.md) · Agent · wave 2 — the D-131 differentiator reaches the SDK; durable await across restarts
@@ -199,6 +198,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-48 — Customer-centric changelog (WHATS-NEW.md) + `flux changelog`](C-48-customer-changelog-flux-changelog.md) · Agent · plain-language 'what has changed' shipped in the binary; CHANGELOG.md stays the engineering log
 - [C-49 — Claude provider hardening — model-gated quirks, fable alias, spec parsing](C-49-claude-provider-model-hardening.md) · Core · e2e sweep 2026-07-09 found haiku 400s (adaptive thinking), `claude/fable` 404s, `claude/` reaches the wire
 - [C-50 — Harden audited safety, correctness, and efficiency seams](C-50-audit-hardening-wave.md) · Core · concurrent hardening wave from the 2026-07-10 repository audit
+- [C-51 — Add flux-web to the crates.io publish closure](C-51-flux-web-publish-closure.md) · Core · prerequisite for downstream consumption of the web capabilities (D-160 web.crawl + D-161 PDF now land in flux-web): add codewandler-flux-web to the crates.io publish closure — a version pin + a publish-script entry; all its flux deps are already published
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

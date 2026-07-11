@@ -6,6 +6,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-51: `codewandler-flux-web` joins the crates.io publish closure.** The web pack
+  (`http.request`, `web_fetch` — now with PDF extraction, `web.crawl`, `browser.*`) was in-tree only,
+  consumed by `flux-cli`; it now publishes to crates.io so external SDK/plugin authors can depend on
+  it directly. The root `[workspace.dependencies]` `flux-web` entry gains a `version` pin (kept in
+  lockstep by `scripts/cut-release.sh`), and `codewandler-flux-web` is appended to the `CRATES`
+  publish order after all its deps (core, runtime, spec, system, plugin, markdown, datasource,
+  evidence — all already published). Verified with `cargo publish --dry-run`. While reconciling,
+  `crates/flux-sdk/PUBLISHING.md` was corrected against the actual publish script: it had drifted to
+  "24 crates" and wrongly listed `flux-a2a`/`flux-audio`/`flux-capabilities` as unpublished — the
+  closure is now documented as the true **28 crates**, mirroring `scripts/publish-crates-io.sh`.
+
 ## [0.16.0] - 2026-07-11
 
 ### Added

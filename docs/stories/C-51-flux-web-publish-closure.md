@@ -2,8 +2,7 @@
 id: C-51
 title: Add flux-web to the crates.io publish closure
 pillar: Core
-status: ready
-priority: 11
+status: done
 epic:
 design:
 note: "prerequisite for downstream consumption of the web capabilities (D-160 web.crawl + D-161 PDF now land in flux-web): add codewandler-flux-web to the crates.io publish closure — a version pin + a publish-script entry; all its flux deps are already published"
@@ -41,6 +40,17 @@ from crates.io. Today flux-web is excluded purely by omission and is consumed on
   (`scripts/publish-crates-io.sh`) gate it; its whole flux-dep set is already published (verified).
 - Execute at the next release cut, ideally folded into `scripts/cut-release.sh`'s version bump so the
   pin lands in lockstep.
+- 2026-07-11 — DONE, cut in v0.16.1. Applied all four acceptance items:
+  - Root `Cargo.toml` `flux-web` gained `version = "0.16.0"` (the exclusion-by-omission comment
+    removed); `cut-release.sh`'s blanket bump now keeps it in lockstep like every other pin.
+  - `codewandler-flux-web` appended to the `CRATES` array in `scripts/publish-crates-io.sh`, after all
+    eight deps; the header's stale "24 crates" phrasing made count-free.
+  - `crates/flux-sdk/PUBLISHING.md` reconciled against the actual publish script — it had drifted to
+    "24 crates" and wrongly listed `flux-a2a`/`flux-audio`/`flux-capabilities` as unpublished. Now
+    documents the true **28 crates**, numbered list mirrors `scripts/publish-crates-io.sh`, and the
+    path-only lists corrected (added `flux-lsp`, dropped the three published crates).
+  - Verified with `cargo publish --dry-run -p codewandler-flux-web` — packaged + compiled clean
+    against the crates.io index. Real publish runs via CI on the `v0.16.1` tag.
 
 ## Notes
 - Release-ops, filed standalone (not part of any feature epic) — same convention as C-47.
