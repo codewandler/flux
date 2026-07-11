@@ -29,6 +29,18 @@ All notable changes to this project are documented in this file. The format is b
   fold a segment's planner spend into the turn's usage/telemetry. Design:
   `docs/designs/flow-driven-session.md`.
 
+- **D-133: `annotate_effects` — per-node effect/risk annotation over an analyzed flow.** New
+  `flux_lang::analyze::annotate_effects(ast, ops)` walks a flow and returns, per `call` node, an
+  `EffectAnnotation` (`{effects, risk, idempotency}`) keyed by the same JSON-pointer-style node path
+  diagnostics already render (`body[3].then[1]`) — the per-node, attributed sibling of
+  `HirFlow::effects`'s deduped flow-level union (right for the approval envelope, lossy for "which
+  node did this"). `effects` folds in both of `gather_effects`'s contribution sources — the op's own
+  host effects mapped onto `FlowEffect`, plus the semantic tag declared on an immediately enclosing
+  `bind`/`memo` (e.g. `$charge = call(charge_card, {…}) effect: money`) — so a consumer (e.g. a
+  visual editor pinning `Money`/`High`-risk nodes) can tell exactly which call moves money instead of
+  only that something in the flow does. An unregistered op annotates honestly as `None` rather than
+  being silently skipped, matching the analyzer's own "unknown operation" diagnostic.
+
 ### Changed
 
 - **README identity and first-screen refresh.** Replaced the gradient orbit/lambda logo with a flat,

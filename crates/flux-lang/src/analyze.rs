@@ -4,6 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use flux_spec::{Idempotency, Risk};
+
 use crate::ast::{
     is_valid_decl_name, is_valid_op_name, DraftAst, FlowEffect, HirFlow, Node, SymbolName, TypeRef,
 };
@@ -952,6 +954,276 @@ pub fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
             | Node::Ctx { .. }
             | Node::CtxAppend { .. } => {}
         }
+    }
+}
+
+/// The effect/risk/idempotency annotation [`annotate_effects`] attributes to one `call` node.
+///
+/// `effects` mirrors [`gather_effects`]'s two contribution sources — the op's own host effects
+/// (mapped onto [`FlowEffect`] via [`host_effect_to_flow`]) plus the semantic effect tag declared
+/// on an immediately enclosing `bind`/`memo` (e.g. `$charge = call(charge_card, {…}) effect:
+/// money`) — but attributed to this one call instead of deduped into the flow-wide union, so a
+/// consumer can tell *which* call moves money rather than only that *something* in the flow does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectAnnotation {
+    /// Semantic effects attributed to this call (deduped, first-seen order — same convention as
+    /// [`HirFlow::effects`]).
+    pub effects: Vec<FlowEffect>,
+    /// The op's declared risk tier, driving approval thresholds.
+    pub risk: Risk,
+    /// Whether re-running this op is safe.
+    pub idempotency: Idempotency,
+}
+
+/// Derive one call's [`EffectAnnotation`] from the catalog, or `None` when `op` is unregistered —
+/// the same "unknown operation" condition [`check_node`]'s `Node::Call` arm diagnoses. Callers must
+/// keep the `None` entry (see [`annotate_effects`]) rather than treat it as "no effects": an unknown
+/// op's effects are *unknown*, not empty.
+fn call_effect_annotation(
+    op: &str,
+    ops: &dyn OpCatalog,
+    enclosing_effect: Option<FlowEffect>,
+) -> Option<EffectAnnotation> {
+    let sig = ops.lookup(op)?;
+    let mut effects: Vec<FlowEffect> = Vec::new();
+    for e in sig.effects {
+        if let Some(f) = host_effect_to_flow(e) {
+            if !effects.contains(&f) {
+                effects.push(f);
+            }
+        }
+    }
+    if let Some(e) = enclosing_effect {
+        if !effects.contains(&e) {
+            effects.push(e);
+        }
+    }
+    Some(EffectAnnotation {
+        effects,
+        risk: sig.risk,
+        idempotency: sig.idempotency,
+    })
+}
+
+/// Walk an analyzed flow and return, per `call` node, its [`EffectAnnotation`] keyed by the same
+/// JSON-pointer-style node path diagnostics render (`body[3].then[1]`, see [`Diags`]) — the
+/// per-node (attributed) sibling of [`gather_effects`]'s deduped flow-level union
+/// ([`HirFlow::effects`]): right for the approval envelope, lossy for "which node did this."
+///
+/// An unregistered op annotates honestly as `None` rather than being silently skipped — the entry
+/// still appears at its node path, matching [`analyze_call`]'s "unknown operation" diagnostic — so
+/// a consumer (e.g. a visual editor pinning `Money`/`High`-risk nodes) can render "unknown effect"
+/// instead of mistaking absence-from-the-list for "no effect."
+///
+/// Mirrors [`for_each_node`]'s traversal shape and [`check_node`]/[`check_body`]'s path labels in
+/// lock-step — the two conventions must never drift apart, or a node path this function emits
+/// would not line up with the diagnostic path a repairing model or UI already understands.
+pub fn annotate_effects(
+    ast: &DraftAst,
+    ops: &dyn OpCatalog,
+) -> Vec<(String, Option<EffectAnnotation>)> {
+    let mut out = Vec::new();
+    let mut d = Diags::default();
+    annotate_body(&ast.body, "body", ops, &mut d, &mut out);
+    out
+}
+
+/// [`annotate_effects`]'s statement-list walker — the per-node-path counterpart of [`check_body`].
+fn annotate_body(
+    body: &[Node],
+    label: &str,
+    ops: &dyn OpCatalog,
+    d: &mut Diags,
+    out: &mut Vec<(String, Option<EffectAnnotation>)>,
+) {
+    for (i, n) in body.iter().enumerate() {
+        d.with(format!("{label}[{i}]"), |d| {
+            annotate_node(n, ops, None, d, out)
+        });
+    }
+}
+
+/// [`annotate_effects`]'s single-node walker — the per-node-path counterpart of [`check_node`].
+/// `enclosing_effect` is the effect tag (if any) declared on the `bind`/`memo` this node is the
+/// direct `value` of; it folds into a directly-nested `call`'s annotation (see
+/// [`call_effect_annotation`]) and is dropped for every other child position, matching
+/// `gather_effects`'s bind-level contribution being "this statement's own tag," not inherited by
+/// arbitrarily deep descendants.
+///
+/// Exhaustive on purpose (no `_ =>`, F12, mirrors [`for_each_node`]/[`check_node`]): a new node
+/// kind must state its child positions here so this stays in lock-step with the diagnostic path
+/// convention.
+fn annotate_node(
+    node: &Node,
+    ops: &dyn OpCatalog,
+    enclosing_effect: Option<FlowEffect>,
+    d: &mut Diags,
+    out: &mut Vec<(String, Option<EffectAnnotation>)>,
+) {
+    match node {
+        Node::Call { op, args } => {
+            out.push((
+                d.path.join("."),
+                call_effect_annotation(op, ops, enclosing_effect),
+            ));
+            for (i, a) in args.iter().enumerate() {
+                d.with(format!("args[{i}]"), |d| {
+                    annotate_node(a, ops, None, d, out)
+                });
+            }
+        }
+        Node::Bind { value, effect, .. } | Node::Memo { value, effect, .. } => {
+            d.with("value", |d| annotate_node(value, ops, *effect, d, out));
+        }
+        Node::When {
+            cond,
+            then,
+            otherwise,
+        } => {
+            d.with("cond", |d| annotate_node(cond, ops, None, d, out));
+            annotate_body(then, "then", ops, d, out);
+            annotate_body(otherwise, "otherwise", ops, d, out);
+        }
+        Node::Unless { cond, body } => {
+            d.with("cond", |d| annotate_node(cond, ops, None, d, out));
+            annotate_body(body, "body", ops, d, out);
+        }
+        Node::Repeat { until, body, .. } | Node::Loop { until, body, .. } => {
+            if let Some(u) = until {
+                d.with("until", |d| annotate_node(u, ops, None, d, out));
+            }
+            annotate_body(body, "body", ops, d, out);
+        }
+        Node::Each { source, body, .. } => {
+            d.with("in", |d| annotate_node(source, ops, None, d, out));
+            annotate_body(body, "body", ops, d, out);
+        }
+        Node::Assert { cond, .. } => {
+            d.with("cond", |d| annotate_node(cond, ops, None, d, out));
+        }
+        Node::Pipe { steps, .. } => {
+            for (i, s) in steps.iter().enumerate() {
+                d.with(format!("steps[{i}]"), |d| {
+                    annotate_node(s, ops, None, d, out)
+                });
+            }
+        }
+        Node::Seq { body, .. }
+        | Node::Retry { body, .. }
+        | Node::Confirm { body, .. }
+        | Node::Throttle { body, .. }
+        | Node::Debounce { body, .. } => annotate_body(body, "body", ops, d, out),
+        Node::Try { body, handler, .. } => {
+            annotate_body(body, "body", ops, d, out);
+            annotate_body(handler, "handler", ops, d, out);
+        }
+        Node::Parallel { branches } | Node::Race { branches, .. } => {
+            for (i, b) in branches.iter().enumerate() {
+                d.with(format!("branches[{i}]"), |d| {
+                    annotate_body(&b.body, "body", ops, d, out)
+                });
+            }
+        }
+        Node::Verify { cmd, expect, .. } => {
+            d.with("cmd", |d| annotate_node(cmd, ops, None, d, out));
+            d.with("expect", |d| annotate_node(expect, ops, None, d, out));
+        }
+        Node::Return { value } => {
+            d.with("value", |d| annotate_node(value, ops, None, d, out));
+        }
+        Node::Jq { input, .. } => {
+            d.with("input", |d| annotate_node(input, ops, None, d, out));
+        }
+        Node::Parse { value, .. } => {
+            d.with("value", |d| annotate_node(value, ops, None, d, out));
+        }
+        Node::Expr { vars, .. } => {
+            for (k, v) in vars {
+                d.with(format!("vars.{k}"), |d| annotate_node(v, ops, None, d, out));
+            }
+        }
+        Node::Match {
+            subject,
+            cases,
+            default,
+        } => {
+            d.with("subject", |d| annotate_node(subject, ops, None, d, out));
+            for (i, c) in cases.iter().enumerate() {
+                d.with(format!("cases[{i}]"), |d| {
+                    d.with("value", |d| annotate_node(&c.value, ops, None, d, out));
+                    annotate_body(&c.body, "body", ops, d, out);
+                });
+            }
+            annotate_body(default, "default", ops, d, out);
+        }
+        Node::Route {
+            selector,
+            cases,
+            default,
+        } => {
+            d.with("selector", |d| annotate_node(selector, ops, None, d, out));
+            for (i, c) in cases.iter().enumerate() {
+                d.with(format!("cases[{i}]"), |d| {
+                    annotate_body(&c.body, "body", ops, d, out)
+                });
+            }
+            annotate_body(default, "default", ops, d, out);
+        }
+        Node::Fallback { branches, .. } => {
+            for (i, b) in branches.iter().enumerate() {
+                d.with(format!("branches[{i}]"), |d| {
+                    annotate_body(&b.body, "body", ops, d, out)
+                });
+            }
+        }
+        Node::Timeout { body, .. } | Node::Budget { body, .. } | Node::CapScope { body, .. } => {
+            annotate_body(body, "body", ops, d, out)
+        }
+        Node::Scope {
+            acquire,
+            body,
+            finally,
+            ..
+        } => {
+            if let Some(acq) = acquire {
+                d.with("acquire", |d| annotate_node(acq, ops, None, d, out));
+            }
+            annotate_body(body, "body", ops, d, out);
+            annotate_body(finally, "finally", ops, d, out);
+        }
+        Node::Saga { steps } => {
+            for (i, step) in steps.iter().enumerate() {
+                d.with(format!("steps[{i}]"), |d| {
+                    annotate_body(&step.body, "body", ops, d, out);
+                    annotate_body(&step.undo, "undo", ops, d, out);
+                });
+            }
+        }
+        Node::Once { body, .. } => annotate_body(body, "body", ops, d, out),
+        Node::Obj { fields } => {
+            for (k, v) in fields {
+                d.with(format!("fields.{k}"), |d| {
+                    annotate_node(v, ops, None, d, out)
+                });
+            }
+        }
+        Node::List { items } => {
+            for (i, it) in items.iter().enumerate() {
+                d.with(format!("items[{i}]"), |d| {
+                    annotate_node(it, ops, None, d, out)
+                });
+            }
+        }
+        // Leaf nodes: no nested node positions, so none can themselves be (or contain) a `call`.
+        Node::Await { .. }
+        | Node::Checkpoint { .. }
+        | Node::Peek { .. }
+        | Node::Var { .. }
+        | Node::Lit { .. }
+        | Node::Thing { .. }
+        | Node::Fmt { .. }
+        | Node::Ctx { .. }
+        | Node::CtxAppend { .. } => {}
     }
 }
 
@@ -4018,6 +4290,127 @@ mod tests {
                 && d.message.contains("body[1].then[0]")),
             "expected the diagnostic to carry its node path, got: {:?}",
             err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- D-133: annotate_effects — per-node effect/risk annotation ----
+
+    /// A catalog with a plain `read` (low-risk, idempotent) and a `charge_card` op (high-risk,
+    /// non-idempotent) — enough to distinguish "the write node" from "the read node" in the
+    /// annotate_effects tests below.
+    struct EffectCatalog;
+    impl OpCatalog for EffectCatalog {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            match name {
+                "read" => Some(OpSignature {
+                    name: name.into(),
+                    description: String::new(),
+                    effects: vec![flux_spec::Effect::Read],
+                    risk: Risk::Low,
+                    idempotency: Idempotency::Idempotent,
+                    required_params: Vec::new(),
+                    optional_params: Vec::new(),
+                    param_types: Default::default(),
+                }),
+                "charge_card" => Some(OpSignature {
+                    name: name.into(),
+                    description: String::new(),
+                    effects: vec![flux_spec::Effect::Network],
+                    risk: Risk::High,
+                    idempotency: Idempotency::NonIdempotent,
+                    required_params: Vec::new(),
+                    optional_params: Vec::new(),
+                    param_types: Default::default(),
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    /// Failing-first for D-133: a flow with one `read` call and one `Money`-effect `charge_card`
+    /// write (declared via the enclosing `bind`'s `effect: money` tag, the same annotation
+    /// `lower_gathers_effects_and_named_args_are_validated` exercises for the flow-level union)
+    /// must annotate EXACTLY the write node with `Money` + its `High` risk tier — the read node
+    /// must not pick it up.
+    #[test]
+    fn annotate_effects_attributes_money_to_exactly_the_write_node() {
+        let ops = EffectCatalog;
+        let ast = DraftAst {
+            body: vec![
+                Node::Call {
+                    op: "read".into(),
+                    args: vec![],
+                },
+                Node::Bind {
+                    name: "charge".into(),
+                    value: Box::new(Node::Call {
+                        op: "charge_card".into(),
+                        args: vec![],
+                    }),
+                    ty: None,
+                    effect: Some(FlowEffect::Money),
+                },
+            ],
+            ..Default::default()
+        };
+        let annotated = annotate_effects(&ast, &ops);
+
+        let read = annotated
+            .iter()
+            .find(|(path, _)| path == "body[0]")
+            .unwrap_or_else(|| panic!("expected an entry for the read node, got: {annotated:?}"));
+        let write = annotated
+            .iter()
+            .find(|(path, _)| path == "body[1].value")
+            .unwrap_or_else(|| panic!("expected an entry for the write node, got: {annotated:?}"));
+
+        let read_ann = read.1.as_ref().expect("`read` is a known op");
+        let write_ann = write.1.as_ref().expect("`charge_card` is a known op");
+
+        assert!(
+            !read_ann.effects.contains(&FlowEffect::Money),
+            "the read node must not carry `Money`, got {:?}",
+            read_ann.effects
+        );
+        assert!(
+            write_ann.effects.contains(&FlowEffect::Money),
+            "the write node must carry `Money`, got {:?}",
+            write_ann.effects
+        );
+        assert_eq!(
+            write_ann.risk,
+            Risk::High,
+            "the write node must carry its op's risk tier"
+        );
+    }
+
+    /// Failing-first for D-133: an unknown op must still get an entry at its node path (`None`),
+    /// not be silently skipped — mirroring [`analyze_call`]'s own "unknown operation" diagnostic.
+    #[test]
+    fn annotate_effects_honestly_flags_unknown_ops_instead_of_skipping() {
+        let ops = EffectCatalog;
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "nope.op".into(),
+                args: vec![],
+            }],
+            ..Default::default()
+        };
+
+        // The analyzer itself treats this op as unknown...
+        assert!(analyze_call("nope.op", &ops).is_err());
+
+        // ...and annotate_effects must agree: an entry is still present, honestly `None`.
+        let annotated = annotate_effects(&ast, &ops);
+        assert_eq!(
+            annotated.len(),
+            1,
+            "the unknown-op call must still get an entry, not be skipped: {annotated:?}"
+        );
+        assert_eq!(annotated[0].0, "body[0]");
+        assert!(
+            annotated[0].1.is_none(),
+            "an unknown op annotates as `None` (honest absence), not a guessed signature"
         );
     }
 }
