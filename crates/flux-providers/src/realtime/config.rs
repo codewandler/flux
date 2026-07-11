@@ -127,6 +127,16 @@ pub struct TurnDetection {
     /// Eagerness hint for `semantic_vad` (e.g. `"low"`/`"medium"`/`"high"`/`"auto"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eagerness: Option<String>,
+    /// Whether the model auto-creates a response once a turn ends (both `server_vad` and
+    /// `semantic_vad` support this). Omitted (`None`) keeps the API's own default (`true`); D-140
+    /// sets `Some(false)` for a flow/engine-driven session so the handler's own reply doesn't race
+    /// an auto-created one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_response: Option<bool>,
+    /// Whether an in-flight response is auto-interrupted when new speech is detected. Omitted
+    /// keeps the API's own default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupt_response: Option<bool>,
 }
 
 /// A function tool exposed to the model.
@@ -194,6 +204,8 @@ mod tests {
                 prefix_padding_ms: None,
                 silence_duration_ms: None,
                 eagerness: None,
+                create_response: None,
+                interrupt_response: None,
             }),
             ..Default::default()
         };

@@ -153,6 +153,8 @@ impl RealtimeConfig {
                 threshold: None,
                 prefix_padding_ms: None,
                 silence_duration_ms: None,
+                create_response: None,
+                interrupt_response: None,
             },
             temperature: None,
             metadata: serde_json::Map::new(),
@@ -189,11 +191,25 @@ pub enum TurnDetection {
         prefix_padding_ms: Option<u32>,
         /// Silence before a turn is considered ended, in ms.
         silence_duration_ms: Option<u32>,
+        /// Whether the model auto-creates a response once a turn ends. `None` keeps the provider
+        /// default (`true`) — set `Some(false)` for a flow/engine-driven session (D-140) where a
+        /// handler owns the reply (e.g. `flux-flow`'s `run_flow_turns`) and an auto-created
+        /// response would race it.
+        create_response: Option<bool>,
+        /// Whether an in-flight response is auto-interrupted when new speech is detected. `None`
+        /// keeps the provider default.
+        interrupt_response: Option<bool>,
     },
     /// Semantic (model-judged) turn detection.
     SemanticVad {
         /// Provider-specific eagerness hint.
         eagerness: Option<String>,
+        /// Whether the model auto-creates a response once a turn ends. `None` keeps the provider
+        /// default (`true`) — same knob as `ServerVad::create_response` (D-140).
+        create_response: Option<bool>,
+        /// Whether an in-flight response is auto-interrupted when new speech is detected. `None`
+        /// keeps the provider default.
+        interrupt_response: Option<bool>,
     },
     /// No detection — the client delimits turns via [`RealtimeSession::commit_audio`] +
     /// [`RealtimeSession::create_response`].

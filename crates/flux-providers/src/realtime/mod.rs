@@ -140,19 +140,29 @@ fn to_session_config(cfg: &RealtimeConfig) -> SessionConfig {
             threshold,
             prefix_padding_ms,
             silence_duration_ms,
+            create_response,
+            interrupt_response,
         } => Some(WireTurnDetection {
             kind: "server_vad".into(),
             threshold: threshold.map(f64::from),
             prefix_padding_ms: *prefix_padding_ms,
             silence_duration_ms: *silence_duration_ms,
             eagerness: None,
+            create_response: *create_response,
+            interrupt_response: *interrupt_response,
         }),
-        SeamTurnDetection::SemanticVad { eagerness } => Some(WireTurnDetection {
+        SeamTurnDetection::SemanticVad {
+            eagerness,
+            create_response,
+            interrupt_response,
+        } => Some(WireTurnDetection {
             kind: "semantic_vad".into(),
             threshold: None,
             prefix_padding_ms: None,
             silence_duration_ms: None,
             eagerness: eagerness.clone(),
+            create_response: *create_response,
+            interrupt_response: *interrupt_response,
         }),
         SeamTurnDetection::None => None,
     };
@@ -284,5 +294,54 @@ mod tests {
     #[test]
     fn default_model_is_reachable_via_the_module_reexport() {
         assert!(!crate::realtime::default_model().is_empty());
+    }
+
+    /// D-140: `create_response`/`interrupt_response` are additive knobs on both VAD modes — a
+    /// session config that sets `create_response: Some(false)` must render the wire flag, and a
+    /// config that leaves it `None` must keep the wire object free of it (today's provider
+    /// default, unconfigured). Exercises the full seam -> wire -> GA-JSON path, since that's what
+    /// a live OpenAI session actually sends.
+    #[test]
+    fn server_vad_create_response_flag_serializes_when_set_and_omitted_when_absent() {
+        let mut cfg = RealtimeConfig::voice_agent("gpt-realtime", "be brief");
+        cfg.turn_detection = SeamTurnDetection::ServerVad {
+            threshold: None,
+            prefix_padding_ms: None,
+            silence_duration_ms: None,
+            create_response: Some(false),
+            interrupt_response: None,
+        };
+        let v = to_session_config(&cfg).to_ga_session();
+        assert_eq!(
+            v["audio"]["input"]["turn_detection"]["create_response"],
+            false
+        );
+        assert!(v["audio"]["input"]["turn_detection"]
+            .get("interrupt_response")
+            .is_none());
+
+        // `voice_agent`'s default leaves both flags `None` — absent stays absent on the wire.
+        let default_cfg = RealtimeConfig::voice_agent("gpt-realtime", "be brief");
+        let default_v = to_session_config(&default_cfg).to_ga_session();
+        assert!(default_v["audio"]["input"]["turn_detection"]
+            .get("create_response")
+            .is_none());
+    }
+
+    /// D-140: `SemanticVad` gets the same `create_response`/`interrupt_response` treatment as
+    /// `ServerVad` — the OpenAI wire supports both flags on either turn-detection kind.
+    #[test]
+    fn semantic_vad_create_response_and_interrupt_response_serialize_when_set() {
+        let mut cfg = RealtimeConfig::voice_agent("gpt-realtime", "be brief");
+        cfg.turn_detection = SeamTurnDetection::SemanticVad {
+            eagerness: Some("low".into()),
+            create_response: Some(false),
+            interrupt_response: Some(true),
+        };
+        let v = to_session_config(&cfg).to_ga_session();
+        let td = &v["audio"]["input"]["turn_detection"];
+        assert_eq!(td["type"], "semantic_vad");
+        assert_eq!(td["create_response"], false);
+        assert_eq!(td["interrupt_response"], true);
     }
 }

@@ -218,8 +218,9 @@ impl VoiceSessionDriver {
     /// like a tool call. The executor this driver holds is unused in this mode (the flow owns tools).
     ///
     /// Configure [`RealtimeConfig::turn_detection`](flux_provider::RealtimeConfig) so the model does
-    /// **not** auto-respond (`TurnDetection::None`, or server-VAD with response creation off) —
-    /// otherwise the model's own auto-reply races the flow's `send_text` reply and both speak.
+    /// **not** auto-respond: `TurnDetection::None`, or `TurnDetection::ServerVad` /
+    /// `TurnDetection::SemanticVad` with `create_response: Some(false)` (D-140) — otherwise the
+    /// model's own auto-reply races the flow's `send_text` reply and both speak.
     pub async fn run_flow_turns(
         &self,
         conn: RealtimeConnection,
