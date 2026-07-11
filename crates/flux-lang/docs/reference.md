@@ -1307,8 +1307,13 @@ re-applies the pack's budget.
 | `list` | homogeneous list — `List<String>`, etc. |
 | `named(X)` | a named/registered type — `Ticket`, `Draft`, `Result`, ... |
 
-`FlowEffect` is the semantic effect declared on a `bind` or `memo` node. It drives
-risk scoring and approval decisions:
+`FlowEffect` is the semantic effect an op carries beyond its host-resource `Effect`
+(`Read`/`Write`/`Network`/…) — the tier that distinguishes "this call moves money" from
+"this call writes a file." It reaches a call's effect annotation two ways: authored on
+a `bind`/`memo` node (`effect: money`), or declared directly on the op's own catalog
+signature (`OpSignature::semantic_effects` — a plugin manifest's `OperationSpec` or an
+`OpSpec` can declare it, so a plain, untagged call still annotates correctly). Either
+way it drives risk scoring and approval decisions:
 
 | tag | meaning |
 |---|---|

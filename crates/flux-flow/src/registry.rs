@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 
 use flux_lang::analyze::{for_each_node, lower, Diagnostic};
-use flux_runtime::ToolRegistry;
+use flux_lang::ast::FlowEffect;
+use flux_runtime::{Tool, ToolRegistry};
 use flux_spec::{Effect, Risk};
 
 use crate::ast::{Node, ResolvedThing, ThingRef};
@@ -90,10 +91,11 @@ impl<'a> OpRegistry<'a> {
     pub fn signatures(&self) -> Vec<OpSignature> {
         let mut signatures: Vec<OpSignature> = self
             .tools
-            .specs()
-            .iter()
-            .filter(|s| self.is_advertised(&s.name))
-            .map(OpSignature::from_spec)
+            .names()
+            .into_iter()
+            .filter(|n| self.is_advertised(n))
+            .filter_map(|n| self.tools.get(&n))
+            .map(|t| signature_for_tool(t.as_ref()))
             .collect();
         signatures.extend(
             self.composites
@@ -201,7 +203,7 @@ impl<'a> OpRegistry<'a> {
     pub fn get(&self, name: &str) -> Option<OpSignature> {
         self.tools
             .get(name)
-            .map(|t| OpSignature::from_spec(&t.spec()))
+            .map(|t| signature_for_tool(t.as_ref()))
             .or_else(|| {
                 self.composites
                     .iter()
@@ -236,6 +238,28 @@ impl OpCatalog for OpRegistry<'_> {
     }
 }
 
+/// Derive a tool's [`OpSignature`], folding its declared semantic-effect tags
+/// ([`Tool::semantic_effects`]) into [`OpSignature::semantic_effects`] — the D-138 manifest→catalog
+/// adapter: a plugin's manifest-declared `OperationSpec::semantic_effects` (`Money`/`Delete`/
+/// `SendExternal`, or any built-in `Tool` impl that overrides the same hook) survives from the
+/// registered tool all the way to the catalog the analyzer/planner see, with no authored `effect:`
+/// tag required at the call site. Unknown tags are silently dropped rather than erroring — a
+/// forward-compatible tag from a newer catalog degrades to "no extra semantic tier" instead of
+/// breaking resolution.
+fn signature_for_tool(tool: &dyn Tool) -> OpSignature {
+    let mut sig = OpSignature::from_spec(&tool.spec());
+    let mut semantic: Vec<FlowEffect> = Vec::new();
+    for tag in tool.semantic_effects() {
+        if let Some(e) = FlowEffect::from_tag(&tag) {
+            if !semantic.contains(&e) {
+                semantic.push(e);
+            }
+        }
+    }
+    sig.semantic_effects = semantic;
+    sig
+}
+
 fn composite_signature(op: &CompositeOpDecl) -> OpSignature {
     let mut param_types = std::collections::BTreeMap::new();
     for p in &op.params {
@@ -250,6 +274,9 @@ fn composite_signature(op: &CompositeOpDecl) -> OpSignature {
         required_params: op.params.iter().map(|p| p.name.0.clone()).collect(),
         optional_params: Vec::new(),
         param_types,
+        // Composite ops don't yet have their own declared semantic-effect tier (they compose
+        // existing ops rather than being a leaf `OpSpec`/`OperationSpec`); leave empty for now.
+        semantic_effects: Vec::new(),
     }
 }
 

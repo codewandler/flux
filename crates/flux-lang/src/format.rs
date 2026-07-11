@@ -1125,20 +1125,9 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
 }
 
 /// The stable lowercase tag for a semantic effect (matches the serde `snake_case` wire tag).
+/// Delegates to [`FlowEffect::tag`], the single source of truth for the tag vocabulary.
 pub(crate) fn effect_tag(e: FlowEffect) -> &'static str {
-    match e {
-        FlowEffect::Pure => "pure",
-        FlowEffect::Read => "read",
-        FlowEffect::Model => "model",
-        FlowEffect::Network => "network",
-        FlowEffect::WriteFile => "write_file",
-        FlowEffect::WriteDb => "write_db",
-        FlowEffect::SendExternal => "send_external",
-        FlowEffect::Delete => "delete",
-        FlowEffect::Money => "money",
-        FlowEffect::Calendar => "calendar",
-        FlowEffect::HumanVisible => "human_visible",
-    }
+    e.tag()
 }
 
 #[cfg(test)]

@@ -488,6 +488,7 @@ mod tests {
                 required_params: vec!["x".into()],
                 optional_params: Vec::new(),
                 param_types: Default::default(),
+                semantic_effects: Vec::new(),
             };
             match name {
                 "read" => Some(mk(vec![Effect::Read], Idempotency::Idempotent)),

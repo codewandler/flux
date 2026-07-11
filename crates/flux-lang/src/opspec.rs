@@ -91,6 +91,27 @@ impl OpSpec {
             "required": serde_json::Value::Array(required),
         })
     }
+
+    /// Derive this op's [`OpSignature`] directly from the typed spec — the D-138 counterpart of
+    /// [`Self::lower`] that does NOT erase the semantic tier. [`Self::lower`]'s [`ToolSpec`] can only
+    /// carry the host-resource effects [`FlowEffect::lower`] projects (`Money` vanishes entirely,
+    /// `Delete`/`SendExternal` collapse into `Write`/`Network`), because a `ToolSpec` has no room for
+    /// a semantic-effect field. This method still calls [`Self::lower`] for every host-facing field
+    /// (name, schema, host effects, risk, idempotency), but additionally copies the ORIGINAL,
+    /// undegraded [`effects`](Self::effects) onto [`OpSignature::semantic_effects`] — so a consumer
+    /// reading the signature (the SDK catalog, a downstream visual editor, `annotate_effects`) can
+    /// see `Money`/`Delete`/`SendExternal` even though no host `Effect` distinguishes them.
+    pub fn to_signature(&self) -> OpSignature {
+        let mut sig = OpSignature::from_spec(&self.lower());
+        let mut semantic: Vec<FlowEffect> = Vec::new();
+        for e in &self.effects {
+            if !semantic.contains(e) {
+                semantic.push(*e);
+            }
+        }
+        sig.semantic_effects = semantic;
+        sig
+    }
 }
 
 /// Project a [`TypeRef`] onto a JSON Schema fragment. A `Named` type renders as a `$ref` into
@@ -182,6 +203,19 @@ pub struct OpSignature {
     /// argument type-checking. Empty when the schema is untyped (a param absent here is `Any`).
     #[serde(default)]
     pub param_types: std::collections::BTreeMap<String, TypeRef>,
+    /// The op's declared SEMANTIC effects (`Money`/`Delete`/`SendExternal`/…), carried alongside the
+    /// lowered host [`effects`](Self::effects) instead of being erased by [`OpSpec::lower`] (D-138).
+    /// `OpSignature::from_spec` cannot recover these from a bare [`ToolSpec`] — a `ToolSpec` has no
+    /// semantic-effect field, by design (it stays free of any `flux-lang` dependency) — so this is
+    /// empty unless a caller populates it from a richer source: [`OpSpec::to_signature`] (an
+    /// `OpSpec`'s own declared `effects`) or the engine's tool-registry adapter, which folds in a
+    /// `flux_runtime::Tool`'s declared semantic-effect tags (e.g. a plugin manifest's
+    /// `OperationSpec::semantic_effects`). `annotate_effects` (`crate::analyze`) folds these into a
+    /// call's `EffectAnnotation` without requiring an authored `effect:` tag on the call site.
+    /// Deduped, first-seen order; additive — existing callers that never set this field keep getting
+    /// an empty list, same as before this field existed.
+    #[serde(default)]
+    pub semantic_effects: Vec<FlowEffect>,
 }
 
 impl OpSignature {
@@ -207,6 +241,10 @@ impl OpSignature {
             required_params,
             optional_params,
             param_types,
+            // A bare `ToolSpec` carries no semantic-effect tier (see the field doc); a caller that
+            // has a richer source (an `OpSpec`, or a `flux_runtime::Tool`'s declared semantic-effect
+            // tags) sets `semantic_effects` afterward. See `OpSpec::to_signature` for the OpSpec case.
+            semantic_effects: Vec::new(),
         }
     }
 
@@ -301,6 +339,23 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// D-138: unlike `lower()`'s `ToolSpec` (which collapses `Network` and `SendExternal` into the
+    /// same host `Effect::Network`, indistinguishable from each other), `to_signature()` preserves
+    /// the ORIGINAL semantic effects on `OpSignature::semantic_effects` — so `SendExternal` stays
+    /// visible to a catalog consumer even though no host effect distinguishes it from `Network`.
+    #[test]
+    fn opspec_to_signature_preserves_semantic_effects_lower_erases() {
+        let sig = kb_search().to_signature();
+
+        assert_eq!(sig.name, "kb.search");
+        // The host-facing fields still match a plain `from_spec(&lower())`.
+        assert!(sig.effects.contains(&Effect::Read));
+        // But the semantic tier survives, distinctly:
+        assert!(sig.semantic_effects.contains(&FlowEffect::Read));
+        assert!(sig.semantic_effects.contains(&FlowEffect::Network));
+        assert!(sig.semantic_effects.contains(&FlowEffect::SendExternal));
     }
 
     #[test]

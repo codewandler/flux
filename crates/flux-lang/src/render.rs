@@ -690,20 +690,10 @@ fn eff(effect: &Option<FlowEffect>) -> Option<Span> {
         .map(|e| (format!("   !{}", effect_tag(*e)), Role::Effect))
 }
 
+/// The stable lowercase tag for a semantic effect. Delegates to [`FlowEffect::tag`], the single
+/// source of truth for the tag vocabulary.
 fn effect_tag(e: FlowEffect) -> &'static str {
-    match e {
-        FlowEffect::Pure => "pure",
-        FlowEffect::Read => "read",
-        FlowEffect::Model => "model",
-        FlowEffect::Network => "network",
-        FlowEffect::WriteFile => "write_file",
-        FlowEffect::WriteDb => "write_db",
-        FlowEffect::SendExternal => "send_external",
-        FlowEffect::Delete => "delete",
-        FlowEffect::Money => "money",
-        FlowEffect::Calendar => "calendar",
-        FlowEffect::HumanVisible => "human_visible",
-    }
+    e.tag()
 }
 
 fn thing_span(thing: &ThingRef) -> Span {

@@ -4395,6 +4395,7 @@ mod tests {
             required_params: required.iter().map(|s| s.to_string()).collect(),
             optional_params: optional.iter().map(|s| s.to_string()).collect(),
             param_types: Default::default(),
+            semantic_effects: Vec::new(),
         }
     }
     fn catalog() -> MockCatalog {
@@ -4825,6 +4826,7 @@ mod tests {
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 })
             }
         }
@@ -4932,6 +4934,7 @@ mod tests {
                     required_params: vec!["x".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 })
             }
         }
@@ -5079,6 +5082,7 @@ mod tests {
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 })
             }
         }
@@ -5175,6 +5179,7 @@ mod tests {
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 })
             }
         }
@@ -5287,6 +5292,7 @@ mod tests {
                     required_params: req.iter().map(|s| s.to_string()).collect(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 })
             };
             match name {
@@ -8654,6 +8660,7 @@ mod tests {
                 required_params: Vec::new(),
                 optional_params: Vec::new(),
                 param_types: Default::default(),
+                semantic_effects: Vec::new(),
             })
         }
     }

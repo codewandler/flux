@@ -1055,6 +1055,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
         secret_purposes: Vec::new(),
         group: None,
         internal: false,
+        semantic_effects: Vec::new(),
     }
 }
 
@@ -1070,6 +1071,7 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         secret_purposes: Vec::new(),
         group: None,
         internal: false,
+        semantic_effects: Vec::new(),
     }
 }
 
@@ -1115,6 +1117,7 @@ pub fn internal_op(name: &str, description: &str, input_schema: Value) -> Operat
         secret_purposes: Vec::new(),
         group: None,
         internal: true,
+        semantic_effects: Vec::new(),
     }
 }
 

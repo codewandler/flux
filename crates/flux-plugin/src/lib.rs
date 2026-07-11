@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 
 use flux_core::{Error, Result};
 pub use flux_evidence::ToolGroup;
+use flux_lang::ast::FlowEffect;
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
 use flux_system::net::PrivateNetAllow;
@@ -131,6 +132,16 @@ pub struct OperationSpec {
     /// on the manifest and merged into the runtime group list when the plugin loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// The op's declared SEMANTIC effects (`money`, `delete`, `send_external`, …) — the
+    /// `flux_lang::ast::FlowEffect` tag vocabulary — carried alongside `effects` above instead of
+    /// being erased the way lowering a Flux-Lang `OpSpec` to a host [`ToolSpec`] necessarily erases
+    /// them (D-138). [`PluginTool`] projects these onto its [`Tool::semantic_effects`] hook, and
+    /// `flux-flow`'s catalog adapter folds them into the op's `OpSignature` and, from there, into
+    /// `annotate_effects`'s per-call annotation — with no authored `effect:` tag required at the
+    /// call site. Empty means "no declared semantic tier beyond `effects`," matching every existing
+    /// manifest that says nothing about it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_effects: Vec<FlowEffect>,
     /// **Host-only op** (C-09a): when `true` this op is NOT advertised to the LLM as a callable
     /// tool — it is an internal host-dispatched channel. The canonical case is the `aws-bedrock`
     /// plugin's `auth` op, which returns raw AWS credentials: the model must never call it, or the
@@ -2577,6 +2588,9 @@ pub struct PluginTool {
     plugin: String,
     operation: String,
     spec: ToolSpec,
+    /// The manifest-declared semantic-effect tags (D-138), carried alongside `spec` since a
+    /// [`ToolSpec`] has no room for them — see [`Tool::semantic_effects`].
+    semantic_effects: Vec<String>,
 }
 
 impl PluginTool {
@@ -2587,12 +2601,14 @@ impl PluginTool {
         op: &OperationSpec,
     ) -> Self {
         let (operation, spec) = plugin_tool_spec(plugin, op);
+        let semantic_effects = semantic_effect_tags(&op.semantic_effects);
         Self {
             host,
             caps,
             plugin: plugin.to_string(),
             operation,
             spec,
+            semantic_effects,
         }
     }
 }
@@ -2633,6 +2649,15 @@ fn plugin_tool_spec(plugin: &str, op: &OperationSpec) -> (String, ToolSpec) {
     (op.name.clone(), spec)
 }
 
+/// Project an op's declared [`FlowEffect`]s onto the plain tag strings [`Tool::semantic_effects`]
+/// returns (D-138) — a small free function so the manifest→catalog projection is unit-testable
+/// without spinning up a full [`PluginTool`] (which needs a live [`PluginHost`] subprocess
+/// connection). Order-preserving; duplicates are the caller's concern (the catalog adapter in
+/// `flux-flow`'s `OpRegistry` dedupes when it parses these back onto `OpSignature::semantic_effects`).
+fn semantic_effect_tags(effects: &[FlowEffect]) -> Vec<String> {
+    effects.iter().map(|e| e.tag().to_string()).collect()
+}
+
 #[async_trait]
 impl Tool for PluginTool {
     fn spec(&self) -> ToolSpec {
@@ -2641,6 +2666,10 @@ impl Tool for PluginTool {
 
     fn permission_subjects(&self, _params: &Value) -> Vec<String> {
         vec![format!("{}.{}", self.plugin, self.operation)]
+    }
+
+    fn semantic_effects(&self) -> Vec<String> {
+        self.semantic_effects.clone()
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -3126,6 +3155,24 @@ mod tests {
         let (_, spec) = plugin_tool_spec("vault", &op);
         assert_eq!(spec.name, "vault.kv.read");
         assert_eq!(spec.group.as_deref(), Some("vault.kv"));
+    }
+
+    /// D-138: a manifest-declared `OperationSpec::semantic_effects` (`Money`) projects onto the
+    /// plain tag strings [`Tool::semantic_effects`] returns — the plugin-side half of the
+    /// manifest→catalog adapter (`flux-flow`'s `OpRegistry` parses these tags back onto
+    /// `OpSignature::semantic_effects`; see `analyze::tests::
+    /// annotate_effects_folds_catalog_declared_semantics_without_an_authored_tag` for the catalog
+    /// side).
+    #[test]
+    fn operation_spec_semantic_effects_project_onto_tag_strings() {
+        let op = OperationSpec {
+            name: "billing.charge".into(),
+            description: "charge a customer".into(),
+            effects: vec![Effect::Network],
+            semantic_effects: vec![FlowEffect::Money],
+            ..Default::default()
+        };
+        assert_eq!(semantic_effect_tags(&op.semantic_effects), vec!["money"]);
     }
 
     #[test]

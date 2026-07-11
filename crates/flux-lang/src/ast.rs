@@ -159,6 +159,48 @@ pub enum FlowEffect {
     HumanVisible,
 }
 
+impl FlowEffect {
+    /// The stable lowercase tag for this semantic effect — matches the serde `snake_case` wire tag
+    /// and the `!tag` bind/memo syntax (see [`FlowEffect::from_tag`] for the inverse). The single
+    /// source of truth for the tag vocabulary: `format`/`render`'s pretty-printers and `parse`'s
+    /// `@effect`/`!tag` readers all resolve through this pair rather than keeping their own tables.
+    pub fn tag(self) -> &'static str {
+        match self {
+            FlowEffect::Pure => "pure",
+            FlowEffect::Read => "read",
+            FlowEffect::Model => "model",
+            FlowEffect::Network => "network",
+            FlowEffect::WriteFile => "write_file",
+            FlowEffect::WriteDb => "write_db",
+            FlowEffect::SendExternal => "send_external",
+            FlowEffect::Delete => "delete",
+            FlowEffect::Money => "money",
+            FlowEffect::Calendar => "calendar",
+            FlowEffect::HumanVisible => "human_visible",
+        }
+    }
+
+    /// Parse a semantic-effect tag (the inverse of [`FlowEffect::tag`]), or `None` for an unknown
+    /// tag. Used both by the text-syntax reader and by anything reconstructing a [`FlowEffect`] from
+    /// a catalog's serialized tag strings (e.g. a plugin-manifest-declared op, D-138).
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "pure" => FlowEffect::Pure,
+            "read" => FlowEffect::Read,
+            "model" => FlowEffect::Model,
+            "network" => FlowEffect::Network,
+            "write_file" => FlowEffect::WriteFile,
+            "write_db" => FlowEffect::WriteDb,
+            "send_external" => FlowEffect::SendExternal,
+            "delete" => FlowEffect::Delete,
+            "money" => FlowEffect::Money,
+            "calendar" => FlowEffect::Calendar,
+            "human_visible" => FlowEffect::HumanVisible,
+            _ => return None,
+        })
+    }
+}
+
 /// How visible a session symbol is to the model when projecting `view(Session)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

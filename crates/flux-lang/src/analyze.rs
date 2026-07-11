@@ -979,6 +979,14 @@ pub struct EffectAnnotation {
 /// the same "unknown operation" condition [`check_node`]'s `Node::Call` arm diagnoses. Callers must
 /// keep the `None` entry (see [`annotate_effects`]) rather than treat it as "no effects": an unknown
 /// op's effects are *unknown*, not empty.
+///
+/// Three contribution sources fold into `effects`, in order: the op's lowered host effects (mapped
+/// back onto a representative [`FlowEffect`] via [`host_effect_to_flow`]), the op's own CATALOG-
+/// declared semantics (`sig.semantic_effects` — D-138: `Money`/`Delete`/`SendExternal` a plugin
+/// manifest or `OpSpec` declares directly, with no authored tag on the call site), and finally the
+/// semantic effect tag declared on an immediately enclosing `bind`/`memo` (D-133's authored
+/// `effect:`). All three are additive and deduped — an op that both declares `Money` in its own
+/// catalog entry AND is called under an authored `effect: money` bind still reports `Money` once.
 fn call_effect_annotation(
     op: &str,
     ops: &dyn OpCatalog,
@@ -991,6 +999,11 @@ fn call_effect_annotation(
             if !effects.contains(&f) {
                 effects.push(f);
             }
+        }
+    }
+    for f in sig.semantic_effects {
+        if !effects.contains(&f) {
+            effects.push(f);
         }
     }
     if let Some(e) = enclosing_effect {
@@ -2140,6 +2153,7 @@ mod tests {
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 })
         }
     }
@@ -2162,6 +2176,7 @@ mod tests {
                 required_params: required.iter().map(|s| s.to_string()).collect(),
                 optional_params: optional.iter().map(|s| s.to_string()).collect(),
                 param_types: Default::default(),
+                semantic_effects: Vec::new(),
             };
             match name {
                 "read" => Some(sig(vec![flux_spec::Effect::Read], &["path"], &[])),
@@ -2559,6 +2574,7 @@ mod tests {
                 param_types: [("n".to_string(), crate::ast::TypeRef::Number)]
                     .into_iter()
                     .collect(),
+                semantic_effects: Vec::new(),
             })
         }
     }
@@ -2577,6 +2593,7 @@ mod tests {
                 required_params: vec!["items".into()],
                 optional_params: vec!["vars".into(), "where".into()],
                 param_types: Default::default(),
+                semantic_effects: Vec::new(),
             })
         }
 
@@ -4297,7 +4314,10 @@ mod tests {
 
     /// A catalog with a plain `read` (low-risk, idempotent) and a `charge_card` op (high-risk,
     /// non-idempotent) — enough to distinguish "the write node" from "the read node" in the
-    /// annotate_effects tests below.
+    /// annotate_effects tests below. `charge_card` also declares `Money` directly in its catalog
+    /// signature (`semantic_effects`, D-138) — independent of whatever `effect:` tag (if any) a
+    /// call site's enclosing `bind`/`memo` authors — so the catalog-declared-semantics test below
+    /// doesn't depend on an authored tag at all.
     struct EffectCatalog;
     impl OpCatalog for EffectCatalog {
         fn lookup(&self, name: &str) -> Option<OpSignature> {
@@ -4311,6 +4331,7 @@ mod tests {
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: Vec::new(),
                 }),
                 "charge_card" => Some(OpSignature {
                     name: name.into(),
@@ -4321,6 +4342,7 @@ mod tests {
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    semantic_effects: vec![FlowEffect::Money],
                 }),
                 _ => None,
             }
@@ -4381,6 +4403,38 @@ mod tests {
             write_ann.risk,
             Risk::High,
             "the write node must carry its op's risk tier"
+        );
+    }
+
+    /// Failing-first for D-138: an op that declares `Money` directly in its CATALOG signature
+    /// (`OpSignature::semantic_effects`) must annotate a PLAIN, untagged call node with `Money` —
+    /// with no authored `effect: money` tag on an enclosing `bind`/`memo` at all. This is the
+    /// catalog-declared counterpart to `annotate_effects_attributes_money_to_exactly_the_write_node`
+    /// above (which relies entirely on an authored tag): before this story, `annotate_effects` only
+    /// ever saw `Money` via `enclosing_effect`, so a bare `call(charge_card, {...})` with no bind/tag
+    /// silently lost the semantic tier — exactly the erasure D-138 closes.
+    #[test]
+    fn annotate_effects_folds_catalog_declared_semantics_without_an_authored_tag() {
+        let ops = EffectCatalog;
+        let ast = DraftAst {
+            body: vec![Node::Call {
+                op: "charge_card".into(),
+                args: vec![],
+            }],
+            ..Default::default()
+        };
+
+        let annotated = annotate_effects(&ast, &ops);
+        assert_eq!(annotated.len(), 1);
+        let (path, ann) = &annotated[0];
+        assert_eq!(path, "body[0]");
+        let ann = ann
+            .as_ref()
+            .expect("`charge_card` is a known op in EffectCatalog");
+        assert!(
+            ann.effects.contains(&FlowEffect::Money),
+            "a plain, untagged call to a Money-declaring op must still annotate `Money`, got {:?}",
+            ann.effects
         );
     }
 

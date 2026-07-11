@@ -2786,21 +2786,10 @@ fn set_effect(node: Node, eff: FlowEffect) -> Result<Node> {
     }
 }
 
+/// Parse a semantic-effect tag. Delegates to [`FlowEffect::from_tag`], the single source of truth
+/// for the tag vocabulary.
 fn effect_from_tag(tag: &str) -> Option<FlowEffect> {
-    Some(match tag {
-        "pure" => FlowEffect::Pure,
-        "read" => FlowEffect::Read,
-        "model" => FlowEffect::Model,
-        "network" => FlowEffect::Network,
-        "write_file" => FlowEffect::WriteFile,
-        "write_db" => FlowEffect::WriteDb,
-        "send_external" => FlowEffect::SendExternal,
-        "delete" => FlowEffect::Delete,
-        "money" => FlowEffect::Money,
-        "calendar" => FlowEffect::Calendar,
-        "human_visible" => FlowEffect::HumanVisible,
-        _ => return None,
-    })
+    FlowEffect::from_tag(tag)
 }
 
 // ===========================================================================

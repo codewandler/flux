@@ -390,6 +390,18 @@ pub trait Tool: Send + Sync {
         IntentSet::new()
     }
 
+    /// Declared SEMANTIC-effect tags this tool carries beyond its host [`ToolSpec::effects`] — e.g.
+    /// `"money"`, `"delete"`, `"send_external"` (the `flux_lang::ast::FlowEffect` tag vocabulary,
+    /// D-138). Plain strings rather than the typed `FlowEffect` enum so this trait — the safety
+    /// envelope's core seam, implemented far outside the language crate too — stays free of a
+    /// `flux-lang` dependency; a Flux-Lang-aware catalog adapter (`flux-flow`'s `OpRegistry`) parses
+    /// them back via `FlowEffect::from_tag` onto `OpSignature::semantic_effects`. Default empty:
+    /// most tools have no semantic tier beyond their host effects, and every existing `impl Tool`
+    /// keeps compiling unchanged.
+    fn semantic_effects(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult>;
 }
 
