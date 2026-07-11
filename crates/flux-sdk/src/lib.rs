@@ -27,13 +27,67 @@
 #![warn(missing_docs)]
 
 mod envelope;
+pub mod events;
 pub mod flow;
 pub mod session;
 pub mod storage;
 
+pub use events::{AgentEvent, TurnStream};
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
 pub use session::Session;
 pub use storage::Storage;
+
+/// The engine's streaming contract — implement it and pass it to [`Session::send_with`] to
+/// receive a turn's deltas, tool calls, tool results, and observations as they happen (or use
+/// [`Session::stream`] for the owned-event shape). Re-exported from `flux-flow`.
+pub use flux_flow::AgentSink;
+
+/// Cancels a running turn ([`Session::send_with`]) or voice session — re-exported from
+/// `tokio-util` so consumers don't need the direct dependency.
+pub use tokio_util::sync::CancellationToken;
+
+/// The provider trait — the one construction argument every client's `build` takes. The concrete
+/// backends live in `flux-providers` (Anthropic/OpenAI/OpenRouter/Ollama/Bedrock + the
+/// subscription providers); a consumer implements this for a mock, or adds `flux-providers` for a
+/// real one.
+pub use flux_provider::Provider;
+
+/// The agent definition ([`ClientBuilder::from_spec`]) plus its permission rules. Re-exported so
+/// the full-control door needs no direct `flux-agent` dependency.
+pub use flux_agent::{AgentSpec, Permissions};
+
+/// The per-turn token accounting carried on [`TurnOutput`]. Re-exported from `flux-core`.
+pub use flux_core::Usage;
+
+/// **Custom tools.** Implement [`Tool`](tools::Tool) — or build one from a closure with
+/// [`tool_fn`](tools::tool_fn)/[`FnTool`](tools::FnTool) — and register it with
+/// [`ClientBuilder::register_op`]/[`FlowClient::register_op`]. A registered tool dispatches through
+/// the same authorization → approval → guarded-IO envelope as every built-in. [`ToolSpec`](tools::ToolSpec)
+/// (with [`Risk`](tools::Risk)) describes the tool to the model and the envelope;
+/// [`ToolContext`](tools::ToolContext)/[`ToolResult`](tools::ToolResult) are the dispatch types;
+/// [`ToolRegistry`](tools::ToolRegistry) is what a `register_pack` closure receives.
+pub mod tools {
+    pub use flux_runtime::{tool_fn, FnTool, Tool, ToolContext, ToolRegistry, ToolResult};
+    pub use flux_spec::{Risk, ToolSpec};
+}
+
+/// **Approval policy.** Implement [`Approver`](approval::Approver) and pass it to a builder's
+/// `approver(...)` to gate ops with your own logic; [`ApprovalChoice`](approval::ApprovalChoice) is
+/// your verdict, [`IntentSet`](approval::IntentSet) is the per-call intent your `request` receives,
+/// and [`RiskApprover`](approval::RiskApprover) is a ready-made risk-tiered policy.
+pub mod approval {
+    pub use flux_runtime::{ApprovalChoice, Approver, RiskApprover};
+    pub use flux_spec::IntentSet;
+}
+
+/// **Session observability.** The projection types [`Session`] readers return, plus the stores
+/// [`Storage::custom`] accepts. (Cost/turn/trace projection readers land in wave 2.)
+pub mod observe {
+    pub use flux_core::Message;
+    pub use flux_events::EventStore;
+    pub use flux_evidence::{Observation, ToolGroup};
+    pub use flux_flow::state::FlowStore;
+}
 
 /// The OS-sandbox posture types, re-exported so a consumer can inject an explicit sandbox into a
 /// builder via [`ClientBuilder::with_sandbox`]/[`flow::FlowClientBuilder::with_sandbox`] without
@@ -51,13 +105,12 @@ pub mod recipes;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_agent::AgentSpec;
+// `AgentSpec`, `Usage`, and `Provider` are in scope via the public re-exports above.
 use flux_cognition::CognitionPack;
 use flux_core::ContextBlock;
-use flux_core::{Result, Usage};
+use flux_core::Result;
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
-use flux_provider::Provider;
 use flux_runtime::{Approver, Tool, ToolContext, ToolRegistry};
 use flux_system::{System, Workspace};
 
@@ -772,6 +825,167 @@ mod tests {
         assert!(
             !dir.join("sdk-plan.txt").exists(),
             "an out-of-subset op must not execute"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-144: `send_with` streams to a consumer sink — text deltas arrive AND tool results arrive
+    /// (the old private collector dropped tool results entirely).
+    #[tokio::test]
+    async fn send_with_streams_deltas_and_tool_results_to_a_consumer_sink() {
+        #[derive(Default)]
+        struct Recording {
+            deltas: Vec<String>,
+            tool_results: Vec<String>,
+        }
+        impl AgentSink for Recording {
+            fn text_delta(&mut self, t: &str) {
+                self.deltas.push(t.to_string());
+            }
+            fn tool_result(&mut self, name: &str, _result: &flux_runtime::ToolResult) {
+                self.tool_results.push(name.to_string());
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("flux-sdk-sendwith-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .build(
+                Box::new(PlanThenProseMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let session = client.default_session();
+        let mut sink = Recording::default();
+        let out = session
+            .send_with("write a file", &mut sink, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "Wrote the file.");
+        // `deltas` is exercised live by `stream_yields_events_live_and_finish_collects`; the
+        // load-bearing assertion here is the tool RESULT reaching the consumer (the old private
+        // collector dropped those entirely).
+        assert!(
+            sink.tool_results.contains(&"write".to_string()),
+            "the consumer sink must receive tool_result events, got {:?}",
+            sink.tool_results
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Streams the answer in two text deltas, then the final block.
+    struct TwoDeltaMock;
+    #[async_trait]
+    impl Provider for TwoDeltaMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Chunk::TextDelta("first ".into()),
+                    Chunk::TextDelta("second".into()),
+                    Chunk::Block(ContentBlock::Text {
+                        text: "first second".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    /// D-145: `Session::stream` yields the turn's events as owned `AgentEvent`s (deltas preserved,
+    /// `TurnEnd` fires) and `finish()` returns the collected output. (Cross-turn *liveness* — an
+    /// event observed before the turn ends — is exercised by the cancel test below, where the turn
+    /// cannot end until the consumer acts on a mid-turn `ToolCall` event.)
+    #[tokio::test]
+    async fn stream_yields_events_and_finish_collects() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::builder()
+            .model("mock")
+            .build(Box::new(TwoDeltaMock), &dir)
+            .unwrap();
+        let mut stream = client.default_session().stream("hi");
+
+        let mut deltas = String::new();
+        let mut saw_turn_end = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::TextDelta(t) => deltas.push_str(&t),
+                AgentEvent::TurnEnd { .. } => saw_turn_end = true,
+                _ => {}
+            }
+        }
+        assert_eq!(deltas, "first second");
+        assert!(saw_turn_end, "the stream must emit a TurnEnd event");
+        let out = stream.finish().await.unwrap();
+        assert_eq!(out.text, "first second");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-145: cancelling a streamed turn mid-tool ends it and leaves a valid `user → assistant`
+    /// alternation in the persisted log (the AGENTS.md session-shape invariant).
+    #[tokio::test]
+    async fn cancelling_a_streamed_turn_keeps_the_session_shape_valid() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A tool that parks forever — the turn can only end via cancellation.
+        let parked = flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "park",
+                "Blocks until cancelled",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            ),
+            |_input| async {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                Ok(serde_json::json!("unreachable"))
+            },
+        );
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .register_op(parked)
+            .build(
+                Box::new(PlanOpMock {
+                    op: "park",
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let session = client.default_session();
+        let mut stream = session.stream("park it");
+        // Wait until the parked op is actually in flight, then cancel.
+        loop {
+            match stream.next().await {
+                Some(AgentEvent::ToolCall { name, .. }) if name == "park" => break,
+                Some(_) => continue,
+                None => panic!("stream ended before the tool call"),
+            }
+        }
+        stream.cancel();
+        let _ = stream.finish().await;
+
+        let history = session.history().unwrap();
+        assert!(!history.is_empty());
+        for pair in history.windows(2) {
+            assert_ne!(
+                pair[0].role, pair[1].role,
+                "roles must alternate after a cancelled turn"
+            );
+        }
+        assert!(
+            matches!(history.last().unwrap().role, flux_core::Role::Assistant),
+            "a cancelled turn must still persist exactly one closing assistant message"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

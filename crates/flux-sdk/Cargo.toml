@@ -42,6 +42,10 @@ tokio.workspace = true
 # `Tool::spec()`/`Approver::request` needs `ToolSpec`/`IntentSet`, so the spec contracts are a real
 # dependency (re-exported via `flux_sdk::tools`/`flux_sdk::approval`).
 flux-spec.workspace = true
+# `AgentEvent::Observation` carries the audit observation type (and the evidence-gated `ToolGroup`
+# rides the re-export surface) — L0 contracts, like flux-spec above.
+flux-evidence.workspace = true
+# `TurnStream` implements `futures::Stream` (the async-iterator shape of a live turn).
+futures.workspace = true
 
 [dev-dependencies]
-futures.workspace = true

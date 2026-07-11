@@ -969,6 +969,7 @@ dependencies = [
  "codewandler-flux-cognition",
  "codewandler-flux-core",
  "codewandler-flux-events",
+ "codewandler-flux-evidence",
  "codewandler-flux-flow",
  "codewandler-flux-lang",
  "codewandler-flux-orchestrate",

@@ -2,8 +2,7 @@
 id: D-145
 title: Owned event stream — AgentEvent + TurnStream with cancel/finish
 pillar: Agent
-status: ready
-priority: 4
+status: done
 epic: sdk-surface
 design: docs/designs/sdk-surface.md
 note: "wave 1 — async-iterator streaming over a spawned cancellable turn"
@@ -27,9 +26,17 @@ owned `AgentEvent`s (an enum mirroring `AgentSink` 1:1, `#[non_exhaustive]`) wit
 - [ ] `tokio` promoted to a real dependency (spawn); channel sink forwards owned events.
 
 ## Progress
-- (pending)
+- 2026-07-11: implemented in new `src/events.rs` — `AgentEvent` (`#[non_exhaustive]`, one variant
+  per `AgentSink` method), `TurnStream` (impls `futures::Stream` + `next`/`cancel`/`finish`),
+  `ChannelSink` forwards owned events over an unbounded mpsc while collecting the output.
+  `Session::stream` spawns `run_turn_cancellable` (the turn guard is acquired INSIDE the spawned
+  task so the stream handle returns immediately yet turns still serialize). `futures` +
+  `flux-evidence` promoted to real deps. Tests: gated-mock live-delivery (first delta observable
+  while provider parked on a semaphore), cancel-mid-parked-tool leaves a valid alternation +
+  closing assistant message.
 
 ## Notes
 - New `crates/flux-sdk/src/events.rs`; `Session::stream` spawns `run_turn_cancellable`
   (possible: `Session` holds `Arc<FlowEngine>`, `run_turn*` takes `&self`).
-- Depends on D-142; composes with D-144's sink door (one implementation, two shapes).
+- Depends on D-142; composes with D-144's sink door (one `events.rs`, two shapes: `TeeSink` for
+  bring-your-own-sink, `ChannelSink` for the owned-event stream).

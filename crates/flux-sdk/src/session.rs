@@ -14,7 +14,9 @@ use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 use flux_runtime::ToolResult;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
+use crate::events::{ChannelSink, TeeSink, TurnStream};
 use crate::TurnOutput;
 
 /// A handle to one conversation (an event-store session) on a client's engine.
@@ -49,6 +51,54 @@ impl Session {
         let mut sink = Collector::default();
         self.engine.run_turn(&self.id, input, &mut sink).await?;
         Ok(sink.0)
+    }
+
+    /// Run one turn, streaming every event to your own [`AgentSink`] as it happens — text and
+    /// thinking deltas, plan progress, tool calls **and tool results** — while still returning the
+    /// collected [`TurnOutput`]. Cancel via the token: the engine drops the in-flight op and
+    /// persists exactly one assistant message (the log stays a valid `user → assistant`
+    /// alternation).
+    pub async fn send_with(
+        &self,
+        input: &str,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+    ) -> Result<TurnOutput> {
+        let _turn = self.turn_guard.lock().await;
+        let mut tee = TeeSink {
+            consumer: sink,
+            collect: Collector::default(),
+        };
+        self.engine
+            .run_turn_cancellable(&self.id, input, &mut tee, cancel)
+            .await?;
+        Ok(tee.collect.0)
+    }
+
+    /// Run one turn as a [`TurnStream`] — a stream of owned
+    /// [`AgentEvent`](crate::events::AgentEvent)s plus `cancel()`/`finish()`. The turn runs on a
+    /// spawned task (the client's turn guard still serializes it against other turns), so events
+    /// arrive as they happen whether or not you are polling.
+    pub fn stream(&self, input: &str) -> TurnStream {
+        let engine = self.engine.clone();
+        let id = self.id.clone();
+        let guard = self.turn_guard.clone();
+        let input = input.to_string();
+        let cancel = CancellationToken::new();
+        let child = cancel.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let _turn = guard.lock().await;
+            let mut sink = ChannelSink {
+                tx,
+                collect: Collector::default(),
+            };
+            engine
+                .run_turn_cancellable(&id, &input, &mut sink, &child)
+                .await?;
+            Ok(sink.collect.0)
+        });
+        TurnStream { rx, handle, cancel }
     }
 
     /// The conversation so far — the user/assistant messages projected from the event store.
