@@ -23,6 +23,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   explicit tool list, and plug in its own per-call approval policy (for example, a risk-based
   confirmation gate) — everything still runs through flux's safety envelope.
 
+- **Embedded turns can stream.** An application can now watch a turn unfold live — the assistant's
+  text, its plan, and each tool call and result as they happen — either by handing in its own
+  listener or by consuming a turn as an event stream, and it can cancel a turn mid-flight without
+  corrupting the conversation.
+
 ### Improved
 
 - **A clearer guide to embedding flows.** The public SDK documentation now shows which entry point

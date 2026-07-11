@@ -48,6 +48,26 @@ All notable changes to this project are documented in this file. The format is b
   which also gains `storage()` (durable `once`/`checkpoint` state). `flux-spec` is promoted to a
   real `flux-sdk` dependency (implementing `Tool::spec`/`Approver::request` needs it).
 
+- **D-144 + D-145: streaming turns — bring-your-own-sink and an owned-event stream** (sdk-surface
+  wave 1). `Session::send_with(input, &mut dyn AgentSink, &CancellationToken)` streams a turn's
+  deltas, tool calls, **and tool results** (the old private `Collector` dropped tool results) to a
+  consumer sink while still returning the collected `TurnOutput`; `Session::stream(input)` returns
+  a `TurnStream` — a `futures::Stream` of owned `AgentEvent`s (a `#[non_exhaustive]` enum mirroring
+  `AgentSink` 1:1) with `next`/`cancel`/`finish`. Both drive `FlowEngine::run_turn_cancellable`, so
+  a cancelled turn drops the in-flight op and persists exactly one assistant message (the session
+  stays a valid `user → assistant` alternation). New `flux-sdk` module `events.rs` (`TeeSink` +
+  `ChannelSink`); `AgentSink` and `CancellationToken` re-exported at the crate root; `futures` and
+  `flux-evidence` promoted to real dependencies.
+- **D-146: re-export sweep — one import for the whole SDK surface** (sdk-surface wave 1). Every
+  type that appears in a public `flux-sdk` signature now resolves under `flux_sdk::`, grouped into
+  `flux_sdk::tools` (`Tool`, `tool_fn`, `FnTool`, `ToolContext`, `ToolResult`, `ToolRegistry`,
+  `ToolSpec`, `Risk`), `flux_sdk::approval` (`Approver`, `ApprovalChoice`, `RiskApprover`,
+  `IntentSet`), and `flux_sdk::observe` (`Message`, `Observation`, `ToolGroup`, `EventStore`,
+  `FlowStore`), plus root re-exports (`Provider`, `AgentSpec`, `Permissions`, `Usage`). A consumer
+  writing a custom tool or approval policy no longer adds a direct `flux-runtime`/`flux-spec`
+  dependency — proven by the new `custom_tool` example, which uses only `flux_sdk::` paths and is
+  compiled by the gate. New wave-1 examples: `session_resume`, `streaming`, `custom_tool`.
+
 ### Changed
 
 - **D-141: public flow-surface documentation.** The SDK website now maps the single self-hosted
