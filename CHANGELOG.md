@@ -37,6 +37,19 @@ All notable changes to this project are documented in this file. The format is b
   deterministic runtime owns effects. Added standalone vector/raster mark assets and documented the
   production brand system.
 
+### Fixed
+
+- **OAuth token-refresh failures no longer surface as a cryptic decode crash.** A failed
+  `codex`/`claude` token refresh (e.g. an expired refresh token) returns an OAuth *error* body, and
+  OpenAI (codex) wraps it in a **nested** envelope (`{"error":{"message":…,"type":…}}`). The old
+  `parse_token_resp` decoded *every* response into the success-shaped `TokenResp` (whose `error` is
+  `Option<String>`), so a nested envelope died with `auth error: decode refresh response (status 401
+  Unauthorized): invalid type: map, expected a string` — hiding the real reason. Non-2xx bodies are
+  now read leniently (`refreshed_from_body` + `oauth_error_detail`, tolerant of both the RFC-6749
+  flat form and the nested envelope) and surfaced as the actual reason plus an actionable
+  `Re-authenticate with \`flux auth login <provider>\`` hint for refresh failures. Regression tests
+  cover the nested envelope, the flat form, a non-JSON body, and the success path.
+
 ## [0.14.9] - 2026-07-11
 
 ### Added

@@ -351,6 +351,7 @@ pub fn import_codex() -> Option<OAuthToken> {
 
 /// The result of a refresh: a new access token + (possibly rotated) refresh token + expiry.
 /// `id_token` is only present on codex responses; its claims carry the ChatGPT account id.
+#[derive(Debug)]
 struct Refreshed {
     access: String,
     refresh: Option<String>,
@@ -424,7 +425,7 @@ impl Refresher for AnthropicRefresher {
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
-        parse_token_resp(resp).await
+        parse_token_resp(resp, Some("claude")).await
     }
 }
 
@@ -446,16 +447,76 @@ impl Refresher for CodexRefresher {
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
-        parse_token_resp(resp).await
+        parse_token_resp(resp, Some("codex")).await
     }
 }
 
-async fn parse_token_resp(resp: reqwest::Response) -> Result<Refreshed> {
+async fn parse_token_resp(
+    resp: reqwest::Response,
+    relogin_hint: Option<&str>,
+) -> Result<Refreshed> {
     let status = resp.status();
     let body = resp.text().await.map_err(|e| Error::Http(e.to_string()))?;
-    let parsed: TokenResp = serde_json::from_str(&body)
+    refreshed_from_body(status.as_u16(), &body, relogin_hint)
+}
+
+/// Turn a token-grant HTTP response (status + body) into a [`Refreshed`], or an actionable auth
+/// error. Pure and testable.
+///
+/// A **failed** grant does not return the success shape: the provider replies with an OAuth error,
+/// and OpenAI (codex) wraps it in a NESTED envelope (`{"error":{"message":…,"type":…}}`) rather than
+/// the RFC-6749 flat form (`{"error":"invalid_grant",…}`). The old code decoded *every* response into
+/// the success struct [`TokenResp`], whose `error` is `Option<String>` — so a nested envelope died
+/// with `invalid type: map, expected a string`, masking the real reason (usually an expired refresh
+/// token). Non-2xx bodies are now read leniently and surfaced as the reason, plus (for a token
+/// *refresh*, where the fix is to re-authenticate) a `flux auth login <relogin_hint>` hint.
+fn refreshed_from_body(status: u16, body: &str, relogin_hint: Option<&str>) -> Result<Refreshed> {
+    if !(200..300).contains(&status) {
+        let hint = relogin_hint
+            .map(|p| format!(" Re-authenticate with `flux auth login {p}`."))
+            .unwrap_or_default();
+        return Err(Error::Auth(format!(
+            "token grant failed (status {status}): {}.{hint}",
+            oauth_error_detail(body)
+        )));
+    }
+    let parsed: TokenResp = serde_json::from_str(body)
         .map_err(|e| Error::Auth(format!("decode refresh response (status {status}): {e}")))?;
     parsed.into_refreshed()
+}
+
+/// Extract a human-readable reason from a failed OAuth token-grant body, tolerant of both shapes:
+/// the RFC-6749 flat form (`{"error":"invalid_grant","error_description":"…"}`) and OpenAI's nested
+/// envelope (`{"error":{"message":"…","type":"…"}}`). Falls back to a truncated raw body.
+fn oauth_error_detail(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => match v.get("error") {
+            Some(serde_json::Value::String(code)) => {
+                match v.get("error_description").and_then(|d| d.as_str()) {
+                    Some(desc) if !desc.is_empty() => format!("{code}: {desc}"),
+                    _ => code.clone(),
+                }
+            }
+            Some(serde_json::Value::Object(obj)) => obj
+                .get("message")
+                .or_else(|| obj.get("type"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| truncate_body(body)),
+            _ => truncate_body(body),
+        },
+        Err(_) => truncate_body(body),
+    }
+}
+
+/// A trimmed, length-bounded view of a raw response body for error messages (char-safe).
+fn truncate_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() > 300 {
+        format!("{}…", trimmed.chars().take(300).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +535,7 @@ pub async fn oauth_token_grant(token_url: &str, params: &[(&str, &str)]) -> Resu
         .send()
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
-    let r = parse_token_resp(resp).await?;
+    let r = parse_token_resp(resp, None).await?;
     Ok(OAuthToken {
         access: r.access,
         refresh: r.refresh,
@@ -1172,7 +1233,7 @@ pub async fn anthropic_exchange_and_store(code: &str, state: &str, verifier: &st
         .send()
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
-    let refreshed = parse_token_resp(resp).await?;
+    let refreshed = parse_token_resp(resp, None).await?;
     save_stored(
         "claude",
         &OAuthToken {
@@ -1267,7 +1328,7 @@ pub async fn codex_exchange_and_store_at(
         .send()
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
-    let refreshed = parse_token_resp(resp).await?;
+    let refreshed = parse_token_resp(resp, None).await?;
     // The ChatGPT backend rejects requests without `chatgpt-account-id`; pull it from the
     // id token's claims, exactly as the import path does.
     let account_id = refreshed
@@ -1405,6 +1466,53 @@ mod tests {
         let token = format!("h.{payload}.s");
         assert_eq!(jwt_expiry_ms(&token), Some(2_000_000_000 * 1000));
         assert_eq!(jwt_expiry_ms("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn nested_oauth_error_envelope_yields_actionable_error_not_a_decode_crash() {
+        // OpenAI (codex) returns a NESTED error envelope on a failed refresh. The old code decoded
+        // it into the string-typed `TokenResp.error` and died with the cryptic
+        // `invalid type: map, expected a string`, hiding the real reason (an expired refresh token).
+        let body =
+            r#"{"error":{"message":"refresh token is expired","type":"invalid_request_error"}}"#;
+        let err = refreshed_from_body(401, body, Some("codex")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refresh token is expired"),
+            "surfaces the real reason: {msg}"
+        );
+        assert!(
+            msg.contains("flux auth login codex"),
+            "gives an actionable re-login hint: {msg}"
+        );
+        assert!(
+            !msg.contains("invalid type: map"),
+            "no raw serde decode crash leaks through: {msg}"
+        );
+    }
+
+    #[test]
+    fn flat_rfc6749_error_form_is_surfaced_with_description() {
+        let body = r#"{"error":"invalid_grant","error_description":"token has expired"}"#;
+        let err = refreshed_from_body(401, body, Some("claude")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid_grant"), "{msg}");
+        assert!(msg.contains("token has expired"), "{msg}");
+        assert!(msg.contains("flux auth login claude"), "{msg}");
+    }
+
+    #[test]
+    fn non_json_error_body_falls_back_to_raw_text() {
+        let err = refreshed_from_body(502, "upstream unavailable", Some("codex")).unwrap_err();
+        assert!(err.to_string().contains("upstream unavailable"), "{err}");
+    }
+
+    #[test]
+    fn successful_refresh_body_still_decodes() {
+        let body = r#"{"access_token":"at_abc123","expires_in":3600}"#;
+        let refreshed = refreshed_from_body(200, body, Some("codex")).unwrap();
+        assert_eq!(refreshed.access, "at_abc123");
+        assert!(refreshed.expires_at_ms.is_some());
     }
 
     #[test]
