@@ -1,16 +1,18 @@
 ---
 title: SDK overview
-description: "Entry point for embedding flux in Rust, including loops, providers, tooling, and safety expectations."
+description: "Choose the right Rust surface for conversational agents, authored flows, language tooling, and advanced flow hosts."
 ---
 
-# Embedding flux: the Rust SDK
+# Embedding flux in Rust
 
-`flux-sdk` embeds the same policy-gated agent engine used by the CLI. You provide a model provider
-and a workspace root; the SDK wires the agent loop, built-in tools, safety envelope, and session
-storage.
+`flux-sdk` embeds the same policy-gated flow engine used by the CLI. You provide a model provider
+and a workspace root; the SDK wires the Flux-Lang agent loop, built-in operations, safety envelope,
+and session storage.
 
-Use the SDK when you want flux behavior inside your own Rust application instead of shelling out to
-the `flux` binary.
+There is only one agent turn engine. `Client`, the CLI, sub-agents, and served agents all assemble
+`flux_flow::engine::FlowEngine`, whose turn loop is itself the editable
+[`agent-loop.flux`](../agent/agent-loop.md). `FlowClient` is the other view of the same architecture:
+it exposes an individual flow's lifecycle directly instead of driving a conversation.
 
 ## Install
 
@@ -21,37 +23,46 @@ short `flux-*` package names are owned by unrelated projects):
 cargo add codewandler-flux-sdk codewandler-flux-providers
 ```
 
-Package names are prefixed, but Rust import paths stay short: `use flux_sdk::…` and
-`use flux_providers::…`. `flux-sdk` is provider-agnostic and has no cargo features of its own. The
-concrete backends live in `flux-providers` (Anthropic, OpenAI, OpenRouter, Ollama, AWS Bedrock, and
-the claude/codex subscription providers; the full-duplex voice provider sits behind its `realtime`
-feature).
+Package names are prefixed, but Rust imports stay short: `use flux_sdk::...` and
+`use flux_providers::...`. The SDK is provider-neutral; concrete Anthropic, OpenAI, OpenRouter,
+Ollama, Bedrock, and subscription-backed providers live in `flux-providers`.
 
-## The three front doors
+## Choose a surface
 
-| Surface | What it is |
-|---|---|
-| `Client` | The classic agent loop: run a turn, let the model plan and call tools under the envelope. |
-| `FlowClient` | The Flux-Lang lifecycle: `compile` an instruction into a typed AST, `analyze` it, `execute` it. |
-| `dsl` | Author the AST **in Rust** — builder primitives that compile to the Flux-Lang AST, then run via `FlowClient`. |
+| Need | Use | Why |
+|---|---|---|
+| Run conversational agent turns | `flux_sdk::Client` | The complete self-hosted Flux-Lang agent loop, session, tools, and envelope behind one `run` call. |
+| Compile or run one flow explicitly | `flux_sdk::FlowClient` | Direct control over parse/compile, analysis, optimization, seeded inputs, and execution. This is the recommended AI-app flow API. |
+| Build a flow in Rust | `flux_sdk::dsl` | Typed builder ergonomics that produce the same `DraftAst`; execute it with `FlowClient`. |
+| Build language tooling or a custom host | `flux_lang` | The standalone AST, parser/formatter, analyzer, optimizer, schema, DSL, program declarations, and reference-interpreter traits. |
+| Own engine/session internals | `flux_flow` | Advanced `FlowEngine`, guarded runtime adapters, durable store, replay, suspension, and voice-driver integration. |
 
-### `Client` — a conversational turn
+For shell and deployment surfaces, use [`flux flow run`](../language/tooling.md) for an already
+authored flow, [`flux run`](../agent/cli.md) for an agent turn, and
+[`flux app run`](../agent/programs.md) for an event-driven multi-agent program.
+
+### `Client`: conversational turns
 
 ```rust
 let provider = Box::new(flux_providers::anthropic::anthropic_from_env()?);
 let client = flux_sdk::Client::builder()
     .model("anthropic/opus")
     .build(provider, ".")?;
+
 let out = client.run("Summarize the README").await?;
 println!("{}", out.text); // TurnOutput: text, tool_calls, usage
 ```
 
-The builder carries the policy: `allow`/`deny` permission rules (reads are pre-allowed,
-everything else denies by default — there is no approval UI in a library), `auto_approve(true)`
-for headless use, plus `system_prompt`, `max_tokens`, `max_iterations`, and `add_context` for
-inline knowledge blocks.
+`Client` does not wrap a legacy or provider-native tool loop. Each turn runs the same
+`FlowEngine` as the CLI: the model emits Flux-Lang plans, the engine dispatches their operations,
+and `agent-loop.flux` decides when to gather, revise, or answer.
 
-### `FlowClient` — the Flux-Lang lifecycle
+The builder carries `allow`/`deny` permission rules, `auto_approve(true)` for trusted headless use,
+an optional system prompt and context blocks, model/token/iteration limits, and the OS-sandbox
+posture. Because a library has no approval UI, reads are pre-allowed and other gated operations deny
+by default unless you provide a broader policy.
+
+### `FlowClient`: one flow's lifecycle
 
 ```rust
 let client = flux_sdk::FlowClient::builder()
@@ -59,113 +70,99 @@ let client = flux_sdk::FlowClient::builder()
     .auto_approve(true)
     .build(provider, ".")?; // provider: Arc<dyn flux_provider::Provider>
 
-let ast = client.compile("read the doc and show it", None).await?; // NL → typed AST
-client.analyze(&ast).map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
-let out = client.execute(&ast).await?; // ExecutionResult: result, transcript, steps, tool_calls
+let ast = client.compile("read the doc and show it", None).await?;
+client
+    .analyze(&ast)
+    .map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
+let out = client.execute(&ast).await?;
 ```
 
-`parse` is the deterministic (no model round-trip) partner of `compile` for stored flow text,
-and `run` is the one-call `compile → analyze → execute` pipeline. See
-[FlowClient](./flow-client.md) for the full lifecycle, including seeded inputs.
+Use `parse` instead of `compile` for stored Flux-Lang text when no model call should occur. Use
+`run` for the one-call natural-language pipeline, or `run_flow` for deterministic stored text plus
+inputs. The full registration, policy, optimization, result, and suspension contract is in the
+[`FlowClient` guide](./flow-client.md).
 
-### `dsl` — build flows in Rust
-
-Loops (`each`/`repeat`/`loop_for`/`race`) and the control-flow guards
-(`match`/`route`/`fallback`/`timeout`/`budget`) are first-class builder primitives:
+### `dsl`: author the AST in Rust
 
 ```rust
-use flux_sdk::{FlowClient, dsl::*};
+use flux_sdk::{dsl::*, FlowClient};
 use serde_json::json;
 
-// each $f in ["a.txt", "b.txt"] -> $contents: read $f ; return $contents
 let flow = Flow::named("read_each")
     .body(|b| {
         b.each("f", lit(json!(["a.txt", "b.txt"])), |e| {
             e.collect("contents");
-            e.body(|b| { b.call("read", [var("f")]); });
+            e.body(|b| {
+                b.call("read", [var("f")]);
+            });
         });
         b.ret(var("contents"));
     })
     .build();
 
-client.analyze(&flow).map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
+client
+    .analyze(&flow)
+    .map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
 let out = client.execute(&flow).await?;
 ```
 
-The DSL is a *construction* convenience, not a type-checker — always `analyze` a built flow
-before you `execute` it.
+The DSL is a construction convenience, not a second language or a type-checker. It produces the
+same `flux_lang::ast::DraftAst` as text parsing or model compilation; always analyze it against the
+actual operation catalog before execution.
 
-## Zero-key testing with a mock provider
+## The lower-level libraries
 
-`Provider` is a small trait (a name and a `stream` method), so tests and examples can run the
-real engine and envelope hermetically — no API key, no network:
+Most applications should stay on `Client` or `FlowClient`. Drop below the SDK only when you need to
+replace a host boundary rather than configure it:
 
-```rust
-struct OneShotMock { chunks: Mutex<Option<Vec<Chunk>>> }
+- **`codewandler-flux-lang` / `flux_lang`** is the provider- and tool-independent language library.
+  Its reference interpreter runs only through injected `OpHost`, `ValueStore`, and `FlowSink`
+  traits. Use it for parsers, editors, validators, schemas, custom catalogs, or a non-flux host.
+- **`codewandler-flux-flow` / `flux_flow`** adapts the language to a provider, the real tool
+  registry, `Executor::dispatch`, event/value stores, and agent sinks. Use `FlowEngine` when the host
+  must own cancellable turns, reviewed-plan execution, cross-turn `await` sessions,
+  [replay](../agent/time-machine.md), or [flow-driven voice](../agent/realtime.md).
 
-#[async_trait]
-impl Provider for OneShotMock {
-    fn name(&self) -> &str { "mock" }
-    async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-        let chunks = self.chunks.lock().unwrap().take().unwrap_or_default();
-        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
-    }
-}
-```
+Direct `flux-lang` interpretation does not silently inherit flux's concrete safety envelope: the
+embedder supplies the host traits. `FlowClient`, `Client`, and `FlowEngine` already wire operation
+calls through the envelope and are therefore the safer starting points for effectful applications.
 
-Every SDK example ships this way and runs with no API key:
+## Zero-key testing
+
+`Provider` is a small trait, so tests and examples can drive the real engine and envelope with a
+hermetic provider and no API key. The repository ships runnable examples:
 
 ```sh
-cargo run -p codewandler-flux-sdk --example client_basic   # the classic agent loop
-cargo run -p codewandler-flux-sdk --example flow_compile   # NL → AST → execute
-cargo run -p codewandler-flux-sdk --example dsl_loops      # loops/control-flow via the DSL
+cargo run -p codewandler-flux-sdk --example client_basic
+cargo run -p codewandler-flux-sdk --example flow_compile
+cargo run -p codewandler-flux-sdk --example dsl_loops
 ```
 
-`crates/flux-sdk/examples/client_basic.rs` is the full mock-provider turn;
-`crates/flux-sdk/examples/dsl_loops.rs` executes a real `each` loop through the envelope against
-a temp workspace.
+`client_basic` exercises the self-hosted agent loop; `flow_compile` covers natural language to AST
+to execution; `dsl_loops` executes a Rust-authored `each` loop against a temporary workspace.
 
-## Recipes — a cookbook of prebuilt flows
+## Recipes
 
-`flux_sdk::recipes` is a cookbook of reusable, parameterized flow builders on top of the DSL —
-hand any of them to a `FlowClient` to `analyze` + `execute`:
+`flux_sdk::recipes` is a cookbook of parameterized DSL builders that can be analyzed and executed
+by any `FlowClient`:
 
-| Module | Recipe(s) |
+| Module | Recipes |
 |---|---|
-| `recipes::routing` | `route_intent` — classify once, then dispatch deterministically |
-| `recipes::lookup` | `answer_with_fallback` — graceful degradation into a typed `Answer` |
-| `recipes::batch` | `map_each`, `repeat_until`, `poll_for`, `race_first` — the loop family |
+| `recipes::routing` | `route_intent` |
+| `recipes::lookup` | `answer_with_fallback` |
+| `recipes::batch` | `map_each`, `repeat_until`, `poll_for`, `race_first` |
 | `recipes::resilience` | `retry_with_backoff`, `with_timeout`, `with_budget`, `try_catch` |
-| `recipes::fanout` | `parallel_all` — run ops concurrently |
-| `recipes::dispatch` | `match_value` — dispatch on a computed value |
-| `recipes::compose` | `resilient_call` — `retry { timeout { fallback {…} } }`, nested |
+| `recipes::fanout` | `parallel_all` |
+| `recipes::dispatch` | `match_value` |
+| `recipes::compose` | `resilient_call` |
 
-```rust
-use flux_sdk::recipes::routing::route_intent;
-use flux_sdk::dsl::lit;
-
-let flow = route_intent(
-    "intent.classify",
-    lit("I'd like to book a flight"),
-    &[("book", "booking.create")],
-    "support.ticket",
-);
-// client.analyze(&flow)?; client.execute(&flow).await?;
-```
-
-The same cookbook is exposed on the CLI as `flux preset` — `flux preset list` shows it,
-`flux preset help retry_with_backoff` describes one, and `--run` executes a filled preset.
-
-## Where to go next
-
-- The crate README in-repo: [`crates/flux-sdk/README.md`](https://github.com/codewandler/flux/blob/main/crates/flux-sdk/README.md)
-- Runnable examples: [`crates/flux-sdk/examples/`](https://github.com/codewandler/flux/tree/main/crates/flux-sdk/examples)
-- [FlowClient](./flow-client.md) — the `compile → analyze → execute` lifecycle in detail
-- [Safety & approvals](../agent/safety.md) — the envelope applies identically when embedded
-- [Flux-Lang overview](../language/overview.md) — the plan language your flows compile to
+The CLI exposes the same cookbook through `flux preset list`, `flux preset help`, and
+`flux preset ... --run`.
 
 ## Related docs
 
-- [FlowClient](./flow-client.md) — deterministic Flux-Lang lifecycle control.
-- [CLI](../agent/cli.md) — the binary surface backed by the same engine.
-- [Safety & approvals](../agent/safety.md) — the runtime envelope embedded applications inherit.
+- [`FlowClient`](./flow-client.md) — the direct lifecycle and extension surface.
+- [The agent loop](../agent/agent-loop.md) — how `Client` and the CLI orient, gather, execute, and revise.
+- [Flux-Lang overview](../language/overview.md) — the language all of these surfaces share.
+- [Safety and approvals](../agent/safety.md) — the envelope embedded applications inherit.
+- [Multi-agent programs](../agent/programs.md) — event-triggered applications whose journeys are flows.

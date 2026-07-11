@@ -6,7 +6,7 @@
 //! spawner, executor, and tool context. Roles are registered **in memory** (no shared `.flux/agents`
 //! dir), the model is mocked, so it runs offline.
 //!
-//! Run with: `cargo run -p flux-sdk --example sub_agent`
+//! Run with: `cargo run -p codewandler-flux-sdk --example sub_agent`
 
 use std::sync::Arc;
 

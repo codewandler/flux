@@ -1,10 +1,12 @@
 //! The Flux-Lang **lifecycle surface** — the SDK front door for "the LLM plans, the runtime runs".
 //!
-//! Where [`crate::Client`] wraps the classic agent loop, [`FlowClient`] exposes the Flux-Lang
-//! lifecycle directly: `compile` an instruction into a typed execution graph, `analyze` it against
-//! the op catalog, and `execute` it through the real safety envelope. None of that machinery is
-//! reimplemented here — every method delegates to `flux-flow` (the engine) and `flux-lang` (the
-//! language), so the envelope, store, and analyzer are reused, not forked.
+//! Where [`crate::Client`] runs a conversational turn through the self-hosted Flux-Lang
+//! [`FlowEngine`](flux_flow::engine::FlowEngine), [`FlowClient`] exposes one flow's lifecycle
+//! directly: parse or `compile` an instruction into a typed execution graph, `analyze` it against
+//! the op catalog, optionally `optimize` it, and `execute` it through the real safety envelope.
+//! None of that machinery is reimplemented here — every method delegates to `flux-flow` (the
+//! engine) and `flux-lang` (the language), so the envelope, store, and analyzer are reused, not
+//! forked.
 //!
 //! The wiring that earns its keep is [`assemble_registry`]: it takes the pure built-ins
 //! (`flux_tools::register_builtins`) **and** the provider-backed [`CognitionPack`] and registers
@@ -18,7 +20,7 @@
 //! paths: `examples/flow_compile.rs` (NL→AST) and `examples/dsl_loops.rs` (Rust DSL).
 //!
 //! ```ignore
-//! // Runnable hermetic version: `cargo run -p flux-sdk --example flow_compile`.
+//! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example flow_compile`.
 //! # async fn ex() -> flux_core::Result<()> {
 //! use std::sync::Arc;
 //! use flux_sdk::flow::FlowClient;

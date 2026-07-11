@@ -2,7 +2,7 @@
 //! runtime runs the flux-lang agent loop), the safety envelope, and a session. Here a hermetic mock
 //! provider answers in prose (no plan) so the example runs with no API key.
 //!
-//! Run with: `cargo run -p flux-sdk --example client_basic`
+//! Run with: `cargo run -p codewandler-flux-sdk --example client_basic`
 
 use std::sync::Mutex;
 

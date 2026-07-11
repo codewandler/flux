@@ -6,11 +6,13 @@
 //!
 //! There are three front doors: [`Client`] (an agentic turn — the model plans, the runtime runs the
 //! flux-lang agent loop — returning a [`TurnOutput`]), [`FlowClient`] (the Flux-Lang
-//! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust). Both
-//! `Client` and `FlowClient` run on the same engine ([`flux_flow::engine::FlowEngine`]). Each door
-//! has a runnable, no-API-key example: `examples/client_basic.rs`, `examples/flow_compile.rs`, and
-//! `examples/dsl_loops.rs` respectively. On top of the DSL, [`recipes`] is a cookbook of reusable,
-//! parameterized flow builders (routing, lookup, the loop family, resilience).
+//! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust).
+//! `Client` assembles [`flux_flow::engine::FlowEngine`]; `FlowClient` delegates directly to the same
+//! `flux-flow` compiler, runtime adapter, store, and safety envelope for one-flow execution. Each
+//! door has a runnable, no-API-key example: `examples/client_basic.rs`,
+//! `examples/flow_compile.rs`, and `examples/dsl_loops.rs` respectively. On top of the DSL,
+//! [`recipes`] is a cookbook of reusable, parameterized flow builders (routing, lookup, the loop
+//! family, resilience).
 //!
 //! ```ignore
 //! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example client_basic`.

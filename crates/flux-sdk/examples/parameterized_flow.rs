@@ -7,7 +7,7 @@
 //! behaviour, driven by validated per-call settings. The adapter op is mocked, so it runs with no API
 //! key and never touches the network.
 //!
-//! Run with: `cargo run -p flux-sdk --example parameterized_flow`
+//! Run with: `cargo run -p codewandler-flux-sdk --example parameterized_flow`
 
 use std::sync::Arc;
 

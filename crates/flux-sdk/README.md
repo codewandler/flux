@@ -6,6 +6,8 @@ root; the SDK wires the agent loop, the built-in tools, the safety envelope, and
 
 The guiding idea is **"the LLM is not the runtime"**: the model emits a Flux-Lang plan (an execution
 graph), and a deterministic engine runs it through a non-bypassable safety envelope.
+There is one turn engine: `Client`, the CLI, sub-agents, and served agents all assemble
+`flux_flow::engine::FlowEngine`, whose loop is itself a Flux-Lang program.
 
 ## Install
 
@@ -22,15 +24,15 @@ but the **import paths are unprefixed** — the crate `codewandler-flux-sdk` is 
 
 | Surface | What it is | Example |
 |---|---|---|
-| [`Client`] | The classic agent loop: stream a turn, let the model call tools under the envelope. | `examples/client_basic.rs` |
-| [`FlowClient`] | The Flux-Lang lifecycle: `compile` an instruction into a typed AST, `analyze` it, `execute` it. | `examples/flow_compile.rs` |
+| [`Client`] | A conversational turn through the self-hosted Flux-Lang agent loop and safety envelope. | `examples/client_basic.rs` |
+| [`FlowClient`] | The direct Flux-Lang lifecycle: parse/compile, analyze, optimize, seed, and execute. | `examples/flow_compile.rs` |
 | [`dsl`] | Author the AST **in Rust** — builder primitives (loops + control-flow) that compile to the Flux-Lang AST, then run via `FlowClient`. | `examples/dsl_loops.rs` |
 
 All three examples are hermetic (a mock provider) and run with no API key:
 
 ```sh
 cargo run -p codewandler-flux-sdk --example dsl_loops      # build loops/control-flow with the DSL, execute them
-cargo run -p codewandler-flux-sdk --example client_basic   # the classic agent loop
+cargo run -p codewandler-flux-sdk --example client_basic   # the self-hosted Flux-Lang agent loop
 cargo run -p codewandler-flux-sdk --example flow_compile   # NL → AST → execute
 ```
 
@@ -80,7 +82,7 @@ The DSL is a **construction** convenience, not a type-checker: semantic validity
 top-level `await`, `match` subjects, op resolution) stays the analyzer's job — always `analyze` a built
 flow before you `execute` it.
 
-## Quick start — the classic agent
+## Quick start — a conversational agent
 
 ```rust,ignore
 use flux_sdk::Client;
@@ -91,6 +93,31 @@ let out = client.run("Summarize the README").await?;
 println!("{}", out.text);
 # Ok(()) }
 ```
+
+`Client` runs the same `FlowEngine` as the CLI. The model emits typed plans (or prose), and the
+editable `agent-loop.flux` controls gather, execute, revise, and completion passes; there is no
+separate provider-native tool loop.
+
+## Direct-flow lifecycle and lower-level crates
+
+`FlowClient` is the recommended AI-application API when the application owns a flow. It exposes
+natural-language `compile`, deterministic `parse`/`parse_module`, `analyze`/`analyze_seeded`,
+`optimize`, `execute`/`execute_with`, `execute_optimized`, and the `run`/`run_flow` convenience
+pipelines. Its builder carries permission, approval, sandbox, and compiler-budget controls; the
+client can register custom operations, packs, composite ops, artifact definitions, and sub-agents.
+
+Use the lower-level published libraries only when you need to replace a host boundary:
+
+- `codewandler-flux-lang` (`flux_lang`) owns the standalone AST, parser/formatter, analyzer,
+  optimizer, schema, DSL, program declarations, and the reference interpreter over injected
+  `OpHost`/`ValueStore`/`FlowSink` traits.
+- `codewandler-flux-flow` (`flux_flow`) adapts the language onto providers, the guarded executor,
+  event/value stores, replay, suspension, and voice. Its `FlowEngine` is the advanced embedding
+  surface for cancellable or durable conversational turns and flow-driven sessions.
+
+The [public SDK guide](https://codewandler.github.io/flux/docs/sdk/overview) maps these choices, and
+the [FlowClient guide](https://codewandler.github.io/flux/docs/sdk/flow-client) documents the full
+lifecycle, one-shot `await` boundary, result type, and voice split.
 
 ## Recipes
 
@@ -129,8 +156,6 @@ live in `flux-providers` (modules `anthropic`/`openai`/`openrouter`/`ollama`) so
 
 MIT OR Apache-2.0.
 
-<!-- The crates are not on crates.io yet, so these link into the repo (docs.rs pages don't exist).
-     Swap back to docs.rs links once the publish closure ships (see PUBLISHING.md). -->
 [`Client`]: src/lib.rs
 [`FlowClient`]: src/flow.rs
 [`dsl`]: ../flux-lang/src/dsl.rs

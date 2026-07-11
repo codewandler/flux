@@ -1,49 +1,207 @@
 ---
 title: FlowClient
-description: "Lifecycle details for deterministic flow execution: parse/compile/analyze/execute with optional seeded inputs."
+description: "Build, extend, analyze, optimize, and execute Flux-Lang flows through the SDK safety envelope."
 ---
 
 # FlowClient
 
-`FlowClient` is the SDK surface for the Flux-Lang lifecycle. Use it when you already have a flow, or
-when your application wants explicit control over compile, parse, analyze, and execute steps.
+`FlowClient` is the recommended SDK surface when your application owns a flow. It exposes the
+Flux-Lang lifecycle directly while reusing `flux-flow`'s compiler, analyzer, runtime adapter, value
+store, operation registry, and safety envelope.
 
-For the SDK as a whole — install, `Client`, mock providers, recipes, and the Rust DSL — start at the
-[SDK overview](./overview.md).
+Use the conversational [`Client`](./overview.md#client-conversational-turns) when you want the full
+self-hosted agent loop to gather context and revise plans across a turn. Use `FlowClient` when you
+already have a flow, want to compile one instruction, or need explicit lifecycle control.
 
-## Typical lifecycle
+## Lifecycle at a glance
+
+| Starting point | Validate | Execute | Model calls before execution |
+|---|---|---|---|
+| Natural-language instruction | `compile` then `analyze` | `execute`, or `run` for all three | Yes: compilation |
+| Flux-Lang text | `parse` then `analyze` | `execute`, or `run_flow` with inputs | No, unless the authored flow calls a model op |
+| Rust DSL / existing `DraftAst` | `analyze` | `execute` | No, unless the AST calls a model op |
+| Seeded `DraftAst` | `analyze_seeded` | `execute_with` | No, unless the AST calls a model op |
+| Read-parallelized AST | `optimize` | `execute_optimized` | No, unless the AST calls a model op |
+
+The `run` and `run_flow` convenience pipelines abort on parse/compile/analysis failure before
+execution. When invoking the stages separately, call `analyze` (or `analyze_seeded`) yourself before
+`execute`; the direct execute methods assume the supplied AST is ready. Once execution begins, every
+effectful `call` still passes through `Executor::dispatch`, and parsing or seeding data never grants
+a capability.
+
+## Build the client and its policy
 
 ```rust
-let client = FlowClient::builder()
+let client = flux_sdk::FlowClient::builder()
     .model("anthropic/opus")
-    .auto_approve(true)
+    .allow("read")
+    .allow("grep")
+    .deny("Bash(rm:*)")
+    .auto_approve(false)
     .build(provider, ".")?; // provider: Arc<dyn flux_provider::Provider>
-
-let ast = client.parse(source)?;            // deterministic text → AST (no model call);
-                                            // client.compile(text, None).await? is the NL→AST partner
-client.analyze(&ast)                        // Err carries Vec<Diagnostic>: unknown ops, unbound $vars
-    .map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
-let out = client.execute(&ast).await?;      // ExecutionResult: result, transcript, steps, tool_calls
 ```
 
-`run(text)` is the one-call convenience pipeline (`compile → analyze → execute`); a failed analysis
-aborts before any side effect.
+The builder assembles the built-in operations and provider-backed cognition operations into one
+registry, creates a guarded workspace rooted at the supplied path, and uses an in-memory flow store.
+Its controls are:
 
-For per-node effect/risk annotation — which call in a flow moves money, writes, deletes —
-`flux_lang::analyze::annotate_effects(&ast, &ops)` (0.15.0) is the analysis sibling: it returns an
-`EffectAnnotation` (`{effects, risk, idempotency}`) per `call` node, keyed by the node paths
-diagnostics already use. See [Types & effects](../language/types-and-effects.md#effects).
+- `model` selects the planner and cognition-op model.
+- `allow` and `deny` add permission rules; deny rules take precedence.
+- `auto_approve(true)` installs a headless allow-all approver. The default is deny when a call needs
+  approval because a library has no prompt UI.
+- `approver` installs your own per-operation `Approver` and overrides `auto_approve`.
+- `with_sandbox` pins an explicit OS-sandbox posture. Without it, the builder resolves the posture
+  from the `FLUX_SANDBOX*` environment settings.
+- `compile_options` changes the natural-language compiler's attempt, step, and token budgets.
+- `without_prelude` starts with an empty artifact-definition map instead of the standard
+  `Claim`/`Evidence`/`Ctx`/`Answer` family.
 
-Inputs can be seeded as flow variables for stored flows: `execute_with(&ast, inputs)` injects them
-before the run, and `analyze_seeded(&ast, names)` analyzes the flow as it will actually run under that
-seeding. Seeding data does not grant capabilities; operation dispatch still uses the same policy and
-approval path.
+`auto_approve(true)` should be reserved for trusted, pre-authored work. It does not bypass the
+dispatcher or guarded IO, but it removes the human approval stop for calls that policy permits.
 
-Use the agent-facing `Client` when you want a complete conversational turn. Use `FlowClient` when you
-already have a flow or want deterministic lifecycle control.
+## Extend the operation and type surface
+
+A new client exposes `registry`, `op_names`, and `prelude_defs` for inspection. Mutating registration
+methods return `&mut Self`, so a host can assemble its domain before compiling or analyzing flows:
+
+- `register_op` adds one `Arc<dyn Tool>`.
+- `register_pack` installs a group of tools into the registry.
+- `with_sub_agents` registers `task` and attaches a `SubAgents` spawner. If the bundle has no
+  wall-clock limit, the SDK supplies a ten-minute default.
+- `register_composites` installs Flux-Lang `CompositeOpDecl`s so flows can call them like ordinary
+  operations. `parse_module` is the deterministic loader for modules that declare these ops.
+- `register_prelude` merges additional artifact `$defs` into the client's definition map for
+  inspection and downstream catalog enrichment.
+
+All registered tools still execute through the same permission, approval, redaction, and guarded-IO
+path. A composite operation is a nested flow; its inner calls do not inherit authority from the
+wrapper.
+
+## Compile or parse
+
+```rust
+// Model-backed natural language -> DraftAst, with bounded parse/analyze repair.
+let compiled = client
+    .compile("read README.md and return its heading", None)
+    .await?;
+
+// Deterministic Flux-Lang text -> the same DraftAst, with no provider call.
+let parsed = client.parse(
+    r#"flow heading
+  $doc = read("README.md")
+  return $doc"#,
+)?;
+```
+
+`compile(text, view)` can receive a `SessionView` so the planner may refer to existing symbols.
+`parse(text)` is total and returns an error for malformed source rather than panicking.
+`parse_module(text)` also recognizes module-level flows, composite operations, and multi-agent
+program declarations. Treat the AST returned by `compile` as a draft and run `analyze` against the
+client's final registry before calling `execute`.
+
+`run(text)` is the natural-language convenience pipeline:
+
+```text
+compile -> analyze -> execute
+```
+
+It is not the conversational agent loop: it compiles and executes one flow once.
+
+## Analyze effects and optimize
+
+Always analyze text, compiled ASTs, or DSL output against the client's final registry:
+
+```rust
+client
+    .analyze(&ast)
+    .map_err(|diagnostics| flux_core::Error::Other(format!("{diagnostics:?}")))?;
+```
+
+`analyze` reports unknown operations, wrong arguments/types, invalid control-flow placement, and
+unbound symbols before effects begin. Flow parameters count as bound. When a host injects values
+that were not declared as parameters, call `analyze_seeded(&ast, input_names)` instead.
+
+For approval UIs and visual editors, the lower-level
+`flux_lang::analyze::annotate_effects(&ast, &ops)` returns each call's effects, risk, and
+idempotency keyed by its diagnostic node path. See [Types and effects](../language/types-and-effects.md#effects).
+
+`optimize` performs analysis/lowering and returns a `PhysicalPlan` that groups independent
+read-only top-level work into parallel stages while fencing unknown or effectful work.
+`optimize_seeded` accepts the same prebound-name contract as `analyze_seeded`.
+`execute_optimized` optimizes and runs in one call. Optimization never grants permission: every
+operation in every stage still dispatches independently through the envelope.
+
+## Execute stored flows with inputs
+
+`execute(&ast)` uses the client's in-memory store, so symbols produced by one call remain available
+to later calls on that client. `execute_with(&ast, inputs)` instead creates a fresh store for that
+invocation, seeds its `$name` values, and discards that per-run state afterward. This keeps repeated
+runs with different inputs isolated.
+
+```rust
+use serde_json::{json, Map};
+
+let mut inputs = Map::new();
+inputs.insert("path".into(), json!("README.md"));
+
+client
+    .analyze_seeded(&ast, inputs.keys().cloned())
+    .map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
+let out = client.execute_with(&ast, inputs).await?;
+```
+
+Seeding is data injection only. It cannot register an operation, widen a permission rule, or skip
+approval. A flow-local binding may shadow a seed; an unseeded reference fails; unused extra inputs
+are ignored.
+
+`run_flow(source, inputs)` is the stored-flow convenience:
+
+```text
+parse -> analyze -> execute_with
+```
+
+Declare reusable inputs in the flow header so plain analysis recognizes them. The command-line
+equivalent is [`flux flow run --inputs/--arg`](../language/tooling.md#flux-flow-list--run--discover-and-execute-saved-flows).
+
+## Read the result
+
+Every execution method returns `ExecutionResult`:
+
+| Field or helper | Meaning |
+|---|---|
+| `result` | The explicit `return`, or the last node's rendered value. |
+| `transcript` | The labeled model-facing views produced during execution. |
+| `steps` | Number of dispatched operations. |
+| `tool_calls` | Operation names in dispatch order. |
+| `parse::<T>()` | Deserialize `result` into an application type. |
+| `answer()` | Deserialize the standard prelude `Answer` artifact. |
+
+Typed prelude artifacts such as `Answer`, `Claim`, `Evidence`, `Patch`, `TestResult`, and `Verdict`
+are re-exported from `flux_sdk::flow`.
+
+## Session, suspension, and voice boundaries
+
+`FlowClient` is deliberately a one-flow façade, not a durable conversation host:
+
+- Its store is in memory. Use `FlowEngine` with a durable `FlowStore` when values, run traces, and
+  suspensions must survive process exit.
+- `execute`, `execute_with`, and `run_flow` do not resume a top-level `await`. If execution suspends,
+  they return an explicit error after reporting that the one-shot SDK path has no resume hook.
+  Drive authored conversations through `FlowEngine::start_flow_turn`; later `run_turn` calls resume
+  the stored suspension. See [Flow-driven sessions](../language/durability.md#flow-driven-sessions--await-as-the-conversation).
+- `run_voice_session` is the model-driven realtime façade: it advertises the client's registered
+  tools once and dispatches voice-model tool calls through the same executor. For a flow-driven
+  call, use `VoiceSessionDriver::run_flow_turns` with `EngineVoiceHandler`, which owns a
+  `FlowEngine`. See [Realtime voice](../agent/realtime.md).
+
+For cancellable conversational turns, reviewed-plan execution, hermetic replay, forks, durable
+sessions, or flow-driven voice, drop to `flux_flow::engine::FlowEngine` rather than rebuilding those
+seams around `FlowClient`.
 
 ## Related docs
 
-- [SDK overview](./overview.md) — provider setup and the higher-level `Client`.
-- [Tooling](../language/tooling.md) — CLI equivalents for flow execution.
-- [Safety and approvals](../agent/safety.md) — policy and approval behavior during SDK dispatch.
+- [SDK overview](./overview.md) — choose between `Client`, `FlowClient`, the DSL, and lower-level crates.
+- [Flux-Lang execution model](../language/execution-model.md) — analyzer, optimizer, values, and dispatch semantics.
+- [Saved flows and custom operations](../agent/saved-flows.md) — reusable project/global flows and composites.
+- [Time Machine](../agent/time-machine.md) — replay, fork, diff, and resumable stored flows.
+- [Safety and approvals](../agent/safety.md) — permission and approval behavior during dispatch.

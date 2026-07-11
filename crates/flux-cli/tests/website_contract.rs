@@ -3,7 +3,7 @@
 //! The node/prelude tables and customer changelog have their own generated-block test in
 //! `flux-lang`. This suite covers the remaining cross-crate surfaces that are easy to let drift:
 //! CLI command names, registered operations, config examples, plugin-pack membership, SDK package
-//! names, and complete Flux-Lang snippets.
+//! names/lifecycle surfaces, and complete Flux-Lang snippets.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -221,6 +221,77 @@ fn plugin_and_sdk_docs_track_the_shipped_surfaces() {
     assert!(!sdk.contains("not published to crates.io"));
     assert!(!sdk.contains("tag = \"v0.6.0\""));
     assert!(!sdk.contains("cargo run -p flux-sdk"));
+}
+
+#[test]
+fn sdk_docs_map_the_shared_engine_and_flowclient_lifecycle() {
+    let overview = read("website/docs/sdk/overview.md");
+    for surface in [
+        "`flux_sdk::Client`",
+        "`flux_sdk::FlowClient`",
+        "`flux_sdk::dsl`",
+        "`flux_lang`",
+        "`flux_flow`",
+        "`flux_flow::engine::FlowEngine`",
+    ] {
+        assert!(
+            overview.contains(surface),
+            "website SDK overview omits the `{surface}` surface"
+        );
+    }
+    assert!(overview.contains("There is only one agent turn engine"));
+    assert!(!overview.contains("classic agent loop"));
+
+    let flow = read("website/docs/sdk/flow-client.md");
+    for method in [
+        "model",
+        "allow",
+        "deny",
+        "auto_approve",
+        "approver",
+        "with_sandbox",
+        "compile_options",
+        "without_prelude",
+        "register_op",
+        "register_pack",
+        "with_sub_agents",
+        "register_composites",
+        "register_prelude",
+        "compile",
+        "parse",
+        "parse_module",
+        "analyze",
+        "analyze_seeded",
+        "optimize",
+        "optimize_seeded",
+        "execute",
+        "execute_with",
+        "execute_optimized",
+        "run",
+        "run_flow",
+        "run_voice_session",
+    ] {
+        assert!(
+            flow.contains(&format!("`{method}`")),
+            "website FlowClient guide omits `{method}`"
+        );
+    }
+    for boundary in [
+        "`ExecutionResult`",
+        "`FlowEngine::start_flow_turn`",
+        "`VoiceSessionDriver::run_flow_turns`",
+        "`EngineVoiceHandler`",
+    ] {
+        assert!(
+            flow.contains(boundary),
+            "website FlowClient guide omits the {boundary} boundary"
+        );
+    }
+    assert!(flow.contains("one-flow façade, not a durable conversation host"));
+
+    let crate_readme = read("crates/flux-sdk/README.md");
+    assert!(crate_readme.contains("There is one turn engine"));
+    assert!(!crate_readme.contains("classic agent loop"));
 }
 
 /// Every occurrence of the "not OS-sandboxed" disclaimer must be immediately qualified "by

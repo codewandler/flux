@@ -4,7 +4,7 @@
 //!
 //! All adapters are mocked — registered stub ops — so it runs with no API key.
 //!
-//! Run with: `cargo run -p flux-sdk --example faq_lookup`
+//! Run with: `cargo run -p codewandler-flux-sdk --example faq_lookup`
 
 use std::sync::Arc;
 

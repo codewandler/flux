@@ -1,8 +1,8 @@
 //! Author a Flux-Lang flow in Rust with the embedded DSL, then run it through the `FlowClient`
-//! lifecycle — no model, no API key. The DSL is the third front door (alongside the classic agent
+//! lifecycle — no model, no API key. The DSL is the third front door (alongside the conversational
 //! `Client` and `FlowClient::compile`'s NL→AST): you build the AST directly, the engine runs it.
 //!
-//! Run with: `cargo run -p flux-sdk --example dsl_loops`
+//! Run with: `cargo run -p codewandler-flux-sdk --example dsl_loops`
 //!
 //! It demonstrates two things:
 //!   1. A *loop* that actually executes — `each $f in $files: read $f` — dispatched through the real

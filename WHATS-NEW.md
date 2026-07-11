@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **A clearer guide to embedding flows.** The public SDK documentation now shows which entry point
+  to use for a conversational agent, a stored or model-compiled flow, Rust-authored flow builders,
+  custom language tooling, and advanced durable/replay/voice hosts. The full direct-flow lifecycle,
+  policy controls, extension points, result shape, and suspension boundary are documented together.
+
 ## [0.15.1] - 2026-07-11
 
 ## [0.15.0] - 2026-07-11

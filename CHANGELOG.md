@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **D-141: public flow-surface documentation.** The SDK website now maps the single self-hosted
+  `FlowEngine` through `Client`, `FlowClient`, the Rust DSL, the standalone `flux-lang` library, and
+  the advanced `flux-flow` host. The expanded `FlowClient` guide covers builder policy, extension
+  points, parse/compile/analyze/optimize/execute variants, seeded isolation, `ExecutionResult`, and
+  the one-shot suspension/voice boundaries. Crate README/rustdoc copy is synchronized, and the
+  website contract pins the surface map and lifecycle method families against drift.
+
 ## [0.15.1] - 2026-07-11
 
 ### Changed

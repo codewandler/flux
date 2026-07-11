@@ -3,7 +3,7 @@
 //! fenced AST instead of calling a real model, so the example runs with no API key — the same
 //! `compile → analyze → execute` lifecycle the DSL feeds into at the `analyze` step.
 //!
-//! Run with: `cargo run -p flux-sdk --example flow_compile`
+//! Run with: `cargo run -p codewandler-flux-sdk --example flow_compile`
 
 use std::sync::Arc;
 

@@ -6,7 +6,7 @@
 //! `route` is the *bounded non-determinism* primitive: the (mock) model picks **which** declared branch
 //! runs, never **what** it does.
 //!
-//! Run with: `cargo run -p flux-sdk --example intent_routing`
+//! Run with: `cargo run -p codewandler-flux-sdk --example intent_routing`
 
 use std::sync::Arc;
 
