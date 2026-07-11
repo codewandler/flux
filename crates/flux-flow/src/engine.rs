@@ -32,9 +32,11 @@ use crate::compile::{compile_turn, Brief, CompileOptions, Phase, TurnOutput, GAT
 use crate::composites::DynamicComposites;
 use crate::registry::OpRegistry;
 use crate::runtime::{
-    execute_flow_resumable_with_composites, execute_flow_traced, resume_flow_with_composites,
+    execute_flow_resumable_with_composites, execute_flow_traced, execute_flow_with_composites,
+    resume_flow_with_composites,
 };
 use crate::state::FlowStore;
+use flux_lang::runtime::FlowOutcome;
 
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
 /// (conversation + run trace + turn telemetry), and flux-flow's own value/symbol/suspension store.
@@ -142,7 +144,14 @@ impl FlowEngine {
         // The loop machinery is the engine's own control flow (call the model, run its plan, record
         // evidence), not a user action — pre-allow it so a turn never prompts to approve `plan`/
         // `run_plan`/`observe`. The inner ops a plan runs still gate individually.
-        executor.allow(&["plan", "run_plan", "observe", "evidence", "metrics"]);
+        executor.allow(&[
+            "plan",
+            "run_plan",
+            "ai_segment",
+            "observe",
+            "evidence",
+            "metrics",
+        ]);
         composites.validate_base(executor.registry())?;
         let agent_loop = load_agent_loop_with_iterations(&cwd, max_iterations)?;
         Ok(FlowEngine {
@@ -1072,6 +1081,148 @@ impl FlowEngine {
         }
     }
 
+    /// Start an authored flow as the session's conversation driver (D-131). Executes the flow
+    /// **fresh** to its first top-level `await`, persists the suspension so every later `run_turn`
+    /// routes through the existing suspension-first branch (`resume_suspended`), and surfaces the
+    /// flow's own **authored prompt** (its last emitted view) as the assistant turn — no planner is
+    /// invoked for this deterministic skeleton. A flow that completes without any `await` surfaces
+    /// its result as a single completed turn.
+    ///
+    /// Turn 1 is flow-authored, not user-authored: the flow speaks first, so no user message is
+    /// recorded (the session log opens with the authored prompt). Runs over the shared
+    /// `Arc<Executor>`, so the authorization → approval → guarded-IO envelope applies exactly as on
+    /// the planner path — a `RiskApprover` gates a flow-driven op identically to a planned one.
+    pub async fn start_flow_turn(
+        &self,
+        session_id: &str,
+        flow: &DraftAst,
+        sink: &mut dyn AgentSink,
+    ) -> Result<()> {
+        // Open a first-class turn. The flow speaks first (no user utterance), so the turn's
+        // attribution label is the flow's name — or a generic marker for an anonymous flow.
+        let label = flow.name.as_deref().unwrap_or("(flow start)");
+        let turn_id = self
+            .events
+            .begin_turn(
+                session_id,
+                label,
+                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
+            )
+            .unwrap_or(-1);
+        // Fresh turn boundary for the deterministic read cache (L-54), as in `run_turn`.
+        self.executor.begin_cache_turn();
+        // A fresh flow drive bypasses the planner/loop host exactly like a resume: the only billable
+        // spend is `task` sub-agents in the flow body. Snapshot the count so only THIS turn's fold in
+        // (`record_resume_usage` reads observations since this base — the same helper resume uses).
+        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
+
+        // Arm the reflexive loop host so a top-level `ai_segment` in the flow can delegate a bounded
+        // run of model turns (D-131 Phase B). No user utterance drives this turn, so skills match
+        // against an empty input. For a flow with no `ai_segment` this is harmless overhead — the
+        // authored prompt is still surfaced explicitly below (Phase A unchanged).
+        let base_system = self.base_system_with_skills("", sink);
+        let advertised = self.surfaced_for_turn(sink);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(tx),
+        ));
+        self.loop_host.set_turn(
+            session_id.to_string(),
+            Some(base_system),
+            channel.clone(),
+            Some(advertised),
+            Some((self.events.clone(), turn_id)),
+        );
+        self.executor.context().set_session(session_id);
+
+        self.composites
+            .ensure_session_loaded(&self.flow, session_id)?;
+        let composites = self.composites.active_for_session(session_id);
+
+        // Run the authored flow through an OWNED channel sink, draining its events onto the borrowed
+        // `sink` LIVE — so an `ai_segment`'s inner plan/run_plan/leaf ops stream as they happen (the
+        // machinery ops are filtered by `drain_event`). Mirrors `run_turn_cancellable`'s plumbing.
+        let mut outer = crate::loop_host::SharedSink::new(channel.clone());
+        let reveal = show_loop();
+        let result = {
+            let flow_fut = execute_flow_with_composites(
+                &self.flow,
+                &self.executor,
+                session_id,
+                flow,
+                &composites,
+                &mut outer,
+            );
+            tokio::pin!(flow_fut);
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = rx.recv() => { if let Some(ev) = maybe { drain_event(ev, sink, reveal); } }
+                    res = &mut flow_fut => {
+                        while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
+                        break res;
+                    }
+                }
+            }
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = format!("The flow failed to start — {e}");
+                sink.text_delta(&msg);
+                let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
+                let _ = self
+                    .events
+                    .end_turn(session_id, turn_id, "error", 0, &msg, usage.clone());
+                return self.finish_turn(session_id, turn_id, sink, &msg, true, usage);
+            }
+        };
+
+        // Suspended on the first top-level `await`: persist the resume point (the flow name rides
+        // along so a NAMED flow's resume derives the same checkpoint `flow_key`, L-21) and surface
+        // the flow's authored prompt. Every subsequent `run_turn` now routes through the existing
+        // suspension-first branch — no second parking mechanism (invariant 3).
+        if let Some(susp) = &outcome.suspension {
+            self.flow.save_suspension(
+                session_id,
+                flow.name.as_deref(),
+                &flow.body,
+                susp.node,
+                &susp.source,
+            )?;
+            let prompt = suspension_prompt(&outcome);
+            sink.text_delta(&prompt);
+            let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
+            let _ = self.events.end_turn(
+                session_id,
+                turn_id,
+                "suspended",
+                outcome.steps as u32,
+                &prompt,
+                usage.clone(),
+            );
+            return self.finish_turn(session_id, turn_id, sink, &prompt, false, usage);
+        }
+
+        // Completed with no `await`: the flow's own output is the answer.
+        let answer = if !outcome.result.trim().is_empty() {
+            outcome.result.trim().to_string()
+        } else {
+            format!("Flow completed ({} step(s)).", outcome.steps)
+        };
+        sink.text_delta(&answer);
+        let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
+        let _ = self.events.end_turn(
+            session_id,
+            turn_id,
+            "completed",
+            outcome.steps as u32,
+            &answer,
+            usage.clone(),
+        );
+        self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
+    }
+
     /// Resume a flow suspended on a top-level `await`, with this turn's message as the awaited input.
     /// Continues from the next statement (the prefix and its side effects are not re-run); the flow may
     /// suspend again on a later `await` (persist + wait) or complete (surface its result). Bypasses the
@@ -1108,30 +1259,65 @@ impl FlowEngine {
             .unwrap_or(-1);
         // Sub-agent spend during the resume (a `task` op in the resumed body) rides the shared
         // evidence log as `subagent.usage` observations, exactly as in `run_turn` — snapshot the
-        // count so only THIS resume's sub-agents fold in. The resume bypasses the planner/loop host,
-        // so there are no planner `CallUsage` rows to gather here (and the loop host's per-turn
-        // tallies belong to a prior turn — never read them on this path).
+        // count so only THIS resume's sub-agents fold in. The resumed body may also invoke the
+        // planner via a top-level `ai_segment` (D-131 Phase B), whose spend rides the loop host's
+        // per-turn tally, reset by the `set_turn` below.
         let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
 
         let input = flux_lang::ast::Value::String(user_input.to_string());
+
+        // Arm the reflexive loop host so a top-level `ai_segment` AFTER the resumed `await` can
+        // delegate a bounded run of model turns (D-131 Phase B). Skills match the reply text; a
+        // resume with no segment pays only harmless overhead.
+        let base_system = self.base_system_with_skills(user_input, sink);
+        let advertised = self.surfaced_for_turn(sink);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(tx),
+        ));
+        self.loop_host.set_turn(
+            session_id.to_string(),
+            Some(base_system),
+            channel.clone(),
+            Some(advertised),
+            Some((self.events.clone(), turn_id)),
+        );
+        self.executor.context().set_session(session_id);
+
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
         let composites = self.composites.active_for_session(session_id);
-        // The persisted flow name rides along so a NAMED flow's resumed run derives the same
-        // checkpoint `flow_key` (name + body hash) its original run recorded under (L-21).
-        let outcome = match resume_flow_with_composites(
-            &self.flow,
-            &self.executor,
-            session_id,
-            flow_name.as_deref(),
-            &body,
-            node,
-            input,
-            &composites,
-            sink,
-        )
-        .await
-        {
+
+        // Run the resumed continuation through an owned channel sink, draining onto the borrowed
+        // `sink` live (a segment's inner ops stream as they happen). The persisted flow name rides
+        // along so a NAMED flow's resumed run derives the same checkpoint `flow_key` (L-21).
+        let mut outer = crate::loop_host::SharedSink::new(channel.clone());
+        let reveal = show_loop();
+        let result = {
+            let flow_fut = resume_flow_with_composites(
+                &self.flow,
+                &self.executor,
+                session_id,
+                flow_name.as_deref(),
+                &body,
+                node,
+                input,
+                &composites,
+                &mut outer,
+            );
+            tokio::pin!(flow_fut);
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe = rx.recv() => { if let Some(ev) = maybe { drain_event(ev, sink, reveal); } }
+                    res = &mut flow_fut => {
+                        while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
+                        break res;
+                    }
+                }
+            }
+        };
+        let outcome = match result {
             Ok(o) => o,
             Err(e) => {
                 let msg = format!("The resumed flow failed — {e}");
@@ -1154,18 +1340,20 @@ impl FlowEngine {
                 susp.node,
                 &susp.source,
             )?;
-            let hint = "(awaiting your input — reply to continue the flow)";
-            sink.text_delta(hint);
+            // D-131: surface the flow's own authored prompt (its last emitted view) rather than the
+            // fixed hint — the hint remains only as the empty-emit fallback (`suspension_prompt`).
+            let prompt = suspension_prompt(&outcome);
+            sink.text_delta(&prompt);
             let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
             let _ = self.events.end_turn(
                 session_id,
                 turn_id,
                 "suspended",
                 outcome.steps as u32,
-                hint,
+                &prompt,
                 usage.clone(),
             );
-            return self.finish_turn(session_id, turn_id, sink, hint, false, usage);
+            return self.finish_turn(session_id, turn_id, sink, &prompt, false, usage);
         }
 
         // Completed: the flow's own output is the answer (a model-grounded summary is a later refinement).
@@ -1187,10 +1375,13 @@ impl FlowEngine {
         self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
     }
 
-    /// Record this resumed turn's sub-agent spend and return the turn total (C-26). A resume bypasses
-    /// the planner, so the only spend is from `task` ops in the resumed body — folded from the
-    /// `subagent.usage` observations recorded since `base`, one `CallUsage` per sub-agent (attributed
-    /// to the child's model). `None` when nothing billed, mirroring [`Self::turn_usage`].
+    /// Record a flow-driven turn's spend and return the turn total (C-26). Used by both
+    /// [`Self::start_flow_turn`] and [`Self::resume_suspended`]; both now arm (and reset) the loop
+    /// host before running, so this folds BOTH the loop host's planner calls — non-zero only when a
+    /// top-level `ai_segment` delegated to the model this turn (D-131) — AND the `task` sub-agent
+    /// spend recorded since `subagent_base`, emitting one `CallUsage` per call and returning the
+    /// turn aggregate. `None` when nothing billed, mirroring [`Self::turn_usage`]. Identical
+    /// accounting to `run_turn_cancellable`'s turn-end (`record_call_usage_events` + `turn_usage`).
     fn record_resume_usage(
         &self,
         session_id: &str,
@@ -1198,20 +1389,8 @@ impl FlowEngine {
         subagent_base: usize,
     ) -> Option<Usage> {
         let subagent_calls = self.subagent_calls_since(subagent_base);
-        let mut total = Usage::default();
-        for (model, call) in &subagent_calls {
-            if call.total() > 0 {
-                let _ = self
-                    .events
-                    .record_call_usage(session_id, turn_id, model, call.clone());
-            }
-            total.output_tokens += call.output_tokens;
-            total.input_tokens += call.input_tokens;
-            total.cache_creation_input_tokens += call.cache_creation_input_tokens;
-            total.cache_read_input_tokens += call.cache_read_input_tokens;
-            total.reasoning_tokens += call.reasoning_tokens;
-        }
-        (total.total() > 0).then_some(total)
+        self.record_call_usage_events(session_id, turn_id, &subagent_calls);
+        self.turn_usage(&subagent_calls)
     }
 
     /// If the session has grown past `compact_threshold_chars`, summarize everything but the most
@@ -1529,7 +1708,13 @@ fn load_agent_loop_with_iterations(
 /// tool-call/result events are filtered out of the user-facing sink so the surface shows the actual
 /// operations (`read`/`edit`/`bash`/…) the inner `run_plan` performs, not the plumbing.
 const MACHINERY_OPS: &[&str] = &[
-    "plan", "run_plan", "observe", "evidence", "metrics", "grade",
+    "plan",
+    "run_plan",
+    "ai_segment",
+    "observe",
+    "evidence",
+    "metrics",
+    "grade",
 ];
 
 /// Whether an op is internal agent-loop machinery rather than user-requested work. Surfaces use
@@ -1601,6 +1786,19 @@ pub fn planner_error(e: &flux_core::Error) -> String {
     }
 }
 
+/// The text to surface when a flow-driven session suspends on a top-level `await` (D-131): the
+/// flow's own last-emitted view (`outcome.result`) — its **authored prompt** — falling back to the
+/// generic hint only when the author emitted nothing before the `await`. Shared by the fresh
+/// [`FlowEngine::start_flow_turn`] and the resume path so both surface the same authored text.
+fn suspension_prompt(outcome: &FlowOutcome) -> String {
+    let prompt = outcome.result.trim();
+    if prompt.is_empty() {
+        "(awaiting your input — reply to continue the flow)".to_string()
+    } else {
+        prompt.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1639,6 +1837,87 @@ mod tests {
                 .pop_front()
                 .unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A provider that counts `stream()` calls — for asserting the deterministic flow-driven path
+    /// (D-131 `start_flow_turn` + resume) makes ZERO planner invocations (invariant 1). If it were
+    /// ever called, the counter trips the assertion; the returned prose keeps a stray call from
+    /// failing the turn in a confusing way.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = prose("(unexpected planner call)");
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A counting provider whose every `plan` round emits a plan that binds `$slots` to a non-empty
+    /// value — for the `ai_segment` `until` early-exit test (D-131 Phase B): the predicate should end
+    /// the segment after the FIRST round even though `max_rounds` is larger.
+    struct BindSlotsProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for BindSlotsProvider {
+        fn name(&self) -> &str {
+            "bind-slots"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = emit_plan(json!({
+                "body": [{
+                    "kind": "bind",
+                    "name": "slots",
+                    "value": { "kind": "call", "op": "echo",
+                               "args": [{ "kind": "lit", "value": "filled" }] }
+                }]
+            }));
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// Build an authored `$_ = ai_segment({goal, tools, max_rounds, until?})` call node (D-131). A lone
+    /// object argument is the op's named input map (runtime `call_named_input`).
+    fn ai_segment_call(
+        goal: &str,
+        tools: &[&str],
+        max_rounds: u32,
+        until: Option<&str>,
+    ) -> flux_lang::ast::Node {
+        use flux_lang::ast::Node;
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "goal".to_string(),
+            Box::new(Node::Lit { value: json!(goal) }),
+        );
+        fields.insert(
+            "tools".to_string(),
+            Box::new(Node::Lit {
+                value: json!(tools),
+            }),
+        );
+        fields.insert(
+            "max_rounds".to_string(),
+            Box::new(Node::Lit {
+                value: json!(max_rounds),
+            }),
+        );
+        if let Some(u) = until {
+            fields.insert("until".to_string(), Box::new(Node::Lit { value: json!(u) }));
+        }
+        Node::Call {
+            op: "ai_segment".into(),
+            args: vec![Node::Obj { fields }],
         }
     }
 
@@ -3258,6 +3537,323 @@ mod tests {
         assert!(
             scoped_obs > 0,
             "resume observations are turn-scoped, not unscoped under -1"
+        );
+    }
+
+    /// D-131 (invariant 1): an authored two-`await` flow driven turn-by-turn via `start_flow_turn`
+    /// surfaces the flow's OWN authored prompts and makes ZERO planner invocations — the
+    /// deterministic skeleton never calls the model. Turn 1 starts the flow fresh; each later reply
+    /// resumes the persisted suspension through the existing suspension-first branch.
+    #[tokio::test]
+    async fn start_flow_turn_drives_a_two_await_flow_with_zero_planner_calls() {
+        use flux_lang::ast::{DraftAst, Node};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = engine_with_provider(
+            Box::new(CountingProvider {
+                calls: calls.clone(),
+            }),
+            store.clone(),
+        );
+
+        // `echo` emits the authored prompt (its view becomes `outcome.result`); `await` parks for
+        // the reply.
+        let prompt = |t: &str| Node::Call {
+            op: "echo".into(),
+            args: vec![Node::Lit { value: json!(t) }],
+        };
+        let await_reply = |name: &str| Node::Await {
+            binding: Some(SymbolName(name.into())),
+            source: "user_input".into(),
+            as_type: None,
+        };
+        let flow = DraftAst {
+            body: vec![
+                prompt("What is your name?"),
+                await_reply("name"),
+                prompt("Nice to meet you. Favorite color?"),
+                await_reply("color"),
+                prompt("All done — thanks!"),
+            ],
+            ..Default::default()
+        };
+
+        // Turn 1: fresh start → first authored prompt, parked on await #1.
+        let mut s1 = CollectSink::default();
+        engine.start_flow_turn(&sid, &flow, &mut s1).await.unwrap();
+        assert!(
+            s1.text.contains("What is your name?"),
+            "turn 1 surfaces the first authored prompt: {:?}",
+            s1.text
+        );
+
+        // Turn 2: the reply resumes → second authored prompt, parked on await #2.
+        let mut s2 = CollectSink::default();
+        engine.run_turn(&sid, "Timo", &mut s2).await.unwrap();
+        assert!(
+            s2.text.contains("Favorite color?"),
+            "turn 2 surfaces the second authored prompt: {:?}",
+            s2.text
+        );
+
+        // Turn 3: the second reply resumes → the flow completes and surfaces its result.
+        let mut s3 = CollectSink::default();
+        engine.run_turn(&sid, "blue", &mut s3).await.unwrap();
+        assert!(
+            s3.text.contains("All done"),
+            "turn 3 surfaces the completion result: {:?}",
+            s3.text
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the deterministic flow-driven path must not invoke the planner"
+        );
+        let turns = store.turns(&sid).unwrap();
+        assert_eq!(turns.len(), 3, "each driven turn is a first-class turn");
+    }
+
+    /// D-131 (invariant 6): a flow that parks on `await` WITHOUT emitting any text first falls back
+    /// to the generic hint — the user always gets a usable prompt. (The non-empty authored-prompt
+    /// case is covered by `start_flow_turn_drives_a_two_await_flow_with_zero_planner_calls`.)
+    #[tokio::test]
+    async fn flow_driven_suspension_falls_back_to_hint_on_empty_authored_prompt() {
+        use flux_lang::ast::{DraftAst, Node};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let engine = engine_with(VecDeque::new(), store.clone());
+        let flow = DraftAst {
+            body: vec![Node::Await {
+                binding: Some(SymbolName("reply".into())),
+                source: "user_input".into(),
+                as_type: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        engine
+            .start_flow_turn(&sid, &flow, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            sink.text.contains("awaiting your input"),
+            "an await with no emitted prompt falls back to the hint: {:?}",
+            sink.text
+        );
+    }
+
+    /// D-131 (invariant 2): the safety envelope applies inside a flow-driven session exactly as on
+    /// the planner path — a blanket-deny `RiskApprover` refuses a destructive op the authored flow
+    /// dispatches, and the op never executes. `write_file` is left at `Ask` (empty allow rules) so
+    /// it reaches the approver, mirroring `fork_tail_keeps_the_envelope`.
+    #[tokio::test]
+    async fn flow_driven_session_applies_the_risk_approver() {
+        use flux_lang::ast::{DraftAst, Node};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+
+        let write_calls = Arc::new(Mutex::new(Vec::new()));
+        let dir =
+            std::env::temp_dir().join(format!("flux-flow-driven-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(WriteTool(write_calls.clone())));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&[], &[]),
+            Arc::new(flux_runtime::DenyApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        let flow_store = FlowStore::in_memory_with_events(store.clone()).unwrap();
+        let engine = FlowEngine::assemble(
+            Arc::from(Box::new(MockProvider {
+                responses: Mutex::new(VecDeque::new()),
+            }) as Box<dyn Provider>),
+            executor,
+            store.clone(),
+            flow_store,
+            "mock".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            dir,
+        )
+        .unwrap();
+
+        // An authored flow whose first op is a destructive write.
+        let flow = DraftAst {
+            body: vec![Node::Bind {
+                name: SymbolName("w".into()),
+                value: Box::new(Node::Call {
+                    op: "write_file".into(),
+                    args: vec![Node::Lit {
+                        value: json!("danger.txt"),
+                    }],
+                }),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        engine
+            .start_flow_turn(&sid, &flow, &mut sink)
+            .await
+            .unwrap();
+
+        assert!(
+            write_calls.lock().unwrap().is_empty(),
+            "the denied destructive op must not execute in a flow-driven session (surfaced: {:?})",
+            sink.text
+        );
+    }
+
+    /// D-131 Phase B (invariant 5): an `ai_segment` is BOUNDED — with `max_rounds: 1` against a mock
+    /// that never completes, the segment stops after exactly one delegated planner round and control
+    /// returns to the deterministic flow, whose next node runs and its result surfaces.
+    #[tokio::test]
+    async fn ai_segment_is_bounded_by_max_rounds_and_returns_control() {
+        use flux_lang::ast::{DraftAst, Node};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // FreshPlanProvider returns a fresh echo plan on every call and NEVER completes → only the
+        // `max_rounds` cap can end the segment.
+        let engine = engine_with_provider(
+            Box::new(FreshPlanProvider {
+                calls: calls.clone(),
+            }),
+            store.clone(),
+        );
+
+        let flow = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: SymbolName("seg".into()),
+                    value: Box::new(ai_segment_call("do the thing", &["echo"], 1, None)),
+                    ty: None,
+                    effect: None,
+                },
+                // A deterministic node AFTER the segment — its view proves control returned to the
+                // flow's own skeleton once the bounded delegation ended.
+                Node::Call {
+                    op: "echo".into(),
+                    args: vec![Node::Lit {
+                        value: json!("after the segment"),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        engine
+            .start_flow_turn(&sid, &flow, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "max_rounds:1 caps the segment at exactly ONE planner round"
+        );
+        assert!(
+            sink.text.contains("after the segment"),
+            "control returned to the flow's next deterministic node: {:?}",
+            sink.text
+        );
+    }
+
+    /// D-131 Phase B: the optional `until` predicate ends an `ai_segment` early — as soon as the
+    /// named symbol is bound to a non-empty value — well before `max_rounds`.
+    #[tokio::test]
+    async fn ai_segment_exits_early_when_until_symbol_is_bound() {
+        use flux_lang::ast::{DraftAst, Node};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Every round binds `$slots`; with until:"slots" the segment must exit after the FIRST round
+        // despite max_rounds:5.
+        let engine = engine_with_provider(
+            Box::new(BindSlotsProvider {
+                calls: calls.clone(),
+            }),
+            store.clone(),
+        );
+
+        let flow = DraftAst {
+            body: vec![Node::Bind {
+                name: SymbolName("seg".into()),
+                value: Box::new(ai_segment_call(
+                    "fill the slots",
+                    &["echo"],
+                    5,
+                    Some("slots"),
+                )),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        engine
+            .start_flow_turn(&sid, &flow, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the `until` predicate exits after ONE round, not max_rounds(5)"
+        );
+    }
+
+    /// D-131 Phase B (invariant 4): an `ai_segment` cannot call an op outside its capability scope —
+    /// a segment scoped to `[echo]` whose model keeps trying `write_file` never executes it.
+    #[tokio::test]
+    async fn ai_segment_cannot_call_an_op_outside_its_scope() {
+        use flux_lang::ast::{DraftAst, Node};
+        let store = Arc::new(EventStore::in_memory().unwrap());
+        let sid = store.create_session("mock").unwrap();
+        // The model keeps trying to write_file; scoped to [echo], every attempt is refused (advertised
+        // catalog + cap-scope floor), so the write never runs.
+        let write_plan = json!({
+            "body": [{ "kind": "bind", "name": "w",
+                "value": { "kind": "call", "op": "write_file",
+                           "args": [{ "kind": "lit", "value": "danger.txt" }] } }]
+        });
+        let responses = VecDeque::from(vec![
+            emit_plan(write_plan.clone()),
+            emit_plan(write_plan.clone()),
+            emit_plan(write_plan),
+        ]);
+        let (engine, write_calls) = engine_with_write_tool(responses, store.clone());
+
+        let flow = DraftAst {
+            body: vec![Node::Bind {
+                name: SymbolName("seg".into()),
+                value: Box::new(ai_segment_call("write the file", &["echo"], 2, None)),
+                ty: None,
+                effect: None,
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        // The segment may end by erroring (every round refused) — that is fine; the invariant is only
+        // that the out-of-scope op NEVER executed.
+        let _ = engine.start_flow_turn(&sid, &flow, &mut sink).await;
+
+        assert!(
+            write_calls.lock().unwrap().is_empty(),
+            "an op outside the segment's [echo] scope must never execute (surfaced: {:?})",
+            sink.text
         );
     }
 

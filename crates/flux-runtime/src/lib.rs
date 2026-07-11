@@ -165,6 +165,19 @@ pub trait LoopHost: Send + Sync {
     /// a caller can route on (e.g. the agent loop's `when $ran.failure`); never a missing key, since
     /// flux-lang's dotted field-access sugar errors on one.
     async fn run_plan(&self, plan: serde_json::Value) -> flux_core::Result<serde_json::Value>;
+
+    /// Hand a **bounded run of model turns** to the loop under a capability scope and an explicit
+    /// exit condition, then return control to the caller — the "deterministic skeleton with a
+    /// visibly-bounded non-deterministic segment" (D-131). `input` carries `goal` (the instruction
+    /// handed to the model), `tools` (the capability scope for the delegated leaf ops), `max_rounds`
+    /// (required cap), and an optional `until` (a symbol name — exit early once it is bound to a
+    /// non-empty value). Returns `{result}` (the segment's answer) as JSON. The default is an error:
+    /// a host without a real planner cannot delegate.
+    async fn ai_segment(&self, _input: serde_json::Value) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "ai_segment: this host does not provide a reflexive planner".into(),
+        ))
+    }
 }
 
 /// A request to register a Flux-Lang composite op into a host-managed catalog.

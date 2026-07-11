@@ -6,6 +6,29 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-131: Flow-driven session primitive — run an authored flow as the conversation driver.** New
+  public `FlowEngine::start_flow_turn(session_id, flow, sink)` executes an authored flow **fresh** to
+  its first top-level `await`, persists the suspension, and surfaces the flow's own **authored
+  prompt** (its last emitted view) as the assistant turn — no planner is invoked for the
+  deterministic skeleton (a two-`await` flow driven turn-by-turn makes zero provider calls). Every
+  later `run_turn` routes through the existing suspension-first branch, so resume is unchanged;
+  `resume_suspended` and `start_flow_turn` now surface `outcome.result` on suspension (the fixed
+  "awaiting your input" hint remains only as the empty-emit fallback) and the flow's result on
+  completion. The full authorization → approval → guarded-IO envelope applies inside a flow-driven
+  session exactly as on the planner path (a `RiskApprover` denies a flow-dispatched destructive op
+  identically). **Bounded model-segment delegation:** a new reflexive `ai_segment(goal, tools,
+  max_rounds, until?)` op (a third `LoopHost` method, routed like `plan`/`run_plan`) hands a bounded
+  run of model turns to the loop under a capability scope + explicit exit condition, then returns
+  control to the deterministic flow — "a deterministic skeleton with visibly-bounded
+  non-deterministic segments." The delegated leaf ops are confined to `tools` (dispatch-floor + a
+  restricted advertised catalog, so an out-of-scope op is refused and never runs); the run is capped
+  at the required `max_rounds`; and it exits early on natural completion or the optional `until`
+  symbol becoming bound to a non-empty value. Both flow-driven paths arm the reflexive loop host and
+  fold a segment's planner spend into the turn's usage/telemetry. Design:
+  `docs/designs/flow-driven-session.md`.
+
 ### Changed
 
 - **README identity and first-screen refresh.** Replaced the gradient orbit/lambda logo with a flat,

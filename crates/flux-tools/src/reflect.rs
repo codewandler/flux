@@ -26,6 +26,7 @@ use flux_spec::{
 pub fn register_reflect(registry: &mut ToolRegistry) {
     registry.register(Arc::new(PlanOp));
     registry.register(Arc::new(RunPlanOp));
+    registry.register(Arc::new(AiSegmentOp));
     registry.register(Arc::new(RegisterCompositeOp));
 }
 
@@ -98,6 +99,23 @@ struct PlanInput {
 struct RunPlanInput {
     /// the Plan emitted by `plan` (its `ast` is executed)
     plan: serde_json::Value,
+}
+
+/// Arguments for the `ai_segment` op (D-131).
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AiSegmentInput {
+    /// the instruction handed to the delegated model loop (the segment's goal)
+    goal: String,
+    /// the capability scope for the segment's leaf ops — the model can call nothing outside it
+    tools: Vec<String>,
+    /// the required cap on delegated model rounds (the segment is always bounded)
+    max_rounds: u32,
+    /// optional early-exit: the name of a symbol; the segment returns as soon as it is bound to a
+    /// non-empty value (e.g. `"slots"` to exit once `$slots` is complete)
+    #[serde(default)]
+    until: Option<String>,
 }
 
 /// Where a registered composite op is reusable.
@@ -218,6 +236,49 @@ impl Tool for RunPlanOp {
         let outcome = loop_host(ctx)?.run_plan(plan).await?;
         Ok(ToolResult::ok(
             serde_json::to_string(&outcome).unwrap_or_default(),
+        ))
+    }
+}
+
+/// `ai_segment(goal, tools, max_rounds, until?) -> {result}` — hand a BOUNDED run of model turns to
+/// the loop under a capability scope + explicit exit condition, then return control (D-131). The
+/// delegated leaf ops are confined to `tools`; the run is capped at `max_rounds` and exits early on
+/// natural completion or the optional `until` symbol becoming bound. Reflexive like `plan`/`run_plan`
+/// — it re-enters the same audited planner+interpreter behind the [`LoopHost`] seam.
+struct AiSegmentOp;
+
+#[async_trait]
+impl Tool for AiSegmentOp {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ai_segment".into(),
+            description: "Hand a bounded run of model turns to the loop under a capability scope and \
+                          an explicit exit condition, then return control to the flow. `tools` is the \
+                          scope the delegated model may call within; `max_rounds` caps the run; \
+                          optional `until` names a symbol that ends the segment early once bound. \
+                          Returns {result}. The model stays the planner; leaf ops run through the same \
+                          approval+IO envelope."
+                .into(),
+            input_schema: flux_spec::tool_input_schema::<AiSegmentInput>(),
+            output_schema: None,
+            // Like `plan`: the delegated planner calls travel the network; the inner leaf ops declare
+            // and gate their own effects at their own dispatch.
+            effects: vec![Effect::Network],
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Provider],
+            // Hidden from the model-facing catalog (see `plan`), reachable by pre-authored flows.
+            group: Some(flux_runtime::REFLECT_GROUP.into()),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        // Validate the shape, then forward the raw object to the host (which reads goal/tools/
+        // max_rounds/until directly and runs the bounded, cap-scoped delegation loop).
+        let _args: AiSegmentInput = crate::parse_params(params.clone(), "ai_segment")?;
+        let out = loop_host(ctx)?.ai_segment(params).await?;
+        Ok(ToolResult::ok(
+            serde_json::to_string(&out).unwrap_or_default(),
         ))
     }
 }

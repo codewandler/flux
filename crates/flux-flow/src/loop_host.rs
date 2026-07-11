@@ -468,6 +468,20 @@ struct LoopGuard {
     readonly_rounds: u32,
 }
 
+/// Whether a bound value counts as "non-empty" for the `ai_segment` `until` early-exit (D-131):
+/// null, the empty string, and empty lists/structs are still "not yet produced"; any other value
+/// (a filled struct/list, a bool, a number, a thing/ref) means the author's target state exists.
+fn value_is_nonempty(value: &crate::ast::Value) -> bool {
+    use crate::ast::Value;
+    match value {
+        Value::Null => false,
+        Value::String(s) => !s.is_empty(),
+        Value::List(items) => !items.is_empty(),
+        Value::Struct(fields) => !fields.is_empty(),
+        _ => true,
+    }
+}
+
 /// The engine-side reflexive host. Holds the stable machinery the two ops need that a `ToolContext`
 /// does not carry — the planner (provider + model), the shared store, a `Weak` back to the executor it
 /// re-enters — plus the per-turn [`TurnCtx`] (session + sink), updated each turn.
@@ -1318,9 +1332,133 @@ impl LoopHost for EngineLoopHost {
         }
         Ok(out)
     }
+
+    /// D-131: hand a **bounded** run of model turns to the loop under a capability scope + exit
+    /// condition, then return control. Confines the delegated leaf ops to `tools` (the dispatch
+    /// floor denies anything else) AND restricts the model's advertised catalog to `tools` (so it
+    /// never emits an out-of-scope op); caps the run at `max_rounds`; exits early on natural
+    /// completion or the optional `until` symbol becoming bound & non-empty. Re-enters `self.plan`/
+    /// `self.run_plan` directly (Rust calls, not op dispatch, so the loop machinery is never gated
+    /// by the scope). Returns `{result}`.
+    async fn ai_segment(&self, input: Value) -> Result<Value> {
+        let goal = input
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let tools: Vec<String> = input
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let max_rounds = input
+            .get("max_rounds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if max_rounds == 0 {
+            return Err(Error::Other(
+                "ai_segment: `max_rounds` must be a positive integer".into(),
+            ));
+        }
+        let until = input
+            .get("until")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let session_id = self.turn.lock().unwrap().session_id.clone();
+        let executor = self.executor()?;
+
+        // Confine the delegated leaf ops to `tools` (cap-scope floor) for the segment's lifetime,
+        // and restrict the model's advertised catalog to `tools` so it never even emits an
+        // out-of-scope op. The scope guard pops on drop; the advertised override is restored
+        // explicitly on EVERY exit path below (including a mid-segment planner error).
+        let _scope = executor.push_cap_scope(&tools);
+        let prev_advertised = self
+            .turn
+            .lock()
+            .unwrap()
+            .advertised
+            .replace(tools.iter().cloned().collect());
+
+        let rounds = self
+            .run_ai_segment(&session_id, &goal, max_rounds as u32, until.as_deref())
+            .await;
+
+        // Restore the outer turn's catalog whatever the rounds did, THEN propagate any error.
+        self.turn.lock().unwrap().advertised = prev_advertised;
+        let answer = rounds?;
+        Ok(serde_json::json!({ "result": answer }))
+    }
 }
 
 impl EngineLoopHost {
+    /// The bounded, cap-scoped delegation loop behind [`LoopHost::ai_segment`] (D-131). Runs up to
+    /// `max_rounds` planner rounds toward `goal`, feeding each round's transcript back; exits early on
+    /// natural completion (a `chat`/`error` plan), or — when `until` is set — the named symbol
+    /// becoming bound to a non-empty value. Returns the segment's answer. The caller
+    /// ([`LoopHost::ai_segment`]) owns the cap scope + advertised override and their restoration.
+    async fn run_ai_segment(
+        &self,
+        session_id: &str,
+        goal: &str,
+        max_rounds: u32,
+        until: Option<&str>,
+    ) -> Result<String> {
+        let mut answer = String::new();
+        // Round 1 seeds the goal; later rounds fold the goal + the accumulated work transcript, so
+        // the model keeps the objective in view across rounds — the segment has no persisted user
+        // message carrying it, unlike an ordinary turn.
+        let mut feedback = goal.to_string();
+        for _ in 0..max_rounds {
+            // Predicate early-exit: the named symbol is bound to a non-empty value.
+            if let Some(sym) = until {
+                if self.symbol_satisfied(session_id, sym) {
+                    break;
+                }
+            }
+            let plan = self
+                .plan(serde_json::json!({ "feedback": feedback, "phase": "execute" }))
+                .await?;
+            let kind = plan.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            // Natural completion: the model answered (or errored) in prose — the segment is done.
+            if kind == "chat" || kind == "error" {
+                answer = plan
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                break;
+            }
+            let outcome = self.run_plan(plan).await?;
+            let result = outcome.get("result").and_then(|v| v.as_str()).unwrap_or("");
+            if !result.trim().is_empty() {
+                answer = result.to_string();
+            }
+            let transcript = outcome
+                .get("transcript")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            feedback = format!("Goal: {goal}\n\n{transcript}");
+        }
+        Ok(answer)
+    }
+
+    /// Whether `name` is bound in `session_id` to a non-empty value — the `ai_segment` `until`
+    /// early-exit test (D-131). Uses `resolve` (boundness) + a non-emptiness check on the value, so
+    /// an unbound OR empty symbol reads "not yet satisfied" without the unbound-variable error a bare
+    /// `$var` predicate would raise (`runtime.rs`, `eval_arg`).
+    fn symbol_satisfied(&self, session_id: &str, name: &str) -> bool {
+        let sym = crate::ast::SymbolName(name.to_string());
+        matches!(
+            self.store.resolve(session_id, &sym),
+            Ok(Some(vid)) if matches!(self.store.get_value(&vid), Ok(Some(v)) if value_is_nonempty(&v))
+        )
+    }
+
     /// The persisted `user → assistant` conversation for `session_id`, maintained incrementally: the
     /// first call loads the full history, later calls fetch only the message/compacted events appended
     /// since (turn-boundary messages + compaction) and fold them into the cached vector — replacing the
