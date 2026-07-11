@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-11
+
 ### New
 
 - **Author a conversation as a flow.** A flow can now drive a session directly: it runs to its next
