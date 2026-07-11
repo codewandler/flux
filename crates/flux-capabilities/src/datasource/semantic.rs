@@ -18,7 +18,7 @@
 //! and opt-in are unit-tested in the default build with a stub embedder; the only feature-gated pieces are
 //! the concrete embedders (remote [`OpenAiEmbedder`](super::OpenAiEmbedder), local fastembed).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use flux_core::Result;
@@ -32,6 +32,11 @@ use super::{DatasourceBackend, Embedder, MemoryVectorStore, VectorStore};
 pub struct SemanticIndex {
     inner: Arc<dyn DatasourceBackend>,
     embedder: Arc<dyn Embedder>,
+    /// Per-source embedder overrides (story D-162). Empty = every source uses `embedder` (the prior,
+    /// single-global-embedder behavior). A source present here is embedded — and its scoped queries
+    /// embedded — with its own embedder, so a deployment can route different KBs to different
+    /// models/providers.
+    source_embedders: HashMap<String, Arc<dyn Embedder>>,
     vectors: Arc<dyn VectorStore>,
     /// `None` = every source is embedded; `Some(set)` = only these source keys (per-KB opt-in, D-51).
     semantic_sources: Option<HashSet<String>>,
@@ -45,6 +50,7 @@ impl SemanticIndex {
         Self {
             inner,
             embedder,
+            source_embedders: HashMap::new(),
             vectors: Arc::new(MemoryVectorStore::new()),
             semantic_sources: None,
             keyword_weight: 0.5,
@@ -78,6 +84,47 @@ impl SemanticIndex {
             .map(|s| s.contains(source_key))
             .unwrap_or(true)
     }
+
+    /// Route `source_key` to its own `embedder` (story D-162) instead of the default one passed to
+    /// [`new`](Self::new). Records of that source — and queries scoped to it — are embedded with
+    /// this embedder; every other source keeps the default. Cosine rerank stays within one embedding
+    /// space: a query is only compared against vectors produced by the same embedder it was embedded
+    /// with (see [`search`](DatasourceBackend::search)). Additive — with no override configured the
+    /// index behaves exactly as before.
+    pub fn with_source_embedder(
+        mut self,
+        source_key: impl Into<String>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
+        self.source_embedders.insert(source_key.into(), embedder);
+        self
+    }
+
+    /// The embedder that handles `source_key`: its routed override, or the default embedder.
+    fn embedder_for(&self, source_key: &str) -> &Arc<dyn Embedder> {
+        self.source_embedders
+            .get(source_key)
+            .unwrap_or(&self.embedder)
+    }
+
+    /// Embed `records` with `embedder` and persist each vector. Best-effort: an embedding failure (or
+    /// a length mismatch) leaves the keyword index intact — the records are already upserted.
+    fn embed_and_store(&self, embedder: &Arc<dyn Embedder>, records: &[&Record]) {
+        if records.is_empty() {
+            return;
+        }
+        let texts: Vec<String> = records
+            .iter()
+            .map(|r| format!("{}\n{}", r.title, r.body))
+            .collect();
+        if let Ok(vecs) = embedder.embed(&texts) {
+            if vecs.len() == records.len() {
+                for (r, v) in records.iter().zip(vecs) {
+                    let _ = self.vectors.upsert(r.address(), v);
+                }
+            }
+        }
+    }
 }
 
 /// Cosine similarity of two equal-length vectors (`0.0` for mismatched/empty/zero vectors).
@@ -108,16 +155,18 @@ impl DatasourceBackend for SemanticIndex {
         if to_embed.is_empty() {
             return Ok(());
         }
-        let texts: Vec<String> = to_embed
-            .iter()
-            .map(|r| format!("{}\n{}", r.title, r.body))
-            .collect();
-        // Best-effort: an embedding failure must not lose the keyword index (records already upserted).
-        if let Ok(vecs) = self.embedder.embed(&texts) {
-            if vecs.len() == to_embed.len() {
-                for (r, v) in to_embed.iter().zip(vecs) {
-                    let _ = self.vectors.upsert(r.address(), v);
-                }
+        if self.source_embedders.is_empty() {
+            // Default path (unchanged): one batch through the single default embedder.
+            self.embed_and_store(&self.embedder, &to_embed);
+        } else {
+            // Routed path (D-162): group by source key and embed each group with its own embedder,
+            // so different KBs can use different models.
+            let mut by_source: HashMap<String, Vec<&Record>> = HashMap::new();
+            for r in to_embed {
+                by_source.entry(r.source.key()).or_default().push(r);
+            }
+            for (key, recs) in by_source {
+                self.embed_and_store(self.embedder_for(&key), &recs);
             }
         }
         Ok(())
@@ -134,8 +183,16 @@ impl DatasourceBackend for SemanticIndex {
         if candidates.is_empty() {
             return Ok(candidates);
         }
+        // The query is embedded with the embedder that owns its source scope (D-162): a scoped
+        // search uses that source's embedder; an unscoped search uses the default. Cosine is then
+        // only applied against vectors produced by this same embedder (below), so different-model
+        // sources never get compared across embedding spaces.
+        let query_embedder = match &input.source {
+            Some(src) => self.embedder_for(src),
+            None => &self.embedder,
+        };
         // Embed the query (best-effort: on failure, fall back to keyword order).
-        let query_vec = match self.embedder.embed(std::slice::from_ref(&input.query)) {
+        let query_vec = match query_embedder.embed(std::slice::from_ref(&input.query)) {
             Ok(mut v) if !v.is_empty() => v.remove(0),
             _ => {
                 let mut c = candidates;
@@ -154,14 +211,21 @@ impl DatasourceBackend for SemanticIndex {
             .map(|mut m| {
                 let kw_norm = m.score / max_kw; // [0,1]
                                                 // A record with no stored vector (keyword-only source, or embedding not yet computed)
-                                                // contributes cosine 0 — it ranks on keyword alone.
-                let cos = self
-                    .vectors
-                    .get(&m.record.address())
-                    .ok()
-                    .flatten()
-                    .map(|v| cosine(&query_vec, &v))
-                    .unwrap_or(0.0) as f64;
+                                                // contributes cosine 0 — it ranks on keyword alone. So does a record whose source
+                                                // uses a *different* embedder than the query (D-162): its vectors live in another
+                                                // space, so comparing them would be meaningless — keyword-only is the honest score.
+                let same_space =
+                    Arc::ptr_eq(self.embedder_for(&m.record.source.key()), query_embedder);
+                let cos = if same_space {
+                    self.vectors
+                        .get(&m.record.address())
+                        .ok()
+                        .flatten()
+                        .map(|v| cosine(&query_vec, &v))
+                        .unwrap_or(0.0) as f64
+                } else {
+                    0.0
+                };
                 let cos_norm = ((cos + 1.0) / 2.0).clamp(0.0, 1.0); // [-1,1] -> [0,1]
                 m.score = w * kw_norm + (1.0 - w) * cos_norm;
                 m
@@ -227,6 +291,15 @@ mod tests {
                     ]
                 })
                 .collect())
+        }
+    }
+
+    /// A stub whose every vector is a single fixed tag value — so a stored vector reveals *which*
+    /// embedder produced it (used to prove per-source routing, D-162).
+    struct TagEmbedder(f32);
+    impl Embedder for TagEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![self.0]).collect())
         }
     }
 
@@ -304,6 +377,65 @@ mod tests {
             .get(&("plain".into(), "file.document".into(), "1".into()))
             .unwrap()
             .is_none());
+    }
+
+    /// D-162: per-source embedder routing — a source with a routed embedder is embedded by *that*
+    /// embedder, while every other source uses the default one. The stored vectors' tag values prove
+    /// which embedder ran for each source.
+    #[test]
+    fn per_source_routing_embeds_each_source_with_its_own_embedder() {
+        let inner: Arc<dyn DatasourceBackend> = Arc::new(MemoryBackend::new());
+        let store = Arc::new(MemoryVectorStore::new());
+        let idx = SemanticIndex::new(inner, Arc::new(TagEmbedder(1.0))) // default embedder tags 1.0
+            .with_vector_store(store.clone())
+            .with_source_embedder("special", Arc::new(TagEmbedder(9.0))); // routed embedder tags 9.0
+        idx.upsert(&[
+            doc_in("special", "1", "t", "b"),
+            doc_in("plain", "1", "t", "b"),
+        ])
+        .unwrap();
+        let special = store
+            .get(&("special".into(), "file.document".into(), "1".into()))
+            .unwrap()
+            .expect("special source has a vector");
+        let plain = store
+            .get(&("plain".into(), "file.document".into(), "1".into()))
+            .unwrap()
+            .expect("plain source has a vector");
+        assert_eq!(
+            special,
+            vec![9.0],
+            "special source used its routed embedder"
+        );
+        assert_eq!(plain, vec![1.0], "plain source used the default embedder");
+    }
+
+    /// D-162: a source-scoped search embeds the **query** with that source's routed embedder (not the
+    /// default one), so the rerank happens inside the source's own embedding space. Here the default
+    /// embedder carries no ranking signal; only the routed `StubEmbedder` can rank beta first.
+    #[test]
+    fn scoped_search_uses_the_source_routed_embedder_for_the_query() {
+        let inner: Arc<dyn DatasourceBackend> = Arc::new(MemoryBackend::new());
+        let idx = SemanticIndex::new(inner, Arc::new(TagEmbedder(0.0))) // default: constant, no signal
+            .with_keyword_weight(0.0) // pure cosine so the embedding decides the order
+            .with_source_embedder("sem", Arc::new(StubEmbedder));
+        idx.upsert(&[
+            doc_in("sem", "a", "alpha topic", "alpha topic body"),
+            doc_in("sem", "b", "beta topic", "beta topic body"),
+        ])
+        .unwrap();
+        let hits = idx
+            .search(&SearchInput {
+                query: "beta topic".into(),
+                source: Some("sem".into()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            hits[0].record.id, "b",
+            "the query was embedded by the routed StubEmbedder, so cosine ranks beta first"
+        );
     }
 
     /// D-51: durability — a fresh `SemanticIndex` sharing an already-populated vector store + inner backend

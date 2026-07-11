@@ -16,8 +16,8 @@ pub mod endpoint;
 pub use datasource::{
     chunk_text, datasource_tools, freshness, ingest_markdown, ingest_openapi, ingest_text,
     records_to_context_blocks, register_datasource_ops, reindex, ChunkOptions, DatasourceBackend,
-    DatasourceHostCaps, Embedder, MemoryBackend, MemoryVectorStore, SemanticIndex, SqliteBackend,
-    VectorStore,
+    DatasourceHostCaps, Embedder, EmbeddingUsage, MemoryBackend, MemoryVectorStore, SemanticIndex,
+    SqliteBackend, VectorStore,
 };
 pub use endpoint::{
     endpoint_tools, register_endpoint_ops, CredentialReader, CrossPluginApprover, CrossPluginAudit,

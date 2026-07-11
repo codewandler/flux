@@ -92,11 +92,35 @@ pub trait DatasourceBackend: Send + Sync {
     }
 }
 
-/// The embeddings seam — **deferred, no backend wired in v1**. A semantic backend implements this and a
-/// hybrid (keyword + vector) search path layers on top behind it later.
+/// The embeddings seam. A semantic backend implements this; the hybrid (keyword + vector)
+/// [`SemanticIndex`] layers on top of it. Concrete embedders: the remote [`OpenAiEmbedder`]
+/// (feature `embeddings`) and the local fastembed one (feature `local-embeddings`).
 pub trait Embedder: Send + Sync {
     /// Embed a batch of texts into vectors.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+}
+
+/// Token usage reported by an embeddings API call (story D-162). Embeddings endpoints return a
+/// `usage` object that flux previously discarded; capturing it makes embedding token spend
+/// observable (an embedder accumulates it — e.g. [`OpenAiEmbedder::usage_snapshot`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingUsage {
+    /// Tokens in the embedded input(s).
+    pub prompt_tokens: u64,
+    /// Total tokens billed (equals `prompt_tokens` for embeddings endpoints that don't split it).
+    pub total_tokens: u64,
+}
+
+impl EmbeddingUsage {
+    /// Fold onto the shared [`flux_core::Usage`] tally (embedding input tokens → `input_tokens`) so a
+    /// consumer can route embedding spend through the same usage/pricing/event machinery as chat
+    /// calls. (Emitting a `CallUsage` event into `flux usage` is a CLI-side follow-up.)
+    pub fn as_usage(&self) -> flux_core::Usage {
+        flux_core::Usage {
+            input_tokens: self.prompt_tokens,
+            ..Default::default()
+        }
+    }
 }
 
 /// Turn datasource [`Record`]s into injectable [`ContextBlock`]s (story A-19): a consumer that wants to
