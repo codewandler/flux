@@ -72,10 +72,10 @@ impl Tool for WebFetchTool {
         ToolSpec::read_only(
             "web_fetch",
             "Read a web page as a readable document: HTML is returned as condensed markdown \
-             (navigation, scripts, and boilerplate stripped); non-HTML content is returned raw. Pass \
-             `raw: true` for the unprocessed body. Use this to read a page; for calling an API prefer \
-             `http.request`. Loopback/private addresses are blocked unless the `web` egress scope \
-             grants them.",
+             (navigation, scripts, and boilerplate stripped) and PDFs are returned as extracted \
+             text; other non-HTML content is returned raw. Pass `raw: true` for the unprocessed \
+             body. Use this to read a page; for calling an API prefer `http.request`. \
+             Loopback/private addresses are blocked unless the `web` egress scope grants them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -147,16 +147,29 @@ impl Tool for WebFetchTool {
             .unwrap_or("")
             .to_string();
         let capped = egress::read_body_capped(response, MAX_BYTES, "web_fetch").await?;
+
+        // Classify from the *raw bytes* + content-type before any lossy UTF-8 decode (which would
+        // corrupt a binary PDF). A PDF is either declared (`application/pdf`) or sniffed by its
+        // `%PDF` magic bytes, so a mislabeled/absent content-type still routes to text extraction.
+        let is_pdf = !raw_body
+            && (content_type.contains("application/pdf") || looks_like_pdf(&capped.bytes));
         let body = cap_str(
             String::from_utf8_lossy(&capped.bytes).into_owned(),
             MAX_BYTES,
         );
-
-        let is_html = !raw_body && (content_type.contains("text/html") || looks_like_html(&body));
+        let is_html =
+            !raw_body && !is_pdf && (content_type.contains("text/html") || looks_like_html(&body));
 
         let mut rendered = if is_html {
             let md = condense::html_to_markdown(&body);
             cap_str(md, MAX_BYTES)
+        } else if is_pdf {
+            // Extract text, capped exactly like the HTML branch. A malformed/truncated/text-less PDF
+            // falls back to the raw pass-through rather than erroring the whole fetch.
+            match extract_pdf_text(&capped.bytes) {
+                Some(text) => cap_str(text, MAX_BYTES),
+                None => cap_str(body, MAX_BYTES),
+            }
         } else {
             cap_str(body, MAX_BYTES)
         };
@@ -230,7 +243,7 @@ impl Tool for HtmlToMarkdownTool {
 }
 
 /// Sniff a body that lacks a helpful `content-type` for an HTML shape.
-fn looks_like_html(body: &str) -> bool {
+pub(crate) fn looks_like_html(body: &str) -> bool {
     let head = body.trim_start();
     let lower = head[..head.len().min(512)].to_ascii_lowercase();
     lower.starts_with("<!doctype html")
@@ -239,8 +252,29 @@ fn looks_like_html(body: &str) -> bool {
         || lower.contains("<body")
 }
 
+/// Sniff the `%PDF-` magic signature so a PDF served with a wrong/absent `content-type` still routes
+/// to text extraction. Per the PDF spec the header may sit after a short prefix (BOM/whitespace), so
+/// scan a small leading window rather than requiring byte 0.
+fn looks_like_pdf(bytes: &[u8]) -> bool {
+    let window = &bytes[..bytes.len().min(1024)];
+    window.windows(5).any(|w| w == b"%PDF-")
+}
+
+/// Extract readable text from PDF bytes. Returns `None` on any failure — an extraction error, a
+/// panic from a malformed PDF (`pdf-extract` panics on some inputs), or an empty result — so the
+/// caller falls back to the raw pass-through instead of erroring or emptying the whole fetch.
+fn extract_pdf_text(bytes: &[u8]) -> Option<String> {
+    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(bytes)
+    }));
+    match extracted {
+        Ok(Ok(text)) if !text.trim().is_empty() => Some(text),
+        _ => None,
+    }
+}
+
 /// Cap a string to `max` bytes, cut on a char boundary (an arbitrary body may not split cleanly).
-fn cap_str(mut s: String, max: usize) -> String {
+pub(crate) fn cap_str(mut s: String, max: usize) -> String {
     if s.len() > max {
         let mut end = max;
         while end > 0 && !s.is_char_boundary(end) {
@@ -291,6 +325,71 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Like [`one_shot`] but serves an arbitrary **binary** body (headers, then the raw bytes) — the
+    /// PDF/binary fixtures aren't valid UTF-8, so they can't go through the `&str` variant.
+    async fn one_shot_bytes(ctype: &'static str, body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(headers.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Build a tiny valid single-page PDF whose content stream shows `text`, via `lopdf` (so the
+    /// cross-reference table is correct — a hand-rolled xref is what `pdf-extract` rejects).
+    fn make_pdf(text: &str) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                Operation::new("Td", vec![72.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
     }
 
     async fn redirect_to_ungranted_loopback() -> String {
@@ -456,6 +555,55 @@ mod tests {
         assert!(
             r.content.contains("{\"k\": 1}"),
             "json kept raw: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_body_is_returned_as_extracted_text() {
+        // A PDF served with the honest content-type comes back as extracted text — not the raw
+        // `%PDF-...` byte dump the pre-D-161 else-branch produced.
+        let base = one_shot_bytes("application/pdf", make_pdf("Hello Flux PDF")).await;
+        let t = tool(PrivateNetAllow::Any, None);
+        let r = t.execute(&ctx(), json!({ "url": base })).await.unwrap();
+        assert!(
+            r.content.contains("Hello Flux PDF"),
+            "extracted text present: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("%PDF"),
+            "raw PDF bytes must not leak — the header proves a raw dump: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_extracted_via_magic_byte_sniff_when_mislabeled() {
+        // Same bytes, but served as `application/octet-stream` (a common mislabel / absent type):
+        // the `%PDF` magic-byte sniff must still route it to extraction.
+        let base = one_shot_bytes("application/octet-stream", make_pdf("Sniffed PDF Text")).await;
+        let t = tool(PrivateNetAllow::Any, None);
+        let r = t.execute(&ctx(), json!({ "url": base })).await.unwrap();
+        assert!(
+            r.content.contains("Sniffed PDF Text"),
+            "magic-byte sniff routed to extraction: {}",
+            r.content
+        );
+        assert!(!r.content.contains("%PDF"), "no raw bytes: {}", r.content);
+    }
+
+    #[tokio::test]
+    async fn non_pdf_binary_stays_raw() {
+        // A non-PDF, non-HTML binary blob (a PNG signature here) is unchanged by D-161: it still
+        // comes back as the raw lossy pass-through, never routed through PDF extraction.
+        let blob = b"\x89PNG\r\n\x1a\nNOT-A-PDF-just-raw-binary".to_vec();
+        let base = one_shot_bytes("application/octet-stream", blob).await;
+        let t = tool(PrivateNetAllow::Any, None);
+        let r = t.execute(&ctx(), json!({ "url": base })).await.unwrap();
+        assert!(
+            r.content.contains("NOT-A-PDF-just-raw-binary"),
+            "non-PDF binary kept raw: {}",
             r.content
         );
     }

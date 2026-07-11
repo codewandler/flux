@@ -216,9 +216,22 @@ No off switch — this *is* the policy (no-fallbacks rule).
 
 ## Non-goals
 
-Screenshots/vision (above); crawling/spidering; persistent profiles or cookie stores across runs;
-credential autofill / browser-driven login automation; CAPTCHA circumvention; multi-tab
-orchestration beyond one page per session; replacing/moving `websearch`.
+Screenshots/vision (above); unbounded/cross-host crawling or spidering; persistent profiles or
+cookie stores across runs; credential autofill / browser-driven login automation; CAPTCHA
+circumvention; multi-tab orchestration beyond one page per session; replacing/moving `websearch`.
+
+**Update (D-160, D-161):** two capabilities the original design listed as non-goals were later
+shipped in a deliberately bounded form:
+
+- **`web.crawl` (D-160)** — a **bounded, same-host** breadth-first crawl over the same egress
+  envelope as `web_fetch` (every hop guarded by `guard_url_scoped` + `send_guarded`). It stays
+  within the original non-goal's spirit: `max_pages` (≤ 50) and `max_depth` (≤ 5) caps, same-host
+  only, and still **no robots.txt/sitemaps, no cross-host crawl, no JS rendering** (that remains the
+  tier-3 `browser.*` path). The general "unbounded/cross-host spidering" non-goal stands.
+- **PDF text extraction in `web_fetch` (D-161)** — a PDF response (declared `application/pdf` or
+  `%PDF` magic-byte sniff) is returned as extracted text instead of a raw byte dump, via a pure-Rust
+  extractor with a panic-safe raw fallback. Datasource *file* ingestion of PDFs remains deferred
+  (D-50); this covers only the web-fetch path.
 
 ## Acceptance / done
 

@@ -27,6 +27,7 @@ use flux_system::net::PrivateNetAllow;
 pub mod browser;
 pub mod cdp;
 pub mod condense;
+pub mod crawl;
 pub mod digest;
 mod egress;
 pub mod fetch;
@@ -68,13 +69,15 @@ pub struct WebOptions {
 
 /// Register the native web ops on `registry`:
 /// - tier 1: `http.request` (arbitrary HTTP);
-/// - tier 2: `web_fetch` (readable-markdown fetch) + the pure `html_to_markdown` transform;
+/// - tier 2: `web_fetch` (readable-markdown fetch) + the pure `html_to_markdown` transform +
+///   `web.crawl` (bounded, same-host breadth-first crawl over the same egress envelope);
 /// - tier 3: `browser.open`/`goto`/`snapshot`/`act`/`close` (evidence-gated behind the `browser`
 ///   group — surfaced only when a Chromium binary is discoverable; see [`browser_group`]).
 pub fn register_web(registry: &mut ToolRegistry, opts: &WebOptions) {
     registry.register(Arc::new(http::HttpRequestTool::new(opts)));
     registry.register(Arc::new(fetch::WebFetchTool::new(opts)));
     registry.register(Arc::new(fetch::HtmlToMarkdownTool));
+    registry.register(Arc::new(crawl::WebCrawlTool::new(opts)));
 
     // Tier 3: a shared session registry + config for the browser ops. They always register (so the
     // `browser` group can list them); the evidence gate hides them from the catalog when no Chromium

@@ -22,6 +22,38 @@ pub fn html_to_markdown(html: &str) -> String {
     collapse_blank_lines(&to_markdown(&document))
 }
 
+/// Collect the `<a href>` link targets in `html`, each resolved to an absolute URL against `base`.
+///
+/// The condenser renders links inline as [`Inline::Link`] for reading; the `web.crawl` frontier
+/// needs them as *data*. Fragment-only (`#...`) and non-`http(s)` targets (mailto:, javascript:, …)
+/// are dropped, and the result is de-duplicated preserving first-seen order.
+pub(crate) fn extract_links(html: &str, base: &url::Url) -> Vec<String> {
+    let doc = Html::parse_document(html);
+    let Ok(sel) = Selector::parse("a[href]") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for el in doc.select(&sel) {
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
+        let href = href.trim();
+        if href.is_empty() || href.starts_with('#') {
+            continue;
+        }
+        if let Ok(resolved) = base.join(href) {
+            if matches!(resolved.scheme(), "http" | "https") {
+                let s = resolved.to_string();
+                if seen.insert(s.clone()) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The page's `<title>`, whitespace-collapsed, if present and non-empty.
 pub fn page_title(html: &str) -> Option<String> {
     let doc = Html::parse_document(html);
@@ -584,5 +616,29 @@ mod tests {
     fn empty_input_is_empty_output() {
         assert_eq!(html_to_markdown(""), "");
         assert_eq!(html_to_markdown("<html><body></body></html>"), "");
+    }
+
+    #[test]
+    fn extract_links_resolves_dedups_and_filters() {
+        let base = url::Url::parse("https://example.com/dir/page.html").unwrap();
+        let html = r##"
+            <a href="/abs">absolute-path</a>
+            <a href="rel">relative</a>
+            <a href="https://other.com/x">cross-host</a>
+            <a href="/abs">dup of the first</a>
+            <a href="#frag">fragment only</a>
+            <a href="mailto:a@b.com">mail</a>
+            <a href="javascript:void(0)">js</a>
+        "##;
+        let links = extract_links(html, &base);
+        assert_eq!(
+            links,
+            vec![
+                "https://example.com/abs".to_string(),
+                "https://example.com/dir/rel".to_string(),
+                "https://other.com/x".to_string(),
+            ],
+            "resolved against base, de-duplicated, fragments + non-http(s) dropped: {links:?}"
+        );
     }
 }

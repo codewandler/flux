@@ -41,7 +41,8 @@ policy.
 | `list` | `source[, entity, offset, limit]` | low | Enumerate a datasource source's records, paged |
 | `relation` | `source, entity, id[, rel]` | low | Follow a datasource record's typed links |
 | `batch_get` | `source, entity, ids` | low | Fetch several datasource records in one call |
-| `web_fetch` | `url[, raw]` | low | Read a URL as a document: HTML becomes condensed Markdown; `raw` preserves the body |
+| `web_fetch` | `url[, raw]` | low | Read a URL as a document: HTML becomes condensed Markdown, PDFs become extracted text; `raw` preserves the body |
+| `web.crawl` | `url[, max_pages, max_depth]` | low | Crawl a small site or section: from a seed, follow same-host links breadth-first (bounded by `max_pages`/`max_depth`), returning each page as condensed Markdown |
 | `html_to_markdown` | `html` | low | Pure conversion of an HTML string to condensed Markdown; no network access |
 | `http.request` | `url[, method, headers, body, timeout]` | medium, approval | Arbitrary HTTP request with capped response body; non-2xx remains a result |
 | `browser.open` | `[url]` | medium, approval | Start a headless-Chromium session and return a non-visual page digest |
