@@ -10,13 +10,12 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.14.9 (2026-07-11) — opt-in OS process sandboxing (bwrap/Seatbelt) at the spawn
-  boundary, plus the gitlab dry-run/runtime preflight hardening (D-88–D-90). **In flight
-  (`[Unreleased]`, cutting as v0.15.0 — breaking voice-handler seam):** the flows-arc downstream ask
-  (ai-agent-platform R-20) — flow-driven sessions + `ai_segment` (D-131), flow-driven voice (D-132),
-  `annotate_effects` (D-133) — and an actionable error for an expired codex login. **Focus:** the
-  Agent pillar — downstream asks and the gitlab-hardening wave; next up per the generated board
-  below. See [CHANGELOG](../../CHANGELOG.md).
+- **Released:** v0.15.0 + v0.15.1 (2026-07-11) — the flows-arc downstream ask (ai-agent-platform
+  R-20): flow-driven sessions + `ai_segment` (D-131), flow-driven voice (D-132, breaking
+  voice-handler seam), `annotate_effects` (D-133), an actionable error for an expired codex login,
+  and the 0.15.1 docs catch-up. Announced in #ai-agent-platform (covers 0.14.8 → 0.15.1).
+  **Focus:** the Agent pillar — downstream asks and the gitlab-hardening wave; next up per the
+  generated board below. See [CHANGELOG](../../CHANGELOG.md).
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 <!-- BEGIN track:board -->
