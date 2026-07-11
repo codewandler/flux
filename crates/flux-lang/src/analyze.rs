@@ -13,17 +13,23 @@ use crate::opspec::{OpCatalog, OpSignature};
 
 /// A single analyzer diagnostic, suitable for UI display or feeding back into the compile/repair
 /// loop. The JSON-pointer-style node path (`body[3].then[1]`) is rendered into `message` — the
-/// struct's shape is kept message-only so downstream crates (flux-flow/flux-sdk/flux-cli) keep
-/// compiling unchanged (L-16/F11).
+/// human-facing `` (at `…`) `` suffix stays exactly as before (L-16/F11) — **and** is exposed as
+/// the typed `node_path` field (D-139), so a downstream consumer that attributes diagnostics to
+/// its own source model (e.g. a canvas `NodeMap`) can key off the field instead of parsing it back
+/// out of `message`. `node_path` is purely additive: `None` for flow-level diagnostics raised
+/// outside any node (there was no path to render), `Some` otherwise, always matching the path in
+/// the message suffix verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub message: String,
+    pub node_path: Option<String>,
 }
 
 impl Diagnostic {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            node_path: None,
         }
     }
 }
@@ -41,12 +47,15 @@ impl Diags {
     /// Record a diagnostic at the current node path.
     fn add(&mut self, message: impl Into<String>) {
         let message = message.into();
-        let rendered = if self.path.is_empty() {
-            message
-        } else {
-            format!("{message} (at `{}`)", self.path.join("."))
+        let node_path = (!self.path.is_empty()).then(|| self.path.join("."));
+        let rendered = match &node_path {
+            Some(path) => format!("{message} (at `{path}`)"),
+            None => message,
         };
-        self.items.push(Diagnostic::new(rendered));
+        self.items.push(Diagnostic {
+            message: rendered,
+            node_path,
+        });
     }
 
     /// Run `f` with `seg` pushed onto the node path (popped afterwards, even on early return).
@@ -2741,6 +2750,41 @@ mod tests {
                     && d.message.contains("body[1].then[0]")),
             "expected the type diagnostic to carry its node path, got: {:?}",
             err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// D-139: a node-scoped finding must expose its path through the typed `node_path` field
+    /// exactly as it appears in the rendered `` (at `…`) `` message suffix — downstream consumers
+    /// (e.g. a canvas `NodeMap`) can key off the field instead of parsing it back out of the text.
+    #[test]
+    fn diagnostic_node_path_matches_rendered_suffix() {
+        let ast = DraftAst {
+            body: vec![Node::When {
+                cond: Box::new(Node::Lit {
+                    value: serde_json::json!(true),
+                }),
+                then: vec![Node::Call {
+                    op: "does.not.exist".into(),
+                    args: vec![],
+                }],
+                otherwise: vec![],
+            }],
+            ..Default::default()
+        };
+        let err = analyze_flow(&ast, &catalog(), &HashSet::new()).unwrap_err();
+        let finding = err
+            .iter()
+            .find(|d| d.message.contains("unknown operation"))
+            .unwrap_or_else(|| panic!("expected an unknown-operation diagnostic, got: {err:?}"));
+        assert!(
+            finding.message.contains("(at `body[0].then[0]`)"),
+            "expected the rendered suffix to name the nested call, got: {}",
+            finding.message
+        );
+        assert_eq!(
+            finding.node_path.as_deref(),
+            Some("body[0].then[0]"),
+            "the structured node_path field must match the path rendered in the message suffix"
         );
     }
 
