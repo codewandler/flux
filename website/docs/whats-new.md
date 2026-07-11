@@ -22,11 +22,17 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   functions to an embedded conversational agent as callable tools, restrict the agent to an
   explicit tool list, and plug in its own per-call approval policy (for example, a risk-based
   confirmation gate) — everything still runs through flux's safety envelope.
-
 - **Embedded turns can stream.** An application can now watch a turn unfold live — the assistant's
   text, its plan, and each tool call and result as they happen — either by handing in its own
   listener or by consuming a turn as an event stream, and it can cancel a turn mid-flight without
   corrupting the conversation.
+- **The agent can crawl a small site.** Point it at a starting page and it follows links within the
+  same site to read a whole section in one step — bounded by the page and depth limits you set —
+  instead of fetching one URL at a time. It stays on the same site and won't wander off-domain, read
+  robots files, or run JavaScript.
+- **Fetching a PDF now returns its text.** When the agent fetches a link that turns out to be a PDF,
+  it reads the document's text instead of a wall of raw bytes, so linked PDFs become usable content.
+  Even a PDF served without the right file type is detected and read.
 
 ### Improved
 
@@ -38,6 +44,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   plugin's operation manifest can tag an operation as moving money, deleting data, or sending
   something externally — flux surfaces that distinction through its operation catalog and per-call
   flow annotations automatically, without extra tagging in an authored flow.
+- **More control over embeddings-powered knowledge search.** A deployment can now configure the
+  embeddings service explicitly — API key, endpoint, and model — instead of only through environment
+  variables, point different knowledge bases at different embedding models, and account for the
+  tokens that embedding consumes.
 
 ### Fixed
 

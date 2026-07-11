@@ -67,6 +67,34 @@ All notable changes to this project are documented in this file. The format is b
   writing a custom tool or approval policy no longer adds a direct `flux-runtime`/`flux-spec`
   dependency — proven by the new `custom_tool` example, which uses only `flux_sdk::` paths and is
   compiled by the gate. New wave-1 examples: `session_resume`, `streaming`, `custom_tool`.
+- **D-160: `web.crawl` — a bounded, same-host crawl primitive** (`flux-web`). New `web.crawl` op
+  (`WebCrawlTool`, `crates/flux-web/src/crawl.rs`) registered in `register_web()` beside `web_fetch`:
+  from a seed URL it follows **same-host** links breadth-first and returns each page's condensed
+  markdown plus one `web.page` record per page. Bounded on every axis — `max_pages` (default 10,
+  ceiling 50), `max_depth` (default 2, ceiling 5), a 512-URL frontier, per-page/total render caps.
+  Every hop (seed, discovered link, redirect) traverses the same `guard_url_scoped` +
+  `egress::send_guarded` envelope as `web_fetch` (private admits audited as `web:web.crawl`); a
+  refused seed errors, a refused/failed discovered page is skipped. Link extraction via new
+  `condense::extract_links`. Deliberate v1 non-goals: no robots.txt/sitemaps, no cross-host crawl, no
+  JS (that is the `browser.*` tier). Downstream ask (ai-agent-platform, consumer ask A-44).
+- **D-161: `web_fetch` extracts text from PDFs** (`flux-web`). A PDF response (declared
+  `application/pdf` or `%PDF` magic-byte sniff) is returned as extracted text instead of a raw
+  lossy-UTF-8 byte dump, capped like HTML markdown. Extraction is pure-Rust (`pdf-extract` 0.12) and
+  panic-safe (`catch_unwind` with a raw fallback — a malformed PDF never crashes the fetch). Non-PDF
+  binary behavior is unchanged. Datasource *file* ingestion of PDFs stays deferred (D-50); this is
+  the web-fetch path only. Downstream ask (ai-agent-platform, consumer ask A-47).
+- **D-162: provider embeddings pack — explicit config, per-source routing, usage capture**
+  (`flux-capabilities`). `OpenAiEmbedder::new(api_key, endpoint, model)` builds an embedder from
+  explicit config (no env access); `from_env()` is now a thin wrapper (plus `model()`/`endpoint()`
+  accessors). `SemanticIndex::with_source_embedder(source_key, embedder)` routes a source to its own
+  embedder so different KBs can use different models — the default single-embedder path is
+  byte-identical when unconfigured, and cosine rerank stays within one embedding space (a scoped
+  query is embedded by its source's embedder and only compared against same-embedder vectors, via
+  `Arc::ptr_eq`). Embedding `usage` is no longer discarded: a pure `parse_embeddings_response`
+  captures `(vectors, EmbeddingUsage)`, the embedder accumulates it (`usage_snapshot()`), and
+  `EmbeddingUsage::as_usage()` folds it onto the shared `flux_core::Usage` tally. Engine-side only
+  (no SDK/CLI surface change; the CLI `datasource_backend` wiring is untouched). Emitting a
+  `CallUsage` into `flux usage` is a documented follow-up. Downstream ask (ai-agent-platform).
 
 ### Changed
 
