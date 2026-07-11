@@ -24,6 +24,13 @@
   the process can pause, exit, and a later run reopens the session by id and continues exactly where
   it left off. No model call is spent on the scripted questions, and every action the flow takes
   still passes through flux's safety and approval checks.
+- **Embedded conversational agents can now delegate to sub-agents.** An application can give an
+  embedded chat agent a set of named helper roles; when a turn decides to hand off a piece of work,
+  it runs that helper as a child agent — through the same safety and approval checks — and the
+  child's token usage shows up in the conversation's cost trace. Each child is bounded by a
+  time limit (ten minutes by default, adjustable), and cancelling a streamed turn also stops a
+  running child. This was already available for one-shot flows; it now works on the conversational
+  agent too.
 
 ### Action needed
 

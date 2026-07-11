@@ -89,6 +89,21 @@ pub mod observe {
     pub use flux_flow::state::FlowStore;
 }
 
+/// **Sub-agents.** Attach named roles to a conversational client with
+/// [`ClientBuilder::with_sub_agents`] (or to a flow client with
+/// [`FlowClient::with_sub_agents`](flow::FlowClient::with_sub_agents)); a turn whose plan calls
+/// `task(role, …)` then delegates to a role's child agent through the same
+/// authorization → approval → guarded-IO envelope. [`SubAgents`](subagents::SubAgents) is the bundle
+/// (roles + the child tool surface + a [`ProviderFactory`](subagents::ProviderFactory) + limits),
+/// [`SpawnLimits`](subagents::SpawnLimits) bounds each child (tokens, wall-clock, …), and
+/// [`Role`](subagents::Role)/[`RoleRegistry`](subagents::RoleRegistry) name the roles a `task` may
+/// target ([`parse_role`](subagents::parse_role) builds a `Role` from a markdown definition).
+pub mod subagents {
+    pub use flux_orchestrate::{
+        parse_role, ProviderFactory, Role, RoleRegistry, SpawnLimits, SubAgents,
+    };
+}
+
 /// The OS-sandbox posture types, re-exported so a consumer can inject an explicit sandbox into a
 /// builder via [`ClientBuilder::with_sandbox`]/[`flow::FlowClientBuilder::with_sandbox`] without
 /// taking a direct `flux-system` dependency.
@@ -111,6 +126,7 @@ use flux_core::ContextBlock;
 use flux_core::Result;
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
+use flux_orchestrate::{SubAgents, TaskTool};
 use flux_runtime::{Approver, Tool, ToolContext, ToolRegistry};
 use flux_system::{System, Workspace};
 
@@ -148,6 +164,7 @@ pub struct ClientBuilder {
     cognition: bool,
     ops: Vec<Arc<dyn Tool>>,
     packs: Vec<RegistryPack>,
+    sub_agents: Option<SubAgents>,
 }
 
 impl Default for ClientBuilder {
@@ -161,6 +178,8 @@ impl Default for ClientBuilder {
             cognition: false,
             ops: Vec::new(),
             packs: Vec::new(),
+            // Unset ⇒ no `task` tool, no spawner (children off by default).
+            sub_agents: None,
         }
     }
 }
@@ -181,6 +200,7 @@ impl ClientBuilder {
             cognition: false,
             ops: Vec::new(),
             packs: Vec::new(),
+            sub_agents: None,
         }
     }
     /// Set the model id every turn uses.
@@ -238,6 +258,26 @@ impl ClientBuilder {
     /// used across flux). Same envelope rules as [`register_op`](Self::register_op).
     pub fn register_pack<F: FnOnce(&mut ToolRegistry) + 'static>(mut self, pack: F) -> Self {
         self.packs.push(Box::new(pack));
+        self
+    }
+    /// Attach named sub-agents to the conversational client: at [`build`](Self::build) the `task`
+    /// tool joins this client's catalog and the spawner is built over the client's guarded `System`,
+    /// so a turn whose plan calls `task(role, …)` delegates to a role's child agent through the same
+    /// authorization → approval → guarded-IO envelope. The single seam
+    /// [`FlowClient::with_sub_agents`](crate::FlowClient::with_sub_agents) already offered, now on
+    /// the conversational door — a consumer (e.g. a multi-tenant service) drives sub-agents without
+    /// re-assembling the spawner, executor, and context by hand.
+    ///
+    /// A generous default `wall_clock` (10 min) is applied when the bundle sets none, so a hung
+    /// child can't run forever; override it (or any limit) via
+    /// [`SubAgents::with_limits`](subagents::SubAgents::with_limits). Unlike the one-shot
+    /// `FlowClient`, a streamed turn's cancel token ([`Session::stream`]`().cancel()`) also reaches
+    /// a running child, since the conversational path installs a cancellation token.
+    pub fn with_sub_agents(mut self, mut sub_agents: SubAgents) -> Self {
+        if sub_agents.limits.wall_clock.is_none() {
+            sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
+        }
+        self.sub_agents = Some(sub_agents);
         self
     }
     /// Restrict the agent to a subset of the registry's ops by name (`AgentSpec::tools`). Ops
@@ -313,6 +353,13 @@ impl ClientBuilder {
         for pack in self.packs {
             pack(&mut registry);
         }
+        // Sub-agents: register the `task` tool BEFORE the custom-name snapshot so it rides the same
+        // re-admit into a `tools` subset every consumer-registered op does (a consumer that scoped
+        // the catalog AND asked for sub-agents still keeps `task`). The spawner is attached to the
+        // dispatch context below.
+        if self.sub_agents.is_some() {
+            registry.register(Arc::new(TaskTool));
+        }
         let custom_names: Vec<String> = registry
             .names()
             .into_iter()
@@ -348,15 +395,15 @@ impl ClientBuilder {
         if spec.skills.is_empty() {
             spec = spec.with_default_skills();
         }
+        // Thread the sub-agent spawner into the dispatch context when sub-agents are attached, so a
+        // `task` call delegates through the same guarded `System`; `None` (the common case) leaves
+        // the context exactly as before. Mirrors `FlowClient::build_executor`.
+        let mut ctx = ToolContext::new(system.clone());
+        if let Some(sub_agents) = self.sub_agents {
+            ctx = ctx.with_spawner(sub_agents.into_spawner(system));
+        }
         let model = spec.model.clone();
-        let engine = spec.assemble(
-            provider,
-            registry,
-            approver,
-            ToolContext::new(system),
-            events,
-            flow,
-        )?;
+        let engine = spec.assemble(provider, registry, approver, ctx, events, flow)?;
         Ok(Client {
             engine: Arc::new(engine),
             model,
@@ -1433,6 +1480,141 @@ mod tests {
             out.text
         );
         assert!(out.suspended, "re-parked on await #2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child sub-agent provider that bills real tokens, so a delegated `task` call contributes
+    /// usage the parent turn folds in.
+    struct WorkerMock(Usage);
+    #[async_trait]
+    impl Provider for WorkerMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "did the subtask".into(),
+                    }),
+                    Chunk::Usage(self.0.clone()),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    /// The parent planner: round 0 emits a one-op plan calling `task(worker, …)`; round 1 answers in
+    /// prose. Neither call bills usage, so the turn's total isolates the sub-agent's contribution.
+    struct DelegatingMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for DelegatingMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                let ast = serde_json::json!({ "body": [{
+                    "kind": "call", "op": "task",
+                    "args": [{ "kind": "lit", "value": { "role": "worker", "task": "do it" } }]
+                }] });
+                vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "p".into(),
+                        name: "emit_plan".into(),
+                        input: serde_json::json!({ "ast": ast }),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "delegated to the worker".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// D-148: `ClientBuilder::with_sub_agents` puts the `task` tool + spawner on the conversational
+    /// door. A turn whose plan calls `task(role, …)` runs the child through the parent's envelope,
+    /// and the child's usage observation lands in the session's run trace (folded into the turn's
+    /// recorded usage). The `subagents` re-export module names every bundle type.
+    #[tokio::test]
+    async fn with_sub_agents_runs_a_delegated_task_and_records_child_usage() {
+        use crate::subagents::{parse_role, RoleRegistry, SubAgents};
+
+        let dir = std::env::temp_dir().join(format!("flux-sdk-subagents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A mock role registry with one "worker" role.
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nworker prompt", "worker"));
+
+        // The child bills real tokens; the provider factory hands each spawn a fresh worker provider.
+        let child_usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            ..Default::default()
+        };
+        let factory: crate::subagents::ProviderFactory = Arc::new({
+            let u = child_usage.clone();
+            move || Ok(Box::new(WorkerMock(u.clone())) as Box<dyn Provider>)
+        });
+        let sub_agents = SubAgents::new(roles, ToolRegistry::new(), factory, "mock", 1024);
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .with_sub_agents(sub_agents)
+            .build(
+                Box::new(DelegatingMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+
+        let out = client.run("delegate this").await.unwrap();
+        assert!(
+            out.tool_calls.contains(&"task".to_string()),
+            "the plan delegated via `task`: {:?}",
+            out.tool_calls
+        );
+
+        // The child's tokens reached the session's run trace: the parent turn's recorded usage folds
+        // in the sub-agent's spend (the parent's own planner calls billed nothing).
+        let sid = client.session_id().unwrap();
+        let events = client.event_store();
+        let turns = events.turns(&sid).unwrap();
+        let usage = turns
+            .last()
+            .and_then(|t| t.usage.as_ref())
+            .expect("the parent turn's usage must be Some — the sub-agent billed tokens");
+        assert_eq!(
+            usage.input_tokens, 1000,
+            "the sub-agent's input tokens landed in the session's run trace"
+        );
+        assert_eq!(
+            usage.output_tokens, 200,
+            "the sub-agent's output tokens landed in the session's run trace"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

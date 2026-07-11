@@ -26,6 +26,18 @@ All notable changes to this project are documented in this file. The format is b
   pre-1.0 SemVer). External code that constructed `TurnOutput` with a struct literal or matched it
   exhaustively must switch to constructing it only via the SDK and matching with a `..` rest
   pattern. The attribute future-proofs the type for the remaining wave-2/4 fields.
+- **D-148: sub-agents on the conversational `Client`** (sdk-surface wave 2). `ClientBuilder`
+  gains `with_sub_agents(SubAgents)` — the same single seam `FlowClient` already offered, now on the
+  agentic door. At `build` the `task` tool joins the client's catalog (riding the same `tools`-subset
+  re-admit as any consumer-registered op) and the spawner is built over the client's guarded
+  `System` and threaded into the dispatch context, so a turn whose plan calls `task(role, …)`
+  delegates to a role's child agent through the same authorization → approval → guarded-IO envelope;
+  the child's `subagent.usage` observation folds into the session's run trace. A generous default
+  `wall_clock` (10 min) is applied when the bundle sets none (mirrors `FlowClient`); unlike the
+  one-shot door, a streamed turn's cancel token (`Session::stream().cancel()`) also reaches a running
+  child. New `flux_sdk::subagents` re-export module names the bundle types (`SubAgents`,
+  `SpawnLimits`, `Role`, `RoleRegistry`, `ProviderFactory`, `parse_role`). `flux-orchestrate` becomes
+  a directly-named (not just transitive) dependency of `flux-sdk`.
 
 ## [0.16.1] - 2026-07-11
 
