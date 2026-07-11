@@ -12,6 +12,44 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Author a conversation as a flow.** A flow can now drive a session directly: it runs to its next
+  prompt, says that prompt to the user, and resumes exactly where it left off on their reply — the
+  model isn't consulted at all for the scripted skeleton, so those turns are instant, free, and
+  perfectly repeatable. Where you *do* want model judgment, the flow delegates a bounded segment
+  with `ai_segment(goal, tools, max_rounds, until?)`: you state the goal, which tools it may touch,
+  how many rounds it gets, and optionally which value being filled ends it early — then control
+  returns to the flow. Everything a segment does still passes through the same authorization and
+  approval checks as any other run.
+- **Flow-driven voice calls.** The same works over the realtime voice channel: the flow's authored
+  prompts are spoken aloud to the caller, the caller's reply resumes the flow, and when the flow
+  completes the call ends (or hands off) cleanly — classic-IVR determinism, with model cognition
+  only where the flow explicitly asks for it.
+- **Ask a flow where its risk lives.** Analysis can now report, per step of a flow, which effects it
+  has (network, money, writes, …), its risk level, and whether it's safe to retry — so a visual
+  editor or reviewer can pin down exactly which call moves money instead of only knowing that
+  something in the flow does.
+
+### Improved
+
+- **A clearer front door for flux.** The project page now leads with what makes flux different—the
+  model proposes a typed plan and the runtime controls execution—and uses a restrained new identity
+  built around that explicit boundary instead of generic AI imagery.
+
+### Fixed
+
+- **An expired codex login now tells you what to do.** When a stored codex (or claude) sign-in
+  expires, flux used to fail with a cryptic decode error; it now surfaces the provider's actual
+  reason and points you to `flux auth login codex` to sign in again.
+
+### Action needed
+
+- **If you implement the voice turn-handler in your own integration:** `turn` now returns a reply
+  value that signals whether the call continues or completes — return the "continue" variant with
+  your text to keep the previous behavior. (The new "speak first" and "call ended" hooks have
+  defaults; existing sinks keep compiling.)
+
 ## [0.14.9] - 2026-07-11
 
 ### New

@@ -2,7 +2,7 @@
 id: D-132
 title: Realtime/voice driver defers to flow suspensions (flow-driven voice)
 pillar: Agent
-status: in-progress
+status: done
 epic:
 design: ../designs/flow-driven-voice.md
 note: "downstream ask (ai-agent-platform R-20 voice half): a D-131 flow-driven session speaks its authored prompts over the realtime/voice provider and resumes on caller input"
