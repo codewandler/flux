@@ -157,9 +157,12 @@ impl Default for ClientBuilder {
 
 impl ClientBuilder {
     /// Start from a hand-built [`AgentSpec`] — the full-control escape hatch. The spec's own
-    /// permissions are taken as-is (no implicit `read` pre-allow); builder methods overlay on top.
-    /// A spec with explicit `skills` keeps them; an empty `skills` still gets default-dir discovery
-    /// at [`build`](Self::build).
+    /// permissions are taken as-is: unlike [`builder`](Self::builder), there is **no implicit
+    /// `read` pre-allow**, so a spec with empty `permissions` and no [`auto_approve`](Self::auto_approve)
+    /// denies *every* op (including reads) — grant what the agent needs via the spec's
+    /// `permissions`, [`allow`](Self::allow), or `auto_approve`. Builder methods overlay on top. A
+    /// spec with explicit `skills` keeps them; an empty `skills` still gets default-dir discovery at
+    /// [`build`](Self::build).
     pub fn from_spec(spec: AgentSpec) -> Self {
         Self {
             spec,
@@ -288,14 +291,23 @@ impl ClientBuilder {
         if self.cognition {
             CognitionPack::new(provider.clone(), self.spec.model.clone()).register(&mut registry);
         }
+        // Snapshot the base op names (built-ins + cognition) so consumer-registered ops can be
+        // told apart below: a `tools` subset restricts the *base* catalog, but must not silently
+        // drop a tool the consumer explicitly registered.
+        let base_names: std::collections::HashSet<String> = registry.names().into_iter().collect();
         // Consumer ops/packs join the same registry the envelope gates — registration grants
-        // existence, not permission; the `tools` subset below still applies to them.
+        // existence, not permission (the safety envelope still gates every dispatch).
         for tool in self.ops {
             registry.register(tool);
         }
         for pack in self.packs {
             pack(&mut registry);
         }
+        let custom_names: Vec<String> = registry
+            .names()
+            .into_iter()
+            .filter(|n| !base_names.contains(n))
+            .collect();
         let approver = self.envelope.resolve_approver();
 
         let (events, flow) = self.storage.unwrap_or_default().resolve()?;
@@ -313,12 +325,20 @@ impl ClientBuilder {
         spec.permissions
             .deny
             .extend(self.envelope.deny.iter().cloned());
+        // A `tools` subset restricts the base catalog only — re-admit every consumer-registered op
+        // so `register_op(...).tools([...])` never silently drops the just-added tool.
+        if let Some(tools) = spec.tools.as_mut() {
+            for name in custom_names {
+                if !tools.contains(&name) {
+                    tools.push(name);
+                }
+            }
+        }
         spec.cwd = root;
         if spec.skills.is_empty() {
             spec = spec.with_default_skills();
         }
         let model = spec.model.clone();
-        let session_id = events.create_session(&model)?;
         let engine = spec.assemble(
             provider,
             registry,
@@ -330,7 +350,10 @@ impl ClientBuilder {
         Ok(Client {
             engine: Arc::new(engine),
             model,
-            session_id,
+            // The default session is created lazily (on first use), so building a client — e.g. a
+            // service restarting against a persistent `Storage::dir` — never leaves an empty
+            // session behind, and `latest_session()` still points at the real prior conversation.
+            default_session: std::sync::Mutex::new(None),
             turn_guard: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -344,7 +367,9 @@ impl ClientBuilder {
 pub struct Client {
     engine: Arc<FlowEngine>,
     model: String,
-    session_id: String,
+    // The default session's id, created lazily on first use (see `default_id`). Kept behind a
+    // std mutex so two concurrent first-uses can't each mint (and leak) a session.
+    default_session: std::sync::Mutex<Option<String>>,
     // One engine runs one turn at a time (the planner loop is armed per turn); every Session
     // created by this client shares this guard so concurrent sends serialize instead of racing.
     turn_guard: Arc<tokio::sync::Mutex<()>>,
@@ -356,21 +381,34 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// The id of the default session this client's [`run`](Self::run) turns are recorded against
-    /// (created at build).
-    pub fn session_id(&self) -> &str {
-        &self.session_id
+    /// The default session's id, minting it on first call. Returns owned since the id lives behind
+    /// a mutex (the lazy-creation guard).
+    fn default_id(&self) -> Result<String> {
+        let mut slot = self.default_session.lock().unwrap();
+        if let Some(id) = slot.as_ref() {
+            return Ok(id.clone());
+        }
+        let id = self.engine.events.create_session(&self.model)?;
+        *slot = Some(id.clone());
+        Ok(id)
+    }
+
+    /// The id of the default session this client's [`run`](Self::run) turns are recorded against.
+    /// The default session is created lazily, so this call mints it on first use.
+    pub fn session_id(&self) -> Result<String> {
+        self.default_id()
     }
 
     /// Run one turn on the default session, collecting the final text and the tools invoked.
-    /// Equivalent to `client.default_session().send(input)`.
+    /// Equivalent to `client.default_session()?.send(input)`.
     pub async fn run(&self, input: &str) -> Result<TurnOutput> {
-        self.session(self.session_id.clone()).send(input).await
+        let id = self.default_id()?;
+        self.session(id).send(input).await
     }
 
-    /// The default session (created at build) as a [`Session`] handle.
-    pub fn default_session(&self) -> Session {
-        self.session(self.session_id.clone())
+    /// The default session as a [`Session`] handle (created lazily on first use).
+    pub fn default_session(&self) -> Result<Session> {
+        Ok(self.session(self.default_id()?))
     }
 
     /// Create a fresh session and return its handle.
@@ -387,9 +425,11 @@ impl Client {
         Ok(self.session(id.to_string()))
     }
 
-    /// The most recently updated session in this client's [`Storage`], if any. Note the client's
-    /// own default session exists from build time; to resume an earlier process's conversation,
-    /// prefer persisting its id and calling [`open_session`](Self::open_session).
+    /// The most recently updated session in this client's [`Storage`], if any. Because the default
+    /// session is created lazily (not at build), this returns the real prior conversation after a
+    /// restart against a persistent [`Storage::dir`] — as long as no turn has run on this client
+    /// yet to mint a newer default. To target a specific conversation, persist its id and use
+    /// [`open_session`](Self::open_session).
     pub fn latest_session(&self) -> Result<Option<Session>> {
         Ok(self
             .engine
@@ -640,7 +680,7 @@ mod tests {
             .unwrap();
         let out = client.run("hello").await.unwrap();
         assert_eq!(out.text, "first");
-        let id = client.session_id().to_string();
+        let id = client.session_id().unwrap();
         drop(client);
 
         // A "new process": a fresh client over the same storage dir resumes the session.
@@ -859,7 +899,7 @@ mod tests {
                 &dir,
             )
             .unwrap();
-        let session = client.default_session();
+        let session = client.default_session().unwrap();
         let mut sink = Recording::default();
         let out = session
             .send_with("write a file", &mut sink, &CancellationToken::new())
@@ -914,7 +954,7 @@ mod tests {
             .model("mock")
             .build(Box::new(TwoDeltaMock), &dir)
             .unwrap();
-        let mut stream = client.default_session().stream("hi");
+        let mut stream = client.default_session().unwrap().stream("hi");
 
         let mut deltas = String::new();
         let mut saw_turn_end = false;
@@ -962,7 +1002,7 @@ mod tests {
                 &dir,
             )
             .unwrap();
-        let session = client.default_session();
+        let session = client.default_session().unwrap();
         let mut stream = session.stream("park it");
         // Wait until the parked op is actually in flight, then cancel.
         loop {
@@ -1083,6 +1123,134 @@ mod tests {
         assert_eq!(out.tool_calls, vec!["write"]);
         // The plan actually executed through the guarded envelope.
         assert!(dir.join("sdk-plan.txt").exists(), "the plan's write ran");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-143 fix: a `tools(subset)` restricts the base catalog but must NOT drop a tool the
+    /// consumer explicitly registered — `register_op(greet).tools(["read"])` keeps `greet`.
+    #[tokio::test]
+    async fn tools_subset_preserves_registered_custom_ops() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-subkeep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .tools(["read"]) // restricts built-ins, but `greet` was registered on purpose
+            .register_op(greet_tool(hits.clone()))
+            .build(
+                Box::new(PlanOpMock {
+                    op: "greet",
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let out = client.run("greet flux").await.unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the registered custom op must survive the tools() subset"
+        );
+        assert_eq!(out.tool_calls, vec!["greet"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-142 fix: the default session is created lazily — building a client (e.g. a service
+    /// restart) mints no session, so `latest_session()` still points at the real prior
+    /// conversation rather than an empty default.
+    #[tokio::test]
+    async fn lazy_default_session_does_not_shadow_the_prior_conversation() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-lazy-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state");
+
+        // First process: run a real conversation, capture its id.
+        let real_id = {
+            let client = Client::builder()
+                .model("mock")
+                .storage(Storage::dir(&store))
+                .build(Box::new(ProseMock { text: "hi" }), &dir)
+                .unwrap();
+            client.run("remember this").await.unwrap();
+            let id = client.session_id().unwrap();
+            drop(client);
+            id
+        };
+
+        // Second process: a fresh client that has NOT run yet must see the real conversation as
+        // latest (no empty default was minted at build).
+        let client = Client::builder()
+            .model("mock")
+            .storage(Storage::dir(&store))
+            .build(Box::new(ProseMock { text: "hi" }), &dir)
+            .unwrap();
+        let latest = client
+            .latest_session()
+            .unwrap()
+            .expect("a prior session exists");
+        assert_eq!(
+            latest.id(),
+            real_id,
+            "latest_session must return the real prior conversation, not a fresh empty default"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-145 fix: dropping a `TurnStream` cancels its turn instead of leaving it running detached
+    /// and holding the client's turn slot. A parked tool (sleeps 300s) can only be escaped by
+    /// cancellation, so if `run()` after the drop completes, the drop cancelled the turn.
+    #[tokio::test]
+    async fn dropping_a_turn_stream_cancels_the_turn() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-dropcancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parked = flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "park",
+                "Blocks until cancelled",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            ),
+            |_input| async {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                Ok(serde_json::json!("unreachable"))
+            },
+        );
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .register_op(parked)
+            .build(
+                Box::new(PlanOpMock {
+                    op: "park",
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        {
+            let session = client.default_session().unwrap();
+            let mut stream = session.stream("park it");
+            // Wait until the parked op is actually in flight, then drop the stream (no cancel()).
+            loop {
+                match stream.next().await {
+                    Some(AgentEvent::ToolCall { name, .. }) if name == "park" => break,
+                    Some(_) => continue,
+                    None => panic!("stream ended before the tool call"),
+                }
+            }
+            drop(stream);
+        }
+        // If the drop did not cancel, the parked turn would hold the guard for 300s and this
+        // would hang (test timeout). It completing proves the drop cancelled the turn.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.default_session().unwrap().send("are you there"),
+        )
+        .await
+        .expect("run after drop must not hang — the dropped stream should have cancelled the turn")
+        .unwrap();
+        assert_eq!(out.text, "done");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -185,7 +185,7 @@ impl FlowClientBuilder {
         let sandbox = self.envelope.resolve_sandbox();
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = assemble_registry(provider.clone(), self.model.clone());
-        let (_events, store) = self.storage.unwrap_or_default().resolve()?;
+        let store = self.storage.unwrap_or_default().into_flow_store()?;
         let prelude_defs = if self.seed_prelude {
             prelude::prelude_schema()
         } else {

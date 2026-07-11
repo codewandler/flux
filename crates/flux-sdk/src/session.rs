@@ -78,7 +78,13 @@ impl Session {
     /// Run one turn as a [`TurnStream`] — a stream of owned
     /// [`AgentEvent`](crate::events::AgentEvent)s plus `cancel()`/`finish()`. The turn runs on a
     /// spawned task (the client's turn guard still serializes it against other turns), so events
-    /// arrive as they happen whether or not you are polling.
+    /// arrive as they happen whether or not you are polling. Dropping the returned stream cancels
+    /// the turn.
+    ///
+    /// # Panics
+    /// Spawns the turn eagerly, so it must be called from within a Tokio runtime (like any
+    /// `tokio::spawn`-based API); calling it outside one panics. Use [`send`](Self::send) or
+    /// [`send_with`](Self::send_with) when you only have a future to `.await`.
     pub fn stream(&self, input: &str) -> TurnStream {
         let engine = self.engine.clone();
         let id = self.id.clone();
@@ -98,7 +104,11 @@ impl Session {
                 .await?;
             Ok(sink.collect.0)
         });
-        TurnStream { rx, handle, cancel }
+        TurnStream {
+            rx,
+            handle: Some(handle),
+            cancel,
+        }
     }
 
     /// The conversation so far — the user/assistant messages projected from the event store.

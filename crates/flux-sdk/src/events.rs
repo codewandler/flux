@@ -60,11 +60,19 @@ pub enum AgentEvent {
 /// [`Session::stream`](crate::Session::stream); the turn runs on a spawned task, so events arrive
 /// as they happen whether or not you are polling.
 ///
+/// **Dropping the stream cancels the turn.** If you drop a `TurnStream` before it finishes, the
+/// turn is cancelled (the engine drops the in-flight op and persists one closing assistant
+/// message) rather than left running detached — so an abandoned stream never keeps burning tokens
+/// or holding the client's turn slot. Call [`finish`](Self::finish) to instead let the turn
+/// complete and collect its output.
+///
 /// Also implements [`futures::Stream`], so `while let Some(ev) = stream.next().await` and
 /// combinator pipelines both work.
 pub struct TurnStream {
     pub(crate) rx: mpsc::UnboundedReceiver<AgentEvent>,
-    pub(crate) handle: tokio::task::JoinHandle<Result<TurnOutput>>,
+    // `Option` so `finish` can take the handle out to `await` it while `Drop` (which cannot move
+    // fields) still runs — a `Some` handle in `Drop` means the turn was abandoned, so cancel it.
+    pub(crate) handle: Option<tokio::task::JoinHandle<Result<TurnOutput>>>,
     pub(crate) cancel: CancellationToken,
 }
 
@@ -83,10 +91,26 @@ impl TurnStream {
     /// Wait for the turn to complete and return the collected [`TurnOutput`] (the same output a
     /// plain [`Session::send`](crate::Session::send) would have returned). Undelivered events are
     /// dropped — read them via [`next`](Self::next) first if you want them.
-    pub async fn finish(self) -> Result<TurnOutput> {
-        match self.handle.await {
-            Ok(out) => out,
-            Err(e) => Err(flux_core::Error::Other(format!("turn task failed: {e}"))),
+    pub async fn finish(mut self) -> Result<TurnOutput> {
+        match self.handle.take() {
+            // Taken out here, so the `Drop` below sees `None` and does not cancel a completed turn.
+            Some(handle) => match handle.await {
+                Ok(out) => out,
+                Err(e) => Err(flux_core::Error::Other(format!("turn task failed: {e}"))),
+            },
+            None => Err(flux_core::Error::Other(
+                "TurnStream already finished".to_string(),
+            )),
+        }
+    }
+}
+
+impl Drop for TurnStream {
+    fn drop(&mut self) {
+        // A live handle at drop means the stream was abandoned without `finish()` — cancel the
+        // turn so the spawned task unwinds promptly instead of running to completion detached.
+        if self.handle.is_some() {
+            self.cancel.cancel();
         }
     }
 }
@@ -101,6 +125,10 @@ impl futures::Stream for TurnStream {
 /// An [`AgentSink`] that forwards owned [`AgentEvent`]s over a channel while also collecting the
 /// turn into a [`TurnOutput`]. Send failures are ignored: a dropped receiver means the consumer
 /// stopped listening, not that the turn should fail.
+///
+/// INVARIANT: this (and [`TeeSink`]) must override **every** `AgentSink` method — an un-overridden
+/// method falls back to the trait's no-op default and silently drops that event. When `AgentSink`
+/// gains a method, add the matching [`AgentEvent`] variant and forward it here and in `TeeSink`.
 pub(crate) struct ChannelSink {
     pub(crate) tx: mpsc::UnboundedSender<AgentEvent>,
     pub(crate) collect: Collector,

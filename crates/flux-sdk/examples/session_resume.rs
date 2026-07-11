@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
             .storage(Storage::dir(&store))
             .build(Box::new(ProseMock("Filed under 'later'.")), &dir)?;
         client.run("Remember: the meeting moved to Friday.").await?;
-        client.session_id().to_string()
+        client.session_id()?
     };
     println!("first process wrote session {id}");
 

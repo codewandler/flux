@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
         .model("mock")
         .build(Box::new(StreamingMock), ".")?;
 
-    let mut stream = client.default_session().stream("Say something");
+    let mut stream = client.default_session()?.stream("Say something");
     while let Some(event) = stream.next().await {
         match event {
             AgentEvent::TextDelta(t) => print!("{t}"),
