@@ -94,7 +94,6 @@ flux-cognition = { package = "codewandler-flux-cognition", version = "0.15.1", p
 flux-app = { path = "crates/flux-app" }
 flux-markdown = { package = "codewandler-flux-markdown", version = "0.15.1", path = "crates/flux-markdown" }
 flux-channels = { path = "crates/flux-channels" }
-flux-audio = { package = "codewandler-flux-audio", version = "0.15.1", path = "crates/flux-audio" }
 
 # external
 serde = { version = "1", features = ["derive"] }
@@ -134,7 +133,6 @@ crossterm = ">=0.28, <0.29"
 toml = "1.1"
 base64 = "0.22"
 sha2 = "0.11"
-sha1 = "0.11"
 hmac = "0.13"
 hex = "0.4"
 regex = "1"
@@ -156,7 +154,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 slack-morphism = "2.22"
 url = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Language server (flux-lsp): tower-lsp bundles lsp-types + the async JSON-RPC stdio loop.
 tower-lsp = "0.20"
 # Plugin pack distribution (D-47): verify the minisign-signed `plugins-index.json`
