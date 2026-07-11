@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-11
+
 ### New
 
 - **The web toolkit is now available on crates.io.** The crate behind the agent's web capabilities —

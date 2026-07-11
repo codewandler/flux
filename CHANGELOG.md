@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-11
+
 ### Added
 
 - **C-51: `codewandler-flux-web` joins the crates.io publish closure.** The web pack

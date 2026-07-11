@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-11
+
+### New
+
+- **The web toolkit is now available on crates.io.** The crate behind the agent's web capabilities —
+  fetching pages as clean markdown, extracting text from PDFs, crawling a small site, and driving a
+  headless browser — is now published as `codewandler-flux-web`, so you can pull the same web tools
+  into your own SDK or plugin projects instead of only using them through the CLI.
+
 ## [0.16.0] - 2026-07-11
 
 ### New
