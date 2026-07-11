@@ -77,7 +77,8 @@ impl Client {
     pub fn create_session(&self) -> Result<Session>;
     pub fn open_session(&self, id: &str) -> Result<Session>;     // picks up suspensions for free
     pub fn latest_session(&self) -> Result<Option<Session>>;
-    // Source-compatible conveniences over a lazily created default session:
+    // Source-compatible conveniences over the default session (created eagerly at build, as
+    // before 0.16 — keeps `session_id()` infallible; `latest_session` documents the implication):
     pub fn session_id(&self) -> &str;
     pub async fn run(&self, input: &str) -> Result<TurnOutput>;
     // Documented escape hatches:

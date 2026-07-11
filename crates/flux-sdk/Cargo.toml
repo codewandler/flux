@@ -35,9 +35,11 @@ serde.workspace = true
 serde_json.workspace = true
 # `run_voice_session` takes a cancel token to end a full-duplex voice session.
 tokio-util.workspace = true
+# The client's turn guard (`sync::Mutex`) — one engine runs one turn at a time — and the spawned
+# streaming turns.
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 futures.workspace = true
 # Examples register mock adapter ops (impl flux_runtime::Tool), whose `spec()` returns a flux_spec
 # ToolSpec. Dev-only — not in the publish closure.

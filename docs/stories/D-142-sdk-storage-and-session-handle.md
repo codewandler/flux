@@ -2,8 +2,7 @@
 id: D-142
 title: SDK storage injection + the resumable Session handle
 pillar: Agent
-status: ready
-priority: 1
+status: done
 epic: sdk-surface
 design: docs/designs/sdk-surface.md
 note: "wave 1 foundation — unlocks resume, suspensions, flow-driven voice, time machine"
@@ -30,7 +29,13 @@ voice, projections, time machine) has a seam to hang off.
       tasks + a slow mock provider; assert no interleaved turn).
 
 ## Progress
-- (pending)
+- 2026-07-11: implemented — `src/storage.rs` (Storage in_memory/dir/custom + resolve),
+  `src/session.rs` (Session {engine, id, turn_guard} + send/history; Collector moved here),
+  `Client` holds `Arc<FlowEngine>` + model + turn guard; create/open/latest_session +
+  default_session + event_store/engine escape hatches; `tokio` promoted to a real dep (sync
+  Mutex). Default session stays EAGER (created at build) so `session_id()` remains infallible —
+  documented on `latest_session`. Tests: dir persistence + resume-by-id, unknown-id error,
+  turn-guard serialization (interval non-overlap), all pre-existing tests green (26/26).
 
 ## Notes
 - `crates/flux-sdk/src/lib.rs` (builder/build rework), new `src/storage.rs` + `src/session.rs`.

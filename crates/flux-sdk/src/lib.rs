@@ -27,8 +27,12 @@
 #![warn(missing_docs)]
 
 pub mod flow;
+pub mod session;
+pub mod storage;
 
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
+pub use session::Session;
+pub use storage::Storage;
 
 /// The OS-sandbox posture types, re-exported so a consumer can inject an explicit sandbox into a
 /// builder via [`ClientBuilder::with_sandbox`]/[`flow::FlowClientBuilder::with_sandbox`] without
@@ -51,10 +55,8 @@ use flux_core::ContextBlock;
 use flux_core::{Result, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
-use flux_flow::state::FlowStore;
-use flux_flow::AgentSink;
 use flux_provider::Provider;
-use flux_runtime::{AllowApprover, Approver, DenyApprover, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{AllowApprover, Approver, DenyApprover, ToolContext, ToolRegistry};
 use flux_system::{System, Workspace};
 
 /// The result of one `Client::run` turn.
@@ -79,6 +81,7 @@ pub struct ClientBuilder {
     auto_approve: bool,
     context: Vec<ContextBlock>,
     sandbox: Option<Sandbox>,
+    storage: Option<Storage>,
 }
 
 impl Default for ClientBuilder {
@@ -95,6 +98,8 @@ impl Default for ClientBuilder {
             context: Vec::new(),
             // Unset ⇒ resolve the posture from the environment at `build` (off ⇒ disabled).
             sandbox: None,
+            // Unset ⇒ in-memory (ephemeral) stores, the pre-0.16 behavior.
+            storage: None,
         }
     }
 }
@@ -144,6 +149,13 @@ impl ClientBuilder {
         self.sandbox = Some(sandbox);
         self
     }
+    /// Choose where sessions live ([`Storage::in_memory`] by default). [`Storage::dir`] makes the
+    /// client's sessions — turn history, suspended flows, projections — survive the process, and
+    /// is what makes [`Client::open_session`] useful across restarts.
+    pub fn storage(mut self, storage: Storage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
     /// Inject a knowledge block into the agent's system prompt as a `<knowledge-base>` section (A-19):
     /// grounds the agent on a small KB inline, with no retrieval round-trip. Chainable.
     pub fn add_context(
@@ -156,8 +168,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Build the client with `provider` and a workspace rooted at `root`. Sessions are in-memory.
-    /// The turn runs on [`FlowEngine`] (the model plans, the runtime runs the flux-lang agent loop).
+    /// Build the client with `provider` and a workspace rooted at `root`. Sessions live in the
+    /// configured [`Storage`] (in-memory unless set). The turn runs on [`FlowEngine`] (the model
+    /// plans, the runtime runs the flux-lang agent loop).
     pub fn build(self, provider: Box<dyn Provider>, root: impl Into<PathBuf>) -> Result<Client> {
         let root = root.into();
         // Attach the OS-sandbox posture so a consumer's `FLUX_SANDBOX=require` is honored on this
@@ -175,9 +188,9 @@ impl ClientBuilder {
             Arc::new(DenyApprover)
         };
 
-        let events = Arc::new(EventStore::in_memory()?);
+        let (events, flow) = self.storage.unwrap_or_default().resolve()?;
+        let model = self.model.clone();
         let session_id = events.create_session(&self.model)?;
-        let flow = FlowStore::in_memory()?;
 
         // The agent's definition; `assemble` selects the tool subset (all, here), applies the
         // permissions, registers the reflexive ops, and ties the engine⇄loop-host cycle. Skills
@@ -208,14 +221,27 @@ impl ClientBuilder {
             events,
             flow,
         )?;
-        Ok(Client { engine, session_id })
+        Ok(Client {
+            engine: Arc::new(engine),
+            model,
+            session_id,
+            turn_guard: Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 }
 
-/// A configured, session-bound agent (runs on [`FlowEngine`]).
+/// A configured agent (runs on [`FlowEngine`]): the expensive, long-lived half of the SDK's
+/// conversational door. Conversations are [`Session`] handles — a fresh default one is created at
+/// build (so [`Client::run`] works out of the box), and [`Client::create_session`] /
+/// [`Client::open_session`] / [`Client::latest_session`] manage the rest. With persistent
+/// [`Storage`], sessions — and their suspended flows — survive the process.
 pub struct Client {
-    engine: FlowEngine,
+    engine: Arc<FlowEngine>,
+    model: String,
     session_id: String,
+    // One engine runs one turn at a time (the planner loop is armed per turn); every Session
+    // created by this client shares this guard so concurrent sends serialize instead of racing.
+    turn_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Client {
@@ -224,34 +250,66 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// The id of the in-memory session this client's turns are recorded against.
+    /// The id of the default session this client's [`run`](Self::run) turns are recorded against
+    /// (created at build).
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    /// Run one turn to completion, collecting the final text and the tools invoked.
+    /// Run one turn on the default session, collecting the final text and the tools invoked.
+    /// Equivalent to `client.default_session().send(input)`.
     pub async fn run(&self, input: &str) -> Result<TurnOutput> {
-        let mut sink = Collector::default();
-        self.engine
-            .run_turn(&self.session_id, input, &mut sink)
-            .await?;
-        Ok(sink.0)
+        self.session(self.session_id.clone()).send(input).await
     }
-}
 
-#[derive(Default)]
-struct Collector(TurnOutput);
+    /// The default session (created at build) as a [`Session`] handle.
+    pub fn default_session(&self) -> Session {
+        self.session(self.session_id.clone())
+    }
 
-impl AgentSink for Collector {
-    fn text_delta(&mut self, t: &str) {
-        self.0.text.push_str(t);
+    /// Create a fresh session and return its handle.
+    pub fn create_session(&self) -> Result<Session> {
+        let id = self.engine.events.create_session(&self.model)?;
+        Ok(self.session(id))
     }
-    fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
-        self.0.tool_calls.push(name.to_string());
+
+    /// Open an existing session by id — the resume seam. Errors if the id is unknown to this
+    /// client's [`Storage`]. A session parked on a top-level `await` resumes on the next
+    /// [`Session::send`].
+    pub fn open_session(&self, id: &str) -> Result<Session> {
+        self.engine.events.info(id)?;
+        Ok(self.session(id.to_string()))
     }
-    fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
-    fn turn_end(&mut self, usage: Option<Usage>) {
-        self.0.usage = usage;
+
+    /// The most recently updated session in this client's [`Storage`], if any. Note the client's
+    /// own default session exists from build time; to resume an earlier process's conversation,
+    /// prefer persisting its id and calling [`open_session`](Self::open_session).
+    pub fn latest_session(&self) -> Result<Option<Session>> {
+        Ok(self
+            .engine
+            .events
+            .latest_session()?
+            .map(|id| self.session(id)))
+    }
+
+    /// The client's event store — the escape hatch for projections and integrations the typed
+    /// surface doesn't cover yet.
+    pub fn event_store(&self) -> Arc<EventStore> {
+        self.engine.events.clone()
+    }
+
+    /// The assembled engine — the documented advanced escape hatch. Everything reachable from
+    /// here still dispatches through the same authorization → approval → guarded-IO envelope.
+    pub fn engine(&self) -> &Arc<FlowEngine> {
+        &self.engine
+    }
+
+    fn session(&self, id: String) -> Session {
+        Session {
+            engine: self.engine.clone(),
+            id,
+            turn_guard: self.turn_guard.clone(),
+        }
     }
 }
 
@@ -431,6 +489,146 @@ mod tests {
             };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
+    }
+
+    /// A reusable prose mock: every call answers with the same text (no `take()` — it survives
+    /// multiple turns and multiple client builds).
+    struct ProseMock {
+        text: &'static str,
+    }
+    #[async_trait]
+    impl Provider for ProseMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Chunk::TextDelta(self.text.into()),
+                    Chunk::Block(ContentBlock::Text {
+                        text: self.text.into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    /// D-142: `Storage::dir` makes sessions durable — a second client over the same directory
+    /// resumes the first client's session by id and reads its history.
+    #[tokio::test]
+    async fn storage_dir_persists_and_resumes_a_session() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-store-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_dir = dir.join("state");
+
+        let client = Client::builder()
+            .model("mock")
+            .storage(Storage::dir(&store_dir))
+            .build(Box::new(ProseMock { text: "first" }), &dir)
+            .unwrap();
+        let out = client.run("hello").await.unwrap();
+        assert_eq!(out.text, "first");
+        let id = client.session_id().to_string();
+        drop(client);
+
+        // A "new process": a fresh client over the same storage dir resumes the session.
+        let client = Client::builder()
+            .model("mock")
+            .storage(Storage::dir(&store_dir))
+            .build(Box::new(ProseMock { text: "second" }), &dir)
+            .unwrap();
+        let session = client.open_session(&id).unwrap();
+        let history = session.history().unwrap();
+        assert!(
+            history.len() >= 2,
+            "expected the prior turn's user+assistant messages, got {}",
+            history.len()
+        );
+        let out = session.send("again").await.unwrap();
+        assert_eq!(out.text, "second");
+        assert!(session.history().unwrap().len() > history.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-142: opening an unknown session id errors instead of silently minting a new stream.
+    #[tokio::test]
+    async fn open_session_unknown_id_errors() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::builder()
+            .model("mock")
+            .build(Box::new(ProseMock { text: "x" }), &dir)
+            .unwrap();
+        assert!(client.open_session("no-such-session").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prose mock that records each provider call's (start, end) interval; the body sleeps so
+    /// overlapping turns would produce overlapping intervals.
+    struct SlowRecordingMock {
+        calls: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
+    }
+    #[async_trait]
+    impl Provider for SlowRecordingMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let start = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.calls
+                .lock()
+                .unwrap()
+                .push((start, std::time::Instant::now()));
+            Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Chunk::Block(ContentBlock::Text { text: "ok".into() }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    /// D-142: one engine runs one turn at a time — concurrent `send`s on two sessions of the same
+    /// client serialize on the turn guard instead of interleaving provider calls.
+    #[tokio::test]
+    async fn concurrent_sends_serialize_on_the_turn_guard() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client = Client::builder()
+            .model("mock")
+            .build(
+                Box::new(SlowRecordingMock {
+                    calls: calls.clone(),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let a = client.create_session().unwrap();
+        let b = client.create_session().unwrap();
+        let (ra, rb) = tokio::join!(a.send("one"), b.send("two"));
+        ra.unwrap();
+        rb.unwrap();
+
+        let mut intervals = calls.lock().unwrap().clone();
+        intervals.sort_by_key(|(s, _)| *s);
+        assert_eq!(intervals.len(), 2);
+        assert!(
+            intervals[1].0 >= intervals[0].1,
+            "provider calls overlapped: the turn guard failed to serialize the turns"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

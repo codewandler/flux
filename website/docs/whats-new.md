@@ -12,6 +12,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Embedded agents can now remember.** Point an SDK client at a storage directory and its
+  conversations survive restarts: reopen a session by id and keep talking — including
+  conversations waiting on a human answer, which pick up exactly where they paused. The same
+  directory works with `flux sessions`, `flux replay`, and `flux fork`.
+
 ### Improved
 
 - **A clearer guide to embedding flows.** The public SDK documentation now shows which entry point

@@ -25,6 +25,18 @@ All notable changes to this project are documented in this file. The format is b
   downstream consumer that attributes diagnostics to its own source model (e.g. a canvas NodeMap)
   can read the path directly instead of parsing it back out of the message text. Purely additive;
   the rendered message is unchanged and every existing `Diagnostic` consumer compiles as-is.
+- **D-142: SDK storage injection + the resumable `Session` handle** (sdk-surface wave 1, design
+  `docs/designs/sdk-surface.md`). `flux_sdk::Storage` (`in_memory` | `dir` | `custom`) decides
+  where a `Client`'s sessions live — `Storage::dir` uses the CLI's `events.db`/`flow.db` layout,
+  so SDK-persisted sessions are readable by `flux sessions`/`flux replay`/`flux fork`. `Client`
+  now holds `Arc<FlowEngine>` and hands out cheap cloneable `Session` handles
+  (`create_session`/`open_session`/`latest_session` → `send`/`history`), so an embedded
+  conversation survives a process restart and resumes by id — including a session parked on a
+  top-level `await` (the engine's suspension-first resume). Concurrent `send`s serialize on an
+  internal turn guard (one engine, one active turn — enforced, not just documented).
+  `Client::run`/`session_id` are unchanged (default session still created at build);
+  `event_store()`/`engine()` are the documented escape hatches. `tokio` becomes a real (non-dev)
+  dependency of `flux-sdk`.
 
 ### Changed
 
