@@ -58,6 +58,13 @@
   spoken reply — server-side voice detection can now be configured so the flow's response speaks
   alone.
 
+### Action needed
+
+- **If you embed the SDK and read a client's session id:** the accessor now returns a result you
+  unwrap, because a client's default session is created the first time it's used rather than up
+  front — add error handling to that one call. The change is what lets a client start up without
+  leaving an empty session behind and still resume the right conversation.
+
 ## [0.15.1] - 2026-07-11
 
 ## [0.15.0] - 2026-07-11

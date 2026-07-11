@@ -98,6 +98,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **sdk-surface wave 1 review fixes.** Follow-up hardening of D-142…D-146 from the wave-1 code
+  review: a dropped `TurnStream` now cancels its turn instead of running detached and holding the
+  client's turn slot; the `Client` default session is created lazily (not at build), so a client
+  that never runs leaves no empty session behind and `latest_session()` still points at the real
+  prior conversation; a `tools(subset)` no longer silently drops ops added via `register_op`/
+  `register_pack`; and `FlowClient` no longer opens an unused `events.db` under `Storage::dir`.
+  **BREAKING:** `Client::session_id` now returns `Result<String>` (was `&str`) because the default
+  session is minted on first use — call sites add `?`/`.unwrap()`; `Client::default_session` is
+  likewise fallible (new this cycle).
 - **D-141: public flow-surface documentation.** The SDK website now maps the single self-hosted
   `FlowEngine` through `Client`, `FlowClient`, the Rust DSL, the standalone `flux-lang` library, and
   the advanced `flux-flow` host. The expanded `FlowClient` guide covers builder policy, extension
