@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-11
+
 ### New
 
 - **Embedded agents can now remember.** Point an SDK client at a storage directory and its

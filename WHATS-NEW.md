@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-11
+
 ### New
 
 - **Embedded agents can now remember.** Point an SDK client at a storage directory and its
