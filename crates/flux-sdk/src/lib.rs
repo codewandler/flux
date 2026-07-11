@@ -114,8 +114,13 @@ use flux_flow::engine::FlowEngine;
 use flux_runtime::{Approver, Tool, ToolContext, ToolRegistry};
 use flux_system::{System, Workspace};
 
-/// The result of one `Client::run` turn.
+/// The result of one turn — a [`Client::run`], a [`Session::send`], or a
+/// [`Session::start_flow`](Session::start_flow).
+///
+/// `#[non_exhaustive]`: fields are added as the SDK grows (wave 2 added `suspended`), so construct
+/// it only via the SDK and match with a `..` rest pattern.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct TurnOutput {
     /// The assistant's final text for the turn.
     pub text: String,
@@ -123,6 +128,11 @@ pub struct TurnOutput {
     pub tool_calls: Vec<String>,
     /// Token usage for the turn, if the provider reported it.
     pub usage: Option<Usage>,
+    /// Whether the session is parked on a top-level `await` after this turn — a flow-driven session
+    /// (see [`Session::start_flow`](Session::start_flow)) that suspended, or re-suspended on a later
+    /// `await`. Resume by sending the awaited input with [`Session::send`]. Always `false` for an
+    /// ordinary conversational turn and for a flow that ran to completion.
+    pub suspended: bool,
 }
 
 /// A deferred registry installer (the `register_*` pack convention), applied at `build`.
@@ -1251,6 +1261,179 @@ mod tests {
         .expect("run after drop must not hang — the dropped stream should have cancelled the turn")
         .unwrap();
         assert_eq!(out.text, "done");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A never-planning mock: the deterministic flow skeleton (echo prompts + `await`) invokes no
+    /// planner, so a call here is a bug. Panics if the model is ever hit.
+    struct NeverMock;
+    #[async_trait]
+    impl Provider for NeverMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            panic!("a flow-driven session must not invoke the planner");
+        }
+    }
+
+    /// A minimal custom op that emits its `text` back as the model-facing view — the flow's authored
+    /// prompt. Mirrors the engine's test `EchoTool`.
+    struct EchoTool;
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "echo",
+                "echo text",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+            )
+        }
+        async fn execute(
+            &self,
+            _c: &ToolContext,
+            params: serde_json::Value,
+        ) -> Result<flux_runtime::ToolResult> {
+            Ok(flux_runtime::ToolResult::ok(
+                params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// A two-`await` interview flow: prompt, park, prompt, park, done. `echo` emits each authored
+    /// prompt; `await` parks for the reply.
+    fn interview_flow() -> flux_lang::ast::DraftAst {
+        use flux_lang::ast::{Node, SymbolName};
+        let prompt = |t: &str| Node::Call {
+            op: "echo".into(),
+            args: vec![Node::Lit {
+                value: serde_json::json!(t),
+            }],
+        };
+        let await_reply = |name: &str| Node::Await {
+            binding: Some(SymbolName(name.into())),
+            source: "user_input".into(),
+            as_type: None,
+        };
+        flux_lang::ast::DraftAst {
+            body: vec![
+                prompt("What is your name?"),
+                await_reply("name"),
+                prompt("Nice to meet you. Favorite color?"),
+                await_reply("color"),
+                prompt("All done — thanks!"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// D-147: `Session::start_flow` runs an authored flow to its first top-level `await`, surfaces the
+    /// flow's own authored prompt, and reports `suspended: true`. `send` answers the `await` and
+    /// resumes to the next prompt (still suspended); the final `send` completes the flow and flips
+    /// `suspended` to `false` — a durable human-in-the-loop driven entirely by the SDK's front door.
+    #[tokio::test]
+    async fn start_flow_suspends_surfaces_prompt_and_send_resumes() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-startflow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .register_op(Arc::new(EchoTool))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let session = client.create_session().unwrap();
+
+        // Start the flow: first authored prompt, parked on await #1.
+        let out = session.start_flow(&interview_flow()).await.unwrap();
+        assert!(
+            out.text.contains("What is your name?"),
+            "start_flow surfaces the first authored prompt: {:?}",
+            out.text
+        );
+        assert!(out.suspended, "the flow parked on its first `await`");
+        assert!(
+            session.suspended().unwrap(),
+            "the session reports suspended"
+        );
+
+        // Answer #1: resume to the second authored prompt, still parked (await #2).
+        let out = session.send("Timo").await.unwrap();
+        assert!(
+            out.text.contains("Favorite color?"),
+            "send resumes to the second authored prompt: {:?}",
+            out.text
+        );
+        assert!(out.suspended, "still parked on the second `await`");
+
+        // Answer #2: the flow completes — no more awaits, so `suspended` flips false.
+        let out = session.send("blue").await.unwrap();
+        assert!(
+            out.text.contains("All done"),
+            "the final send completes the flow: {:?}",
+            out.text
+        );
+        assert!(!out.suspended, "a completed flow is no longer suspended");
+        assert!(
+            !session.suspended().unwrap(),
+            "the session reports not suspended"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-147: a flow suspended between two `await`s survives a process restart. Persist with
+    /// `Storage::dir`, drop the whole client (simulating the process ending), rebuild a fresh client
+    /// over the same directory, `open_session` by id, and `send` — the parked flow resumes.
+    #[tokio::test]
+    async fn suspended_flow_survives_a_process_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-sdk-startflow-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let session_id = {
+            let client = Client::builder()
+                .model("mock")
+                .auto_approve(true)
+                .register_op(Arc::new(EchoTool))
+                .storage(Storage::dir(&dir))
+                .build(Box::new(NeverMock), &dir)
+                .unwrap();
+            let session = client.create_session().unwrap();
+            let out = session.start_flow(&interview_flow()).await.unwrap();
+            assert!(out.suspended, "parked on await #1 before the restart");
+            session.id().to_string()
+            // client dropped here — the process "restarts".
+        };
+
+        // Fresh client over the same persistent directory — a new process picking up the session.
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .register_op(Arc::new(EchoTool))
+            .storage(Storage::dir(&dir))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let session = client.open_session(&session_id).unwrap();
+        assert!(
+            session.suspended().unwrap(),
+            "the persisted suspension is visible after the restart"
+        );
+        let out = session.send("Timo").await.unwrap();
+        assert!(
+            out.text.contains("Favorite color?"),
+            "the parked flow resumes across the restart: {:?}",
+            out.text
+        );
+        assert!(out.suspended, "re-parked on await #2");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use flux_core::Message;
 use flux_core::{Result, Usage};
+use flux_flow::ast::DraftAst;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 use flux_runtime::ToolResult;
@@ -50,7 +51,43 @@ impl Session {
         let _turn = self.turn_guard.lock().await;
         let mut sink = Collector::default();
         self.engine.run_turn(&self.id, input, &mut sink).await?;
-        Ok(sink.0)
+        self.finalize(sink.0)
+    }
+
+    /// Drive an authored flow as this session's conversation (D-131). Runs the flow to its first
+    /// top-level `await`, surfaces the flow's own **authored prompt** (its last emitted view) as the
+    /// turn text, and returns with [`suspended`](TurnOutput::suspended) `= true`. Answer the prompt
+    /// with [`send`](Self::send) to resume to the next `await`; a flow that completes without any
+    /// `await` returns its result with `suspended = false`.
+    ///
+    /// Durable: with persistent [`Storage::dir`](crate::Storage::dir) the suspension survives a
+    /// process restart — reopen the session with
+    /// [`Client::open_session`](crate::Client::open_session) and `send` the answer. No planner runs
+    /// for the deterministic skeleton, but every op in the flow still dispatches through the one
+    /// authorization → approval → guarded-IO envelope.
+    pub async fn start_flow(&self, flow: &DraftAst) -> Result<TurnOutput> {
+        let _turn = self.turn_guard.lock().await;
+        let mut sink = Collector::default();
+        self.engine
+            .start_flow_turn(&self.id, flow, &mut sink)
+            .await?;
+        self.finalize(sink.0)
+    }
+
+    /// Whether this session is currently parked on a top-level `await` — i.e. a flow started with
+    /// [`start_flow`](Self::start_flow) suspended and is waiting for the awaited input. Resume by
+    /// sending it with [`send`](Self::send). A **non-consuming** check: it reports the state without
+    /// clearing the suspension.
+    pub fn suspended(&self) -> Result<bool> {
+        self.engine.flow.has_suspension(&self.id)
+    }
+
+    /// Stamp the post-turn suspension state onto a collected [`TurnOutput`]. The suspension is a
+    /// property of the session (persisted by the engine), not a sink event, so every turn door
+    /// reads it back the same way — a flow-driven session reports whether it re-parked or completed.
+    fn finalize(&self, mut out: TurnOutput) -> Result<TurnOutput> {
+        out.suspended = self.engine.flow.has_suspension(&self.id)?;
+        Ok(out)
     }
 
     /// Run one turn, streaming every event to your own [`AgentSink`] as it happens — text and
@@ -72,7 +109,7 @@ impl Session {
         self.engine
             .run_turn_cancellable(&self.id, input, &mut tee, cancel)
             .await?;
-        Ok(tee.collect.0)
+        self.finalize(tee.collect.0)
     }
 
     /// Run one turn as a [`TurnStream`] — a stream of owned
@@ -102,7 +139,11 @@ impl Session {
             engine
                 .run_turn_cancellable(&id, &input, &mut sink, &child)
                 .await?;
-            Ok(sink.collect.0)
+            let mut out = sink.collect.0;
+            // Stamp the post-turn suspension state, exactly as `finalize` does for the awaited
+            // doors — a streamed flow-driven turn reports whether it re-parked or completed.
+            out.suspended = engine.flow.has_suspension(&id)?;
+            Ok(out)
         });
         TurnStream {
             rx,

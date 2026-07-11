@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-147: flow-driven sessions reach the SDK — `Session::start_flow` + `suspended`** (sdk-surface
+  wave 2, design `docs/designs/sdk-surface.md`). The D-131 differentiator — durable
+  human-in-the-loop `await` flows — now has an SDK front door. `Session::start_flow(&DraftAst)`
+  runs an authored flow to its first top-level `await`, surfaces the flow's own authored prompt as
+  the turn text, and returns with `suspended: true`; `Session::send(answer)` resumes to the next
+  `await` (still suspended) or completes the flow (`suspended: false`). `Session::suspended()` is a
+  non-consuming query of the parked state. No planner runs for the deterministic skeleton, but every
+  op still dispatches through the one authorization → approval → guarded-IO envelope. With
+  `Storage::dir` the suspension is durable: a process can build a client, park a flow, exit, and a
+  later process reopens the session by id (`Client::open_session`) and resumes — verified by a
+  restart test that drops the whole client between the two awaits. Both `start_flow` and every turn
+  door (`send`/`send_with`/`stream`) now stamp the post-turn suspension state onto `TurnOutput`
+  through one shared `finalize` seam. `FlowClient`'s one-shot suspension error is retargeted from
+  "drive await flows through the engine" at `Session::start_flow`.
+- **`TurnOutput` gains `suspended: bool` and is now `#[non_exhaustive]`** (BREAKING — MINOR under
+  pre-1.0 SemVer). External code that constructed `TurnOutput` with a struct literal or matched it
+  exhaustively must switch to constructing it only via the SDK and matching with a `..` rest
+  pattern. The attribute future-proofs the type for the remaining wave-2/4 fields.
+
 ## [0.16.1] - 2026-07-11
 
 ### Added

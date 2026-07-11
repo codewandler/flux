@@ -27,7 +27,6 @@ _None._
 ## Next (ready — take the top one unless the user named a story)
 
 ### SDK surface — a standard agent SDK, the flux way
-- [D-147 — Flow-driven sessions front door — Session::start_flow + suspended](D-147-sdk-flow-driven-session-front-door.md) · Agent · wave 2 — the D-131 differentiator reaches the SDK; durable await across restarts
 - [D-148 — Sub-agents on the classic Client](D-148-sdk-client-sub-agents.md) · Agent · wave 2 — with_sub_agents parity; cancellation now reaches the task tool
 - [D-149 — AgentSpec knobs on ClientBuilder — groups, ambient signals, compaction, context budget](D-149-sdk-agent-spec-knobs.md) · Agent · wave 2 — evidence-gated tool surfacing + compaction control for embedders
 - [D-150 — ExecutionResult.usage — flow runs report token spend](D-150-flow-execution-usage.md) · Agent · wave 2 — flux-cognition drops per-call usage today; surface + sum it
@@ -321,6 +320,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-144 — Streaming, bring-your-own-sink — AgentSink re-export + Session::send_with](D-144-sdk-agent-sink-send-with.md) · Agent · wave 1 — the minimal streaming door: consumer sink + cancellation token
 - [D-145 — Owned event stream — AgentEvent + TurnStream with cancel/finish](D-145-sdk-agent-event-turn-stream.md) · Agent · wave 1 — async-iterator streaming over a spawned cancellable turn
 - [D-146 — Re-export sweep — one import for every public-signature type](D-146-sdk-reexport-sweep.md) · Agent · wave 1 closer — ends the 4-5-crate dependency scavenger hunt
+- [D-147 — Flow-driven sessions front door — Session::start_flow + suspended](D-147-sdk-flow-driven-session-front-door.md) · Agent · wave 2 — the D-131 differentiator reaches the SDK; durable await across restarts
 - [D-160 — web.crawl — a bounded, SSRF-guarded crawl primitive](D-160-web-crawl-primitive.md) · Agent · downstream ask (ai-agent-platform, consumer ask A-44): a bounded, SSRF-guarded web.crawl op — seed + same-host link-following under page/depth caps — reversing the web-capabilities crawling non-goal
 - [D-161 — web_fetch extracts text from PDFs instead of returning raw bytes](D-161-web-fetch-pdf-extraction.md) · Agent · downstream ask (ai-agent-platform, consumer ask A-47): web_fetch on a PDF returns extracted text, not raw lossy bytes — a content-type/%PDF branch in the non-HTML path; lifts part of the grounded-knowledge binary-extraction deferral for the web path only
 - [D-162 — Provider embeddings pack — explicit config, per-source routing, usage capture](D-162-provider-embeddings-pack.md) · Core · downstream ask (ai-agent-platform): make the embeddings seam production-ready — explicit-config OpenAiEmbedder constructor + per-source embedder/model routing + embed-usage capture; Bedrock embeddings and pgvector are explicit stretch

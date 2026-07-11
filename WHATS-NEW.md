@@ -15,6 +15,23 @@
 
 ## [Unreleased]
 
+### New
+
+- **Embedded agents can now run guided, resumable conversations.** An application can hand an
+  embedded session an authored flow — a scripted interview or wizard that asks a question, waits for
+  the person's answer, then asks the next — and drive it turn by turn. Each turn tells you whether
+  the conversation is still waiting on an answer, and with a storage directory the wait is durable:
+  the process can pause, exit, and a later run reopens the session by id and continues exactly where
+  it left off. No model call is spent on the scripted questions, and every action the flow takes
+  still passes through flux's safety and approval checks.
+
+### Action needed
+
+- **Embedding flux? The turn result type gained a field.** The result an embedded turn returns now
+  carries a `suspended` flag (whether the conversation is waiting on an answer) and is marked
+  non-exhaustive. If your code built that result by hand or matched all of its fields, add a `..`
+  catch-all — a one-line change. Nothing changes for code that only reads the result.
+
 ## [0.16.1] - 2026-07-11
 
 ### New

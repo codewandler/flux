@@ -634,15 +634,16 @@ fn join_diags(diags: &[Diagnostic]) -> String {
 }
 
 /// Fold a finished `execute_flow` outcome into an [`ExecutionResult`], surfacing a top-level `await`
-/// suspension as an error: the one-shot SDK path has no resume hook, so a half-run suspended flow (its
-/// prefix's side effects fired, the remainder never will) is reported rather than silently returned —
-/// cross-turn `await` flows belong on the engine. Shared by [`FlowClient::execute`] and
-/// [`FlowClient::execute_with`] so the two can't drift.
+/// suspension as an error: the one-shot `FlowClient` path has no resume hook, so a half-run suspended
+/// flow (its prefix's side effects fired, the remainder never will) is reported rather than silently
+/// returned — durable cross-turn `await` flows belong on the resumable session door. Shared by
+/// [`FlowClient::execute`] and [`FlowClient::execute_with`] so the two can't drift.
 fn finish_outcome(outcome: FlowOutcome, sink: ExecSink) -> Result<ExecutionResult> {
     if let Some(susp) = &outcome.suspension {
         return Err(Error::Other(format!(
-            "flow suspended on a top-level `await` (source `{}`); the one-shot SDK `execute` path does \
-             not support cross-turn resume — drive await flows through the engine instead",
+            "flow suspended on a top-level `await` (source `{}`); the one-shot `FlowClient::execute` \
+             path does not resume across turns — drive durable await flows through \
+             `Session::start_flow` instead",
             susp.source
         )));
     }
