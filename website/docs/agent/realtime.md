@@ -6,9 +6,11 @@ description: "Experimental realtime voice model seam, session lifecycle, and saf
 # Realtime voice (experimental)
 
 Realtime support is an SDK-level experimental surface for full-duplex voice models. It is not the
-normal text agent loop, and it does not turn each utterance into a Flux-Lang plan. It exists for
-embedders that need a long-lived audio session while still routing effectful tool calls through the
-guarded executor.
+normal text agent loop, and in its default mode it does not turn each utterance into a Flux-Lang
+plan. It exists for embedders that need a long-lived audio session while still routing effectful
+tool calls through the guarded executor. Since 0.15.0 the driver has a second, **flow-driven** mode:
+an authored flow owns the call and the realtime model is only the acoustic front-end (see
+[Flow-driven voice](#flow-driven-voice) below).
 
 The public shape is `RealtimeProvider`, a sibling of the half-duplex [`Provider`](./providers.md).
 The concrete OpenAI implementation is behind the `realtime` cargo feature on `flux-providers`.
@@ -24,7 +26,9 @@ The concrete OpenAI implementation is behind the `realtime` cargo feature on `fl
   `openai_realtime_from_env()` (reads `OPENAI_KEY`, then `OPENAI_API_KEY`), or
   `openai_realtime_oauth(token)`. The default model id is `gpt-realtime`.
 - **The driver** — `VoiceSessionDriver` in `flux-flow` runs the session event loop and feeds a
-  `VoiceSink` (your callbacks for audio frames, transcripts, tool events, barge-in).
+  `VoiceSink` (your callbacks for audio frames, transcripts, tool events, barge-in, and — since
+  0.15.0 — `session_ended` when a flow-driven call completes). Beside the default model-driven
+  entry it exposes `run_flow_turns`, where a `VoiceTurnHandler` on your side owns each turn.
 - **The same safety envelope.** Every tool call the voice model makes is dispatched through the
   runtime's `Executor::dispatch` — the identical [permission / approval / redaction
   chain](./safety.md) a text turn uses, with no bypass path. Tools are declared to the model once,
@@ -64,6 +68,27 @@ client.run_voice_session(&provider, config, &mut sink, &cancel).await?;
 drives the session until `cancel` fires or the connection ends. Your `VoiceSink` receives the output
 half; you push caller audio through the session handle.
 
+## Flow-driven voice
+
+Since 0.15.0 an **authored flow can drive the call** instead of the model: the driver speaks the
+flow's authored prompts (TTS via the realtime channel), the caller's reply resumes the flow's
+suspension, and the model does cognition only where the flow explicitly delegates a bounded
+segment (`ai_segment` — see [durability and sessions](../language/durability.md)). Classic-IVR
+determinism over the same voice stack: the deterministic skeleton makes **zero** model planning
+calls, and when the flow completes the driver speaks the final line, fires
+`VoiceSink::session_ended` (your hangup/handoff hook), and ends the session.
+
+The entry point is driver-level: `VoiceSessionDriver::run_flow_turns` with an
+`EngineVoiceHandler` — a `VoiceTurnHandler` backed by a `FlowEngine` (which server/embedding hosts
+already hold; a `FlowClient` convenience wrapper is a planned follow-up). Each turn the handler
+returns a `VoiceReply`: `Continue(text)` (speak this, await the caller) or `Complete(text)` (speak
+this final line, end the call). Ops a voice-driven flow dispatches traverse the engine's shared
+executor — the same envelope as a text turn — and barge-in is unchanged.
+
+**Breaking in 0.15.0:** `VoiceTurnHandler::turn` returns `VoiceReply` instead of `String` — return
+`VoiceReply::Continue(text)` for the old behavior. The new `start()` (speak first) and
+`VoiceSink::session_ended` hooks have defaults, so existing implementations only adjust `turn`.
+
 ## Status and limits
 
 - **Experimental.** The traits and event shapes are pre-1.0 and have already changed in breaking
@@ -72,10 +97,11 @@ half; you push caller audio through the session handle.
   voice session, and `.flux` programs cannot declare one.
 - **One provider.** OpenAI Realtime is the only implementation; the seam is provider-shaped so
   others can land, but none have.
-- **The model owns the turn.** Unlike text turns, there is no plan/DAG indirection per utterance —
+- **In the default mode, the model owns the turn.** There is no plan/DAG indirection per utterance —
   sub-second turn-taking cannot round-trip a planner. flux's guarantee here is narrower and
   deliberate: every *effectful action* still crosses the guarded executor envelope, and the audit
-  trail still records it.
+  trail still records it. The [flow-driven mode](#flow-driven-voice) inverts this: the flow owns the
+  turn, and the model speaks only inside a bounded, tool-scoped segment.
 - **Audio transport is yours.** flux does no telephony, WebRTC, or device IO; it exchanges
   model-native audio bytes and leaves capture, playout, and resampling to the embedding application
   (with `flux-audio` available as a utility).

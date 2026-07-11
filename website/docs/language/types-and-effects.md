@@ -67,6 +67,14 @@ Operations also declare their own effects host-side; the annotation is the plan 
 declaration of intent on a specific bind. See [Safety & approvals](../agent/safety.md) for how
 effects feed the approval chain.
 
+Tooling can ask **where** a flow's risk lives, per node: since 0.15.0,
+`flux_lang::analyze::annotate_effects(&ast, &ops)` returns, for every `call` node (keyed by the
+same node path diagnostics use, e.g. `body[3].then[1]`), its combined effects — the op's own
+host-declared effects plus the `@effect(tag)` on its enclosing bind — with a risk tier and
+idempotency. It is the per-node, attributed sibling of the flow-level effects union the approval
+envelope consumes, so a visual editor or reviewer can pin exactly which call moves money instead
+of only knowing that something in the flow does.
+
 ## Prelude artifact types
 
 The prelude is an opt-in ontology of the artifacts agent work manipulates — claims, evidence,

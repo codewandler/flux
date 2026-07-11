@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs caught up with the 0.15.0 flows-arc.** `ai_segment` joins the reflexive-op documentation
+  everywhere the family is enumerated (`crates/flux-flow/docs/ops-reference.md` — full
+  signature/return/scoping row — plus `docs/agent-loop.md` and `docs/architecture.md`);
+  the agent-loop and architecture docs now describe the inverted, flow-driven session mode
+  (`FlowEngine::start_flow_turn`, text + voice) with pointers to both designs; the architecture
+  crate map credits `flux-flow`'s voice driver; `docs/roadmap.md`'s status header is current
+  (0.15.0, crates.io publish shipped); and `docs/usage.md` documents `flux auth login codex`
+  as the expired-login recovery path the new auth error points to.
+- **Website docs caught up too.** `agent/realtime.md` no longer claims the model always owns the
+  turn — it documents the flow-driven voice mode (`run_flow_turns`/`EngineVoiceHandler`) and the
+  0.15.0 `VoiceReply` breaking change; `language/durability.md` gains a "Flow-driven sessions"
+  section (the `await`-as-conversation model + the `ai_segment` reflexive op); `agent/agent-loop.md`
+  introduces `ai_segment` as the third reflexive op; `language/types-and-effects.md` and
+  `sdk/flow-client.md` document `annotate_effects`; `troubleshooting.md` gains an
+  expired-subscription-login entry.
+
 ## [0.15.0] - 2026-07-11
 
 ### Added

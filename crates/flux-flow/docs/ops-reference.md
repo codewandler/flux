@@ -136,7 +136,8 @@ their own dispatch). See [`flux-lang-evolution.md`](../../../docs/designs/flux-l
 
 The turn loop is itself a Flux-Lang flow — `crates/flux-flow/assets/agent-loop.flux` — and these ops are
 what let it call the model and run plans reflexively. They are how flux-lang self-hosts the agent loop:
-`plan` re-enters the planner, `run_plan` re-enters the interpreter (over the same session + envelope), and
+`plan` re-enters the planner, `run_plan` re-enters the interpreter (over the same session + envelope),
+`ai_segment` runs a bounded, tool-scoped sequence of the two on behalf of a deterministic flow, and
 the evidence ops let the loop emit and read its own runtime observations and grade outcomes. Every one
 still dispatches through the same `Executor` envelope — no bypass.
 
@@ -155,6 +156,7 @@ runs as the execute pass's first iteration.
 |---|---|---|
 | `plan` | `[feedback, phase]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?, settled}` (JSON). `phase` is `"orient"`/`"gather"`/`"execute"` — absent or unrecognized behaves as `"execute"` (byte-compatible with a phase-less/pre-A-14 caller, e.g. an ejected loop). `complete` is the model's completion directive (`{primer?, instructions}`) or `null`. The model stays the planner; this wraps the compile step. |
 | `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?, failure}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. `failure` is `null` when this round ran clean; otherwise a reified mid-plan halt (design [`multipass-agent-loop.md`](../../../docs/designs/multipass-agent-loop.md) Part 2) — `{node, stmt, op, kind, fatal, message, plan, completed[]}` — that a corrected re-emission fast-forwards the matching completed prefix of (A-16/A-17; never propagated as `Err`). When the plan carried `complete` and ran to success, the **next** `plan` call renders the final message from the results (a toolless model call) and returns it as `{kind: "chat"}` — the complete fast-path. |
+| `ai_segment` | `goal, tools, max_rounds[, until]` | Delegate a **bounded segment** of model turns from inside a deterministic flow (D-131, design [`flow-driven-session.md`](../../../docs/designs/flow-driven-session.md)) → `{result}` (the segment's final answer: its closing prose, or the last non-empty round result). The `goal` is fed to the planner each round; the delegated leaf ops are confined to `tools` for the segment's lifetime (a cap-scope dispatch floor **and** a restricted advertised catalog, so an out-of-scope op is refused and never even emitted); the run is capped at the required `max_rounds` and exits early on natural completion (a prose/error plan) or the optional `until` symbol becoming bound to a non-empty value in the session. Planner spend folds into the enclosing turn's usage. |
 | `op.register` | `source, scope[, replace, expose]` | Register exactly one top-level Flux-Lang composite `op` for later reuse. `scope` is `turn`, `session`, `project`, or `global`; project/global writes are guarded filesystem writes, and all registered inner ops still dispatch through the normal envelope. |
 | `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). The loop itself emits `loop.phase` (at every `plan` entry, payload `{phase}`), `flow.brief` (the moment a `brief` is accepted, payload `{goal, needs}`), `turn.gather` (each gather round's `Outcome`), `turn.iteration` (each clean execute round's `Outcome`), and `turn.revision` (an execute round whose `Outcome.failure` was set — A-17). `run_plan` itself streams (not through this log) `flow.plan` (the compiled plan tree — `resumed`/`gather`/`phase` flags let a surface render it correctly) and, on a halt, `flow.halt` (`{step, of, op, kind, fatal}`, a real-time cue distinct from the fed-back transcript text). |
 | `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log) — so a flow can branch on what has happened so far. |
@@ -166,9 +168,10 @@ prepended to every subsequent `plan` call's feedback message (not just the immed
 multi-round gather — or the execute phase that follows it — never loses the thread. It resets at the
 start of the next turn.
 
-**Visibility:** `plan`/`run_plan` are tagged to a never-surfaced `reflect` group, so the model never sees
-them in its catalog — only a pre-authored flow (the agent loop, or `flux flow run`) can call them, and only
-when a `LoopHost` is installed (the engine installs one per turn). `op.register` is a model-facing root op,
+**Visibility:** `plan`/`run_plan`/`ai_segment` are tagged to a never-surfaced `reflect` group, so the
+model never sees them in its catalog — only a pre-authored flow (the agent loop, a flow-driven session,
+or `flux flow run`) can call them, and only when a `LoopHost` is installed (the engine installs one per
+turn, and the flow-driven paths — `start_flow_turn`/`resume_suspended` — arm it too). `op.register` is a model-facing root op,
 available only when the engine installs a composite registrar. `observe`/`evidence`/`metrics` are ordinary
 builtins; `grade` is in the evidence-gated `eval` group. `flow_list`/`flow_run` (registered by the CLI
 host's `flux_tools::register_flows`, not base `register_builtins`) are **model-facing**; `flow_run` also

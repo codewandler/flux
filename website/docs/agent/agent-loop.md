@@ -19,6 +19,11 @@ compiles your request into a typed [Flux-Lang](../language/overview.md) graph (o
 checks described in [Concepts](../concepts.md). The resulting transcript is fed back so the next
 `plan` call sees what happened. The loop ends when the model answers in prose.
 
+A third reflexive op, `ai_segment` (0.15.0), serves the loop run in reverse: a
+[flow-driven session](../language/durability.md#flow-driven-sessions--await-as-the-conversation),
+where an authored flow owns the conversation and delegates only bounded, tool-scoped segments of
+model turns. Same ops, same envelope, opposite ownership.
+
 ## Three passes
 
 The loop runs in three phases, and a turn only pays for the passes it needs.

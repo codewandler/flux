@@ -1,8 +1,9 @@
 # flux — roadmap & status
 
-Status as of **0.8.0 (2026-07-08)**: public + installable at
-[codewandler/flux](https://github.com/codewandler/flux); 35 crates, **1900+ tests** across the root
-and `plugins/` workspaces, a permanently green
+Status as of **0.15.0 (2026-07-11)**: public + installable at
+[codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
+(`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **1900+ tests** across
+both workspaces, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
 design.
@@ -807,7 +808,9 @@ Drift made visible, so it stops being silent. Each maps to a story on the
 - ~~**Two turn loops.**~~ ✅ done — every surface (CLI/TUI/server/SDK) runs the pure-DAG
   `FlowEngine`; the classic Rust loop is retired. → [A-01](stories/A-01-unify-flowengine.md).
 - ~~**Crate consolidation phases 2–4**~~ ✅ done (35 → 31). → [C-01](stories/C-01-crate-consolidation.md).
-- **crates.io publish** blocked on the `flux-core` name (needs a vanity prefix); deferred.
+- ~~**crates.io publish** blocked on the `flux-core` name~~ ✅ done — the whole publish closure ships
+  as vanity-prefixed `codewandler-flux-*` (import paths unchanged), published by CI on every version
+  tag (`scripts/publish-crates-io.sh` is the ordered, idempotent source of truth).
 - **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result.
   → [I-01](stories/I-01-headline-gain.md).
 - ~~**No cost tracking.**~~ ✅ done — per-call usage is attributed (`CallUsage`, canonical

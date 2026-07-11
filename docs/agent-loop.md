@@ -90,9 +90,16 @@ time (`✗ step 4/9 edit failed — revising…`) and the resumed plan's reused 
 A denied/refused statement is never silently re-dispatched unchanged; the model must choose a
 different approach.
 
-These reflexive ops — `plan`/`run_plan` plus the evidence ops
+These reflexive ops — `plan`/`run_plan`/`ai_segment` plus the evidence ops
 `observe`/`evidence`/`metrics`/`grade` — are documented in
 [`crates/flux-flow/docs/ops-reference.md`](../crates/flux-flow/docs/ops-reference.md).
+
+The loop also runs **inverted**: a flow-driven session (`FlowEngine::start_flow_turn`) makes an
+authored flow the conversation driver — its authored prompts are the assistant turns, resumes are
+deterministic, and the model is consulted only where the flow delegates a bounded
+`ai_segment(goal, tools, max_rounds, until?)`. Same ops, same envelope, opposite ownership. Design:
+[`designs/flow-driven-session.md`](designs/flow-driven-session.md) (and
+[`designs/flow-driven-voice.md`](designs/flow-driven-voice.md) for the realtime/voice channel).
 
 By design the loop is **invisible** during a normal turn: the machinery ops are filtered from the
 surface so you see the real work (`read`/`edit`/`bash`/…), not the plumbing. The commands below let
@@ -233,8 +240,9 @@ control flow entirely — all within the same envelope.
 ## How it fits together
 
 - **The loop is a plan**, not Rust — `assets/agent-loop.flux`, overridable per workspace.
-- **The reflexive ops** (`plan`/`run_plan`) are tagged to a never-surfaced `reflect` group, so the
-  model never sees them; only a pre-authored flow (the loop, or `flux flow run`) can call them.
+- **The reflexive ops** (`plan`/`run_plan`/`ai_segment`) are tagged to a never-surfaced `reflect`
+  group, so the model never sees them; only a pre-authored flow (the loop, a flow-driven session, or
+  `flux flow run`) can call them.
 - **Everything still dispatches through `Executor`** — the no-bypass safety envelope holds
   recursively, even for a plan that runs a plan.
 

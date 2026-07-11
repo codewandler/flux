@@ -23,6 +23,18 @@ flux auth status          # shows every provider, what it needs, and where it re
 Set the environment variable, or run `flux auth login claude` / `flux auth login codex` for the
 subscription paths. See [Providers and models](./agent/providers.md) for the full matrix.
 
+## flux reports an auth error refreshing a stored login
+
+A subscription login (`claude`, `codex`) stores a refresh token, and refresh tokens expire or get
+revoked. When that happens mid-turn, flux surfaces the provider's actual reason and the fix in the
+error itself — sign in again to mint a fresh token:
+
+```bash
+flux auth login codex     # or: flux auth login claude
+```
+
+Nothing else needs resetting; the stored credential is replaced in place.
+
 ## I want to try flux without credentials
 
 Use the offline `mock` provider — it drives the full plan/execute pipeline with no network, returning

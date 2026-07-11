@@ -73,7 +73,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 ### Agent pillar
 | Crate | Layer | Role | Disposition |
 |---|---|---|---|
-| `flux-flow` | L3 | the FlowEngine (the one turn loop) + the `AgentSink` streaming trait: compile NL→plan, execute the DAG, session store | — |
+| `flux-flow` | L3 | the FlowEngine (the one turn loop) + the `AgentSink` streaming trait: compile NL→plan, execute the DAG, session store; also the realtime voice driver (`voice/`) — model-driven or deferring to flow suspensions | — |
 | `flux-agent` | L3 | the Agent pillar: `AgentSpec` + markdown `Role` definitions, assembled onto `FlowEngine` | — |
 | `flux-orchestrate` | L3 | sub-agents + multi-agent orchestration | — |
 | `flux-cognition` | L3 | model-backed ops (`ai.extract` / `rank` / `judge` / …) | — |
@@ -165,9 +165,13 @@ provider is a small composition, never a fork of the loop. Streaming is a
   *bootstrap* that runs `crates/flux-flow/assets/agent-loop.flux` — the loop logic lives in flux-lang, not
   Rust. Each turn that flow does: `plan` (re-enter the planner → a typed graph or a prose answer) →
   `match` on the result → `run_plan` (execute the graph through the same envelope) → feed the transcript
-  back as `$feedback` → repeat until the model answers in prose. The reflexive ops `plan`/`run_plan` and
-  the evidence ops `observe`/`evidence`/`grade`/`metrics` are what let the loop call the model and reason
-  over its own runtime evidence (see `flux-flow/docs/ops-reference.md`). A workspace can override the loop
+  back as `$feedback` → repeat until the model answers in prose. The reflexive ops
+  `plan`/`run_plan`/`ai_segment` and the evidence ops `observe`/`evidence`/`grade`/`metrics` are what let
+  the loop call the model and reason over its own runtime evidence (see
+  `flux-flow/docs/ops-reference.md`). The same engine also runs the loop **inverted**: a flow-driven
+  session (`FlowEngine::start_flow_turn`, design `docs/designs/flow-driven-session.md`) makes an authored
+  flow the conversation driver — over text or the realtime voice channel (`docs/designs/flow-driven-voice.md`)
+  — with the model consulted only inside a bounded, tool-scoped `ai_segment`. A workspace can override the loop
   with its own `.flux/agent-loop.flux`. The loop is cancellable (a `CancellationToken`). This is the
   **one** turn loop everywhere — CLI/server/TUI, the SDK (`flux_sdk::Client` assembles a `FlowEngine`
   via `AgentSpec`; `flux_sdk::FlowClient` is the declarative flow door), and sub-agents

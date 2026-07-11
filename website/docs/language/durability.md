@@ -71,6 +71,29 @@ re-executed.
 `await` is **top-level only**: the analyzer rejects it nested inside `when`/`each`/`repeat`
 bodies, because v1 keeps resume cursors simple and stable.
 
+### Flow-driven sessions — `await` as the conversation
+
+Since 0.15.0 the same suspend/resume machinery can drive a whole conversation: a **flow-driven
+session** runs an authored flow to its first top-level `await`, surfaces the flow's own authored
+prompt (its last emitted view) as the assistant turn, and resumes deterministically on each user
+reply — zero model calls for the scripted skeleton, over text or the
+[realtime voice channel](../agent/realtime.md#flow-driven-voice) (where the prompts are spoken and
+the caller's reply resumes the flow).
+
+Where the flow *does* want model judgment, it delegates a bounded segment:
+
+```flux
+$slot = ai_segment({goal: "Find a free 30-minute slot the caller accepts",
+                    tools: ["calendar.read"], max_rounds: 3, until: "slot"})
+```
+
+`ai_segment(goal, tools, max_rounds, until?)` hands the model a goal for at most `max_rounds`
+planning rounds, confined to `tools` (an out-of-scope op is refused and never runs), exiting early
+on a prose answer or when the `until` symbol becomes bound to a non-empty value — then control
+returns to the flow. It is a reflexive op like `plan`/`run_plan`: never advertised to the model,
+callable only from a pre-authored flow, and everything it dispatches crosses the same approval
+envelope.
+
 ## `checkpoint` — durable resume point
 
 ```flux

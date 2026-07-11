@@ -29,6 +29,11 @@ let out = client.execute(&ast).await?;      // ExecutionResult: result, transcri
 `run(text)` is the one-call convenience pipeline (`compile → analyze → execute`); a failed analysis
 aborts before any side effect.
 
+For per-node effect/risk annotation — which call in a flow moves money, writes, deletes —
+`flux_lang::analyze::annotate_effects(&ast, &ops)` (0.15.0) is the analysis sibling: it returns an
+`EffectAnnotation` (`{effects, risk, idempotency}`) per `call` node, keyed by the node paths
+diagnostics already use. See [Types & effects](../language/types-and-effects.md#effects).
+
 Inputs can be seeded as flow variables for stored flows: `execute_with(&ast, inputs)` injects them
 before the run, and `analyze_seeded(&ast, names)` analyzes the flow as it will actually run under that
 seeding. Seeding data does not grant capabilities; operation dispatch still uses the same policy and
