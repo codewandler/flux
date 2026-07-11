@@ -37,6 +37,16 @@ All notable changes to this project are documented in this file. The format is b
   `Client::run`/`session_id` are unchanged (default session still created at build);
   `event_store()`/`engine()` are the documented escape hatches. `tokio` becomes a real (non-dev)
   dependency of `flux-sdk`.
+- **D-143: Client envelope parity — custom tools, injected approver, tool subset** (sdk-surface
+  wave 1). `ClientBuilder` gains `register_op`/`register_pack` (custom ops join the same gated
+  registry — registration grants existence, not permission), `approver(Arc<dyn Approver>)` (the
+  risk-aware policy seam `FlowClient` already had), `tools(subset)` (`AgentSpec::tools` — ops
+  outside the subset are absent, not hidden), `with_cognition` (the `ai.*`/`synth` pack on the
+  conversational door), and `from_spec(AgentSpec)` (full control: bare envelope, no implicit
+  `read` pre-allow, explicit skills respected). Internally the builder is now `{AgentSpec,
+  Envelope}` with the envelope knobs factored into one module shared with `FlowClientBuilder`,
+  which also gains `storage()` (durable `once`/`checkpoint` state). `flux-spec` is promoted to a
+  real `flux-sdk` dependency (implementing `Tool::spec`/`Approver::request` needs it).
 
 ### Changed
 

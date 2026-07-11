@@ -27,7 +27,6 @@ _None._
 ## Next (ready — take the top one unless the user named a story)
 
 ### SDK surface — a standard agent SDK, the flux way
-- [D-143 — Client envelope parity — custom tools, injected approver, tool subset](D-143-sdk-client-envelope-parity.md) · Agent · wave 1 — the FlowClient knobs the classic door is missing
 - [D-144 — Streaming, bring-your-own-sink — AgentSink re-export + Session::send_with](D-144-sdk-agent-sink-send-with.md) · Agent · wave 1 — the minimal streaming door: consumer sink + cancellation token
 - [D-145 — Owned event stream — AgentEvent + TurnStream with cancel/finish](D-145-sdk-agent-event-turn-stream.md) · Agent · wave 1 — async-iterator streaming over a spawned cancellable turn
 - [D-146 — Re-export sweep — one import for every public-signature type](D-146-sdk-reexport-sweep.md) · Agent · wave 1 closer — ends the 4-5-crate dependency scavenger hunt
@@ -315,6 +314,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-140 — TurnDetection::ServerVad needs a create_response:false knob for flow-driven voice](D-140-servervad-create-response-knob.md) · Agent · downstream ask (ai-agent-platform R-20 voice, flows arc ask 6): D-132's run_flow_turns doc says 'server-VAD with response creation off', but the seam TurnDetection and the OpenAI wire TurnDetection carry no create_response — a live flow-driven session's model auto-reply races the flow's spoken prompt
 - [D-141 — Document the public flow surfaces](D-141-document-public-flow-surfaces.md) · Agent · Map Flux-Lang, FlowEngine, Client, FlowClient, the Rust DSL, and advanced flow hosts in the public docs.
 - [D-142 — SDK storage injection + the resumable Session handle](D-142-sdk-storage-and-session-handle.md) · Agent · wave 1 foundation — unlocks resume, suspensions, flow-driven voice, time machine
+- [D-143 — Client envelope parity — custom tools, injected approver, tool subset](D-143-sdk-client-envelope-parity.md) · Agent · wave 1 — the FlowClient knobs the classic door is missing
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this

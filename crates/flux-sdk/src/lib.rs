@@ -26,6 +26,7 @@
 //! ```
 #![warn(missing_docs)]
 
+mod envelope;
 pub mod flow;
 pub mod session;
 pub mod storage;
@@ -50,13 +51,14 @@ pub mod recipes;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_agent::{AgentSpec, Permissions, DEFAULT_SYSTEM_PROMPT};
+use flux_agent::AgentSpec;
+use flux_cognition::CognitionPack;
 use flux_core::ContextBlock;
 use flux_core::{Result, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_provider::Provider;
-use flux_runtime::{AllowApprover, Approver, DenyApprover, ToolContext, ToolRegistry};
+use flux_runtime::{Approver, Tool, ToolContext, ToolRegistry};
 use flux_system::{System, Workspace};
 
 /// The result of one `Client::run` turn.
@@ -70,74 +72,123 @@ pub struct TurnOutput {
     pub usage: Option<Usage>,
 }
 
-/// Builder for a [`Client`].
+/// A deferred registry installer (the `register_*` pack convention), applied at `build`.
+type RegistryPack = Box<dyn FnOnce(&mut ToolRegistry)>;
+
+/// Builder for a [`Client`]. Internally an [`AgentSpec`] plus the shared envelope knobs, so every
+/// agent-definition field has exactly one home and [`from_spec`](Self::from_spec) is the
+/// full-control escape hatch rather than a parallel path.
 pub struct ClientBuilder {
-    model: String,
-    system_prompt: Option<String>,
-    max_tokens: u32,
-    max_iterations: usize,
-    allow: Vec<String>,
-    deny: Vec<String>,
-    auto_approve: bool,
-    context: Vec<ContextBlock>,
-    sandbox: Option<Sandbox>,
+    spec: AgentSpec,
+    envelope: envelope::Envelope,
     storage: Option<Storage>,
+    cognition: bool,
+    ops: Vec<Arc<dyn Tool>>,
+    packs: Vec<RegistryPack>,
 }
 
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
-            model: "unknown".to_string(),
-            system_prompt: None,
-            max_tokens: 4096,
-            max_iterations: 25,
+            spec: AgentSpec::new("unknown"),
             // Reads pre-allowed; everything else denied unless `auto_approve` (no UI in a library).
-            allow: vec!["read".to_string()],
-            deny: Vec::new(),
-            auto_approve: false,
-            context: Vec::new(),
-            // Unset ⇒ resolve the posture from the environment at `build` (off ⇒ disabled).
-            sandbox: None,
+            envelope: envelope::Envelope::with_default_allow(&["read"]),
             // Unset ⇒ in-memory (ephemeral) stores, the pre-0.16 behavior.
             storage: None,
+            cognition: false,
+            ops: Vec::new(),
+            packs: Vec::new(),
         }
     }
 }
 
 impl ClientBuilder {
+    /// Start from a hand-built [`AgentSpec`] — the full-control escape hatch. The spec's own
+    /// permissions are taken as-is (no implicit `read` pre-allow); builder methods overlay on top.
+    /// A spec with explicit `skills` keeps them; an empty `skills` still gets default-dir discovery
+    /// at [`build`](Self::build).
+    pub fn from_spec(spec: AgentSpec) -> Self {
+        Self {
+            spec,
+            envelope: envelope::Envelope::bare(),
+            storage: None,
+            cognition: false,
+            ops: Vec::new(),
+            packs: Vec::new(),
+        }
+    }
     /// Set the model id every turn uses.
     pub fn model(mut self, m: impl Into<String>) -> Self {
-        self.model = m.into();
+        self.spec.model = m.into();
         self
     }
     /// Override the system prompt (defaults to the agent's built-in prompt).
     pub fn system_prompt(mut self, s: impl Into<String>) -> Self {
-        self.system_prompt = Some(s.into());
+        self.spec.system_prompt = s.into();
         self
     }
     /// Cap the max output tokens per model call.
     pub fn max_tokens(mut self, n: u32) -> Self {
-        self.max_tokens = n;
+        self.spec.max_tokens = n;
         self
     }
     /// Cap the agent loop's tool-calling iterations per turn.
     pub fn max_iterations(mut self, n: usize) -> Self {
-        self.max_iterations = n;
+        self.spec.max_iterations = n;
         self
     }
     /// Add a permission allow rule (e.g. `"write"`, `"Bash(git:*)"`).
     pub fn allow(mut self, rule: impl Into<String>) -> Self {
-        self.allow.push(rule.into());
+        self.envelope.allow.push(rule.into());
         self
     }
     /// Add a permission deny rule (takes precedence over allow rules).
     pub fn deny(mut self, rule: impl Into<String>) -> Self {
-        self.deny.push(rule.into());
+        self.envelope.deny.push(rule.into());
         self
     }
     /// Approve every tool call automatically (no human in the loop). Use with care.
     pub fn auto_approve(mut self, yes: bool) -> Self {
-        self.auto_approve = yes;
+        self.envelope.auto_approve = yes;
+        self
+    }
+    /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
+    /// allow of [`auto_approve`](Self::auto_approve) and the headless default deny (e.g. a
+    /// risk-aware confirm gate). Overrides `auto_approve`. The same seam
+    /// [`FlowClientBuilder::approver`](crate::FlowClientBuilder::approver) and the sub-agent
+    /// spawner already have, now on the conversational door.
+    pub fn approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.envelope.approver = Some(approver);
+        self
+    }
+    /// Register a custom op (any [`Tool`], e.g. one built with `flux_runtime::tool_fn`) alongside
+    /// the built-ins. Registered ops dispatch through the same authorization → approval → guarded
+    /// IO envelope as every other op — registration grants existence, not permission.
+    pub fn register_op(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.ops.push(tool);
+        self
+    }
+    /// Register a whole pack of ops via a closure over the registry (the `register_*` convention
+    /// used across flux). Same envelope rules as [`register_op`](Self::register_op).
+    pub fn register_pack<F: FnOnce(&mut ToolRegistry) + 'static>(mut self, pack: F) -> Self {
+        self.packs.push(Box::new(pack));
+        self
+    }
+    /// Restrict the agent to a subset of the registry's ops by name (`AgentSpec::tools`). Ops
+    /// outside the subset are not just hidden — they are absent from this agent's registry.
+    pub fn tools<I, S>(mut self, subset: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.spec.tools = Some(subset.into_iter().map(Into::into).collect());
+        self
+    }
+    /// Also wire the provider-backed cognition pack (`ai.extract`/`rank`/`judge`/`reason`,
+    /// `synth`, `ai.rewrite`) into the registry — the same pack [`FlowClient`] assembles by
+    /// default. Off by default on the conversational door.
+    pub fn with_cognition(mut self, yes: bool) -> Self {
+        self.cognition = yes;
         self
     }
     /// Inject an explicit OS-sandbox [`Sandbox`] that the built client's guarded `System` enforces on
@@ -146,7 +197,7 @@ impl ClientBuilder {
     /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
     /// Pass one only to pin a posture independent of ambient env.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
-        self.sandbox = Some(sandbox);
+        self.envelope.sandbox = Some(sandbox);
         self
     }
     /// Choose where sessions live ([`Storage::in_memory`] by default). [`Storage::dir`] makes the
@@ -164,7 +215,7 @@ impl ClientBuilder {
         title: impl Into<String>,
         body: impl Into<String>,
     ) -> Self {
-        self.context.push(ContextBlock::new(id, title, body));
+        self.spec.context.push(ContextBlock::new(id, title, body));
         self
     }
 
@@ -173,48 +224,50 @@ impl ClientBuilder {
     /// plans, the runtime runs the flux-lang agent loop).
     pub fn build(self, provider: Box<dyn Provider>, root: impl Into<PathBuf>) -> Result<Client> {
         let root = root.into();
+        let provider: Arc<dyn Provider> = Arc::from(provider);
         // Attach the OS-sandbox posture so a consumer's `FLUX_SANDBOX=require` is honored on this
         // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
         // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
-        let sandbox = self
-            .sandbox
-            .unwrap_or_else(|| Sandbox::resolve(SandboxSettings::from_env()));
+        let sandbox = self.envelope.resolve_sandbox();
         let system = Arc::new(System::new(Workspace::new(root.clone())?).with_sandbox(sandbox));
         let mut registry = ToolRegistry::new();
         flux_tools::register_builtins(&mut registry);
-        let approver: Arc<dyn Approver> = if self.auto_approve {
-            Arc::new(AllowApprover)
-        } else {
-            Arc::new(DenyApprover)
-        };
+        if self.cognition {
+            CognitionPack::new(provider.clone(), self.spec.model.clone()).register(&mut registry);
+        }
+        // Consumer ops/packs join the same registry the envelope gates — registration grants
+        // existence, not permission; the `tools` subset below still applies to them.
+        for tool in self.ops {
+            registry.register(tool);
+        }
+        for pack in self.packs {
+            pack(&mut registry);
+        }
+        let approver = self.envelope.resolve_approver();
 
         let (events, flow) = self.storage.unwrap_or_default().resolve()?;
-        let model = self.model.clone();
-        let session_id = events.create_session(&self.model)?;
 
-        // The agent's definition; `assemble` selects the tool subset (all, here), applies the
-        // permissions, registers the reflexive ops, and ties the engine⇄loop-host cycle. Skills
-        // come from the default skill dirs (project `.flux/skills`/`.claude/skills` + the user
-        // globals, L-02) — discovery is progressive (metadata now, bodies on activation), so this
-        // costs a frontmatter head-read per skill, not the bodies.
-        let spec = AgentSpec {
-            model: self.model,
-            system_prompt: self
-                .system_prompt
-                .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
-            permissions: Permissions {
-                allow: self.allow,
-                deny: self.deny,
-            },
-            max_tokens: self.max_tokens,
-            max_iterations: self.max_iterations,
-            cwd: root,
-            context: self.context,
-            ..AgentSpec::default()
+        // The agent's definition; `assemble` selects the tool subset, applies the permissions,
+        // registers the reflexive ops, and ties the engine⇄loop-host cycle. Builder rules are
+        // additive to the spec's own (`from_spec` starts from a bare envelope). Skills come from
+        // the default skill dirs (project `.flux/skills`/`.claude/skills` + the user globals,
+        // L-02) unless the spec already carries an explicit set — discovery is progressive
+        // (metadata now, bodies on activation), so this costs a frontmatter head-read per skill.
+        let mut spec = self.spec;
+        spec.permissions
+            .allow
+            .extend(self.envelope.allow.iter().cloned());
+        spec.permissions
+            .deny
+            .extend(self.envelope.deny.iter().cloned());
+        spec.cwd = root;
+        if spec.skills.is_empty() {
+            spec = spec.with_default_skills();
         }
-        .with_default_skills();
+        let model = spec.model.clone();
+        let session_id = events.create_session(&model)?;
         let engine = spec.assemble(
-            Arc::from(provider),
+            provider,
             registry,
             approver,
             ToolContext::new(system),
@@ -553,6 +606,173 @@ mod tests {
         let out = session.send("again").await.unwrap();
         assert_eq!(out.text, "second");
         assert!(session.history().unwrap().len() > history.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mock whose first call plans a single named op with a literal arg, then answers in prose.
+    struct PlanOpMock {
+        op: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for PlanOpMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                let ast = serde_json::json!({
+                    "body": [{
+                        "kind": "call", "op": self.op,
+                        "args": [ { "kind": "lit", "value": { "name": "flux" } } ]
+                    }]
+                });
+                vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "p1".into(),
+                        name: "emit_plan".into(),
+                        input: serde_json::json!({ "ast": ast }),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "done".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    fn greet_tool(hits: Arc<std::sync::atomic::AtomicUsize>) -> Arc<dyn flux_runtime::Tool> {
+        flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "greet",
+                "Greets by name",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"]
+                }),
+            ),
+            move |input| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(serde_json::json!(format!(
+                        "hello {}",
+                        input["name"].as_str().unwrap_or("?")
+                    )))
+                }
+            },
+        )
+    }
+
+    /// D-143: a `tool_fn` registered on the builder is callable by a planned turn — and it runs
+    /// through the envelope, not around it (`auto_approve` is what permits it here).
+    #[tokio::test]
+    async fn a_registered_custom_tool_dispatches_through_a_planned_turn() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-fntool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .register_op(greet_tool(hits.clone()))
+            .build(
+                Box::new(PlanOpMock {
+                    op: "greet",
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let out = client.run("greet flux").await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(out.tool_calls, vec!["greet"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-143: an injected deny-listing `Approver` gates a registered custom tool — registration
+    /// grants existence, not permission (mirrors the FlowClient-side
+    /// `an_injected_approver_policy_gates_per_op`).
+    #[tokio::test]
+    async fn an_injected_approver_gates_a_registered_custom_tool() {
+        struct DenyGreet;
+        #[async_trait]
+        impl flux_runtime::Approver for DenyGreet {
+            async fn request(
+                &self,
+                tool: &str,
+                _subjects: &[String],
+                _intents: &flux_spec::IntentSet,
+            ) -> flux_runtime::ApprovalChoice {
+                if tool == "greet" {
+                    flux_runtime::ApprovalChoice::Deny
+                } else {
+                    flux_runtime::ApprovalChoice::Allow
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("flux-sdk-fngate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = Client::builder()
+            .model("mock")
+            .approver(Arc::new(DenyGreet))
+            .register_op(greet_tool(hits.clone()))
+            .build(
+                Box::new(PlanOpMock {
+                    op: "greet",
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let _ = client.run("greet flux").await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the injected approver must gate the registered tool"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-143: `tools(subset)` removes ops from the agent's registry — a plan calling an
+    /// out-of-subset op cannot execute it (the loop machinery itself stays registered).
+    #[tokio::test]
+    async fn tools_subset_removes_ops_from_the_registry() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-subset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .tools(["read"])
+            .build(
+                Box::new(PlanThenProseMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        // The plan calls `write`, which the subset removed: the turn must complete without the
+        // write ever happening.
+        let _ = client.run("write a file").await;
+        assert!(
+            !dir.join("sdk-plan.txt").exists(),
+            "an out-of-subset op must not execute"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

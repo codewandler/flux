@@ -38,9 +38,10 @@ tokio-util.workspace = true
 # The client's turn guard (`sync::Mutex`) — one engine runs one turn at a time — and the spawned
 # streaming turns.
 tokio.workspace = true
+# Custom tools/approvers are part of the public surface (`register_op`, `approver`): implementing
+# `Tool::spec()`/`Approver::request` needs `ToolSpec`/`IntentSet`, so the spec contracts are a real
+# dependency (re-exported via `flux_sdk::tools`/`flux_sdk::approval`).
+flux-spec.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-# Examples register mock adapter ops (impl flux_runtime::Tool), whose `spec()` returns a flux_spec
-# ToolSpec. Dev-only — not in the publish closure.
-flux-spec.workspace = true

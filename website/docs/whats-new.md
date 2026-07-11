@@ -18,6 +18,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   conversations survive restarts: reopen a session by id and keep talking — including
   conversations waiting on a human answer, which pick up exactly where they paused. The same
   directory works with `flux sessions`, `flux replay`, and `flux fork`.
+- **Embedded agents take custom tools and approval policies.** An application can hand its own
+  functions to an embedded conversational agent as callable tools, restrict the agent to an
+  explicit tool list, and plug in its own per-call approval policy (for example, a risk-based
+  confirmation gate) — everything still runs through flux's safety envelope.
 
 ### Improved
 

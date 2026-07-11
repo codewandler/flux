@@ -61,7 +61,7 @@ use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry,
 };
-use flux_system::sandbox::{Sandbox, SandboxSettings};
+use flux_system::sandbox::Sandbox;
 use flux_system::{System, Workspace};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -87,17 +87,15 @@ pub fn assemble_registry(provider: Arc<dyn Provider>, model: impl Into<String>) 
     registry
 }
 
-/// Builder for a [`FlowClient`]. Mirrors [`crate::ClientBuilder`]'s permission/approval knobs so the
-/// two front doors feel the same; the model + workspace root are supplied at [`build`](Self::build).
+/// Builder for a [`FlowClient`]. Shares the envelope knobs (permission rules, approval policy,
+/// sandbox posture) with [`crate::ClientBuilder`] via one internal type so the two front doors
+/// cannot drift; the model + workspace root are supplied at [`build`](Self::build).
 pub struct FlowClientBuilder {
     model: String,
-    allow: Vec<String>,
-    deny: Vec<String>,
-    auto_approve: bool,
-    approver: Option<Arc<dyn Approver>>,
+    envelope: crate::envelope::Envelope,
     seed_prelude: bool,
     compile_opts: CompileOptions,
-    sandbox: Option<Sandbox>,
+    storage: Option<crate::Storage>,
 }
 
 impl Default for FlowClientBuilder {
@@ -105,15 +103,12 @@ impl Default for FlowClientBuilder {
         Self {
             model: "unknown".to_string(),
             // Reads pre-allowed; everything else denied unless `auto_approve` (no UI in a library).
-            allow: vec!["read".to_string(), "glob".to_string(), "grep".to_string()],
-            deny: Vec::new(),
-            auto_approve: false,
-            approver: None,
+            envelope: crate::envelope::Envelope::with_default_allow(&["read", "glob", "grep"]),
             // Seed the planner catalog `$defs` with the v1-core artifact ontology by default.
             seed_prelude: true,
             compile_opts: CompileOptions::default(),
-            // Unset ⇒ resolve the OS-sandbox posture from the environment at `build` (off ⇒ disabled).
-            sandbox: None,
+            // Unset ⇒ an in-memory flow store, the pre-0.16 behavior.
+            storage: None,
         }
     }
 }
@@ -126,18 +121,18 @@ impl FlowClientBuilder {
     }
     /// Add a permission allow rule (e.g. `"write"`, `"Bash(git:*)"`).
     pub fn allow(mut self, rule: impl Into<String>) -> Self {
-        self.allow.push(rule.into());
+        self.envelope.allow.push(rule.into());
         self
     }
     /// Add a permission deny rule (takes precedence over allow rules).
     pub fn deny(mut self, rule: impl Into<String>) -> Self {
-        self.deny.push(rule.into());
+        self.envelope.deny.push(rule.into());
         self
     }
     /// Approve every tool call automatically (no human in the loop). Use with care — model-backed
     /// cognition ops egress over the network, so they gate by default.
     pub fn auto_approve(mut self, yes: bool) -> Self {
-        self.auto_approve = yes;
+        self.envelope.auto_approve = yes;
         self
     }
     /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
@@ -145,7 +140,7 @@ impl FlowClientBuilder {
     /// risk-aware confirm gate). Overrides `auto_approve`. Mirrors flux-orchestrate's
     /// `LocalSpawner::with_approver`, so the flow path and the sub-agent path take the same policy.
     pub fn approver(mut self, approver: Arc<dyn Approver>) -> Self {
-        self.approver = Some(approver);
+        self.envelope.approver = Some(approver);
         self
     }
     /// Skip seeding the planner catalog `$defs` with the prelude artifact ontology (default: seed).
@@ -159,7 +154,7 @@ impl FlowClientBuilder {
     /// exports `FLUX_SANDBOX=require` gets confinement without calling this (off ⇒ disabled, safe).
     /// Pass one only to pin a posture independent of ambient env.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
-        self.sandbox = Some(sandbox);
+        self.envelope.sandbox = Some(sandbox);
         self
     }
     /// Override the compile front-end's attempt/step/token budgets.
@@ -167,9 +162,18 @@ impl FlowClientBuilder {
         self.compile_opts = opts;
         self
     }
+    /// Choose where flow state lives ([`crate::Storage::in_memory`] by default).
+    /// [`crate::Storage::dir`] persists durable-construct state (`once`/`checkpoint`) across
+    /// processes. Note the one-shot `execute_with` path still uses a fresh per-run store — that
+    /// isolation is its contract.
+    pub fn storage(mut self, storage: crate::Storage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
 
     /// Build the client with `provider` and a workspace rooted at `root`. The registry is assembled
-    /// via [`assemble_registry`] (built-ins + cognition pack); the flow store is in-memory.
+    /// via [`assemble_registry`] (built-ins + cognition pack); flow state lives in the configured
+    /// [`crate::Storage`] (in-memory unless set).
     pub fn build(
         self,
         provider: Arc<dyn Provider>,
@@ -178,12 +182,10 @@ impl FlowClientBuilder {
         // Attach the OS-sandbox posture so a consumer's `FLUX_SANDBOX=require` is honored on this
         // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
         // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
-        let sandbox = self
-            .sandbox
-            .unwrap_or_else(|| Sandbox::resolve(SandboxSettings::from_env()));
+        let sandbox = self.envelope.resolve_sandbox();
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = assemble_registry(provider.clone(), self.model.clone());
-        let store = FlowStore::in_memory()?;
+        let (_events, store) = self.storage.unwrap_or_default().resolve()?;
         let prelude_defs = if self.seed_prelude {
             prelude::prelude_schema()
         } else {
@@ -195,10 +197,10 @@ impl FlowClientBuilder {
             registry,
             system,
             store,
-            allow: self.allow,
-            deny: self.deny,
-            auto_approve: self.auto_approve,
-            approver: self.approver,
+            allow: self.envelope.allow,
+            deny: self.envelope.deny,
+            auto_approve: self.envelope.auto_approve,
+            approver: self.envelope.approver,
             compile_opts: self.compile_opts,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
