@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-138: semantic FlowEffects surfaced through op catalogs.** `OpSignature` (`flux-lang`) gains a
+  `semantic_effects: Vec<FlowEffect>` field alongside the lowered host `effects` — additive,
+  existing consumers unaffected — and `OpSpec::to_signature()` derives it directly from an
+  `OpSpec`'s declared effects (the `Money`/`Delete`/`SendExternal` tier that `OpSpec::lower()`'s
+  `ToolSpec` still can't carry). The plugin manifest's `OperationSpec` (`flux-plugin`) can now
+  declare `semantic_effects`; `PluginTool` projects them onto a new default-empty
+  `flux_runtime::Tool::semantic_effects` hook, and `flux-flow`'s `OpRegistry` folds the tags back
+  onto `OpSignature` — the manifest→catalog adapter, preserved end-to-end. `annotate_effects`
+  (D-133) now folds catalog-declared semantics into a call's per-node annotation with no authored
+  `effect:` tag required. `flux-plugin` gains a dependency on `flux-lang` (L4→L0, layering-legal,
+  verified by `flux-codegate`).
+- **D-139: structured node path on `Diagnostic`.** `analyze::Diagnostic` (`flux-lang`) gains a typed
+  `node_path: Option<String>` field carrying the same node locator already rendered as the
+  `` (at `…`) `` message suffix, populated at the analyzer's single locator choke point — so a
+  downstream consumer that attributes diagnostics to its own source model (e.g. a canvas NodeMap)
+  can read the path directly instead of parsing it back out of the message text. Purely additive;
+  the rendered message is unchanged and every existing `Diagnostic` consumer compiles as-is.
+
 ### Changed
 
 - **D-141: public flow-surface documentation.** The SDK website now maps the single self-hosted
@@ -14,6 +34,17 @@ All notable changes to this project are documented in this file. The format is b
   points, parse/compile/analyze/optimize/execute variants, seeded isolation, `ExecutionResult`, and
   the one-shot suspension/voice boundaries. Crate README/rustdoc copy is synchronized, and the
   website contract pins the surface map and lifecycle method families against drift.
+
+### Fixed
+
+- **D-140: `create_response`/`interrupt_response` knobs on server-VAD turn detection.** The seam
+  `TurnDetection::ServerVad`/`SemanticVad` (`flux-provider`) gains
+  `create_response`/`interrupt_response: Option<bool>`, mapped onto the OpenAI GA
+  `turn_detection.create_response`/`interrupt_response` wire flags (`flux-providers`; `None` stays
+  additive — the wire field is omitted). Unblocks `run_flow_turns`' prescription of "server-VAD
+  with response creation off" for flow-driven voice, which was previously unconfigurable — a live
+  session's auto-created model response raced the flow's own spoken reply. The `run_flow_turns`
+  doc now points at the actual knob.
 
 ## [0.15.1] - 2026-07-11
 

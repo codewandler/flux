@@ -25,7 +25,18 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-_None._
+
+### SDK surface — a standard agent SDK, the flux way
+- [D-142 — SDK storage injection + the resumable Session handle](D-142-sdk-storage-and-session-handle.md) · Agent · wave 1 foundation — unlocks resume, suspensions, flow-driven voice, time machine
+- [D-143 — Client envelope parity — custom tools, injected approver, tool subset](D-143-sdk-client-envelope-parity.md) · Agent · wave 1 — the FlowClient knobs the classic door is missing
+- [D-144 — Streaming, bring-your-own-sink — AgentSink re-export + Session::send_with](D-144-sdk-agent-sink-send-with.md) · Agent · wave 1 — the minimal streaming door: consumer sink + cancellation token
+- [D-145 — Owned event stream — AgentEvent + TurnStream with cancel/finish](D-145-sdk-agent-event-turn-stream.md) · Agent · wave 1 — async-iterator streaming over a spawned cancellable turn
+- [D-146 — Re-export sweep — one import for every public-signature type](D-146-sdk-reexport-sweep.md) · Agent · wave 1 closer — ends the 4-5-crate dependency scavenger hunt
+- [D-147 — Flow-driven sessions front door — Session::start_flow + suspended](D-147-sdk-flow-driven-session-front-door.md) · Agent · wave 2 — the D-131 differentiator reaches the SDK; durable await across restarts
+- [D-148 — Sub-agents on the classic Client](D-148-sdk-client-sub-agents.md) · Agent · wave 2 — with_sub_agents parity; cancellation now reaches the task tool
+- [D-149 — AgentSpec knobs on ClientBuilder — groups, ambient signals, compaction, context budget](D-149-sdk-agent-spec-knobs.md) · Agent · wave 2 — evidence-gated tool surfacing + compaction control for embedders
+- [D-150 — ExecutionResult.usage — flow runs report token spend](D-150-flow-execution-usage.md) · Agent · wave 2 — flux-cognition drops per-call usage today; surface + sum it
+- [D-151 — Session observability — history/turns/run_trace/cost/efficiency + pricing feature](D-151-sdk-session-projections-pricing.md) · Agent · wave 2 — the recorded-but-invisible projections reach the embedder
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
@@ -58,6 +69,16 @@ _The `gitlab` plugin has outgrown its connectivity phase — its 64-op surface i
 
 ### Plugin Install Source
 - [D-87 — Install a plugin from source — `flux plugin install --git <url>`](D-87-plugin-install-from-git.md) · Core · third install source next to the signed github pack (D-46..49) and `--dir` local scan: clone a git URL, detect a Rust flux-plugin crate, `cargo build --release`, register the binary. Unblocks GitLab-hosted / third-party plugins that the github+minisign pack channel can't serve.
+
+### SDK surface — a standard agent SDK, the flux way
+- [D-152 — flux_providers::spec — move model-spec → provider resolution out of the CLI](D-152-flux-providers-spec-module.md) · Agent · wave 3 — de-duplicates the only copy of build_provider; CLI delegates byte-identical
+- [D-153 — SDK `providers` feature — one-stop provider construction](D-153-sdk-providers-feature.md) · Agent · wave 3 — feature-gated batteries; default build stays provider-agnostic; ⚠ publish-order flip
+- [D-154 — SDK `plugins` feature — subprocess plugin tools for embedders](D-154-sdk-plugins-feature.md) · Agent · wave 3 — load_plugin_tools into the same gated registry; flux's MCP answer
+- [D-155 — Flow-driven voice front door — Session::run_voice_flow](D-155-sdk-flow-driven-voice.md) · Agent · wave 3 — the deferred D-132 SDK seam; unblocked by D-142's engine-holding Session
+- [D-156 — Session::replay — hermetic time-machine replay in the SDK](D-156-sdk-session-replay.md) · Agent · wave 4 — replay_session over the injected store; CLI-only no more
+- [D-157 — Session::fork + Fork::{inject, edit, diff}](D-157-sdk-session-fork-diff.md) · Agent · wave 4 — counterfactual sessions for embedders
+- [D-158 — FlowClient streaming — execute_with_sink + execute_streamed](D-158-flow-client-streaming.md) · Agent · wave 4 — flow runs stop being observability-blind (ExecSink drops everything but names)
+- [D-159 — Datasource recipe documentation — register_pack + flux-capabilities walkthrough](D-159-sdk-datasource-recipe-doc.md) · Agent · wave 4, docs-only — deliberate non-API until D-62 lands the async paged seam
 
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
@@ -290,7 +311,10 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-135 — Bubblewrap sandbox backend (Linux)](D-135-bubblewrap-backend.md) · Core · bwrap argv builder per the verified flag template; probe classifies Missing/NamespacesDenied/Broken; live smokes double-gated on FLUX_LIVE_SANDBOX_SMOKE — ALL SIX ran for real against bwrap 0.11.2 on this dev machine
 - [D-136 — Seatbelt sandbox backend (macOS)](D-136-seatbelt-backend.md) · Core · sandbox-exec -D params + generated SBPL profile; golden-profile tests hermetic everywhere; discovery/preflight code cross-checked clean on x86_64-apple-darwin from this Linux box; live items flagged 'verify on macOS' (no macOS CI) — see Notes for the status justification
 - [D-137 — Sandbox docs truth pass + plugin coverage proof](D-137-sandbox-docs-truth-pass.md) · Core · flip the 'not OS-sandboxed' promise to 'not OS-sandboxed by default'; new security/os-sandbox page; rewrite the website_contract drift guard
-- [D-141 — Document the public flow surfaces](D-141-document-public-flow-surfaces.md) · Agent · map Flux-Lang, FlowEngine, Client, FlowClient, the Rust DSL, and advanced flow hosts in the public docs
+- [D-138 — Surface semantic FlowEffects through OpSignature + the plugin-manifest OperationSpec](D-138-semantic-effects-through-catalogs.md) · Language · downstream ask (ai-agent-platform flows arc, ask 4): OpSpec::lower() drops Money/Delete/SendExternal (Money vanishes, Delete→Write, SendExternal→Network) — no catalog the platform sees carries the semantic tier; authored bind/memo effect tags (D-133) are the interim
+- [D-139 — Structured node path on Diagnostic — a typed field instead of the rendered locator suffix](D-139-structured-node-path-on-diagnostic.md) · Language · downstream ask (ai-agent-platform flows arc, ask 5): the platform's NodeMap parses the rendered `(at `body[2].then[0]`)` message suffix to key diagnostics to canvas nodes; a typed field removes that string coupling (canary-tested downstream; graceful degradation to flow-level)
+- [D-140 — TurnDetection::ServerVad needs a create_response:false knob for flow-driven voice](D-140-servervad-create-response-knob.md) · Agent · downstream ask (ai-agent-platform R-20 voice, flows arc ask 6): D-132's run_flow_turns doc says 'server-VAD with response creation off', but the seam TurnDetection and the OpenAI wire TurnDetection carry no create_response — a live flow-driven session's model auto-reply races the flow's spoken prompt
+- [D-141 — Document the public flow surfaces](D-141-document-public-flow-surfaces.md) · Agent · Map Flux-Lang, FlowEngine, Client, FlowClient, the Rust DSL, and advanced flow hosts in the public docs.
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this

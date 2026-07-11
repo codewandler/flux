@@ -18,6 +18,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   to use for a conversational agent, a stored or model-compiled flow, Rust-authored flow builders,
   custom language tooling, and advanced durable/replay/voice hosts. The full direct-flow lifecycle,
   policy controls, extension points, result shape, and suspension boundary are documented together.
+- **Plugin operations can now declare their financial, destructive, or external-facing nature.** A
+  plugin's operation manifest can tag an operation as moving money, deleting data, or sending
+  something externally — flux surfaces that distinction through its operation catalog and per-call
+  flow annotations automatically, without extra tagging in an authored flow.
+
+### Fixed
+
+- Voice sessions driven by an authored flow no longer risk the model talking over the flow's own
+  spoken reply — server-side voice detection can now be configured so the flow's response speaks
+  alone.
 
 ## [0.15.1] - 2026-07-11
 
