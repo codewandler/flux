@@ -45,7 +45,7 @@ exclude = ["plugins"]
 
 [workspace.package]
 edition = "2021"
-version = "0.19.0"
+version = "0.19.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/flux"
 homepage = "https://github.com/codewandler/flux"
@@ -58,38 +58,38 @@ rust-version = "1.85"
 # local builds and the version in the *published* manifest, so `cargo publish` can resolve them from
 # crates.io. Keep these versions in lockstep with `[workspace.package].version` on every release (see
 # crates/flux-sdk/PUBLISHING.md). Crates NOT in the closure stay path-only — they are not published.
-flux-core = { package = "codewandler-flux-core", version = "0.19.0", path = "crates/flux-core" }
-flux-policy = { package = "codewandler-flux-policy", version = "0.19.0", path = "crates/flux-policy" }
-flux-secret = { package = "codewandler-flux-secret", version = "0.19.0", path = "crates/flux-secret" }
-flux-spec = { package = "codewandler-flux-spec", version = "0.19.0", path = "crates/flux-spec" }
+flux-core = { package = "codewandler-flux-core", version = "0.19.1", path = "crates/flux-core" }
+flux-policy = { package = "codewandler-flux-policy", version = "0.19.1", path = "crates/flux-policy" }
+flux-secret = { package = "codewandler-flux-secret", version = "0.19.1", path = "crates/flux-secret" }
+flux-spec = { package = "codewandler-flux-spec", version = "0.19.1", path = "crates/flux-spec" }
 flux-config = { path = "crates/flux-config" }
-flux-system = { package = "codewandler-flux-system", version = "0.19.0", path = "crates/flux-system" }
-flux-runtime = { package = "codewandler-flux-runtime", version = "0.19.0", path = "crates/flux-runtime" }
-flux-tools = { package = "codewandler-flux-tools", version = "0.19.0", path = "crates/flux-tools" }
-flux-events = { package = "codewandler-flux-events", version = "0.19.0", path = "crates/flux-events" }
-flux-agent = { package = "codewandler-flux-agent", version = "0.19.0", path = "crates/flux-agent" }
-flux-skill = { package = "codewandler-flux-skill", version = "0.19.0", path = "crates/flux-skill" }
-flux-orchestrate = { package = "codewandler-flux-orchestrate", version = "0.19.0", path = "crates/flux-orchestrate" }
-flux-lang = { package = "codewandler-flux-lang", version = "0.19.0", path = "crates/flux-lang" }
-flux-flow = { package = "codewandler-flux-flow", version = "0.19.0", path = "crates/flux-flow" }
+flux-system = { package = "codewandler-flux-system", version = "0.19.1", path = "crates/flux-system" }
+flux-runtime = { package = "codewandler-flux-runtime", version = "0.19.1", path = "crates/flux-runtime" }
+flux-tools = { package = "codewandler-flux-tools", version = "0.19.1", path = "crates/flux-tools" }
+flux-events = { package = "codewandler-flux-events", version = "0.19.1", path = "crates/flux-events" }
+flux-agent = { package = "codewandler-flux-agent", version = "0.19.1", path = "crates/flux-agent" }
+flux-skill = { package = "codewandler-flux-skill", version = "0.19.1", path = "crates/flux-skill" }
+flux-orchestrate = { package = "codewandler-flux-orchestrate", version = "0.19.1", path = "crates/flux-orchestrate" }
+flux-lang = { package = "codewandler-flux-lang", version = "0.19.1", path = "crates/flux-lang" }
+flux-flow = { package = "codewandler-flux-flow", version = "0.19.1", path = "crates/flux-flow" }
 flux-eval = { path = "crates/flux-eval" }
-flux-plugin = { package = "codewandler-flux-plugin", version = "0.19.0", path = "crates/flux-plugin" }
+flux-plugin = { package = "codewandler-flux-plugin", version = "0.19.1", path = "crates/flux-plugin" }
 flux-auth = { path = "crates/flux-auth" }
-flux-evidence = { package = "codewandler-flux-evidence", version = "0.19.0", path = "crates/flux-evidence" }
-flux-datasource = { package = "codewandler-flux-datasource", version = "0.19.0", path = "crates/flux-datasource" }
-flux-a2a = { package = "codewandler-flux-a2a", version = "0.19.0", path = "crates/flux-a2a" }
-flux-pg = { package = "codewandler-flux-pg", version = "0.19.0", path = "crates/flux-pg" }
+flux-evidence = { package = "codewandler-flux-evidence", version = "0.19.1", path = "crates/flux-evidence" }
+flux-datasource = { package = "codewandler-flux-datasource", version = "0.19.1", path = "crates/flux-datasource" }
+flux-a2a = { package = "codewandler-flux-a2a", version = "0.19.1", path = "crates/flux-a2a" }
+flux-pg = { package = "codewandler-flux-pg", version = "0.19.1", path = "crates/flux-pg" }
 flux-server = { path = "crates/flux-server" }
-flux-capabilities = { package = "codewandler-flux-capabilities", version = "0.19.0", path = "crates/flux-capabilities" }
-flux-web = { package = "codewandler-flux-web", version = "0.19.0", path = "crates/flux-web" }
-flux-sdk = { package = "codewandler-flux-sdk", version = "0.19.0", path = "crates/flux-sdk" }
+flux-capabilities = { package = "codewandler-flux-capabilities", version = "0.19.1", path = "crates/flux-capabilities" }
+flux-web = { package = "codewandler-flux-web", version = "0.19.1", path = "crates/flux-web" }
+flux-sdk = { package = "codewandler-flux-sdk", version = "0.19.1", path = "crates/flux-sdk" }
 flux-tui = { path = "crates/flux-tui" }
-flux-provider = { package = "codewandler-flux-provider", version = "0.19.0", path = "crates/flux-provider" }
-flux-providers = { package = "codewandler-flux-providers", version = "0.19.0", path = "crates/flux-providers" }
-flux-credentials = { package = "codewandler-flux-credentials", version = "0.19.0", path = "crates/flux-credentials" }
-flux-cognition = { package = "codewandler-flux-cognition", version = "0.19.0", path = "crates/flux-cognition" }
+flux-provider = { package = "codewandler-flux-provider", version = "0.19.1", path = "crates/flux-provider" }
+flux-providers = { package = "codewandler-flux-providers", version = "0.19.1", path = "crates/flux-providers" }
+flux-credentials = { package = "codewandler-flux-credentials", version = "0.19.1", path = "crates/flux-credentials" }
+flux-cognition = { package = "codewandler-flux-cognition", version = "0.19.1", path = "crates/flux-cognition" }
 flux-app = { path = "crates/flux-app" }
-flux-markdown = { package = "codewandler-flux-markdown", version = "0.19.0", path = "crates/flux-markdown" }
+flux-markdown = { package = "codewandler-flux-markdown", version = "0.19.1", path = "crates/flux-markdown" }
 flux-channels = { path = "crates/flux-channels" }
 
 # external

@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.19.1] - 2026-07-12
+
 ### Improved
 
 - **`web.crawl` can stop early at a content-size budget.** Pass `max_total_bytes` to bound a crawl by

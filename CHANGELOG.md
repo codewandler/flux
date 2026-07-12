@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-07-12
+
 ### Added
 
 - **D-166: `web.crawl` accepts an optional `max_total_bytes` caller budget** (Agent pillar). The crawl
