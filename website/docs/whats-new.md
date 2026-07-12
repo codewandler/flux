@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-12
+
 ### New
 
 - **Slack support bots run out of the box.** The Slack channel is now built into the standard `flux`

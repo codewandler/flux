@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-12
+
 ### Added
 
 - **D-164: plugin operations can declare an output JSON Schema** (Agent pillar). `OperationSpec` gains an
