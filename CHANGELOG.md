@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release build: exclude `flux-sdk` from the binary release closure.** The D-154 `plugins`-feature
+  test fixture (`flux_sdk_plugin_fixture`, a `required-features`-gated `[[bin]]`) made cargo-dist fail
+  the 0.17.0 Release workflow on every platform (`failed to find bin flux_sdk_plugin_fixture`) — it
+  enumerates every workspace bin and can't resolve a feature-gated one. `flux-sdk` (a library, no
+  release binary) now carries `[package.metadata.dist] dist = false`, like `flux-lsp`/`flux-plugin`.
+  crates.io publishing was unaffected (0.17.0 published cleanly); this fast-follow restores the
+  GitHub binary release. Internal only.
+
 ## [0.17.0] - 2026-07-12
 
 ### Added

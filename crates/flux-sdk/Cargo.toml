@@ -11,6 +11,13 @@ documentation = "https://docs.rs/codewandler-flux-sdk"
 keywords = ["agent", "llm", "ai", "tools", "flux"]
 categories = ["development-tools", "api-bindings"]
 
+# flux-sdk ships no release binary — the only `[[bin]]` is the `plugins`-feature test fixture
+# (`flux_sdk_plugin_fixture`), which `required-features` keeps out of a default build. cargo-dist
+# enumerates every workspace bin for the release, though, and can't find that feature-gated one — so
+# exclude this (library-only) package from the binary release, exactly as flux-lsp/flux-plugin do.
+[package.metadata.dist]
+dist = false
+
 [lib]
 name = "flux_sdk"
 
