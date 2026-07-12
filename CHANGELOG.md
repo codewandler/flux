@@ -129,6 +129,16 @@ All notable changes to this project are documented in this file. The format is b
   `ReplayReport` is re-exported at the crate root. Verified by a two-client test: one records a
   plan-running turn, a second (with a never-called provider) replays it hermetically over the same
   `Storage::dir`.
+- **D-157: `Session::fork` + `Fork::{inject, edit, diff}` — counterfactual sessions in the SDK**
+  (sdk-surface wave 4). `Session::fork(at)` mints a fresh session correlated to this one, copies its
+  conversation, and hermetically replays the prefix (statements `0..at` of the recorded final plan)
+  into it — leaving the original **untouched** — returning a `Fork`. `Fork::inject(value, sink)`
+  diverges by substituting a different value at the fork's bound statement (skipping the op that
+  produced it); `Fork::edit(ast, sink)` diverges with an alternate plan; both run the tail through
+  the real envelope. `Fork::diff(&original)` reports the aligned per-statement divergence
+  (`flux_events::run_diff`), and `Fork::session()` exposes the fork as a full `Session`. `Fork` is
+  re-exported at the crate root; `RunDiff`/`DiffRow` via `flux_sdk::observe`. Verified by tests that
+  inject/edit a divergence and assert the original's `head_seq` is unchanged.
 
 ## [0.16.1] - 2026-07-11
 

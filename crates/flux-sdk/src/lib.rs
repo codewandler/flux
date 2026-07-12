@@ -34,7 +34,7 @@ pub mod storage;
 
 pub use events::{AgentEvent, TurnStream};
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
-pub use session::Session;
+pub use session::{Fork, Session};
 pub use storage::Storage;
 
 /// The engine's streaming contract — implement it and pass it to [`Session::send_with`] to
@@ -105,7 +105,7 @@ pub mod approval {
 pub mod observe {
     pub use flux_core::Message;
     pub use flux_events::EventStore;
-    pub use flux_events::{EfficiencySummary, ModelCost, TurnSummary};
+    pub use flux_events::{DiffRow, EfficiencySummary, ModelCost, RunDiff, TurnSummary};
     pub use flux_evidence::{Observation, SignalMatch, ToolGroup, KIND_SIGNAL};
     pub use flux_flow::state::FlowStore;
     pub use flux_lang::ast::RunEvent;
@@ -2130,6 +2130,150 @@ mod tests {
         assert!(
             err.to_string().contains("not replayable"),
             "the error is honest about why: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A planner that emits `bind x = read(note.txt); return x` once, then answers in prose — a
+    /// recorded session with a `bind` at the fork point and a cassette-captured `read`.
+    struct BindPlanMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for BindPlanMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                let ast = serde_json::json!({ "body": [
+                    { "kind": "bind", "name": "x",
+                      "value": { "kind": "call", "op": "read",
+                                 "args": [{ "kind": "lit", "value": "note.txt" }] } },
+                    { "kind": "return", "value": { "kind": "var", "name": "x" } }
+                ] });
+                vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "p".into(),
+                        name: "emit_plan".into(),
+                        input: serde_json::json!({ "ast": ast }),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "done".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// Record a `bind x = read(note.txt); return x` session on a `Storage::dir`; returns the store
+    /// dir and the session id.
+    async fn record_bind_session(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-fork-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "original").unwrap();
+        let store = dir.join("state");
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store.clone()))
+            .build(
+                Box::new(BindPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        client.run("read the note").await.unwrap();
+        let sid = client.session_id().unwrap();
+        (dir, store, sid)
+    }
+
+    struct NullSink;
+    impl AgentSink for NullSink {}
+
+    /// D-157: `Session::fork` + `Fork::inject` — inject a different value at the fork's bound
+    /// statement; `diff` reports the divergence and the original session's log is untouched.
+    #[tokio::test]
+    async fn fork_inject_diverges_and_leaves_the_original_untouched() {
+        let (dir, store, sid) = record_bind_session("inject").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let events = client.event_store();
+        let head_before = events.head_seq(&sid).unwrap();
+
+        let session = client.open_session(&sid).unwrap();
+        let fork = session.fork(0).await.unwrap();
+        let mut sink = NullSink;
+        fork.inject(&serde_json::json!("injected"), &mut sink)
+            .await
+            .unwrap();
+
+        // The original session's log is untouched by the fork.
+        assert_eq!(
+            events.head_seq(&sid).unwrap(),
+            head_before,
+            "forking must not touch the original session's log"
+        );
+
+        // The diff reports the divergence between original and fork.
+        let diff = fork.diff(&session).unwrap();
+        assert!(
+            !diff.identical && !diff.rows.is_empty(),
+            "the injected fork diverges from the original: {diff:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-157: `Fork::edit` — diverge by supplying an alternate plan (a different bound value), which
+    /// runs through the envelope and diverges from the original.
+    #[tokio::test]
+    async fn fork_edit_diverges_on_a_bound_value() {
+        let (dir, store, sid) = record_bind_session("edit").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let session = client.open_session(&sid).unwrap();
+        let fork = session.fork(0).await.unwrap();
+
+        // An alternate tail: bind x to a literal instead of the recorded read, then return it.
+        let edited: crate::flow::DraftAst = serde_json::from_value(serde_json::json!({ "body": [
+            { "kind": "bind", "name": "x", "value": { "kind": "lit", "value": "edited-value" } },
+            { "kind": "return", "value": { "kind": "var", "name": "x" } }
+        ]}))
+        .unwrap();
+        let mut sink = NullSink;
+        fork.edit(&edited, &mut sink).await.unwrap();
+
+        let diff = fork.diff(&session).unwrap();
+        assert!(
+            !diff.identical,
+            "the edited fork diverges from the original: {diff:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

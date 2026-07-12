@@ -63,6 +63,10 @@
   recorded conversation — every tool result served from the recording, so nothing happens for real
   and the model is never called — and inspect what it did. The same time-machine replay the `flux`
   CLI offers, now available when embedding.
+- **Embedded agents can explore "what if" branches.** An application can fork a recorded session at
+  a chosen point, swap in a different value or an alternate plan, run the branch, and get a
+  precise diff of what changed — all without altering the original session. Great for debugging
+  ("what if that lookup had returned X?") and A/B exploration.
 
 ### Action needed
 

@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use flux_core::Message;
 use flux_core::{PricingTable, Result, Usage};
-use flux_events::{EfficiencySummary, ModelCost, TurnSummary};
+use flux_events::{EfficiencySummary, EventContext, ModelCost, RunDiff, TurnSummary};
 use flux_flow::ast::DraftAst;
 use flux_flow::ast::RunEvent;
 use flux_flow::engine::FlowEngine;
+use flux_flow::fork::ForkPrefix;
 use flux_flow::replay::ReplayReport;
 use flux_flow::voice::{EngineVoiceHandler, VoiceSessionDriver, VoiceSink};
 use flux_flow::AgentSink;
@@ -246,7 +247,139 @@ impl Session {
         .await
         .map_err(|e| flux_core::Error::Other(e.to_string()))
     }
+
+    /// **Fork** this session at statement `at` of its recorded final plan (the time machine's
+    /// counterfactual door): mint a fresh session correlated to this one, copy its conversation, and
+    /// hermetically replay the prefix (statements `0..at`) into it — leaving **this** session
+    /// untouched. Diverge the returned [`Fork`] with [`Fork::inject`]/[`Fork::edit`], then
+    /// [`Fork::diff`] it against the original. Requires a cassette-recorded session (as
+    /// [`replay`](Self::replay) does).
+    pub async fn fork(&self, at: usize) -> Result<Fork> {
+        let _turn = self.turn_guard.lock().await;
+        let info = self.engine.events.info(&self.id)?;
+        let fork_id = self.engine.events.create_session_with_context(
+            &info.model,
+            &EventContext {
+                correlation_id: Some(self.id.clone()),
+                agent_id: Some(format!("fork:{}@{}", self.id, at)),
+                ..Default::default()
+            },
+        )?;
+        // Copy the conversation so the fork's planner (mode B) sees the same history.
+        for m in self.engine.events.conversation(&self.id)? {
+            self.engine.events.record_message(&fork_id, &m)?;
+        }
+        // Replay the prefix into the fork session. The replay is hermetic (cassette-served), so its
+        // events don't need surfacing — discard them.
+        let mut sink = DiscardSink;
+        let prefix = flux_flow::fork::replay_prefix(
+            &self.engine.events,
+            &self.engine.flow,
+            &self.engine.executor,
+            &self.id,
+            &fork_id,
+            at,
+            &mut sink,
+        )
+        .await
+        .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+        Ok(Fork {
+            engine: self.engine.clone(),
+            id: fork_id,
+            prefix,
+            turn_guard: self.turn_guard.clone(),
+        })
+    }
 }
+
+/// A counterfactual branch of a [`Session`], created by [`Session::fork`]. The recorded prefix has
+/// been replayed hermetically into a fresh session (the original is untouched); diverge it with
+/// [`inject`](Self::inject) or [`edit`](Self::edit), then compare with [`diff`](Self::diff). The
+/// fork is itself a real, recorded session — reach it as a [`Session`] via [`session`](Self::session)
+/// (for `history`/`turns`/`replay`/further forks).
+pub struct Fork {
+    engine: Arc<FlowEngine>,
+    id: String,
+    prefix: ForkPrefix,
+    turn_guard: Arc<Mutex<()>>,
+}
+
+impl Fork {
+    /// The fork session's id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The fork as a [`Session`] handle — read its `history`/`turns`, `replay` it, or fork it again.
+    pub fn session(&self) -> Session {
+        Session {
+            engine: self.engine.clone(),
+            id: self.id.clone(),
+            turn_guard: self.turn_guard.clone(),
+        }
+    }
+
+    /// Diverge by **injecting** a different value at the fork point's bound statement (skipping the
+    /// op that produced it), then run the plan's tail through the real envelope, streaming to `sink`.
+    /// Errors if the fork point isn't a `bind` statement, or the diverged tail halts.
+    pub async fn inject(&self, value: &serde_json::Value, sink: &mut dyn AgentSink) -> Result<()> {
+        let _turn = self.turn_guard.lock().await;
+        let out = flux_flow::fork::diverge_inject(
+            &self.engine.flow,
+            &self.engine.executor,
+            &self.id,
+            &self.prefix,
+            value,
+            sink,
+        )
+        .await
+        .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+        if let Some(halt) = out.failure {
+            return Err(flux_core::Error::Other(format!(
+                "fork tail halted: {}",
+                halt.message
+            )));
+        }
+        Ok(())
+    }
+
+    /// Diverge by **editing** the plan (an alternate `DraftAst` for the tail from the fork point),
+    /// then run it through the real envelope, streaming to `sink`. Errors if the diverged tail halts.
+    pub async fn edit(&self, edited: &DraftAst, sink: &mut dyn AgentSink) -> Result<()> {
+        let _turn = self.turn_guard.lock().await;
+        let out = flux_flow::fork::diverge_edit(
+            &self.engine.flow,
+            &self.engine.executor,
+            &self.id,
+            &self.prefix,
+            edited,
+            sink,
+        )
+        .await
+        .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+        if let Some(halt) = out.failure {
+            return Err(flux_core::Error::Other(format!(
+                "fork tail halted: {}",
+                halt.message
+            )));
+        }
+        Ok(())
+    }
+
+    /// The aligned per-statement divergence between `original` and this fork
+    /// ([`flux_events::run_diff`] over the two run traces): which statements ran the same, which
+    /// plan changed, and which hit a different recorded world.
+    pub fn diff(&self, original: &Session) -> Result<RunDiff> {
+        let a = original.engine.events.run_trace(&original.id)?;
+        let b = self.engine.events.run_trace(&self.id)?;
+        Ok(flux_events::run_diff(&a, &b))
+    }
+}
+
+/// A throwaway [`AgentSink`] that discards every event — used where a driver requires a sink but the
+/// caller doesn't consume it (the hermetic prefix replay inside [`Session::fork`]).
+struct DiscardSink;
+impl AgentSink for DiscardSink {}
 
 /// Collects a turn's stream into a [`TurnOutput`].
 #[derive(Default)]
