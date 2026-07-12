@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-07-12
+
 ### Added
 
 - **Public beginner tutorial: guarded agent turn → authored Flux-Lang flow → local docs app**

@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-07-12
+
 ### New
 
 - **Learn flux by building a local documentation assistant.** A new four-part beginner tutorial
