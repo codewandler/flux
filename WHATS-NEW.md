@@ -67,6 +67,9 @@
   a chosen point, swap in a different value or an alternate plan, run the branch, and get a
   precise diff of what changed — all without altering the original session. Great for debugging
   ("what if that lookup had returned X?") and A/B exploration.
+- **Flow runs can be watched step by step.** An application running a flow can now stream each step
+  as it happens — every operation's call and its result — instead of only getting the final answer,
+  either by supplying a handler or consuming a live event stream.
 
 ### Action needed
 

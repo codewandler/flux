@@ -122,6 +122,47 @@ impl futures::Stream for TurnStream {
     }
 }
 
+/// A live **flow execution** as a stream of [`AgentEvent`]s — the owned-event counterpart of
+/// [`FlowClient::execute_with_sink`](crate::FlowClient::execute_with_sink), produced by
+/// [`FlowClient::execute_streamed`](crate::FlowClient::execute_streamed). The flow runs on a spawned
+/// task, so every op's `tool_call` and `tool_result` arrive as they happen; [`finish`](Self::finish)
+/// awaits completion and returns the [`ExecutionResult`](crate::ExecutionResult). Also implements
+/// [`futures::Stream`]. Dropping it detaches the (bounded) execution rather than cancelling it — a
+/// flow run has no cancellation token, unlike a [`TurnStream`].
+pub struct FlowStream {
+    pub(crate) rx: mpsc::UnboundedReceiver<AgentEvent>,
+    pub(crate) handle: Option<tokio::task::JoinHandle<Result<crate::ExecutionResult>>>,
+}
+
+impl FlowStream {
+    /// The next event, or `None` once the flow is over and the stream is drained.
+    pub async fn next(&mut self) -> Option<AgentEvent> {
+        self.rx.recv().await
+    }
+
+    /// Wait for the flow to complete and return its [`ExecutionResult`](crate::ExecutionResult) (the
+    /// same value [`FlowClient::execute`](crate::FlowClient::execute) returns). Undelivered events
+    /// are dropped — read them via [`next`](Self::next) first if you want them.
+    pub async fn finish(mut self) -> Result<crate::ExecutionResult> {
+        match self.handle.take() {
+            Some(handle) => match handle.await {
+                Ok(out) => out,
+                Err(e) => Err(flux_core::Error::Other(format!("flow task failed: {e}"))),
+            },
+            None => Err(flux_core::Error::Other(
+                "FlowStream already finished".to_string(),
+            )),
+        }
+    }
+}
+
+impl futures::Stream for FlowStream {
+    type Item = AgentEvent;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
 /// An [`AgentSink`] that forwards owned [`AgentEvent`]s over a channel while also collecting the
 /// turn into a [`TurnOutput`]. Send failures are ignored: a dropped receiver means the consumer
 /// stopped listening, not that the turn should fail.

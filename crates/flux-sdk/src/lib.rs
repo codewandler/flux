@@ -32,7 +32,7 @@ pub mod flow;
 pub mod session;
 pub mod storage;
 
-pub use events::{AgentEvent, TurnStream};
+pub use events::{AgentEvent, FlowStream, TurnStream};
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
 pub use session::{Fork, Session};
 pub use storage::Storage;

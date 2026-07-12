@@ -139,6 +139,16 @@ All notable changes to this project are documented in this file. The format is b
   (`flux_events::run_diff`), and `Fork::session()` exposes the fork as a full `Session`. `Fork` is
   re-exported at the crate root; `RunDiff`/`DiffRow` via `flux_sdk::observe`. Verified by tests that
   inject/edit a divergence and assert the original's `head_seq` is unchanged.
+- **D-158: `FlowClient` streaming — `execute_with_sink` + `execute_streamed`** (sdk-surface wave 4,
+  completes the epic). Flow executions stop being observability-blind: `execute_with_sink(ast, sink)`
+  streams every dispatched op's `tool_call` **and** `tool_result` (plus text/observations) to a
+  consumer `AgentSink` while still returning the `ExecutionResult` — the private collector behind
+  `execute` had kept only op names. `execute_streamed(ast)` is the owned-`AgentEvent` variant: a new
+  `FlowStream` (mirroring `TurnStream` — `futures::Stream` + `finish() -> ExecutionResult`) driven by
+  a spawned run, so events arrive live while a slow op is still in flight. `execute`/`execute_with`
+  are unchanged. `FlowClient.store` became `Arc<FlowStore>` so the spawned run shares it (`FlowStore`
+  isn't `Clone`); every direct path deref-coerces unchanged. `FlowStream` is re-exported at the crate
+  root.
 
 ## [0.16.1] - 2026-07-11
 

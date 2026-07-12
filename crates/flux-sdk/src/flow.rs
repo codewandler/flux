@@ -67,6 +67,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::events::{ChannelSink, FlowStream, TeeSink};
+use crate::session::Collector;
+
 // Re-export the lifecycle's public language types so a consumer can stay in `flux_sdk::flow`.
 pub use flux_flow::analyze::Diagnostic;
 pub use flux_flow::ast::DraftAst;
@@ -185,7 +188,7 @@ impl FlowClientBuilder {
         let sandbox = self.envelope.resolve_sandbox();
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = assemble_registry(provider.clone(), self.model.clone());
-        let store = self.storage.unwrap_or_default().into_flow_store()?;
+        let store = Arc::new(self.storage.unwrap_or_default().into_flow_store()?);
         let prelude_defs = if self.seed_prelude {
             prelude::prelude_schema()
         } else {
@@ -217,7 +220,9 @@ pub struct FlowClient {
     model: String,
     registry: ToolRegistry,
     system: Arc<System>,
-    store: FlowStore,
+    // `Arc` so a spawned `execute_streamed` can share the same store (`FlowStore` isn't `Clone`);
+    // `&self.store` still deref-coerces to `&FlowStore` for every direct execute path.
+    store: Arc<FlowStore>,
     allow: Vec<String>,
     deny: Vec<String>,
     auto_approve: bool,
@@ -465,6 +470,88 @@ impl FlowClient {
         }
         .map_err(|e| Error::Other(e.to_string()))?;
         finish_outcome(outcome, sink, cognition_usage(&executor))
+    }
+
+    /// Execute `ast` while **streaming** every dispatch to your own [`AgentSink`] as it happens — each
+    /// op's `tool_call` **and** `tool_result`, text, and observations — and still returning the
+    /// collected [`ExecutionResult`]. The observable counterpart of [`execute`](Self::execute), whose
+    /// private collector drops everything but op names. Same envelope, same one-shot `await` handling.
+    pub async fn execute_with_sink(
+        &self,
+        ast: &DraftAst,
+        sink: &mut dyn AgentSink,
+    ) -> Result<ExecutionResult> {
+        let executor = self.build_executor();
+        let mut tee = TeeSink {
+            consumer: sink,
+            collect: Collector::default(),
+        };
+        let outcome = if self.composites.is_empty() {
+            execute_flow(&self.store, &executor, &self.session_id, ast, &mut tee).await
+        } else {
+            execute_flow_with_composites(
+                &self.store,
+                &executor,
+                &self.session_id,
+                ast,
+                &self.composites,
+                &mut tee,
+            )
+            .await
+        }
+        .map_err(|e| Error::Other(e.to_string()))?;
+        // The tee's collector holds the op names (as `TurnOutput.tool_calls`) for the result.
+        let names = std::mem::take(&mut tee.collect.0.tool_calls);
+        finish_outcome(
+            outcome,
+            ExecSink { tool_calls: names },
+            cognition_usage(&executor),
+        )
+    }
+
+    /// Execute `ast` as a [`FlowStream`] — a live stream of owned [`AgentEvent`](crate::AgentEvent)s
+    /// plus `finish() -> ExecutionResult`. The flow runs on a spawned task, so events arrive as they
+    /// happen whether or not you are polling (unlike the fully-buffered [`execute`](Self::execute)).
+    ///
+    /// # Panics
+    /// Spawns the flow eagerly, so it must be called from within a Tokio runtime.
+    pub fn execute_streamed(&self, ast: &DraftAst) -> FlowStream {
+        let store = self.store.clone();
+        let executor = self.build_executor();
+        let session_id = self.session_id.clone();
+        let ast = ast.clone();
+        let composites = self.composites.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let mut sink = ChannelSink {
+                tx,
+                collect: Collector::default(),
+            };
+            let outcome = if composites.is_empty() {
+                execute_flow(&store, &executor, &session_id, &ast, &mut sink).await
+            } else {
+                execute_flow_with_composites(
+                    &store,
+                    &executor,
+                    &session_id,
+                    &ast,
+                    &composites,
+                    &mut sink,
+                )
+                .await
+            }
+            .map_err(|e| Error::Other(e.to_string()))?;
+            let names = std::mem::take(&mut sink.collect.0.tool_calls);
+            finish_outcome(
+                outcome,
+                ExecSink { tool_calls: names },
+                cognition_usage(&executor),
+            )
+        });
+        FlowStream {
+            rx,
+            handle: Some(handle),
+        }
     }
 
     /// Lower an AST to an optimizer [`PhysicalPlan`]: `analyze::lower` (validate + gather effects)
@@ -1611,5 +1698,96 @@ flow main
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A tool that sleeps briefly before returning — so a streamed run's events arrive while the op
+    /// is still in flight.
+    struct SlowTool;
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only("slow", "slow op", json!({"type": "object"}))
+        }
+        async fn execute(&self, _c: &ToolContext, _p: Value) -> CoreResult<ToolResult> {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Ok(ToolResult::ok("slow-done"))
+        }
+    }
+
+    fn slow_flow() -> DraftAst {
+        serde_json::from_value(json!({
+            "body": [ { "kind": "call", "op": "slow", "args": [] } ]
+        }))
+        .unwrap()
+    }
+
+    /// D-158: `execute_with_sink` streams each dispatched op's `tool_call` AND `tool_result` to a
+    /// consumer sink — which the private collector behind `execute` drops (it keeps only op names).
+    #[tokio::test]
+    async fn execute_with_sink_streams_tool_results() {
+        #[derive(Default)]
+        struct RecordSink {
+            calls: Vec<String>,
+            results: Vec<String>,
+        }
+        impl AgentSink for RecordSink {
+            fn tool_call(&mut self, name: &str, _input: &Value) {
+                self.calls.push(name.to_string());
+            }
+            fn tool_result(&mut self, name: &str, _result: &ToolResult) {
+                self.results.push(name.to_string());
+            }
+        }
+
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("with-sink"))
+            .unwrap();
+        client.register_op(Arc::new(SlowTool));
+
+        let mut sink = RecordSink::default();
+        let out = client
+            .execute_with_sink(&slow_flow(), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.tool_calls,
+            vec!["slow"],
+            "the result still carries op names"
+        );
+        assert_eq!(sink.calls, vec!["slow"], "the consumer saw the tool_call");
+        assert_eq!(
+            sink.results,
+            vec!["slow"],
+            "the consumer saw the tool_result (execute's collector drops it)"
+        );
+    }
+
+    /// D-158: `execute_streamed` yields owned events live while a slow op runs, and `finish` returns
+    /// the same `ExecutionResult` as `execute`.
+    #[tokio::test]
+    async fn execute_streamed_yields_events_then_finishes() {
+        use crate::AgentEvent;
+
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("streamed"))
+            .unwrap();
+        client.register_op(Arc::new(SlowTool));
+
+        let mut stream = client.execute_streamed(&slow_flow());
+        let mut saw_call = false;
+        let mut saw_result = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                AgentEvent::ToolCall { name, .. } if name == "slow" => saw_call = true,
+                AgentEvent::ToolResult { name, .. } if name == "slow" => saw_result = true,
+                _ => {}
+            }
+        }
+        assert!(saw_call, "the stream delivered the op's tool_call live");
+        assert!(saw_result, "the stream delivered the op's tool_result live");
+        let out = stream.finish().await.unwrap();
+        assert_eq!(out.tool_calls, vec!["slow"]);
     }
 }
