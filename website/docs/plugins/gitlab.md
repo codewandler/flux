@@ -24,8 +24,8 @@ flux plugin status gitlab
 ```
 
 ```text
-gitlab           ~/.flux/plugins/bin/gitlab/0.1.0/flux-plugin-gitlab   v0.1.0  [ok]  [verified]
-    manifest:  v0.1.0  79 op(s)  ·  1 auth purpose(s)  ·  1 endpoint(s)  ·  3 datasource(s)  ·  caps: http, secret(2), blob
+gitlab           ~/.flux/plugins/bin/gitlab/0.1.1/flux-plugin-gitlab   v0.1.1  [ok]  [verified]
+    manifest:  v0.1.1  79 op(s)  ·  1 auth purpose(s)  ·  1 endpoint(s)  ·  3 datasource(s)  ·  caps: http, secret(2), blob
     auth:      · personal_token — not configured (env: GITLAB_PERSONAL_TOKEN, GITLAB_PERSONAL_ACCESS_TOKEN)
     endpoint:  · gitlab.endpoint — env not set, defaults to https://gitlab.com
 ```
@@ -125,8 +125,8 @@ work. It is useful for checking argument shape before a write operation.
 
 | Step | Command | Failure mode if skipped |
 |---|---|---|
-| Install | `flux plugin install gitlab` | `plugin \`gitlab\` not installed` |
-| Token (+ URL if self-hosted) | `export GITLAB_PERSONAL_TOKEN=…` | `secret \`GITLAB_PERSONAL_TOKEN\` not set` |
+| Install | `flux plugin install gitlab` | `no such plugin \`gitlab\`` |
+| Token (+ URL if self-hosted) | `export GITLAB_PERSONAL_TOKEN=…` | `no credential for purpose \`personal_token\`` |
 | Private-net grant (self-hosted only) | `[private_net.plugins]` in config | `refusing to fetch private/loopback/link-local address …` |
 | Verify | `flux plugin call gitlab gitlab.test` | (this *is* the verification step) |
 

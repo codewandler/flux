@@ -20,7 +20,7 @@ The two concepts sit at different layers, and the relationship is deliberately s
 - A **datasource** is one specific capability: a queryable index of knowledge records. It is a
   *noun* — it does nothing on its own.
 - The agent reaches a datasource **through operations**. Retrieval is exposed as ordinary read-only
-  ops (`search`, `get`, `list`, `relation`, `batch_get`) registered in the same catalog as every
+  ops (`sources`, `search`, `get`, `list`, `relation`, `batch_get`) registered in the same catalog as every
   other operation. There is no side door: reading knowledge is a governed call like any other.
 
 So "datasource vs. operation" is not a choice between alternatives — a datasource is *served by*

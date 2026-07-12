@@ -61,8 +61,8 @@ tools: [read, glob, grep, git_status, git_diff]
 Inspect the requested area quickly. Do not modify files. Return evidence with paths.
 ```
 
-- Omit `model` to inherit the parent's model. A role may select another model only on the parent's
-  provider.
+- Omit `model` to inherit the parent's model. A role's `model` resolves against the parent's
+  provider aliases.
 - Omit `tools` to inherit the tools available to the parent.
 - Use `tools: []` to grant no operations.
 - A listed tool is still subject to policy, approval, and the parent capability floor.

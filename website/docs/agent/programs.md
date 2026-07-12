@@ -24,7 +24,7 @@ its settings inline as ordinary Flux-Lang values:
 - **`journey`** — a named flow that does the work. A journey is an ordinary Flux-Lang flow.
 
 Here is a complete Slack support bot — an agent, its channel, a docs datasource, and an agent-bound
-trigger that answers each message ([`crates/flux-app/examples/support-bot.flux`](https://github.com/babelforce/flux/blob/main/crates/flux-app/examples/support-bot.flux)):
+trigger that answers each message ([`crates/flux-app/examples/support-bot.flux`](https://github.com/codewandler/flux/blob/main/crates/flux-app/examples/support-bot.flux)):
 
 ```flux
 agent assistant
@@ -74,7 +74,7 @@ Inside a journey, agents coordinate through a small set of orchestration operati
 - **`emit`** — publish an event onto the bus for other triggers to pick up.
 - **`send`** — deliver a message out on a channel (as in `send({ "channel": "cli", "message": … })`).
 - **`ask`** — put a question to another agent (or a human) and wait for the reply.
-- **`spawn`** — start a sub-agent to work in parallel and hand back a result.
+- **`spawn`** — run a named journey to completion and hand back its result.
 
 This is what makes it multi-agent: independent agents react to events and hand work to one another,
 rather than one loop doing everything.
@@ -92,7 +92,7 @@ trusted, pre-authored program under an allow-all approver instead — it approve
 ones included. To expose the program as a long-running HTTP/A2A daemon instead of a one-shot run:
 
 ```bash
-flux app run --serve 127.0.0.1:8787 --yes
+flux app run app.flux --serve 127.0.0.1:8787 --yes
 ```
 
 See [Agent-to-agent (A2A)](./a2a.md) for reaching a running program from other agents.

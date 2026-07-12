@@ -29,6 +29,7 @@ const sidebars = {
         'agent/claude-code',
         'agent/safety',
         'agent/a2a',
+        'agent/a2a-conformance',
         'agent/programs',
         'agent/slack-channel',
         'agent/datasources',

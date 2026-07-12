@@ -51,9 +51,9 @@ for message in session.history()? {
 }
 ```
 
-`create_session`, `open_session`, and `latest_session` all return a `Session`; `open_session`
-errors if the id is unknown to the client's storage. `Client::run` and `Client::session_id` remain
-the one-line path over the default session.
+`create_session` and `open_session` return a `Session` (`open_session` errors if the id is unknown
+to the client's storage); `latest_session` returns `Option<Session>` — `None` when no prior session
+exists. `Client::run` and `Client::session_id` remain the one-line path over the default session.
 
 ## Resuming across a restart
 
@@ -67,7 +67,7 @@ the pause survives the restart, not just the process.
 let id = {
     let client = Client::builder().storage(Storage::dir("./state")).build(p1, ".")?;
     client.run("Book the earliest flight you can find.").await?;
-    client.session_id().to_string()
+    client.session_id()?
 };
 
 // Later process — same directory, same conversation:

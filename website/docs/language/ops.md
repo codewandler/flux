@@ -51,7 +51,7 @@ policy.
 | `browser.act` | `session, action[, ref, value, full]` | medium, approval | Click, type, fill, select, press, scroll, navigate, or go back using digest refs |
 | `browser.close` | `session` | low | Close a browser session and its Chromium child |
 | `web.search` | `query[, max_results]` | low | Tavily web search (requires `TAVILY_API_KEY`) |
-| `sqlite_query` | `db, sql[, params]` | low | Read-only SQLite query |
+| `sqlite_query` | `db, sql[, limit]` | low | Read-only SQLite query (`limit` caps rows, default 200) |
 | `now` / `cwd` / `home_dir` / `sys_info` | | low | Clock, workspace/home paths, and host metadata — no shell needed |
 
 All native web operations share the `[private_net] web` scope. Public destinations are allowed by

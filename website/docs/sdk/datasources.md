@@ -17,8 +17,8 @@ Add the capabilities crate alongside the SDK:
 
 ```toml
 [dependencies]
-codewandler-flux-sdk = "0.17"
-codewandler-flux-capabilities = "0.17"
+codewandler-flux-sdk = "0.19"
+codewandler-flux-capabilities = "0.19"
 ```
 
 Build a backend, index documents into it, and register its ops onto a client. The registered ops

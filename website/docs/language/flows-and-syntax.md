@@ -162,7 +162,7 @@ another symbol, or a literal. An optional type annotation documents the expected
 ```flux
 $tests: TestResult = cargo_test({args: ["--workspace"]})
 $ok = $score >= 0.8
-$scaled = round($base * 1.2, 2)
+$scaled = $base * 1.2
 ```
 
 Operator formulas in bind RHS positions lower to pure `expr` nodes. `$name` references become the

@@ -29,8 +29,8 @@ flux plugin status slack
 ```
 
 ```text
-slack            ~/.flux/plugins/bin/slack/0.1.0/flux-plugin-slack   v0.1.0  [ok]  [verified]
-    manifest:  v0.1.0  30 op(s)  ·  2 auth purpose(s)  ·  1 endpoint(s)  ·  2 datasource(s)  ·  caps: http, secret(2), blob
+slack            ~/.flux/plugins/bin/slack/0.1.1/flux-plugin-slack   v0.1.1  [ok]  [verified]
+    manifest:  v0.1.1  30 op(s)  ·  2 auth purpose(s)  ·  1 endpoint(s)  ·  2 datasource(s)  ·  caps: http, secret(2), blob
     auth:      · bot_token — not configured (env: SLACK_BOT_TOKEN, or `flux auth set slack bot_token`)
     auth:      · user_token — not configured (env: SLACK_USER_TOKEN, or `flux auth set slack user_token`)
     endpoint:  · slack.endpoint — env not set, defaults to https://slack.com/api

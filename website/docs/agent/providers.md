@@ -91,9 +91,9 @@ Prompt caching is applied automatically for long contexts on providers that supp
 needed.
 
 :::note
-`--think` / `--effort` flags exist but are hidden and **not yet wired into the plan engine** — they
-currently only affect the raw `-p` prompt path. Extended-thinking control for full agent turns is
-planned.
+`--think` / `--effort` flags are hidden and accepted for CLI compatibility, but are currently
+**no-ops** — the raw `-p` prompt path that consumed them was removed in the engine cutover.
+Extended-thinking control for full agent turns is planned.
 :::
 
 ## Related docs

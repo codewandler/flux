@@ -26,7 +26,7 @@ In the JSON wire form these correspond to the `TypeRef` tags `any`, `bool`, `num
 ## Where types appear
 
 ```flux
-flow build-report(repo: String, branch: String) -> String
+flow build-report(repo: String, branch: String) -> TestResult
   $tests: TestResult = cargo_test({args: ["--workspace"]})
   return $tests
 ```

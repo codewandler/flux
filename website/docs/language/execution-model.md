@@ -29,8 +29,9 @@ parse (or receive JSON) -> analyze -> optimize -> execute
    all registered and read-only may run concurrently with other such statements when their
    symbol reads and writes are independent. A statement containing a write/network/process
    effect, an **unknown operation** (unknown effects are treated as the most dangerous
-   effects), or an approval/durability construct (`confirm`, `await`, `checkpoint`, `once`,
-   `saga`, `thing`) is a **hard fence**: nothing is scheduled across it in either direction,
+   effects), an approval/durability construct (`confirm`, `await`, `checkpoint`, `once`,
+   `saga`, `thing`), or a cross-turn rate construct (`throttle`, `debounce`) is a **hard fence**:
+   nothing is scheduled across it in either direction,
    so approval order and policy behavior are exactly those of sequential execution. The
    optimized run is observationally equivalent to the sequential one — same bound values,
    same user-visible trace order.

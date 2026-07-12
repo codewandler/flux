@@ -25,7 +25,7 @@ The integration plugins ship separately from flux as the signed **plugin pack**
 
 ```bash
 flux plugin install gitlab slack     # newest pack release
-flux plugin install gitlab@0.1.0     # exact version
+flux plugin install gitlab@0.1.1     # exact version
 flux plugin install --all            # the whole pack
 ```
 

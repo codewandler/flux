@@ -207,7 +207,7 @@ sandbox replaces `/run` with a fresh tmpfs to hide host sockets like `docker.soc
 hides the resolver socket/config that most Linux distros keep under `/run`. flux re-exposes the
 common ones read-only when the network is on — systemd-resolved (`/run/systemd/resolve`),
 `resolvconf` (`/run/resolvconf`), and NetworkManager (`/run/NetworkManager`). If your distro keeps
-its resolver state somewhere else, add that path (or the directory `/etc/resolv.conf` symlinks
+its resolver state somewhere else, adding that path (or the directory `/etc/resolv.conf` symlinks
 into) to `[sandbox] writable` is *not* the fix — instead file it as a gap; the built-in re-bind
 list is what needs extending. As a workaround, a static `/etc/resolv.conf` (not a symlink into
 `/run`) resolves fine because the whole filesystem is visible read-only.

@@ -52,6 +52,8 @@ Its controls are:
 - `approver` installs your own per-operation `Approver` and overrides `auto_approve`.
 - `with_sandbox` pins an explicit OS-sandbox posture. Without it, the builder resolves the posture
   from the `FLUX_SANDBOX*` environment settings.
+- `storage(Storage::dir(...))` persists durable-construct state (`once`/`checkpoint`) across
+  processes. The default store is in memory.
 - `compile_options` changes the natural-language compiler's attempt, step, and token budgets.
 - `without_prelude` starts with an empty artifact-definition map instead of the standard
   `Claim`/`Evidence`/`Ctx`/`Answer` family.
@@ -173,6 +175,7 @@ Every execution method returns `ExecutionResult`:
 | `transcript` | The labeled model-facing views produced during execution. |
 | `steps` | Number of dispatched operations. |
 | `tool_calls` | Operation names in dispatch order. |
+| `usage` | Summed token spend of model-backed cognition ops; `None` if none were billed. |
 | `parse::<T>()` | Deserialize `result` into an application type. |
 | `answer()` | Deserialize the standard prelude `Answer` artifact. |
 
@@ -183,7 +186,8 @@ are re-exported from `flux_sdk::flow`.
 
 `FlowClient` is deliberately a one-flow façade, not a durable conversation host:
 
-- Its store is in memory. Use `FlowEngine` with a durable `FlowStore` when values, run traces, and
+- Its store is in memory by default; `storage(Storage::dir(...))` persists `once`/`checkpoint` state
+  across processes. Use `FlowEngine` with a durable `FlowStore` when values, run traces, and
   suspensions must survive process exit.
 - `execute`, `execute_with`, and `run_flow` do not resume a top-level `await`. If execution suspends,
   they return an explicit error after reporting that the one-shot SDK path has no resume hook.

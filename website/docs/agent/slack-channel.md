@@ -69,7 +69,7 @@ flux app run crates/flux-app/examples/support-bot.flux
 
 The program runs as a daemon until Ctrl-C. `@`-mention the bot in a channel it is in; it reads the
 message, searches its docs, and replies in the thread. The runnable
-[`support-bot.flux`](https://github.com/babelforce/flux/blob/main/crates/flux-app/examples/support-bot.flux)
+[`support-bot.flux`](https://github.com/codewandler/flux/blob/main/crates/flux-app/examples/support-bot.flux)
 example is the complete source.
 
 ## Restricting access

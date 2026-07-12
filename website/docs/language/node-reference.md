@@ -315,6 +315,7 @@ List-driven loop. Text form: `each $x in $list [-> $collect | -> flat $collect]`
 | `as` | string | yes | element symbol per iteration |
 | `body` | Node[] | no | per-element body |
 | `collect` | string | no | symbol bound to the per-iteration results (empty list ⇒ `[]`) |
+| `flat` | bool | no | when `collect` is set, flatten each iteration's (list) result one level into the combined list |
 
 ### `loop`
 

@@ -69,6 +69,7 @@ explicit `agent`. On startup flux prints the agent-card and endpoint URLs.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/.well-known/agent-card.json` | exempt | A2A discovery card |
+| `GET` | `/health` | exempt | Liveness probe |
 | `POST` | `/a2a` | per mode | JSON-RPC 2.0 dispatcher (`message/send`, `message/stream`) |
 
 The discovery card is always public so external agents can find flux without a token. Every other
@@ -83,9 +84,11 @@ Each agent's card advertises its own `/:agent_id/a2a` endpoint, agents are resol
 agent id is an indistinguishable `404`. Agents are isolated by construction — each has its own
 engine and event store. Embedders reach this via `flux_server::router_multi`.
 
-### `message/send` — synchronous
+### `message/send`
 
-Runs one flux turn and returns the resulting `Task` when complete.
+Runs one flux turn and returns the resulting `Task`. The A2A spec default is **non-blocking**:
+without `configuration.blocking: true` the call returns a `submitted` task immediately and runs the
+turn in the background. The example below sets `blocking: true` for the synchronous response shown.
 
 ```bash
 curl -s http://localhost:3000/a2a \

@@ -6,8 +6,9 @@ description: An example-driven walk through Flux-Lang — flows, calls, pure dat
 # A ten-minute tour
 
 This tour builds one small Flux-Lang vocabulary at a time: flows, calls, pure values, branches,
-iteration, concurrency, guard rails, and context packs. Every snippet uses current syntax and can be
-pasted into a `.flux` file.
+iteration, concurrency, guard rails, and context packs. Every snippet uses current syntax; complete
+flows run as-is in a `.flux` file, and the shorter fragments show a flow body (wrap them in a `flow`
+header to run standalone).
 
 ## A minimal flow
 

@@ -11,7 +11,7 @@ offline smoke test first so you can verify the runtime without provider credenti
 
 ## Install
 
-**Prebuilt binary** — installs `flux` into `~/.cargo/bin` (Linux, macOS, Windows; x86_64 + aarch64):
+**Prebuilt binary** — installs `flux` into `~/.cargo/bin` (Linux & macOS on x86_64 + aarch64; Windows on x86_64):
 
 ```bash
 # Linux / macOS
@@ -87,7 +87,8 @@ step, including destructive ones, so reserve it for trusted automation.
 
 ## Run a stored Flux-Lang flow
 
-Flux-Lang text can be parsed and executed without asking a model to compile a new plan:
+Flux-Lang text can be parsed and executed without asking a model to compile a new plan. Save this
+as `hello.flux`:
 
 ```flux
 flow hello -> String

@@ -78,9 +78,12 @@ determinism over the same voice stack: the deterministic skeleton makes **zero**
 calls, and when the flow completes the driver speaks the final line, fires
 `VoiceSink::session_ended` (your hangup/handoff hook), and ends the session.
 
-The entry point is driver-level: `VoiceSessionDriver::run_flow_turns` with an
-`EngineVoiceHandler` — a `VoiceTurnHandler` backed by a `FlowEngine` (which server/embedding hosts
-already hold; a `FlowClient` convenience wrapper is a planned follow-up). Each turn the handler
+The SDK entry point is `Session::run_voice_flow(provider, config, flow, sink, cancel)` — the voice
+counterpart of `Session::start_flow` and the flow-driven sibling of the model-driven
+`FlowClient::run_voice_session`. It needs the persistent engine, so it lives on `Session` rather than
+`FlowClient`. Under the hood it drives `VoiceSessionDriver::run_flow_turns` with an
+`EngineVoiceHandler` — a `VoiceTurnHandler` backed by a `FlowEngine`, which server/embedding hosts
+can also drive at the driver level directly. Each turn the handler
 returns a `VoiceReply`: `Continue(text)` (speak this, await the caller) or `Complete(text)` (speak
 this final line, end the call). Ops a voice-driven flow dispatches traverse the engine's shared
 executor — the same envelope as a text turn — and barge-in is unchanged.
