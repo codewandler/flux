@@ -47,5 +47,15 @@ flux-spec.workspace = true
 flux-evidence.workspace = true
 # `TurnStream` implements `futures::Stream` (the async-iterator shape of a live turn).
 futures.workspace = true
+# Optional (feature `pricing`): the `~/.flux/pricing.toml` loader behind `flux_sdk::pricing`, so a
+# consumer gets `Session::cost` ergonomics without re-implementing the built-in-plus-overlay resolve.
+# The provider-agnostic default build (`default = []`) pulls none of this.
+flux-credentials = { workspace = true, optional = true }
+
+[features]
+default = []
+# `flux_sdk::pricing::load_pricing_table()` — the built-in rate table overlaid by the user's
+# `~/.flux/pricing.toml`, for `Session::cost`.
+pricing = ["dep:flux-credentials"]
 
 [dev-dependencies]

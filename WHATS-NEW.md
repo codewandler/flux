@@ -40,6 +40,11 @@
   rank, judge, reason, synthesize, rewrite), the result now includes the total token usage of those
   calls — so an application can measure and bill the spend of a flow. A flow with no AI steps reports
   no usage.
+- **Embedded conversations expose their history, cost, and metrics.** An embedded session can now be
+  asked for its turn-by-turn summaries, its full run trace, its per-model cost in dollars, and its
+  efficiency metrics — the same data the `flux` CLI reports — so an application can show or bill a
+  conversation's usage. An optional pricing add-on loads your `~/.flux/pricing.toml` rates for the
+  cost calculation.
 
 ### Action needed
 

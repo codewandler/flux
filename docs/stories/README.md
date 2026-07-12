@@ -26,9 +26,6 @@ _None._
 
 ## Next (ready — take the top one unless the user named a story)
 
-### SDK surface — a standard agent SDK, the flux way
-- [D-151 — Session observability — history/turns/run_trace/cost/efficiency + pricing feature](D-151-sdk-session-projections-pricing.md) · Agent · wave 2 — the recorded-but-invisible projections reach the embedder
-
 ### Web capabilities — request · read · browse
 _flux's web surface grew bottom-up and it shows. Today there are exactly two model-facing web ops:_
 - [D-163 — Rename web_fetch/web_search to web.fetch/web.search — op-family naming consistency](D-163-web-fetch-search-dot-rename.md) · Agent · surfaced by an op-naming convention audit (2026-07-11): web_fetch/web_search are the only snake_case ops left in the web family — http.request, web.crawl, and browser.* are all dot-namespaced, and docs/designs/web-capabilities.md already calls the op web.fetch (lines 28, 96) while the shipped code/other docs still say web_fetch
@@ -321,6 +318,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-148 — Sub-agents on the classic Client](D-148-sdk-client-sub-agents.md) · Agent · wave 2 — with_sub_agents parity; cancellation now reaches the task tool
 - [D-149 — AgentSpec knobs on ClientBuilder — groups, ambient signals, compaction, context budget](D-149-sdk-agent-spec-knobs.md) · Agent · wave 2 — evidence-gated tool surfacing + compaction control for embedders
 - [D-150 — ExecutionResult.usage — flow runs report token spend](D-150-flow-execution-usage.md) · Agent · wave 2 — flux-cognition drops per-call usage today; surface + sum it
+- [D-151 — Session observability — history/turns/run_trace/cost/efficiency + pricing feature](D-151-sdk-session-projections-pricing.md) · Agent · wave 2 — the recorded-but-invisible projections reach the embedder
 - [D-160 — web.crawl — a bounded, SSRF-guarded crawl primitive](D-160-web-crawl-primitive.md) · Agent · downstream ask (ai-agent-platform, consumer ask A-44): a bounded, SSRF-guarded web.crawl op — seed + same-host link-following under page/depth caps — reversing the web-capabilities crawling non-goal
 - [D-161 — web_fetch extracts text from PDFs instead of returning raw bytes](D-161-web-fetch-pdf-extraction.md) · Agent · downstream ask (ai-agent-platform, consumer ask A-47): web_fetch on a PDF returns extracted text, not raw lossy bytes — a content-type/%PDF branch in the non-HTML path; lifts part of the grounded-knowledge binary-extraction deferral for the web path only
 - [D-162 — Provider embeddings pack — explicit config, per-source routing, usage capture](D-162-provider-embeddings-pack.md) · Core · downstream ask (ai-agent-platform): make the embeddings seam production-ready — explicit-config OpenAiEmbedder constructor + per-source embedder/model routing + embed-usage capture; Bedrock embeddings and pgvector are explicit stretch

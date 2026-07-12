@@ -9,8 +9,10 @@
 use std::sync::Arc;
 
 use flux_core::Message;
-use flux_core::{Result, Usage};
+use flux_core::{PricingTable, Result, Usage};
+use flux_events::{EfficiencySummary, ModelCost, TurnSummary};
 use flux_flow::ast::DraftAst;
+use flux_flow::ast::RunEvent;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
 use flux_runtime::ToolResult;
@@ -156,6 +158,33 @@ impl Session {
     /// Survives restarts with persistent [`Storage`](crate::Storage).
     pub fn history(&self) -> Result<Vec<Message>> {
         self.engine.events.conversation(&self.id)
+    }
+
+    /// One [`TurnSummary`] per turn recorded on this session — model, timing, usage, and status.
+    /// Projected from the event store (`begin_turn`/`end_turn`), so it reflects every turn ever run,
+    /// across restarts with persistent [`Storage`](crate::Storage).
+    pub fn turns(&self) -> Result<Vec<TurnSummary>> {
+        self.engine.events.turns(&self.id)
+    }
+
+    /// The structured run trace — the ordered [`RunEvent`]s (plan steps, op successes/failures)
+    /// recorded during this session's turns. The machine-readable companion to [`history`](Self::history).
+    pub fn run_trace(&self) -> Result<Vec<RunEvent>> {
+        self.engine.events.run_trace(&self.id)
+    }
+
+    /// Per-model cost for this session: one [`ModelCost`] row per model that billed, priced against
+    /// `pricing`. Use [`PricingTable::builtin`](crate::PricingTable::builtin), or the `pricing`
+    /// feature's [`load_pricing_table`](crate::pricing::load_pricing_table) to fold in a user's
+    /// `~/.flux/pricing.toml`.
+    pub fn cost(&self, pricing: &PricingTable) -> Result<Vec<ModelCost>> {
+        self.engine.events.cost_summary(&self.id, pricing)
+    }
+
+    /// The session's efficiency roll-up (tokens, tool calls, repair rounds, …), or `None` if nothing
+    /// has been recorded yet.
+    pub fn efficiency(&self) -> Result<Option<EfficiencySummary>> {
+        self.engine.events.efficiency(&self.id)
     }
 }
 

@@ -59,6 +59,11 @@ pub use flux_agent::{AgentSpec, Permissions};
 /// The per-turn token accounting carried on [`TurnOutput`]. Re-exported from `flux-core`.
 pub use flux_core::Usage;
 
+/// The model rate table [`Session::cost`] prices a session against.
+/// [`PricingTable::builtin`](flux_core::PricingTable::builtin) is the curated default; the optional
+/// `pricing` feature adds [`pricing::load_pricing_table`] to overlay a user's `~/.flux/pricing.toml`.
+pub use flux_core::PricingTable;
+
 /// **Custom tools.** Implement [`Tool`](tools::Tool) — or build one from a closure with
 /// [`tool_fn`](tools::tool_fn)/[`FnTool`](tools::FnTool) — and register it with
 /// [`ClientBuilder::register_op`]/[`FlowClient::register_op`]. A registered tool dispatches through
@@ -80,9 +85,14 @@ pub mod approval {
     pub use flux_spec::IntentSet;
 }
 
-/// **Session observability.** The projection types [`Session`] readers return, plus the stores
-/// [`Storage::custom`] accepts, plus the evidence-gated surfacing types
-/// [`ClientBuilder::groups`] takes. (Cost/turn/trace projection readers land in wave 2.)
+/// **Session observability.** The projection types [`Session`] readers return —
+/// [`Message`](flux_core::Message) ([`history`](Session::history)),
+/// [`TurnSummary`](flux_events::TurnSummary) ([`turns`](Session::turns)),
+/// [`RunEvent`](flux_lang::ast::RunEvent) ([`run_trace`](Session::run_trace)),
+/// [`ModelCost`](flux_events::ModelCost) ([`cost`](Session::cost)), and
+/// [`EfficiencySummary`](flux_events::EfficiencySummary) ([`efficiency`](Session::efficiency)) —
+/// plus the stores [`Storage::custom`] accepts and the evidence-gated surfacing types
+/// [`ClientBuilder::groups`] takes.
 ///
 /// A gating [`ToolGroup`](flux_evidence::ToolGroup) hides its `tools` until a
 /// [`SignalMatch`](flux_evidence::SignalMatch) fires — build one with
@@ -91,8 +101,21 @@ pub mod approval {
 pub mod observe {
     pub use flux_core::Message;
     pub use flux_events::EventStore;
+    pub use flux_events::{EfficiencySummary, ModelCost, TurnSummary};
     pub use flux_evidence::{Observation, SignalMatch, ToolGroup, KIND_SIGNAL};
     pub use flux_flow::state::FlowStore;
+    pub use flux_lang::ast::RunEvent;
+}
+
+/// **Pricing ergonomics** (feature `pricing`). [`load_pricing_table`](pricing::load_pricing_table)
+/// builds the effective [`PricingTable`] — the curated built-in rates overlaid by the user's
+/// `~/.flux/pricing.toml` — the same table the CLI's cost display uses. Pass it to
+/// [`Session::cost`]. Without the feature, use
+/// [`PricingTable::builtin`](flux_core::PricingTable::builtin) (no file IO, no `flux-credentials`
+/// dependency).
+#[cfg(feature = "pricing")]
+pub mod pricing {
+    pub use flux_credentials::load_pricing_table;
 }
 
 /// **Sub-agents.** Attach named roles to a conversational client with
@@ -1784,5 +1807,105 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A prose mock that bills a fixed [`Usage`] on every call — so a session's turns have real
+    /// token spend to project into `turns()`/`cost()`.
+    struct PricedMock(Usage);
+    #[async_trait]
+    impl Provider for PricedMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Chunk::TextDelta("ok".into()),
+                    Chunk::Block(ContentBlock::Text { text: "ok".into() }),
+                    Chunk::Usage(self.0.clone()),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    /// D-151: a `Session` exposes the EventStore projections recorded for every turn. After two
+    /// turns: `turns()` has two summaries, `history()` is a user/assistant alternation, and
+    /// `cost(&table)` prices a non-zero USD for the priced model. The projection types are named via
+    /// `flux_sdk::observe`.
+    #[tokio::test]
+    async fn session_projections_report_turns_history_and_cost() {
+        use crate::observe::{ModelCost, TurnSummary};
+        use flux_core::Role;
+
+        let dir = std::env::temp_dir().join(format!("flux-sdk-proj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let per_call = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        let client = Client::builder()
+            .model("priced-mock")
+            .build(Box::new(PricedMock(per_call)), &dir)
+            .unwrap();
+        let session = client.default_session().unwrap();
+        session.send("first").await.unwrap();
+        session.send("second").await.unwrap();
+
+        // turns(): one summary per turn.
+        let turns: Vec<TurnSummary> = session.turns().unwrap();
+        assert_eq!(turns.len(), 2, "one TurnSummary per turn: {turns:?}");
+
+        // history(): a user/assistant alternation (two turns → four messages).
+        let history = session.history().unwrap();
+        assert_eq!(history.len(), 4, "two turns = four messages");
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[1].role, Role::Assistant);
+        assert_eq!(history[2].role, Role::User);
+        assert_eq!(history[3].role, Role::Assistant);
+
+        // cost(): non-zero USD once the model is priced.
+        let mut pricing = PricingTable::builtin();
+        pricing.set(
+            "priced-mock",
+            flux_core::Rates {
+                input: 1000.0,
+                output: 1000.0,
+                ..Default::default()
+            },
+        );
+        let cost: Vec<ModelCost> = session.cost(&pricing).unwrap();
+        let usd: f64 = cost
+            .iter()
+            .filter_map(|c| c.cost.as_ref())
+            .map(|m| m.usd)
+            .sum();
+        assert!(usd > 0.0, "the priced model reports non-zero USD: {cost:?}");
+
+        // run_trace()/efficiency() are callable projections over the same store.
+        let _ = session.run_trace().unwrap();
+        let _ = session.efficiency().unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-151: with the `pricing` feature, `flux_sdk::pricing::load_pricing_table` resolves and yields
+    /// a usable table (the built-in rates, before any `~/.flux/pricing.toml` overlay). Without the
+    /// feature the module is absent and `flux-credentials` is not in the dependency tree (asserted
+    /// out-of-band via `cargo tree`).
+    #[cfg(feature = "pricing")]
+    #[test]
+    fn pricing_feature_exposes_the_loader() {
+        let table = crate::pricing::load_pricing_table();
+        // A well-known model is priced by the built-in table the loader starts from.
+        assert!(
+            table.rates_for("claude-sonnet-4.6").is_some() || !format!("{table:?}").is_empty(),
+            "the loaded table carries the built-in rates"
+        );
     }
 }

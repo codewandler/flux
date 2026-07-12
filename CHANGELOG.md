@@ -61,6 +61,18 @@ All notable changes to this project are documented in this file. The format is b
   is now `#[non_exhaustive]` (**BREAKING** — MINOR under pre-1.0 SemVer; construct it only via the
   SDK and match with a `..` rest pattern). `flux-cognition` gains a dependency on the L0
   `flux-evidence` (layering-legal, verified by `flux-codegate`).
+- **D-151: Session observability — the recorded projections reach the embedder** (sdk-surface
+  wave 2). `Session` gains `turns()` (`Vec<TurnSummary>`), `run_trace()` (`Vec<RunEvent>`),
+  `cost(&PricingTable)` (`Vec<ModelCost>`), and `efficiency()` (`Option<EfficiencySummary>`) —
+  pure reads over the event store's projections, already recorded for every turn but previously
+  unreachable from the SDK (`history()` shipped in wave 1). A new opt-in `pricing` cargo feature
+  (`default = []`) adds `flux_sdk::pricing::load_pricing_table()` — the built-in rate table overlaid
+  by the user's `~/.flux/pricing.toml`, the same loader the CLI's cost display uses — behind an
+  optional `flux-credentials` dependency, so the default build stays free of it (verified by
+  `cargo tree`). `Session::cost` itself takes any `PricingTable`, so
+  `PricingTable::builtin()` works without the feature. `flux_sdk::observe` now re-exports the
+  projection types (`TurnSummary`, `RunEvent`, `ModelCost`, `EfficiencySummary`) and `PricingTable`
+  is re-exported at the crate root.
 
 ## [0.16.1] - 2026-07-11
 
