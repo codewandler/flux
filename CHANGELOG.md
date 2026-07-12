@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-12
+
 ### Added
 
 - **D-147: flow-driven sessions reach the SDK — `Session::start_flow` + `suspended`** (sdk-surface

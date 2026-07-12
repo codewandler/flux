@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-12
+
 ### New
 
 - **Embedded agents can now run guided, resumable conversations.** An application can hand an

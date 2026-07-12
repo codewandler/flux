@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-12
+
 ### New
 
 - **Embedded agents can now run guided, resumable conversations.** An application can hand an
