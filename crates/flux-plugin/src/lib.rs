@@ -116,6 +116,10 @@ pub struct OperationSpec {
     pub description: String,
     #[serde(default)]
     pub input_schema: Value,
+    /// JSON Schema for a successful operation result. Optional for wire compatibility with
+    /// existing plugins; schema-complete catalogs may require it for their own visible ops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     /// IO effects this operation may produce (drives the policy floor + approval).
     #[serde(default)]
     pub effects: Vec<Effect>,
@@ -2639,7 +2643,7 @@ fn plugin_tool_spec(plugin: &str, op: &OperationSpec) -> (String, ToolSpec) {
         name: qualified,
         description: op.description.clone(),
         input_schema: op.input_schema.clone(),
-        output_schema: None,
+        output_schema: op.output_schema.clone(),
         effects,
         risk: op.risk.unwrap_or(Risk::Medium),
         idempotency: op.idempotency.unwrap_or(Idempotency::NonIdempotent),
@@ -3155,6 +3159,48 @@ mod tests {
         let (_, spec) = plugin_tool_spec("vault", &op);
         assert_eq!(spec.name, "vault.kv.read");
         assert_eq!(spec.group.as_deref(), Some("vault.kv"));
+    }
+
+    /// D-164 failing-first: output documentation belongs to the plugin manifest and must survive
+    /// both the subprocess wire and the agent-tool projection. Legacy manifests omit the field.
+    #[test]
+    fn operation_output_schema_round_trips_and_defaults_for_legacy_manifests() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"]
+        });
+        let op = serde_json::from_value::<OperationSpec>(serde_json::json!({
+            "name": "tickets.create",
+            "output_schema": schema
+        }))
+        .unwrap();
+        assert_eq!(op.output_schema.as_ref(), Some(&schema));
+
+        let encoded = serde_json::to_value(&op).unwrap();
+        assert_eq!(encoded["output_schema"], schema);
+
+        let legacy = serde_json::from_value::<OperationSpec>(serde_json::json!({
+            "name": "tickets.list"
+        }))
+        .unwrap();
+        assert!(legacy.output_schema.is_none());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("output_schema")
+            .is_none());
+    }
+
+    #[test]
+    fn plugin_operation_output_schema_projects_to_tool_spec() {
+        let schema = serde_json::json!({ "type": "array", "items": { "type": "string" } });
+        let op = OperationSpec {
+            name: "tickets.labels".into(),
+            output_schema: Some(schema.clone()),
+            ..Default::default()
+        };
+        let (_, spec) = plugin_tool_spec("tickets", &op);
+        assert_eq!(spec.output_schema, Some(schema));
     }
 
     /// D-138: a manifest-declared `OperationSpec::semantic_effects` (`Money`) projects onto the

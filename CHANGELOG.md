@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **D-164: plugin operations can declare an output JSON Schema** (Agent pillar). `OperationSpec` gains an
+  optional, serde-defaulted `output_schema` (wire-compatible with existing plugins/manifests) that projects
+  unchanged onto the runtime `ToolSpec` — the machine-readable return contract generated capability
+  references consume. host-kit adds the `with_output_schema(op, schema)` combinator (mirroring
+  `grouped`/`risked`) and `PluginBuilder::map_operations(...)` for bulk metadata sourced from an external
+  contract; AUTHORING.md documents both. Tests: `operation_output_schema_round_trips_and_defaults_for_legacy_manifests`,
+  `plugin_operation_output_schema_projects_to_tool_spec` (`crates/flux-plugin`),
+  `output_schema_via_combinator_and_map_operations` (`plugins/host-kit`).
 - **D-165: the Slack support-bot example is genuinely runnable end-to-end** (Agent pillar; a D-11
   app-runner follow-on). `crates/flux-app/examples/support-bot.flux` was advertised as a one-line
   `flux app run …` but couldn't run. Three fixes make it real: (1) the Slack channel adapter is now

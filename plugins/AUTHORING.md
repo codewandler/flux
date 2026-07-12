@@ -146,6 +146,11 @@ Edit `plugins/<name>/src/main.rs` (reference: `plugins/gitlab/src/main.rs` for H
 
 1. **Declare** in `manifest_builder()`: `.operation(read_op|write_op("<name>", "<desc>", json!(<schema>)), <handler>)`,
    plus any new `Caps.secrets`, `EndpointSpec`, `AuthMethod`, or `.datasource(...)`.
+   Declare the result shape with the `with_output_schema(read_op(...), json!(<schema>))` combinator
+   (or `PluginBuilder::map_operations(...)` for schemas generated in bulk from an external contract)
+   when the successful result has a stable JSON shape — it is the machine-readable return contract
+   used by generated references and is projected unchanged onto the runtime `ToolSpec`. Keep it absent
+   only when the output is genuinely open-ended.
 2. **Handler** `fn <handler>(input: Value, host: &mut Host) -> Result<Value, String>`: validate input,
    do IO through `host.get_json_ref`/`send_json_ref`/`http_ref`/`http_bytes_ref` (endpoint-reference
    HTTP) or `run`/`conn_*`/`blob_*`, and for knowledge ops emit `Record`s via `host.contribute`.

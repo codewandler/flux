@@ -923,6 +923,17 @@ impl PluginBuilder {
         self.manifest.clone()
     }
 
+    /// Transform every operation declaration accumulated so far. This is useful for generated
+    /// manifest metadata (for example output schemas sourced from an external API contract) that
+    /// should stay separate from hand-written handler registration. The operation names and
+    /// handler map are unaffected.
+    pub fn map_operations(mut self, mut map: impl FnMut(&mut OperationSpec)) -> Self {
+        for operation in &mut self.manifest.operations {
+            map(operation);
+        }
+        self
+    }
+
     /// Finish building (without serving) — used by tests to call ops against a mock host.
     ///
     /// Panics if a [`preflight`](Self::preflight) rule names an unregistered op (a developer
@@ -1049,6 +1060,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
         name: name.into(),
         description: description.into(),
         input_schema,
+        output_schema: None,
         effects: vec![Effect::Read],
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
@@ -1065,6 +1077,7 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         name: name.into(),
         description: description.into(),
         input_schema,
+        output_schema: None,
         effects: vec![Effect::Write, Effect::Network],
         risk: Some(Risk::Medium),
         idempotency: Some(Idempotency::NonIdempotent),
@@ -1111,6 +1124,7 @@ pub fn internal_op(name: &str, description: &str, input_schema: Value) -> Operat
         name: name.into(),
         description: description.into(),
         input_schema,
+        output_schema: None,
         effects: Vec::new(),
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
@@ -1130,6 +1144,15 @@ pub fn grouped(mut op: OperationSpec, group: &str) -> OperationSpec {
 /// Override an operation's risk classification.
 pub fn risked(mut op: OperationSpec, risk: Risk) -> OperationSpec {
     op.risk = Some(risk);
+    op
+}
+
+/// Attach the JSON Schema describing an operation's successful result — the machine-readable return
+/// contract projected unchanged onto the runtime `ToolSpec` and used by generated references (D-164).
+/// Composes with the `read_op`/`write_op` presets in the fluent `.operation(...)` call, e.g.
+/// `.operation(with_output_schema(read_op("tickets.list", "...", json!({...})), json!({...})), handler)`.
+pub fn with_output_schema(mut op: OperationSpec, output_schema: Value) -> OperationSpec {
+    op.output_schema = Some(output_schema);
     op
 }
 
@@ -1672,6 +1695,39 @@ mod tests {
 
         // unknown op errors
         assert!(plugin.call("nope", json!({}), &mut host).is_err());
+    }
+
+    /// D-164: a plugin author can attach an operation's result schema two ways — the
+    /// [`with_output_schema`] combinator on a single op, and [`PluginBuilder::map_operations`] for
+    /// bulk metadata sourced separately from handler registration — and both land in the manifest.
+    #[test]
+    fn output_schema_via_combinator_and_map_operations() {
+        let out = json!({ "type": "object", "properties": { "id": { "type": "string" } } });
+        let plugin = PluginBuilder::new("acme", "0.1.0")
+            .operation(
+                with_output_schema(
+                    read_op("acme.get", "get a thing", json!({ "type": "object" })),
+                    out.clone(),
+                ),
+                |_input, _host| Ok(json!({ "id": "1" })),
+            )
+            .operation(
+                read_op("acme.list", "list things", json!({ "type": "object" })),
+                |_input, _host| Ok(json!([])),
+            )
+            // Bulk-annotate every op declared so far (here: stamp a group), leaving the
+            // combinator-set output schema untouched.
+            .map_operations(|op| op.group = Some("acme.core".into()))
+            .build();
+
+        let m = plugin.manifest();
+        let get = m.operations.iter().find(|o| o.name == "acme.get").unwrap();
+        assert_eq!(get.output_schema.as_ref(), Some(&out));
+        assert_eq!(get.group.as_deref(), Some("acme.core"));
+        // The op without an explicit schema keeps `None`; the bulk map still reached it.
+        let list = m.operations.iter().find(|o| o.name == "acme.list").unwrap();
+        assert!(list.output_schema.is_none());
+        assert_eq!(list.group.as_deref(), Some("acme.core"));
     }
 
     #[test]
