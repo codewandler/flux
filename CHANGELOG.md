@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-07-12
+
 ### Fixed
 
 - **Release build: exclude `flux-sdk` from the binary release closure.** The D-154 `plugins`-feature
