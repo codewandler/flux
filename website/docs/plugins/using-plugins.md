@@ -78,7 +78,11 @@ flux plugin call websearch websearch.search '{"query":"warm transfer"}'
 ```
 
 `flux run`, the REPL, and `flux app run` discover installed plugins at startup; the agent's grants
-decide which of their ops it may call.
+still decide which operations may execute. For open-ended CLI turns, ungrouped plugin operations are
+advertised on demand: name the integration in the request (for example, “list the open GitLab merge
+requests” or “post this in Slack”) and Flux surfaces that integration's catalog for the rest of the
+engine session. Unrelated installed plugins stay out of the planner prompt. Direct `flux plugin call`
+and authored app/flow operation lists are unchanged.
 
 ## Local / dev install
 

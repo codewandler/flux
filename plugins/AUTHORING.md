@@ -63,7 +63,11 @@ callbacks so the manifest gates below actually apply.
 3. **Call** — `flux plugin call <name> <op> '<json>'` (debugging/scripting), or let the agent path
    (`flux run` / `flux app run`) discover installed plugins and project their ops as tools. The plugin
    is launched once per session; its manifest is fetched once and pins the host's grants for that
-   session.
+   session. On the open-ended CLI agent path, visible operations without an explicit manifest group
+   are placed in an on-demand `plugin.<name>` group: naming the plugin in the user's request surfaces
+   its catalog for that engine session. This keeps unrelated installed integrations out of every
+   planner prompt. Declare an explicit group when you need different surfacing behavior; a force-on
+   group (`surface_when = []`) remains always visible.
 
 After changing a plugin's surface, regenerate the catalog skill: `flux plugin skill --install`.
 

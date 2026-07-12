@@ -88,6 +88,11 @@ pub const KIND_DESTRUCTIVE: &str = "destructive_command";
 /// recorded under. Shared by the detector that emits signals and the groups that match on them.
 pub const KIND_SIGNAL: &str = "project.signal";
 
+/// A signal inferred from the current user's wording rather than the workspace. Tool groups use
+/// this for large optional catalogs (notably installed integrations): naming the integration makes
+/// its group relevant for the turn without treating every installed operation as core.
+pub const KIND_TURN_INTENT: &str = "turn.intent";
+
 /// A built-in reaction: a [`KIND_DESTRUCTIVE`] observation escalates the operation to human
 /// approval. The runtime consults this to force an approval prompt even under a permissive
 /// allow-rule.
@@ -185,6 +190,43 @@ pub struct ToolGroup {
     pub tools: Vec<String>,
     #[serde(default)]
     pub surface_when: Vec<SignalMatch>,
+}
+
+/// Infer the declared [`KIND_TURN_INTENT`] signals present in `input`. Matching is
+/// case-insensitive and bounded by non-alphanumeric characters, so an integration named `slack`
+/// matches `Slack` and `slack.message.send` but not `Slackware`. Only signals explicitly declared
+/// by a group are considered; arbitrary prompt words never become evidence.
+pub fn turn_intent_observations(groups: &[ToolGroup], input: &str) -> Vec<Observation> {
+    let input = input.to_lowercase();
+    let signals: std::collections::BTreeSet<String> = groups
+        .iter()
+        .flat_map(|group| &group.surface_when)
+        .filter(|matcher| matcher.kind == KIND_TURN_INTENT)
+        .filter_map(|matcher| matcher.signal.as_deref())
+        .filter(|signal| contains_bounded(&input, &signal.to_lowercase()))
+        .map(str::to_string)
+        .collect();
+
+    signals
+        .into_iter()
+        .map(|signal| {
+            Observation::new(
+                KIND_TURN_INTENT,
+                Phase::Turn,
+                serde_json::json!({ "signal": signal }),
+            )
+        })
+        .collect()
+}
+
+fn contains_bounded(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty()
+        && haystack.match_indices(needle).any(|(start, _)| {
+            let before = haystack[..start].chars().next_back();
+            let after = haystack[start + needle.len()..].chars().next();
+            before.is_none_or(|ch| !ch.is_alphanumeric())
+                && after.is_none_or(|ch| !ch.is_alphanumeric())
+        })
 }
 
 /// A [`Reaction`] that surfaces any group whose `surface_when` matches an observation — keeping op
@@ -332,6 +374,31 @@ mod tests {
             ..Default::default()
         }];
         assert!(resolve_active_groups(&groups, &[]).contains("pinned"));
+    }
+
+    #[test]
+    fn turn_intent_signals_match_integration_names_without_substring_collisions() {
+        let groups = vec![ToolGroup {
+            name: "plugin.slack".into(),
+            tools: vec!["slack.message.send".into()],
+            surface_when: vec![SignalMatch {
+                kind: KIND_TURN_INTENT.into(),
+                signal: Some("slack".into()),
+            }],
+            ..Default::default()
+        }];
+
+        for input in ["Post this in Slack", "call slack.message.send"] {
+            let observations = turn_intent_observations(&groups, input);
+            let active = resolve_active_groups(&groups, &observations);
+            assert!(active.contains("plugin.slack"), "{input:?}");
+        }
+        for input in ["Install Slackware", "summarize the notebook"] {
+            assert!(
+                turn_intent_observations(&groups, input).is_empty(),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

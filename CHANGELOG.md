@@ -30,6 +30,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **A-67: installed plugin catalogs now surface on turn intent instead of taxing every planner
+  request** (Agent pillar; `docs/designs/turn-intent-plugin-surfacing.md`). Visible operations with
+  no explicit plugin-authored group are assigned to an implicit `plugin.<name>` group and surface
+  when the current request names that integration. Matching is case-insensitive and boundary-aware,
+  activation is sticky for the engine session, and the inferred signal is recorded in
+  `groups.active`. Explicit groups, pre-authored flows, the guarded execution envelope, and
+  `FLUX_SURFACE_ALL` remain unchanged. Live normal-HOME proof with 636 registered operations and the
+  same OpenRouter prompt: planner input fell **41,567 → ~14,100 tokens (−66%)**, and reported cost
+  fell **$0.0106 → $0.0025**; naming Slack selectively surfaced `plugin.slack` at 15.3k tokens.
+  Failing-first tests: `turn_intent_signals_match_integration_names_without_substring_collisions`,
+  `ungrouped_plugin_ops_get_an_implicit_turn_intent_group`, and
+  `turn_intent_surfaces_and_sticks_an_integration_group`.
 - **BREAKING (Rust API):** `flux_lang::program::Program` and `AgentDecl` gain typed optional
   permission fields. Downstream exhaustive struct literals must add `permissions: None` or use
   `..Default::default()`. Serde inputs remain compatible because both fields default to absent.

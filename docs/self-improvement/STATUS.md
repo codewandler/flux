@@ -1,7 +1,7 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-07-10 (audit-hardening docs). Substantive loop state is frozen at round 3,
-2026-07-06 — the initiative has been ON HOLD since._
+_Last updated: 2026-07-13 (targeted planner-catalog hardening). Substantive autonomous-loop state is
+frozen at round 3, 2026-07-06 — the initiative remains ON HOLD._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
 including the bugs each live run surfaced, the first kept gain, and the caveats that keep the claims
@@ -19,6 +19,16 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   produced, accepts fenced/prose-wrapped candidate arrays, and the eval keep-gate rejects malformed
   or invalid telemetry instead of treating it as a cheap zero. Trial concurrency is bounded and
   deterministic, and terminal-bench usage remains unavailable rather than falsely zero when absent.
+
+- **2026-07-13 targeted live harness hardening (outside the paused autonomous loop):** tutorial E2E
+  latency analysis found 636 registered operations and a 27.5k-token unrelated-plugin tax on every
+  planner call. A-67 now puts otherwise-ungrouped plugin ops behind audited turn-intent groups. With
+  the same binary, HOME, workspace, OpenRouter model, and prompt, planner input fell 41,567 → ~14,100
+  tokens and reported cost $0.0106 → $0.0025; naming Slack surfaced only `plugin.slack` (15.3k).
+  Correctness caveat from the same experiment: Gemini 2.5 Flash was fast (5.7s) but falsely claimed a
+  file write without emitting a plan, while GPT-5-mini was correct but spent 46.2s planning. Model
+  latency is not a substitute for the structural catalog fix. The autonomous improvement initiative
+  remains on hold; this was a user-scoped, live before/after hardening task.
 
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →

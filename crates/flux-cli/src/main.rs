@@ -2082,6 +2082,45 @@ fn session_ambient_signals(endpoints: &flux_capabilities::EndpointRegistry) -> V
     }
 }
 
+/// Put a plugin's otherwise-ungrouped visible operations behind one turn-intent group. Explicit
+/// manifest membership and per-op group tags remain authoritative; this only changes the legacy
+/// `group = None` case that would otherwise classify hundreds of installed integration ops as core
+/// and inject them into every planner request.
+fn implicit_plugin_group(
+    manifest: &flux_plugin::PluginManifest,
+    specs: &[flux_spec::ToolSpec],
+) -> Option<flux_evidence::ToolGroup> {
+    let explicitly_grouped: std::collections::HashSet<&str> = manifest
+        .groups
+        .iter()
+        .flat_map(|group| group.tools.iter().map(String::as_str))
+        .collect();
+    let mut tools: Vec<String> = specs
+        .iter()
+        .filter(|spec| spec.group.is_none() && !explicitly_grouped.contains(spec.name.as_str()))
+        .map(|spec| spec.name.clone())
+        .collect();
+    tools.sort();
+    tools.dedup();
+    if tools.is_empty() {
+        return None;
+    }
+
+    let intent = manifest.name.to_lowercase();
+    Some(flux_evidence::ToolGroup {
+        name: format!("plugin.{intent}"),
+        description: format!(
+            "Operations from the installed `{}` integration, surfaced when the current request names it.",
+            manifest.name
+        ),
+        tools,
+        surface_when: vec![flux_evidence::SignalMatch {
+            kind: flux_evidence::KIND_TURN_INTENT.into(),
+            signal: Some(intent),
+        }],
+    })
+}
+
 /// Read-only ops pre-allowed by default when no `[permissions].allow` is configured, so the common
 /// case needs no config. `read`/`glob`/`grep`/`search` are the workspace reads; `now`/`cwd`/`home_dir`/
 /// `sys_info` are zero-arg ambient reads (no IO, no permission subjects) that carry no approval-worthy
@@ -2495,7 +2534,12 @@ async fn build_agent_with(
                             caps: lp.caps.clone(),
                         },
                     );
+                    let specs: Vec<flux_spec::ToolSpec> =
+                        lp.tools.iter().map(|tool| tool.spec()).collect();
                     plugin_groups.extend(lp.manifest.groups.clone());
+                    if let Some(group) = implicit_plugin_group(&lp.manifest, &specs) {
+                        plugin_groups.push(group);
+                    }
                     // The registered tools hold the host alive for the session.
                     for t in lp.tools {
                         registry.register(t);
@@ -9315,9 +9359,9 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 mod tests {
     use super::{
         app_plugin_caps, build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, endpoint_ref_from_parts, format_evidence, loop_machinery_label,
-        merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
-        plugin_status_one, render_endpoint_row, render_review_markdown,
+        credential_location, endpoint_ref_from_parts, format_evidence, implicit_plugin_group,
+        loop_machinery_label, merge_static_endpoints, new_render_suffix, parse_labels,
+        plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
         resolve_plugin_operation_name, run_corpus_export_with, run_endpoint_in, run_plugin_in,
         run_usage_with, should_fail, tool_preview, truncate, url_has_userinfo, usage_annotation,
         write_generated_skill, EndpointAction, EventStore, EventStoreCrossPluginAudit,
@@ -11353,6 +11397,31 @@ mod tests {
             .to_string();
         assert!(err.contains("tried `grafana.dashboards`"), "{err}");
         assert!(err.contains("grafana.search"), "{err}");
+    }
+
+    #[test]
+    fn ungrouped_plugin_ops_get_an_implicit_turn_intent_group() {
+        let manifest = flux_plugin::PluginManifest {
+            name: "slack".into(),
+            groups: vec![flux_evidence::ToolGroup {
+                name: "slack.health".into(),
+                tools: vec!["slack.test".into()],
+                surface_when: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let specs = vec![
+            flux_spec::ToolSpec::read_only("slack.message.send", "send", json!({})),
+            flux_spec::ToolSpec::read_only("slack.test", "test", json!({})),
+        ];
+
+        let group = implicit_plugin_group(&manifest, &specs).expect("one ungrouped operation");
+        assert_eq!(group.name, "plugin.slack");
+        assert_eq!(group.tools, vec!["slack.message.send"]);
+        assert_eq!(group.surface_when.len(), 1);
+        assert_eq!(group.surface_when[0].kind, flux_evidence::KIND_TURN_INTENT);
+        assert_eq!(group.surface_when[0].signal.as_deref(), Some("slack"));
     }
 
     // ─── Track A1: `flux plugin call/run --arg` schema-coerced input building ──────────

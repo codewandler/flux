@@ -329,7 +329,7 @@ impl FlowEngine {
 
         // Evidence-gated surfacing for this turn: probe the workspace signals once and hand the
         // advertised op set to the loop host, so every planner iteration sees the gated catalog.
-        let advertised = self.surfaced_for_turn(sink);
+        let advertised = self.surfaced_for_turn(user_input, sink);
 
         // Drive the flux-lang agent loop (`agent_loop`) through an OWNED channel sink — the `'static`
         // loop host holds it for reentrant `run_plan` — draining its events onto the borrowed `sink`
@@ -500,6 +500,7 @@ impl FlowEngine {
             &self.cwd,
             &self.sticky_groups,
             &self.ambient_signals,
+            prompt,
         );
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
@@ -751,7 +752,7 @@ impl FlowEngine {
         // Computed ONCE for the whole phased sequence (mirrors `run_turn_cancellable`'s
         // `surfaced_for_turn`) — A-04 gating stays turn-stable across orient/gather rounds rather
         // than re-probing workspace signals (and re-observing `groups.active`) every round.
-        let advertised = self.surfaced_for_turn(sink);
+        let advertised = self.surfaced_for_turn(user_input, sink);
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
             ..CompileOptions::default()
@@ -886,13 +887,18 @@ impl FlowEngine {
     /// paths — before A-04 the loop built an ungated registry, so every op (incl. `bash`) was
     /// advertised every turn and the opt-in `shell` group gated nothing. Records the `groups.active`
     /// observation when gating is on.
-    fn surfaced_for_turn(&self, sink: &mut dyn AgentSink) -> std::collections::HashSet<String> {
+    fn surfaced_for_turn(
+        &self,
+        user_input: &str,
+        sink: &mut dyn AgentSink,
+    ) -> std::collections::HashSet<String> {
         let (advertised, surfaced) = surfaced_op_names(
             self.executor.registry(),
             &self.groups,
             &self.cwd,
             &self.sticky_groups,
             &self.ambient_signals,
+            user_input,
         );
         if let Some(surfaced) = surfaced.as_ref() {
             self.record_active_groups(surfaced, sink);
@@ -1121,7 +1127,7 @@ impl FlowEngine {
         // against an empty input. For a flow with no `ai_segment` this is harmless overhead — the
         // authored prompt is still surfaced explicitly below (Phase A unchanged).
         let base_system = self.base_system_with_skills("", sink);
-        let advertised = self.surfaced_for_turn(sink);
+        let advertised = self.surfaced_for_turn("", sink);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
@@ -1270,7 +1276,7 @@ impl FlowEngine {
         // delegate a bounded run of model turns (D-131 Phase B). Skills match the reply text; a
         // resume with no segment pays only harmless overhead.
         let base_system = self.base_system_with_skills(user_input, sink);
-        let advertised = self.surfaced_for_turn(sink);
+        let advertised = self.surfaced_for_turn(user_input, sink);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
@@ -1586,6 +1592,7 @@ pub(crate) fn surfaced_op_names(
     cwd: &std::path::Path,
     sticky: &std::sync::Mutex<std::collections::HashSet<String>>,
     ambient: &[String],
+    user_input: &str,
 ) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
     if groups.is_empty() {
         let advertised = reg
@@ -1605,6 +1612,7 @@ pub(crate) fn surfaced_op_names(
             .iter()
             .map(|s| flux_evidence::Observation::signal(s)),
     );
+    signals.extend(flux_evidence::turn_intent_observations(groups, user_input));
     let active = flux_evidence::resolve_active_groups(groups, &signals);
     // Monotonic surfacing (A-03 cache stability): fold this turn's active groups into the session's
     // sticky union and advertise from the ACCUMULATED set. `resolve_active_groups` is stateless, so a
@@ -4039,7 +4047,7 @@ mod tests {
         let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
 
         // Turn A — no marker signal: the group is inactive, so `echo` is gated (not advertised).
-        let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
+        let (a, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[], "");
         assert!(
             !a.contains("echo"),
             "echo gated before the marker appears: {a:?}"
@@ -4052,6 +4060,7 @@ mod tests {
             &dir,
             &sticky,
             std::slice::from_ref(&marker),
+            "",
         );
         assert!(
             b.contains("echo"),
@@ -4060,7 +4069,7 @@ mod tests {
 
         // Turn C — marker signal absent: stateless resolution would drop `echo`, but the sticky union
         // keeps the group surfaced, so the advertised catalog never shrinks.
-        let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
+        let (c, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[], "");
         assert!(
             c.contains("echo"),
             "sticky surfacing keeps echo after the marker disappears: {c:?}"
@@ -4093,7 +4102,7 @@ mod tests {
 
         // No ambient signal (fresh sticky set): the group stays gated.
         let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
-        let (gated, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[]);
+        let (gated, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &[], "");
         assert!(
             !gated.contains("echo"),
             "gated without the ambient signal: {gated:?}"
@@ -4102,12 +4111,48 @@ mod tests {
         // The ambient `endpoint` signal surfaces it.
         let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
         let ambient = ["endpoint".to_string()];
-        let (surfaced, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &ambient);
+        let (surfaced, _) = surfaced_op_names(&registry, &groups, &dir, &sticky, &ambient, "");
         assert!(
             surfaced.contains("echo"),
             "ambient signal surfaces the group: {surfaced:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn turn_intent_surfaces_and_sticks_an_integration_group() {
+        let dir = std::env::temp_dir();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "plugin.slack".into(),
+            description: String::new(),
+            tools: vec!["echo".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_TURN_INTENT.into(),
+                signal: Some("slack".into()),
+            }],
+        }];
+        let sticky = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        let (unrelated, _) =
+            surfaced_op_names(&registry, &groups, &dir, &sticky, &[], "summarize docs");
+        assert!(!unrelated.contains("echo"));
+
+        let (named, surfaced) = surfaced_op_names(
+            &registry,
+            &groups,
+            &dir,
+            &sticky,
+            &[],
+            "post the summary in Slack",
+        );
+        assert!(named.contains("echo"));
+        assert!(surfaced.unwrap().signals.contains(&"slack".to_string()));
+
+        let (sticky_next, _) =
+            surfaced_op_names(&registry, &groups, &dir, &sticky, &[], "continue");
+        assert!(sticky_next.contains("echo"));
     }
 
     /// A-10: once the turn's accumulated planner usage crosses the installed token budget, the

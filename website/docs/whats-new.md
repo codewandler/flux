@@ -23,6 +23,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **Installed integrations no longer make unrelated agent turns carry their entire tool catalog.**
+  Flux keeps plugin operations out of the planner prompt until your request names that integration,
+  then makes only that integration available for the session. On a plugin-heavy installation this
+  cut a measured tiny prompt from about 42k to 14k input tokens while keeping named integrations
+  discoverable.
 - **The beginner tutorial now demonstrates why deterministic flows matter.** It first lets the model
   decide whether to search a handbook, then refactors the same assistant so every answer must pass
   through scoped retrieval before the model writes it.
