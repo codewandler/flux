@@ -12,6 +12,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **`web.crawl` can stop early at a content-size budget.** Pass `max_total_bytes` to bound a crawl by
+  the total amount of readable content it gathers — not only by page count or depth. The crawl halts as
+  soon as it reaches the budget and returns the pages it already collected, so you can cap how much a
+  crawl pulls down without having to guess a page count up front.
+
 ## [0.19.0] - 2026-07-12
 
 ### Action needed

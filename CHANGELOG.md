@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-166: `web.crawl` accepts an optional `max_total_bytes` caller budget** (Agent pillar). The crawl
+  now stops as soon as the running total of condensed-markdown content reaches the budget — an additional
+  upper bound alongside `max_pages`/`max_depth`, never a widening of any axis. It is clamped to the
+  existing 512 KiB whole-result ceiling and checked *after* each page, so a crawl always still yields at
+  least the seed and the pages already gathered return `Ok` (the existing partial-crawl, skip-not-fatal
+  contract). Serves the downstream consumer's per-account byte quota (ai-agent-platform C-37): the crawl
+  halts when the budget is spent instead of always running to `max_pages`, avoiding wasted egress. The
+  SSRF/egress envelope, same-host scoping, and existing caps are unchanged. Failing-first test
+  `byte_budget_stops_crawl_before_page_cap` (a multi-page fixture crawled under a tiny budget fetches
+  fewer than `max_pages`). Op-catalog docs updated (`website/docs/language/ops.md`,
+  `crates/flux-flow/docs/ops-reference.md`, the flux-flow engine skill).
+
 ## [0.19.0] - 2026-07-12
 
 ### Changed

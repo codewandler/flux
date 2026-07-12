@@ -74,7 +74,7 @@ Flux-Lang is the planning language for this project. The LLM has no directly-cal
 | `search` | `query[, limit]` | Low |
 | `sources` | | Low |
 | `web.fetch` | `url[, raw]` | Low |
-| `web.crawl` | `url[, max_pages, max_depth]` | Low |
+| `web.crawl` | `url[, max_pages, max_depth, max_total_bytes]` | Low |
 | `html_to_markdown` | `html` | Low |
 | `http.request` | `url[, method, headers, body, timeout]` | Medium |
 | `browser.open` | `[url]` | Medium |

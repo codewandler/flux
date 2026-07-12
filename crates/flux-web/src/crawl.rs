@@ -1,7 +1,8 @@
 //! `web.crawl` — a bounded, SSRF-guarded breadth-first crawl from a seed URL.
 //!
 //! The everyday "read this small site/section" capability: from a seed, follow **same-host** links
-//! to a bounded depth and page count, returning each fetched page as condensed markdown (and
+//! to a bounded depth, page count, and (optionally) total-content byte budget, returning each
+//! fetched page as condensed markdown (and
 //! contributing `web.page` records, exactly like [`crate::fetch::WebFetchTool`]). It is the
 //! multi-page sibling of `web.fetch`, sharing its egress envelope: every hop — seed, each discovered
 //! link, and every redirect — passes through [`flux_system::net::guard_url_scoped`] +
@@ -146,6 +147,13 @@ impl Tool for WebCrawlTool {
                     "max_depth": {
                         "type": "integer",
                         "description": "Maximum link distance from the seed to follow (default 2, hard cap 5)."
+                    },
+                    "max_total_bytes": {
+                        "type": "integer",
+                        "description": "Optional caller budget: stop the crawl as soon as the total \
+                                        condensed-markdown bytes gathered reach this many. An extra \
+                                        upper bound alongside max_pages/max_depth (hard cap 512 KiB); \
+                                        the pages already fetched are returned (partial crawl)."
                     }
                 },
                 "required": ["url"]
@@ -195,6 +203,15 @@ impl Tool for WebCrawlTool {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_MAX_DEPTH)
             .min(MAX_DEPTH_CEILING);
+        // Optional caller byte budget: an additional upper bound on the running condensed-content
+        // total, never a widening of any axis. Absent → the hard ceiling. Clamped to at least 1 so a
+        // budget always still yields the seed page (checked *after* each fetch, partial-crawl `Ok`).
+        let byte_budget = params
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(MAX_TOTAL_RENDER_BYTES)
+            .clamp(1, MAX_TOTAL_RENDER_BYTES);
 
         // Guard the seed up front so a bad/private seed is a clean error (mirrors `web.fetch`). Every
         // *discovered* hop is guarded again below and skipped (not fatal) if it is refused.
@@ -288,7 +305,9 @@ impl Tool for WebCrawlTool {
                 );
             }
 
-            if total_render >= MAX_TOTAL_RENDER_BYTES {
+            // Stop once the running condensed-content total reaches the caller budget (or, absent
+            // one, the hard ceiling). The pages already gathered are returned below (partial crawl).
+            if total_render >= byte_budget {
                 break;
             }
         }
@@ -445,6 +464,49 @@ mod tests {
         );
         let recs = sink.records.lock().unwrap();
         assert_eq!(recs.len(), 2, "exactly seed + one page recorded: {recs:?}");
+    }
+
+    #[tokio::test]
+    async fn byte_budget_stops_crawl_before_page_cap() {
+        // Same seed -> /a -> /b chain, but with generous page/depth caps and a tiny byte budget. The
+        // seed's own condensed section already crosses the budget, so the crawl stops after the seed:
+        // fewer than max_pages pages, capped on bytes rather than page count.
+        let base = site_server(vec![
+            ("/", page("Seed", "SEEDMARKER", &["/a"])),
+            ("/a", page("Page A", "PAGEAMARKER", &["/b"])),
+            ("/b", page("Page B", "PAGEBMARKER", &[])),
+        ])
+        .await;
+        let sink = Arc::new(RecordingSink::default());
+        let t = tool(PrivateNetAllow::Any, Some(sink.clone()));
+        let r = t
+            .execute(
+                &ctx(),
+                json!({ "url": base, "max_depth": 5, "max_pages": 10, "max_total_bytes": 1 }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.content.contains("SEEDMARKER"),
+            "seed fetched (partial crawl still returns Ok): {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("PAGEAMARKER"),
+            "page A must NOT be fetched — the byte budget was spent by the seed: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("PAGEBMARKER"),
+            "page B must NOT be fetched: {}",
+            r.content
+        );
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(
+            recs.len(),
+            1,
+            "only the seed recorded before the byte budget stopped the crawl: {recs:?}"
+        );
     }
 
     #[tokio::test]
