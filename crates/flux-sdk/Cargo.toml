@@ -81,3 +81,7 @@ path = "fixtures/plugin_fixture.rs"
 required-features = ["plugins"]
 
 [dev-dependencies]
+# L5 web + datasource/RAG capabilities — a dev-only dependency for the `datasource_recipe` example
+# (D-159): it shows how an EMBEDDER attaches datasources today via `register_pack`, so `flux-sdk`
+# itself stays free of the dependency until the first-class seam lands (D-62).
+flux-capabilities.workspace = true

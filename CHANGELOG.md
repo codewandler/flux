@@ -139,8 +139,8 @@ All notable changes to this project are documented in this file. The format is b
   (`flux_events::run_diff`), and `Fork::session()` exposes the fork as a full `Session`. `Fork` is
   re-exported at the crate root; `RunDiff`/`DiffRow` via `flux_sdk::observe`. Verified by tests that
   inject/edit a divergence and assert the original's `head_seq` is unchanged.
-- **D-158: `FlowClient` streaming — `execute_with_sink` + `execute_streamed`** (sdk-surface wave 4,
-  completes the epic). Flow executions stop being observability-blind: `execute_with_sink(ast, sink)`
+- **D-158: `FlowClient` streaming — `execute_with_sink` + `execute_streamed`** (sdk-surface wave 4).
+  Flow executions stop being observability-blind: `execute_with_sink(ast, sink)`
   streams every dispatched op's `tool_call` **and** `tool_result` (plus text/observations) to a
   consumer `AgentSink` while still returning the `ExecutionResult` — the private collector behind
   `execute` had kept only op names. `execute_streamed(ast)` is the owned-`AgentEvent` variant: a new
@@ -149,6 +149,16 @@ All notable changes to this project are documented in this file. The format is b
   are unchanged. `FlowClient.store` became `Arc<FlowStore>` so the spawned run shares it (`FlowStore`
   isn't `Clone`); every direct path deref-coerces unchanged. `FlowStream` is re-exported at the crate
   root.
+- **D-159: datasource recipe docs** (sdk-surface wave 4, **completes the epic**). Documents — rather
+  than API-ifies — how an embedder attaches a knowledge datasource today: a direct
+  `codewandler-flux-capabilities` dep + `register_pack(|r| register_datasource_ops(r, backend))`, so
+  `search`/`get`/`list`/… dispatch through the same envelope as any built-in. A new website page
+  (`sdk/datasources.md`) with a gate-verified example (`crates/flux-sdk/examples/datasource_recipe.rs`,
+  `flux-capabilities` as a dev-dependency only) walks it through, and links the sdk-surface design's
+  "Out of scope" rationale: a first-class `with_datasource(...)` waits on the async paged
+  live-backend seam (D-62) so the wrong contract isn't frozen. No `flux-sdk` runtime dependency added.
+  With this, the **sdk-surface epic (D-142…D-159) is complete** — the whole surface is unreleased,
+  pending the next MINOR.
 
 ## [0.16.1] - 2026-07-11
 

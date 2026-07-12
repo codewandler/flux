@@ -63,9 +63,6 @@ _The `gitlab` plugin has outgrown its connectivity phase — its 64-op surface i
 ### Plugin Install Source
 - [D-87 — Install a plugin from source — `flux plugin install --git <url>`](D-87-plugin-install-from-git.md) · Core · third install source next to the signed github pack (D-46..49) and `--dir` local scan: clone a git URL, detect a Rust flux-plugin crate, `cargo build --release`, register the binary. Unblocks GitLab-hosted / third-party plugins that the github+minisign pack channel can't serve.
 
-### SDK surface — a standard agent SDK, the flux way
-- [D-159 — Datasource recipe documentation — register_pack + flux-capabilities walkthrough](D-159-sdk-datasource-recipe-doc.md) · Agent · wave 4, docs-only — deliberate non-API until D-62 lands the async paged seam
-
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
@@ -319,6 +316,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-156 — Session::replay — hermetic time-machine replay in the SDK](D-156-sdk-session-replay.md) · Agent · wave 4 — replay_session over the injected store; CLI-only no more
 - [D-157 — Session::fork + Fork::{inject, edit, diff}](D-157-sdk-session-fork-diff.md) · Agent · wave 4 — counterfactual sessions for embedders
 - [D-158 — FlowClient streaming — execute_with_sink + execute_streamed](D-158-flow-client-streaming.md) · Agent · wave 4 — flow runs stop being observability-blind (ExecSink drops everything but names)
+- [D-159 — Datasource recipe documentation — register_pack + flux-capabilities walkthrough](D-159-sdk-datasource-recipe-doc.md) · Agent · wave 4, docs-only — deliberate non-API until D-62 lands the async paged seam
 - [D-160 — web.crawl — a bounded, SSRF-guarded crawl primitive](D-160-web-crawl-primitive.md) · Agent · downstream ask (ai-agent-platform, consumer ask A-44): a bounded, SSRF-guarded web.crawl op — seed + same-host link-following under page/depth caps — reversing the web-capabilities crawling non-goal
 - [D-161 — web_fetch extracts text from PDFs instead of returning raw bytes](D-161-web-fetch-pdf-extraction.md) · Agent · downstream ask (ai-agent-platform, consumer ask A-47): web_fetch on a PDF returns extracted text, not raw lossy bytes — a content-type/%PDF branch in the non-HTML path; lifts part of the grounded-knowledge binary-extraction deferral for the web path only
 - [D-162 — Provider embeddings pack — explicit config, per-source routing, usage capture](D-162-provider-embeddings-pack.md) · Core · downstream ask (ai-agent-platform): make the embeddings seam production-ready — explicit-config OpenAiEmbedder constructor + per-source embedder/model routing + embed-usage capture; Bedrock embeddings and pgvector are explicit stretch

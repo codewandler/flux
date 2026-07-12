@@ -72,7 +72,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'SDK',
-      items: ['sdk/overview', 'sdk/sessions', 'sdk/streaming', 'sdk/flow-client'],
+      items: ['sdk/overview', 'sdk/sessions', 'sdk/streaming', 'sdk/flow-client', 'sdk/datasources'],
     },
     {
       type: 'category',
