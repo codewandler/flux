@@ -15,6 +15,18 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **The beginner tutorial now completes reliably.** Context packs pass the selected handbook text
+  into AI reasoning instead of only its variable names, GPT-5 requests use the token-limit field its
+  API accepts, and the tutorial explains the model-call approval and plan mode's bounded read-only
+  gathering accurately.
+- **App datasources are now real per-agent boundaries.** An app agent is told which named knowledge
+  sources it can use; searches are automatically scoped when there is one source, and attempts to
+  query an undeclared source are rejected.
+- **Ctrl-C now stops an interactive app promptly.** `flux app run` no longer hangs during shutdown
+  just because it is waiting for the next terminal line.
+
 ## [0.19.2] - 2026-07-12
 
 ### New

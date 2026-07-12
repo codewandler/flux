@@ -61,6 +61,17 @@ fn tool_result_text(content: &[ToolResultContent]) -> String {
     out
 }
 
+/// GPT-5-family Chat Completions requests use the replacement token-limit field. Model specs may
+/// arrive as a bare id (`gpt-5-mini`) or with a routing prefix (`openai/gpt-5`), so inspect the
+/// final path segment.
+fn uses_max_completion_tokens(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    model == "gpt-5"
+        || model
+            .strip_prefix("gpt-5")
+            .is_some_and(|suffix| suffix.starts_with(['-', '.']))
+}
+
 /// Build the Chat Completions request body. Anthropic-style content blocks are flattened to
 /// OpenAI's message model: tool results become `role:"tool"` messages, assistant tool_use
 /// becomes `tool_calls`.
@@ -132,7 +143,12 @@ fn build_chat_body(req: &Request) -> Result<Value> {
         "stream_options": { "include_usage": true },
     });
     if req.max_tokens > 0 {
-        body["max_tokens"] = json!(req.max_tokens);
+        let field = if uses_max_completion_tokens(&req.model) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[field] = json!(req.max_tokens);
     }
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
@@ -1133,6 +1149,23 @@ mod tests {
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool["tool_call_id"], "tc_1");
         assert_eq!(tool["content"], "file body");
+    }
+
+    /// OpenAI's GPT-5 Chat Completions models reject the legacy `max_tokens` field and require
+    /// `max_completion_tokens`. Keep the legacy field for models such as GPT-4o that still speak
+    /// the older request shape.
+    #[test]
+    fn chat_body_uses_gpt5_completion_token_field() {
+        let gpt5 = build_chat_body(&Request::new("gpt-5", "hi").with_max_tokens(123)).unwrap();
+        assert_eq!(gpt5["max_completion_tokens"], 123);
+        assert!(
+            gpt5.get("max_tokens").is_none(),
+            "GPT-5 rejects the legacy max_tokens field: {gpt5}"
+        );
+
+        let gpt4o = build_chat_body(&Request::new("gpt-4o", "hi").with_max_tokens(123)).unwrap();
+        assert_eq!(gpt4o["max_tokens"], 123);
+        assert!(gpt4o.get("max_completion_tokens").is_none());
     }
 
     #[tokio::test]

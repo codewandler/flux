@@ -19,24 +19,30 @@ On PowerShell, use `Get-Location` instead of `pwd` if it is not available.
 
 ## Preview the plan
 
-Ask the model to compile the task, but do not execute anything yet:
+Ask the model to gather any read-only context it needs and preview the remaining plan without
+executing that returned plan:
 
 ```bash
 flux plan -m sonnet -o yaml "Read docs/product.md and docs/policies.md, then write a five-bullet onboarding brief to SUMMARY.md. Include the support hours and workspace recovery period."
 ```
 
-Your exact plan will vary by model. Look for operations that read the two source files and write
-`SUMMARY.md`. Because `-o yaml` prints the plan and exits, none of those operations has run: the
-files have not been read and `SUMMARY.md` does not exist.
+Your exact plan will vary by model. Plan mode may run up to three small, bounded **read-only gather**
+rounds so the final proposal is grounded. If that happens, the two `read` operations have already
+run and the printed plan may contain only the pending `write` to `SUMMARY.md`. A model that settles
+without a gather round may instead print the reads and write together.
+
+In both cases, the important guarantee is the same: the **printed plan itself is left unexecuted**.
+Plan mode never auto-executes its returned mutation plan, so `SUMMARY.md` does not exist yet.
 
 This is the first important boundary in flux:
 
 ```text
-your request -> model -> typed plan
-                          (stops here)
+your request -> model -> bounded read-only gather (if needed) -> typed pending plan
+                                                           (stops here)
 ```
 
-The model can decide what to propose. It cannot perform the proposed IO itself.
+The model can decide what to propose. The runtime alone performs the bounded gather and stops before
+the returned plan; the model cannot perform IO itself.
 
 ## Run the task
 
@@ -87,4 +93,3 @@ You have used natural language to produce an inspectable, guarded plan. Next you
 planning step and write a reusable plan directly.
 
 Continue to [Write a reusable flow](./first-flow.md).
-

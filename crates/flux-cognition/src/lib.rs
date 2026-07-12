@@ -220,7 +220,7 @@ impl OpKind {
             }
             OpKind::Reason => {
                 let ask = require(params, "ask", self.name())?;
-                let ctx = p("ctx");
+                let ctx = context_text(params);
                 format!("Context:\n{ctx}\n\nQuestion:\n{ask}")
             }
             OpKind::Synth => {
@@ -377,6 +377,30 @@ fn field_text(params: &Value, key: &str) -> String {
         Some(Value::String(s)) => s.clone(),
         Some(v) => v.to_string(),
         None => String::new(),
+    }
+}
+
+/// Render the runtime's `Ctx` artifact for a reasoning prompt. New context packs carry a bounded
+/// `content` payload plus audit metadata; only the purpose and payload belong in the model prompt.
+/// A string or a legacy object without `content` keeps the old generic rendering for compatibility.
+fn context_text(params: &Value) -> String {
+    let Some(ctx) = params.get("ctx") else {
+        return String::new();
+    };
+    let Some(fields) = ctx.as_object() else {
+        return match ctx {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+    };
+    let Some(content) = fields.get("content").and_then(Value::as_str) else {
+        return ctx.to_string();
+    };
+    match fields.get("purpose").and_then(Value::as_str) {
+        Some(purpose) if !purpose.trim().is_empty() => {
+            format!("Purpose: {purpose}\n\n{content}")
+        }
+        _ => content.to_string(),
     }
 }
 
@@ -539,6 +563,34 @@ mod tests {
         // Artifact-typed slots lower to a `$ref` into `#/$defs/<Name>`.
         assert_eq!(props["claim"], json!({ "$ref": "#/$defs/Claim" }));
         assert_eq!(props["evidence"], json!({ "$ref": "#/$defs/Evidence" }));
+    }
+
+    /// `ctx` is a runtime value with audit metadata plus a materialized, budgeted payload. The
+    /// reasoning prompt must pass the payload itself to the provider, not serialize the metadata
+    /// (`name`, `members`, `budget`) as if those symbol names were the source documents.
+    #[test]
+    fn reason_prompt_uses_materialized_context_content() {
+        let prompt = OpKind::Reason
+            .prompt(&json!({
+                "ask": "How long is recovery?",
+                "ctx": {
+                    "name": "handbook",
+                    "purpose": "answer from the handbook",
+                    "members": ["product", "policies"],
+                    "budget": 5000,
+                    "content": "## $product\nWorkspaces recover for 30 days."
+                }
+            }))
+            .unwrap();
+        assert!(prompt.contains("Workspaces recover for 30 days."));
+        assert!(
+            !prompt.contains("\"members\""),
+            "metadata leaked into prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"budget\""),
+            "metadata leaked into prompt: {prompt}"
+        );
     }
 
     #[tokio::test]

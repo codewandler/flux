@@ -192,7 +192,7 @@ of these schemas; ops declare their inputs/outputs in these terms.
 | `Claim` | A factual assertion extracted from a source, carrying its provenance span and a confidence score. |
 | `Evidence` | A claim together with the supporting spans that ground it — the audited unit of support. |
 | `Need` | An explicit statement of missing information: what to ask, which fields are required to satisfy it, and the condition under which it is considered met. Produced by the pure `need` op; its complement `gaps` reports the still-unmet `require` fields. |
-| `Ctx` | A bounded, intentionally-budgeted bundle of context — the value produced by the `ctx`/`ctx_append` nodes. `members` are the symbol references selected into the pack; `budget` is the char/token cap the runtime shrinks the pack to at node evaluation. |
+| `Ctx` | A bounded, intentionally-budgeted bundle of context — the value produced by the `ctx`/`ctx_append` nodes. `members` are the symbol references selected into the pack; at evaluation the runtime materializes their retained values into a model-ready payload, and `budget` caps that payload by character count. |
 | `Query` | A structured retrieval request over one or more datasources — the input to the `query`/`Search.run` ops. |
 | `Answer` | A structured, evidence-bearing **successful** return from an agent task. |
 | `Blocked` | A structured return signalling the task **could not** be completed, with the open gaps that blocked it. Same shape as [`Answer`] but a distinct type so callers can branch on success vs. blockage. |

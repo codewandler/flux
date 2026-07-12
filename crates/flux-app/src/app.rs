@@ -957,6 +957,20 @@ async fn agent_spec_from_decl(
             parts.push(text);
         }
     }
+    if !decl.datasources.is_empty() {
+        let sources = decl
+            .datasources
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Knowledge access: this agent may query only the declared datasource(s) {sources}. \
+             Before answering a question that depends on this knowledge, call `search` (or another \
+             granted retrieval operation) and ground the answer in the returned records. If no \
+             relevant record is found, say that the declared datasource does not contain the answer."
+        ));
+    }
     let system_prompt = if parts.is_empty() {
         AgentSpec::default().system_prompt
     } else {
@@ -991,13 +1005,157 @@ async fn agent_spec_from_decl(
     })
 }
 
+/// Retrieval op names whose `source` argument is governed by [`AgentDecl::datasources`]. The app's
+/// shared registry may serve many program sources, but an agent engine receives a wrapper around
+/// each of these ops so its declaration is a real capability boundary rather than prompt-only text.
+const DATASOURCE_OPS: &[&str] = &["search", "get", "list", "relation", "batch_get", "sources"];
+
+struct DatasourceScopedTool {
+    inner: Arc<dyn Tool>,
+    allowed: Vec<String>,
+}
+
+impl DatasourceScopedTool {
+    fn scoped_params(&self, mut params: Value) -> Result<Value> {
+        if self.inner.spec().name == "sources" {
+            return Ok(params);
+        }
+        let obj = params.as_object_mut().ok_or_else(|| {
+            Error::Other(format!(
+                "{}: input must be an object",
+                self.inner.spec().name
+            ))
+        })?;
+        match obj.get("source") {
+            Some(Value::String(source)) if self.allowed.contains(source) => Ok(params),
+            Some(Value::String(source)) => Err(Error::Other(format!(
+                "{}: datasource `{source}` is not declared for this agent (allowed: {})",
+                self.inner.spec().name,
+                self.allowed_display()
+            ))),
+            Some(_) => Err(Error::Other(format!(
+                "{}: `source` must be a string",
+                self.inner.spec().name
+            ))),
+            None => match self.allowed.as_slice() {
+                [only] => {
+                    obj.insert("source".to_string(), Value::String(only.clone()));
+                    Ok(params)
+                }
+                [] => Err(Error::Other(format!(
+                    "{}: this agent declares no datasources",
+                    self.inner.spec().name
+                ))),
+                _ => Err(Error::Other(format!(
+                    "{}: choose a declared `source` ({})",
+                    self.inner.spec().name,
+                    self.allowed_display()
+                ))),
+            },
+        }
+    }
+
+    fn allowed_display(&self) -> String {
+        if self.allowed.is_empty() {
+            "none".to_string()
+        } else {
+            self.allowed.join(", ")
+        }
+    }
+
+    fn filter_sources(&self, text: &str) -> String {
+        text.lines()
+            .filter(|line| {
+                self.allowed
+                    .iter()
+                    .any(|source| *line == source || line.starts_with(&format!("{source} (")))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[async_trait]
+impl Tool for DatasourceScopedTool {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        let mut spec = self.inner.spec();
+        if spec.name == "sources" {
+            spec.description = format!(
+                "List the datasources declared for this agent ({}).",
+                self.allowed_display()
+            );
+            return spec;
+        }
+        spec.description.push_str(&format!(
+            " This agent is limited to source(s): {}.",
+            self.allowed_display()
+        ));
+        if let Some(source) = spec
+            .input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("source"))
+            .and_then(Value::as_object_mut)
+        {
+            source.insert("enum".to_string(), json!(self.allowed));
+            if let [only] = self.allowed.as_slice() {
+                source.insert("default".to_string(), Value::String(only.clone()));
+            }
+        }
+        spec
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        self.scoped_params(params.clone())
+            .map(|scoped| self.inner.permission_subjects(&scoped))
+            .unwrap_or_else(|_| self.inner.permission_subjects(params))
+    }
+
+    fn intents(&self, params: &Value) -> flux_spec::IntentSet {
+        self.scoped_params(params.clone())
+            .map(|scoped| self.inner.intents(&scoped))
+            .unwrap_or_else(|_| self.inner.intents(params))
+    }
+
+    fn semantic_effects(&self) -> Vec<String> {
+        self.inner.semantic_effects()
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        if self.inner.spec().name == "sources" {
+            if self.allowed.is_empty() {
+                return Ok(ToolResult::ok("no sources"));
+            }
+            let mut result = self.inner.execute(ctx, params).await?;
+            result.content = self.filter_sources(&result.content);
+            if result.content.is_empty() && !result.is_error {
+                result.content = "no sources".to_string();
+            }
+            result.view = result.view.as_deref().map(|view| self.filter_sources(view));
+            return Ok(result);
+        }
+        self.inner.execute(ctx, self.scoped_params(params)?).await
+    }
+}
+
+fn scope_datasource_tools(registry: &mut ToolRegistry, allowed: &[String]) {
+    for name in DATASOURCE_OPS {
+        if let Some(inner) = registry.remove(name) {
+            registry.register(Arc::new(DatasourceScopedTool {
+                inner,
+                allowed: allowed.to_vec(),
+            }));
+        }
+    }
+}
+
 /// Assemble an agent-target [`FlowEngine`] from a declaration: a guarded [`System`] rooted at the cwd, the
 /// host's op registry (subset to the agent's tools), the spec's grants, and a headless [`DenyApprover`] —
 /// so the agent runs only its granted ops with no human at a prompt.
 async fn build_agent_engine(
     decl: &AgentDecl,
     provider: Arc<dyn Provider>,
-    registry: ToolRegistry,
+    mut registry: ToolRegistry,
     events: Arc<EventStore>,
     default_model: &str,
     redactor: Redactor,
@@ -1008,6 +1166,7 @@ async fn build_agent_engine(
     // Build the spec (which may read persona files through the guarded `system`) before moving the
     // `system` into the tool context.
     let spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
+    scope_datasource_tools(&mut registry, &decl.datasources);
     let ctx = ToolContext::new(system).with_redactor(redactor);
     let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
     // The agent loop's planner reads the turn's conversation via the FlowStore (`store.conversation()`),
@@ -1386,8 +1545,8 @@ journey pong
         let decl = AgentDecl {
             name: "a".into(),
             model: None,
-            tools: vec!["read".into(), "now".into()],
-            datasources: vec![],
+            tools: vec!["search".into(), "now".into()],
+            datasources: vec!["handbook".into()],
             description: Some("be terse".into()),
             settings: Value::Null,
         };
@@ -1396,17 +1555,122 @@ journey pong
             .await
             .unwrap();
         assert_eq!(spec.model, "host-model"); // falls back to the host default
-        assert_eq!(spec.system_prompt, "be terse");
+        assert!(spec.system_prompt.starts_with("be terse"));
+        assert!(
+            spec.system_prompt.contains("handbook") && spec.system_prompt.contains("search"),
+            "declared knowledge must be visible in the model framing: {}",
+            spec.system_prompt
+        );
         // tools are the visible subset AND the pre-allow grants — under DenyApprover only these run.
         assert_eq!(
             spec.tools.as_deref(),
-            Some(&["read".to_string(), "now".to_string()][..])
+            Some(&["search".to_string(), "now".to_string()][..])
         );
         assert_eq!(
             spec.permissions.allow,
-            vec!["read".to_string(), "now".to_string()]
+            vec!["search".to_string(), "now".to_string()]
         );
         assert!(spec.permissions.deny.is_empty());
+    }
+
+    /// An app agent's `datasources` list is an actual capability boundary. With one declared source,
+    /// an unscoped search is pinned to it automatically; an explicit attempt to query another source
+    /// is rejected before the underlying retrieval tool runs.
+    #[tokio::test]
+    async fn agent_datasource_scope_injects_and_enforces_source() {
+        struct EchoSearch;
+        #[async_trait]
+        impl Tool for EchoSearch {
+            fn spec(&self) -> flux_spec::ToolSpec {
+                flux_spec::ToolSpec::read_only(
+                    "search",
+                    "echo search input",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "source": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    }),
+                )
+            }
+
+            async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok(params.to_string()))
+            }
+        }
+
+        struct EchoSources;
+        #[async_trait]
+        impl Tool for EchoSources {
+            fn spec(&self) -> flux_spec::ToolSpec {
+                flux_spec::ToolSpec::read_only(
+                    "sources",
+                    "list sources",
+                    json!({"type": "object", "properties": {}}),
+                )
+            }
+
+            async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok(
+                    "handbook (2 records; entities: file.document)\nprivate-notes (1 record; entities: file.document)",
+                ))
+            }
+        }
+
+        let decl = AgentDecl {
+            name: "guide".into(),
+            model: None,
+            tools: vec!["search".into(), "sources".into()],
+            datasources: vec!["handbook".into()],
+            description: Some("answer from docs".into()),
+            settings: Value::Null,
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoSearch));
+        registry.register(Arc::new(EchoSources));
+        let engine = build_agent_engine(
+            &decl,
+            Arc::new(ReplyProvider { reply: "ok".into() }),
+            registry,
+            Arc::new(EventStore::in_memory().unwrap()),
+            "mock",
+            Redactor::new(),
+        )
+        .await
+        .unwrap();
+
+        let scoped = engine
+            .executor
+            .dispatch("search", json!({"query": "support hours"}))
+            .await;
+        assert!(!scoped.is_error, "{}", scoped.content);
+        let input: Value = serde_json::from_str(&scoped.content).unwrap();
+        assert_eq!(input["source"], "handbook", "input was not source-scoped");
+
+        let denied = engine
+            .executor
+            .dispatch(
+                "search",
+                json!({"query": "secrets", "source": "private-notes"}),
+            )
+            .await;
+        assert!(
+            denied.is_error,
+            "undeclared source unexpectedly ran: {denied:?}"
+        );
+        assert!(denied.content.contains("private-notes"));
+        assert!(denied.content.contains("handbook"));
+
+        let sources = engine.executor.dispatch("sources", json!({})).await;
+        assert!(!sources.is_error, "{}", sources.content);
+        assert!(sources.content.contains("handbook (2 records"));
+        assert!(
+            !sources.content.contains("private-notes"),
+            "undeclared source leaked through sources: {}",
+            sources.content
+        );
     }
 
     /// A-22: a served/agentic agent target gets a NON-ZERO compaction threshold by default (so its

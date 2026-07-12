@@ -97,14 +97,29 @@ async fn stdin_loop(
     cancel: CancellationToken,
     pricing: Arc<flux_core::PricingTable>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    // `tokio::io::stdin()` delegates blocking terminal reads to a runtime worker. Such a read cannot
+    // be cancelled, and Tokio waits for the worker during runtime shutdown — so Ctrl-C hung forever
+    // while an interactive terminal remained open. A detached standard thread may stay blocked after
+    // cancellation, but it is not owned by the Tokio runtime and therefore cannot hold process exit.
+    let (tx, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("flux-stdin".to_string())
+        .spawn(move || {
+            use std::io::BufRead;
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })?;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            line = lines.next_line() => match line? {
-                Some(line) => {
+            line = lines.recv() => match line {
+                Some(Ok(line)) => {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
@@ -117,7 +132,8 @@ async fn stdin_loop(
                         eprintln!("{}", dim(&cost_line(&run, &pricing)));
                     }
                 }
-                None => break, // EOF
+                Some(Err(e)) => return Err(e.into()),
+                None => break, // EOF or the reader thread ended
             },
         }
     }

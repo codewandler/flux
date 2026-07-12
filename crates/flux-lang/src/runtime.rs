@@ -4065,12 +4065,12 @@ fn vis_keep_rank(v: Visibility) -> u8 {
 
 /// Resolve a context pack's `members` (already exclude-filtered, in declared order) to a budgeted
 /// `Ctx` value bound to `name`. When `budget` is set the pack is shrunk **at evaluation**: members are
-/// kept in priority order (visibility tier, then declared order) while their cumulative char size fits
-/// the budget; the rest are dropped and recorded as a [`RunEvent::CtxShrunk`]. Packing is
+/// kept in priority order (visibility tier, then declared order) while their cumulative rendered size
+/// fits the budget; the rest are dropped and recorded as a [`RunEvent::CtxShrunk`]. Packing is
 /// **drop-and-continue**: a member that doesn't fit in the remaining budget is dropped and packing
 /// continues with the next, so a single oversized early member never evicts the smaller members after
-/// it (the s_251 death spiral). The interpreter stays op-agnostic — consuming ops just read the
-/// already-bounded member list.
+/// it (the s_251 death spiral). The retained values are materialized into a labelled `content` field,
+/// so a consuming op gets the bounded payload rather than only the members' symbol names.
 #[allow(clippy::too_many_arguments)] // the sink (A-63) rides alongside the existing packing inputs
 fn build_ctx(
     store: &dyn ValueStore,
@@ -4154,20 +4154,24 @@ fn build_ctx(
             .collect::<Vec<_>>()
     };
 
-    // Char size + visibility rank per member. An unbound member contributes nothing (a pack tolerates
-    // a not-yet-resolved reference rather than erroring).
-    let sizes: Vec<usize> = members
+    // Materialize each bound member exactly as a consuming model sees it. Every section owns its
+    // trailing separator, so the sum of `sizes` is the exact final payload length; an unbound member
+    // contributes nothing (a pack tolerates a not-yet-resolved reference rather than erroring).
+    let rendered: Vec<Option<String>> = members
         .iter()
-        .map(|sym| -> Result<usize> {
+        .map(|sym| -> Result<Option<String>> {
             Ok(match store.resolve(session_id, sym)? {
                 Some(vid) => store
                     .get_value(&vid)?
-                    .map(|v| v.to_json().to_string().chars().count())
-                    .unwrap_or(0),
-                None => 0,
+                    .map(|v| format!("## ${}\n{}\n\n", sym.0, value_text(&v))),
+                None => None,
             })
         })
         .collect::<Result<_>>()?;
+    let sizes: Vec<usize> = rendered
+        .iter()
+        .map(|entry| entry.as_ref().map_or(0, |text| text.chars().count()))
+        .collect();
     let ranks: Vec<u8> = members
         .iter()
         .map(|sym| -> Result<u8> {
@@ -4254,6 +4258,17 @@ fn build_ctx(
         "members".to_string(),
         Value::List(kept.iter().cloned().map(Value::String).collect()),
     );
+    let content = rendered
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .filter_map(|(_, entry)| entry.as_deref())
+        .collect::<String>();
+    debug_assert!(
+        budget.is_none_or(|b| content.chars().count() <= b as usize),
+        "context payload must fit its declared character budget"
+    );
+    fields.insert("content".to_string(), Value::String(content));
     if let Some(b) = budget {
         fields.insert("budget".to_string(), Value::Number(b as f64));
     }
@@ -4448,7 +4463,7 @@ mod tests {
                 .bind(sid, &SymbolName(name.into()), &vid, None, &val, vis)
                 .unwrap();
         };
-        // Each value serializes to ~42 chars ("xxxx…" + quotes); budget 100 fits exactly two.
+        // Each value renders to 48 chars (label + body + separator); budget 110 fits exactly two.
         put("a", "x".repeat(40), Visibility::Visible);
         put("b", "y".repeat(40), Visibility::Visible);
         put("c", "z".repeat(40), Visibility::Pinned);
@@ -4465,7 +4480,7 @@ mod tests {
             &SymbolName("pack".into()),
             &Some("debug".into()),
             &members,
-            Some(100),
+            Some(110),
             &mut transcript,
             &mut BufferSink::default(),
         )
@@ -4636,6 +4651,22 @@ mod tests {
             "private/hidden members excluded, the visible one kept"
         );
 
+        let Value::String(content) = &fields["content"] else {
+            panic!("ctx materializes its retained values into a content string")
+        };
+        assert!(
+            content.contains("fine"),
+            "visible value reaches the payload: {content}"
+        );
+        assert!(
+            !content.contains("classified"),
+            "private value leaked: {content}"
+        );
+        assert!(
+            !content.contains("internal"),
+            "hidden value leaked: {content}"
+        );
+
         let obs = observations(sink);
         assert!(
             obs.iter().any(|(k, _)| k == "context.sliced"),
@@ -4655,8 +4686,8 @@ mod tests {
                 .bind(sid, &SymbolName(name.into()), &vid, None, &val, vis)
                 .unwrap();
         };
-        put("keep", "z".repeat(40), Visibility::Pinned); // ~42 chars
-        put("low", "y".repeat(40), Visibility::Visible); // ~42 chars
+        put("keep", "z".repeat(40), Visibility::Pinned); // 52 rendered chars
+        put("low", "y".repeat(40), Visibility::Visible); // 51 rendered chars
         let mut t = Vec::new();
         let members = vec![SymbolName("keep".into()), SymbolName("low".into())];
         build_ctx(
@@ -4665,14 +4696,14 @@ mod tests {
             &SymbolName("p".into()),
             &None,
             &members,
-            Some(100),
+            Some(120),
             &mut t,
             &mut BufferSink::default(),
         )
         .unwrap();
 
         // A higher-priority (pinned) member that overflows the budget evicts the lower-priority `low`.
-        put("big", "q".repeat(50), Visibility::Pinned); // ~52 chars
+        put("big", "q".repeat(50), Visibility::Pinned); // 61 rendered chars
         let v2 = append_ctx(
             &store,
             sid,
@@ -4722,17 +4753,17 @@ mod tests {
         };
         // Mirror the s_251 pack shape, scaled down: a tiny status bind, a tiny recent-commits bind,
         // then one oversized evidence bind, then several modest code reads that fit the leftover.
-        // Each `Value::String` serializes to `"<value>"` — 2 chars overhead on top of the body.
-        put("status", "ok".into(), Visibility::Visible); // 4 chars
-        put("recent", "commits".into(), Visibility::Visible); // 9 chars
-        put("evidence", "e".repeat(200), Visibility::Visible); // 202 chars (oversized vs budget)
-        put("code_ops", "o".repeat(20), Visibility::Visible); // 22 chars
-        put("code_db", "d".repeat(20), Visibility::Visible); // 22 chars
-        put("code_sql", "q".repeat(20), Visibility::Visible); // 22 chars
+        // Each member renders with a short `## $name` label and a blank-line separator.
+        put("status", "ok".into(), Visibility::Visible);
+        put("recent", "commits".into(), Visibility::Visible);
+        put("evidence", "e".repeat(200), Visibility::Visible); // oversized vs budget
+        put("code_ops", "o".repeat(20), Visibility::Visible);
+        put("code_db", "d".repeat(20), Visibility::Visible);
+        put("code_sql", "q".repeat(20), Visibility::Visible);
 
         let mut t = Vec::new();
-        // Budget 100: status(4) + recent(9) + code_ops(22) + code_db(22) + code_sql(22) = 79 ≤ 100 all
-        // fit; evidence(202) doesn't fit. Today the hard `break` at `evidence` drops itself AND the
+        // Budget 160 fits every small labelled section; evidence doesn't fit. The old hard `break`
+        // at `evidence` dropped itself AND the
         // three code reads that would have fit; after the fix only `evidence` is dropped (drop-and-
         // continue) and the three code reads survive in the leftover ~87 chars of budget.
         let members = vec![
@@ -4749,7 +4780,7 @@ mod tests {
             &SymbolName("analysis_pack".into()),
             &Some("diagnose".into()),
             &members,
-            Some(100),
+            Some(160),
             &mut t,
             &mut BufferSink::default(),
         )

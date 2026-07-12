@@ -68,8 +68,9 @@ pub struct Need {
 }
 
 /// A bounded, intentionally-budgeted bundle of context — the value produced by the `ctx`/`ctx_append`
-/// nodes. `members` are the symbol references selected into the pack; `budget` is the char/token cap the
-/// runtime shrinks the pack to at node evaluation.
+/// nodes. `members` are the symbol references selected into the pack; at evaluation the runtime
+/// materializes their retained values into a model-ready payload, and `budget` caps that payload by
+/// character count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Ctx {
     /// The pack's name (the symbol it binds to).
@@ -80,7 +81,7 @@ pub struct Ctx {
     /// The symbol references included in the pack, after budgeting.
     #[serde(default)]
     pub members: Vec<String>,
-    /// The char/token budget the pack was shrunk to, if one was declared.
+    /// The character budget the materialized content was shrunk to, if one was declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<u64>,
 }

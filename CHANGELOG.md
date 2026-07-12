@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The beginner tutorial now works as written end-to-end** (Agent + Language pillars;
+  `docs/designs/tutorial-e2e-hardening.md`). Runtime `Ctx` values materialize their retained symbol
+  values into an exactly character-budgeted, labelled payload, and `ai.reason` sends that payload
+  instead of only `{name, members, purpose, budget}` metadata. Private/hidden gating still happens
+  before materialization. Failing-first tests:
+  `ctx_excludes_private_and_hidden_members_by_default`,
+  `reason_prompt_uses_materialized_context_content`, plus
+  `tutorial_flow_materializes_handbook_context_for_ai_reason`, which executes the public lesson's
+  exact flow fence with a capture provider.
+- **OpenAI GPT-5 Chat Completions use `max_completion_tokens`** while GPT-4o and older chat models
+  retain `max_tokens` (`chat_body_uses_gpt5_completion_token_field`). This fixes the API 400 seen
+  when following the tutorial with `openai/gpt-5`; Responses API shaping is unchanged.
+- **App agents now honour their declared datasource boundary.** `AgentDecl.datasources` is injected
+  into the agent's grounding instructions and scopes the retrieval tools: one source is filled in
+  automatically, an undeclared source is rejected before retrieval, multiple sources require an
+  explicit choice, and `sources` lists only the agent's declarations
+  (`agent_datasource_scope_injects_and_enforces_source`).
+- **`flux app run` exits cleanly on Ctrl-C while waiting for terminal input.** Interactive stdin no
+  longer occupies Tokio's uncancellable blocking worker; a detached reader forwards lines without
+  holding runtime shutdown. The exact tutorial app is started and sent direct SIGINT by
+  `tutorial_app_exits_cleanly_on_direct_sigint`.
+- **Plan-mode docs disclose bounded read-only gathering.** The tutorial and language tooling now
+  distinguish gather operations that may auto-run from the returned plan, which always remains
+  unexecuted; a website contract test guards against the old “nothing runs” claim.
+
 ## [0.19.2] - 2026-07-12
 
 ### Added

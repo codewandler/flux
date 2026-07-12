@@ -16,7 +16,7 @@ Create `assistant.flux` beside `brief.flux`:
 agent guide
   tools [search]
   datasources [handbook]
-  description "Answer questions only from the Northstar handbook. If the handbook does not contain the answer, say so."
+  description "For every question, call search before answering. Answer only from the Northstar handbook. If search finds no answer, say so."
 
 channel cli
 
@@ -41,7 +41,8 @@ journey show-welcome
 This is both application configuration and executable Flux-Lang:
 
 - `agent guide` defines the model-facing role and grants only the `search` operation over the
-  declared datasource.
+  declared datasource. The runtime scopes that operation to `handbook`; an omitted `source` is
+  filled in automatically, and another source is rejected.
 - `channel cli` turns each non-empty terminal line into a `user_input` event.
 - `datasource handbook` indexes the Markdown files under `./docs` when the app starts.
 - `trigger questions` routes each input event to the agent. It is agent-bound, so it does not need a
@@ -63,8 +64,9 @@ After the welcome message, type a complete question and press Enter:
 What happens to my edits if I work offline?
 ```
 
-The agent can call only `search`, retrieve the relevant handbook passage, and answer that offline
-edits synchronize after the device reconnects. Try another standalone question:
+The agent is instructed to call its only operation, `search`, retrieve the relevant handbook
+passage, and answer that offline edits synchronize after the device reconnects. Try another
+standalone question:
 
 ```text
 What are the support hours and timezone?
@@ -89,9 +91,10 @@ terminal line
     -> terminal result
 ```
 
-The model decides how to answer and whether it needs the granted `search` operation. It still cannot
-open arbitrary files or perform an undeclared effect. The app host indexes the datasource, the
-runtime dispatches the operation, and the channel renders the result.
+The model decides how to phrase the answer, while its role instructs it to ground every answer with
+the granted `search` operation. It still cannot open arbitrary files, query an undeclared
+datasource, or perform an undeclared effect. The app host indexes the datasource, the runtime scopes
+and dispatches the operation, and the channel renders the result.
 
 The datasource path is resolved relative to `assistant.flux`, not the directory from which you
 launch flux. If you edit either handbook file, restart the app to rebuild its in-memory index.
@@ -116,4 +119,3 @@ Starting from basic terminal commands, you have now:
 - [Slack channel setup](../agent/slack-channel.md) — move the same docs-assistant pattern into Slack.
 - [Agent-to-agent](../agent/a2a.md) — expose an agent over HTTP/A2A.
 - [Safety and approvals](../agent/safety.md) — configure the envelope that guarded every exercise.
-

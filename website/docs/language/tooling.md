@@ -45,14 +45,17 @@ The selected flow is already the plan — no model compiles it. Details:
   (whose existing compatibility-lenient input behavior is unchanged) — see
   [Where flows live](#where-flows-live).
 
-## `flux plan` — preview without executing
+## `flux plan` — gather safely, then preview
 
 ```bash
 flux plan "summarize README.md into SUMMARY.txt"
 ```
 
-Asks the model to compile the request into a plan and shows it — nothing runs. Useful for
-inspecting what a prompt turns into before letting it touch the workspace.
+Asks the model to compile the request and shows the settled plan without executing that returned
+plan. To ground the proposal, plan mode may first auto-run up to three bounded read-only gather
+rounds; they are restricted to low-risk operations and cannot request approval. The final plan
+— including every pending write, process, or network effect — is printed and left unexecuted. This
+is useful for inspecting what a prompt turns into before allowing any mutation.
 
 ## `flux run` — plan and execute
 

@@ -8,10 +8,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use flux_cognition::CognitionPack;
-use flux_provider::NullProvider;
+use flux_core::{Chunk, StopReason};
+use flux_provider::{ChunkStream, NullProvider, Provider, Request};
 use flux_runtime::ToolRegistry;
 
 fn repo_path(rel: &str) -> PathBuf {
@@ -53,6 +56,44 @@ fn fenced_blocks<'a>(markdown: &'a str, language: &str) -> Vec<&'a str> {
         rest = &rest[end + 4..];
     }
     blocks
+}
+
+fn test_dir(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    std::env::temp_dir().join(format!("flux-{label}-{}-{nonce}", std::process::id()))
+}
+
+/// A provider that records the cognition prompt and returns one deterministic answer. The tutorial
+/// flow is authored (not planner-compiled), so this provider is called exactly once by `ai.reason`.
+struct PromptCapture {
+    prompts: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for PromptCapture {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn stream(&self, req: Request) -> flux_core::Result<ChunkStream> {
+        let prompt = req
+            .messages
+            .last()
+            .map(|message| message.text())
+            .unwrap_or_default();
+        self.prompts.lock().unwrap().push(prompt);
+        Ok(Box::pin(futures::stream::iter([
+            Ok(Chunk::TextDelta(
+                "A deleted workspace can be recovered for 30 days.".into(),
+            )),
+            Ok(Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            }),
+        ])))
+    }
 }
 
 #[test]
@@ -195,6 +236,206 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
         checked >= 25,
         "expected a representative Flux example corpus"
     );
+}
+
+#[test]
+fn tutorial_plan_copy_matches_bounded_gather_semantics() {
+    let lesson = read("website/docs/tutorial/first-agent.md");
+    let tooling = read("website/docs/language/tooling.md");
+    for (rel, docs) in [
+        ("tutorial/first-agent.md", lesson.as_str()),
+        ("language/tooling.md", tooling.as_str()),
+    ] {
+        assert!(
+            docs.contains("read-only gather"),
+            "{rel} must disclose plan mode's automatic gather"
+        );
+        assert!(
+            docs.contains("returned") && docs.contains("plan") && docs.contains("unexecuted"),
+            "{rel} must distinguish gather from the returned plan"
+        );
+        assert!(
+            !docs.contains("the files have not been read") && !docs.contains("nothing runs"),
+            "{rel} regressed to the pre-A-18 plan-mode claim"
+        );
+    }
+}
+
+/// Execute the public lesson's exact Flux fence over the exact handbook facts with a hermetic model.
+/// This catches the failure the parser-only contract missed: `ctx` used to pass only `members` names
+/// into `ai.reason`, so a syntactically-valid tutorial flow could not answer from either file.
+#[tokio::test]
+async fn tutorial_flow_materializes_handbook_context_for_ai_reason() {
+    let root = test_dir("website-tutorial-flow");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join("docs/product.md"),
+        "# Northstar Notes\n\nOffline edits synchronize automatically when a device reconnects.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/policies.md"),
+        "# Northstar policies\n\nCustomers can request a refund within 14 days of their first payment. A deleted workspace can be recovered for 30 days.\n",
+    )
+    .unwrap();
+
+    let lesson = read("website/docs/tutorial/first-flow.md");
+    let flow = fenced_blocks(&lesson, "flux")
+        .into_iter()
+        .next()
+        .expect("tutorial flow fence");
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(PromptCapture {
+        prompts: prompts.clone(),
+    });
+    let client = flux_sdk::flow::FlowClient::builder()
+        .model("mock")
+        .auto_approve(true)
+        .build(provider, &root)
+        .unwrap();
+    let ast = client.parse(flow).unwrap();
+    let mut inputs = serde_json::Map::new();
+    inputs.insert(
+        "question".into(),
+        serde_json::json!("How long can a deleted workspace be recovered?"),
+    );
+    let result = client.execute_with(&ast, inputs).await.unwrap();
+    assert!(result.result.contains("30 days"));
+
+    let captured = prompts.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "the authored flow has one model boundary"
+    );
+    let prompt = &captured[0];
+    for fact in [
+        "Offline edits synchronize automatically",
+        "within 14 days of their first payment",
+        "recovered for 30 days",
+    ] {
+        assert!(prompt.contains(fact), "context omitted `{fact}`: {prompt}");
+    }
+    assert!(prompt.contains("## $product"));
+    assert!(prompt.contains("## $policies"));
+    assert!(
+        !prompt.contains("\"members\""),
+        "Ctx metadata replaced content: {prompt}"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn tutorial_app_declares_forced_scoped_retrieval() {
+    let lesson = read("website/docs/tutorial/first-app.md");
+    let source = fenced_blocks(&lesson, "flux")
+        .into_iter()
+        .next()
+        .expect("tutorial app fence");
+    let flux_lang::program::Module::Program(program) =
+        flux_lang::parse::parse_program(source).expect("parse tutorial app")
+    else {
+        panic!("tutorial app fence must be a Program")
+    };
+    let guide = program
+        .agents
+        .iter()
+        .find(|agent| agent.name == "guide")
+        .expect("guide agent");
+    assert_eq!(guide.tools, ["search"]);
+    assert_eq!(guide.datasources, ["handbook"]);
+    let description = guide.description.as_deref().unwrap_or_default();
+    assert!(description.contains("every question"));
+    assert!(description.contains("call search"));
+}
+
+/// The earlier manual E2E needed SIGTERM only when `flux` was nested under a PTY-recording process.
+/// Send SIGINT directly to the real app process and require a clean status, proving the product's
+/// shutdown handler works independently of terminal-forwarding behavior in the harness.
+#[cfg(unix)]
+#[test]
+fn tutorial_app_exits_cleanly_on_direct_sigint() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let root = test_dir("website-tutorial-sigint");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/product.md"), "# Product\n\nOffline sync.\n").unwrap();
+    fs::write(
+        root.join("docs/policies.md"),
+        "# Policies\n\n30 day recovery.\n",
+    )
+    .unwrap();
+    let lesson = read("website/docs/tutorial/first-app.md");
+    let app_source = fenced_blocks(&lesson, "flux")
+        .into_iter()
+        .next()
+        .expect("tutorial app fence");
+    fs::write(root.join("assistant.flux"), app_source).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["app", "run", "assistant.flux", "-m", "mock"])
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start tutorial app");
+    let stdout = child.stdout.take().expect("app stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    let ready_by = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < ready_by {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains("Northstar handbook assistant ready") => {
+                ready = true;
+                break;
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready {
+        let early = child.try_wait().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("tutorial app never reached its welcome message (status: {early:?})");
+    }
+
+    // Let `serve` move from startup delivery into its signal-select loop before sending SIGINT.
+    std::thread::sleep(Duration::from_millis(50));
+    let signal = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(signal.success());
+
+    let exit_by = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= exit_by {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("tutorial app did not stop within five seconds of direct SIGINT");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        status.success(),
+        "SIGINT was not handled gracefully: {status}"
+    );
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]

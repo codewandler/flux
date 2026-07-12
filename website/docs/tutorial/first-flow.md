@@ -32,7 +32,8 @@ result. Its body then makes every important boundary explicit:
 
 - `read(...)` is an operation; its result is stored in an immutable symbol such as `$product`.
 - `ctx $handbook` selects exactly which values the reasoning model may see and caps their combined
-  size.
+  materialized size. The pack retains the selected values themselves, labelled by symbol name — not
+  merely the names `$product` and `$policies`.
 - `ai.reason(...)` is the one model-backed step. The model receives the question and the context
   pack, not ambient access to your filesystem.
 - `return` makes the flow's result explicit.
@@ -44,6 +45,10 @@ Pass the declared input and choose the same model as before:
 ```bash
 flux flow run brief.flux --arg "question=How long can a deleted workspace be recovered?" -m sonnet
 ```
+
+`ai.reason` is an explicit model/network effect, so flux asks you to approve that operation before
+it sends the bounded context to the configured provider. Review the operation and provider, then
+approve it. The two local `read` operations remain pre-authorized.
 
 The answer should say **30 days**. Try the other policy fact:
 
@@ -63,7 +68,8 @@ The two model uses in this tutorial have different jobs:
 | `flux flow run brief.flux` | Only the answer inside `ai.reason` | The authored flow, context budget, dispatch, and every effect |
 
 The reads still cross the safety envelope. Writing them into a flow does not grant extra authority;
-it only makes their order and data flow repeatable.
+it only makes their order and data flow repeatable. The `ai.reason` approval is the same envelope
+governing the one intentional model call.
 
 If you omit `--arg question=...`, provide an unknown input, or pass a value of the wrong declared
 type, flux rejects the invocation before the flow runs.
@@ -74,4 +80,3 @@ You now have a reusable typed workflow. The final lesson will keep the same hand
 one-shot command with a long-running application that receives questions as events.
 
 Continue to [Build a local docs assistant](./first-app.md).
-
