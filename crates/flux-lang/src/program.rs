@@ -1,5 +1,6 @@
-//! The multi-agent **Program** layer: a `.flux` file may declare a whole app — agents, channels,
-//! datasources, triggers, and journeys — not just a single flow. These are **pure-data declarations**
+//! The multi-agent **Program** layer: a `.flux` file may declare a whole app — capability ceilings,
+//! agents, channels, datasources, triggers, and journeys — not just a single flow. These are
+//! **pure-data declarations**
 //! (L0, strings + an opaque `settings` JSON map); the L3 engine and the L6 `flux-app` host give them
 //! their runtime *meaning* (model/datasource/channel wiring, the event bus, the scheduler). This keeps
 //! the multi-agent vision coherent without expanding the language core: **orchestration is an op-pack**
@@ -18,6 +19,20 @@ use crate::error::Result;
 
 use flux_spec::{Effect, Idempotency, Risk};
 
+/// Exact operation-name capabilities declared by a program or agent. `allow: None` inherits the
+/// parent/default capability set; `allow: Some([])` is an explicit empty ceiling. Hosts intersect
+/// nested allow-lists and union denies. These are deliberately simpler than subject-scoped local
+/// approval rules: an app manifest states which operations exist in the app at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PermissionDecl {
+    /// Exact operations admitted by this layer, or `None` to inherit the parent/default ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    /// Exact operations removed at this layer. Deny always wins over allow.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 /// An agent: an identity plus the model / tool / datasource access surface it runs with. A superset
 /// of an orchestration role; the L3 engine resolves the names to concrete capabilities.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
@@ -35,6 +50,9 @@ pub struct AgentDecl {
     /// A human-readable role description (seeds the agent's system framing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional capability narrowing for this agent and the journeys it owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionDecl>,
     /// An opaque settings bag — the L0 layer carries it verbatim; the engine interprets it.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub settings: serde_json::Value,
@@ -167,12 +185,15 @@ pub struct CompositeOpDecl {
     pub body: DraftAst,
 }
 
-/// A whole multi-agent program (a module): agents, channels, triggers, journeys, and any top-level
-/// flows. Every field defaults to empty, so a minimal program is valid.
+/// A whole multi-agent program (a module): permissions, agents, channels, triggers, journeys, and
+/// any top-level flows. Every field defaults to empty, so a minimal program is valid.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Program {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional app-wide operation ceiling. Agent declarations may narrow but never widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionDecl>,
     #[serde(default)]
     pub agents: Vec<AgentDecl>,
     #[serde(default)]
@@ -235,8 +256,8 @@ pub fn as_secret_ref(v: &serde_json::Value) -> Option<&str> {
 
 /// A loaded `.flux` module: either a single bare flow or a full multi-agent program. The loader
 /// sniffs the shape so a host can accept both `foo.flux` (one flow) and `app.flux` (a program). Both
-/// are **native flux-lang text** — module declarations (`agent`/`channel`/`datasource`/`trigger`/
-/// `journey`) mark a program; a lone `flow` header is a bare flow.
+/// are **native flux-lang text** — module declarations (`permissions`/`agent`/`channel`/`datasource`/
+/// `trigger`/`journey`) mark a program; a lone `flow` header is a bare flow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Module {
     /// A bare single-flow file (a lone `DraftAst`).

@@ -7040,7 +7040,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // uses, so the two surfaces delegate through the identical envelope, never a re-derived one.
     let sub_agents = is_builtin_strict_review
         .then(|| build_review_sub_agents(&cwd, &spec, model.clone(), flags.max_tokens));
-    let app = std::sync::Arc::new(flux_app::App::with_events(
+    let app = std::sync::Arc::new(flux_app::App::try_with_events_and_permissions(
         program,
         provider,
         model,
@@ -7049,7 +7049,11 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
         sub_agents,
         redactor,
         app_events,
-    ));
+        flux_app::HostPermissionRules {
+            allow: cfg.permissions.allow.clone(),
+            deny: cfg.permissions.deny.clone(),
+        },
+    )?);
     let channels = flux_channels::build_channels(&channel_decls)?;
     // Serve stdin when an interactive `cli` channel is declared, or when the program declares no
     // channels at all (preserving the plain read-eval-print behavior).

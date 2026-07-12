@@ -5,8 +5,8 @@ description: "Defining multi-agent program files, channels, and journey composit
 
 # Multi-agent programs
 
-A single agent is one loop. A multi-agent program is a whole application: agents, channels,
-datasources, triggers, and journeys declared in one Flux-Lang `.flux` file.
+A single agent is one loop. A multi-agent program is a whole application: permissions, agents,
+channels, datasources, triggers, and journeys declared in one Flux-Lang `.flux` file.
 
 Use programs when you want more than one prompt-response turn: a Slack bot, an A2A service, a
 scheduled workflow, or an event-driven assistant that coordinates multiple agents.
@@ -16,12 +16,14 @@ scheduled workflow, or an event-driven assistant that coordinates multiple agent
 A program file is a set of typed module declarations. Each one names a part of the system and carries
 its settings inline as ordinary Flux-Lang values:
 
-- **`agent`** — a model, its tool allow-list, its datasources, and a description.
+- **`permissions`** — the app-wide operation ceiling, declared as exact `allow`/`deny` names.
+- **`agent`** — a model, its model-visible tools, datasources, description, and optional capability narrowing.
 - **`channel`** — a surface the app is reached on (CLI, Slack, HTTP/A2A, …).
 - **`datasource`** — grounded knowledge an agent answers from (e.g. a Markdown corpus) — see [Datasources](./datasources.md).
 - **`trigger`** — an event to listen for, and what runs when it fires: an **agent** (the model drives
   the turn) or a **journey** (a fixed flow).
-- **`journey`** — a named flow that does the work. A journey is an ordinary Flux-Lang flow.
+- **`journey`** — a named flow that does the work. It may name an owning agent whose model, persona,
+  datasource scope, and capability narrowing the flow inherits.
 
 Here is a complete Slack support bot — an agent, its channel, a docs datasource, and an agent-bound
 trigger that answers each message ([`crates/flux-app/examples/support-bot.flux`](https://github.com/codewandler/flux/blob/main/crates/flux-app/examples/support-bot.flux)):
@@ -52,8 +54,34 @@ names an `agent`, not a `run` journey), so the model drives the turn. See the [S
 guide](./slack-channel.md) for creating the Slack app and its tokens.
 
 For deterministic, fixed-step work a trigger can run a **journey** — a named Flux-Lang flow — instead
-of an agent (`run <journey>` with no `agent`). See the [language overview](../language/overview.md)
-and [flows & syntax](../language/flows-and-syntax.md).
+of an agent (`run <journey>` with no trigger-level `agent`). A journey may still declare `agent
+<name>` inside its own body: that supplies the execution context without giving the model control of
+the graph. See the [language overview](../language/overview.md) and [flows &
+syntax](../language/flows-and-syntax.md).
+
+## Capabilities in app source
+
+Programs can make their headless authority explicit:
+
+```flux
+permissions
+  allow [search, "ai.reason", send]
+  deny [write, edit, bash]
+
+agent guide
+  tools [search]
+  datasources [handbook]
+  allow [search, "ai.reason", send]
+```
+
+The top-level `allow` list is a hard app ceiling. An agent-level list intersects it; app and agent
+denies are combined and always win. Missing `allow` inherits the parent/default set, while `allow []`
+is explicitly empty. Entries are exact operation names, so dotted names such as `ai.reason` are
+quoted. Local `.flux/config.toml` rules remain the place for subject-scoped approvals.
+
+`tools` is deliberately separate from `allow`: `tools` is the catalog an open-ended agent may choose
+from, while `allow` governs calls already authored into journeys. Neither local approval rules nor
+`--yes` can restore an operation removed by the app or agent ceiling.
 
 ## Secrets are references, never plaintext
 
@@ -85,11 +113,12 @@ rather than one loop doing everything.
 flux run app.flux        # or: flux app run app.flux
 ```
 
-Programs run headless, so they are **deny-by-default**: the orchestration verbs (`emit`/`send`/`ask`/
-`spawn`) and read-only builtins are pre-allowed, but anything that changes the world (`write`, `bash`,
-`git_*`, …) is **denied** outright — there is no human at a prompt to approve it. Pass `--yes` to run a
-trusted, pre-authored program under an allow-all approver instead — it approves every step, destructive
-ones included. To expose the program as a long-running HTTP/A2A daemon instead of a one-shot run:
+Programs without an explicit `permissions` declaration retain the safe legacy posture: orchestration
+verbs and read-only builtins are pre-allowed, while other operations need approval and are denied in a
+headless run. `--yes` auto-approves those remaining prompts for a trusted legacy program. With an
+explicit app ceiling, `--yes` applies only inside that ceiling and can never widen it. Destructive
+operations still pass the runtime's risk and authorization checks. To expose the program as a
+long-running HTTP/A2A daemon instead of a one-shot run:
 
 ```bash
 flux app run app.flux --serve 127.0.0.1:8787 --yes

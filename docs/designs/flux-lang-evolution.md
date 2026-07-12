@@ -424,14 +424,15 @@ perspective* here; its long-running executor is deferred to the appendix.
 A file may be a **`Program`** (a module), not just one flow:
 
 ```
-Program { types, agents, channels, conditions, triggers, journeys, flows }
+Program { types, permissions, agents, channels, conditions, triggers, journeys, flows }
 ```
 
-- **Agents/channels/triggers** are pure-data declarations (identity, model/tools/datasource access;
+- **Permissions/agents/channels/triggers** are pure-data declarations (app capability ceiling;
+  identity, model/tools/datasource access;
   input/output surfaces; event→action bindings). `AgentDecl` is a superset of the existing
   `flux_orchestrate::role::Role`.
-- **Journeys are flows.** A `JourneyDecl` embeds a `DraftAst`; it runs on the existing interpreter
-  unchanged.
+- **Journeys are flows.** A `JourneyDecl` embeds a `DraftAst`; an optional owning agent supplies its
+  model, persona, datasource boundary, and capability narrowing while the graph stays authored.
 - **Orchestration is an op-pack** (`ask` / `send` / `emit` / `spawn`) — agent/channel interaction is op
   dispatch, so this layer needs **zero new node kinds**. "User input is just an event": a trigger's `on`
   label shares the event-label space with `Node::Await`.

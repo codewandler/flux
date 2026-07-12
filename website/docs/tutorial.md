@@ -15,13 +15,14 @@ to know Rust, Flux-Lang, or any agent framework.
 ## What you will build
 
 The finished app is a local assistant for a fictional product handbook. It starts in your terminal,
-indexes two Markdown files, and uses a real model to answer questions from those files.
+indexes two Markdown files, and requires every model-written answer to pass through an authored,
+scoped retrieval journey.
 
 Along the way you will learn the three ways work enters flux:
 
 1. **A request** — the model compiles your words into a typed plan.
 2. **A flow** — you write the plan directly in Flux-Lang.
-3. **An app** — declarations connect agents, channels, datasources, triggers, and flows.
+3. **An app** — declarations connect permissions, agents, channels, datasources, triggers, and journeys.
 
 All three use the same runtime and the same safety envelope:
 

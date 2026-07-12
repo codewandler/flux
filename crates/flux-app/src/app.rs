@@ -11,7 +11,7 @@
 //! `DraftAst`, with a [`FlowStore`] for state and an [`AgentSink`] for output. Nothing about the
 //! interpreter is reinvented here — the multi-agent layer is pure wiring over the existing engine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -28,7 +28,7 @@ use flux_flow::registry::analyze_composites;
 use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_lang::ast::{Node, SymbolName, Value as FluxValue, Visibility};
-use flux_lang::program::{AgentDecl, Program};
+use flux_lang::program::{AgentDecl, PermissionDecl, Program};
 use flux_lang::runtime::FlowOutcome;
 use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::Provider;
@@ -51,6 +51,48 @@ const MAX_SPAWN_DEPTH: u32 = 16;
 /// into (via `emit`). Bounds an `emit`-loop in the one-shot path; the long-running [`App::run`] loop is
 /// unbounded by design.
 const MAX_CASCADE: u32 = 256;
+
+/// Legacy grants for a journey in a program which declares no capability policy. Kept byte-for-byte
+/// compatible; a declared policy replaces this implicit set with an explicit app/agent ceiling.
+const LEGACY_JOURNEY_ALLOW: &[&str] = &[
+    "emit", "send", "ask", "spawn", "read", "glob", "grep", "search",
+];
+
+#[derive(Debug, Clone)]
+struct EffectiveCapabilities {
+    /// Whether app or agent source declared a capability layer. When false, callers preserve the
+    /// legacy journey/agent behavior rather than treating `allow` as a hard registry ceiling.
+    declared: bool,
+    /// Hard registry ceiling after app/agent intersections and denies.
+    allow: Vec<String>,
+    /// Calls pre-authorized by source. With only deny declarations this stays at the legacy safe
+    /// journey set; `--yes` may approve other calls inside `allow`, never outside it.
+    grants: Vec<String>,
+    deny: Vec<String>,
+}
+
+struct AgentRuntimeProfile {
+    spec: AgentSpec,
+    registry: ToolRegistry,
+    capabilities: EffectiveCapabilities,
+}
+
+struct JourneyRuntimeProfile {
+    registry: ToolRegistry,
+    capabilities: EffectiveCapabilities,
+    model: String,
+}
+
+/// Host/local coder-style approval rules layered inside source-declared app capabilities. These may
+/// include subject-scoped forms such as `Bash(git:*)`. They can approve or deny calls still present
+/// in the app registry but can never restore an operation removed by the app/agent ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct HostPermissionRules {
+    /// Allow rules (`read`, `Bash(git:*)`, …) from the host's layered configuration.
+    pub allow: Vec<String>,
+    /// Deny rules evaluated before allows.
+    pub deny: Vec<String>,
+}
 
 /// The result of running one journey: which journey, its textual result (the flow's `return`/last view),
 /// and how many ops it dispatched.
@@ -90,9 +132,20 @@ impl App {
         Self::with_options(program, provider, model, false)
     }
 
+    /// Fallible counterpart to [`new`](Self::new): validates the complete program against the
+    /// assembled runtime catalog before returning, so a surface can fail before starting channels.
+    pub fn try_new(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+    ) -> Result<Self> {
+        Self::try_with_options(program, provider, model, false)
+    }
+
     /// Build a host, choosing the approval posture. `auto_approve = false` (the safe default) **denies**
-    /// any op outside the pre-allowed orchestration + read-only set; `true` (the CLI's `--yes`) runs
-    /// allow-all for trusted, pre-authored programs.
+    /// any legacy-program op outside the pre-allowed orchestration + read-only set; `true` (the CLI's
+    /// `--yes`) approves remaining prompts for trusted programs. A source-declared capability ceiling
+    /// is absolute in either posture.
     pub fn with_options(
         program: Program,
         provider: Option<Arc<dyn Provider>>,
@@ -100,6 +153,16 @@ impl App {
         auto_approve: bool,
     ) -> Self {
         Self::with_tools(program, provider, model, auto_approve, Vec::new())
+    }
+
+    /// Validating counterpart to [`with_options`](Self::with_options).
+    pub fn try_with_options(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+    ) -> Result<Self> {
+        Self::try_with_tools(program, provider, model, auto_approve, Vec::new())
     }
 
     /// Like [`with_options`](Self::with_options) but also registers `extra_tools` into the host
@@ -114,6 +177,25 @@ impl App {
         extra_tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
         Self::with_sub_agents(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            None,
+            Redactor::new(),
+        )
+    }
+
+    /// Validating counterpart to [`with_tools`](Self::with_tools).
+    pub fn try_with_tools(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<Self> {
+        Self::try_with_sub_agents(
             program,
             provider,
             model,
@@ -155,6 +237,29 @@ impl App {
         )
     }
 
+    /// Validating counterpart to [`with_sub_agents`](Self::with_sub_agents).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_with_sub_agents(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+        redactor: Redactor,
+    ) -> Result<Self> {
+        Self::try_with_events(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            sub_agents,
+            redactor,
+            Arc::new(EventStore::in_memory().map_err(other)?),
+        )
+    }
+
     /// Like [`with_sub_agents`](Self::with_sub_agents) but takes the host's [`EventStore`] explicitly
     /// (flux D-65). The seam a surface uses when ITS OWN plugin/endpoint wiring must reach the same
     /// per-run stream `App` records agent-target session memory and sub-agent spawn audit into: build
@@ -176,6 +281,31 @@ impl App {
         redactor: Redactor,
         events: Arc<EventStore>,
     ) -> Self {
+        Self::with_events_and_permission_rules(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            sub_agents,
+            redactor,
+            events,
+            HostPermissionRules::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_events_and_permission_rules(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+        redactor: Redactor,
+        events: Arc<EventStore>,
+        host_permissions: HostPermissionRules,
+    ) -> Self {
         App {
             engine: Engine::new(
                 program,
@@ -186,8 +316,66 @@ impl App {
                 sub_agents,
                 redactor,
                 events,
+                host_permissions,
             ),
         }
+    }
+
+    /// Validating counterpart to [`with_events`](Self::with_events). This is the constructor product
+    /// surfaces should use: all declarations and recursively nested calls are checked before any
+    /// channel begins receiving events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_with_events(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+        redactor: Redactor,
+        events: Arc<EventStore>,
+    ) -> Result<Self> {
+        let app = Self::with_events(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            sub_agents,
+            redactor,
+            events,
+        );
+        app.engine.validate()?;
+        Ok(app)
+    }
+
+    /// Validating app constructor with host/local approval rules. Source declarations are applied as
+    /// a hard registry ceiling first; these rules then decide calls inside that ceiling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_with_events_and_permissions(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+        redactor: Redactor,
+        events: Arc<EventStore>,
+        host_permissions: HostPermissionRules,
+    ) -> Result<Self> {
+        let app = Self::with_events_and_permission_rules(
+            program,
+            provider,
+            model,
+            auto_approve,
+            extra_tools,
+            sub_agents,
+            redactor,
+            events,
+            host_permissions,
+        );
+        app.engine.validate()?;
+        Ok(app)
     }
 
     /// The program this host runs.
@@ -296,8 +484,9 @@ pub(crate) struct Engine {
     depth: AtomicU32,
     /// Monotonic counter giving each journey run a distinct session id.
     runs: AtomicU64,
-    /// When true, journeys run under an allow-all approver (`--yes`); otherwise destructive ops
-    /// outside the pre-allowed safe set are **denied** (the safe headless default).
+    /// When true, journeys use an allow approver (`--yes`) for calls still present in their effective
+    /// registry; otherwise calls outside the pre-allowed set are denied. Source-declared ceilings
+    /// are enforced by registry narrowing before this approval layer.
     auto_approve: bool,
     /// The sub-agent spawner (when [`App::with_sub_agents`] wired one) — installed on every journey
     /// run's executor so a `task` call (e.g. inside the `strict_review` composite op's reviewer
@@ -323,6 +512,8 @@ pub(crate) struct Engine {
     /// store). Installed on every journey-run executor's and agent-target engine's `ToolContext`, so
     /// program-declared secrets are scrubbed from tool output/logs everywhere.
     redactor: Redactor,
+    /// Local config approval rules. Applied after source capability narrowing; local deny wins.
+    host_permissions: HostPermissionRules,
     /// Journeys parked on an `ask`, oldest first, each waiting for the correlated reply (A-11).
     /// [`Engine::run_triggers`] checks these before routing: a correlated inbound event resumes the
     /// oldest matching park instead of triggering journeys. See [`crate::park`] for the rule.
@@ -342,6 +533,185 @@ fn guarded_system(workspace: Workspace) -> System {
     ))
 }
 
+fn effective_capabilities(
+    available: &[String],
+    app: Option<&PermissionDecl>,
+    agent: Option<&PermissionDecl>,
+) -> EffectiveCapabilities {
+    let declared = app.is_some() || agent.is_some();
+    let mut allowed: BTreeSet<String> = available.iter().cloned().collect();
+    let mut denied = BTreeSet::new();
+    let mut explicit_allow = false;
+    for layer in [app, agent].into_iter().flatten() {
+        if let Some(layer_allow) = &layer.allow {
+            explicit_allow = true;
+            let layer_allow: HashSet<&str> = layer_allow.iter().map(String::as_str).collect();
+            allowed.retain(|name| layer_allow.contains(name.as_str()));
+        }
+        for name in &layer.deny {
+            allowed.remove(name);
+            denied.insert(name.clone());
+        }
+    }
+    let grants = if explicit_allow {
+        allowed.iter().cloned().collect()
+    } else {
+        LEGACY_JOURNEY_ALLOW
+            .iter()
+            .filter(|&&name| allowed.contains(name))
+            .map(|name| (*name).to_string())
+            .collect()
+    };
+    EffectiveCapabilities {
+        declared,
+        allow: allowed.into_iter().collect(),
+        grants,
+        deny: denied.into_iter().collect(),
+    }
+}
+
+fn narrowed_registry(
+    registry: &ToolRegistry,
+    capabilities: &EffectiveCapabilities,
+) -> ToolRegistry {
+    if capabilities.declared {
+        registry.subset(Some(&capabilities.allow))
+    } else {
+        registry.clone()
+    }
+}
+
+fn rebind_cognition(
+    registry: &mut ToolRegistry,
+    provider: Arc<dyn Provider>,
+    model: &str,
+    persona: &str,
+) {
+    for name in flux_cognition::CognitionPack::names() {
+        registry.remove(name);
+    }
+    flux_cognition::CognitionPack::new(provider, model)
+        .with_system_prefix(persona)
+        .register(registry);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_agent_runtime_profile(
+    decl: &AgentDecl,
+    app_permissions: Option<&PermissionDecl>,
+    provider: Option<Arc<dyn Provider>>,
+    mut registry: ToolRegistry,
+    available: &[String],
+    default_model: &str,
+    system: Arc<System>,
+    host_permissions: &HostPermissionRules,
+) -> Result<AgentRuntimeProfile> {
+    let root = std::env::current_dir().map_err(other)?;
+    let mut spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
+    let capabilities =
+        effective_capabilities(available, app_permissions, decl.permissions.as_ref());
+    scope_datasource_tools(&mut registry, &decl.datasources);
+    if let Some(provider) = provider {
+        rebind_cognition(
+            &mut registry,
+            provider,
+            &spec.model,
+            &spec.effective_system_prompt(),
+        );
+    }
+
+    // For an open-ended agent, `tools` remains the visible catalog. A declared capability layer can
+    // only remove entries from that catalog; authored journeys use the wider effective set below.
+    if capabilities.declared {
+        let allowed: HashSet<&str> = capabilities.allow.iter().map(String::as_str).collect();
+        let visible: Vec<String> = decl
+            .tools
+            .iter()
+            .filter(|name| allowed.contains(name.as_str()))
+            .cloned()
+            .collect();
+        spec.tools = Some(visible.clone());
+        spec.permissions = Permissions {
+            allow: visible,
+            deny: capabilities.deny.clone(),
+        };
+    }
+    spec.permissions
+        .allow
+        .extend(host_permissions.allow.iter().cloned());
+    spec.permissions
+        .deny
+        .extend(host_permissions.deny.iter().cloned());
+
+    Ok(AgentRuntimeProfile {
+        spec,
+        registry,
+        capabilities,
+    })
+}
+
+fn validate_permission_decl(
+    owner: &str,
+    decl: &PermissionDecl,
+    known: &HashSet<String>,
+) -> Result<()> {
+    for name in decl.allow.iter().flatten().chain(decl.deny.iter()) {
+        if name.trim().is_empty() {
+            return Err(Error::Other(format!(
+                "{owner} declares an empty operation name"
+            )));
+        }
+        if !known.contains(name) {
+            return Err(Error::Other(format!(
+                "{owner} names unknown operation `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_body_calls(
+    body: &[Node],
+    owner: &str,
+    capabilities: &EffectiveCapabilities,
+    known: &HashSet<String>,
+    composites: &HashMap<String, &[Node]>,
+    visiting: &mut HashSet<String>,
+) -> Result<()> {
+    let mut calls = Vec::new();
+    flux_lang::analyze::for_each_node(body, &mut |node| {
+        if let Node::Call { op, .. } = node {
+            calls.push(op.clone());
+        }
+    });
+    for op in calls {
+        if !known.contains(&op) {
+            return Err(Error::Other(format!(
+                "{owner} calls unknown operation `{op}`"
+            )));
+        }
+        if capabilities.declared && !capabilities.allow.contains(&op) {
+            return Err(Error::Other(format!(
+                "{owner} calls `{op}`, but the effective app/agent capability ceiling denies it"
+            )));
+        }
+        if let Some(composite_body) = composites.get(&op) {
+            if visiting.insert(op.clone()) {
+                validate_body_calls(
+                    composite_body,
+                    &format!("{owner} via composite `{op}`"),
+                    capabilities,
+                    known,
+                    composites,
+                    visiting,
+                )?;
+                visiting.remove(&op);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -353,6 +723,7 @@ impl Engine {
         sub_agents: Option<SubAgents>,
         redactor: Redactor,
         events: Arc<EventStore>,
+        host_permissions: HostPermissionRules,
     ) -> Arc<Self> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
@@ -407,9 +778,153 @@ impl Engine {
                 sessions: Mutex::new(HashMap::new()),
                 system,
                 redactor,
+                host_permissions,
                 parks: Mutex::new(Vec::new()),
             }
         })
+    }
+
+    fn available_op_names(&self) -> Vec<String> {
+        let mut names = self.registry.names();
+        names.extend(self.program.ops.iter().map(|op| op.name.clone()));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn validate(&self) -> Result<()> {
+        let available = self.available_op_names();
+        let known: HashSet<String> = available.iter().cloned().collect();
+        let registered_tools: HashSet<String> = self.registry.names().into_iter().collect();
+        let agent_names: HashSet<&str> = self
+            .program
+            .agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        let datasource_names: HashSet<&str> = self
+            .program
+            .datasources
+            .iter()
+            .map(|source| source.name.as_str())
+            .collect();
+        let composites: HashMap<String, &[Node]> = self
+            .program
+            .ops
+            .iter()
+            .map(|op| (op.name.clone(), op.body.body.as_slice()))
+            .collect();
+
+        if let Some(permissions) = &self.program.permissions {
+            validate_permission_decl("program permissions", permissions, &known)?;
+        }
+        for agent in &self.program.agents {
+            if let Some(permissions) = &agent.permissions {
+                validate_permission_decl(
+                    &format!("agent `{}` permissions", agent.name),
+                    permissions,
+                    &known,
+                )?;
+            }
+            let effective = effective_capabilities(
+                &available,
+                self.program.permissions.as_ref(),
+                agent.permissions.as_ref(),
+            );
+            for tool in &agent.tools {
+                if !registered_tools.contains(tool) {
+                    return Err(Error::Other(format!(
+                        "agent `{}` names unknown tool `{tool}`",
+                        agent.name
+                    )));
+                }
+                if effective.declared && !effective.allow.contains(tool) {
+                    return Err(Error::Other(format!(
+                        "agent `{}` exposes tool `{tool}`, but its effective app/agent capability ceiling denies it",
+                        agent.name
+                    )));
+                }
+            }
+            for datasource in &agent.datasources {
+                if !datasource_names.contains(datasource.as_str()) {
+                    return Err(Error::Other(format!(
+                        "agent `{}` names unknown datasource `{datasource}`",
+                        agent.name
+                    )));
+                }
+            }
+        }
+        for trigger in &self.program.triggers {
+            if let Some(agent) = trigger.agent.as_deref() {
+                if !agent_names.contains(agent) {
+                    return Err(Error::Other(format!(
+                        "trigger `{}` names unknown agent `{agent}`",
+                        trigger.name
+                    )));
+                }
+            } else if self.program.flow_named(&trigger.run).is_none() {
+                return Err(Error::Other(format!(
+                    "trigger `{}` names unknown journey/flow `{}`",
+                    trigger.name, trigger.run
+                )));
+            }
+        }
+
+        for journey in &self.program.journeys {
+            let agent_permissions = match journey.agent.as_deref() {
+                Some(name) => {
+                    let agent = self
+                        .program
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == name)
+                        .ok_or_else(|| {
+                            Error::Other(format!(
+                                "journey `{}` names unknown agent `{name}`",
+                                journey.name
+                            ))
+                        })?;
+                    agent.permissions.as_ref()
+                }
+                None => None,
+            };
+            let effective = effective_capabilities(
+                &available,
+                self.program.permissions.as_ref(),
+                agent_permissions,
+            );
+            validate_body_calls(
+                &journey.flow.body,
+                &format!("journey `{}`", journey.name),
+                &effective,
+                &known,
+                &composites,
+                &mut HashSet::new(),
+            )?;
+        }
+        let app_capabilities =
+            effective_capabilities(&available, self.program.permissions.as_ref(), None);
+        for flow in &self.program.flows {
+            validate_body_calls(
+                &flow.body,
+                &format!("flow `{}`", flow.name.as_deref().unwrap_or("<anonymous>")),
+                &app_capabilities,
+                &known,
+                &composites,
+                &mut HashSet::new(),
+            )?;
+        }
+        for op in &self.program.ops {
+            validate_body_calls(
+                &op.body.body,
+                &format!("composite op `{}`", op.name),
+                &app_capabilities,
+                &known,
+                &composites,
+                &mut HashSet::from([op.name.clone()]),
+            )?;
+        }
+        Ok(())
     }
 
     /// Run every trigger whose `on` label equals `label`, collecting each journey run.
@@ -469,6 +984,49 @@ impl Engine {
         Ok(results)
     }
 
+    async fn journey_runtime_profile(&self, owner: Option<&str>) -> Result<JourneyRuntimeProfile> {
+        let available = self.available_op_names();
+        match owner {
+            Some(name) => {
+                let decl = self
+                    .program
+                    .agents
+                    .iter()
+                    .find(|agent| agent.name == name)
+                    .ok_or_else(|| Error::Other(format!("journey names unknown agent `{name}`")))?;
+                let profile = resolve_agent_runtime_profile(
+                    decl,
+                    self.program.permissions.as_ref(),
+                    self.provider.clone(),
+                    self.registry.clone(),
+                    &available,
+                    &self.default_model,
+                    self.system.clone(),
+                    &self.host_permissions,
+                )
+                .await?;
+                let model = flux_core::canonical_model_spec(
+                    self.provider.as_ref().map(|provider| provider.name()),
+                    &profile.spec.model,
+                );
+                Ok(JourneyRuntimeProfile {
+                    registry: narrowed_registry(&profile.registry, &profile.capabilities),
+                    capabilities: profile.capabilities,
+                    model,
+                })
+            }
+            None => {
+                let capabilities =
+                    effective_capabilities(&available, self.program.permissions.as_ref(), None);
+                Ok(JourneyRuntimeProfile {
+                    registry: narrowed_registry(&self.registry, &capabilities),
+                    capabilities,
+                    model: self.default_model_spec(),
+                })
+            }
+        }
+    }
+
     /// Execute one named journey to completion, reusing flux-flow's engine path (full envelope).
     async fn run_journey(
         &self,
@@ -476,11 +1034,24 @@ impl Engine {
         payload: &Value,
         sink: &mut dyn AgentSink,
     ) -> Result<JourneyRun> {
-        let mut ast = self
+        let (mut ast, owner) = match self
             .program
-            .flow_named(name)
-            .cloned()
-            .ok_or_else(|| Error::Other(format!("unknown journey `{name}`")))?;
+            .journeys
+            .iter()
+            .find(|journey| journey.name == name)
+        {
+            Some(journey) => (journey.flow.clone(), journey.agent.clone()),
+            None => (
+                self.program
+                    .flows
+                    .iter()
+                    .find(|flow| flow.name.as_deref() == Some(name))
+                    .cloned()
+                    .ok_or_else(|| Error::Other(format!("unknown journey `{name}`")))?,
+                None,
+            ),
+        };
+        let profile = self.journey_runtime_profile(owner.as_deref()).await?;
         // Lower top-level `ask` calls onto the suspension seam (ask + await) — see `crate::park`.
         ast.body = park::rewrite_asks(std::mem::take(&mut ast.body));
 
@@ -499,7 +1070,9 @@ impl Engine {
         let session_id = format!("{name}#{}", self.runs.fetch_add(1, Ordering::SeqCst));
         seed_payload(&store, &session_id, payload)?;
         let executor = build_executor(
-            self.registry.clone(),
+            profile.registry.clone(),
+            &profile.capabilities,
+            &self.host_permissions,
             self.auto_approve,
             self.spawner.clone(),
             self.system.clone(),
@@ -536,7 +1109,7 @@ impl Engine {
         }
         .map_err(other)?;
         let usage = capture.usage;
-        let model = self.default_model_spec();
+        let model = profile.model;
 
         if let Some(parked) = self.park_if_asked(
             name,
@@ -681,8 +1254,17 @@ impl Engine {
                 "parked ask for journey `{journey}` has no persisted suspension"
             )));
         };
+        let owner = self
+            .program
+            .journeys
+            .iter()
+            .find(|decl| decl.name == journey)
+            .and_then(|decl| decl.agent.as_deref());
+        let profile = self.journey_runtime_profile(owner).await?;
         let executor = build_executor(
-            self.registry.clone(),
+            profile.registry.clone(),
+            &profile.capabilities,
+            &self.host_permissions,
             self.auto_approve,
             self.spawner.clone(),
             self.system.clone(),
@@ -726,7 +1308,7 @@ impl Engine {
         }
         .map_err(other)?;
         let usage = capture.usage;
-        let model = self.default_model_spec();
+        let model = profile.model;
 
         if let Some(parked) = self.park_if_asked(
             &journey,
@@ -773,11 +1355,14 @@ impl Engine {
         let engine = Arc::new(
             build_agent_engine(
                 decl,
+                self.program.permissions.as_ref(),
                 provider,
                 self.registry.clone(),
                 self.events.clone(),
                 &self.default_model,
                 self.redactor.clone(),
+                self.system.clone(),
+                &self.host_permissions,
             )
             .await?,
         );
@@ -864,13 +1449,16 @@ impl JourneyHost for Engine {
 /// pre-allowed (they run without prompting); anything else (`bash`, `write`, `git_*`, …) falls to a
 /// [`DenyApprover`] and is **denied** — there is no human at a prompt, so destructive ops in an
 /// untrusted program cannot execute. `auto_approve = true` (the CLI's `--yes`) swaps in an
-/// [`AllowApprover`] for trusted, pre-authored programs.
+/// [`AllowApprover`] for trusted, pre-authored programs, but cannot restore an operation removed by
+/// a declared app/agent ceiling.
 ///
 /// `spawner`, when [`App::with_sub_agents`] wired one, is installed on the returned executor's
 /// [`ToolContext`] so a `task` call inside the journey (or a composite op it calls) can delegate —
 /// the same seam [`ToolContext::with_spawner`] provides everywhere else.
 fn build_executor(
     registry: ToolRegistry,
+    capabilities: &EffectiveCapabilities,
+    host_permissions: &HostPermissionRules,
     auto_approve: bool,
     spawner: Option<Arc<dyn Spawner>>,
     system: Arc<System>,
@@ -880,13 +1468,18 @@ fn build_executor(
     if let Some(spawner) = spawner {
         ctx = ctx.with_spawner(spawner);
     }
-    let allow: Vec<String> = [
-        "emit", "send", "ask", "spawn", "read", "glob", "grep", "search",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    let perms = PermissionManager::from_rules(&allow, &[]);
+    let mut allow: Vec<String> = if capabilities.declared {
+        capabilities.grants.clone()
+    } else {
+        LEGACY_JOURNEY_ALLOW
+            .iter()
+            .map(|name| (*name).into())
+            .collect()
+    };
+    allow.extend(host_permissions.allow.iter().cloned());
+    let mut deny = capabilities.deny.clone();
+    deny.extend(host_permissions.deny.iter().cloned());
+    let perms = PermissionManager::from_rules(&allow, &deny);
     let approver: Arc<dyn Approver> = if auto_approve {
         Arc::new(AllowApprover)
     } else {
@@ -895,9 +1488,9 @@ fn build_executor(
     Ok(Executor::new(registry, perms, approver, ctx))
 }
 
-/// Map a program-level [`AgentDecl`] to an [`AgentSpec`]. Its declared `tools` become **both** the visible
-/// op subset *and* the pre-allow grants (`permissions.allow`), so under a [`DenyApprover`] only granted ops
-/// run and everything else is denied — declared grants without a blanket `--yes`. The persona is the
+/// Map a program-level [`AgentDecl`] to an [`AgentSpec`]. Without source-declared permissions its
+/// `tools` retain the legacy dual role of visible subset + grants; the shared runtime-profile resolver
+/// later intersects them with any app/agent ceiling. The persona is the
 /// `description` (or a `settings.system_prompt` string), followed by the contents of any
 /// `settings.system_prompt_files` paths — read through the guarded, workspace-confined `system` so a
 /// declarative bot can keep a long persona in `bot/PERSONA.md` instead of inlining it (flux D-11). A
@@ -1152,21 +1745,30 @@ fn scope_datasource_tools(registry: &mut ToolRegistry, allowed: &[String]) {
 /// Assemble an agent-target [`FlowEngine`] from a declaration: a guarded [`System`] rooted at the cwd, the
 /// host's op registry (subset to the agent's tools), the spec's grants, and a headless [`DenyApprover`] —
 /// so the agent runs only its granted ops with no human at a prompt.
+#[allow(clippy::too_many_arguments)]
 async fn build_agent_engine(
     decl: &AgentDecl,
+    app_permissions: Option<&PermissionDecl>,
     provider: Arc<dyn Provider>,
-    mut registry: ToolRegistry,
+    registry: ToolRegistry,
     events: Arc<EventStore>,
     default_model: &str,
     redactor: Redactor,
+    system: Arc<System>,
+    host_permissions: &HostPermissionRules,
 ) -> Result<FlowEngine> {
-    let root = std::env::current_dir().map_err(other)?;
-    let workspace = Workspace::from_env(&root).map_err(other)?;
-    let system = Arc::new(guarded_system(workspace));
-    // Build the spec (which may read persona files through the guarded `system`) before moving the
-    // `system` into the tool context.
-    let spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
-    scope_datasource_tools(&mut registry, &decl.datasources);
+    let available = registry.names();
+    let profile = resolve_agent_runtime_profile(
+        decl,
+        app_permissions,
+        Some(provider.clone()),
+        registry,
+        &available,
+        default_model,
+        system.clone(),
+        host_permissions,
+    )
+    .await?;
     let ctx = ToolContext::new(system).with_redactor(redactor);
     let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
     // The agent loop's planner reads the turn's conversation via the FlowStore (`store.conversation()`),
@@ -1175,7 +1777,9 @@ async fn build_agent_engine(
     // the planner sees no conversation, so the model only ever gets the system prompt (never the user's
     // message). This is what makes an `agent`-bound trigger actually answer the inbound mention.
     let flow = FlowStore::in_memory_with_events(events.clone()).map_err(other)?;
-    spec.assemble(provider, registry, approver, ctx, events, flow)
+    profile
+        .spec
+        .assemble(provider, profile.registry, approver, ctx, events, flow)
         .map_err(other)
 }
 
@@ -1495,7 +2099,22 @@ trigger t1
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(LeakyTool));
         let system = Arc::new(System::new(Workspace::new(".").unwrap()));
-        let executor = build_executor(registry, false, None, system, redactor).unwrap();
+        let capabilities = EffectiveCapabilities {
+            declared: false,
+            allow: Vec::new(),
+            grants: Vec::new(),
+            deny: Vec::new(),
+        };
+        let executor = build_executor(
+            registry,
+            &capabilities,
+            &HostPermissionRules::default(),
+            false,
+            None,
+            system,
+            redactor,
+        )
+        .unwrap();
         let r = executor.dispatch("search", json!({})).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(
@@ -1548,6 +2167,7 @@ journey pong
             tools: vec!["search".into(), "now".into()],
             datasources: vec!["handbook".into()],
             description: Some("be terse".into()),
+            permissions: None,
             settings: Value::Null,
         };
         let system = System::new(Workspace::new(".").unwrap());
@@ -1625,6 +2245,7 @@ journey pong
             tools: vec!["search".into(), "sources".into()],
             datasources: vec!["handbook".into()],
             description: Some("answer from docs".into()),
+            permissions: None,
             settings: Value::Null,
         };
         let mut registry = ToolRegistry::new();
@@ -1632,11 +2253,14 @@ journey pong
         registry.register(Arc::new(EchoSources));
         let engine = build_agent_engine(
             &decl,
+            None,
             Arc::new(ReplyProvider { reply: "ok".into() }),
             registry,
             Arc::new(EventStore::in_memory().unwrap()),
             "mock",
             Redactor::new(),
+            Arc::new(System::new(Workspace::new(".").unwrap())),
+            &HostPermissionRules::default(),
         )
         .await
         .unwrap();
@@ -1687,6 +2311,7 @@ journey pong
             tools: vec![],
             datasources: vec![],
             description: Some("be terse".into()),
+            permissions: None,
             settings: Value::Null,
         };
 
@@ -1731,6 +2356,7 @@ journey pong
             tools: vec![],
             datasources: vec![],
             description: Some("be terse".into()),
+            permissions: None,
             settings: json!({
                 "context": [
                     { "id": "hours", "title": "Opening hours", "body": "Mon–Fri 09:00–18:00 CET." }
@@ -1780,6 +2406,7 @@ journey pong
             tools: vec![],
             datasources: vec![],
             description: Some("be terse".into()),
+            permissions: None,
             settings: json!({ "system_prompt_files": ["persona.md"] }),
         };
         let system = System::new(Workspace::new(&dir).unwrap());

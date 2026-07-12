@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use flux_cognition::CognitionPack;
 use flux_core::{Chunk, StopReason};
 use flux_provider::{ChunkStream, NullProvider, Provider, Request};
-use flux_runtime::ToolRegistry;
+use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -70,6 +70,39 @@ fn test_dir(label: &str) -> PathBuf {
 /// flow is authored (not planner-compiled), so this provider is called exactly once by `ai.reason`.
 struct PromptCapture {
     prompts: Arc<Mutex<Vec<String>>>,
+}
+
+struct TutorialSearch {
+    calls: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl Tool for TutorialSearch {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec::read_only(
+            "search",
+            "search the Northstar handbook",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "source": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        params: serde_json::Value,
+    ) -> flux_core::Result<ToolResult> {
+        self.calls.lock().unwrap().push(params);
+        Ok(ToolResult::ok(
+            "Offline edits synchronize automatically when a device reconnects. Support is available Monday through Friday, 09:00–17:00 Central European Time.",
+        ))
+    }
 }
 
 #[async_trait]
@@ -201,6 +234,7 @@ fn public_config_examples_deserialize_and_have_effect() {
 fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
     let docs_root = repo_path("website/docs");
     let declarations = [
+        "permissions",
         "agent ",
         "channel ",
         "datasource ",
@@ -331,8 +365,8 @@ fn tutorial_app_declares_forced_scoped_retrieval() {
     let lesson = read("website/docs/tutorial/first-app.md");
     let source = fenced_blocks(&lesson, "flux")
         .into_iter()
-        .next()
-        .expect("tutorial app fence");
+        .find(|block| block.contains("journey answer-question"))
+        .expect("deterministic tutorial app fence");
     let flux_lang::program::Module::Program(program) =
         flux_lang::parse::parse_program(source).expect("parse tutorial app")
     else {
@@ -345,9 +379,79 @@ fn tutorial_app_declares_forced_scoped_retrieval() {
         .expect("guide agent");
     assert_eq!(guide.tools, ["search"]);
     assert_eq!(guide.datasources, ["handbook"]);
-    let description = guide.description.as_deref().unwrap_or_default();
-    assert!(description.contains("every question"));
-    assert!(description.contains("call search"));
+    let app_permissions = program.permissions.as_ref().expect("app permissions");
+    assert_eq!(
+        app_permissions.allow.as_deref(),
+        Some(&["search".into(), "ai.reason".into(), "send".into()][..])
+    );
+    let journey = program
+        .journeys
+        .iter()
+        .find(|journey| journey.name == "answer-question")
+        .expect("answer journey");
+    assert_eq!(journey.agent.as_deref(), Some("guide"));
+    let mut calls = Vec::new();
+    flux_lang::analyze::for_each_node(&journey.flow.body, &mut |node| {
+        if let flux_lang::ast::Node::Call { op, .. } = node {
+            calls.push(op.clone());
+        }
+    });
+    assert_eq!(calls, ["search", "ai.reason", "send"]);
+    let trigger = program
+        .triggers
+        .iter()
+        .find(|trigger| trigger.name == "questions")
+        .expect("questions trigger");
+    assert_eq!(trigger.run, "answer-question");
+    assert_eq!(trigger.agent, None, "the trigger runs the authored journey");
+}
+
+#[tokio::test]
+async fn tutorial_owned_journey_searches_before_every_reasoning_call() {
+    let lesson = read("website/docs/tutorial/first-app.md");
+    let source = fenced_blocks(&lesson, "flux")
+        .into_iter()
+        .find(|block| block.contains("journey answer-question"))
+        .expect("deterministic tutorial app fence");
+    let flux_lang::program::Module::Program(program) =
+        flux_lang::parse::parse_program(source).expect("parse tutorial app")
+    else {
+        panic!("tutorial app fence must be a Program")
+    };
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let searches = Arc::new(Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(PromptCapture {
+        prompts: prompts.clone(),
+    });
+    let search: Arc<dyn Tool> = Arc::new(TutorialSearch {
+        calls: searches.clone(),
+    });
+    let app = flux_app::App::try_with_tools(program, Some(provider), "mock", false, vec![search])
+        .expect("validated tutorial app");
+
+    for question in [
+        "What happens to my edits if I work offline?",
+        "What are the support hours and timezone?",
+    ] {
+        app.deliver("user_input", serde_json::json!({"text": question}))
+            .await
+            .expect("answer journey");
+    }
+
+    let searches = searches.lock().unwrap();
+    assert_eq!(searches.len(), 2, "one mandatory search per question");
+    assert!(searches.iter().all(|call| call["source"] == "handbook"));
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2, "one reasoning call per searched question");
+    assert!(prompts.iter().all(|prompt| {
+        prompt.contains("Offline edits synchronize automatically")
+            && prompt.contains("09:00–17:00 Central European Time")
+    }));
+    assert_eq!(
+        app.bus().sent().len(),
+        2,
+        "one terminal answer per question"
+    );
 }
 
 /// The earlier manual E2E needed SIGTERM only when `flux` was nested under a PTY-recording process.
@@ -372,8 +476,8 @@ fn tutorial_app_exits_cleanly_on_direct_sigint() {
     let lesson = read("website/docs/tutorial/first-app.md");
     let app_source = fenced_blocks(&lesson, "flux")
         .into_iter()
-        .next()
-        .expect("tutorial app fence");
+        .find(|block| block.contains("journey answer-question"))
+        .expect("deterministic tutorial app fence");
     fs::write(root.join("assistant.flux"), app_source).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_flux"))

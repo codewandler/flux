@@ -2,8 +2,14 @@
 //! the trigger → journey → execution path runs, that the orchestration ops are functional, and that
 //! the bundled `examples/hello.flux` stays valid.
 
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 use flux_app::App;
+use flux_core::{Chunk, StopReason};
 use flux_lang::program::{Module, Program};
+use flux_provider::{ChunkStream, Provider, Request};
+use flux_runtime::{Tool, ToolContext, ToolResult};
 use serde_json::json;
 
 /// Parse a program source string, panicking with context if it isn't a program.
@@ -11,6 +17,316 @@ fn program(src: &str) -> Program {
     match Module::parse_str(src).expect("parse program") {
         Module::Program(p) => p,
         Module::Flow(_) => panic!("expected a program, got a bare flow"),
+    }
+}
+
+#[derive(Default)]
+struct OwnedJourneyTrace {
+    searches: Vec<serde_json::Value>,
+    requests: Vec<Request>,
+}
+
+struct RecordingSearch(Arc<Mutex<OwnedJourneyTrace>>);
+
+#[async_trait]
+impl Tool for RecordingSearch {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec::read_only(
+            "search",
+            "search the tutorial handbook",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "source": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        params: serde_json::Value,
+    ) -> flux_core::Result<ToolResult> {
+        self.0.lock().unwrap().searches.push(params);
+        Ok(ToolResult::ok(
+            "Offline edits synchronize automatically when a device reconnects.",
+        ))
+    }
+}
+
+struct RecordingProvider(Arc<Mutex<OwnedJourneyTrace>>);
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    fn name(&self) -> &str {
+        "capture"
+    }
+
+    async fn stream(&self, req: Request) -> flux_core::Result<ChunkStream> {
+        self.0.lock().unwrap().requests.push(req);
+        Ok(Box::pin(futures::stream::iter([
+            Ok(Chunk::TextDelta(
+                "Offline edits sync after the device reconnects.".into(),
+            )),
+            Ok(Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            }),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn owned_journey_inherits_model_persona_datasource_and_capabilities() {
+    let src = r#"permissions
+  allow [search, "ai.reason", send]
+  deny [write, bash]
+
+agent guide
+  model "owned-model"
+  tools [search]
+  datasources [handbook]
+  allow [search, "ai.reason", send]
+  description "Answer only from the Northstar handbook."
+
+channel cli
+
+datasource handbook
+  kind "markdown"
+  path "./docs"
+
+trigger questions
+  on "user_input"
+  run answer-question
+
+journey answer-question
+  agent guide
+  flow
+    $hits = search({"query": "{text}"})
+    $answer = ai.reason({"ask": "Question: {text}\nHandbook results: {hits}"})
+    send({"channel": "cli", "message": "{answer}"})
+    return ""
+"#;
+    let trace = Arc::new(Mutex::new(OwnedJourneyTrace::default()));
+    let provider: Arc<dyn Provider> = Arc::new(RecordingProvider(trace.clone()));
+    let search: Arc<dyn Tool> = Arc::new(RecordingSearch(trace.clone()));
+    let app = App::try_with_tools(
+        program(src),
+        Some(provider),
+        "host-model",
+        false,
+        vec![search],
+    )
+    .expect("valid app");
+
+    app.deliver(
+        "user_input",
+        json!({"text": "What happens to offline edits?"}),
+    )
+    .await
+    .expect("journey");
+
+    let trace = trace.lock().unwrap();
+    assert_eq!(
+        trace.searches.len(),
+        1,
+        "retrieval is structurally mandatory"
+    );
+    assert_eq!(trace.searches[0]["source"], "handbook");
+    assert_eq!(trace.requests.len(), 1, "one authored cognition boundary");
+    assert_eq!(trace.requests[0].model, "owned-model");
+    let system = trace.requests[0]
+        .system_text()
+        .expect("cognition system prompt");
+    assert!(system.contains("Answer only from the Northstar handbook."));
+    assert!(system.contains("careful reasoning engine"));
+    assert_eq!(
+        app.bus().sent()[0].message,
+        "Offline edits sync after the device reconnects."
+    );
+}
+
+#[tokio::test]
+async fn app_capability_ceiling_is_absolute_under_auto_approve() {
+    let src = r#"permissions
+  allow [send]
+
+trigger t
+  on "startup"
+  run forbidden
+
+journey forbidden
+  flow
+    return now()
+"#;
+    let app = App::with_options(program(src), None, "mock", true);
+    let err = app
+        .deliver("startup", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("now"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn deny_only_policy_preserves_legacy_grants_until_auto_approved() {
+    let src = r#"permissions
+  deny [bash]
+
+trigger t
+  on "startup"
+  run clock
+
+journey clock
+  flow
+    return now()
+"#;
+    let denied = App::with_options(program(src), None, "mock", false)
+        .deliver("startup", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(denied.contains("now"), "unexpected error: {denied}");
+
+    let approved = App::with_options(program(src), None, "mock", true)
+        .deliver("startup", json!({}))
+        .await
+        .expect("now remains inside the deny-only ceiling");
+    assert!(!approved[0].result.is_empty());
+}
+
+#[tokio::test]
+async fn host_permission_rules_apply_inside_but_never_widen_source_ceiling() {
+    let app = App::try_with_events_and_permissions(
+        program(
+            r#"permissions
+  allow [now]
+
+trigger t
+  on "startup"
+  run clock
+
+journey clock
+  flow
+    return now()
+"#,
+        ),
+        None,
+        "mock",
+        true,
+        Vec::new(),
+        None,
+        flux_secret::Redactor::new(),
+        Arc::new(flux_events::EventStore::in_memory().unwrap()),
+        flux_app::HostPermissionRules {
+            allow: vec!["now".into()],
+            deny: vec!["now".into()],
+        },
+    )
+    .expect("valid app");
+    let denied = app
+        .deliver("startup", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(denied.contains("now"), "local deny did not win: {denied}");
+
+    let widened = App::try_with_events_and_permissions(
+        program(
+            r#"permissions
+  allow [send]
+
+journey clock
+  flow
+    return now()
+"#,
+        ),
+        None,
+        "mock",
+        false,
+        Vec::new(),
+        None,
+        flux_secret::Redactor::new(),
+        Arc::new(flux_events::EventStore::in_memory().unwrap()),
+        flux_app::HostPermissionRules {
+            allow: vec!["now".into()],
+            deny: Vec::new(),
+        },
+    )
+    .err()
+    .expect("local allow must not widen app source")
+    .to_string();
+    assert!(
+        widened.contains("now") && widened.contains("ceiling"),
+        "{widened}"
+    );
+}
+
+#[test]
+fn fallible_app_construction_rejects_invalid_ownership_and_capabilities() {
+    let unknown_owner = r#"journey answer
+  agent missing
+  flow
+    return ""
+"#;
+    let err = App::try_new(program(unknown_owner), None, "mock")
+        .err()
+        .expect("invalid app")
+        .to_string();
+    assert!(err.contains("answer") && err.contains("missing"), "{err}");
+
+    let outside_ceiling = r#"permissions
+  allow [send]
+
+journey answer
+  flow
+    return now()
+"#;
+    let err = App::try_new(program(outside_ceiling), None, "mock")
+        .err()
+        .expect("invalid app")
+        .to_string();
+    assert!(err.contains("answer") && err.contains("now"), "{err}");
+}
+
+#[test]
+fn startup_validation_covers_tools_datasources_nested_calls_and_composites() {
+    for (label, src, needles) in [
+        (
+            "datasource",
+            "agent guide\n  tools []\n  datasources [missing]\n",
+            &["guide", "missing"][..],
+        ),
+        (
+            "tool",
+            "agent guide\n  tools [not_registered]\n",
+            &["guide", "not_registered"][..],
+        ),
+        (
+            "permission",
+            "permissions\n  allow [not_registered]\n",
+            &["permissions", "not_registered"][..],
+        ),
+        (
+            "nested call",
+            "permissions\n  allow [send]\n\njourney nested\n  flow\n    when true\n      now()\n",
+            &["nested", "now"][..],
+        ),
+        (
+            "composite",
+            "permissions\n  allow [wrapper]\n\nop wrapper()\n  now()\n\njourney answer\n  flow\n    return wrapper()\n",
+            &["wrapper", "now"][..],
+        ),
+    ] {
+        let err = App::try_new(program(src), None, "mock")
+            .err()
+            .unwrap_or_else(|| panic!("{label} should fail validation"))
+            .to_string();
+        for needle in needles {
+            assert!(err.contains(needle), "{label} error omitted `{needle}`: {err}");
+        }
     }
 }
 

@@ -254,6 +254,7 @@ struct CognitionOp {
     kind: OpKind,
     provider: Arc<dyn Provider>,
     model: String,
+    system_prefix: Option<String>,
 }
 
 #[async_trait]
@@ -270,13 +271,14 @@ impl Tool for CognitionOp {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let prompt = self.kind.prompt(&params)?;
-        let (out, usage) = run_model(
-            self.provider.as_ref(),
-            &self.model,
-            self.kind.system(),
-            &prompt,
-        )
-        .await?;
+        let system = match self.system_prefix.as_deref() {
+            Some(prefix) if !prefix.trim().is_empty() => format!(
+                "{prefix}\n\nOperation contract (follow this for the current call):\n{}",
+                self.kind.system()
+            ),
+            _ => self.kind.system().to_string(),
+        };
+        let (out, usage) = run_model(self.provider.as_ref(), &self.model, &system, &prompt).await?;
         // A cognition op is a real model call, but its token spend can't ride back through
         // `ToolResult` (a plain string). Record it on the shared evidence log — the same side-channel
         // `subagent.usage` uses — so a `FlowClient` run can sum what its cognition ops cost
@@ -302,6 +304,7 @@ impl Tool for CognitionOp {
 pub struct CognitionPack {
     provider: Arc<dyn Provider>,
     model: String,
+    system_prefix: Option<String>,
 }
 
 impl CognitionPack {
@@ -310,7 +313,20 @@ impl CognitionPack {
         Self {
             provider,
             model: model.into(),
+            system_prefix: None,
         }
+    }
+
+    /// Prefix every cognition op's operation-specific system contract with an owning agent's
+    /// persona. The operation contract remains last so JSON/text shape requirements stay explicit.
+    pub fn with_system_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.system_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Stable operation names installed by this pack.
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        OpKind::ALL.into_iter().map(OpKind::name)
     }
 
     /// Register every cognition op (`ai.extract`, `ai.rank`, `ai.judge`, `ai.reason`, `synth`,
@@ -321,6 +337,7 @@ impl CognitionPack {
                 kind,
                 provider: self.provider.clone(),
                 model: self.model.clone(),
+                system_prefix: self.system_prefix.clone(),
             }));
         }
     }

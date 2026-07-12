@@ -77,7 +77,7 @@ caching / dead-step elimination the optimizer targets.
 | `analyze` | validate a flow against an `OpCatalog`; `lower` → typed HIR (effects + arity + arg type-checking) |
 | `optimize` | the read-parallelizing optimizer → `PhysicalPlan` (run by `runtime::execute_plan`) |
 | `parse` / `format` | the round-trippable `.flux` **text syntax** (`parse(format(ast)) == ast`) |
-| `program` | the multi-agent `Program` layer (agents/channels/triggers/journeys) + module loader |
+| `program` | the multi-agent `Program` layer (capabilities/agents/channels/triggers/owned journeys) + module loader |
 | `effects` | lower semantic `FlowEffect`s onto host effects + policy actions |
 | `render` | render an AST as a human-readable (one-way) execution tree |
 | `schema` | the single source of truth: the AST's JSON Schema + the node-kind catalog |

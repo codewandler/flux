@@ -79,4 +79,4 @@ type, flux rejects the invocation before the flow runs.
 You now have a reusable typed workflow. The final lesson will keep the same handbook but replace the
 one-shot command with a long-running application that receives questions as events.
 
-Continue to [Build a local docs assistant](./first-app.md).
+Continue to [Make the docs assistant reliable](./first-app.md).

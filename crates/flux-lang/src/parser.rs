@@ -322,7 +322,7 @@ impl<'s> Parser<'s> {
     fn at_decl_kw(&self) -> bool {
         matches!(
             self.cur_text(),
-            "agent" | "channel" | "datasource" | "trigger" | "journey"
+            "permissions" | "agent" | "channel" | "datasource" | "trigger" | "journey"
         )
     }
 

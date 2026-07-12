@@ -6,6 +6,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-66: app-declared capability ceilings and executable journey ownership** (Agent + Language
+  pillars; `docs/designs/owned-journeys.md`). Native programs can declare a top-level exact-op
+  `permissions` ceiling and agent-level `allow`/`deny` narrowing. The runtime subsets the actual
+  registry, so agent/app denies remain absolute under `--yes`; local approval can never restore a
+  removed capability. `journey … agent <name>` now inherits that agent's model, persona, datasource
+  wrappers, and permissions while retaining an authored graph. The CLI validates owners, trigger
+  targets, datasources, tools, permission names, nested calls, and transitive composite calls before
+  starting channels. Failing-first and contract tests:
+  `program_permissions_and_agent_narrowing_parse`,
+  `owned_journey_inherits_model_persona_datasource_and_capabilities`,
+  `app_capability_ceiling_is_absolute_under_auto_approve`,
+  `host_permission_rules_apply_inside_but_never_widen_source_ceiling`,
+  `startup_validation_covers_tools_datasources_nested_calls_and_composites`, and
+  `tutorial_owned_journey_searches_before_every_reasoning_call`.
+- **The beginner app lesson now turns retrieval unreliability into the Flux-Lang “aha”.** Part A
+  intentionally leaves handbook search to an agent and explains why even a correct answer is not a
+  control-flow guarantee. Part B refactors the same questions into an owned
+  `search → context → ai.reason → send` journey, explains flow versus journey, and declares the
+  exact headless capabilities in app source.
+
+### Changed
+
+- **BREAKING (Rust API):** `flux_lang::program::Program` and `AgentDecl` gain typed optional
+  permission fields. Downstream exhaustive struct literals must add `permissions: None` or use
+  `..Default::default()`. Serde inputs remain compatible because both fields default to absent.
+
 ### Fixed
 
 - **The beginner tutorial now works as written end-to-end** (Agent + Language pillars;

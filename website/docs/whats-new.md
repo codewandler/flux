@@ -12,6 +12,28 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Apps can declare their own hard capability boundary.** Put exact operation names in a top-level
+  `permissions` block, then optionally narrow them per agent. An app or agent deny cannot be undone
+  by local auto-approval or `--yes`.
+- **Journeys can execute as an agent without becoming open-ended agent loops.** An owned journey now
+  uses that agent's model, instructions, and datasource boundary while the steps remain the flow you
+  authored. Invalid owners, sources, tools, and disallowed calls fail when the app loads.
+
+### Improved
+
+- **The beginner tutorial now demonstrates why deterministic flows matter.** It first lets the model
+  decide whether to search a handbook, then refactors the same assistant so every answer must pass
+  through scoped retrieval before the model writes it.
+
+### Action needed
+
+- **Rust code constructing Flux-Lang programs directly may need one small update.** `Program` and
+  `AgentDecl` have a new optional permissions field; exhaustive struct literals should set it to
+  `None` or finish with `..Default::default()`. Existing `.flux` files and serialized programs remain
+  compatible.
+
 ### Fixed
 
 - **The beginner tutorial now completes reliably.** Context packs pass the selected handbook text

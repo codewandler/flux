@@ -87,11 +87,16 @@ The complete discovery, precedence, CLI-input, and `op.register` scope rules liv
 
 ## Program declarations
 
-Beyond flows and ops, a module may declare a whole multi-agent application: `agent`,
-`channel`, `datasource`, `trigger`, and `journey` declarations describe agents, the channels
-they listen on, the data they index, and the event-triggered journeys that tie them together —
-one typed `.flux` file for the entire app. Secrets are declared as references
+Beyond flows and ops, a module may declare a whole multi-agent application: `permissions`, `agent`,
+`channel`, `datasource`, `trigger`, and `journey` declarations describe the capability ceiling,
+agents, channels, indexed data, and event-triggered journeys that tie them together — one typed
+`.flux` file for the entire app. A journey's optional `agent` attribute makes ownership executable:
+the fixed flow inherits that agent's model, persona, datasource scope, and capability narrowing.
+Secrets are declared as references
 (`secret "ENV_VAR"`) and resolved at load time; values never live in the file.
+
+Top-level and agent `allow`/`deny` lists contain exact operation names. The app list is the ceiling;
+an agent list may narrow but never widen it. `tools` remains the separate model-visible catalog.
 
 Programs are run by the app host:
 

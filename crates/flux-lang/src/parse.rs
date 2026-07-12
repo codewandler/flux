@@ -32,7 +32,7 @@ use crate::ast::{DraftAst, FlowEffect, Node, Param, SymbolName, TypeRef};
 use crate::error::{FlowError, Result};
 use crate::program::{
     AgentDecl, ChannelDecl, CompositeLimits, CompositeOpDecl, CompositeOpMeta, DatasourceDecl,
-    JourneyDecl, Module, Program, TriggerDecl,
+    JourneyDecl, Module, PermissionDecl, Program, TriggerDecl,
 };
 use flux_spec::{Effect, Idempotency, Risk};
 use std::collections::BTreeMap;
@@ -125,8 +125,8 @@ fn is_flow_header(t: &str) -> bool {
 }
 
 /// Parse a `.flux` **module** from native flux-lang text: a multi-agent [`Program`] — any of the
-/// `agent`/`channel`/`datasource`/`trigger`/`journey` declarations plus top-level `flow`s — or, when the
-/// file is a lone `flow`, a bare [`Module::Flow`]. The backend of
+/// `permissions`/`agent`/`channel`/`datasource`/`trigger`/`journey` declarations plus top-level
+/// `flow`s — or, when the file is a lone `flow`, a bare [`Module::Flow`]. The backend of
 /// [`crate::program::Module::parse_str`]; module declarations are pure data (the L6 hosts give them
 /// runtime meaning), so this adds **no** new node kinds.
 pub fn parse_program(src: &str) -> Result<Module> {
@@ -146,6 +146,7 @@ pub(crate) fn parse_program_text(src: &str) -> Result<Module> {
     }
     let mut program = Program::default();
     let mut saw_module_decl = false;
+    let mut saw_permissions = false;
     let mut i = 0;
     while i < lines.len() {
         let line = &lines[i];
@@ -159,7 +160,23 @@ pub(crate) fn parse_program_text(src: &str) -> Result<Module> {
         let region = child_region(&lines[i..], 0);
         let consumed = 1 + region.len();
 
-        if let Some(rest) = kw(header, "agent") {
+        if let Some(rest) = kw(header, "permissions") {
+            if !rest.trim().is_empty() {
+                return Err(perr_at(
+                    line.number,
+                    "`permissions` is a singleton declaration and takes no name",
+                ));
+            }
+            if saw_permissions {
+                return Err(perr_at(
+                    line.number,
+                    "a program may declare `permissions` only once",
+                ));
+            }
+            program.permissions = Some(parse_permission_decl(region).map_err(|e| err_at(line, e))?);
+            saw_permissions = true;
+            saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "agent") {
             program
                 .agents
                 .push(parse_agent_decl(rest, region).map_err(|e| err_at(line, e))?);
@@ -199,8 +216,8 @@ pub(crate) fn parse_program_text(src: &str) -> Result<Module> {
             return Err(perr_at(
                 line.number,
                 &format!(
-                    "unknown top-level declaration: `{header}` (expected agent / channel / \
-                     datasource / trigger / journey / op / flow)"
+                    "unknown top-level declaration: `{header}` (expected permissions / agent / \
+                     channel / datasource / trigger / journey / op / flow)"
                 ),
             ));
         }
@@ -377,6 +394,9 @@ fn parse_agent_decl(name_str: &str, region: &[Line]) -> Result<AgentDecl> {
         ..Default::default()
     };
     let mut settings = serde_json::Map::new();
+    let mut allow: Option<Vec<String>> = None;
+    let mut saw_allow = false;
+    let mut deny: Option<Vec<String>> = None;
     for (key, val) in attr_lines(region)? {
         match key.as_str() {
             "model" => decl.model = Some(string_value(val, "model")?),
@@ -385,15 +405,62 @@ fn parse_agent_decl(name_str: &str, region: &[Line]) -> Result<AgentDecl> {
                 decl.datasources = as_string_list(&parse_setting(val)?, "datasources")?
             }
             "description" => decl.description = Some(string_value(val, "description")?),
+            "allow" => {
+                if saw_allow {
+                    return Err(perr("duplicate agent attribute `allow`"));
+                }
+                allow = Some(as_string_list(&parse_setting(val)?, "allow")?);
+                saw_allow = true;
+            }
+            "deny" => {
+                if deny.is_some() {
+                    return Err(perr("duplicate agent attribute `deny`"));
+                }
+                deny = Some(as_string_list(&parse_setting(val)?, "deny")?);
+            }
             _ => {
                 settings.insert(key, parse_setting(val)?);
             }
         }
     }
+    if saw_allow || deny.is_some() {
+        decl.permissions = Some(PermissionDecl {
+            allow,
+            deny: deny.unwrap_or_default(),
+        });
+    }
     if !settings.is_empty() {
         decl.settings = serde_json::Value::Object(settings);
     }
     Ok(decl)
+}
+
+fn parse_permission_decl(region: &[Line]) -> Result<PermissionDecl> {
+    let mut allow: Option<Vec<String>> = None;
+    let mut saw_allow = false;
+    let mut deny: Option<Vec<String>> = None;
+    for (key, val) in attr_lines(region)? {
+        match key.as_str() {
+            "allow" => {
+                if saw_allow {
+                    return Err(perr("duplicate permissions attribute `allow`"));
+                }
+                allow = Some(as_string_list(&parse_setting(val)?, "allow")?);
+                saw_allow = true;
+            }
+            "deny" => {
+                if deny.is_some() {
+                    return Err(perr("duplicate permissions attribute `deny`"));
+                }
+                deny = Some(as_string_list(&parse_setting(val)?, "deny")?);
+            }
+            other => return Err(perr(&format!("unknown permissions attribute `{other}`"))),
+        }
+    }
+    Ok(PermissionDecl {
+        allow,
+        deny: deny.unwrap_or_default(),
+    })
 }
 
 fn parse_channel_decl(name_str: &str, region: &[Line]) -> Result<ChannelDecl> {
@@ -4463,6 +4530,82 @@ journey greet
             matches!(flow.body.last(), Some(Node::Return { .. })),
             "the flow body parsed as native statements"
         );
+    }
+
+    #[test]
+    fn program_permissions_and_agent_narrowing_parse() {
+        let src = r#"permissions
+  allow [search, "ai.reason", send]
+  deny [write, bash]
+
+agent guide
+  tools [search]
+  datasources [handbook]
+  allow [search, "ai.reason", send]
+  deny [bash]
+
+trigger questions
+  on "user_input"
+  run answer
+
+journey answer
+  agent guide
+  flow
+    return ""
+"#;
+        let Module::Program(program) = parse_program(src).expect("parse program") else {
+            panic!("expected program")
+        };
+        let app = program.permissions.expect("top-level permissions");
+        assert_eq!(
+            app.allow.as_deref(),
+            Some(&["search".into(), "ai.reason".into(), "send".into()][..])
+        );
+        assert_eq!(app.deny, ["write", "bash"]);
+        let agent = program.agents.first().expect("guide");
+        let permissions = agent.permissions.as_ref().expect("agent permissions");
+        assert_eq!(
+            permissions.allow.as_deref(),
+            Some(&["search".into(), "ai.reason".into(), "send".into()][..])
+        );
+        assert_eq!(permissions.deny, ["bash"]);
+        assert_eq!(program.journeys[0].agent.as_deref(), Some("guide"));
+    }
+
+    #[test]
+    fn permission_allow_absent_inherits_but_explicit_empty_denies_all() {
+        let Module::Program(inherited) = parse_program("permissions\n  deny [bash]\n").unwrap()
+        else {
+            panic!("program")
+        };
+        assert_eq!(inherited.permissions.unwrap().allow, None);
+
+        let Module::Program(empty) = parse_program("permissions\n  allow []\n").unwrap() else {
+            panic!("program")
+        };
+        assert_eq!(empty.permissions.unwrap().allow, Some(Vec::new()));
+    }
+
+    #[test]
+    fn duplicate_or_unknown_permission_declarations_are_rejected() {
+        for (src, needle) in [
+            ("permissions\n\npermissions\n", "only once"),
+            (
+                "permissions\n  allow [read]\n  allow [search]\n",
+                "duplicate permissions attribute `allow`",
+            ),
+            (
+                "permissions\n  maybe [read]\n",
+                "unknown permissions attribute",
+            ),
+            (
+                "agent guide\n  allow [read]\n  allow [search]\n",
+                "duplicate agent attribute `allow`",
+            ),
+        ] {
+            let err = parse_program(src).unwrap_err().to_string();
+            assert!(err.contains(needle), "`{src}`: {err}");
+        }
     }
 
     #[test]

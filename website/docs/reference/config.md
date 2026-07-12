@@ -86,6 +86,10 @@ actions   = ["workspace.write"]
 otherwise the operation prompts. Entries may be operation names (`read`, `search`) or scoped shell
 subjects such as `Bash(git:*)`. Reads are pre-allowed by the local defaults.
 
+For `flux app run`, these host rules are evaluated **inside** any `permissions` ceiling declared by
+the `.flux` program and its owning agent. A local deny still wins; a local allow can approve a scoped
+invocation but cannot restore an operation the app source removed.
+
 `[[policy.grants]]` adds fine-grained authorization grants to the built-in policy floor. Permission
 rules cannot widen past that floor, and destructive operations always re-fire the approval gate.
 Interactive runs prompt; `--yes` answers every gate “yes,” including destructive ones. See

@@ -84,7 +84,7 @@ read-only output for inspection, not a format you write.
 ## File structure
 
 A `.flux` file is a sequence of one or more named flow definitions (plus, at the module level,
-optional `agent`/`channel`/`datasource`/`trigger`/`journey`/`op` declarations). The `flow` header
+optional `permissions`/`agent`/`channel`/`datasource`/`trigger`/`journey`/`op` declarations). The `flow` header
 is **always required** — even for single-flow files. This keeps the format unambiguous
 for parsers and formatters, and means any `.flux` snippet is valid in a multi-flow file
 without modification. `parse` reads a single flow; `parse_program` reads a whole module
@@ -115,12 +115,28 @@ allowed (blank lines are not required separators).
 ### Module declarations
 
 Module declarations (`agent`/`channel`/`datasource`/`trigger`/`journey`) start at column 0 with the
-keyword and a single-identifier name. Except for `journey` (whose body is an `agent` attribute plus
-an inline `flow` block), a declaration body is a **flat list of `key value` attribute lines**, all
-at one indentation level — no nested blocks. Keys the decl kind knows become typed fields (`agent`:
-`model`/`tools`/`datasources`/`description`; `channel`/`datasource`: `kind`, defaulting to the decl
-name, plus `datasource`'s `path`; `trigger` accepts *only* `on`/`run`/`agent`); every other key is
-collected into the decl's `settings` object.
+keyword and a single-identifier name. The singleton top-level `permissions` declaration takes no
+name. Except for `journey` (whose body is an `agent` attribute plus an inline `flow` block), a
+declaration body is a **flat list of `key value` attribute lines**, all at one indentation level — no
+nested blocks. Keys the decl kind knows become typed fields (`permissions`: `allow`/`deny`; `agent`:
+`model`/`tools`/`datasources`/`description` plus `allow`/`deny`; `channel`/`datasource`: `kind`,
+defaulting to the decl name, plus `datasource`'s `path`; `trigger` accepts *only*
+`on`/`run`/`agent`); every other agent/channel/datasource key is collected into the decl's `settings`
+object.
+
+Capability lists contain exact operation names. A missing `allow` is represented as `None` and
+inherits the parent/default set; an explicit `allow []` is represented as `Some([])` and admits no
+effectful operations at that layer. Dotted operation names must be quoted:
+
+```flux
+permissions
+  allow [search, "ai.reason", send]
+  deny [write, bash]
+
+agent guide
+  tools [search]
+  allow [search, "ai.reason", send]
+```
 
 A setting value is one of: a quoted string, a number, `true`/`false`/`null`, a bare identifier
 (kept as a string), a `[a, b]` list, a `{ k: v }` record (lists and records nest), or a **secret

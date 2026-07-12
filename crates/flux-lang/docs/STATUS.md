@@ -132,7 +132,7 @@ review pass (findings fixed before commit).
 | Needs & gaps — **two pure ops** (`need`/`gaps`, not nodes) | ✅ | `flux-tools/src/cognition.rs` |
 | Cognition op-pack + domain-wrapper convention | ✅ | pure: `flux-tools/src/cognition.rs`; model-backed: `flux-cognition` (L3) |
 | `=`/`do`/`+=` marker syntax | ✅ | `src/parse.rs`/`src/format.rs` (`goal` header tolerated; not in the AST/round-trip) |
-| Multi-agent `Program` layer (agents/channels/triggers/journeys) | ✅ | `flux-lang/src/program.rs` (L0 decls + module loader) |
+| Multi-agent `Program` layer (capabilities/agents/channels/triggers/owned journeys) | ✅ | `flux-lang/src/program.rs` (L0 decls + module loader); app ceiling + agent narrowing and executable journey ownership shipped in A-66 |
 | `flux-app` L6 runtime host — event bus, triggers, journeys, orchestration ops (`emit`/`send`/`spawn`; `ask` MVP), `flux run app.flux` | ✅ | `crates/flux-app/` + `flux-cli` `run_app_cmd`. **Safe default: destructive ops denied** (orchestration + read pre-allowed); `--yes` opts into allow-all |
 | Real `flux-sdk` lifecycle surface (`OpRegistry`/packs/prelude + `FlowClient` + artifact APIs) | ✅ | `flux-sdk/src/flow.rs`; cognition pack wired into the CLI registry too (`flux-cli` `build_agent`) |
 
