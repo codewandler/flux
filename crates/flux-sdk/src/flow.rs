@@ -280,6 +280,24 @@ impl FlowClient {
         self
     }
 
+    /// Load an installed subprocess plugin (feature `plugins`) and register its operations as
+    /// policy-gated tools in this client's catalog. Spawns the plugin over this client's guarded
+    /// `System` with **manifest-scoped** host capabilities (nothing widened), so a flow that calls a
+    /// plugin op (e.g. `gitlab.mr_list`) dispatches through the same authorization → approval →
+    /// guarded-IO envelope as a built-in. The registered tools hold the subprocess connection alive.
+    #[cfg(feature = "plugins")]
+    pub async fn register_plugin(
+        &mut self,
+        name: &str,
+        descriptor: &flux_plugin::PluginDescriptor,
+    ) -> Result<&mut Self> {
+        let tools = crate::plugins::load_tools(&self.system, name, descriptor).await?;
+        for tool in tools {
+            self.registry.register(tool);
+        }
+        Ok(self)
+    }
+
     /// Attach named sub-agents: register the `task` tool into this client's catalog and build the
     /// spawner from `sub_agents` over the client's guarded `System`. After this, a flow that calls
     /// `task(role, …)` delegates to a role's sub-agent through the same safety envelope. The single

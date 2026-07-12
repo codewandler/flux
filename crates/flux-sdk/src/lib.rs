@@ -153,6 +153,47 @@ pub mod providers {
     }
 }
 
+/// **Subprocess plugin tools** (feature `plugins`). Load an installed plugin's operations as
+/// policy-gated tools inside an embedded agent — the same authorization → approval → guarded-IO
+/// envelope, the same approval path. Attach them with
+/// [`ClientBuilder::with_plugin_tools`](ClientBuilder::with_plugin_tools) (conversational door) or
+/// [`FlowClient::register_plugin`](flow::FlowClient::register_plugin) (flow door), or load them
+/// yourself with [`load_tools`](plugins::load_tools).
+///
+/// **Trust boundary:** plugin binaries are *trusted dependencies* — native code the host spawns as
+/// a subprocess, not OS-sandboxed. Their host capabilities are still manifest-scoped
+/// ([`SystemHostCaps`](plugins::SystemHostCaps) defaults — a plugin may only run programs / read
+/// secrets / reach hosts its manifest declares), but the process itself runs your machine's code.
+/// Install only plugins you trust.
+#[cfg(feature = "plugins")]
+pub mod plugins {
+    pub use flux_plugin::{HostCapabilities, PluginDescriptor, PluginManifest, SystemHostCaps};
+
+    use std::sync::Arc;
+
+    use flux_core::Result;
+    use flux_runtime::Tool;
+    use flux_system::System;
+
+    /// Spawn the plugin described by `descriptor` (verified against its pin), fetch its manifest, and
+    /// project every operation as a policy-gated [`Tool`]. Host capabilities are **manifest-scoped**
+    /// ([`SystemHostCaps`] defaults over `system` — nothing widened). Register the returned tools
+    /// into a client's catalog (they hold the subprocess connection alive); each dispatches through
+    /// the one safety envelope, just like a built-in.
+    pub async fn load_tools(
+        system: &Arc<System>,
+        name: &str,
+        descriptor: &PluginDescriptor,
+    ) -> Result<Vec<Arc<dyn Tool>>> {
+        let caps_system = system.clone();
+        let loaded = flux_plugin::load_plugin_tools(system, name, descriptor, move |m| {
+            Arc::new(SystemHostCaps::new(caps_system).with_manifest(m)) as Arc<dyn HostCapabilities>
+        })
+        .await?;
+        Ok(loaded.tools)
+    }
+}
+
 /// **Sub-agents.** Attach named roles to a conversational client with
 /// [`ClientBuilder::with_sub_agents`] (or to a flow client with
 /// [`FlowClient::with_sub_agents`](flow::FlowClient::with_sub_agents)); a turn whose plan calls
@@ -322,6 +363,20 @@ impl ClientBuilder {
     /// used across flux). Same envelope rules as [`register_op`](Self::register_op).
     pub fn register_pack<F: FnOnce(&mut ToolRegistry) + 'static>(mut self, pack: F) -> Self {
         self.packs.push(Box::new(pack));
+        self
+    }
+    /// Attach a subprocess plugin's operations (feature `plugins`) as policy-gated tools. Load them
+    /// first with [`plugins::load_tools`] over a guarded [`System`] — plugin ops carry their own host
+    /// connection, so they dispatch through the safety envelope like any [`register_op`](Self::register_op)
+    /// tool (a subset via [`tools`](Self::tools) re-admits them). A `tools`-subset build keeps them.
+    ///
+    /// ```ignore
+    /// let tools = flux_sdk::plugins::load_tools(&system, "gitlab", &descriptor).await?;
+    /// let client = flux_sdk::Client::builder().with_plugin_tools(tools).build(provider, ".")?;
+    /// ```
+    #[cfg(feature = "plugins")]
+    pub fn with_plugin_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.ops.extend(tools);
         self
     }
     /// Attach named sub-agents to the conversational client: at [`build`](Self::build) the `task`
@@ -1976,6 +2031,10 @@ mod tests {
         assert!(
             manifest.contains("flux-credentials = { workspace = true, optional = true }"),
             "flux-credentials must be optional (the `pricing` feature only)"
+        );
+        assert!(
+            manifest.contains("flux-plugin = { workspace = true, optional = true }"),
+            "flux-plugin must be optional (the `plugins` feature only)"
         );
     }
 }

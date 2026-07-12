@@ -95,6 +95,19 @@ All notable changes to this project are documented in this file. The format is b
   manifest keeps `default = []` and both batteries `optional`. **Publish-order flip:**
   `scripts/publish-crates-io.sh` (and `PUBLISHING.md`) now publish `codewandler-flux-providers` before
   `codewandler-flux-sdk` — crates.io requires the SDK's optional dep to be published first.
+- **D-154: SDK `plugins` feature — subprocess plugin tools for embedders** (sdk-surface wave 3). A
+  new opt-in `plugins` cargo feature (`default = []`) adds `flux_sdk::plugins` with
+  `load_tools(system, name, descriptor)`, plus `FlowClient::register_plugin(name, descriptor).await`
+  and `ClientBuilder::with_plugin_tools(tools)` — so an installed subprocess plugin's operations
+  become policy-gated tools inside an embedded agent, dispatching through the same
+  authorization → approval → guarded-IO envelope as a built-in. Host capabilities stay
+  **manifest-scoped** (`SystemHostCaps` defaults — a plugin may only run programs / read secrets /
+  reach hosts its manifest declares; nothing widened); plugin binaries are trusted (native)
+  dependencies, documented as such. The default build pulls no `flux-plugin` (the lean-default test
+  now covers it too). A feature-gated fixture plugin (`fixtures/plugin_fixture.rs`, built only under
+  `--features plugins`) backs the end-to-end integration test (`op_names()` carries `fixture.upper`;
+  it dispatches uppercased when approved and is denied by the default approver). `flux-plugin` already
+  precedes `flux-sdk` in the publish order.
 
 ## [0.16.1] - 2026-07-11
 

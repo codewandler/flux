@@ -55,6 +55,9 @@ flux-credentials = { workspace = true, optional = true }
 # `flux_sdk::providers`, so `providers::from_spec("claude/sonnet")` is a one-stop shop. The default
 # build stays provider-agnostic (pulls neither this nor its transitive `flux-credentials`).
 flux-providers = { workspace = true, optional = true }
+# Optional (feature `plugins`): subprocess plugin tools behind `flux_sdk::plugins`, so an installed
+# plugin's operations become policy-gated tools inside an embedded agent. Off by default.
+flux-plugin = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -64,5 +67,17 @@ pricing = ["dep:flux-credentials"]
 # `flux_sdk::providers::{*, from_spec}` — re-export the concrete backends and build a provider from a
 # model spec (the CLI's exact resolver, incl. the claude/codex subscription token sources).
 providers = ["dep:flux-providers"]
+# `flux_sdk::plugins` + `FlowClient::register_plugin`/`ClientBuilder::with_plugin_tools` — load an
+# installed subprocess plugin's operations as policy-gated tools.
+plugins = ["dep:flux-plugin"]
+
+# A minimal fixture plugin (echo/`upper`) for the `plugins` integration test — a real subprocess so
+# `tests/plugins.rs` can exercise `register_plugin` end-to-end. `required-features` keeps it out of
+# every default build; the custom path keeps it out of autobin discovery (flux-sdk stays lib-only by
+# default).
+[[bin]]
+name = "flux_sdk_plugin_fixture"
+path = "fixtures/plugin_fixture.rs"
+required-features = ["plugins"]
 
 [dev-dependencies]
