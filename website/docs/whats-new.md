@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Action needed
+
+- **Two web tools were renamed for consistency.** `web_fetch` is now `web.fetch` and `web_search` is
+  now `web.search`, so the whole web toolset shares one naming style (`http.request`, `web.fetch`,
+  `web.search`, `web.crawl`, `browser.*`). Update any flow that calls `web_fetch(...)`/`web_search(...)`
+  and any agent whose tool list grants `web_search` — the old names no longer work, and there is no
+  alias. (This is unrelated to the old `[private_net] web_fetch` config setting, which was already
+  replaced by the `[private_net] web` setting.)
+
 ## [0.18.0] - 2026-07-12
 
 ### New

@@ -4,7 +4,7 @@
 //! html5ever family (`scraper`), drops boilerplate (script/style/nav/header/footer/aside/forms/…),
 //! prefers the main content region, builds a [`flux_markdown`] AST, and renders it with the markdown
 //! writer — so the budget buys content, not tags. It is pure: no IO, no egress. The `html_to_markdown`
-//! op and tier-2 `web_fetch` both call [`html_to_markdown`].
+//! op and tier-2 `web.fetch` both call [`html_to_markdown`].
 
 use flux_markdown::ast::{Alignment, Block, Document, Inline, List, ListItem, Table};
 use flux_markdown::writer::to_markdown;

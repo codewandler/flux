@@ -91,7 +91,7 @@ Grant the specific host to the native web family if you really need it:
 ```toml
 # .flux/config.toml
 [private_net]
-web = ["localhost"]     # or `true` for any private host; covers http.request, web_fetch, browser.*
+web = ["localhost"]     # or `true` for any private host; covers http.request, web.fetch, browser.*
 ```
 
 The retired `web_fetch = …` key is ignored; use the family-wide `web` key shown above.

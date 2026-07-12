@@ -60,7 +60,7 @@ impl PrivateNetGrant {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateNetConfig {
     /// The family-wide `web` egress scope: grants private-network access to every native `flux-web`
-    /// op (`http.request`, `web_fetch`, `browser.*`) — the one policy the whole web family answers
+    /// op (`http.request`, `web.fetch`, `browser.*`) — the one policy the whole web family answers
     /// to. (Replaced the per-tool `web_fetch` key in D-120's clean cutover; a legacy `web_fetch = …`
     /// entry in an old config is now silently ignored — migrate it to `web`.)
     #[serde(default, skip_serializing_if = "PrivateNetGrant::is_default")]
@@ -327,7 +327,7 @@ impl Limits {
 
 impl Config {
     /// Host patterns allowed to bypass the private-network guard for the whole native web family
-    /// (`http.request`, `web_fetch`, `browser.*`) — the `[private_net] web` scope. The deprecated
+    /// (`http.request`, `web.fetch`, `browser.*`) — the `[private_net] web` scope. The deprecated
     /// `allow_private_net` compat flag still widens it to `*` when set.
     pub fn web_private_hosts(&self) -> Vec<String> {
         let mut hosts = self.private_net.web.to_hosts();

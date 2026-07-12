@@ -3494,7 +3494,7 @@ mod tests {
                 "sys_info",
                 "top",
                 "values",
-                "web_search",
+                "web.search",
                 "write"
             ]
         );

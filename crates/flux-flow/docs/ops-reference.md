@@ -16,7 +16,7 @@ optional arguments are in `[brackets]`.
 | `glob` | `pattern[, path]` | Low | List files matching a glob pattern (`*` crosses `/`) |
 | `search` | `query[, limit]` | Low | Search the indexed datasource |
 | `sources` | | Low | Enumerate the datasources in the index: per source, its entity types and record count |
-| `web_fetch` | `url[, raw]` | Low | Read a page as a **document**: HTML → condensed markdown (boilerplate stripped), PDF → extracted text, other non-HTML raw, `raw: true` forces the raw body. Fetched pages become `web.page` records. Private/loopback blocked unless the `web` egress scope grants them |
+| `web.fetch` | `url[, raw]` | Low | Read a page as a **document**: HTML → condensed markdown (boilerplate stripped), PDF → extracted text, other non-HTML raw, `raw: true` forces the raw body. Fetched pages become `web.page` records. Private/loopback blocked unless the `web` egress scope grants them |
 | `web.crawl` | `url[, max_pages, max_depth]` | Low | Crawl a small site/section: from a seed, follow **same-host** links breadth-first (bounded — `max_pages` ≤ 50, `max_depth` ≤ 5) → each page condensed to markdown + one `web.page` record per page. Same-host only; no robots.txt/sitemaps/JS (use `browser.*` for JS). Every hop guarded by the `web` egress scope |
 | `html_to_markdown` | `html` | Low | Pure (no egress): condense an HTML string to readable markdown; composes with `http.request` |
 | `http.request` | `url[, method, headers, body, timeout]` | Medium | Make an arbitrary HTTP(S) request (any method/headers/body) → status + headers + capped body; non-2xx is a result. Header values may be `{"$secret": "ENV"}`. Private/loopback blocked unless the `web` egress scope grants them |
@@ -36,7 +36,7 @@ optional arguments are in `[brackets]`.
 | `file_stat` | `path` | Low | File metadata: size, line count, mtime (replaces `wc -l`, `stat`, `ls -la`) |
 | `path_exists` | `path` | Low | Returns `"true"`/`"false"` — use with `when`/`unless` to branch on file presence |
 | `sqlite_query` | `db, sql[, params]` | Low | Read-only SQLite query (SELECT/PRAGMA only) |
-| `web_search` | `query[, max_results]` | Low | Tavily web search — requires `TAVILY_API_KEY` env var |
+| `web.search` | `query[, max_results]` | Low | Tavily web search — requires `TAVILY_API_KEY` env var |
 | `now` | | Low | Current wall-clock time: unix seconds + UTC string (replaces `date`) |
 | `cwd` | | Low | Absolute path of the workspace root (replaces `pwd`) |
 | `sys_info` | | Low | Host metadata: os, arch, family, hostname (replaces `uname`) |

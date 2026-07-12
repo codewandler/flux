@@ -4,7 +4,7 @@
 //!   `flux-datasource` records + the retrieval ops
 //!   `search`/`get`/`list`/`relation`/`batch_get`/`sources` (D-114).
 //!
-//! Web access (`http.request`, `web_fetch`, `browser.*`) moved to the native `flux-web` crate
+//! Web access (`http.request`, `web.fetch`, `browser.*`) moved to the native `flux-web` crate
 //! (web-capabilities epic, D-120); the former `browser` module retired with it.
 //!
 //! Caller identity (`flux-auth`) is deliberately *not* here — it is a distinct concern (surfaces

@@ -6,6 +6,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **D-163: the built-in web ops are renamed `web_fetch` → `web.fetch` and `web_search` → `web.search`**
+  (Agent pillar). The web family is now uniformly dot-namespaced (`http.request`, `web.fetch`,
+  `web.search`, `web.crawl`, `browser.*`) — `web_fetch`/`web_search` were the last snake_case holdouts.
+  This is a **breaking rename** of two model-facing op names (a flow calling `web_fetch(...)` must now
+  call `web.fetch(...)`; a `tools:`/`allow` grant naming `web_search` must name `web.search`), shipping
+  as a MINOR per the pre-1.0 SemVer rule. There is no `web_fetch`/`web_search` alias — clean cutover.
+  The private-admit audit label changes from `web:web_fetch` to `web:web.fetch`. The retired
+  `[private_net] web_fetch` **config key** is unrelated and unchanged (it was already superseded by the
+  family-wide `[private_net] web` scope in D-120). Tests updated across `flux-web`, `flux-tools`,
+  `flux-lsp`, and `flux-tui`.
+
 ## [0.18.0] - 2026-07-12
 
 ### Added

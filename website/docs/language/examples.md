@@ -29,7 +29,7 @@ Pure field access and formatting — no shell, no approval pauses:
 
 ```flux
 flow latest-release
-  $raw = web_fetch("https://api.github.com/repos/codewandler/flux/releases/latest")
+  $raw = web.fetch("https://api.github.com/repos/codewandler/flux/releases/latest")
   $tag = $raw.tag_name
   $msg = fmt("latest flux release: {tag}")
   return { tag: $tag, message: $msg }
@@ -64,7 +64,7 @@ flow cached-page(url: String)
       $page = read("cache/page.html")
     branch
       retry 3 backoff exponential delay 500 -> $page
-        web_fetch($url)
+        web.fetch($url)
   assert $page, "no cached copy and the fetch failed"
   return $page
 ```

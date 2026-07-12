@@ -7,7 +7,7 @@
 //! | Tier | Op(s) | The model sees |
 //! |------|-------|----------------|
 //! | 1 — request | [`http`]`::http.request` | status + headers + capped body (bytes) |
-//! | 2 — read    | `web_fetch` (D-120) | readable content as condensed markdown |
+//! | 2 — read    | `web.fetch` (D-120) | readable content as condensed markdown |
 //! | 3 — browse  | `browser.*` (D-121…D-124) | an interface digest + deltas after actions |
 //!
 //! All three are **native** (no plugin/install step) and answer to one family-wide egress policy:
@@ -60,7 +60,7 @@ pub struct WebOptions {
     /// The `grant_source` label recorded on an admit — e.g. `"config:web"` or
     /// `"cli:--allow-private-net"`. Defaults to `"config:web"` when unset.
     pub grant_source: Option<String>,
-    /// Sink for `web.page` records contributed by `web_fetch`. `None` disables it.
+    /// Sink for `web.page` records contributed by `web.fetch`. `None` disables it.
     pub records: Option<Arc<dyn RecordSink>>,
     /// Optional configured path to a Chromium binary for the browser ops (else `FLUX_BROWSER_BIN` /
     /// `PATH` discovery).
@@ -69,7 +69,7 @@ pub struct WebOptions {
 
 /// Register the native web ops on `registry`:
 /// - tier 1: `http.request` (arbitrary HTTP);
-/// - tier 2: `web_fetch` (readable-markdown fetch) + the pure `html_to_markdown` transform +
+/// - tier 2: `web.fetch` (readable-markdown fetch) + the pure `html_to_markdown` transform +
 ///   `web.crawl` (bounded, same-host breadth-first crawl over the same egress envelope);
 /// - tier 3: `browser.open`/`goto`/`snapshot`/`act`/`close` (evidence-gated behind the `browser`
 ///   group — surfaced only when a Chromium binary is discoverable; see [`browser_group`]).

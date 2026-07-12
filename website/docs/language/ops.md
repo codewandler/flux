@@ -41,7 +41,7 @@ policy.
 | `list` | `source[, entity, offset, limit]` | low | Enumerate a datasource source's records, paged |
 | `relation` | `source, entity, id[, rel]` | low | Follow a datasource record's typed links |
 | `batch_get` | `source, entity, ids` | low | Fetch several datasource records in one call |
-| `web_fetch` | `url[, raw]` | low | Read a URL as a document: HTML becomes condensed Markdown, PDFs become extracted text; `raw` preserves the body |
+| `web.fetch` | `url[, raw]` | low | Read a URL as a document: HTML becomes condensed Markdown, PDFs become extracted text; `raw` preserves the body |
 | `web.crawl` | `url[, max_pages, max_depth]` | low | Crawl a small site or section: from a seed, follow same-host links breadth-first (bounded by `max_pages`/`max_depth`), returning each page as condensed Markdown |
 | `html_to_markdown` | `html` | low | Pure conversion of an HTML string to condensed Markdown; no network access |
 | `http.request` | `url[, method, headers, body, timeout]` | medium, approval | Arbitrary HTTP request with capped response body; non-2xx remains a result |
@@ -50,7 +50,7 @@ policy.
 | `browser.snapshot` | `session[, view]` | low | Re-observe a session (`full`, `actions`, or `content`) |
 | `browser.act` | `session, action[, ref, value, full]` | medium, approval | Click, type, fill, select, press, scroll, navigate, or go back using digest refs |
 | `browser.close` | `session` | low | Close a browser session and its Chromium child |
-| `web_search` | `query[, max_results]` | low | Tavily web search (requires `TAVILY_API_KEY`) |
+| `web.search` | `query[, max_results]` | low | Tavily web search (requires `TAVILY_API_KEY`) |
 | `sqlite_query` | `db, sql[, params]` | low | Read-only SQLite query |
 | `now` / `cwd` / `home_dir` / `sys_info` | | low | Clock, workspace/home paths, and host metadata — no shell needed |
 

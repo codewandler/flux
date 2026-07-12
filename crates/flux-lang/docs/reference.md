@@ -683,7 +683,7 @@ the node errors rather than blocking, so the plan stays responsive.
 ```json
 {"kind": "throttle", "name": "fetches", "max": 5, "window_ms": 60000,
  "body": [
-   {"kind": "call", "op": "web_fetch", "args": [{"kind": "var", "name": "url"}]}
+   {"kind": "call", "op": "web.fetch", "args": [{"kind": "var", "name": "url"}]}
  ]}
 ```
 
@@ -876,7 +876,7 @@ deadline expires, the node errors and an enclosing `try` or `retry` can handle i
 
 ```json
 {"kind": "timeout", "ms": 30000, "bind": "result",
- "body": [{"kind": "call", "op": "web_fetch",
+ "body": [{"kind": "call", "op": "web.fetch",
            "args": [{"kind": "lit", "value": "https://example.com"}]}]}
 ```
 
@@ -1154,7 +1154,7 @@ stays lenient.
 ```json
 {"body": [
   {"kind": "bind", "name": "raw",
-   "value": {"kind": "call", "op": "web_fetch",
+   "value": {"kind": "call", "op": "web.fetch",
      "args": [{"kind": "lit", "value": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"}]}},
   {"kind": "bind", "name": "price",
    "value": {"kind": "jq", "path": ".bitcoin.usd",

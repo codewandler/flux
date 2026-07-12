@@ -35,7 +35,7 @@ When the input is a bound symbol and the path is a simple dotted field path, ext
 with the access sugar:
 
 ```flux
-$raw   = web_fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+$raw   = web.fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
 $price = $raw.bitcoin.usd
 $kind  = $plan.kind
 ```
@@ -160,7 +160,7 @@ $version = regex_extract({ s: $body, pattern: "v(\\d+\\.\\d+\\.\\d+)", group: 1 
 
 Use `map`/`filter` when the input is already structured JSON and the transformation is a field
 projection or predicate. Use `each` when every item must dispatch real work such as `read`,
-`web_fetch`, or `task`.
+`web.fetch`, or `task`.
 
 ## `parse` — type coercion
 
@@ -203,7 +203,7 @@ escapes — every step has a native spelling:
 
 ```flux
 flow btc-double
-  $raw   = web_fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+  $raw   = web.fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
   $price = $raw.bitcoin.usd
   $doubled = $price * 2
   $label = fmt("BTC: {price} | Double: {doubled}")

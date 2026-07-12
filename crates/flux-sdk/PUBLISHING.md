@@ -3,7 +3,7 @@
 The publish closure is **28 crates**: the `flux-sdk` + `flux-providers` SDK surface, the plugin
 authoring surface (`flux-datasource`, `flux-credentials`, `flux-plugin`, `host-kit`), and the
 standalone capability crates that external consumers depend on directly — `flux-a2a`, `flux-audio`,
-`flux-capabilities`, and `flux-web` (the web pack: `http.request`, `web_fetch`, `web.crawl`,
+`flux-capabilities`, and `flux-web` (the web pack: `http.request`, `web.fetch`, `web.crawl`,
 `browser.*`). Publishing in dependency order means every dependent resolves its deps from the index.
 The authoritative list is the `CRATES` array in `scripts/publish-crates-io.sh` — this doc mirrors it.
 

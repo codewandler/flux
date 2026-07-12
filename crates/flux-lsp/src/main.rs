@@ -704,7 +704,7 @@ mod tests {
             "synth",
             "search",
             "sources",
-            "web_fetch",
+            "web.fetch",
         ] {
             assert!(
                 names.contains(required),
@@ -716,8 +716,8 @@ mod tests {
     #[test]
     fn stable_host_ops_do_not_report_unknown_operation() {
         let src = r#"flow research
-  $web = web_search({query: "flux", max_results: 2})
-  $page = web_fetch("https://example.com")
+  $web = web.search({query: "flux", max_results: 2})
+  $page = web.fetch("https://example.com")
   $hits = search({query: "flux", limit: 2})
   $inventory = sources()
   $claims = ai.extract({from: $page, ask: "facts", schema: "Claim[]"})

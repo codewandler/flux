@@ -77,7 +77,7 @@ struct Cli {
 
     /// Temporarily allow egress to private/internal network addresses for THIS invocation only —
     /// the ephemeral, audited equivalent of a `[private_net]` config grant (no config edit, nothing
-    /// persisted). Plugins still only reach the private hosts their manifest declares; `web_fetch`
+    /// persisted). Plugins still only reach the private hosts their manifest declares; `web.fetch`
     /// is opened for the run (its guard has no manifest safeguard, so this re-exposes cloud-metadata
     /// and RFC-1918 ranges to any fetched URL). Prefer a scoped `[private_net.plugins]` grant for
     /// anything recurring. Exported as `FLUX_ALLOW_PRIVATE_NET` so `app run`/`plugin call` inherit it.
@@ -1846,7 +1846,7 @@ impl flux_plugin::EgressAudit for EventStoreEgressAudit {
     }
 }
 
-/// L6 binding of the L5 [`flux_web::RecordSink`] seam: contributes the `web.page` records `web_fetch`
+/// L6 binding of the L5 [`flux_web::RecordSink`] seam: contributes the `web.page` records `web.fetch`
 /// produces to the workspace datasource backend, so a fetched page is searchable afterwards. Errors
 /// are swallowed — contribution is best-effort enrichment, never load-bearing for the fetch.
 struct BackendRecordSink {
@@ -2314,7 +2314,7 @@ async fn build_agent_with(
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
-    // backend is also the sink `web_fetch` contributes `web.page` records to (below), so read pages
+    // backend is also the sink `web.fetch` contributes `web.page` records to (below), so read pages
     // are groundable.
     let backend = build_doc_index(&system).await;
     flux_capabilities::register_datasource_ops(&mut registry, backend.clone());
@@ -2341,10 +2341,10 @@ async fn build_agent_with(
     let redactor = flux_secret::Redactor::new();
     seed_provider_env_secrets(&redactor);
 
-    // Native web capabilities (flux-web): `http.request` (tier 1), `web_fetch` + `html_to_markdown`
+    // Native web capabilities (flux-web): `http.request` (tier 1), `web.fetch` + `html_to_markdown`
     // (tier 2), all under the family-wide `[private_net] web` egress scope. Registered here — after
     // the session is resolved — because the `PrivateNetAdmit` audit sink needs the event store +
-    // session id, and `web_fetch` contributes `web.page` records to the datasource backend.
+    // session id, and `web.fetch` contributes `web.page` records to the datasource backend.
     {
         let web_audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
             store: events.clone(),
@@ -5027,7 +5027,7 @@ fn loop_machinery_label(name: &str, input: &Value) -> Option<String> {
 }
 
 fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
-    // Column width: wide enough for the longest built-in op name (`web_fetch` = 9).
+    // Column width: wide enough for the longest built-in op name (`web.fetch` = 9).
     const GUTTER: usize = 10;
     const ARG_CAP: usize = 120;
     // The loop machinery (revealed by `--show-loop`) carries large inputs — a plan AST, a transcript.
@@ -6228,7 +6228,7 @@ fn apply_workspace_access_env(cli: &Cli, cfg: &flux_config::Config) {
         std::env::set_var("FLUX_ALLOW_PRIVATE_NET", "1");
         eprintln!(
             "{} private-network egress allowed for this run ({source}): plugins may reach \
-             the private hosts their manifest declares, and web_fetch may reach any private/loopback \
+             the private hosts their manifest declares, and web.fetch may reach any private/loopback \
              address (incl. cloud metadata). Prefer a scoped [private_net.plugins] grant for recurring use.",
             style::red("warning:")
         );
@@ -6411,7 +6411,7 @@ fn effective_plugin_private_hosts(cfg: &flux_config::Config, name: &str) -> Vec<
 }
 
 /// The family-wide `web`-scope private-net host grant (native `flux-web` ops: `http.request`,
-/// `web_fetch`, `browser.*`), widened to `*` when `--allow-private-net` is active.
+/// `web.fetch`, `browser.*`), widened to `*` when `--allow-private-net` is active.
 fn effective_web_private_hosts(cfg: &flux_config::Config) -> Vec<String> {
     if private_net_cli_override() {
         vec!["*".to_string()]

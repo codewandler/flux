@@ -3,7 +3,7 @@
 //! The everyday "read this small site/section" capability: from a seed, follow **same-host** links
 //! to a bounded depth and page count, returning each fetched page as condensed markdown (and
 //! contributing `web.page` records, exactly like [`crate::fetch::WebFetchTool`]). It is the
-//! multi-page sibling of `web_fetch`, sharing its egress envelope: every hop — seed, each discovered
+//! multi-page sibling of `web.fetch`, sharing its egress envelope: every hop — seed, each discovered
 //! link, and every redirect — passes through [`flux_system::net::guard_url_scoped`] +
 //! [`egress::send_guarded`], and a private-host admit emits the same [`flux_plugin::EgressAudit`]
 //! event.
@@ -33,7 +33,7 @@ use flux_system::net::PrivateNetAllow;
 use crate::fetch::{cap_str, looks_like_html};
 use crate::{condense, egress, RecordSink, WebOptions};
 
-/// Per-page cap on the downloaded body (bytes) before condensing — mirrors `web_fetch`'s `MAX_BYTES`.
+/// Per-page cap on the downloaded body (bytes) before condensing — mirrors `web.fetch`'s `MAX_BYTES`.
 const MAX_PAGE_BYTES: usize = 256 * 1024;
 /// Per-page cap on the condensed markdown appended to the crawl digest, so one page can't spend the
 /// whole budget in a many-page crawl.
@@ -49,7 +49,7 @@ const MAX_DEPTH_CEILING: usize = 5;
 /// Hard ceiling on the queued-but-not-yet-fetched frontier, so a link-dense page cannot make the
 /// frontier grow without bound even before the page cap stops the crawl.
 const MAX_FRONTIER: usize = 512;
-/// Per-page request timeout, and the ceiling on it — mirrors `web_fetch`.
+/// Per-page request timeout, and the ceiling on it — mirrors `web.fetch`.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
@@ -79,7 +79,7 @@ impl WebCrawlTool {
     }
 
     /// Emit the `PrivateNetAdmit` audit event when a hop is admitted to a private/internal host under
-    /// a grant. Mirrors `web_fetch`'s `audit_admit`, gated on `host_resolves_private`.
+    /// a grant. Mirrors `web.fetch`'s `audit_admit`, gated on `host_resolves_private`.
     fn audit_admit(&self, host: &str) {
         if let Some(audit) = &self.audit {
             if flux_system::net::host_resolves_private(host) {
@@ -130,7 +130,7 @@ impl Tool for WebCrawlTool {
             "web.crawl",
             "Crawl a small site or section: from a seed URL, follow same-host links breadth-first to \
              a bounded depth and page count, returning each fetched page as condensed markdown. Use \
-             this instead of many one-URL `web_fetch` calls when you need to read several linked \
+             this instead of many one-URL `web.fetch` calls when you need to read several linked \
              pages of one site. Bounded and same-host by design — it does NOT follow cross-host \
              links, obey/read robots.txt or sitemaps, or render JavaScript (use the `browser.*` ops \
              for JS-rendered pages). Loopback/private addresses are blocked unless the `web` egress \
@@ -196,7 +196,7 @@ impl Tool for WebCrawlTool {
             .unwrap_or(DEFAULT_MAX_DEPTH)
             .min(MAX_DEPTH_CEILING);
 
-        // Guard the seed up front so a bad/private seed is a clean error (mirrors `web_fetch`). Every
+        // Guard the seed up front so a bad/private seed is a clean error (mirrors `web.fetch`). Every
         // *discovered* hop is guarded again below and skipped (not fatal) if it is refused.
         let seed_url = flux_system::net::guard_url_scoped(seed_raw, &self.private_net)?;
         let seed_host = seed_url.host_str().unwrap_or_default().to_ascii_lowercase();

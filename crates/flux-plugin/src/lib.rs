@@ -742,7 +742,7 @@ impl HostCapabilities for DenyHostCaps {
 /// implementation that appends a `PrivateNetAdmit` event lives at a surface (L6), so flux-plugin
 /// stays free of an event-store dependency. A host with no audit installed simply admits silently.
 pub trait EgressAudit: Send + Sync {
-    /// Record that `caller` (a plugin name, or `"web_fetch"`) reached the private `host`, admitted by
+    /// Record that `caller` (a plugin name, or `"web.fetch"`) reached the private `host`, admitted by
     /// `grant_source` (e.g. `"config:plugin/<name>"` or `"config:endpoint/<plugin>:<ep>"`).
     fn record_private_admit(&self, caller: &str, host: &str, grant_source: &str);
 }
@@ -2197,7 +2197,7 @@ async fn read_http_body_capped(
 
 /// Reject non-HTTP(S) schemes and (unless `allow_private`) private/loopback/link-local hosts —
 /// delegating to the shared egress guard in `flux-system` (host→IP resolution, IPv6/IPv4-mapped
-/// coverage), the same SSRF policy the agent's own `web_fetch` uses.
+/// coverage), the same SSRF policy the agent's own `web.fetch` uses.
 fn guard_http_url(raw: &str, allow: &PrivateNetAllow) -> std::result::Result<url::Url, String> {
     flux_system::net::guard_url_scoped(raw, allow).map_err(|e| e.to_string())
 }

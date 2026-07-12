@@ -57,7 +57,7 @@ approval pause, no shelling out to `bash`.
 
 ```flux
 flow price-check
-  $raw   = web_fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+  $raw   = web.fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
   $price = $raw.bitcoin.usd
   $label = fmt("BTC is at {price} USD")
   return { price: $price, label: $label }
@@ -139,7 +139,7 @@ Reliability constraints are nodes, not prompt instructions:
 ```flux
 flow careful-fetch(url: String)
   retry 3 backoff exponential delay 500 -> $page
-    web_fetch($url)
+    web.fetch($url)
   assert $page, "fetch returned nothing"
   return $page
 ```

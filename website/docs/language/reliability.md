@@ -27,7 +27,7 @@ assert len($hits) > 0, "no ERROR lines found"
 
 ```flux
 retry 3 backoff exponential delay 500 -> $health
-  web_fetch("https://api.example.com/health")
+  web.fetch("https://api.example.com/health")
 ```
 
 The header uses space-keyword tokens in a fixed order:
@@ -68,7 +68,7 @@ retry 3
 
 ```flux
 timeout 5000 -> $page
-  $page = web_fetch("https://example.com")
+  $page = web.fetch("https://example.com")
 ```
 
 `timeout <ms>` runs its body under a wall-clock deadline. If the body finishes in time, `-> $bind` names its result. If the deadline expires, the node errors — and that error is catchable by an enclosing `try` or `retry`, so a slow path can degrade instead of killing the flow.
@@ -146,7 +146,7 @@ verify bash("cargo test --workspace 2>&1") contains "test result: ok": "workspac
 
 ```flux
 throttle "fetches" 5 per 60000
-  web_fetch($url)
+  web.fetch($url)
 ```
 
 - The header reads `throttle "<name>" <max> per <window_ms>`: at most `max` op dispatches inside the body per sliding `window_ms` window.

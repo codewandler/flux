@@ -123,7 +123,7 @@ impl Embedder for OpenAiEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // SSRF guard (host→IP resolution; blocks loopback/private/metadata) — same policy as web_fetch.
+        // SSRF guard (host→IP resolution; blocks loopback/private/metadata) — same policy as web.fetch.
         let url = flux_system::net::guard_url(&self.endpoint, false)
             .map_err(|e| Error::Other(format!("embeddings endpoint: {e}")))?;
         let body = serde_json::json!({ "model": self.model, "input": texts });

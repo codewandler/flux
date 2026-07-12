@@ -726,7 +726,7 @@ At most `max` **op dispatches** inside the body per sliding `window_ms`; the buc
 the session store, atomically, keyed by the required `name`:
 
 ```flux
-@json {"kind": "throttle", "name": "fetches", "max": 5, "window_ms": 60000, "body": [{"kind": "call", "op": "web_fetch", "args": [{"kind": "var", "name": "url"}]}]}
+@json {"kind": "throttle", "name": "fetches", "max": 5, "window_ms": 60000, "body": [{"kind": "call", "op": "web.fetch", "args": [{"kind": "var", "name": "url"}]}]}
 ```
 
 ### debounce — *`@json` only*

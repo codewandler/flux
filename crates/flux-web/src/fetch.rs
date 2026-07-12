@@ -1,4 +1,4 @@
-//! Tier 2 — `web_fetch`: read a page as a **document**, not markup.
+//! Tier 2 — `web.fetch`: read a page as a **document**, not markup.
 //!
 //! The everyday "read this page" capability. `text/html` responses come back as condensed markdown
 //! (boilerplate stripped, the budget spent on content, capped *after* condensation); non-HTML bodies
@@ -28,12 +28,12 @@ use flux_system::net::PrivateNetAllow;
 use crate::{condense, egress, RecordSink, WebOptions};
 
 /// Cap on the returned document (bytes, char-boundary safe) — applied *after* condensation so the
-/// budget buys content, not tags. Mirrors the historical `web_fetch` `MAX_BYTES`.
+/// budget buys content, not tags. Mirrors the historical `web.fetch` `MAX_BYTES`.
 const MAX_BYTES: usize = 256 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
-/// `web_fetch`: fetch a URL and return its readable content as condensed markdown (HTML) or the raw
+/// `web.fetch`: fetch a URL and return its readable content as condensed markdown (HTML) or the raw
 /// body (everything else / `raw: true`).
 pub struct WebFetchTool {
     http: reqwest::Client,
@@ -60,7 +60,7 @@ impl WebFetchTool {
     fn audit_admit(&self, host: &str) {
         if let Some(audit) = &self.audit {
             if flux_system::net::host_resolves_private(host) {
-                audit.record_private_admit("web:web_fetch", host, &self.grant_source);
+                audit.record_private_admit("web:web.fetch", host, &self.grant_source);
             }
         }
     }
@@ -70,7 +70,7 @@ impl WebFetchTool {
 impl Tool for WebFetchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
-            "web_fetch",
+            "web.fetch",
             "Read a web page as a readable document: HTML is returned as condensed markdown \
              (navigation, scripts, and boilerplate stripped) and PDFs are returned as extracted \
              text; other non-HTML content is returned raw. Pass `raw: true` for the unprocessed \
@@ -116,7 +116,7 @@ impl Tool for WebFetchTool {
         let raw_url = params
             .get("url")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Other("web_fetch: `url` required".into()))?;
+            .ok_or_else(|| Error::Other("web.fetch: `url` required".into()))?;
         let raw_body = params.get("raw").and_then(Value::as_bool).unwrap_or(false);
 
         let url = flux_system::net::guard_url_scoped(raw_url, &self.private_net)?;
@@ -129,7 +129,7 @@ impl Tool for WebFetchTool {
                 body: None,
                 timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
             },
-            "web_fetch",
+            "web.fetch",
             |raw| flux_system::net::guard_url_scoped(raw, &self.private_net),
             |url| {
                 if let Some(host) = url.host_str() {
@@ -146,7 +146,7 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let capped = egress::read_body_capped(response, MAX_BYTES, "web_fetch").await?;
+        let capped = egress::read_body_capped(response, MAX_BYTES, "web.fetch").await?;
 
         // Classify from the *raw bytes* + content-type before any lossy UTF-8 decode (which would
         // corrupt a binary PDF). A PDF is either declared (`application/pdf`) or sniffed by its
@@ -652,7 +652,7 @@ mod tests {
             .await
             .is_err());
 
-        // Admitted with the web grant, and the admit is audited as `web:web_fetch`.
+        // Admitted with the web grant, and the admit is audited as `web:web.fetch`.
         let base2 = one_shot("200 OK", "text/html", "<html><body>x</body></html>").await;
         let audit = Arc::new(RecordingAudit::default());
         let t = WebFetchTool::new(&WebOptions {
@@ -665,7 +665,7 @@ mod tests {
         t.execute(&ctx(), json!({ "url": base2 })).await.unwrap();
         let calls = audit.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "web:web_fetch");
+        assert_eq!(calls[0].0, "web:web.fetch");
         assert_eq!(calls[0].2, "config:web");
     }
 

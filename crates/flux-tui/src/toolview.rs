@@ -53,7 +53,7 @@ pub fn format_call(name: &str, input: &Value) -> Call {
                 None => format!("{pat:?}"),
             }
         }
-        "web_fetch" => s("url").unwrap_or_default(),
+        "web.fetch" => s("url").unwrap_or_default(),
         "search" => format!("{:?}", s("query").unwrap_or_default()),
         "append" => match (s("path"), input.get("content").and_then(Value::as_str)) {
             (Some(p), Some(c)) => format!("{p} (+{} bytes)", c.len()),

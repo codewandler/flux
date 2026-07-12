@@ -100,7 +100,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-lsp` | L6 | Flux-Lang language server (`flux-lsp` binary): CST-driven diagnostics, completion, hover, formatting; wired into Helix config-only | — |
 | `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
 | `flux-capabilities` | L5 | `datasource` (keyword index + search; RAG deferred) module | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
-| `flux-web` | L5 | native web capabilities: `http.request`, `web_fetch` (HTML→readable markdown via `condense`), and the non-visual CDP browser ops — all under the family-wide `[private_net] web` egress scope (SSRF guard on every call) | new 2026-07-09 (D-98, D-120…D-124); `web_fetch` moved here from `flux-capabilities` |
+| `flux-web` | L5 | native web capabilities: `http.request`, `web.fetch` (HTML→readable markdown via `condense`), and the non-visual CDP browser ops — all under the family-wide `[private_net] web` egress scope (SSRF guard on every call) | new 2026-07-09 (D-98, D-120…D-124); `web.fetch` moved here from `flux-capabilities` |
 | `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |
 
 ## The safety envelope (the execution substrate)

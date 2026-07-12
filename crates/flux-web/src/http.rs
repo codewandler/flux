@@ -3,7 +3,7 @@
 //! The model gets the status, response headers, and a byte-capped body. Non-2xx responses are a
 //! *result*, not an op failure — a 404 comes back with its status, the op succeeds. This is the
 //! "APIs → tier 1" surface: for reading a page *as a document* the model should reach for
-//! `web_fetch` (tier 2) instead.
+//! `web.fetch` (tier 2) instead.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use flux_system::net::PrivateNetAllow;
 use crate::{egress, WebOptions};
 
 /// Cap on the response body handed to the model (bytes, cut on a char boundary). Mirrors the
-/// `web_fetch` `MAX_BYTES` precedent.
+/// `web.fetch` `MAX_BYTES` precedent.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Cap on the rendered response-header block.
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -75,7 +75,7 @@ impl Tool for HttpRequestTool {
             name: "http.request".into(),
             description: "Make an arbitrary HTTP(S) request (any method, headers, and body) and \
                 return the status, response headers, and body. Use this for APIs and raw protocol \
-                access; to read a web page as a readable document prefer `web_fetch`. \
+                access; to read a web page as a readable document prefer `web.fetch`. \
                 Private/loopback addresses are blocked unless the `web` egress scope grants them. A \
                 header value may be a secret reference `{\"$secret\": \"ENV_NAME\"}`, resolved from \
                 the environment and never shown."
@@ -97,7 +97,7 @@ impl Tool for HttpRequestTool {
             }),
             output_schema: None,
             // Arbitrary HTTP can mutate remote state (POST/PUT/DELETE), so this is not the read-only
-            // shape `web_fetch` uses: honest Network effect, Medium risk, non-idempotent.
+            // shape `web.fetch` uses: honest Network effect, Medium risk, non-idempotent.
             effects: vec![Effect::Network],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,

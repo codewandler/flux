@@ -11,9 +11,9 @@
 ## Why
 
 flux's web surface grew bottom-up and it shows. Today there are exactly two model-facing web ops:
-`web_fetch` (native, raw `[status]\n<body>` text capped at 256 KiB, **no** condensation, and a
+`web.fetch` (native, raw `[status]\n<body>` text capped at 256 KiB, **no** condensation, and a
 bespoke per-tool private-net path — the caveat recorded on
-[D-96](../stories/D-96-allow-private-net-cli-override.md)) and `web_search` (native, Tavily) plus
+[D-96](../stories/D-96-allow-private-net-cli-override.md)) and `web.search` (native, Tavily) plus
 the `websearch` plugin. Integration plugins do vendor-scoped HTTP through the host `http.do`
 capability, but nothing exposes *generic* HTTP to the model. And there is no browser at all —
 `flux-capabilities/src/browser.rs` names CDP automation as deferred in a comment.
@@ -65,7 +65,7 @@ One crate, module-per-concern (`http`, `fetch`, `condense`, `browser`, `cdp`, `d
 
 ### One egress policy for the whole family
 
-The D-96 caveat ("`web_fetch` has no manifest to intersect against") is answered by unification,
+The D-96 caveat ("`web.fetch` has no manifest to intersect against") is answered by unification,
 not by a manifest: a single **`web` scope** in `[private_net]` config governs every flux-web op.
 
 - Default: **public internet only** — `flux_system::net::guard_url_scoped` runs on every fetch,
@@ -76,7 +76,7 @@ not by a manifest: a single **`web` scope** in `[private_net]` config governs ev
   (D-96) which widens the `web` scope exactly as it widens plugin scopes. Every admit emits
   `PrivateNetAdmit` with `caller: "web:<op>"` (the existing event carries all needed fields,
   `flux-events/src/kind.rs:118`).
-- The bespoke `web_fetch` path — `effective_web_fetch_private_hosts`
+- The bespoke `web.fetch` path — `effective_web_fetch_private_hosts`
   (`flux-cli/src/main.rs:5497`) and the `[private_net] web_fetch` key — is **deleted** in D-120
   (clean cutover, no fallback key).
 
@@ -87,7 +87,7 @@ never lands readable in transcripts or `events.db` (C-22 lesson).
 ### Tier 1 — `http.request` — D-98
 
 A native op in `flux-web::http`: method, URL, headers, body, timeout → status, response headers
-(capped), body (capped, char-boundary safe — the `web_fetch` `MAX_BYTES` precedent). Non-2xx is a
+(capped), body (capped, char-boundary safe — the `web.fetch` `MAX_BYTES` precedent). Non-2xx is a
 *result*, not an op failure. Dotted native op names are established (`proc.run`, `ai.extract`,
 `endpoint.discover`). Honest metadata: `Effect::Network`, `NetworkFetch` intent, non-flat risk —
 plan approval sees it (D-91 lesson). Ungated (`group: None`, always advertised) — it's one op, and
@@ -100,7 +100,7 @@ The everyday capability — "read this page" — stops returning markup. The con
 flux-markdown) → readability-style extraction (drop nav/boilerplate/script) → **`flux-markdown`
 AST** → the existing markdown writer.
 
-- `web_fetch` moves into flux-web and upgrades in place: `text/html` responses return condensed
+- `web.fetch` moves into flux-web and upgrades in place: `text/html` responses return condensed
   markdown (capped *after* condensation, so the budget buys content, not tags); non-HTML stays
   raw; `raw: true` escape hatch.
 - A pure op `html_to_markdown` (no egress) composes in flux-lang:
@@ -168,7 +168,7 @@ No off switch — this *is* the policy (no-fallbacks rule).
 
 - **Determinism / Time Machine:** all of this is ordinary ops through normal dispatch, so outputs
   ride the C-43 cassette — a browsing run replays hermetically and forks/diffs like any other run.
-- **The `websearch` plugin and native `web_search` are untouched** (non-goal); a later story may
+- **The `websearch` plugin and native `web.search` are untouched** (non-goal); a later story may
   fold search into flux-web for symmetry, but nothing here depends on it.
 - **Vision:** screenshots are a **non-goal** for v1 — `ToolResult` is text-only (the flux-render
   constraint), and the non-visual digest is the product thesis; revisit only if a multimodal
@@ -224,11 +224,11 @@ circumvention; multi-tab orchestration beyond one page per session; replacing/mo
 shipped in a deliberately bounded form:
 
 - **`web.crawl` (D-160)** — a **bounded, same-host** breadth-first crawl over the same egress
-  envelope as `web_fetch` (every hop guarded by `guard_url_scoped` + `send_guarded`). It stays
+  envelope as `web.fetch` (every hop guarded by `guard_url_scoped` + `send_guarded`). It stays
   within the original non-goal's spirit: `max_pages` (≤ 50) and `max_depth` (≤ 5) caps, same-host
   only, and still **no robots.txt/sitemaps, no cross-host crawl, no JS rendering** (that remains the
   tier-3 `browser.*` path). The general "unbounded/cross-host spidering" non-goal stands.
-- **PDF text extraction in `web_fetch` (D-161)** — a PDF response (declared `application/pdf` or
+- **PDF text extraction in `web.fetch` (D-161)** — a PDF response (declared `application/pdf` or
   `%PDF` magic-byte sniff) is returned as extracted text instead of a raw byte dump, via a pure-Rust
   extractor with a panic-safe raw fallback. Datasource *file* ingestion of PDFs remains deferred
   (D-50); this covers only the web-fetch path.
@@ -239,6 +239,6 @@ Union of D-98 + D-120…D-124, plus the epic demo: against a live JS-rendered si
 completes a realistic task ("find X and submit the form") **without ever receiving HTML source** —
 first observation is one bounded digest, every subsequent observation is a delta — while a blocked
 private-net subresource shows up as a policy refusal in the digest and `PrivateNetAdmit`/deny
-events audit correctly. `web_fetch` returns markdown for HTML pages; the whole family answers to
+events audit correctly. `web.fetch` returns markdown for HTML pages; the whole family answers to
 the one `[private_net] web` scope (the per-tool special case is gone from `flux-cli`/`flux-config`);
 on a machine without Chromium the browser ops don't appear in the catalog at all.

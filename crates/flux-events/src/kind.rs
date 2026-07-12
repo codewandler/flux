@@ -113,7 +113,7 @@ pub enum EventKind {
 
     /// The host admitted an egress request to a **private/internal** address under a scoped
     /// private-network grant — the auditable security event. `caller` is the plugin name (or
-    /// `"web_fetch"`); `host` is the private host that was reached; `grant_source` names the grant
+    /// `"web.fetch"`); `host` is the private host that was reached; `grant_source` names the grant
     /// that let it through (e.g. `"config:plugin/<name>"` or `"config:endpoint/<plugin>:<ep>"`).
     PrivateNetAdmit {
         caller: String,

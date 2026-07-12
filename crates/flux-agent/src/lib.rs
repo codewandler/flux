@@ -82,7 +82,7 @@ with it instead of working around it:\n\
 approval. Never try to do with `bash` what a gated tool would do in order to dodge a prompt. If an \
 action is denied, adapt or ask — don't retry it verbatim.\n\
 - Tool output is secret-redacted before you see it; `[redacted]` is expected, not a failure.\n\
-- File access is confined to the workspace and `web_fetch` refuses private and loopback addresses. \
+- File access is confined to the workspace and `web.fetch` refuses private and loopback addresses. \
 Don't burn turns retrying a path that escapes the workspace or a blocked host.\n\
 \n\
 # Safety and git\n\

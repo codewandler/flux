@@ -96,7 +96,7 @@ Interactive runs prompt; `--yes` answers every gate “yes,” including destruc
 DNS is resolved before a request and private, loopback, link-local, unique-local, and internal hosts
 are refused by default.
 
-- `[private_net] web` covers the entire native web family: `http.request`, `web_fetch`, and
+- `[private_net] web` covers the entire native web family: `http.request`, `web.fetch`, and
   `browser.*`. Use a host list, or `true` for any private address.
 - `[private_net.plugins]` is keyed by plugin manifest name. The host intersects the operator grant
   with hosts declared by that plugin.

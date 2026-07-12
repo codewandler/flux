@@ -90,7 +90,7 @@ fallback -> $value
   branch
     $value = read("cache.json")
   branch
-    $value = web_fetch($url)
+    $value = web.fetch($url)
 ```
 
 - A branch **error or empty result** falls through to the next branch.

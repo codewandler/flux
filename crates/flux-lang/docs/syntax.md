@@ -813,7 +813,7 @@ the session store, atomically, keyed by the required name. The header is
 
 ```flux
 throttle "fetches" 5 per 60000
-  web_fetch($url)
+  web.fetch($url)
 ```
 
 ### debounce

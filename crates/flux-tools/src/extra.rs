@@ -1,10 +1,10 @@
-//! Extra built-in tools: file_stat, path_exists, sqlite_query, web_search, home_dir, now, cwd,
+//! Extra built-in tools: file_stat, path_exists, sqlite_query, web.search, home_dir, now, cwd,
 //! sys_info.
 //!
 //! - `file_stat`    — file metadata (size, line count, mtime, mode). Risk: Low.
 //! - `path_exists`  — pure filesystem probe. Risk: Low.
 //! - `sqlite_query` — read-only SQLite query (no INSERT/UPDATE/DELETE/DROP/ALTER). Risk: Low.
-//! - `web_search`   — Tavily web search API. Risk: Low, goes through guard_url.
+//! - `web.search`   — Tavily web search API. Risk: Low, goes through guard_url.
 //! - `home_dir`     — the user's home directory. Risk: Low.
 //! - `now`          — current wall-clock time (unix seconds + UTC). Replaces `date`. Risk: Low.
 //! - `cwd`          — the workspace root path. Replaces `pwd`. Risk: Low.
@@ -357,12 +357,12 @@ impl Tool for SqliteQueryTool {
 }
 
 // ---------------------------------------------------------------------------
-// web_search (Tavily)
+// web.search (Tavily)
 // ---------------------------------------------------------------------------
 
 pub struct WebSearchTool;
 
-/// Arguments for the `web_search` op.
+/// Arguments for the `web.search` op.
 #[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -381,7 +381,7 @@ struct WebSearchInput {
 impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "web_search".into(),
+            name: "web.search".into(),
             description: "Search the web via Tavily and return a ranked list of results \
                           (title, URL, snippet, score). Requires the environment variable \
                           `TAVILY_API_KEY` (or pass it as `api_key`). Optional `max_results` \
@@ -402,8 +402,8 @@ impl Tool for WebSearchTool {
         let q = params
             .get("query")
             .and_then(|v| v.as_str())
-            .unwrap_or("web_search");
-        vec![format!("web_search:{q}")]
+            .unwrap_or("web.search");
+        vec![format!("web.search:{q}")]
     }
 
     fn intents(&self, params: &Value) -> IntentSet {
@@ -424,7 +424,7 @@ impl Tool for WebSearchTool {
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("web_search: required param `query` missing".into()))?;
+            .ok_or_else(|| Error::Other("web.search: required param `query` missing".into()))?;
         let max_results = params
             .get("max_results")
             .and_then(|v| v.as_u64())
@@ -437,7 +437,7 @@ impl Tool for WebSearchTool {
             .or_else(|| std::env::var("TAVILY_API_KEY").ok())
             .ok_or_else(|| {
                 Error::Other(
-                    "web_search: TAVILY_API_KEY env var not set and no `api_key` param provided"
+                    "web.search: TAVILY_API_KEY env var not set and no `api_key` param provided"
                         .to_string(),
                 )
             })?;
@@ -445,12 +445,12 @@ impl Tool for WebSearchTool {
         // Guard the URL through flux_system's net guard.
         let endpoint = "https://api.tavily.com/search";
         flux_system::net::guard_url(endpoint, false)
-            .map_err(|e| Error::Other(format!("web_search: URL guard rejected endpoint: {e}")))?;
+            .map_err(|e| Error::Other(format!("web.search: URL guard rejected endpoint: {e}")))?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| Error::Other(format!("web_search: failed to build HTTP client: {e}")))?;
+            .map_err(|e| Error::Other(format!("web.search: failed to build HTTP client: {e}")))?;
 
         let body = json!({
             "api_key": api_key,
@@ -466,20 +466,20 @@ impl Tool for WebSearchTool {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Other(format!("web_search: HTTP request failed: {e}")))?;
+            .map_err(|e| Error::Other(format!("web.search: HTTP request failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Ok(ToolResult::error(format!(
-                "web_search: Tavily returned HTTP {status}: {text}"
+                "web.search: Tavily returned HTTP {status}: {text}"
             )));
         }
 
         let json: Value = resp
             .json()
             .await
-            .map_err(|e| Error::Other(format!("web_search: failed to parse response: {e}")))?;
+            .map_err(|e| Error::Other(format!("web.search: failed to parse response: {e}")))?;
 
         let results = json
             .get("results")
