@@ -31,6 +31,11 @@
   time limit (ten minutes by default, adjustable), and cancelling a streamed turn also stops a
   running child. This was already available for one-shot flows; it now works on the conversational
   agent too.
+- **Embedded agents get finer control over tools and long conversations.** An application can now
+  group tools so they're only offered to the model when they're relevant (revealed by a signal it
+  provides), and can set when a long conversation gets automatically summarized to stay within the
+  model's context window. These controls already governed the `flux` CLI; they're now available when
+  embedding an agent too.
 
 ### Action needed
 

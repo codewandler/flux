@@ -38,6 +38,16 @@ All notable changes to this project are documented in this file. The format is b
   child. New `flux_sdk::subagents` re-export module names the bundle types (`SubAgents`,
   `SpawnLimits`, `Role`, `RoleRegistry`, `ProviderFactory`, `parse_role`). `flux-orchestrate` becomes
   a directly-named (not just transitive) dependency of `flux-sdk`.
+- **D-149: `AgentSpec` surfacing + compaction knobs on `ClientBuilder`** (sdk-surface wave 2). The
+  builder gains the `AgentSpec` pass-throughs the CLI already uses but the SDK hardcoded:
+  `groups(impl IntoIterator<Item = ToolGroup>)` (evidence-gated tool surfacing — an op named in a
+  group's `tools` is advertised to the model only once the group's `surface_when` signal fires,
+  sticky-monotonic per session; empty disables gating), `ambient_signals(...)` (host-known signals
+  the per-turn workspace walk can't see, appended to every turn's probe), `with_compaction(chars)`
+  (summarize older turns past a serialized-char threshold; `0` disables), and `context_budget(bytes)`
+  (byte cap on rendered inline `add_context` knowledge blocks). Pure builder overlay onto the
+  existing `AgentSpec` — no engine change. `flux_sdk::observe` additionally re-exports `SignalMatch`
+  and `KIND_SIGNAL` (needed to construct a gating `ToolGroup`, which appears in `groups`'s signature).
 
 ## [0.16.1] - 2026-07-11
 

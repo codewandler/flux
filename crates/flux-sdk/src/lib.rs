@@ -81,11 +81,17 @@ pub mod approval {
 }
 
 /// **Session observability.** The projection types [`Session`] readers return, plus the stores
-/// [`Storage::custom`] accepts. (Cost/turn/trace projection readers land in wave 2.)
+/// [`Storage::custom`] accepts, plus the evidence-gated surfacing types
+/// [`ClientBuilder::groups`] takes. (Cost/turn/trace projection readers land in wave 2.)
+///
+/// A gating [`ToolGroup`](flux_evidence::ToolGroup) hides its `tools` until a
+/// [`SignalMatch`](flux_evidence::SignalMatch) fires — build one with
+/// `SignalMatch { kind: KIND_SIGNAL.to_string(), signal: Some("my_signal".into()) }` and surface it
+/// via [`ClientBuilder::ambient_signals`] or a workspace signal.
 pub mod observe {
     pub use flux_core::Message;
     pub use flux_events::EventStore;
-    pub use flux_evidence::{Observation, ToolGroup};
+    pub use flux_evidence::{Observation, SignalMatch, ToolGroup, KIND_SIGNAL};
     pub use flux_flow::state::FlowStore;
 }
 
@@ -322,6 +328,46 @@ impl ClientBuilder {
         body: impl Into<String>,
     ) -> Self {
         self.spec.context.push(ContextBlock::new(id, title, body));
+        self
+    }
+    /// Set the evidence-gated tool groups. Each turn the workspace is probed for signals and only
+    /// ops whose group has surfaced are advertised to the model; an op named in a group's `tools`
+    /// stays hidden until that group's `surface_when` signal fires (surfacing is sticky-monotonic
+    /// within a session). Empty (the default) disables gating — every op is advertised. Name a group
+    /// with [`ToolGroup`](observe::ToolGroup) (re-exported via [`observe`]); pair with
+    /// [`ambient_signals`](Self::ambient_signals) for signals the per-turn workspace walk can't see.
+    pub fn groups<I>(mut self, groups: I) -> Self
+    where
+        I: IntoIterator<Item = flux_evidence::ToolGroup>,
+    {
+        self.spec.groups = groups.into_iter().collect();
+        self
+    }
+    /// Add session-ambient group-surfacing signals (D-115): host-known facts the per-turn workspace
+    /// walk can't observe (e.g. "an endpoints store is loaded"). Appended to every turn's probed
+    /// signals, so a startup-static value is enough to surface its [`groups`](Self::groups). Empty by
+    /// default.
+    pub fn ambient_signals<I, S>(mut self, signals: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.spec.ambient_signals = signals.into_iter().map(Into::into).collect();
+        self
+    }
+    /// Set the compaction threshold in serialized chars: once a persisted session grows past it,
+    /// older turns are summarized into a durable digest before the next request (A-22), instead of
+    /// re-sending an ever-growing transcript. `0` disables compaction. Defaults to
+    /// `flux_agent::DEFAULT_COMPACT_THRESHOLD_CHARS` (matching the CLI).
+    pub fn with_compaction(mut self, threshold_chars: usize) -> Self {
+        self.spec.compact_threshold_chars = threshold_chars;
+        self
+    }
+    /// Set the byte budget for the rendered inline `context` knowledge blocks
+    /// ([`add_context`](Self::add_context)); over-budget blocks truncate with a marker. `0` =
+    /// unbounded. Defaults to `flux_agent::DEFAULT_CONTEXT_BUDGET`.
+    pub fn context_budget(mut self, bytes: usize) -> Self {
+        self.spec.context_budget = bytes;
         self
     }
 
@@ -1614,6 +1660,127 @@ mod tests {
         assert_eq!(
             usage.output_tokens, 200,
             "the sub-agent's output tokens landed in the session's run trace"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gated custom op with a distinctive name unlikely to collide with prompt boilerplate, so a
+    /// catalog-capturing test can assert its presence/absence in the advertised op catalog.
+    struct WidgetTool;
+    #[async_trait]
+    impl Tool for WidgetTool {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "zzquux_probe",
+                "a gated probe op",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            )
+        }
+        async fn execute(
+            &self,
+            _c: &ToolContext,
+            _params: serde_json::Value,
+        ) -> Result<flux_runtime::ToolResult> {
+            Ok(flux_runtime::ToolResult::ok("ok"))
+        }
+    }
+
+    /// D-149: `ClientBuilder::groups` + `ambient_signals` gate an op behind an evidence signal — it
+    /// is absent from the advertised op catalog until its group surfaces. `ToolGroup`/`SignalMatch`/
+    /// `KIND_SIGNAL` are named via `flux_sdk::observe` (acceptance 3). Mirrors the engine's
+    /// evidence-gated surfacing, driven entirely through the SDK builder.
+    #[tokio::test]
+    async fn groups_gate_an_op_until_its_ambient_signal_surfaces() {
+        use crate::observe::{SignalMatch, ToolGroup, KIND_SIGNAL};
+
+        let dir = std::env::temp_dir().join(format!("flux-sdk-groups-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let group = ToolGroup {
+            name: "widgets".into(),
+            description: String::new(),
+            tools: vec!["zzquux_probe".into()],
+            surface_when: vec![SignalMatch {
+                kind: KIND_SIGNAL.to_string(),
+                signal: Some("widgets_on".into()),
+            }],
+        };
+
+        // Gated: no signal fires → the op stays hidden from the catalog the model sees.
+        let systems_gated = Arc::new(Mutex::new(Vec::new()));
+        let client = Client::builder()
+            .model("mock")
+            .register_op(Arc::new(WidgetTool))
+            .groups([group.clone()])
+            .build(
+                Box::new(SystemCaptureMock {
+                    systems: systems_gated.clone(),
+                }),
+                &dir,
+            )
+            .unwrap();
+        client.run("hi").await.unwrap();
+        let gated = systems_gated.lock().unwrap().join("\n");
+        assert!(
+            !gated.contains("zzquux_probe"),
+            "the gated op must be absent from the catalog until its signal fires"
+        );
+
+        // Surfaced: the ambient signal is present → the op joins the advertised catalog.
+        let systems_on = Arc::new(Mutex::new(Vec::new()));
+        let client = Client::builder()
+            .model("mock")
+            .register_op(Arc::new(WidgetTool))
+            .groups([group])
+            .ambient_signals(["widgets_on"])
+            .build(
+                Box::new(SystemCaptureMock {
+                    systems: systems_on.clone(),
+                }),
+                &dir,
+            )
+            .unwrap();
+        client.run("hi").await.unwrap();
+        let surfaced = systems_on.lock().unwrap().join("\n");
+        assert!(
+            surfaced.contains("zzquux_probe"),
+            "the op must be advertised once its group's signal surfaces:\n{surfaced}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-149: `ClientBuilder::with_compaction` sets the threshold past which older turns are
+    /// summarized. With a tiny threshold, a few turns trip compaction and a `context.compacted`
+    /// observation lands in the session's evidence. `Observation` is named via `flux_sdk::observe`.
+    #[tokio::test]
+    async fn with_compaction_trips_and_records_a_context_compacted_observation() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Tiny threshold: any real conversation exceeds it, so compaction trips as soon as there are
+        // enough messages (the engine needs ≥ 4 before it will summarize).
+        let client = Client::builder()
+            .model("mock")
+            .with_compaction(10)
+            .build(Box::new(ProseMock { text: "ok" }), &dir)
+            .unwrap();
+
+        // Three turns: by the third, the persisted conversation has ≥ 4 messages and far exceeds the
+        // 10-char threshold, so compaction runs before that turn plans.
+        for _ in 0..3 {
+            client.run("tell me something").await.unwrap();
+        }
+
+        let sid = client.session_id().unwrap();
+        let obs = client.event_store().observations(&sid).unwrap();
+        let compacted: Option<&crate::observe::Observation> =
+            obs.iter().find(|o| o.kind == "context.compacted");
+        let compacted = compacted.expect("a context.compacted observation must be recorded");
+        assert!(
+            compacted.data["from_messages"].as_u64().unwrap()
+                > compacted.data["to_messages"].as_u64().unwrap(),
+            "compaction shrank the message count: {:?}",
+            compacted.data
         );
 
         std::fs::remove_dir_all(&dir).ok();
