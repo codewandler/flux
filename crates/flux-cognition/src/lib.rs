@@ -26,7 +26,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
-use flux_core::{Chunk, Error, Result};
+use flux_core::{Chunk, Error, Result, Usage};
+use flux_evidence::{Observation, Phase};
 use flux_lang::ast::{FlowEffect, TypeRef};
 use flux_lang::opspec::{OpSpec, Param};
 use flux_provider::{Provider, Request};
@@ -267,15 +268,31 @@ impl Tool for CognitionOp {
             .with_risk(Risk::Low)
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let prompt = self.kind.prompt(&params)?;
-        let out = run_model(
+        let (out, usage) = run_model(
             self.provider.as_ref(),
             &self.model,
             self.kind.system(),
             &prompt,
         )
         .await?;
+        // A cognition op is a real model call, but its token spend can't ride back through
+        // `ToolResult` (a plain string). Record it on the shared evidence log — the same side-channel
+        // `subagent.usage` uses — so a `FlowClient` run can sum what its cognition ops cost
+        // (`ExecutionResult.usage`, D-150). A call the provider reported no usage for (e.g. the `mock`
+        // provider) records nothing, so a free run stays `usage: None`.
+        if usage.total() > 0 {
+            ctx.evidence.lock().unwrap().record(Observation::new(
+                "cognition.usage",
+                Phase::Turn,
+                serde_json::json!({
+                    "op": self.kind.opspec().name,
+                    "model": self.model,
+                    "usage": usage,
+                }),
+            ));
+        }
         Ok(ToolResult::ok(out))
     }
 }
@@ -309,25 +326,30 @@ impl CognitionPack {
     }
 }
 
-/// One single-shot text completion: stream and collect every [`Chunk::TextDelta`] (mirrors the
-/// `run_model` helper in `flux-flow`'s compiler).
+/// One single-shot text completion: stream and collect every [`Chunk::TextDelta`] plus the call's
+/// [`Usage`] (mirrors the `run_model` helper in `flux-flow`'s compiler). Provider usage chunks are
+/// cumulative within one call, so the last one wins; a provider that reports none yields a zero
+/// `Usage` (the caller records no observation for it).
 async fn run_model(
     provider: &dyn Provider,
     model: &str,
     system: &str,
     prompt: &str,
-) -> Result<String> {
+) -> Result<(String, Usage)> {
     let req = Request::new(model.to_string(), prompt.to_string())
         .with_system(system.to_string())
         .with_max_tokens(MAX_TOKENS);
     let mut stream = provider.stream(req).await?;
     let mut out = String::new();
+    let mut usage = Usage::default();
     while let Some(chunk) = stream.next().await {
-        if let Chunk::TextDelta(t) = chunk? {
-            out.push_str(&t);
+        match chunk? {
+            Chunk::TextDelta(t) => out.push_str(&t),
+            Chunk::Usage(u) => usage = u,
+            _ => {}
         }
     }
-    Ok(out)
+    Ok((out, usage))
 }
 
 /// A required, non-optional param.
@@ -571,5 +593,73 @@ mod tests {
             .execute(&ctx(), json!({ "evidence": "some evidence" }))
             .await;
         assert!(err.is_err());
+    }
+
+    /// A provider that bills a fixed [`Usage`] — so a cognition op's model call has spend to record.
+    struct UsageProvider(Usage);
+    #[async_trait]
+    impl Provider for UsageProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            let chunks = vec![
+                Ok(Chunk::TextDelta("[]".into())),
+                Ok(Chunk::Usage(self.0.clone())),
+                Ok(Chunk::Done { stop_reason: None }),
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// D-150: a cognition op's model call was billing tokens that got dropped on the floor. It now
+    /// records a `cognition.usage` observation (op + model + the call's `Usage`) on the shared
+    /// evidence log — the side-channel a `FlowClient` run reads to sum `ExecutionResult.usage`.
+    #[tokio::test]
+    async fn cognition_op_records_a_usage_observation_when_the_call_bills() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        let mut reg = ToolRegistry::new();
+        CognitionPack::new(Arc::new(UsageProvider(usage)), "test-model").register(&mut reg);
+        let ctx = ctx();
+        reg.get("ai.extract")
+            .unwrap()
+            .execute(&ctx, json!({ "from": "x", "ask": "y" }))
+            .await
+            .unwrap();
+
+        let log = ctx.evidence.lock().unwrap();
+        let recorded: Vec<&Observation> = log.by_kind("cognition.usage").collect();
+        assert_eq!(recorded.len(), 1, "one usage observation per model call");
+        assert_eq!(recorded[0].data["op"], "ai.extract");
+        assert_eq!(recorded[0].data["model"], "test-model");
+        let u: Usage = serde_json::from_value(recorded[0].data["usage"].clone()).unwrap();
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 20);
+    }
+
+    /// A free call (the `mock` provider reports no usage) records nothing — so a free run stays
+    /// `ExecutionResult.usage: None` instead of a bogus zero-usage entry.
+    #[tokio::test]
+    async fn cognition_op_records_nothing_when_the_call_is_free() {
+        let (_pack, reg) = pack("[]"); // MockProvider bills no usage
+        let ctx = ctx();
+        reg.get("ai.extract")
+            .unwrap()
+            .execute(&ctx, json!({ "from": "x" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.evidence
+                .lock()
+                .unwrap()
+                .by_kind("cognition.usage")
+                .count(),
+            0,
+            "a call the provider billed nothing for records no usage observation"
+        );
     }
 }

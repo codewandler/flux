@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use flux_cognition::CognitionPack;
-use flux_core::{Error, Result};
+use flux_core::{Error, Result, Usage};
 use flux_flow::ast::SymbolName;
 use flux_flow::compile::{compile as compile_flow, CompileOptions};
 use flux_flow::registry::{analyze_composites, OpRegistry};
@@ -400,7 +400,7 @@ impl FlowClient {
             .await
         }
         .map_err(|e| Error::Other(e.to_string()))?;
-        finish_outcome(outcome, sink)
+        finish_outcome(outcome, sink, cognition_usage(&executor))
     }
 
     /// Execute `ast` with `inputs` seeded as flow variables (`$name`) **before** the run — the
@@ -446,7 +446,7 @@ impl FlowClient {
             .await
         }
         .map_err(|e| Error::Other(e.to_string()))?;
-        finish_outcome(outcome, sink)
+        finish_outcome(outcome, sink, cognition_usage(&executor))
     }
 
     /// Lower an AST to an optimizer [`PhysicalPlan`]: `analyze::lower` (validate + gather effects)
@@ -513,6 +513,7 @@ impl FlowClient {
             transcript: outcome.transcript,
             steps: outcome.steps,
             tool_calls: sink.tool_calls,
+            usage: cognition_usage(&executor),
         })
     }
 
@@ -586,8 +587,13 @@ impl FlowClient {
 }
 
 /// The outcome of [`FlowClient::execute`]: the rendered result, the model-facing transcript (every
-/// node's view), the dispatched op count, and the op names invoked.
+/// node's view), the dispatched op count, the op names invoked, and the token spend of any model
+/// calls inside the flow.
+///
+/// `#[non_exhaustive]`: fields are added as the SDK grows (wave 2 added `usage`), so construct it
+/// only via the SDK and match with a `..` rest pattern.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ExecutionResult {
     /// The flow's result rendered as text — the last node's view, or an explicit `return`'s value.
     pub result: String,
@@ -597,6 +603,13 @@ pub struct ExecutionResult {
     pub steps: usize,
     /// The op names invoked, in dispatch order.
     pub tool_calls: Vec<String>,
+    /// Summed token usage of the model-backed cognition ops (`ai.extract`/`rank`/`judge`/`reason`,
+    /// `synth`, `ai.rewrite`) dispatched during the run — `None` if the flow made no model call, or
+    /// the provider reported no usage (e.g. the `mock` provider). Each cognition op is an
+    /// **independent** single-shot completion with its own prompt, so — unlike the agent loop's
+    /// re-sent conversation (`Usage::accumulate`, input last-wins) — every field is **summed** here:
+    /// two `ai.extract` calls billing 100 input each report 200 input.
+    pub usage: Option<Usage>,
 }
 
 impl ExecutionResult {
@@ -637,8 +650,13 @@ fn join_diags(diags: &[Diagnostic]) -> String {
 /// suspension as an error: the one-shot `FlowClient` path has no resume hook, so a half-run suspended
 /// flow (its prefix's side effects fired, the remainder never will) is reported rather than silently
 /// returned — durable cross-turn `await` flows belong on the resumable session door. Shared by
-/// [`FlowClient::execute`] and [`FlowClient::execute_with`] so the two can't drift.
-fn finish_outcome(outcome: FlowOutcome, sink: ExecSink) -> Result<ExecutionResult> {
+/// [`FlowClient::execute`] and [`FlowClient::execute_with`] so the two can't drift. `usage` is the
+/// run's summed cognition spend (see [`cognition_usage`]).
+fn finish_outcome(
+    outcome: FlowOutcome,
+    sink: ExecSink,
+    usage: Option<Usage>,
+) -> Result<ExecutionResult> {
     if let Some(susp) = &outcome.suspension {
         return Err(Error::Other(format!(
             "flow suspended on a top-level `await` (source `{}`); the one-shot `FlowClient::execute` \
@@ -652,7 +670,38 @@ fn finish_outcome(outcome: FlowOutcome, sink: ExecSink) -> Result<ExecutionResul
         transcript: outcome.transcript,
         steps: outcome.steps,
         tool_calls: sink.tool_calls,
+        usage,
     })
+}
+
+/// Sum the token spend of the cognition ops dispatched during a run. Each `CognitionOp` records a
+/// `cognition.usage` observation on the shared evidence log (D-150); this reads them back off the
+/// executor's log and **sums every field** — cognition calls are independent single-shot completions
+/// (distinct prompts), not a re-sent conversation, so `Usage::accumulate`'s input-last-wins would
+/// undercount. `None` when no cognition op billed anything (a pure-ops flow, or a free provider).
+fn cognition_usage(executor: &Executor) -> Option<Usage> {
+    let mut total = Usage::default();
+    let mut any = false;
+    for obs in executor.evidence().by_kind("cognition.usage") {
+        if let Some(u) = obs
+            .data
+            .get("usage")
+            .and_then(|v| serde_json::from_value::<Usage>(v.clone()).ok())
+        {
+            total.input_tokens += u.input_tokens;
+            total.output_tokens += u.output_tokens;
+            total.cache_creation_input_tokens += u.cache_creation_input_tokens;
+            total.cache_read_input_tokens += u.cache_read_input_tokens;
+            total.reasoning_tokens += u.reasoning_tokens;
+            total.audio_input_tokens += u.audio_input_tokens;
+            total.audio_output_tokens += u.audio_output_tokens;
+            if let Some(c) = u.reported_cost_usd {
+                *total.reported_cost_usd.get_or_insert(0.0) += c;
+            }
+            any = true;
+        }
+    }
+    any.then_some(total)
 }
 
 #[cfg(test)]
@@ -1458,5 +1507,86 @@ flow main
         assert!(client.prelude_defs().as_object().unwrap().is_empty());
         client.register_prelude(prelude::prelude_schema());
         assert!(client.prelude_defs().get("Answer").is_some());
+    }
+
+    /// A provider that bills a fixed [`Usage`] on every call — so a cognition op's model call has
+    /// token spend to record. Reusable across calls (a two-`ai.extract` flow calls it twice).
+    struct UsageMock(Usage);
+    #[async_trait]
+    impl Provider for UsageMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, _req: Request) -> CoreResult<ChunkStream> {
+            let chunks = vec![
+                Ok(Chunk::TextDelta("[]".into())),
+                Ok(Chunk::Usage(self.0.clone())),
+                Ok(Chunk::Done { stop_reason: None }),
+            ];
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// D-150: a flow's model calls report their token spend. Two `ai.extract` calls each bill
+    /// 100/20; `ExecutionResult.usage` sums them (independent calls → every field summed, so 200/40).
+    /// A pure-ops flow (no model call) reports `None`.
+    #[tokio::test]
+    async fn execution_result_sums_cognition_usage_and_none_for_pure_ops() {
+        let per_call = Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        let client = FlowClient::builder()
+            .model("test-model")
+            .auto_approve(true) // cognition ops egress, so they gate by default
+            .build(Arc::new(UsageMock(per_call)), temp_root("cog-usage"))
+            .unwrap();
+
+        // Two independent `ai.extract` calls.
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "call", "op": "ai.extract",
+                  "args": [{ "kind": "lit", "value": { "from": "Alice and Bob", "ask": "names" } }] },
+                { "kind": "call", "op": "ai.extract",
+                  "args": [{ "kind": "lit", "value": { "from": "Carol and Dave", "ask": "names" } }] }
+            ]
+        }))
+        .unwrap();
+        let out = client.execute(&ast).await.unwrap();
+        assert_eq!(out.tool_calls, vec!["ai.extract", "ai.extract"]);
+        let usage = out
+            .usage
+            .expect("a flow with model calls reports summed usage");
+        assert_eq!(
+            usage.input_tokens, 200,
+            "two 100-token calls sum (independent prompts, not last-wins)"
+        );
+        assert_eq!(usage.output_tokens, 40, "two 20-token calls sum");
+
+        // A pure-ops flow makes no model call → no usage.
+        let root = temp_root("pure-ops");
+        std::fs::write(root.join("note.txt"), "hi").unwrap();
+        let pure = FlowClient::builder()
+            .model("test-model")
+            .auto_approve(true)
+            .build(Arc::new(UsageMock(Usage::default())), &root)
+            .unwrap();
+        let read_ast: DraftAst = serde_json::from_value(json!({
+            "body": [
+                { "kind": "call", "op": "read",
+                  "args": [{ "kind": "lit", "value": "note.txt" }] }
+            ]
+        }))
+        .unwrap();
+        let out = pure.execute(&read_ast).await.unwrap();
+        assert_eq!(out.tool_calls, vec!["read"]);
+        assert!(
+            out.usage.is_none(),
+            "a flow with no model call reports no usage: {:?}",
+            out.usage
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

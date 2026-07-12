@@ -33,13 +33,18 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   provides), and can set when a long conversation gets automatically summarized to stay within the
   model's context window. These controls already governed the `flux` CLI; they're now available when
   embedding an agent too.
+- **Flow runs now report what their AI steps cost.** When a flow uses model-backed steps (extract,
+  rank, judge, reason, synthesize, rewrite), the result now includes the total token usage of those
+  calls — so an application can measure and bill the spend of a flow. A flow with no AI steps reports
+  no usage.
 
 ### Action needed
 
-- **Embedding flux? The turn result type gained a field.** The result an embedded turn returns now
-  carries a `suspended` flag (whether the conversation is waiting on an answer) and is marked
-  non-exhaustive. If your code built that result by hand or matched all of its fields, add a `..`
-  catch-all — a one-line change. Nothing changes for code that only reads the result.
+- **Embedding flux? Two result types gained a field.** The result an embedded *turn* returns now
+  carries a `suspended` flag (whether the conversation is waiting on an answer); the result a *flow*
+  run returns now carries a `usage` total. Both are marked non-exhaustive. If your code built either
+  result by hand or matched all of its fields, add a `..` catch-all — a one-line change. Nothing
+  changes for code that only reads the results.
 
 ## [0.16.1] - 2026-07-11
 

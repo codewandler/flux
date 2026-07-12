@@ -744,6 +744,7 @@ version = "0.16.1"
 dependencies = [
  "async-trait",
  "codewandler-flux-core",
+ "codewandler-flux-evidence",
  "codewandler-flux-lang",
  "codewandler-flux-provider",
  "codewandler-flux-runtime",

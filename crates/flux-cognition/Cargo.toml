@@ -16,6 +16,9 @@ flux-spec.workspace = true
 flux-runtime.workspace = true
 flux-provider.workspace = true
 flux-lang.workspace = true
+# L0 evidence backbone: each model call records a `cognition.usage` observation on the shared
+# evidence log so a `FlowClient` run can sum the token spend of its cognition ops (D-150).
+flux-evidence.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

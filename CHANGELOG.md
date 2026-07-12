@@ -48,6 +48,19 @@ All notable changes to this project are documented in this file. The format is b
   (byte cap on rendered inline `add_context` knowledge blocks). Pure builder overlay onto the
   existing `AgentSpec` — no engine change. `flux_sdk::observe` additionally re-exports `SignalMatch`
   and `KIND_SIGNAL` (needed to construct a gating `ToolGroup`, which appears in `groups`'s signature).
+- **D-150: flow runs report their model-call token spend** (sdk-surface wave 2). Each cognition op
+  (`ai.extract`/`rank`/`judge`/`reason`, `synth`, `ai.rewrite`) was billing tokens that
+  `flux-cognition` dropped on the floor — its `run_model` collected only `TextDelta` and discarded
+  the `Chunk::Usage`. It now captures the call's `Usage` and records a `cognition.usage` observation
+  (op + model + usage) on the shared evidence log — the same side-channel `subagent.usage` uses —
+  when the call billed anything (a free/`mock` call records nothing). `FlowClient::execute`/
+  `execute_with`/`execute_optimized` read those observations back off the executor's evidence and
+  populate a new `ExecutionResult.usage: Option<Usage>`, **summing every field** across the run
+  (cognition calls are independent single-shot completions, so — unlike the agent loop's re-sent
+  conversation — inputs are summed, not last-wins). A pure-ops flow reports `None`. `ExecutionResult`
+  is now `#[non_exhaustive]` (**BREAKING** — MINOR under pre-1.0 SemVer; construct it only via the
+  SDK and match with a `..` rest pattern). `flux-cognition` gains a dependency on the L0
+  `flux-evidence` (layering-legal, verified by `flux-codegate`).
 
 ## [0.16.1] - 2026-07-11
 
