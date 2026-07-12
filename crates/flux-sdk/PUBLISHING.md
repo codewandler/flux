@@ -70,8 +70,9 @@ the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two i
 23. flux-flow           (→ lang, events, runtime, provider, skill, evidence, system, spec, secret, core)
 24. flux-agent          (→ flow, markdown, skill, tools, runtime, provider, events, evidence, core)
 25. flux-orchestrate    (→ agent, flow, …)
-26. flux-sdk            (→ orchestrate, agent, flow, cognition, …)
-27. flux-providers      (→ core, provider)  — the concrete clients (plural)
+26. flux-providers      (→ core, provider, credentials)  — the concrete clients (plural); precedes
+    flux-sdk because the SDK's optional `providers` feature (D-153) depends on it
+27. flux-sdk            (→ orchestrate, agent, flow, cognition, …; optional: providers, credentials)
 28. flux-web            (→ core, runtime, spec, system, plugin, markdown, datasource, evidence)  — the web pack
 ```
 

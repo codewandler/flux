@@ -118,6 +118,41 @@ pub mod pricing {
     pub use flux_credentials::load_pricing_table;
 }
 
+/// **Provider construction** (feature `providers`). Re-exports the concrete LLM backends from
+/// `flux-providers` (`anthropic`/`openai`/`openrouter`/`ollama`/`bedrock`/`codex` + the `spec`
+/// resolver) and adds [`from_spec`](providers::from_spec) — the one-stop shop that turns a model
+/// spec into a ready-to-`build` provider, using the CLI's exact resolution (including the
+/// `claude`/`codex` subscription token sources and the AWS Bedrock chain).
+///
+/// The default build stays provider-agnostic: without this feature `flux-providers` (and its
+/// transitive `flux-credentials`) are not dependencies at all.
+///
+/// ```ignore
+/// # #[cfg(feature = "providers")]
+/// # fn ex() -> flux_core::Result<()> {
+/// let (provider, model) = flux_sdk::providers::from_spec("ollama/qwen3")?;
+/// let client = flux_sdk::Client::builder().model(model).build(provider, ".")?;
+/// # let _ = client; Ok(()) }
+/// ```
+#[cfg(feature = "providers")]
+pub mod providers {
+    pub use flux_providers::{anthropic, bedrock, codex, ollama, openai, openrouter, spec};
+
+    use flux_core::Result;
+    use flux_provider::Provider;
+
+    /// Build a provider from a model spec (`"claude/sonnet"`, `"ollama/qwen3"`, `"openai/gpt-5.5"`,
+    /// or a bare alias like `sonnet`), returning the boxed provider and its **resolved** model id —
+    /// pass both straight to [`ClientBuilder::model`](crate::ClientBuilder::model) +
+    /// [`ClientBuilder::build`](crate::ClientBuilder::build). Wraps
+    /// [`flux_providers::spec::build`], so credentials resolve from the environment exactly as the
+    /// `flux` CLI does.
+    pub fn from_spec(spec: &str) -> Result<(Box<dyn Provider>, String)> {
+        let (native, _provider, model) = spec::build(spec)?;
+        Ok((Box::new(native), model))
+    }
+}
+
 /// **Sub-agents.** Attach named roles to a conversational client with
 /// [`ClientBuilder::with_sub_agents`] (or to a flow client with
 /// [`FlowClient::with_sub_agents`](flow::FlowClient::with_sub_agents)); a turn whose plan calls
@@ -1906,6 +1941,41 @@ mod tests {
         assert!(
             table.rates_for("claude-sonnet-4.6").is_some() || !format!("{table:?}").is_empty(),
             "the loaded table carries the built-in rates"
+        );
+    }
+
+    /// D-153: with the `providers` feature, `flux_sdk::providers::from_spec` builds a working
+    /// provider from a model spec. `ollama/qwen3` needs no credential (local endpoint), so it
+    /// resolves offline; the resolved model id rides back for `ClientBuilder::model`.
+    #[cfg(feature = "providers")]
+    #[test]
+    fn providers_from_spec_builds_a_credential_free_provider() {
+        let (provider, model) =
+            crate::providers::from_spec("ollama/qwen3").expect("ollama needs no credential");
+        assert_eq!(model, "qwen3", "the resolved model id rides back");
+        // A working `Provider` — usable as the `Client::build` argument.
+        let _name = provider.name();
+    }
+
+    /// D-153 / lean-default enforcement (not aspirational): the default build must pull no provider
+    /// batteries. Assert structurally from the manifest — `default = []`, and `flux-providers` /
+    /// `flux-credentials` are `optional` (so `cargo build` with no features links neither, nor their
+    /// transitive deps). A regression here (a battery made non-optional, or added to `default`) fails
+    /// this test rather than silently fattening every downstream default build.
+    #[test]
+    fn default_build_pulls_no_optional_provider_batteries() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains("default = []"),
+            "default features must be empty (provider-agnostic default build)"
+        );
+        assert!(
+            manifest.contains("flux-providers = { workspace = true, optional = true }"),
+            "flux-providers must be optional (the `providers` feature only)"
+        );
+        assert!(
+            manifest.contains("flux-credentials = { workspace = true, optional = true }"),
+            "flux-credentials must be optional (the `pricing` feature only)"
         );
     }
 }

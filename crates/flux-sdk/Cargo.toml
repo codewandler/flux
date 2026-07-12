@@ -51,11 +51,18 @@ futures.workspace = true
 # consumer gets `Session::cost` ergonomics without re-implementing the built-in-plus-overlay resolve.
 # The provider-agnostic default build (`default = []`) pulls none of this.
 flux-credentials = { workspace = true, optional = true }
+# Optional (feature `providers`): the concrete LLM backends + the model-spec resolver behind
+# `flux_sdk::providers`, so `providers::from_spec("claude/sonnet")` is a one-stop shop. The default
+# build stays provider-agnostic (pulls neither this nor its transitive `flux-credentials`).
+flux-providers = { workspace = true, optional = true }
 
 [features]
 default = []
 # `flux_sdk::pricing::load_pricing_table()` — the built-in rate table overlaid by the user's
 # `~/.flux/pricing.toml`, for `Session::cost`.
 pricing = ["dep:flux-credentials"]
+# `flux_sdk::providers::{*, from_spec}` — re-export the concrete backends and build a provider from a
+# model spec (the CLI's exact resolver, incl. the claude/codex subscription token sources).
+providers = ["dep:flux-providers"]
 
 [dev-dependencies]

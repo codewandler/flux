@@ -44,8 +44,10 @@ CRATES=(
   codewandler-flux-flow
   codewandler-flux-agent
   codewandler-flux-orchestrate
-  codewandler-flux-sdk
+  # flux-providers must precede flux-sdk: the SDK's optional `providers` feature (D-153) depends on
+  # it, and crates.io requires an optional dep to already be published.
   codewandler-flux-providers
+  codewandler-flux-sdk
   codewandler-flux-web
 )
 

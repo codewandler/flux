@@ -85,6 +85,16 @@ All notable changes to this project are documented in this file. The format is b
   `flux-credentials` (L1) — codegate-legal, no cycle (`flux-credentials` depends only on the
   `flux-provider` abstraction), and the crates.io publish order already lists credentials before
   providers. Internal refactor: no CLI-visible behavior change.
+- **D-153: SDK `providers` feature — one-stop provider construction** (sdk-surface wave 3). A new
+  opt-in `providers` cargo feature (`default = []`) adds `flux_sdk::providers`, re-exporting the
+  concrete backends (`anthropic`/`openai`/`openrouter`/`ollama`/`bedrock`/`codex` + the D-152 `spec`
+  resolver) and `providers::from_spec("claude/sonnet")` → `(Box<dyn Provider>, resolved_model)`, ready
+  for `Client::builder().model(model).build(provider, root)` — the CLI's exact resolution including
+  the subscription token sources. The default build stays provider-agnostic (pulls neither
+  `flux-providers` nor its transitive `flux-credentials`), now **enforced** by a test that asserts the
+  manifest keeps `default = []` and both batteries `optional`. **Publish-order flip:**
+  `scripts/publish-crates-io.sh` (and `PUBLISHING.md`) now publish `codewandler-flux-providers` before
+  `codewandler-flux-sdk` — crates.io requires the SDK's optional dep to be published first.
 
 ## [0.16.1] - 2026-07-11
 

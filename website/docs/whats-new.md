@@ -42,6 +42,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   efficiency metrics — the same data the `flux` CLI reports — so an application can show or bill a
   conversation's usage. An optional pricing add-on loads your `~/.flux/pricing.toml` rates for the
   cost calculation.
+- **Embedding an agent is now one line to a provider.** An optional providers add-on lets an
+  application turn a model name like `claude/sonnet` or `ollama/qwen3` into a ready-to-use provider —
+  resolving credentials (including Claude/Codex subscriptions and AWS Bedrock) exactly the way the
+  `flux` CLI does — instead of wiring each backend by hand. The default library stays lean and pulls
+  no provider code unless you ask for it.
 
 ### Action needed
 

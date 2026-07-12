@@ -1021,6 +1021,7 @@ dependencies = [
  "codewandler-flux-lang",
  "codewandler-flux-orchestrate",
  "codewandler-flux-provider",
+ "codewandler-flux-providers",
  "codewandler-flux-runtime",
  "codewandler-flux-spec",
  "codewandler-flux-system",
