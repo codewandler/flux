@@ -73,6 +73,18 @@ All notable changes to this project are documented in this file. The format is b
   `PricingTable::builtin()` works without the feature. `flux_sdk::observe` now re-exports the
   projection types (`TurnSummary`, `RunEvent`, `ModelCost`, `EfficiencySummary`) and `PricingTable`
   is re-exported at the crate root.
+- **D-152: model-spec → provider resolution moves into `flux_providers::spec`** (sdk-surface
+  wave 3). `parse_model_spec` and `build_provider` (plus the bare-alias `provider_prefix` and the
+  AWS credential-chain bridge) moved out of `crates/flux-cli/src/main.rs` into a new public
+  `flux_providers::spec` module, so every embedder can resolve a spec the way `flux` does —
+  `spec::build("claude/sonnet")` wires the subscription token source, `spec::build("aws/sonnet")`
+  materializes the AWS chain, bare aliases resolve per each provider's `resolve_model` map. The CLI
+  now delegates through thin wrappers; behavior is byte-identical (the anyhow `.context("… provider")`
+  chain is reproduced as `flux_core::Error` with the same `{:#}` string, and the `parse_model_spec`
+  error snapshots are unchanged). `flux-providers` (L1) gains a same-layer dependency on
+  `flux-credentials` (L1) — codegate-legal, no cycle (`flux-credentials` depends only on the
+  `flux-provider` abstraction), and the crates.io publish order already lists credentials before
+  providers. Internal refactor: no CLI-visible behavior change.
 
 ## [0.16.1] - 2026-07-11
 

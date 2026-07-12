@@ -31,8 +31,6 @@ use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_orchestrate::{ProviderFactory, Role, RoleRegistry, SubAgents, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
-use flux_providers::anthropic::anthropic_from_env;
-use flux_providers::openai::{ollama_api, openai_from_env, openrouter_from_env};
 use flux_runtime::context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_runtime::{
     AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
@@ -981,135 +979,13 @@ fn persist_new_rules(initial: &[String], current: &[String]) {
     }
 }
 
-const KNOWN_PROVIDERS: &[&str] = &[
-    "anthropic",
-    "claude",
-    "openai",
-    "codex",
-    "aws",
-    "openrouter",
-    "openrouter-anthropic",
-    "ollama",
-    "ollama-anthropic",
-];
-
-/// The provider prefix a `provider/model` spec resolves to — the part before `/`, or a bare short
-/// alias mapped to its provider (`sonnet`/`opus`/`haiku`/`fable`/`mock` → `anthropic`, bare
-/// `claude`/`codex`/`aws` → themselves). `None` for a bare word that is not a known alias. The
-/// single source of truth for the bare-alias set, shared by [`parse_model_spec`] and
-/// [`auth_row_for_spec`] so the two can never drift.
-fn spec_provider_prefix(spec: &str) -> Option<&str> {
-    match spec.split_once('/') {
-        Some((p, _)) => Some(p),
-        None => match spec {
-            "sonnet" | "opus" | "haiku" | "fable" | "mock" => Some("anthropic"),
-            "claude" => Some("claude"),
-            "codex" => Some("codex"),
-            "aws" => Some("aws"),
-            _ => None,
-        },
-    }
-}
-
-/// Parse a model spec into `(provider, raw model)` without touching credentials — the pure front
-/// half of [`build_provider`], split out so spec validation is unit-testable (C-49). Accepts a
-/// fully-qualified `provider/model`, or a bare short alias (`sonnet`/`opus`/`haiku`/`fable` →
-/// `anthropic/<alias>`, `claude` → the subscription's sonnet, `codex`/`aws` → that provider's
-/// default model). An empty model after the slash is rejected here, client-side — before C-49 a
-/// spec like `claude/` shipped an empty model id to the API and came back as a confusing HTTP 400.
-fn parse_model_spec(spec: &str) -> Result<(String, String)> {
-    match spec.split_once('/') {
-        Some((p, m)) if KNOWN_PROVIDERS.contains(&p) => {
-            // `codex` and `aws` resolve "" to a documented default model; every other provider
-            // needs the model named.
-            if m.is_empty() && !matches!(p, "codex" | "aws") {
-                let example = match p {
-                    "anthropic" | "claude" => format!("`{p}/sonnet`"),
-                    "openai" => "`openai/gpt-5.5`".to_string(),
-                    _ => format!("`{p}/<model>`"),
-                };
-                bail!("model spec `{spec}` names provider `{p}` but no model — add one, e.g. {example}");
-            }
-            Ok((p.to_string(), m.to_string()))
-        }
-        Some((p, _)) => bail!(
-            "unknown provider `{p}` — use one of: {}",
-            KNOWN_PROVIDERS.join(", ")
-        ),
-        // Bare short aliases only; everything else needs an explicit provider prefix. The alias set
-        // lives in `spec_provider_prefix`; the bare model string is the alias itself for the
-        // anthropic short-names (`sonnet`/`opus`/`haiku`/`fable`/`mock`); bare `claude` gets the
-        // subscription's default (`sonnet`); bare `codex`/`aws` resolve their provider defaults
-        // ("" → ChatGPT-subscription main model / the region's Bedrock profile) downstream.
-        None => match spec_provider_prefix(spec) {
-            Some(provider) => {
-                let model = match provider {
-                    "anthropic" => spec,
-                    "claude" => "sonnet",
-                    _ => "",
-                };
-                Ok((provider.to_string(), model.to_string()))
-            }
-            None => bail!(
-                "model spec `{spec}` has no provider prefix — use `provider/model` \
-                 (e.g. `claude/sonnet`, `anthropic/claude-opus-4-8`, `openai/gpt-5.5`) or a bare \
-                 alias: sonnet, opus, haiku, fable, codex, aws (providers: {})",
-                KNOWN_PROVIDERS.join(", ")
-            ),
-        },
-    }
-}
-
 /// Parse a fully-qualified `provider/model` spec and build the matching provider from environment
-/// credentials. Spec forms and validation live in [`parse_model_spec`].
+/// credentials. Thin delegate to the shared [`flux_providers::spec::build`] (D-152 moved the
+/// mapping into `flux-providers` so every embedder resolves a spec identically); the `?` folds the
+/// library's `flux_core::Error` into the CLI's `anyhow` chain with the same string. Spec forms and
+/// validation live in `flux_providers::spec::parse_model_spec`.
 fn build_provider(spec: &str) -> Result<(NativeProvider, String, String)> {
-    // Returns (native, provider, resolved_model) so callers can reconstruct the canonical
-    // `provider/model` spec (e.g. for cost/subscription detection, which reads the provider prefix).
-    let (provider, model) = parse_model_spec(spec)?;
-
-    let native = match provider.as_str() {
-        "anthropic" => anthropic_from_env().context("anthropic provider")?,
-        "openai" => openai_from_env().context("openai provider")?,
-        "openrouter" => openrouter_from_env().context("openrouter provider")?,
-        // OpenRouter over its native Anthropic Messages endpoint — tool calls come back as
-        // structured `tool_use` blocks instead of leaking as `<tool_call>` text on the Chat path.
-        "openrouter-anthropic" => flux_providers::openrouter::openrouter_anthropic_from_env()
-            .context("openrouter-anthropic provider")?,
-        "ollama" => ollama_api(),
-        // Local ollama over its Anthropic Messages endpoint (latest ollama), for native tool calls.
-        "ollama-anthropic" => flux_providers::ollama::ollama_anthropic_api(),
-        "claude" => {
-            let ts = flux_credentials::claude_token_source().context("claude provider")?;
-            flux_providers::anthropic::claude_oauth(ts)
-        }
-        "codex" => {
-            let ts = flux_credentials::codex_token_source().context("codex provider")?;
-            flux_providers::codex::oauth(ts)
-        }
-        // AWS Bedrock (Anthropic over SigV4), streaming via invoke-with-response-stream. The full
-        // credential chain (env → SSO → IRSA → EKS Pod Identity) is materialized into `AWS_*` env
-        // HERE, in the one factory — so every subcommand that builds a provider (`flux review`,
-        // `flow run`, `preset --run`, the REPL `/model` swap, the sub-agent factory) gets the
-        // chain, not just `build_agent` (C-11). Bedrock bakes the model id into the credential
-        // (it's in the invoke URL), so resolve after the chain sets the region.
-        "aws" => {
-            ensure_aws_chain()?;
-            let m = flux_providers::bedrock::resolve_model(&model);
-            flux_providers::bedrock::bedrock_with_env(m).context("aws provider")?
-        }
-        other => bail!(
-            "unknown provider `{other}` (known: {})",
-            KNOWN_PROVIDERS.join(", ")
-        ),
-    };
-
-    let model = match provider.as_str() {
-        "anthropic" | "claude" => flux_providers::anthropic::resolve_model(&model),
-        "codex" => flux_providers::codex::resolve_model(&model),
-        "aws" => flux_providers::bedrock::resolve_model(&model),
-        _ => model,
-    };
-    Ok((native, provider, model))
+    Ok(flux_providers::spec::build(spec)?)
 }
 
 /// Build the knowledge datasource from the workspace's documentation files (markdown/text), indexed as
@@ -2045,31 +1921,6 @@ impl flux_capabilities::CrossPluginAudit for EventStoreCrossPluginAudit {
             );
         }
     }
-}
-
-/// Materialize the AWS credential chain into env from a **sync** context (C-11): `build_provider`
-/// must stay sync (the sub-agent `Spawner` closure demands it), but the chain resolution (SSO/IRSA
-/// HTTP) is async. Inside the CLI's multi-thread tokio runtime this hops through `block_in_place`;
-/// with no runtime (plain sync callers, tests) it spins a one-shot current-thread runtime. A no-op
-/// when `AWS_ACCESS_KEY_ID` is already set (static env / already materialized).
-fn ensure_aws_chain() -> Result<()> {
-    if std::env::var("AWS_ACCESS_KEY_ID")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(flux_providers::bedrock::materialize_chain_into_env())
-        })?,
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("aws chain: build runtime")?
-            .block_on(flux_providers::bedrock::materialize_chain_into_env())?,
-    }
-    Ok(())
 }
 
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
@@ -8825,11 +8676,12 @@ fn warn_stale_plugins(stale: &[String]) {
 /// listed credential (local `ollama*`, or `aws`, which isn't a listed row).
 fn auth_row_for_spec(spec: &str) -> Option<&'static str> {
     // The offline `mock` provider needs no credential (bare `mock` resolves to `anthropic` in
-    // `spec_provider_prefix` for provider construction, but there is no key to flag here).
+    // `flux_providers::spec::provider_prefix` for provider construction, but there is no key to
+    // flag here).
     if spec == "mock" {
         return None;
     }
-    match spec_provider_prefix(spec)? {
+    match flux_providers::spec::provider_prefix(spec)? {
         "anthropic" => Some("anthropic"),
         "claude" => Some("claude"),
         "openai" => Some("openai"),
@@ -10383,10 +10235,11 @@ mod tests {
 
     /// C-49: spec parsing — bare aliases, bare-provider defaults, and the client-side empty-model
     /// rejection (a spec like `claude/` previously shipped an empty model id to the API and came
-    /// back as a confusing HTTP 400).
+    /// back as a confusing HTTP 400). D-152 moved the parser into `flux-providers`; this asserts the
+    /// CLI's view of the shared function still surfaces the exact provider-error strings.
     #[test]
     fn parse_model_spec_covers_aliases_defaults_and_rejects_empty_models() {
-        let parse = super::parse_model_spec;
+        let parse = flux_providers::spec::parse_model_spec;
         // Bare anthropic short-names carry the alias through as the model.
         assert_eq!(
             parse("sonnet").unwrap(),

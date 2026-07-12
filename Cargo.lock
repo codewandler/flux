@@ -972,6 +972,7 @@ dependencies = [
  "bytes",
  "chrono",
  "codewandler-flux-core",
+ "codewandler-flux-credentials",
  "codewandler-flux-provider",
  "eventsource-stream",
  "futures",

@@ -13,6 +13,10 @@ name = "flux_providers"
 [dependencies]
 flux-core.workspace = true
 flux-provider.workspace = true
+# Same-layer (L1) dep: the `spec` module's `build("claude/…")`/`build("codex/…")` resolve the
+# subscription token sources through flux-credentials. `flux-credentials` depends only on
+# `flux-provider` (the abstraction), not this crate, so there is no cycle (codegate-verified).
+flux-credentials.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

@@ -30,6 +30,11 @@ pub mod ollama;
 pub mod openai;
 pub mod openrouter;
 
+/// Model-spec → provider resolution: parse a `provider/model` spec and build the concrete provider
+/// from environment credentials (including the `claude`/`codex` subscription token sources). The
+/// one place the CLI and every embedder share, so a spec resolves identically everywhere.
+pub mod spec;
+
 /// The OpenAI Realtime (full-duplex, voice-to-voice) provider — WebSocket, behind the `realtime`
 /// feature. See [`flux_provider::realtime`] for the seam it implements.
 #[cfg(feature = "realtime")]
