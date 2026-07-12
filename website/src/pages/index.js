@@ -40,8 +40,8 @@ export default function Home() {
                 that plan through authorization, approval, and guarded IO.
               </p>
               <div className="hero-actions">
-                <Link className="button button--primary button--lg" to="/docs/intro">
-                  Read the docs
+                <Link className="button button--primary button--lg" to="/docs/tutorial">
+                  Start the tutorial
                 </Link>
                 <Link className="button button--secondary button--lg" to="/docs/language/overview">
                   Explore Flux-Lang

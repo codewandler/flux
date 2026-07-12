@@ -114,6 +114,12 @@ completion, hover, and formatting from the `flux-lsp` language server. The
 [Editor setup](./language/editors.md) page has the recipes — Helix is the reference setup, with
 Neovim, Zed, and IntelliJ/TextMate covered too.
 
+## Learn by building
+
+For a guided path through the agent, Flux-Lang, and Flux apps, follow
+[Build your first Flux app](./tutorial.md). The tutorial assumes only basic terminal skills and
+ends with a real model-backed assistant that answers from local Markdown documentation.
+
 ## Contributor setup
 
 Building from a checkout, the full repository gate is:
@@ -131,6 +137,7 @@ repository's internal `docs/` map and `AGENTS.md`.
 
 ## Related docs
 
+- [Beginner tutorial](./tutorial.md) — build a guarded agent task, reusable flow, and local app.
 - [Concepts](./concepts.md) — the plan-first execution model.
 - [CLI](./agent/cli.md) — the command surface after the first run.
 - [Safety and approvals](./agent/safety.md) — what prompts and why.

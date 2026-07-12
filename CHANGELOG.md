@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Public beginner tutorial: guarded agent turn → authored Flux-Lang flow → local docs app**
+  (Agent + Language pillars). The website now has a four-part, real-model walkthrough for readers
+  with basic terminal skills: create a small handbook workspace, preview and approve an agent plan,
+  express the grounded question-answering path as a typed flow with an explicit context pack, then
+  combine an agent, CLI channel, Markdown datasource, triggers, and a deterministic startup journey
+  in one runnable app. The sidebar, homepage, overview, and getting-started page all link to the new
+  path; every complete Flux snippet remains covered by the public website parser contract.
+
 ## [0.19.1] - 2026-07-12
 
 ### Added

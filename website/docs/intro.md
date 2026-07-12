@@ -42,7 +42,8 @@ They are useful when contributing, but they are more detailed and more volatile 
 
 ## Start here
 
-- New to flux: read [Getting started](./getting-started.md).
+- New to flux: [build your first Flux app](./tutorial.md) in the guided beginner tutorial.
+- Need only installation and command examples: read [Getting started](./getting-started.md).
 - How a turn works: read [Concepts](./concepts.md) and [The agent loop](./agent/agent-loop.md).
 - How the pieces fit together: see [Infrastructure](./infrastructure.md).
 - What flux is allowed to do: read [Safety & approvals](./agent/safety.md).
@@ -54,6 +55,7 @@ They are useful when contributing, but they are more detailed and more volatile 
 
 ## Related docs
 
+- [Build your first Flux app](./tutorial.md) — go from a guarded agent run to a local docs assistant.
 - [Getting started](./getting-started.md) — install flux and run the mock provider.
 - [Concepts](./concepts.md) — understand plans, symbols, evidence, and the safety envelope.
 - [Infrastructure](./infrastructure.md) — see the runtime, safety boundary, and crate layers at a glance.

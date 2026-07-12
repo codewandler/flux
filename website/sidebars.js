@@ -4,6 +4,17 @@ const sidebars = {
   docs: [
     'intro',
     'getting-started',
+    {
+      type: 'category',
+      label: 'Tutorial',
+      collapsed: false,
+      items: [
+        'tutorial',
+        'tutorial/first-agent',
+        'tutorial/first-flow',
+        'tutorial/first-app',
+      ],
+    },
     'whats-new',
     'concepts',
     'infrastructure',

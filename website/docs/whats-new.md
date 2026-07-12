@@ -12,6 +12,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Learn flux by building a local documentation assistant.** A new four-part beginner tutorial
+  starts with a safely previewed agent task, turns the task into a reusable Flux-Lang flow, and then
+  combines an agent, terminal channel, local Markdown knowledge, triggers, and a journey into a real
+  model-backed app. It assumes only basic terminal skills and explains each safety boundary as it
+  appears.
+
 ## [0.19.1] - 2026-07-12
 
 ### Improved
