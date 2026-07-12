@@ -14,6 +14,7 @@ use flux_events::{EfficiencySummary, ModelCost, TurnSummary};
 use flux_flow::ast::DraftAst;
 use flux_flow::ast::RunEvent;
 use flux_flow::engine::FlowEngine;
+use flux_flow::replay::ReplayReport;
 use flux_flow::voice::{EngineVoiceHandler, VoiceSessionDriver, VoiceSink};
 use flux_flow::AgentSink;
 use flux_provider::{RealtimeConfig, RealtimeProvider};
@@ -218,6 +219,32 @@ impl Session {
             .run_flow_turns(conn, sink, &handler, cancel)
             .await;
         Ok(())
+    }
+
+    /// Hermetically **replay** this recorded session (the time machine): re-run its plans with every
+    /// leaf-op output served from the recorded cassette — **zero live dispatches**, side effects
+    /// never re-fire, the model is never called — streaming the reconstructed turns to `sink`. `turn`
+    /// replays a single 0-based turn; `None` replays the whole session. Returns a [`ReplayReport`]
+    /// (the replayed plans, a divergence diagnostic, and cassette-cell accounting).
+    ///
+    /// Requires a cassette-recorded session — a run that dispatched ops with the cassette on (the
+    /// default; disabled by `FLUX_CASSETTE=0`). A chat-only or pre-cassette session has no cells and
+    /// errors honestly. Because replay serves every op from the cassette, it is safe to run against a
+    /// client built with a deny-all approver and a never-called provider.
+    pub async fn replay(
+        &self,
+        turn: Option<usize>,
+        sink: &mut dyn AgentSink,
+    ) -> Result<ReplayReport> {
+        flux_flow::replay::replay_session(
+            &self.engine.events,
+            &self.engine.executor,
+            &self.id,
+            turn,
+            sink,
+        )
+        .await
+        .map_err(|e| flux_core::Error::Other(e.to_string()))
     }
 }
 

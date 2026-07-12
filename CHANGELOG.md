@@ -119,6 +119,16 @@ All notable changes to this project are documented in this file. The format is b
   re-export module names the types both voice doors take (`VoiceSink`, `VoiceReply`,
   `RealtimeProvider`, `RealtimeConfig`). The existing model-driven `FlowClient::run_voice_session` is
   unchanged; its docs now contrast the two modes.
+- **D-156: `Session::replay` — hermetic time-machine replay in the SDK** (sdk-surface wave 4). The
+  CLI's `flux replay` reaches the SDK: `Session::replay(turn, sink)` wraps
+  `flux_flow::replay::replay_session` over the session's `(events, executor)` — re-running its plans
+  with every leaf-op output served from the recorded cassette (zero live dispatches, side effects
+  never re-fire, the model never called), streaming reconstructed turns to `sink` and returning a
+  `ReplayReport` (plans, divergence, cassette-cell accounting). `turn` replays one 0-based turn or
+  `None` the whole session. A chat-only / pre-cassette session errors honestly ("not replayable").
+  `ReplayReport` is re-exported at the crate root. Verified by a two-client test: one records a
+  plan-running turn, a second (with a never-called provider) replays it hermetically over the same
+  `Storage::dir`.
 
 ## [0.16.1] - 2026-07-11
 

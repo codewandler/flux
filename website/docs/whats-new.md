@@ -56,6 +56,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   caller's spoken answer, and hangs up when the script finishes — with the model handling only speech
   in and out. This complements the existing model-led voice mode, where the model leads and calls
   tools.
+- **Embedded agents can replay a past session.** An application can now hermetically re-run a
+  recorded conversation — every tool result served from the recording, so nothing happens for real
+  and the model is never called — and inspect what it did. The same time-machine replay the `flux`
+  CLI offers, now available when embedding.
 
 ### Action needed
 

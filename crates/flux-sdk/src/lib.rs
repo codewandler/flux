@@ -64,6 +64,10 @@ pub use flux_core::Usage;
 /// `pricing` feature adds [`pricing::load_pricing_table`] to overlay a user's `~/.flux/pricing.toml`.
 pub use flux_core::PricingTable;
 
+/// The report [`Session::replay`] returns — the replayed plans, a divergence diagnostic (`None` on a
+/// faithful replay), and cassette-cell accounting. Re-exported from `flux-flow`.
+pub use flux_flow::replay::ReplayReport;
+
 /// **Custom tools.** Implement [`Tool`](tools::Tool) — or build one from a closure with
 /// [`tool_fn`](tools::tool_fn)/[`FnTool`](tools::FnTool) — and register it with
 /// [`ClientBuilder::register_op`]/[`FlowClient::register_op`]. A registered tool dispatches through
@@ -2049,5 +2053,85 @@ mod tests {
             manifest.contains("flux-plugin = { workspace = true, optional = true }"),
             "flux-plugin must be optional (the `plugins` feature only)"
         );
+    }
+
+    /// D-156: a cassette-recorded session replays hermetically through the SDK. A first client
+    /// records a plan-running turn (the `write` op lands a cassette cell); a **second** client over
+    /// the same `Storage::dir` — built with a **never-called** provider (panics if the model is hit)
+    /// — replays it: the recorded plan comes back, nothing dispatches live.
+    #[tokio::test]
+    async fn session_replays_a_recorded_plan_hermetically() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-replay-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state");
+
+        // Record: a plan that writes a file → the write dispatches and is captured on the cassette.
+        let sid = {
+            let client = Client::builder()
+                .model("mock")
+                .auto_approve(true)
+                .storage(Storage::dir(&store))
+                .build(
+                    Box::new(PlanThenProseMock {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }),
+                    &dir,
+                )
+                .unwrap();
+            client.run("write a file").await.unwrap();
+            client.session_id().unwrap()
+        };
+
+        // Replay in a fresh client over the same store, with a provider that must never be called —
+        // replay serves every op from the cassette, so the model is never hit.
+        let client = Client::builder()
+            .model("mock")
+            .storage(Storage::dir(&store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let session = client.open_session(&sid).unwrap();
+        struct NullSink;
+        impl AgentSink for NullSink {}
+        let mut sink = NullSink;
+        let report = session.replay(None, &mut sink).await.unwrap();
+        assert!(
+            !report.plans.is_empty(),
+            "the recorded plan replayed: {report:?}"
+        );
+        assert!(
+            report.diverged.is_none(),
+            "a faithful replay does not diverge: {report:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-156: a chat-only session (no ops → no cassette cells) is not replayable, and says so.
+    #[tokio::test]
+    async fn replay_of_a_non_recorded_session_errors_honestly() {
+        let dir = std::env::temp_dir().join(format!("flux-sdk-replay-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::builder()
+            .model("mock")
+            .storage(Storage::dir(dir.join("state")))
+            .build(Box::new(ProseMock { text: "hello" }), &dir)
+            .unwrap();
+        let session = client.default_session().unwrap();
+        session.send("hi").await.unwrap(); // a prose turn — no plan, no ops, no cassette cells
+
+        struct NullSink;
+        impl AgentSink for NullSink {}
+        let mut sink = NullSink;
+        let err = session
+            .replay(None, &mut sink)
+            .await
+            .expect_err("a chat-only session is not replayable");
+        assert!(
+            err.to_string().contains("not replayable"),
+            "the error is honest about why: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
