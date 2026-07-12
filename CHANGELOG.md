@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-12
+
 ### Changed
 
 - **D-163: the built-in web ops are renamed `web_fetch` → `web.fetch` and `web_search` → `web.search`**

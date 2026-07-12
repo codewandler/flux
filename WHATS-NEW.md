@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-12
+
 ### Action needed
 
 - **Two web tools were renamed for consistency.** `web_fetch` is now `web.fetch` and `web_search` is
