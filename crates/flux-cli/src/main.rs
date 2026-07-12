@@ -1032,18 +1032,30 @@ async fn build_doc_index(system: &System) -> Arc<dyn flux_capabilities::Datasour
 /// retrieval ops dispatch against.
 async fn build_datasources(
     decls: &[flux_lang::program::DatasourceDecl],
+    program_dir: &std::path::Path,
     system: &System,
 ) -> Result<Arc<dyn flux_capabilities::DatasourceBackend>> {
     const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
     const MAX_DOCS: usize = 1000;
     const MAX_BYTES: usize = 200_000;
+    // A datasource path is relative to the PROGRAM FILE's directory (absolute paths pass through), so
+    // `path "./docs"` means "beside the .flux file" regardless of the launch cwd. `program_dir` is a
+    // read-only root of `system`, so the resulting absolute path is walkable/readable.
+    fn resolve_ds_path(program_dir: &std::path::Path, raw: &str) -> String {
+        let p = std::path::Path::new(raw);
+        if p.is_absolute() {
+            raw.to_string()
+        } else {
+            program_dir.join(p).to_string_lossy().into_owned()
+        }
+    }
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
     for d in decls {
         match d.kind.as_str() {
             "markdown" => {
-                let base = d.path.as_deref().unwrap_or(".");
-                let files = system.walk_files(base, 4000).await.unwrap_or_default();
+                let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
+                let files = system.walk_files(&base, 4000).await.unwrap_or_default();
                 let mut docs: Vec<(String, String)> = Vec::new();
                 for f in files {
                     if docs.len() >= MAX_DOCS {
@@ -1064,15 +1076,16 @@ async fn build_datasources(
                     .map_err(|e| anyhow::anyhow!("datasource `{}` (markdown): {e}", d.name))?;
             }
             "openapi" => {
-                let path = d.path.as_deref().ok_or_else(|| {
+                let raw = d.path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("datasource `{}` (openapi) needs a `path`", d.name)
                 })?;
+                let path = resolve_ds_path(program_dir, raw);
                 let text = system
-                    .read_file(path)
+                    .read_file(&path)
                     .await
-                    .map_err(|e| anyhow::anyhow!("datasource `{}`: read {path}: {e}", d.name))?;
+                    .map_err(|e| anyhow::anyhow!("datasource `{}`: read {raw}: {e}", d.name))?;
                 let spec: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-                    anyhow::anyhow!("datasource `{}`: parse {path} as OpenAPI JSON: {e}", d.name)
+                    anyhow::anyhow!("datasource `{}`: parse {raw} as OpenAPI JSON: {e}", d.name)
                 })?;
                 flux_capabilities::ingest_openapi(&*backend, &d.name, &spec)
                     .map_err(|e| anyhow::anyhow!("datasource `{}` (openapi): {e}", d.name))?;
@@ -6866,19 +6879,38 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     // Assemble the knowledge + integration tools the program's agent target (`trigger.agent`) and its
     // journeys can drive — the D-09 registry wiring. A guarded `System` rooted at the cwd backs both.
     let cwd = std::env::current_dir()?;
-    let system = Arc::new(System::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?);
+    // A `datasource … path "./docs"` resolves against the PROGRAM FILE's directory, not the launch cwd,
+    // so `flux app run <dir>/support-bot.flux` indexes the `./docs` shipped beside the program from ANY
+    // working directory (`build_datasources` joins relative paths against this). `strict-review` is a
+    // built-in with no file → fall back to cwd. We also register that directory as a read-only root so the
+    // walk/read is permitted when the program lives OUTSIDE cwd; when it's under cwd (the in-repo case)
+    // the primary root already covers it and this is a harmless duplicate.
+    let program_dir = if is_builtin_strict_review {
+        cwd.clone()
+    } else {
+        std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone())
+    };
+    let mut workspace = Workspace::from_env(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A missing/invalid program dir is skipped, not fatal (mirrors `FLUX_ADD_DIRS`); a datasource that
+    // then can't be read surfaces its own clear error below.
+    let _ = workspace.add_read_root(&program_dir);
+    let system = Arc::new(System::new(workspace).with_sandbox(resolved_sandbox()));
     // Scoped SSRF egress opt-in, off by default. Program-serving plugin hosts use per-plugin grants.
     // A *missing* config is fine (the safe default), but a *malformed* one is a hard error rather
     // than a silent `unwrap_or_default()` (finding 7): `app run` is a real workload whose security
     // (private-net grants, `[sandbox]` posture) is config-driven, so silently discarding a broken
     // config and running with an empty one is fail-open. This matches the `run`/`plan`/`tui` agent
     // paths, which already load the config with `?`. (The sandbox posture itself was already
-    // resolved and exported at startup, so `System::from_env` above still reflects it.)
+    // resolved and exported at startup, so the `resolved_sandbox()` on the `System` above reflects it.)
     let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
-    let backend = build_datasources(&program.datasources, &system).await?;
+    let backend = build_datasources(&program.datasources, &program_dir, &system).await?;
     let mut extra_tools: Vec<Arc<dyn flux_runtime::Tool>> =
         flux_capabilities::datasource_tools(backend.clone());
     // The app-path event store + this run's stream identity (D-65): built here, BEFORE `App`, so the
@@ -10543,6 +10575,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-ds-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Canonicalize so the program dir matches the (canonicalized) workspace root on platforms where
+        // the temp dir is a symlink (e.g. macOS `/tmp` → `/private/tmp`).
+        let dir = std::fs::canonicalize(&dir).unwrap();
         std::fs::write(dir.join("note.md"), "# Title\nhello from a markdown note").unwrap();
         let system = System::new(Workspace::new(&dir).unwrap());
 
@@ -10552,7 +10587,7 @@ mod tests {
             path: Some(".".into()),
             settings: serde_json::Value::Null,
         }];
-        let backend = build_datasources(&ok, &system).await.unwrap();
+        let backend = build_datasources(&ok, &dir, &system).await.unwrap();
         assert!(!backend.is_empty(), "the markdown note was ingested");
 
         let bad = vec![DatasourceDecl {
@@ -10562,10 +10597,80 @@ mod tests {
             settings: serde_json::Value::Null,
         }];
         assert!(
-            build_datasources(&bad, &system).await.is_err(),
+            build_datasources(&bad, &dir, &system).await.is_err(),
             "an unknown datasource kind is a clean error"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relative datasource `path` resolves against the PROGRAM FILE's directory, not the process cwd —
+    /// so `flux app run <elsewhere>/support-bot.flux` indexes the `./docs` shipped beside the program even
+    /// when launched from an unrelated directory. Here the workspace root (the "cwd") and the program dir
+    /// are siblings: `./docs` must pull the program dir's corpus and ignore a decoy under the cwd root.
+    #[tokio::test]
+    async fn build_datasources_resolves_relative_path_against_program_dir() {
+        use flux_datasource::SearchInput;
+        use flux_lang::program::DatasourceDecl;
+        use flux_system::{System, Workspace};
+
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = base.join(format!("flux-ds-cwd-{}", std::process::id())); // the launch "cwd"
+        let progdir = base.join(format!("flux-ds-prog-{}", std::process::id())); // where the .flux lives
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&progdir);
+        std::fs::create_dir_all(progdir.join("docs")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            progdir.join("docs/faq.md"),
+            "# FAQ\nReset your password from the account settings page.",
+        )
+        .unwrap();
+        // A decoy under the cwd root — it must NOT be indexed (proves resolution is program-relative).
+        std::fs::write(
+            root.join("decoy.md"),
+            "# Decoy\nkielbasa should not be indexed",
+        )
+        .unwrap();
+
+        // The workspace is rooted at the cwd; the program dir is registered as a read-only root, exactly
+        // as `run_app` does for an out-of-cwd program.
+        let mut ws = Workspace::new(&root).unwrap();
+        ws.add_read_root(&progdir).unwrap();
+        let system = System::new(ws);
+
+        let decls = vec![DatasourceDecl {
+            name: "docs".into(),
+            kind: "markdown".into(),
+            path: Some("./docs".into()),
+            settings: serde_json::Value::Null,
+        }];
+        let backend = build_datasources(&decls, &progdir, &system).await.unwrap();
+
+        // The program dir's corpus is searchable...
+        let hits = backend
+            .search(&SearchInput {
+                query: "reset password settings".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.record.entity == "file.document"),
+            "the ./docs beside the program was indexed"
+        );
+        // ...and the decoy under the cwd root was not.
+        let decoy = backend
+            .search(&SearchInput {
+                query: "kielbasa".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            decoy.is_empty(),
+            "a file under the cwd (not the program dir) must not be indexed"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&progdir).ok();
     }
 
     /// `build_datasources` ingests an `openapi` source (via the existing `ingest_openapi`) alongside a
@@ -10580,6 +10685,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-ds-oa-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
         std::fs::write(
             dir.join("guide.md"),
             "# Booking\nHow to book a widget appointment.",
@@ -10606,7 +10712,7 @@ mod tests {
                 settings: serde_json::Value::Null,
             },
         ];
-        let backend = build_datasources(&decls, &system).await.unwrap();
+        let backend = build_datasources(&decls, &dir, &system).await.unwrap();
 
         // The markdown note is indexed as a `file.document`...
         let md = backend

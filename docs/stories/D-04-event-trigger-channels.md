@@ -50,8 +50,8 @@ agents on cron/webhook/Slack.
 - [x] **schedule** adapter: **full cron** (5-field crontab + 6/7-field seconds-first) + `on:"startup"`.
 - [x] **webhook** adapter: axum `POST <path>` per channel → delivery; sync JSON reply / `async=true` →
       `202`; optional bearer token; non-loopback bind requires a token.
-- [x] **slack** adapter (feature `slack`): socket-mode mentions/messages; thread as conversation; posts
-      results back; `allow_users`/`allow_channels` policy.
+- [x] **slack** adapter (feature `slack`, now on by default): socket-mode mentions/messages; thread as
+      conversation; posts results back; `allow_users`/`allow_channels` policy.
 - [x] **`flux app run <program.flux>`** subcommand (+ `flux run <app.flux>` routes through it).
 - [x] `flux-channels` in the `flux-codegate` `layer()` map (L6) + root `Cargo.toml` members; full gate
       green (`cargo build/test/clippy/fmt`, `cargo test -p flux-codegate`, `--features slack`).

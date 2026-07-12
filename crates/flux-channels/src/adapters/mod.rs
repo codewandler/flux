@@ -51,7 +51,8 @@ pub fn build_channels(decls: &[ChannelDecl]) -> anyhow::Result<Vec<Box<dyn Chann
                 out.push(Box::new(SlackChannel::from_decl(d)?));
                 #[cfg(not(feature = "slack"))]
                 anyhow::bail!(
-                    "channel `{}` has kind `slack` — rebuild with `--features slack`",
+                    "channel `{}` has kind `slack`, but this binary was built with \
+                     `--no-default-features` — re-enable the `slack` feature to use it",
                     d.name
                 );
             }

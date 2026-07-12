@@ -58,7 +58,7 @@ Deliverer (trait) deliver(label, payload) -> Vec<JourneyRun> — the seam a chan
 AppDeliverer      the production Deliverer: gate-serialized App::deliver
 serve(app, channels, run_stdin, cancel)  the host: fire startup, spawn channels, await Ctrl-C/cancel
 build_channels(&[ChannelDecl]) -> Vec<Box<dyn Channel>>   kind → adapter; skips `cli`; unknown = error
-adapters: schedule (cron+chrono) · webhook (axum) · slack (slack-morphism, feature `slack`)
+adapters: schedule (cron+chrono) · webhook (axum) · slack (slack-morphism, default feature `slack`)
 ```
 
 - **`Channel::start(d, cancel)`** runs the adapter's protocol loop until `cancel`; per external event it
@@ -95,8 +95,9 @@ requires a `token`** (the host
 auto-approves tools, so an open listener is a remote-trigger surface — mirrors flux-server). HMAC and a
 shared multi-channel server are follow-ups.
 
-### slack (`kind = "slack"`, feature `slack`)
-`slack-morphism` socket mode, behind `--features slack` so its dep tree stays out of the default build.
+### slack (`kind = "slack"`, default feature `slack`)
+`slack-morphism` socket mode. Compiled in by default so `channel slack` runs on the stock binary; the
+`slack` feature can still be dropped with `--no-default-features` to keep the dep tree out of a build.
 Subscribes to app-mentions and human messages (bot/subtype messages are skipped to avoid reply loops);
 delivers `{ text, user, channel, thread, conversation }` under the channel name and posts the journeys'
 joined result back to the thread. `allow_users` / `allow_channels` settings gate access; bot/app tokens
@@ -126,7 +127,7 @@ a program with only background channels runs as a daemon until Ctrl-C. Destructi
   a non-loopback bind without a token is rejected.
 - `e2e.rs` — a fast cron channel wakes a **real** `App` whose journey formats the seeded payload field;
   asserts timer → deliver → trigger → journey → result, with no provider.
-- slack (feature-gated, in-module) — event→payload mapping (thread as conversation) + allow-list.
+- slack (default feature, in-module) — event→payload mapping (thread as conversation) + allow-list.
 
 `examples/channels-app.flux` (a cron heartbeat + a webhook) demonstrates `flux app run`.
 

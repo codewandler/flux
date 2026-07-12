@@ -64,6 +64,10 @@ Three routes feed the index:
      path "./docs"
    ```
 
+   A relative `path` resolves against the **program file's own directory**, not the directory you
+   launched from — so `flux app run /any/where/app.flux` finds the `./docs` shipped beside `app.flux`
+   from any working directory. An absolute path is used as-is.
+
 3. **Plugin records.** A [plugin](../plugins/authoring.md) declares datasources in its manifest
    and emits records through the gated `datasource.*` host capability — integration records
    (issues, merge requests, …) become searchable knowledge alongside local docs, without the

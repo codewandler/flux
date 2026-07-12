@@ -24,8 +24,11 @@ chrono.workspace = true
 slack-morphism = { workspace = true, optional = true }
 
 [features]
-# The Slack socket-mode adapter. slack-morphism's `hyper` feature pulls its hyper/tungstenite connector
-# only — its optional axum integration stays off (harmless either way: its axum is 0.8, same as ours).
+# The Slack socket-mode adapter, on by default so a standalone `cargo build/test -p flux-channels`
+# compiles and exercises it (drop with `--no-default-features`). slack-morphism's `hyper` feature pulls
+# its hyper/tungstenite connector only — its optional axum integration stays off (harmless either way:
+# its axum is 0.8, same as ours).
+default = ["slack"]
 slack = ["dep:slack-morphism", "slack-morphism/hyper"]
 
 [dev-dependencies]

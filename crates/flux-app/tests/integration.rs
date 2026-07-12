@@ -313,12 +313,14 @@ fn bundled_example_parses_as_a_program() {
     assert!(p.flow_named("echo").is_some());
 }
 
-/// The full-surface example exercises every typed declaration — agent + slack channel (with `secret`
-/// references) + a markdown datasource + an agent-bound trigger + a journey — and secrets stay as
-/// unresolved markers until the host resolves them.
+/// The agent-driven support example exercises every typed declaration that actually runs — agent (with
+/// its `search` tool + docs) + slack channel (with `secret` references) + a markdown datasource + an
+/// agent-bound trigger — and secrets stay as unresolved markers until the host resolves them. The
+/// trigger is agent-bound (no `run`), so a Slack mention wakes the model, not a fixed journey.
 #[test]
-fn support_bot_example_covers_the_full_module_surface() {
+fn support_bot_example_covers_the_module_surface() {
     let p = program(include_str!("../examples/support-bot.flux"));
+    assert_eq!(p.agents[0].tools, vec!["search"]);
     assert_eq!(p.agents[0].datasources, vec!["docs"]);
     assert_eq!(p.channels[0].kind, "slack");
     assert_eq!(
@@ -329,5 +331,8 @@ fn support_bot_example_covers_the_full_module_surface() {
     assert_eq!(p.datasources[0].kind, "markdown");
     assert_eq!(p.datasources[0].path.as_deref(), Some("./docs"));
     assert_eq!(p.triggers[0].agent.as_deref(), Some("assistant"));
-    assert!(p.flow_named("answer").is_some());
+    assert!(
+        p.triggers[0].run.is_empty(),
+        "the trigger is agent-bound — no journey to run"
+    );
 }

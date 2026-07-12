@@ -68,8 +68,10 @@ flux-markdown = { workspace = true, features = ["terminal"] }
 rustls = { version = "0.23", optional = true }
 
 [features]
-# Build the `flux` binary with the Slack channel adapter compiled in (off by default to keep the heavy
-# slack-morphism dep out of the standard build). Use `cargo build -p flux-cli --features slack`.
+# The Slack channel adapter is compiled in by default so `channel slack` programs run on the stock
+# binary. It pulls the slack-morphism socket-mode dep (and, via `dep:rustls`, a process-level crypto
+# provider — see the `rustls` dep note above). Drop it with `cargo build -p flux-cli --no-default-features`.
+default = ["slack"]
 slack = ["flux-channels/slack", "dep:rustls"]
 # Wire the semantic/embeddings datasource backend (the agent's `search` blends keyword + embeddings).
 # Off by default; needs an embeddings API key at runtime (see flux-capabilities `OpenAiEmbedder`).

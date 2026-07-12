@@ -19,16 +19,17 @@ its settings inline as ordinary Flux-Lang values:
 - **`agent`** — a model, its tool allow-list, its datasources, and a description.
 - **`channel`** — a surface the app is reached on (CLI, Slack, HTTP/A2A, …).
 - **`datasource`** — grounded knowledge an agent answers from (e.g. a Markdown corpus) — see [Datasources](./datasources.md).
-- **`trigger`** — an event to listen for, and the journey to run when it fires.
+- **`trigger`** — an event to listen for, and what runs when it fires: an **agent** (the model drives
+  the turn) or a **journey** (a fixed flow).
 - **`journey`** — a named flow that does the work. A journey is an ordinary Flux-Lang flow.
 
-Here is a complete Slack support bot — an agent, its channel, a docs datasource, and the journey that
-runs per message:
+Here is a complete Slack support bot — an agent, its channel, a docs datasource, and an agent-bound
+trigger that answers each message ([`crates/flux-app/examples/support-bot.flux`](https://github.com/babelforce/flux/blob/main/crates/flux-app/examples/support-bot.flux)):
 
 ```flux
 agent assistant
-  model "claude-sonnet-4-6"
-  tools [search, send]
+  model "claude-sonnet-5"
+  tools [search]
   datasources [docs]
   description "answers support questions from the docs"
 
@@ -42,18 +43,17 @@ datasource docs
 
 trigger on_message
   on "slack"
-  run answer
   agent assistant
-
-journey answer
-  agent assistant
-  flow
-    $hits = search($text)
-    return $hits
 ```
 
-That is the entire application. The `flow` body is regular Flux-Lang — see the
-[language overview](../language/overview.md) and [flows & syntax](../language/flows-and-syntax.md).
+That is the entire application. On each Slack mention the agent reads the message, calls `search` over
+the indexed docs, and its answer is posted back into the thread. The trigger is **agent-bound** (it
+names an `agent`, not a `run` journey), so the model drives the turn. See the [Slack channel setup
+guide](./slack-channel.md) for creating the Slack app and its tokens.
+
+For deterministic, fixed-step work a trigger can run a **journey** — a named Flux-Lang flow — instead
+of an agent (`run <journey>` with no `agent`). See the [language overview](../language/overview.md)
+and [flows & syntax](../language/flows-and-syntax.md).
 
 ## Secrets are references, never plaintext
 
@@ -64,9 +64,10 @@ to commit and share. Set the referenced variables in the environment before you 
 ## How a program runs
 
 At load, the host wires the modules onto an **event bus**. **Triggers** subscribe to named events —
-`"startup"`, `"user_input"`, a channel name like `"slack"` — and each dispatches its **journey** with
-the event payload in scope (for example `$text` for an incoming message). Journeys run as flows through
-the same safety envelope as everything else in flux: authorization, approval, then guarded IO.
+`"startup"`, `"user_input"`, a channel name like `"slack"` — and each dispatches its **agent** or
+**journey** with the event payload in scope (for example `$text` for an incoming message). An
+agent-bound trigger wakes a model turn; a journey-bound one runs a flow — both through the same safety
+envelope as everything else in flux: authorization, approval, then guarded IO.
 
 Inside a journey, agents coordinate through a small set of orchestration operations:
 

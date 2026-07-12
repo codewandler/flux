@@ -450,10 +450,19 @@ fn parse_trigger_decl(name_str: &str, region: &[Line]) -> Result<TriggerDecl> {
             other => return Err(perr(&format!("unknown trigger attribute `{other}`"))),
         }
     }
+    // A trigger routes to an `agent` turn or a `run` journey — require exactly the field the runtime
+    // will use. An agent-bound trigger doesn't need a journey name (the model drives the turn); a
+    // trigger with neither has nothing to run.
+    let run = run.unwrap_or_default();
+    if agent.is_none() && run.is_empty() {
+        return Err(perr(
+            "a `trigger` needs a `run` journey/flow name or an `agent` to run",
+        ));
+    }
     Ok(TriggerDecl {
         name,
         on: on.ok_or_else(|| perr("a `trigger` needs an `on` event label"))?,
-        run: run.ok_or_else(|| perr("a `trigger` needs a `run` journey/flow name"))?,
+        run,
         agent,
     })
 }
@@ -4453,6 +4462,29 @@ journey greet
         assert!(
             matches!(flow.body.last(), Some(Node::Return { .. })),
             "the flow body parsed as native statements"
+        );
+    }
+
+    #[test]
+    fn agent_bound_trigger_needs_no_run_journey() {
+        // An agent-bound trigger routes to a model turn (`run_agent`), so a `run` journey name is
+        // optional — the runtime never reads it. This is the shape the support-bot example uses.
+        let src = "trigger on_msg\n  on \"slack\"\n  agent assistant\n";
+        let Module::Program(p) = parse_program(src).unwrap() else {
+            panic!("program")
+        };
+        assert_eq!(p.triggers[0].on, "slack");
+        assert_eq!(p.triggers[0].agent.as_deref(), Some("assistant"));
+        assert!(p.triggers[0].run.is_empty(), "no journey to run");
+    }
+
+    #[test]
+    fn trigger_with_neither_run_nor_agent_is_an_error() {
+        let src = "trigger on_msg\n  on \"slack\"\n";
+        let err = parse_program(src).unwrap_err().to_string();
+        assert!(
+            err.contains("`run`") && err.contains("`agent`"),
+            "error names both routes: {err}"
         );
     }
 

@@ -12,6 +12,20 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Slack support bots run out of the box.** The Slack channel is now built into the standard `flux`
+  binary — no special build needed. Point a program at your Slack app's tokens and it listens for
+  mentions and replies in the thread. There's a new step-by-step [Slack channel setup
+  guide](agent/slack-channel.md), and the bundled `support-bot.flux` example is now a complete,
+  runnable Slack support agent that answers from a folder of docs.
+
+### Improved
+
+- **A program's docs folder is found next to the program, wherever you run it.** A datasource path like
+  `./docs` now resolves relative to the program file itself, so `flux app run /path/to/app.flux` picks
+  up the docs shipped beside it no matter which directory you launched from.
+
 ## [0.17.1] - 2026-07-12
 
 ## [0.17.0] - 2026-07-12

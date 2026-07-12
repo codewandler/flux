@@ -87,7 +87,7 @@ pub struct A2aSettings {
 // `{"$secret":…}` marker) are resolved from the environment once at load by `flux_app::resolve_secrets`,
 // before any adapter deserializes these settings. So the token fields above are already plain values.
 
-/// `kind = "slack"` settings (feature `slack`).
+/// `kind = "slack"` settings (compiled in by default; gated only for `--no-default-features` builds).
 #[cfg(feature = "slack")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SlackSettings {

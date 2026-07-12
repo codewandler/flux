@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **D-165: the Slack support-bot example is genuinely runnable end-to-end** (Agent pillar; a D-11
+  app-runner follow-on). `crates/flux-app/examples/support-bot.flux` was advertised as a one-line
+  `flux app run …` but couldn't run. Three fixes make it real: (1) the Slack channel adapter is now
+  compiled into the stock binary (`default = ["slack"]` in `flux-cli` + `flux-channels`; disable with
+  `--no-default-features`); (2) the example is rewritten to the coherent agent-driven shape — an
+  agent-bound trigger wakes the model, which answers from the docs via `search`, its reply posted to
+  the thread — dropping the never-executed `journey answer` and the inert `send` tool; (3) a real
+  `examples/docs/*.md` corpus ships beside it. New Slack setup guide at
+  `website/docs/agent/slack-channel.md`. Trade-off: the default build now pulls `slack-morphism` and a
+  second rustls crypto provider (aws-lc-rs alongside ring).
+
+### Changed
+
+- **A `datasource … path "./docs"` now resolves against the program file's directory, not the launch
+  cwd** (D-165). `flux app run <anywhere>/app.flux` indexes the `./docs` shipped beside `app.flux` from
+  any working directory; the program's directory is registered as a read-only root so an out-of-cwd
+  program can still be read. Absolute paths are unchanged. Behavior change to `flux app run` datasource
+  resolution (test: `build_datasources_resolves_relative_path_against_program_dir`).
+- **An `agent`-bound `trigger` no longer requires a `run` journey name** (D-165). The runtime only reads
+  `trigger.run` when the trigger has no agent, so the parser now accepts an agent-only trigger; a trigger
+  with neither a `run` nor an `agent` is a clear error (tests: `agent_bound_trigger_needs_no_run_journey`,
+  `trigger_with_neither_run_nor_agent_is_an_error`).
+
 ## [0.17.1] - 2026-07-12
 
 ### Fixed
