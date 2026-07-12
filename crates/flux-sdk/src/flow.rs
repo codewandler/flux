@@ -571,6 +571,11 @@ impl FlowClient {
     /// The single seam: a consumer (e.g. a telephony channel) drives a voice agent without assembling
     /// an `Executor`, the driver, or the model-facing tool declarations by hand — the same "don't
     /// re-implement the wiring" shape as [`with_sub_agents`](Self::with_sub_agents).
+    ///
+    /// This is the **model-driven** mode: the model leads the conversation and calls the declared
+    /// tools. For the **flow-driven** counterpart — an authored flow leads and the model is pure
+    /// speech I/O — use [`Session::run_voice_flow`](crate::Session::run_voice_flow) (it needs the
+    /// session's persistent engine, which `FlowClient` doesn't own).
     pub async fn run_voice_session(
         &self,
         provider: &dyn RealtimeProvider,

@@ -51,6 +51,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   an installed integration plugin (GitLab, Slack, …) so its operations become tools the embedded
   agent can call — running through the same permission and approval checks, and limited to what each
   plugin's manifest declares. As always, only install plugins you trust.
+- **Embedded voice agents can be script-driven.** An embedded session can now run a voice call
+  driven by an authored flow: the agent speaks first, asks each scripted question, waits for the
+  caller's spoken answer, and hangs up when the script finishes — with the model handling only speech
+  in and out. This complements the existing model-led voice mode, where the model leads and calls
+  tools.
 
 ### Action needed
 

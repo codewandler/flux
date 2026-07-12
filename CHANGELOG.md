@@ -108,6 +108,17 @@ All notable changes to this project are documented in this file. The format is b
   `--features plugins`) backs the end-to-end integration test (`op_names()` carries `fixture.upper`;
   it dispatches uppercased when approved and is denied by the default approver). `flux-plugin` already
   precedes `flux-sdk` in the publish order.
+- **D-155: flow-driven voice front door — `Session::run_voice_flow`** (sdk-surface wave 3, completes
+  the epic's wave 3). The engine-owned flow-driven voice loop (D-132), deferred at the time because
+  `FlowClient` has no `EventStore`, reaches the SDK now that a `Session` owns the persistent engine:
+  `Session::run_voice_flow(provider, config, flow, sink, cancel)` assembles an `EngineVoiceHandler`
+  over the session's engine and drives `VoiceSessionDriver::run_flow_turns` — the authored flow
+  speaks first (runs to its first `await`, the model speaks the prompt as pure STT/TTS, no planner),
+  each caller turn resumes the suspension, and flow completion hangs up via `VoiceSink::session_ended`.
+  The voice counterpart of `Session::start_flow`, durable across a reconnect. New `flux_sdk::voice`
+  re-export module names the types both voice doors take (`VoiceSink`, `VoiceReply`,
+  `RealtimeProvider`, `RealtimeConfig`). The existing model-driven `FlowClient::run_voice_session` is
+  unchanged; its docs now contrast the two modes.
 
 ## [0.16.1] - 2026-07-11
 

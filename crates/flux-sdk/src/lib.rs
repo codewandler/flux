@@ -107,6 +107,19 @@ pub mod observe {
     pub use flux_lang::ast::RunEvent;
 }
 
+/// **Voice.** The types the two voice front doors take —
+/// [`Session::run_voice_flow`](Session::run_voice_flow) (flow-driven: the flow leads, the model is
+/// speech I/O) and [`FlowClient::run_voice_session`](flow::FlowClient::run_voice_session)
+/// (model-driven: the model leads and calls tools). Implement [`VoiceSink`](voice::VoiceSink) to
+/// receive audio / transcripts / lifecycle; [`VoiceReply`](voice::VoiceReply) is a flow turn's
+/// spoken reply (`Continue`/`Complete`); [`RealtimeProvider`](voice::RealtimeProvider) +
+/// [`RealtimeConfig`](voice::RealtimeConfig) are the full-duplex provider seam (a concrete one lives
+/// behind `flux-providers`' `realtime` feature).
+pub mod voice {
+    pub use flux_flow::voice::{VoiceReply, VoiceSink};
+    pub use flux_provider::{RealtimeConfig, RealtimeProvider};
+}
+
 /// **Pricing ergonomics** (feature `pricing`). [`load_pricing_table`](pricing::load_pricing_table)
 /// builds the effective [`PricingTable`] — the curated built-in rates overlaid by the user's
 /// `~/.flux/pricing.toml` — the same table the CLI's cost display uses. Pass it to

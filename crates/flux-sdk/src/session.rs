@@ -14,7 +14,9 @@ use flux_events::{EfficiencySummary, ModelCost, TurnSummary};
 use flux_flow::ast::DraftAst;
 use flux_flow::ast::RunEvent;
 use flux_flow::engine::FlowEngine;
+use flux_flow::voice::{EngineVoiceHandler, VoiceSessionDriver, VoiceSink};
 use flux_flow::AgentSink;
+use flux_provider::{RealtimeConfig, RealtimeProvider};
 use flux_runtime::ToolResult;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -185,6 +187,37 @@ impl Session {
     /// has been recorded yet.
     pub fn efficiency(&self) -> Result<Option<EfficiencySummary>> {
         self.engine.events.efficiency(&self.id)
+    }
+
+    /// Run a **flow-driven** full-duplex voice session (D-132): an authored `flow` owns the whole
+    /// call. The flow speaks first — it runs to its first top-level `await` and the realtime model
+    /// speaks the authored prompt (STT/TTS only, no planner) — each caller utterance resumes the
+    /// suspension to the next prompt, and the flow completing hangs up (via
+    /// [`VoiceSink::session_ended`]). This is the voice counterpart of
+    /// [`start_flow`](Self::start_flow), and it rides the session's own persistent engine, so the
+    /// suspension state is durable across a reconnect.
+    ///
+    /// Contrast with the **model-driven** [`FlowClient::run_voice_session`](crate::FlowClient::run_voice_session),
+    /// where the model leads the conversation and calls tools; here the flow leads and the model is
+    /// pure speech I/O. `provider` is any [`RealtimeProvider`]; `cancel` ends the call (e.g. a
+    /// hangup).
+    pub async fn run_voice_flow(
+        &self,
+        provider: &dyn RealtimeProvider,
+        config: RealtimeConfig,
+        flow: DraftAst,
+        sink: &mut dyn VoiceSink,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        // Flow-driven: the flow owns tools (the model is STT/TTS only), so no tool defs are declared.
+        let conn = provider.connect(config).await?;
+        let handler = EngineVoiceHandler::new(self.engine.clone(), self.id.clone(), flow);
+        // The driver's own executor is unused in flow mode (the engine drives every turn through its
+        // own envelope); reuse the engine's so no throwaway is built.
+        VoiceSessionDriver::new(self.engine.executor.clone())
+            .run_flow_turns(conn, sink, &handler, cancel)
+            .await;
+        Ok(())
     }
 }
 
