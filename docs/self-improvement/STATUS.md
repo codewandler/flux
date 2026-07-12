@@ -1,12 +1,19 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-07-10._
+_Last updated: 2026-07-10 (audit-hardening docs). Substantive loop state is frozen at round 3,
+2026-07-06 — the initiative has been ON HOLD since._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
 including the bugs each live run surfaced, the first kept gain, and the caveats that keep the claims
 defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
 
 ## TL;DR
+
+- **ON HOLD / de-prioritized since 2026-07-06 (user priority call).** The machinery is proven
+  end-to-end, but active development is paused (focus shifted to hardening/docs/cleanup) and the
+  headline gain — a statistically clean, grader-confirmed improvement at **trials ≥ 3** — is **not
+  yet achieved**. Resume at I-05's two queued chain fixes, then fund round 4. See the
+  [2026-07-06 journey entry](#journey-the-runs-and-what-each-one-taught-us) and stories I-01 / I-05.
 
 - **2026-07-10 audit hardening:** the improve-tbench flow now fails closed when no implementation is
   produced, accepts fenced/prose-wrapped candidate arrays, and the eval keep-gate rejects malformed
@@ -32,7 +39,7 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
 | Machinery runs end-to-end | ✅ proven | multiple live tb runs; every op fires |
 | Correct **revert** on a non-improvement | ✅ proven | revert run; grader caught a real flux bug (below) |
 | Integrity guard restores tampered grader | ✅ proven (fired live) | `guard_protected` rolled back a worker edit to `crates/flux-eval` |
-| Correct **keep + commit + tag** on a real gain | ✅ proven (once) | commit `3c86874`, tag `improve-tbench-0-3c8687…` |
+| Correct **keep + commit + tag** on a real gain | ✅ proven (once) | commit `3c86874` (the disposable tag/branch have since been pruned; the fix now lives on `main` as `f0ede92`) |
 | Statistically clean headline gain (trials ≥ 3) | ⛔ not yet | next chapter |
 
 ## The epic's arc (milestones)
@@ -90,9 +97,11 @@ On a `fibonacci-server` round, the loop did the whole thing by itself:
    `git_tag improve-tbench-0` + `eval_adopt`, logged `{decision: kept, reason:
    candidate_beat_baseline}`.
 
-**Where it lives:** branch `improve-tbench/20260626-203839` @ `3c86874`
-("improve: adopt candidate (terminal-bench gain)", `crates/flux-agent/src/lib.rs` +43/-1), tag
-`improve-tbench-0-3c8687492dc4`. `main` is untouched.
+**Where it lives:** the loop produced this on a disposable worktree branch
+(`improve-tbench/20260626-…`) as commit `3c86874` ("improve: adopt candidate (terminal-bench gain)",
+`crates/flux-agent/src/lib.rs` +43/-1) with tag `improve-tbench-0-3c8687…`. Those throwaway refs have
+since been **pruned** — the kept fix was brought to `main` verbatim as commit `f0ede92` (see
+[Suggested next steps](#suggested-next-steps) #1), which is where it lives now.
 
 ### Honest caveats on that gain
 
@@ -217,8 +226,10 @@ was valid and the revert was correct — the loop did not reward a plausible-but
 - **Partial-credit scoring** — the terminal-bench adapter parses `parser_results` into
   `mean_check_pass_rate`, used as the first tiebreaker after full-pass-rate, so the loop sees 5/6 → 6/6
   progress instead of only binary pass/fail (`2199477`).
-- **trials = 3** (raised from 2) in `improve-tbench.flux` / `improve-multi.flux`, plus a
-  **per-decision audit log** appended to `.flux/eval/improve-log.jsonl` each round (`81fe021`).
+- **trials ≥ 3** (raised from 2), plus a **per-decision audit log** appended to
+  `.flux/eval/improve-log.jsonl` each round (`81fe021`). `improve-tbench.flux` was later sharpened to
+  **trials = 5** on the single stable fibonacci-server task (I-05); `improve-multi.flux` stays at
+  **trials = 3**.
 - **Tracked sub-agent roles** in `crates/flux-eval/agents/`, seeded into the worktree by the runner (`4930bf9`).
 - **Observability** — `bench/watch-agent.sh` (live in-container pane) + `bench/replay-agent.sh`
   (asciinema cast replay, no API) (`7499649`).

@@ -10,12 +10,18 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.15.0 + v0.15.1 (2026-07-11) — the flows-arc downstream ask (ai-agent-platform
-  R-20): flow-driven sessions + `ai_segment` (D-131), flow-driven voice (D-132, breaking
-  voice-handler seam), `annotate_effects` (D-133), an actionable error for an expired codex login,
-  and the 0.15.1 docs catch-up. Announced in #ai-agent-platform (covers 0.14.8 → 0.15.1).
-  **Focus:** the Agent pillar — downstream asks and the gitlab-hardening wave; next up per the
-  generated board below. See [CHANGELOG](../../CHANGELOG.md).
+- **Released:** v0.19.2 (2026-07-12). Since the 0.15.x line: the **flux-sdk surface** epic
+  (D-142…D-159, v0.16.0–v0.17.0), the **web-capabilities II** extensions (`web.crawl` + a
+  `max_total_bytes` byte budget, PDF extraction, an embeddings pack, and the breaking
+  `web.fetch`/`web.search` dot-rename; D-160…D-166), **plugin operation output schemas** (D-164), a
+  **runnable Slack support-bot** example (D-165), and a public beginner tutorial. See
+  [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
+- **Focus:** the Agent pillar. **Nothing is currently promoted to `ready`**, so `Now`/`Next` below are
+  empty — the live work sits in Backlog + Blocked. The strongest ready-candidates are the
+  gitlab-hardening wave (D-91…D-95) and the flux-lsp stories (L-68…L-70); promote one to
+  `status: ready` and re-run `/track:board` to queue it.
+- **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
+  machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
 
 <!-- BEGIN track:board -->

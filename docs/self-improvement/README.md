@@ -6,6 +6,11 @@ and **keeps the change only if it measurably helps** (with the dev-gate green) �
 reverts. The whole loop is authored as a flux-flow graph and executed by `flux flow run`; the agent
 never grades itself, declares victory, or hides the evidence.
 
+> **Status (2026-07-06):** the loop machinery is proven end-to-end, but active development is
+> **ON HOLD / de-prioritized** (a user priority call — focus shifted to hardening/docs/cleanup). The
+> headline self-improvement gain (trials ≥ 3, grader-confirmed) remains **unproven**. See
+> [STATUS.md](STATUS.md).
+
 This folder is the operator- and reviewer-facing record of that work.
 
 - **[DESIGN.md](DESIGN.md)** — how the process works: the loop, the three invariants and how they're

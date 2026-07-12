@@ -68,7 +68,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-runtime` | L2 | `Executor::dispatch` — the safety envelope; `context` module = the projector | absorbed `flux-context` (consolidation P4 ✅) |
 | `flux-tools` | L2 | built-in tools (read / write / edit / grep / …) | — |
 | `flux-events` | L2 | append-only event store (SQLite default; opt-in Postgres backend behind the `postgres` feature) | — |
-| `flux-codegate` | infra | the layering lint (enforces L0→L6) | — |
+| `flux-codegate` | L6 | the layering lint (enforces L0→L6; self-classified L6 — nothing depends on it, so it's absent from the L6 dependency row above) | — |
 
 ### Agent pillar
 | Crate | Layer | Role | Disposition |

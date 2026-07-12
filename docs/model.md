@@ -162,6 +162,61 @@ Bedrock cross-region inference-profile ids are **region-specific**: `us.anthropi
 
 ---
 
+## OpenAI
+
+**Wire:** OpenAI Chat Completions API (`POST /v1/chat/completions`)  
+**Auth:** `OPENAI_API_KEY` environment variable
+
+```bash
+export OPENAI_API_KEY=sk-...
+```
+
+The `openai` provider talks to the OpenAI API directly, over the same Chat Completions codec as
+`openrouter`/`ollama`, with full streaming and tool-call support. The model string after `openai/`
+is forwarded verbatim, so any current or future OpenAI model id works — but a model **must** be
+named: there is no bare-`openai` default, and `openai/` with an empty model is rejected client-side
+with the hint `openai/gpt-5.5`.
+
+### Usage
+
+```bash
+flux run -m openai/gpt-5.5   "review this PR"
+flux run -m openai/gpt-5     "explain the auth flow"
+```
+
+### Config file
+
+```toml
+model = "openai/gpt-5.5"
+```
+
+### Notes
+
+- **Metered API**, billed by OpenAI per token — no `(sub)` label.
+- GPT-5-family requests automatically use the replacement `max_completion_tokens` field.
+
+## Codex (`codex`) — ChatGPT / Codex subscription
+
+**Wire:** OpenAI Responses API, on the ChatGPT backend  
+**Auth:** ChatGPT/Codex OAuth — `flux auth login codex` (imported from `~/.codex/auth.json`)
+
+The `codex` provider bills against a **ChatGPT/Codex subscription** rather than the metered API, so
+its costs are shown as the *equivalent* metered figure, marked `(sub)` — the same convention as
+`claude`.
+
+```bash
+flux run -m codex           "explain the auth flow"   # bare `codex` = codex/gpt-5.5
+flux run -m codex/gpt-5.5   "refactor this module"
+```
+
+- Bare `codex` (or `codex/`) resolves to the backend's default model, **`gpt-5.5`**.
+- The ChatGPT-subscription backend serves the `gpt-5.5` family and rejects the legacy
+  `*-codex`-suffixed ids (`gpt-5-codex`, …) with HTTP 400; flux maps those to `gpt-5.5`. Any other
+  id is forwarded verbatim, so a future model works without a flux release.
+- Single owner: `flux_providers::codex::resolve_model`.
+
+---
+
 ## OpenRouter
 
 **Wire:** OpenAI Chat-compatible (OpenRouter proxies all models behind a single endpoint)  
@@ -365,7 +420,7 @@ Run `flux auth status` to see what credentials are currently resolved and from w
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | Full streaming + tool-call support |
 | `codex` | OpenAI Responses | — | ChatGPT/Codex OAuth; opt-in (`flux auth login codex`) |
 | `aws` | Anthropic Messages (Bedrock) | `AWS_*` / SSO / IRSA / EKS Pod Identity | Claude via AWS Bedrock; full credential chain, no `aws` CLI; metered; region-aware model ids |
-| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | Proxy to 300 + models; append any OpenRouter slug; recovers inline-text tool calls |
+| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | Proxies a large catalog of models; the `provider/model` slug after `openrouter/` is forwarded verbatim; recovers inline-text tool calls |
 | `openrouter-anthropic` | Anthropic Messages | `OPENROUTER_API_KEY` | OpenRouter's native Messages endpoint — structured `tool_use`, no text leakage; preferred for agentic use |
 | `ollama` | OpenAI Chat | — | Local models; no key; `OLLAMA_HOST` overrides `localhost:11434`; needs a tool-capable model |
 | `ollama-anthropic` | Anthropic Messages | — | Local Ollama's Messages endpoint (recent builds) — native `tool_use` |

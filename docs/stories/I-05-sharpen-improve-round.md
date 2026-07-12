@@ -18,16 +18,21 @@ while fibonacci-server sat at a rock-stable 83% checks with clear headroom
 consume the ranking, so the next funded round measures the change instead of the noise.
 
 ## Acceptance
-- [ ] The improve flow's scored eval set is fibonacci-server × 5 trials (both legs) — stable
+- [x] The improve flow's scored eval set is fibonacci-server × 5 trials (both legs) — stable
       baseline, real headroom, no vision/registry variance; chess-best-move's exclusion is
-      recorded with the evidence. `flows_validate` stays green.
-- [ ] The planner prompt instructs weight-order consumption and per-task candidate attribution
-      ("name the candidate id each task addresses").
-- [ ] `bench/run-tbench-loop.sh` gains an operator env knob for the in-container eval model
+      recorded with the evidence. `flows_validate` stays green. _(Landed: `improve-tbench.flux`
+      scores `fibonacci-server` only at `trials: 5` on both the baseline and candidate legs.)_
+- [x] The planner prompt instructs weight-order consumption and per-task candidate attribution
+      ("name the candidate id each task addresses"). _(Landed: the `improve-tbench.flux` planner
+      template — "RANKED by measured weight — take them in order … every task must name the
+      candidate id it addresses in an `addresses` field".)_
+- [x] `bench/run-tbench-loop.sh` gains an operator env knob for the in-container eval model
       (`FLUX_IMPROVE_EVAL_MODEL`) so openrouter routing no longer needs hand commits on the loop
-      branch.
+      branch. _(Landed: `bench/run-tbench-loop.sh` rewrites the flow model when
+      `FLUX_IMPROVE_EVAL_MODEL` is set.)_
 - [ ] A funded round runs on the sharpened setup; outcome recorded here + STATUS.md (keep OR
-      revert — the round must measure cleanly either way).
+      revert — the round must measure cleanly either way). **← the one open item; blocked on a
+      funded round (see below), which is why this story stays `backlog`.**
 
 ## Progress
 - 2026-07-06 filed + implementation started (same session as the proving round).
@@ -55,6 +60,10 @@ consume the ranking, so the next funded round measures the change instead of the
      names non-empty-but-unparseable `tasks` input in its view (mirror `fbec793`).
 - 2026-07-06 — **ON HOLD** (user priority call): machinery proven, three chain defects found+
   fixed or queued, headline gain not yet attempted on a fully-hardened chain. Resume here.
+- Acceptance status: the three infra items (fibonacci×5 substrate, ranked-planner prompt,
+  `FLUX_IMPROVE_EVAL_MODEL` knob) are **landed** and checked above; only the final item — a
+  cleanly-measured funded round — remains, so the story stays `backlog` (blocked on funding a
+  round after the two queued chain fixes above).
 
 ## Notes
 - Loop-development work on `main` under the standing invariants (integrity/validity/

@@ -1,6 +1,8 @@
 # How the self-improvement process works
 
 **Status:** implemented · proven end-to-end on terminal-bench (working loop **and** a first kept gain).
+Active development is **ON HOLD / de-prioritized since 2026-07-06** (user priority call); the headline
+gain (trials ≥ 3, grader-confirmed) remains **unproven** — see [STATUS.md](STATUS.md).
 **Layer:** L3 crate `flux-eval`. **Owner:** Timo Friedl.
 
 This is the design home for the self-improvement loop (it consolidates the former
@@ -71,8 +73,9 @@ it — and `guard_protected` rolled it back before the candidate eval, so the ta
 
 ### Validity — a kept gain beats noise
 
-- **Multiple trials.** `trials >= 3` (the terminal-bench flow uses 3); the keep decision is on the
-  aggregate, not a single run.
+- **Multiple trials.** `trials >= 3`; the terminal-bench flow (`improve-tbench.flux`) uses **5** on a
+  single stable task (fibonacci-server, the I-05 sharpening), and the multi flow
+  (`improve-multi.flux`) uses **3**. The keep decision is on the aggregate, not a single run.
 - **Partial-credit scoring.** Instead of all-or-nothing pass/fail, the terminal-bench adapter reads
   the per-subtest `parser_results` into `mean_check_pass_rate`. The loop can see and keep progress
   *toward* a full pass (e.g. 5/6 → 6/6), which sharply reduces single-trial binary noise.
@@ -231,9 +234,10 @@ The loop is implemented in the L3 crate `flux-eval`, driven by the flux-flow eng
 - `crates/flux-eval/src/score.rs` — `SuiteScore`, the lexicographic comparison, partial credit.
 - `crates/flux-eval/src/metrics.rs` — `RunResult` / `CaseOutcome` (pass, sub-checks, transcript).
 - `crates/flux-eval/src/adapter.rs` — the `BenchmarkAdapter` trait.
-- `crates/flux-eval/src/adapters/{local,terminal_bench}.rs` — `local.rs` is the offline `mock`
-  fixture; `terminal_bench.rs` is the real adapter, whose `prepare()` rebuilds the static musl binary
-  from *candidate* source so the eval measures the worker's edits.
+- `crates/flux-eval/src/adapters/{mod,local,terminal_bench,multi}.rs` — `local.rs` is the offline
+  `mock`/`synthetic` adapter; `terminal_bench.rs` is the real adapter, whose `prepare()` rebuilds the
+  static musl binary from *candidate* source so the eval measures the worker's edits; `multi.rs` is
+  the `MultiAdapter` that grades several members behind one combined score; `mod.rs` wires them up.
 - `crates/flux-eval/terminal_bench/flux_agent.py` — the terminal-bench custom-agent shim (+ `flux-setup.sh`).
 - `crates/flux-agent/src/lib.rs` — flux's shipped `DEFAULT_SYSTEM_PROMPT` (a frequent, legitimate
   improvement target); `crates/flux-tools` — its built-in tools.

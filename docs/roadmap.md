@@ -1,8 +1,8 @@
 # flux — roadmap & status
 
-Status as of **0.15.0 (2026-07-11)**: public + installable at
+Status as of **0.19.2 (2026-07-12)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
-(`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **1900+ tests** across
+(`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
 gate (tests, clippy `-D warnings`, fmt, the `flux-codegate` layering lint). See
 [CHANGELOG.md](../CHANGELOG.md) for the released history and [architecture.md](architecture.md) for the
@@ -79,7 +79,40 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
-### OS process sandboxing — bubblewrap · Seatbelt · graceful-Windows (epic) — **proposed 2026-07-10 (D-134…D-137)**
+> The entries below are the epic log, newest first, each stamped with its status. Everything through
+> **v0.19.2** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+
+### flux-sdk surface — a standard agent SDK (epic) — ✅ **SHIPPED 2026-07-12 (v0.16.0–v0.17.0; D-142…D-159)**
+
+Grew `flux-sdk` from a thin `FlowClient` into a batteries-included agent SDK **without adding a third
+client**: two doors (the deterministic `FlowClient` and the model-driven `Client`) over one `Session`
+handle, with feature-gated batteries (`pricing`/`providers`/`plugins`). **Wave 1** (storage + the
+`Session` handle, `Client` envelope parity, `send_with`, `TurnStream`, a re-export sweep — D-142…D-146)
+landed in **v0.16.0**; **waves 2–4** (flow-driven `Session::start_flow` + suspensions, `with_sub_agents`,
+ClientBuilder surfacing/compaction knobs, `ExecutionResult.usage`, `Session` projections; the
+`flux_providers::spec` module + the `providers`/`plugins` features + `Session::run_voice_flow`; hermetic
+`Session::replay`, `Session::fork`+diff, `FlowClient` streaming, and the datasource recipe doc —
+D-147…D-159) landed in **v0.17.0**. `flux-sdk` itself stays `dist = false` — excluded from the binary
+release closure. Design: [designs/sdk-surface.md](designs/sdk-surface.md).
+
+### Web capabilities II + plugin polish — crawl · PDF · embeddings · dot-naming (v0.16.0–v0.19.2) — ✅ **SHIPPED**
+
+The additive cluster that extended the D-98/D-120 web surface and adjacent plugin/example work, none
+of which had a roadmap entry:
+- **Web capabilities II (D-160…D-163, D-166)** — ✅ `web.crawl` (same-host BFS with page/depth caps,
+  v0.16.0; later gained an optional `max_total_bytes` caller byte budget, v0.19.1 —
+  [D-166](stories/D-166-web-crawl-byte-budget.md)), PDF extraction on `web.fetch`
+  ([D-161](stories/D-161-web-fetch-pdf-extraction.md)), an opt-in provider embeddings pack
+  ([D-162](stories/D-162-provider-embeddings-pack.md)), and the **breaking `web_fetch`/`web_search` →
+  `web.fetch`/`web.search` dot-rename** that made the whole web family uniformly dot-namespaced
+  (clean cutover, no alias; [D-163](stories/D-163-web-fetch-search-dot-rename.md), v0.19.0).
+- **Plugin operation output schemas (D-164, v0.18.0)** — ✅ preserve a plugin op's declared output
+  schema end-to-end ([D-164](stories/D-164-plugin-operation-output-schemas.md)).
+- **Runnable Slack support-bot example (D-165, v0.18.0)** — ✅ made the support-bot example genuinely
+  runnable ([D-165](stories/D-165-support-bot-example-runnable.md)); a public beginner tutorial
+  followed in v0.19.2.
+
+### OS process sandboxing — bubblewrap · Seatbelt · graceful-Windows (epic) — ✅ **SHIPPED 2026-07-11 (v0.14.9; D-134…D-137)**
 
 The safety envelope governs what the *model* may request, but the processes flux ultimately spawns
 — shell commands and above all **stdio plugins** — run with the user's full OS access; five website
@@ -100,7 +133,7 @@ website security docs updated truthfully with the drift-guard test rewritten
 ([D-137](stories/D-137-sandbox-docs-truth-pass.md)). Design:
 [designs/process-sandboxing.md](designs/process-sandboxing.md).
 
-### Web capabilities — request · read · browse (epic) — **SHIPPED 2026-07-09 (D-98 + D-120…D-124 all done, in `[Unreleased]`)**
+### Web capabilities — request · read · browse (epic) — ✅ **SHIPPED 2026-07-09 (v0.12.0; D-98 + D-120…D-124)**
 
 Working with the web is **three fundamentally different capabilities** — distinguished by what the
 model *sees* and what can go wrong — and flux ships them as three deliberately separate surfaces,
@@ -111,8 +144,9 @@ L5 crate **`crates/flux-web`** governed by one family-wide scoped egress policy
 native `http.request` op (arbitrary method/headers/body, status/bytes back); **tier 2, read** —
 [D-120](stories/D-120-web-fetch-readable-markdown.md), pages as *documents*: an
 HTML→readable-markdown condenser (`flux-web::condense`, emitting through the `flux-markdown` AST)
-behind an upgraded `web_fetch` (which cuts over to the `web` scope — the per-tool special case
-from the D-96 caveat dies) plus a composable pure `html_to_markdown` op; **tier 3, browse** —
+behind an upgraded `web.fetch` (which cuts over to the `web` scope — the per-tool special case
+from the D-96 caveat dies; the op shipped as `web_fetch` here and was dot-renamed to `web.fetch`
+by D-163 in v0.19.0) plus a composable pure `html_to_markdown` op; **tier 3, browse** —
 non-visual browser use over headless Chromium and a minimal hand-rolled CDP-on-a-pipe client,
 evidence-gated behind a Chromium-discoverable signal
 ([D-121](stories/D-121-browser-cdp-foundation.md)): the agent observes a byte-budgeted
@@ -127,7 +161,7 @@ JS-initiated) run through the scoped guard via CDP interception — required for
 D-98 (first drafted as plugins; revised native the same day, user call). Design:
 [designs/web-capabilities.md](designs/web-capabilities.md).
 
-### flux-render — `flow_render`: flux source/plan → SVG (epic) — **proposed 2026-07-09 (L-74…L-78)**
+### flux-render — `flow_render`: flux source/plan → SVG (epic) — ✅ **SHIPPED 2026-07-09 (v0.13.2; L-74…L-77; L-78 PNG backlog)**
 
 A model-facing built-in tool `flow_render` (beside `flow_list`/`flow_run`) that turns Flux-Lang into
 a syntax-highlighted image — the highlighted **source** or the **execution-path tree** — rendered
@@ -144,7 +178,7 @@ rasterization ([L-78](stories/L-78-flux-render-png.md), backlog — the only sto
 Phase 1 is SVG-only by constraint and by design: `ToolResult` is text-only, so the model-facing tool
 stays read-only string generation. Design: [designs/flux-render.md](designs/flux-render.md).
 
-### Datasource & endpoint discoverability (epic) — **proposed 2026-07-09 (D-114…D-117)**
+### Datasource & endpoint discoverability (epic) — ✅ **SHIPPED 2026-07-09…10 (v0.13.0–v0.14.6; D-114…D-117)**
 
 A grounding pass over "what can the agent do to enumerate its datasources and register new ones —
 e.g. wire a Postgres endpoint and query it?" found the machinery **exists and is well-built but is
@@ -229,23 +263,26 @@ re-scoped to clients that render them), L-70 (incremental reparse + comment-pres
 epic closeout). Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
 [designs/flux-lsp.md](designs/flux-lsp.md).
 
-### A2A protocol conformance (epic) — **proposed 2026-07-07**
+### A2A protocol conformance (epic) — ✅ **SHIPPED (Tier 1 v0.4.2/0.4.3; Tier 3 v0.6.0; A-49…A-57 all done)**
 
-After v0.4.0 (multi-tenant principal auth + multi-agent mount) the A2A wire surface is stable enough
-to measure against the [spec](https://a2a-protocol.org/) (v0.3.0), so the gaps become a ranked backlog.
-The root of most gaps is one deliberate choice: **flux runs an A2A request as one synchronous turn and
-returns a `completed` Task** — there is no retained, addressable async task, so the whole
-task-management half of the spec is out of reach until that changes. The gaps therefore split into
-*conformance polish that fits today's model* and *a deliberate model change*. **Tier 1 (ready)** —
+After v0.4.0 (multi-tenant principal auth + multi-agent mount) the A2A wire surface was stable enough
+to measure against the [spec](https://a2a-protocol.org/) (v0.3.0), so the gaps became a ranked backlog —
+now **fully delivered**. The root of the early gaps was one deliberate choice: flux ran an A2A request
+as one synchronous turn and returned a `completed` Task, with no retained addressable async task. Tier 3
+removed that constraint. **Tier 1 (v0.4.2/0.4.3)** —
 [A-49](stories/A-49-agent-card-conformance-fields.md) (the card gains `protocolVersion`, honest
 `interfaces`/`preferredTransport`, optional metadata) and
 [A-50](stories/A-50-a2a-error-codes.md) (A2A-specific error codes: `-32004` for unsupported methods,
-`-32005` for unusable content). **Tier 2 (backlog)** —
+`-32005` for unusable content). **Tier 2 (shipped)** —
 [A-51](stories/A-51-inbound-multimodal-parts.md) (inbound file/data parts) and
-[A-52](stories/A-52-outbound-task-fidelity.md) (`Task.history` + artifact emission). **Tier 3
-(design-first)** — [A-53](stories/A-53-stateful-a2a-task-model.md), the stateful task model that
-unlocks `tasks/get` server-side, cancel, resubscribe, non-blocking send, `input-required`, and push.
-Non-goals: gRPC/REST bindings, extensions negotiation, `tasks/list`. Living support matrix:
+[A-52](stories/A-52-outbound-task-fidelity.md) (`Task.history` + artifact emission). **Tier 3 (v0.6.0)** —
+[A-53](stories/A-53-stateful-a2a-task-model.md), the stateful task model, plus the addressable-task
+surface it unlocked: `tasks/get` non-blocking ([A-54](stories/A-54-addressable-tasks-get-nonblocking.md)),
+`tasks/cancel` ([A-55](stories/A-55-tasks-cancel.md)), `tasks/resubscribe`
+([A-56](stories/A-56-tasks-resubscribe.md)), and push notifications
+([A-57](stories/A-57-a2a-push-notifications.md)). The remaining open slice is `input-required`/
+`auth-required` (resume-on-`taskId`) — tracked in the living matrix. Non-goals: gRPC/REST bindings,
+extensions negotiation, `tasks/list`. Living support matrix:
 [a2a-conformance.md](a2a-conformance.md); design: [designs/a2a-conformance.md](designs/a2a-conformance.md).
 
 ### Postgres storage backend (epic) — **SHIPPED 2026-07-07 (v0.4.1; D-71…D-75)**
@@ -811,7 +848,8 @@ Drift made visible, so it stops being silent. Each maps to a story on the
 - ~~**crates.io publish** blocked on the `flux-core` name~~ ✅ done — the whole publish closure ships
   as vanity-prefixed `codewandler-flux-*` (import paths unchanged), published by CI on every version
   tag (`scripts/publish-crates-io.sh` is the ordered, idempotent source of truth).
-- **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result.
+- **Self-improvement headline gain** still lacks a trials ≥ 3, grader-confirmed result; the
+  initiative is **ON HOLD / de-prioritized since 2026-07-06** (machinery proven, gain unproven).
   → [I-01](stories/I-01-headline-gain.md).
 - ~~**No cost tracking.**~~ ✅ done — per-call usage is attributed (`CallUsage`, canonical
   provider/model keys), priced via the built-in table + `~/.flux/pricing.toml`, and reported

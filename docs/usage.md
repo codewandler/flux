@@ -191,6 +191,10 @@ flux --color always|auto|never   # colorize output (auto = a terminal, NO_COLOR 
 flux tui                         # dense ratatui chat UI (queue, session replay, approval sheet)
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
+flux a2a <url> [prompt…]         # connect to a remote A2A agent and chat like a local one (the client
+                                 #   side of `app run --serve`): with a prompt or piped stdin it runs
+                                 #   one turn and exits, otherwise it opens a REPL. --token <t> for a
+                                 #   gated endpoint (falls back to FLUX_A2A_TOKEN)
 flux flow list                   # list saved flows + composite ops (alias: `flux flow ls`) from
                                  #   .flux/flows first, then ~/.flux/flows; no agent session/model
 flux flow run <name|file>        # run a saved flow by filename stem/declared name, or an existing
@@ -248,6 +252,31 @@ flux plugin install <name>       # the plugin CLI — verified install from the 
                                  #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill
 flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);
                                  #   --watch streams the agent live, --report out.md writes a categorized report
+flux review --files a.rs b.rs    # run the embedded strict-review protocol over the files and print a
+                                 #   ReviewReport (self-contained, read-only — posts nowhere, stdout only);
+                                 #   --format md|json, --fail-on info|low|medium|high|critical (exit 1
+                                 #   at/above that severity), -m <spec> reviewer model, --max-tokens N
+flux loop                        # print the active agent loop (assets/agent-loop.flux); the default
+                                 #   `show` action. `flux loop eject` writes the built-in loop to
+                                 #   .flux/agent-loop.flux so you can customize it (-f/--force overwrites)
+flux endpoint list               # inspect the persisted endpoint store (~/.flux/endpoints.toml);
+                                 #   operator-only, reference-only — never prints a secret value. Also:
+                                 #   add <id> --url <bare-url> [--product/--protocol/--credential-ref/
+                                 #   --label] · show <id> · resolve <id> (what a ref WOULD bind to) ·
+                                 #   import <id> [--from-json <ref>]
+flux skill [cli|lang|plugin|ops] # print a generated Claude-format skill's SKILL.md to stdout (omit the
+                                 #   type for the root skill); --install writes skill directories to
+                                 #   .flux/skills instead, --global targets ~/.claude/skills
+flux changelog                   # show what changed in flux, in plain language (the customer changelog);
+                                 #   [<version>] one section, --all every release, --unreleased the
+                                 #   not-yet-released (development) section
+flux completion [shell]          # print a shell completion script to stdout (defaults to fish); an
+                                 #   unknown shell is a usage error (exit 2)
+flux preset list                 # the recipe cookbook — scaffold or run a parameterized flow. `help
+                                 #   <name>` shows a preset's keys; `<name> key=value …` scaffolds it
+                                 #   (-o pretty|json), add --run [--yes] [-m <spec>] to execute instead
+flux corpus export               # mine ~/.flux/events.db (read-only) for NL→Flux-Lang training data,
+                                 #   emitting corpus-shaped JSONL (one row per accepted plan); --out <file>
 ```
 
 A **multi-agent program** is a **native flux-lang `.flux` file** that declares the whole app as typed

@@ -397,7 +397,7 @@ enum Commands {
         #[arg(long, value_enum)]
         fail_on: Option<ReviewSeverity>,
     },
-    /// Inspect or customize the agent loop (`assets/agent-loop.flux`).
+    /// Inspect or customize the agent loop (the Flux-Lang program that drives every turn).
     Loop {
         #[command(subcommand)]
         action: Option<LoopAction>,
@@ -1745,7 +1745,7 @@ fn run_corpus_export_with(
 
 /// `flux loop [show|eject]` — inspect and customize the flux-lang agent loop that drives every turn.
 ///
-/// The loop is real Flux-Lang (`assets/agent-loop.flux`): `plan → match → run_plan → observe`,
+/// The loop is real Flux-Lang (`crates/flux-flow/assets/agent-loop.flux`): `plan → match → run_plan → observe`,
 /// repeated until the model answers in prose. `show` prints the active loop (a workspace
 /// `.flux/agent-loop.flux` override if present, else the built-in); `eject` writes the built-in to
 /// `.flux/agent-loop.flux` so it can be edited (the engine honors the override on the next turn).
