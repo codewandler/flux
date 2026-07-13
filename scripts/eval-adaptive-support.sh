@@ -86,7 +86,7 @@ EOF
 
 QUERY='Using only workspace files, answer as of 2026-07-13 09:50 CET: (1) Is Northwind over its licensed active-seat limit, and exactly how many seats remain or exceed it? (2) What is the exact deadline for the next ORB-17 customer update? (3) Was the P1 first-notification SLA met, and by what margin? Cite the source file paths. Do not modify files.'
 SUMMARY="$RESULTS_DIR/summary.tsv"
-printf 'model\ttrial\tstatus\tlatency_ms\tprovider_calls\tcall_budget\tnative_calls\tlegacy_calls\tfamilies\tfabricated_paths\tsession\tlog\n' >"$SUMMARY"
+printf 'model\ttrial\tstatus\tlatency_ms\tprovider_calls\tcall_budget\tstage_calls_latency\tnative_calls\tlegacy_calls\tfamilies\tfabricated_paths\tsession\tlog\n' >"$SUMMARY"
 
 call_budget() {
   case "$1" in
@@ -148,6 +148,7 @@ for model in $MODELS; do
     provider_calls="$(grep -c '"event":"request"' "$log" || true)"
     native_calls=0
     legacy_calls=0
+    stage_calls_latency='unknown'
     families='unknown'
     answer=''
     if [[ -n "$session" && -f "$HOME/.flux/events.db" ]]; then
@@ -155,6 +156,9 @@ for model in $MODELS; do
         "select count(*) from events where stream='$session' and kind='observation' and json_extract(payload,'$.data.kind')='adaptive.call';" 2>/dev/null || echo 0)"
       legacy_calls="$(sqlite3 "$HOME/.flux/events.db" \
         "select count(*) from events where stream='$session' and kind='observation' and json_extract(payload,'$.data.kind')='tool_call' and json_extract(payload,'$.data.data.tool') in ('emit_plan','run_plan','staged_plan');" 2>/dev/null || echo 0)"
+      stage_calls_latency="$(sqlite3 "$HOME/.flux/events.db" \
+        "select group_concat(stage || '=' || calls || '/' || latency_ms || 'ms', ';') from (select json_extract(payload,'$.data.data.stage') as stage, count(*) as calls, round(sum(json_extract(payload,'$.data.data.duration_us')) / 1000.0) as latency_ms from events where stream='$session' and kind='observation' and json_extract(payload,'$.data.kind')='model.call' group by stage order by stage);" 2>/dev/null || true)"
+      stage_calls_latency="${stage_calls_latency:-unknown}"
       families="$(sqlite3 "$HOME/.flux/events.db" \
         "select json_extract(payload,'$.data.data.families') from events where stream='$session' and kind='observation' and json_extract(payload,'$.data.kind')='turn.intent' order by stream_seq desc limit 1;" 2>/dev/null || true)"
       families="${families:-unknown}"
@@ -178,8 +182,8 @@ for model in $MODELS; do
     else
       failures=$((failures + 1))
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$model" "$trial" "$status" "$latency_ms" "$provider_calls" "$budget" "$native_calls" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$model" "$trial" "$status" "$latency_ms" "$provider_calls" "$budget" "$stage_calls_latency" "$native_calls" \
       "$legacy_calls" "$families" "${invented:-none}" "${session:-unknown}" "$log" | tee -a "$SUMMARY"
   done
 done

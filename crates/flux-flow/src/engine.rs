@@ -115,7 +115,10 @@ pub struct FlowEngine {
     /// widens advertisement only (never grants), and the signals derive from the same host/cwd anyway.
     /// The approval/policy envelope still gates every op. Unused when `groups` is empty (gating off ⇒
     /// all ops advertised, already stable).
-    sticky_groups: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Monotonic surfaced groups scoped by session. A shared server/A2A engine must preserve cache
+    /// stability within one conversation without leaking an integration catalog into another.
+    sticky_groups:
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
     /// How many in-memory evidence observations have been flushed to the event store so far — the
     /// per-turn watermark [`flush_observations`](Self::flush_observations) advances (C-14). The
     /// executor's log is append-only and shared across this engine's turns, so a plain high-water
@@ -237,7 +240,7 @@ impl FlowEngine {
             groups,
             cwd,
             ambient_signals: Vec::new(),
-            sticky_groups: std::sync::Mutex::new(std::collections::HashSet::new()),
+            sticky_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -330,7 +333,7 @@ impl FlowEngine {
 
         // Evidence-gated surfacing for this turn: probe the workspace signals once and hand the
         // advertised op set to the loop host, so every adaptive stage sees the gated catalog.
-        let advertised = self.surfaced_for_turn(user_input, sink);
+        let advertised = self.surfaced_for_turn(session_id, user_input, sink);
 
         // Drive the flux-lang agent loop (`agent_loop`) through an OWNED channel sink — the `'static`
         // loop host owns it while stages are in flight — draining its events onto the borrowed
@@ -506,6 +509,7 @@ impl FlowEngine {
 
     fn surfaced_for_turn(
         &self,
+        session_id: &str,
         user_input: &str,
         sink: &mut dyn AgentSink,
     ) -> std::collections::HashSet<String> {
@@ -514,6 +518,7 @@ impl FlowEngine {
             &self.groups,
             &self.cwd,
             &self.sticky_groups,
+            session_id,
             &self.ambient_signals,
             user_input,
         );
@@ -740,7 +745,7 @@ impl FlowEngine {
         // against an empty input. For a flow with no `ai_segment` this is harmless overhead — the
         // authored prompt is still surfaced explicitly below (Phase A unchanged).
         let base_system = self.base_system_with_skills("", sink);
-        let advertised = self.surfaced_for_turn("", sink);
+        let advertised = self.surfaced_for_turn(session_id, "", sink);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
@@ -889,7 +894,7 @@ impl FlowEngine {
         // delegate a bounded run of model turns (D-131 Phase B). Skills match the reply text; a
         // resume with no segment pays only harmless overhead.
         let base_system = self.base_system_with_skills(user_input, sink);
-        let advertised = self.surfaced_for_turn(user_input, sink);
+        let advertised = self.surfaced_for_turn(session_id, user_input, sink);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
@@ -1206,7 +1211,8 @@ pub(crate) fn surfaced_op_names(
     reg: &flux_runtime::ToolRegistry,
     groups: &[flux_evidence::ToolGroup],
     cwd: &std::path::Path,
-    sticky: &std::sync::Mutex<std::collections::HashSet<String>>,
+    sticky: &std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    session_id: &str,
     ambient: &[String],
     user_input: &str,
 ) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
@@ -1231,14 +1237,16 @@ pub(crate) fn surfaced_op_names(
     signals.extend(flux_evidence::turn_intent_observations(groups, user_input));
     let active = flux_evidence::resolve_active_groups(groups, &signals);
     // Monotonic surfacing (A-03 cache stability): fold this turn's active groups into the session's
-    // sticky union and advertise from the ACCUMULATED set. `resolve_active_groups` is stateless, so a
+    // session-local sticky union and advertise from the ACCUMULATED set. `resolve_active_groups` is
+    // stateless, so a
     // marker file appearing then disappearing would otherwise rewrite segment A's op catalog and miss
     // the cached `tools+A+phase+B` prefix; accumulating means the catalog only ever grows and the
     // prefix restabilizes. Advertising is not granting — the approval/policy envelope still gates ops.
     let accumulated = {
-        let mut s = sticky.lock().unwrap_or_else(|e| e.into_inner());
-        s.extend(active);
-        s.clone()
+        let mut sessions = sticky.lock().unwrap_or_else(|e| e.into_inner());
+        let session = sessions.entry(session_id.to_string()).or_default();
+        session.extend(active);
+        session.clone()
     };
     let advertised = flux_runtime::advertised_op_names(&reg.specs(), groups, &accumulated);
     // Keep the signal NAMES alongside the resolved groups — the `groups.active` observation
@@ -1303,6 +1311,7 @@ fn load_agent_loop_with_iterations(spec: AgentLoopSpec, max_iterations: usize) -
             "max_iterations must be greater than zero".into(),
         ));
     }
+    let builtin = matches!(spec, AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive));
     let mut ast = match spec {
         AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive) => {
             flux_lang::parse::parse(builtin_agent_loop()).map_err(|error| {
@@ -1323,6 +1332,144 @@ fn load_agent_loop_with_iterations(spec: AgentLoopSpec, max_iterations: usize) -
             }
         }
     }
+    if builtin {
+        ast = lift_builtin_repeat_awaits(ast)?;
+    }
+    Ok(ast)
+}
+
+/// Compile the built-in loop's bounded `repeat` with a direct-child `await` into an equivalent
+/// finite top-level state machine. Flux-Lang's durable cursor is a top-level index; lifting the
+/// bounded copies keeps that cursor stable across process restart without adding another parking
+/// mechanism or teaching the runtime to serialize an async interpreter stack.
+fn lift_builtin_repeat_awaits(mut ast: DraftAst) -> Result<DraftAst> {
+    let mut lowered = Vec::new();
+    let mut repeat_index = 0usize;
+    for node in std::mem::take(&mut ast.body) {
+        let crate::ast::Node::Repeat {
+            max,
+            until,
+            body,
+            collect,
+        } = node
+        else {
+            lowered.push(node);
+            continue;
+        };
+        if !body
+            .iter()
+            .any(|node| matches!(node, crate::ast::Node::Await { .. }))
+        {
+            lowered.push(crate::ast::Node::Repeat {
+                max,
+                until,
+                body,
+                collect,
+            });
+            continue;
+        }
+        if collect.is_some() {
+            return Err(Error::Other(
+                "the built-in repeatable-decision loop cannot collect iteration values".into(),
+            ));
+        }
+        let until = until.ok_or_else(|| {
+            Error::Other("the built-in repeatable-decision loop must have an `until` guard".into())
+        })?;
+        if !matches!(
+            until.as_ref(),
+            crate::ast::Node::Var { .. } | crate::ast::Node::Lit { .. }
+        ) {
+            return Err(Error::Other(
+                "the built-in repeatable-decision loop requires a literal or variable `until` guard"
+                    .into(),
+            ));
+        }
+        let active = crate::ast::SymbolName(format!("__adaptive_repeat_{repeat_index}_active"));
+        lowered.push(crate::ast::Node::Bind {
+            name: active.clone(),
+            value: Box::new(crate::ast::Node::Lit {
+                value: serde_json::Value::Bool(true),
+            }),
+            ty: None,
+            effect: None,
+        });
+        for _ in 0..max {
+            for statement in &body {
+                match statement {
+                    crate::ast::Node::Await {
+                        binding,
+                        source,
+                        as_type,
+                        condition,
+                    } => {
+                        let condition = match condition.as_deref() {
+                            None => crate::ast::Node::Var {
+                                name: active.clone(),
+                            },
+                            Some(
+                                condition @ (crate::ast::Node::Var { .. }
+                                | crate::ast::Node::Lit { .. }),
+                            ) => crate::ast::Node::Expr {
+                                formula: "active && requested".into(),
+                                vars: [
+                                    (
+                                        "active".into(),
+                                        Box::new(crate::ast::Node::Var {
+                                            name: active.clone(),
+                                        }),
+                                    ),
+                                    ("requested".into(), Box::new(condition.clone())),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            },
+                            Some(_) => {
+                                return Err(Error::Other(
+                                    "the built-in repeatable decision requires a literal or variable await condition"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        lowered.push(crate::ast::Node::Await {
+                            binding: binding.clone(),
+                            source: source.clone(),
+                            as_type: as_type.clone(),
+                            condition: Some(Box::new(condition)),
+                        });
+                    }
+                    statement => lowered.push(crate::ast::Node::When {
+                        cond: Box::new(crate::ast::Node::Var {
+                            name: active.clone(),
+                        }),
+                        then: vec![statement.clone()],
+                        otherwise: Vec::new(),
+                    }),
+                }
+            }
+            lowered.push(crate::ast::Node::Bind {
+                name: active.clone(),
+                value: Box::new(crate::ast::Node::Expr {
+                    formula: "active && !stop".into(),
+                    vars: [
+                        (
+                            "active".into(),
+                            Box::new(crate::ast::Node::Var {
+                                name: active.clone(),
+                            }),
+                        ),
+                        ("stop".into(), Box::new(until.as_ref().clone())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                ty: None,
+                effect: None,
+            });
+        }
+        repeat_index += 1;
+    }
+    ast.body = lowered;
     Ok(ast)
 }
 
@@ -1458,7 +1605,7 @@ mod tests {
     use flux_runtime::{
         AllowApprover, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
     };
-    use flux_spec::ToolSpec;
+    use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
     use flux_system::{System, Workspace};
     use serde_json::{json, Value};
 
@@ -1527,10 +1674,48 @@ mod tests {
         }
     }
 
+    struct CountingWriteTool(Arc<AtomicU64>);
+
+    #[async_trait]
+    impl Tool for CountingWriteTool {
+        fn spec(&self) -> ToolSpec {
+            let mut spec = ToolSpec::read_only(
+                "change",
+                "Change the fixture exactly once.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                        "fail": {"type": "boolean"}
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                }),
+            )
+            .with_effects(vec![Effect::Write, Effect::Filesystem])
+            .with_risk(Risk::Medium);
+            spec.idempotency = Idempotency::NonIdempotent;
+            spec
+        }
+
+        fn permission_subjects(&self, _input: &Value) -> Vec<String> {
+            vec!["fixture".into()]
+        }
+
+        async fn execute(&self, _ctx: &ToolContext, input: Value) -> Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if input.get("fail").and_then(Value::as_bool) == Some(true) {
+                return Err(Error::Other("fixture change failed".into()));
+            }
+            Ok(ToolResult::ok("fixture changed"))
+        }
+    }
+
     #[derive(Default)]
     struct CollectSink {
         text: String,
         tools: Vec<String>,
+        observations: Vec<flux_evidence::Observation>,
         ended: usize,
     }
 
@@ -1541,6 +1726,10 @@ mod tests {
 
         fn tool_call(&mut self, name: &str, _input: &Value) {
             self.tools.push(name.to_string());
+        }
+
+        fn observation(&mut self, observation: &flux_evidence::Observation) {
+            self.observations.push(observation.clone());
         }
 
         fn turn_end(&mut self, _usage: Option<Usage>) {
@@ -1559,6 +1748,23 @@ mod tests {
                 stop_reason: Some(StopReason::ToolUse),
             },
         ]
+    }
+
+    fn native_calls(calls: Vec<(&str, &str, Value)>) -> Vec<Chunk> {
+        let mut chunks = calls
+            .into_iter()
+            .map(|(id, name, input)| {
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: id.into(),
+                    name: name.into(),
+                    input,
+                })
+            })
+            .collect::<Vec<_>>();
+        chunks.push(Chunk::Done {
+            stop_reason: Some(StopReason::ToolUse),
+        });
+        chunks
     }
 
     fn prose(text: &str) -> Vec<Chunk> {
@@ -1621,6 +1827,57 @@ mod tests {
         });
         let (engine, events) = assemble_test_engine(provider, loop_spec);
         (engine.unwrap(), events, requests)
+    }
+
+    type ScriptedWriteEngine = (
+        FlowEngine,
+        Arc<EventStore>,
+        Arc<Mutex<Vec<Request>>>,
+        Arc<AtomicU64>,
+    );
+
+    fn scripted_write_engine(responses: Vec<Vec<Chunk>>) -> ScriptedWriteEngine {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(responses.into()),
+            requests: requests.clone(),
+        });
+        let writes = Arc::new(AtomicU64::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingWriteTool(writes.clone())));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "flux-adaptive-write-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["change".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap()))),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble_with_loop(
+            provider,
+            executor,
+            events.clone(),
+            flow,
+            "test-model".into(),
+            "Use only observed evidence.".into(),
+            2_048,
+            8,
+            Vec::new(),
+            0,
+            Vec::new(),
+            root,
+            AgentLoopSpec::default(),
+        )
+        .unwrap();
+        (engine, events, requests, writes)
     }
 
     #[test]
@@ -1775,6 +2032,256 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(resumed_context.contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn every_adaptive_decision_suspends_and_resumes_the_same_native_ledger() {
+        let (engine, events, requests) = scripted_engine(
+            vec![
+                native_call(
+                    "intent-1",
+                    "declare_intent",
+                    json!({
+                        "intent": "choose two fixtures",
+                        "capability_families": []
+                    }),
+                ),
+                native_call(
+                    "decision-1",
+                    "request_decision",
+                    json!({
+                        "prompt": "Which primary fixture should I use?",
+                        "options": ["alpha", "beta"]
+                    }),
+                ),
+                native_call(
+                    "decision-2",
+                    "request_decision",
+                    json!({
+                        "prompt": "Which fallback fixture should I use?",
+                        "options": ["gamma", "delta"]
+                    }),
+                ),
+                prose("I will use alpha with gamma as the fallback."),
+            ],
+            AgentLoopSpec::default(),
+        );
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "Choose two fixtures", &mut sink)
+            .await
+            .unwrap();
+        assert!(sink.text.contains("Which primary fixture should I use?"));
+
+        engine.run_turn(&session, "alpha", &mut sink).await.unwrap();
+        assert!(sink.text.contains("Which fallback fixture should I use?"));
+
+        engine.run_turn(&session, "gamma", &mut sink).await.unwrap();
+        assert!(sink
+            .text
+            .ends_with("I will use alpha with gamma as the fallback."));
+        assert_eq!(sink.ended, 3);
+        assert_eq!(events.conversation(&session).unwrap().len(), 6);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "each resume must continue the native ledger without rerunning intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_after_execution_resumes_without_replaying_the_completed_action() {
+        let responses = vec![
+            native_call(
+                "intent-1",
+                "declare_intent",
+                json!({
+                    "intent": "change a fixture and choose the follow-up",
+                    "capability_families": ["workspace.write"]
+                }),
+            ),
+            native_call("change-1", "change", json!({"value": "updated"})),
+            native_call(
+                "finalize-1",
+                "finalize_plan",
+                json!({"instructions": "Report the completed change after resolving the follow-up."}),
+            ),
+            native_call(
+                "decision-after-execution",
+                "request_decision",
+                json!({
+                    "prompt": "Which follow-up should I report?",
+                    "options": ["summary", "details"]
+                }),
+            ),
+            prose("The fixture changed once; here is the summary."),
+        ];
+        let (engine, events, requests, writes) = scripted_write_engine(responses);
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "Change the fixture", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "sink text={:?}, tools={:?}, conversation={:?}, requests={}",
+            sink.text,
+            sink.tools,
+            events.conversation(&session).unwrap(),
+            requests.lock().unwrap().len(),
+        );
+        assert!(sink.text.contains("Which follow-up should I report?"));
+        assert!(
+            sink.text.contains("1. summary"),
+            "sink text={:?}",
+            sink.text
+        );
+        let approved = sink
+            .observations
+            .iter()
+            .find(|observation| observation.kind == "approval.approved")
+            .expect("approval outcome is observable");
+        assert!(approved.data["wait_us"].is_number());
+        let executed = sink
+            .observations
+            .iter()
+            .find(|observation| observation.kind == "action_batch.executed")
+            .expect("batch execution is observable");
+        assert!(executed.data["duration_us"].is_number());
+        assert!(sink
+            .observations
+            .iter()
+            .any(|observation| observation.kind == "model.call"
+                && observation.data["stage"] == "explore"));
+
+        engine
+            .run_turn(&session, "summary", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "resuming a post-execution decision must not replay the consumed batch"
+        );
+        assert!(sink
+            .text
+            .ends_with("The fixture changed once; here is the summary."));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            5,
+            "resume must continue after the execution report without rerunning intent or action capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_failure_skips_later_actions_and_is_not_replayed_after_decision_resume() {
+        let responses = vec![
+            native_call(
+                "intent-1",
+                "declare_intent",
+                json!({
+                    "intent": "attempt two fixture changes and choose the report",
+                    "capability_families": ["workspace.write"]
+                }),
+            ),
+            native_calls(vec![
+                (
+                    "change-fails",
+                    "change",
+                    json!({"value": "first", "fail": true}),
+                ),
+                ("change-skipped", "change", json!({"value": "second"})),
+            ]),
+            native_call(
+                "finalize-1",
+                "finalize_plan",
+                json!({"instructions": "Report the partial failure after resolving presentation."}),
+            ),
+            native_call(
+                "decision-after-failure",
+                "request_decision",
+                json!({
+                    "prompt": "How should I present the partial failure?",
+                    "options": ["briefly", "with details"]
+                }),
+            ),
+            prose("The first change failed, so the second was skipped."),
+        ];
+        let (engine, events, requests, writes) = scripted_write_engine(responses);
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "Attempt both fixture changes", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the second action must be skipped after the first action fails"
+        );
+        assert!(sink.text.contains("1. briefly"));
+
+        engine
+            .run_turn(&session, "briefly", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "resuming after a partial failure must not replay either the failed or skipped action"
+        );
+        assert!(sink
+            .text
+            .ends_with("The first change failed, so the second was skipped."));
+        assert_eq!(requests.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn surfaced_groups_do_not_leak_between_sessions_on_a_shared_engine() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "plugin.slack".into(),
+            description: "Company chat operations.".into(),
+            tools: vec!["echo".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_TURN_INTENT.into(),
+                signal: Some("slack".into()),
+            }],
+        }];
+        let root = std::env::temp_dir();
+        let sticky = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        let (first, _) = surfaced_op_names(
+            &registry,
+            &groups,
+            &root,
+            &sticky,
+            "session-a",
+            &[],
+            "use slack",
+        );
+        assert!(first.contains("echo"));
+
+        let (second, _) = surfaced_op_names(
+            &registry,
+            &groups,
+            &root,
+            &sticky,
+            "session-b",
+            &[],
+            "say hello",
+        );
+        assert!(
+            !second.contains("echo"),
+            "a different session must not inherit another session's surfaced integration"
+        );
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ pub struct EngineLoopHost {
     usage: Mutex<Usage>,
     calls: Mutex<Vec<(String, Usage)>>,
     token_budget: Mutex<Option<u64>>,
+    adaptive_policy: Mutex<crate::staged::AdaptiveLoopPolicy>,
     conversation_cache: Mutex<HashMap<String, (Vec<Message>, i64)>>,
     receipts: crate::staged::ReceiptBook,
     groups: Mutex<Vec<flux_evidence::ToolGroup>>,
@@ -99,6 +100,7 @@ impl EngineLoopHost {
                 usage: Mutex::new(Usage::default()),
                 calls: Mutex::new(Vec::new()),
                 token_budget: Mutex::new(None),
+                adaptive_policy: Mutex::new(crate::staged::AdaptiveLoopPolicy::default()),
                 conversation_cache: Mutex::new(HashMap::new()),
                 receipts: crate::staged::ReceiptBook::default(),
                 groups: Mutex::new(Vec::new()),
@@ -135,6 +137,10 @@ impl EngineLoopHost {
 
     pub fn set_token_budget(&self, budget: Option<u64>) {
         *self.token_budget.lock().unwrap() = budget;
+    }
+
+    pub fn set_adaptive_policy(&self, policy: crate::staged::AdaptiveLoopPolicy) {
+        *self.adaptive_policy.lock().unwrap() = policy;
     }
 
     /// Point the long-lived host at the active turn and reset every turn-scoped capability.
@@ -206,6 +212,7 @@ impl EngineLoopHost {
         let model = self.model.lock().unwrap().clone();
         let options = self.options.lock().unwrap().clone();
         let groups = self.groups.lock().unwrap().clone();
+        let adaptive_policy = self.adaptive_policy.lock().unwrap().clone();
         let (session_id, base_system, sink, audit, mut advertised) = {
             let turn = self.turn.lock().unwrap();
             (
@@ -247,6 +254,7 @@ impl EngineLoopHost {
                 opts: options,
                 max_native_rounds: 12,
                 remaining_token_budget,
+                adaptive_policy,
             },
             provider_name,
             model,
@@ -461,9 +469,9 @@ fn validate_live_batch(
 #[async_trait]
 impl LoopHost for EngineLoopHost {
     async fn detect_intent(&self) -> Result<Value> {
-        let (context, provider, model) = self.adaptive_context()?;
+        let (context, provider, _) = self.adaptive_context()?;
         let run = crate::staged::detect_intent_stage(context).await;
-        self.record_stage_usages(&provider, &model, run.usages);
+        self.record_stage_usages(&provider, &run.model, run.usages);
         match run.result {
             Ok(value) => Ok(value),
             Err(error) => Ok(json!({
@@ -474,9 +482,9 @@ impl LoopHost for EngineLoopHost {
     }
 
     async fn explore(&self, input: Value) -> Result<Value> {
-        let (context, provider, model) = self.adaptive_context()?;
+        let (context, provider, _) = self.adaptive_context()?;
         let run = crate::staged::explore_stage(context, input).await;
-        self.record_stage_usages(&provider, &model, run.usages);
+        self.record_stage_usages(&provider, &run.model, run.usages);
         match run.result {
             Ok(value) => Ok(value),
             Err(error) => Ok(json!({
@@ -494,13 +502,9 @@ impl LoopHost for EngineLoopHost {
             .get(name)
             .cloned()
             .ok_or_else(|| Error::Other(format!("model stage '{name}' is not configured")))?;
-        let attribution_model = definition
-            .model
-            .clone()
-            .unwrap_or_else(|| self.model.lock().unwrap().clone());
         let (context, provider, _) = self.adaptive_context()?;
         let run = crate::staged::run_model_stage(context, name, definition, input).await;
-        self.record_stage_usages(&provider, &attribution_model, run.usages);
+        self.record_stage_usages(&provider, &run.model, run.usages);
         run.result
     }
 
@@ -630,14 +634,20 @@ impl LoopHost for EngineLoopHost {
         );
         executor.observe(requested.clone());
         SharedSink::new(sink.clone()).observation(&requested);
-        if !executor
+        let approval_started = std::time::Instant::now();
+        let approved_choice = executor
             .request_plan_approval(&risk.approval_request())
-            .await
-        {
+            .await;
+        let approval_wait_us = approval_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        if !approved_choice {
             let denied = flux_evidence::Observation::new(
                 "approval.denied",
                 flux_evidence::Phase::Turn,
-                json!({ "scope": "action_batch", "batch_id": batch.id }),
+                json!({
+                    "scope": "action_batch",
+                    "batch_id": batch.id,
+                    "wait_us": approval_wait_us,
+                }),
             );
             executor.observe(denied.clone());
             SharedSink::new(sink).observation(&denied);
@@ -654,7 +664,11 @@ impl LoopHost for EngineLoopHost {
         let approved = flux_evidence::Observation::new(
             "approval.approved",
             flux_evidence::Phase::Turn,
-            json!({ "scope": "action_batch", "batch_id": batch.id }),
+            json!({
+                "scope": "action_batch",
+                "batch_id": batch.id,
+                "wait_us": approval_wait_us,
+            }),
         );
         executor.observe(approved.clone());
         SharedSink::new(sink).observation(&approved);
@@ -702,6 +716,7 @@ impl LoopHost for EngineLoopHost {
                 .consume(&batch, &receipt, &session_id, &executor.approval_context())?;
 
         let _approved = executor.enter_approved_scope(destructive);
+        let execution_started = std::time::Instant::now();
         self.composites
             .ensure_session_loaded(&self.store, &session_id)?;
         let composites = self.composites.active_for_session(&session_id);
@@ -759,12 +774,17 @@ impl LoopHost for EngineLoopHost {
             ok: !failed,
             actions,
         };
+        let duration_us = execution_started
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
         let executed = flux_evidence::Observation::new(
             "action_batch.executed",
             flux_evidence::Phase::Turn,
             json!({
                 "batch_id": batch.id,
                 "ok": report.ok,
+                "duration_us": duration_us,
                 "actions": report.actions.iter().map(|action| json!({
                     "id": action.id,
                     "op": action.op,

@@ -30,7 +30,10 @@ pub mod registry;
 pub mod replay;
 pub mod runtime;
 mod staged;
-pub use staged::{statically_gather_safe, ModelStageDefinition};
+pub use staged::{
+    statically_gather_safe, AdaptiveLoopPolicy, AgentStagePolicy, ModelStageDefinition,
+    DEFAULT_ADAPTIVE_MODEL_CALLS,
+};
 pub mod state;
 pub mod voice;
 

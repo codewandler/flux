@@ -192,19 +192,53 @@ pub struct ToolGroup {
     pub surface_when: Vec<SignalMatch>,
 }
 
+/// One integration family matched by explicit turn-routing evidence. `signals` contains only
+/// manifest-declared [`KIND_TURN_INTENT`] values that occurred in the input; matching never invents
+/// a capability from arbitrary prompt words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentGroupMatch {
+    pub group: String,
+    pub signals: Vec<String>,
+}
+
+/// Match explicit integration aliases, semantic capabilities, and URL-host hints declared as
+/// [`KIND_TURN_INTENT`] signals. Results are name-stable and contain each group once.
+pub fn matching_turn_intent_groups(groups: &[ToolGroup], input: &str) -> Vec<IntentGroupMatch> {
+    let input = input.to_lowercase();
+    let mut matched =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for group in groups {
+        for signal in group
+            .surface_when
+            .iter()
+            .filter(|matcher| matcher.kind == KIND_TURN_INTENT)
+            .filter_map(|matcher| matcher.signal.as_deref())
+        {
+            if contains_bounded(&input, &signal.to_lowercase()) {
+                matched
+                    .entry(group.name.clone())
+                    .or_default()
+                    .insert(signal.to_string());
+            }
+        }
+    }
+    matched
+        .into_iter()
+        .map(|(group, signals)| IntentGroupMatch {
+            group,
+            signals: signals.into_iter().collect(),
+        })
+        .collect()
+}
+
 /// Infer the declared [`KIND_TURN_INTENT`] signals present in `input`. Matching is
 /// case-insensitive and bounded by non-alphanumeric characters, so an integration named `slack`
 /// matches `Slack` and `slack.message.send` but not `Slackware`. Only signals explicitly declared
 /// by a group are considered; arbitrary prompt words never become evidence.
 pub fn turn_intent_observations(groups: &[ToolGroup], input: &str) -> Vec<Observation> {
-    let input = input.to_lowercase();
-    let signals: std::collections::BTreeSet<String> = groups
-        .iter()
-        .flat_map(|group| &group.surface_when)
-        .filter(|matcher| matcher.kind == KIND_TURN_INTENT)
-        .filter_map(|matcher| matcher.signal.as_deref())
-        .filter(|signal| contains_bounded(&input, &signal.to_lowercase()))
-        .map(str::to_string)
+    let signals: std::collections::BTreeSet<String> = matching_turn_intent_groups(groups, input)
+        .into_iter()
+        .flat_map(|matched| matched.signals)
         .collect();
 
     signals
@@ -399,6 +433,50 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    #[test]
+    fn routing_matches_semantic_aliases_and_url_hosts_per_group() {
+        let groups = vec![
+            ToolGroup {
+                name: "plugin.slack".into(),
+                tools: vec!["slack.message.send".into()],
+                surface_when: ["slack", "company chat", "chat", "slack.com"]
+                    .into_iter()
+                    .map(|signal| SignalMatch {
+                        kind: KIND_TURN_INTENT.into(),
+                        signal: Some(signal.into()),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ToolGroup {
+                name: "plugin.teams".into(),
+                tools: vec!["teams.message.send".into()],
+                surface_when: vec![SignalMatch {
+                    kind: KIND_TURN_INTENT.into(),
+                    signal: Some("chat".into()),
+                }],
+                ..Default::default()
+            },
+        ];
+
+        let url = matching_turn_intent_groups(
+            &groups,
+            "summarize https://acme.slack.com/archives/C123/p456",
+        );
+        assert_eq!(url.len(), 1);
+        assert_eq!(url[0].group, "plugin.slack");
+        assert_eq!(url[0].signals, vec!["slack", "slack.com"]);
+
+        let ambiguous = matching_turn_intent_groups(&groups, "post this to company chat");
+        assert_eq!(
+            ambiguous
+                .iter()
+                .map(|matched| matched.group.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plugin.slack", "plugin.teams"]
+        );
     }
 
     #[test]

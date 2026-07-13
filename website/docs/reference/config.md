@@ -86,6 +86,30 @@ actions   = ["workspace.write"]
 `[agent] loop` is `"adaptive"` (the default) or a workspace-relative Flux-Lang file. Selection is
 explicit: `.flux/agent-loop.flux` has no effect merely because it exists.
 
+The shipped adaptive loop defaults to at most 12 provider calls across intent repair, exploration,
+and durable decision resumes. Its two built-in stages inherit the agent model, effort, and token
+limit unless overridden:
+
+```toml
+[agent.adaptive]
+max_model_calls = 10
+
+[agent.adaptive.intent]
+model = "codex/gpt-5.5" # optional; must use the agent's provider
+effort = "low"
+max_tokens = 1024
+max_calls = 2
+
+[agent.adaptive.explore]
+effort = "high"
+max_tokens = 8192
+max_calls = 8
+```
+
+All ceilings must be greater than zero. A matching provider prefix is accepted and stripped; a
+different provider fails during startup rather than opening another credential path. The CLI
+`--max-model-calls` flag overrides the configured total for one invocation.
+
 Config may register model-backed stages as ordinary typed guarded operations. Input and output have
 independent JSON Schemas; there is no common stage envelope:
 
@@ -104,8 +128,9 @@ effort = "low"
 ```
 
 `tools` is a hard gather-only ceiling. Each named operation must be registered, visible to the
-agent, and statically low-risk, idempotent, and non-mutating. The stage cannot use the list to gain
-authority or execute writes while reasoning.
+agent, low-risk, side-effect-free, and non-mutating. A fresh, non-cacheable read is valid; its
+idempotency controls reuse rather than safety. The stage cannot use the list to gain authority or
+execute writes while reasoning.
 
 ## Permissions and policy
 

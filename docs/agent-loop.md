@@ -33,14 +33,22 @@ Intent and capability signals control visibility, not authority. A signal can su
 operation that is present in the live registry and inside the agent's tool, permission, policy, and
 `with_tools` ceilings. Every selected operation still traverses `Executor::dispatch`.
 
+Integration manifests contribute a compact routing index of declared aliases, semantic capabilities
+such as `chat`, and URL hosts. One exact live match is mandatory routing evidence the intent model
+cannot discard; multiple matches produce a decision before any integration schema is exposed. Only
+successfully loaded and wired integrations enter the index. Surfacing is monotonic within a session
+for prompt stability and isolated between sessions on a shared engine.
+
 Exploration distinguishes two kinds of native calls:
 
-- A low-risk, idempotent read may run immediately so its actual redacted result becomes evidence.
-- A mutating, destructive, opaque, or non-idempotent call is captured as literal `{op, input}` data.
+- A low-risk, side-effect-free read may run immediately so its actual redacted result becomes
+  evidence, including fresh reads such as `now` whose result must not be cached.
+- A mutating, destructive, or opaque call is captured as literal `{op, input}` data.
   The host validates it against the live schema and later freezes it into an ordered batch.
 
-The model cannot mark a write as a read. Each operation's effects, risk, idempotency, concrete
-intents, and staging disposition are host-owned contracts.
+The model cannot mark a write as a read. Effects, risk, concrete intents, and staging disposition
+decide whether a call may gather; idempotency decides whether a result may be reused. These are
+host-owned contracts.
 
 ## Why this replaced model-generated plans
 
@@ -66,7 +74,9 @@ The resulting division is:
 An exploration stage may return a typed decision request. The outer loop presents the question and
 parks on Flux-Lang's ordinary `await`. The flow store retains the prior bindings, including the
 opaque native-stage ledger. The user's next message resumes that exact flow; it does not ask a model
-to reconstruct the earlier evidence or plan.
+to reconstruct the earlier evidence or plan. This seam is repeatable: routing ambiguity, a question
+before execution, and a question discovered after an execution report all use the same durable
+`agent.decision` await. A resume never reconstructs or re-executes an already consumed batch.
 
 If execution returns a partial failure, completed actions remain recorded and the report goes back
 to the same exploration ledger. The model may correct only failed work and propose a new batch.
@@ -92,9 +102,38 @@ flux run --show-loop "update CHANGELOG.md after checking the current version"
 flux run --trace-loop "update CHANGELOG.md after checking the current version"
 ```
 
-Normal operation calls and results remain visible independently. Provider request/stream timing can
-be recorded with the model-trace controls documented in the CLI reference. `/evidence` shows the
-shared audit observations for the current session.
+`--show-loop` also prints one compact line per model call with stage, round, wall time, TTFT,
+operation count, and schema size. The same redacted data is stored as `model.call` evidence with
+session/turn correlation; approval outcomes carry wait time and executed batches carry duration.
+`FLUX_MODEL_TRACE=1` adds provider-transport milestones, while only the explicit
+`FLUX_MODEL_TRACE=full` mode includes sensitive request bodies. `/evidence` shows the shared audit
+observations for the current session.
+
+## Bound or tune the built-in stages
+
+One logical adaptive turn has a 12-call default ceiling across intent repair, exploration, and every
+decision resume. Exhaustion fails honestly instead of producing an ungrounded answer. Override the
+total from the CLI with `--max-model-calls`, or set independent same-provider stage policy in config:
+
+```toml
+[agent.adaptive]
+max_model_calls = 10
+
+[agent.adaptive.intent]
+model = "codex/gpt-5.5"
+effort = "low"
+max_tokens = 1024
+max_calls = 2
+
+[agent.adaptive.explore]
+effort = "high"
+max_tokens = 8192
+max_calls = 8
+```
+
+Missing stage values inherit the agent. A provider prefix must match the agent's provider and is
+stripped before the request; a cross-provider override fails at startup. Embedded callers use
+`AgentSpec::adaptive_policy` or the SDK builder's `adaptive_policy` method.
 
 ## Select or author a loop
 

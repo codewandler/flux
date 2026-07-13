@@ -78,6 +78,16 @@ pub struct SystemSegment {
     pub cache: bool,
 }
 
+/// Host-owned correlation for one model request. Providers may include it in local diagnostics,
+/// but codecs must never serialize it onto the vendor wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestTrace {
+    pub session_id: String,
+    pub turn_id: i64,
+    pub stage: String,
+    pub round: usize,
+}
+
 /// A provider-agnostic inference request.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -104,6 +114,8 @@ pub struct Request {
     pub thinking: bool,
     /// Reasoning effort (depth/cost); provider- and model-dependent, opt-in.
     pub effort: Option<Effort>,
+    /// Host-only request correlation. This is consumed by local telemetry and never sent on wire.
+    pub trace: Option<RequestTrace>,
     /// Catch-all for provider-specific parameters.
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
@@ -123,6 +135,7 @@ impl Request {
             stop_sequences: Vec::new(),
             thinking: false,
             effort: None,
+            trace: None,
             metadata: serde_json::Map::new(),
         }
     }
@@ -428,6 +441,7 @@ struct ModelTrace {
     id: u64,
     provider: String,
     model: String,
+    correlation: Option<RequestTrace>,
     started: Instant,
     body_built_us: u64,
     response_us: u64,
@@ -489,6 +503,7 @@ impl ModelTrace {
             "id": self.id,
             "provider": self.provider,
             "model": self.model,
+            "correlation": &self.correlation,
             "terminal": terminal,
             "body_built_us": self.body_built_us,
             "response_us": self.response_us,
@@ -562,6 +577,7 @@ fn begin_model_trace(
         "id": id,
         "provider": provider,
         "model": req.model,
+        "correlation": &req.trace,
         "thinking": req.thinking,
         "effort": req.effort.map(Effort::as_str),
         "max_tokens": req.max_tokens,
@@ -586,6 +602,7 @@ fn begin_model_trace(
         id,
         provider: provider.to_string(),
         model: req.model.clone(),
+        correlation: req.trace.clone(),
         started,
         body_built_us,
         response_us: 0,
@@ -786,9 +803,15 @@ mod tests {
             }));
         });
 
-        let req = Request::new("model", "hello")
+        let mut req = Request::new("model", "hello")
             .with_thinking(true)
             .with_effort(Effort::High);
+        req.trace = Some(RequestTrace {
+            session_id: "s_1".into(),
+            turn_id: 7,
+            stage: "explore".into(),
+            round: 2,
+        });
         let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
         let started = Instant::now();
         let mut trace = begin_model_trace(ModelTraceMode::Summary, "test", &req, &body, started);
@@ -817,7 +840,12 @@ mod tests {
         assert_eq!(records[0]["event"], "request");
         assert_eq!(records[0]["effort"], "high");
         assert_eq!(records[0]["thinking"], true);
+        assert_eq!(records[0]["correlation"]["session_id"], "s_1");
+        assert_eq!(records[0]["correlation"]["turn_id"], 7);
+        assert_eq!(records[0]["correlation"]["stage"], "explore");
+        assert_eq!(records[0]["correlation"]["round"], 2);
         assert_eq!(records[1]["event"], "stream.end");
+        assert_eq!(records[1]["correlation"], records[0]["correlation"]);
         assert_eq!(records[1]["terminal"], "eof");
         assert!(records[1]["first_thinking_us"].is_number());
         assert!(records[1]["first_tool_us"].is_number());

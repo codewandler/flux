@@ -54,7 +54,9 @@ pub use flux_provider::Provider;
 
 /// The agent definition ([`ClientBuilder::from_spec`]) plus its permission rules. Re-exported so
 /// the full-control door needs no direct `flux-agent` dependency.
-pub use flux_agent::{AgentLoopSpec, AgentSpec, BuiltinAgentLoop, Permissions};
+pub use flux_agent::{
+    AdaptiveLoopPolicy, AgentLoopSpec, AgentSpec, AgentStagePolicy, BuiltinAgentLoop, Permissions,
+};
 
 /// The per-turn token accounting carried on [`TurnOutput`]. Re-exported from `flux-core`.
 pub use flux_core::Usage;
@@ -379,6 +381,11 @@ impl ClientBuilder {
     /// Cap the agent loop's tool-calling iterations per turn.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.spec.max_iterations = n;
+        self
+    }
+    /// Configure intent/exploration model policy and the shared logical-run call ceiling.
+    pub fn adaptive_policy(mut self, policy: AdaptiveLoopPolicy) -> Self {
+        self.spec.adaptive_policy = policy;
         self
     }
     /// Select the Flux-Lang outer control program for conversational turns.

@@ -9,11 +9,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_core::{render_knowledge_blocks, ContextBlock, Result};
+use flux_core::{render_knowledge_blocks, ContextBlock, Error, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 pub use flux_flow::engine::{AgentLoopSpec, BuiltinAgentLoop};
 use flux_flow::state::FlowStore;
+pub use flux_flow::{AdaptiveLoopPolicy, AgentStagePolicy};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{Approver, Executor, PermissionManager, ToolContext, ToolRegistry};
 
@@ -150,6 +151,8 @@ pub struct AgentSpec {
     pub agent_loop: AgentLoopSpec,
     /// Evidence-gated tool groups (empty disables gating — every op advertised).
     pub groups: Vec<flux_evidence::ToolGroup>,
+    /// Built-in intent/exploration cognition policy, including the logical-run model-call ceiling.
+    pub adaptive_policy: AdaptiveLoopPolicy,
     /// Session-ambient group-surfacing signals (D-115): host-known facts the per-turn workspace
     /// walk can't see — e.g. the CLI injects `endpoint` when its startup-loaded endpoints store
     /// is non-empty. Appended to every turn's probed signals; surfacing is sticky-monotonic, so
@@ -181,6 +184,7 @@ impl Default for AgentSpec {
             effort: None,
             agent_loop: AgentLoopSpec::default(),
             groups: Vec::new(),
+            adaptive_policy: AdaptiveLoopPolicy::default(),
             ambient_signals: Vec::new(),
             compact_threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
             cwd: PathBuf::from("."),
@@ -276,8 +280,10 @@ impl AgentSpec {
         events: Arc<EventStore>,
         flow: FlowStore,
     ) -> Result<FlowEngine> {
+        let mut adaptive_policy = self.adaptive_policy.clone();
+        resolve_adaptive_policy(provider.name(), &mut adaptive_policy)?;
         let system_prompt = self.effective_system_prompt();
-        FlowEngine::assemble_with_loop(
+        let engine = FlowEngine::assemble_with_loop(
             provider,
             executor,
             events,
@@ -291,13 +297,46 @@ impl AgentSpec {
             self.groups,
             self.cwd,
             self.agent_loop,
-        )
-        .map(|engine| {
-            engine
-                .with_reasoning(self.thinking, self.effort)
-                .with_ambient_signals(self.ambient_signals)
-        })
+        )?;
+        engine.loop_host.set_adaptive_policy(adaptive_policy);
+        Ok(engine
+            .with_reasoning(self.thinking, self.effort)
+            .with_ambient_signals(self.ambient_signals))
     }
+}
+
+fn resolve_adaptive_policy(provider: &str, policy: &mut AdaptiveLoopPolicy) -> Result<()> {
+    if policy.max_model_calls == 0 {
+        return Err(Error::Config(
+            "adaptive max_model_calls must be greater than zero".into(),
+        ));
+    }
+    for (name, stage) in [
+        ("intent", &mut policy.intent),
+        ("explore", &mut policy.explore),
+    ] {
+        if stage.max_tokens == Some(0) {
+            return Err(Error::Config(format!(
+                "adaptive {name} max_tokens must be greater than zero"
+            )));
+        }
+        if stage.max_calls == Some(0) {
+            return Err(Error::Config(format!(
+                "adaptive {name} max_calls must be greater than zero"
+            )));
+        }
+        if let Some(model) = stage.model.as_deref() {
+            if model.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "adaptive {name} model must not be empty"
+                )));
+            }
+            stage.model = Some(flux_core::resolve_role_model(provider, model).map_err(
+                |error| Error::Config(format!("adaptive {name} model is invalid: {error}")),
+            )?);
+        }
+    }
+    Ok(())
 }
 
 /// Register the typed adaptive stages the Flux-Lang agent loop (`agent-loop.flux`) calls, plus
@@ -440,6 +479,32 @@ mod tests {
             ..AgentSpec::new("mock")
         };
         assert_eq!(spec.agent_loop, authored);
+    }
+
+    #[test]
+    fn adaptive_stage_models_stay_on_the_parent_provider() {
+        let mut matching = AdaptiveLoopPolicy {
+            intent: AgentStagePolicy {
+                model: Some("codex/fast-router".into()),
+                ..AgentStagePolicy::default()
+            },
+            ..AdaptiveLoopPolicy::default()
+        };
+        resolve_adaptive_policy("codex", &mut matching).unwrap();
+        assert_eq!(matching.intent.model.as_deref(), Some("fast-router"));
+
+        let mut crossing = AdaptiveLoopPolicy {
+            explore: AgentStagePolicy {
+                model: Some("openai/gpt-5.5".into()),
+                ..AgentStagePolicy::default()
+            },
+            ..AdaptiveLoopPolicy::default()
+        };
+        let error = resolve_adaptive_policy("codex", &mut crossing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider 'openai'"), "{error}");
+        assert!(error.contains("parent's provider ('codex')"), "{error}");
     }
 
     /// L-02: `with_default_skills` discovers from `flux_skill::default_skill_dirs(cwd)` — a skill

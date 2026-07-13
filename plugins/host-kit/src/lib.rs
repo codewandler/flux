@@ -36,7 +36,7 @@ pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, 
 pub use flux_plugin::{
     AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OAuth2Spec, OAuthGrant,
     OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
-    ToolGroup, VALIDATE_OP,
+    SignalMatch, ToolGroup, KIND_TURN_INTENT, VALIDATE_OP,
 };
 pub use flux_spec::{Effect, Idempotency, Risk, StagingDisposition};
 

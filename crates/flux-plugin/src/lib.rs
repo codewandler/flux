@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use flux_core::{Error, Result};
-pub use flux_evidence::ToolGroup;
+pub use flux_evidence::{SignalMatch, ToolGroup, KIND_TURN_INTENT};
 use flux_lang::ast::FlowEffect;
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{Effect, Idempotency, Risk, StagingDisposition, ToolSpec};

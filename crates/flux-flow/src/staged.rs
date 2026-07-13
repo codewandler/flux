@@ -8,14 +8,14 @@ use std::sync::{Arc, Mutex};
 use flux_core::{ContentBlock, Error, Message, Result, Usage};
 use flux_evidence::{Observation, Phase as EvidencePhase, ToolGroup, KIND_TURN_INTENT};
 use flux_lang::ast::{DraftAst, Node, SymbolName};
-use flux_provider::{Effort, Provider, Request, SystemSegment, ToolDef};
+use flux_provider::{Effort, Provider, Request, RequestTrace, SystemSegment, ToolDef};
 use flux_runtime::{effective_group, Executor};
 use flux_spec::{AccessKind, Effect, Risk, ToolSpec};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::loop_host::{PlanningGuard, SharedSink};
-use crate::model::{stream_blocks, StageOptions};
+use crate::model::{stream_blocks, ModelCallMetrics, StageOptions};
 use crate::registry::OpRegistry;
 use crate::runtime::execute_flow_with_composites;
 use crate::state::FlowStore;
@@ -31,6 +31,7 @@ const MAX_FAMILIES: usize = 4;
 const MAX_NATIVE_ROUNDS: usize = 12;
 const MAX_NATIVE_TOOLS: usize = 64;
 const MAX_NATIVE_SCHEMA_CHARS: usize = 128_000;
+pub const DEFAULT_ADAPTIVE_MODEL_CALLS: usize = 12;
 
 const INTENT_SYSTEM: &str = "You are Flux's intent router. Understand the user's request and call \
 declare_intent exactly once. Select only the smallest capability families needed. This is routing, \
@@ -88,6 +89,9 @@ pub(crate) struct StagedContext {
     pub max_native_rounds: usize,
     /// Remaining billed-token budget when this stage call began.
     pub remaining_token_budget: Option<u64>,
+    /// Logical-run and per-stage cognition policy. Counts live in [`AdaptiveState`] so an `await`
+    /// and process restart cannot reset them.
+    pub adaptive_policy: AdaptiveLoopPolicy,
 }
 
 /// Usage stays outside the result: a provider error after usage arrived still costs tokens and must
@@ -95,6 +99,36 @@ pub(crate) struct StagedContext {
 pub(crate) struct StagedRun {
     pub result: Result<Value>,
     pub usages: Vec<Usage>,
+    pub model: String,
+}
+
+/// Optional overrides for one built-in adaptive model stage. Missing values inherit the agent's
+/// provider-local model, effort, and token setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentStagePolicy {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub max_tokens: Option<u32>,
+    pub max_calls: Option<usize>,
+}
+
+/// Cognition policy for one logical adaptive run. The total call ceiling spans intent repair,
+/// exploration, and every durable decision resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptiveLoopPolicy {
+    pub max_model_calls: usize,
+    pub intent: AgentStagePolicy,
+    pub explore: AgentStagePolicy,
+}
+
+impl Default for AdaptiveLoopPolicy {
+    fn default() -> Self {
+        Self {
+            max_model_calls: DEFAULT_ADAPTIVE_MODEL_CALLS,
+            intent: AgentStagePolicy::default(),
+            explore: AgentStagePolicy::default(),
+        }
+    }
 }
 
 /// Runtime definition for one config-authored model stage. Its operation contract is registered
@@ -132,6 +166,9 @@ struct Family {
     /// contract and must be listed exhaustively. Authored groups may use their description plus a
     /// compact sample because the group itself is the semantic contract.
     exhaustive_members: bool,
+    /// Manifest-declared routing-only hints. They select visibility, never authority, and remain
+    /// compact because operation schemas are not included until the family is selected.
+    routing_signals: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -211,6 +248,9 @@ pub struct ExecutionReport {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PendingResponse {
+    Routing {
+        candidates: Vec<String>,
+    },
     Decision {
         call_id: String,
     },
@@ -236,6 +276,10 @@ struct AdaptiveState {
     last_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending: Option<PendingResponse>,
+    #[serde(default)]
+    intent_calls: usize,
+    #[serde(default)]
+    explore_calls: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -355,8 +399,13 @@ fn digest(input: &str) -> String {
 /// Run only the intent stage and return a durable state artifact for [`explore_stage`].
 pub(crate) async fn detect_intent_stage(ctx: StagedContext) -> StagedRun {
     let mut usages = Vec::new();
+    let model = stage_model(&ctx, &ctx.adaptive_policy.intent);
     let result = detect_intent_inner(&ctx, &mut usages).await;
-    StagedRun { result, usages }
+    StagedRun {
+        result,
+        usages,
+        model,
+    }
 }
 
 /// Seed a bounded, capability-scoped `ai_segment` without an extra intent-model call. The authored
@@ -389,6 +438,8 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
         native_step: 0,
         last_error: String::new(),
         pending: None,
+        intent_calls: 0,
+        explore_calls: 0,
     };
     adaptive_result(
         "intent",
@@ -425,7 +476,65 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
     }
 
     observe(ctx, "loop.phase", json!({"phase": "intent"}));
-    let declaration = declare_intent(ctx, &families, usages).await?;
+    let routed = matched_routing_families(ctx, &families);
+    if routed.len() > 1 {
+        let candidates = routed
+            .iter()
+            .map(|matched| matched.group.clone())
+            .collect::<Vec<_>>();
+        let intent = latest_user_input(ctx);
+        let state = AdaptiveState {
+            version: 1,
+            declaration: IntentDeclaration {
+                intent: intent.clone(),
+                families: Vec::new(),
+            },
+            selected: Vec::new(),
+            messages: ctx.conversation.clone(),
+            proposed: Vec::new(),
+            gathered: Vec::new(),
+            native_step: 0,
+            last_error: String::new(),
+            pending: Some(PendingResponse::Routing {
+                candidates: candidates.clone(),
+            }),
+            intent_calls: 0,
+            explore_calls: 0,
+        };
+        observe(
+            ctx,
+            "turn.routing",
+            json!({
+                "status": "ambiguous",
+                "families": &candidates,
+                "signals": routed.iter().flat_map(|matched| &matched.signals).collect::<Vec<_>>(),
+            }),
+        );
+        return adaptive_result(
+            "decision",
+            &state,
+            json!({"question": routing_question(&candidates, &families, false)}),
+        );
+    }
+
+    let mut declaration = declare_intent(ctx, &families, usages).await?;
+    if let Some(routed) = routed.first() {
+        if !declaration.families.contains(&routed.group) {
+            declaration
+                .families
+                .truncate(MAX_FAMILIES.saturating_sub(1));
+            declaration.families.push(routed.group.clone());
+        }
+        observe(
+            ctx,
+            "turn.routing",
+            json!({
+                "status": "matched",
+                "family": &routed.group,
+                "signals": &routed.signals,
+            }),
+        );
+    }
     let selected = selected_specs(&declaration, &families)?;
     let selected_names = selected
         .iter()
@@ -451,6 +560,8 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
         native_step: 0,
         last_error: String::new(),
         pending: None,
+        intent_calls: usages.len(),
+        explore_calls: 0,
     };
     Ok(json!({
         "kind": "intent",
@@ -466,8 +577,13 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
 /// decision or action-batch result, preserving a valid provider history.
 pub(crate) async fn explore_stage(ctx: StagedContext, input: Value) -> StagedRun {
     let mut usages = Vec::new();
+    let model = stage_model(&ctx, &ctx.adaptive_policy.explore);
     let result = explore_stage_inner(&ctx, input, &mut usages).await;
-    StagedRun { result, usages }
+    StagedRun {
+        result,
+        usages,
+        model,
+    }
 }
 
 /// Run one config-defined model stage. The model may only call the declared gather-safe tools and
@@ -480,8 +596,16 @@ pub(crate) async fn run_model_stage(
     input: Value,
 ) -> StagedRun {
     let mut usages = Vec::new();
+    let model = definition
+        .model
+        .clone()
+        .unwrap_or_else(|| ctx.model.clone());
     let result = run_model_stage_inner(&ctx, name, &definition, input, &mut usages).await;
-    StagedRun { result, usages }
+    StagedRun {
+        result,
+        usages,
+        model,
+    }
 }
 
 async fn run_model_stage_inner(
@@ -576,12 +700,27 @@ async fn run_model_stage_inner(
             .map(tool_def)
             .chain(std::iter::once(return_tool.clone()))
             .collect();
+        let stage_label = format!("stage.{name}");
+        correlate_request(ctx, &mut req, &stage_label, round);
+        let request_model = req.model.clone();
 
-        let (streamed, usage) = {
+        let (streamed, usage, metrics) = {
             let _planning = PlanningGuard::start(ctx.sink.clone());
             let mut sink = SharedSink::new(ctx.sink.clone());
             stream_blocks(ctx.provider.as_ref(), req, Some(&mut sink)).await
         };
+        observe_model_call(
+            ctx,
+            ModelCallObservation {
+                stage: &stage_label,
+                round,
+                repair_attempt: round.saturating_sub(1),
+                model: &request_model,
+                usage: &usage,
+                metrics: &metrics,
+                ok: streamed.is_ok(),
+            },
+        );
         usages.push(usage);
         let (mut blocks, text, _, _) = streamed?;
         if blocks.is_empty() && !text.trim().is_empty() {
@@ -727,6 +866,51 @@ async fn explore_stage_inner(
     if let Some(decision) = input.get("decision") {
         let decision = value_as_text(decision);
         match state.pending.take() {
+            Some(PendingResponse::Routing { candidates }) => {
+                let specs = live_visible_specs(ctx);
+                let families = build_families(&specs, &ctx.groups, &ctx.advertised);
+                let live_candidates = candidates
+                    .iter()
+                    .filter(|candidate| families.contains_key(candidate.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if live_candidates.is_empty() {
+                    return Err(Error::Other(
+                        "explore: every integration offered by the routing decision is no longer wired and visible"
+                            .into(),
+                    ));
+                }
+                let Some(chosen) =
+                    resolve_routing_choice(&decision, &live_candidates, &ctx.groups, &families)
+                else {
+                    state.pending = Some(PendingResponse::Routing {
+                        candidates: live_candidates.clone(),
+                    });
+                    return adaptive_result(
+                        "decision",
+                        &state,
+                        json!({"question": routing_question(&live_candidates, &families, true)}),
+                    );
+                };
+                state.declaration.families = vec![chosen.clone()];
+                state.selected = selected_specs(&state.declaration, &families)?
+                    .into_iter()
+                    .map(|spec| spec.name)
+                    .collect();
+                state.messages.push(Message::user_text(format!(
+                    "The user selected integration family `{chosen}`: {decision}"
+                )));
+                observe(
+                    ctx,
+                    "turn.intent",
+                    json!({
+                        "intent": &state.declaration.intent,
+                        "families": &state.declaration.families,
+                        "operations": &state.selected,
+                        "routing_decision": true,
+                    }),
+                );
+            }
             Some(PendingResponse::Decision { call_id }) => {
                 state
                     .messages
@@ -790,6 +974,77 @@ async fn explore_stage_inner(
     adaptive_explore(ctx, state, usages).await
 }
 
+fn latest_user_input(ctx: &StagedContext) -> String {
+    ctx.conversation
+        .iter()
+        .rev()
+        .find(|message| message.role == flux_core::Role::User)
+        .map(Message::text)
+        .unwrap_or_default()
+}
+
+fn matched_routing_families(
+    ctx: &StagedContext,
+    families: &BTreeMap<String, Family>,
+) -> Vec<flux_evidence::IntentGroupMatch> {
+    flux_evidence::matching_turn_intent_groups(&ctx.groups, &latest_user_input(ctx))
+        .into_iter()
+        .filter(|matched| families.contains_key(&matched.group))
+        .collect()
+}
+
+fn routing_question(
+    candidates: &[String],
+    families: &BTreeMap<String, Family>,
+    retry: bool,
+) -> DecisionRequest {
+    let options = candidates
+        .iter()
+        .map(|candidate| {
+            families
+                .get(candidate)
+                .map(|family| format!("{} — {}", family.name, family.description))
+                .unwrap_or_else(|| candidate.clone())
+        })
+        .collect();
+    DecisionRequest {
+        prompt: if retry {
+            "That did not identify one of the live integration families. Which integration should Flux use?"
+                .into()
+        } else {
+            "The request matches more than one live integration. Which integration should Flux use?"
+                .into()
+        },
+        options,
+    }
+}
+
+fn resolve_routing_choice(
+    decision: &str,
+    candidates: &[String],
+    groups: &[ToolGroup],
+    families: &BTreeMap<String, Family>,
+) -> Option<String> {
+    let trimmed = decision.trim();
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if (1..=candidates.len()).contains(&index) {
+            return Some(candidates[index - 1].clone());
+        }
+    }
+    if let Some(exact) = candidates
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(trimmed))
+    {
+        return Some(exact.clone());
+    }
+    let matched = flux_evidence::matching_turn_intent_groups(groups, trimmed)
+        .into_iter()
+        .map(|matched| matched.group)
+        .filter(|group| candidates.contains(group) && families.contains_key(group))
+        .collect::<std::collections::BTreeSet<_>>();
+    (matched.len() == 1).then(|| matched.into_iter().next().unwrap())
+}
+
 async fn adaptive_explore(
     ctx: &StagedContext,
     mut state: AdaptiveState,
@@ -801,6 +1056,7 @@ async fn adaptive_explore(
     let round_limit = native_round_limit(ctx);
     for _round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
+        ensure_model_call_budget(ctx, state.intent_calls, state.explore_calls, "explore")?;
         let specs = live_visible_specs(ctx);
         let families = build_families(&specs, &ctx.groups, &ctx.advertised);
         let selected = selected_specs_for_state(&state, &families, ctx)?;
@@ -816,7 +1072,12 @@ async fn adaptive_explore(
         }
         let selected_names: HashSet<String> =
             selected.iter().map(|spec| spec.name.clone()).collect();
-        let mut req = base_request(ctx, state.messages.clone(), ctx.opts.max_tokens.min(8_192));
+        let mut req = adaptive_request(
+            ctx,
+            &ctx.adaptive_policy.explore,
+            state.messages.clone(),
+            ctx.opts.max_tokens.min(8_192),
+        );
         req.system_segments = explore_segments(ctx, &state.declaration);
         req.tools = selected
             .iter()
@@ -827,11 +1088,27 @@ async fn adaptive_explore(
                 capability_signal_tool(&families),
             ])
             .collect();
-        let (result, usage) = {
+        let repair_attempt = state.explore_calls;
+        correlate_request(ctx, &mut req, "explore", state.explore_calls + 1);
+        let request_model = req.model.clone();
+        let (result, usage, metrics) = {
             let _planning = PlanningGuard::start(ctx.sink.clone());
             let mut sink = SharedSink::new(ctx.sink.clone());
             stream_blocks(ctx.provider.as_ref(), req, Some(&mut sink)).await
         };
+        state.explore_calls += 1;
+        observe_model_call(
+            ctx,
+            ModelCallObservation {
+                stage: "explore",
+                round: state.explore_calls,
+                repair_attempt,
+                model: &request_model,
+                usage: &usage,
+                metrics: &metrics,
+                ok: result.is_ok(),
+            },
+        );
         usages.push(usage);
         let (mut blocks, text, _, _) = result?;
         if blocks.is_empty() && !text.trim().is_empty() {
@@ -1095,7 +1372,8 @@ fn build_families(
         }
 
         let physical = effective_group(spec, groups);
-        let (name, description, discoverable, exhaustive_members) = match physical {
+        let (name, description, discoverable, exhaustive_members, routing_signals) = match physical
+        {
             Some(name) => {
                 let manifest = groups.iter().find(|g| g.name == name);
                 let semantic = manifest
@@ -1105,7 +1383,21 @@ fn build_families(
                     .map(|g| g.description.clone())
                     .filter(|d| !d.trim().is_empty())
                     .unwrap_or_else(|| format!("Registered `{name}` operations."));
-                (name.to_string(), description, semantic || active, false)
+                let mut routing_signals = manifest
+                    .into_iter()
+                    .flat_map(|group| &group.surface_when)
+                    .filter(|matcher| matcher.kind == KIND_TURN_INTENT)
+                    .filter_map(|matcher| matcher.signal.clone())
+                    .collect::<Vec<_>>();
+                routing_signals.sort();
+                routing_signals.dedup();
+                (
+                    name.to_string(),
+                    description,
+                    semantic || active,
+                    false,
+                    routing_signals,
+                )
             }
             None => {
                 let name = virtual_family(spec);
@@ -1114,6 +1406,7 @@ fn build_families(
                     virtual_description(name).to_string(),
                     advertised.contains(&spec.name),
                     true,
+                    Vec::new(),
                 )
             }
         };
@@ -1125,6 +1418,7 @@ fn build_families(
             description,
             specs: Vec::new(),
             exhaustive_members,
+            routing_signals,
         });
         family.specs.push(spec.clone());
     }
@@ -1187,8 +1481,22 @@ fn family_index(families: &BTreeMap<String, Family>) -> String {
         } else {
             "e.g."
         };
+        let routing = if family.routing_signals.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Routing hints: {}.",
+                family
+                    .routing_signals
+                    .iter()
+                    .take(8)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         out.push_str(&format!(
-            "- {} ({} operation{}; {member_label} {}): {}\n",
+            "- {} ({} operation{}; {member_label} {}): {}{routing}\n",
             family.name,
             family.specs.len(),
             if family.specs.len() == 1 { "" } else { "s" },
@@ -1233,16 +1541,31 @@ async fn declare_intent(
     let valid = families.keys().cloned().collect::<Vec<_>>().join(", ");
     let mut last_error = String::new();
 
-    for _ in 0..MAX_INTENT_ATTEMPTS {
+    for attempt in 0..MAX_INTENT_ATTEMPTS {
         ensure_stage_budget(ctx, usages)?;
-        let mut req = base_request(ctx, messages.clone(), 1_024);
+        ensure_model_call_budget(ctx, usages.len(), 0, "intent")?;
+        let mut req = adaptive_request(ctx, &ctx.adaptive_policy.intent, messages.clone(), 1_024);
         req.system_segments = intent_segments(ctx, family_index(families));
         req.tools = vec![intent_tool(families)];
-        let (result, usage) = {
+        correlate_request(ctx, &mut req, "intent", attempt + 1);
+        let request_model = req.model.clone();
+        let (result, usage, metrics) = {
             let _planning = PlanningGuard::start(ctx.sink.clone());
             let mut sink = SharedSink::new(ctx.sink.clone());
             stream_blocks(ctx.provider.as_ref(), req, Some(&mut sink)).await
         };
+        observe_model_call(
+            ctx,
+            ModelCallObservation {
+                stage: "intent",
+                round: attempt + 1,
+                repair_attempt: attempt,
+                model: &request_model,
+                usage: &usage,
+                metrics: &metrics,
+                ok: result.is_ok(),
+            },
+        );
         usages.push(usage);
         let (mut blocks, text, _, _) = result?;
         if blocks.is_empty() && !text.trim().is_empty() {
@@ -1750,6 +2073,107 @@ fn base_request(ctx: &StagedContext, messages: Vec<Message>, max_tokens: u32) ->
     req.thinking = ctx.opts.thinking;
     req.effort = ctx.opts.effort;
     req
+}
+
+fn correlate_request(ctx: &StagedContext, request: &mut Request, stage: &str, round: usize) {
+    request.trace = Some(RequestTrace {
+        session_id: ctx.session_id.clone(),
+        turn_id: ctx.audit.as_ref().map(|(_, turn_id)| *turn_id).unwrap_or(0),
+        stage: stage.to_string(),
+        round,
+    });
+}
+
+struct ModelCallObservation<'a> {
+    stage: &'a str,
+    round: usize,
+    repair_attempt: usize,
+    model: &'a str,
+    usage: &'a Usage,
+    metrics: &'a ModelCallMetrics,
+    ok: bool,
+}
+
+fn observe_model_call(ctx: &StagedContext, call: ModelCallObservation<'_>) {
+    let ModelCallObservation {
+        stage,
+        round,
+        repair_attempt,
+        model,
+        usage,
+        metrics,
+        ok,
+    } = call;
+    observe(
+        ctx,
+        "model.call",
+        json!({
+            "session_id": ctx.session_id,
+            "turn_id": ctx.audit.as_ref().map(|(_, turn_id)| *turn_id),
+            "stage": stage,
+            "round": round,
+            "repair_attempt": repair_attempt,
+            "provider": ctx.provider.name(),
+            "model": model,
+            "ok": ok,
+            "duration_us": metrics.duration_us,
+            "ttft_us": metrics.ttft_us,
+            "chunks": metrics.chunks,
+            "system_bytes": metrics.system_bytes,
+            "message_bytes": metrics.message_bytes,
+            "operations": metrics.operations,
+            "schema_bytes": metrics.schema_bytes,
+            "usage": usage,
+        }),
+    );
+}
+
+fn stage_model(ctx: &StagedContext, policy: &AgentStagePolicy) -> String {
+    policy.model.clone().unwrap_or_else(|| ctx.model.clone())
+}
+
+fn adaptive_request(
+    ctx: &StagedContext,
+    policy: &AgentStagePolicy,
+    messages: Vec<Message>,
+    default_max_tokens: u32,
+) -> Request {
+    let mut req = base_request(
+        ctx,
+        messages,
+        policy.max_tokens.unwrap_or(default_max_tokens),
+    );
+    req.model = stage_model(ctx, policy);
+    req.effort = policy.effort.or(ctx.opts.effort);
+    req
+}
+
+fn ensure_model_call_budget(
+    ctx: &StagedContext,
+    intent_calls: usize,
+    explore_calls: usize,
+    stage: &str,
+) -> Result<()> {
+    let total = intent_calls.saturating_add(explore_calls);
+    if total >= ctx.adaptive_policy.max_model_calls {
+        return Err(Error::Other(format!(
+            "adaptive model-call budget exhausted before `{stage}` ({total}/{} calls used in this logical run)",
+            ctx.adaptive_policy.max_model_calls
+        )));
+    }
+    let (used, cap) = match stage {
+        "intent" => (intent_calls, ctx.adaptive_policy.intent.max_calls),
+        "explore" => (explore_calls, ctx.adaptive_policy.explore.max_calls),
+        _ => (total, None),
+    };
+    if let Some(cap) = cap {
+        if used >= cap {
+            return Err(Error::Other(format!(
+                "adaptive `{stage}` model-call cap exhausted ({used}/{cap} calls used in this logical run)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_stage_budget(ctx: &StagedContext, usages: &[Usage]) -> Result<()> {
@@ -2381,6 +2805,7 @@ mod tests {
             opts: StageOptions::default(),
             max_native_rounds: MAX_NATIVE_ROUNDS,
             remaining_token_budget: None,
+            adaptive_policy: AdaptiveLoopPolicy::default(),
         };
         TestHarness {
             context,
@@ -2402,6 +2827,7 @@ mod tests {
                 return StagedRun {
                     result: Err(error),
                     usages: intent.usages,
+                    model: intent.model,
                 };
             }
         };
@@ -2411,6 +2837,7 @@ mod tests {
         StagedRun {
             result: exploration.result,
             usages: intent.usages,
+            model: exploration.model,
         }
     }
 
@@ -2521,14 +2948,17 @@ mod tests {
                 "observation:loop.phase",
                 "planning:true",
                 "planning:false",
+                "observation:model.call",
                 "observation:turn.intent",
                 "observation:loop.phase",
                 "planning:true",
                 "planning:false",
+                "observation:model.call",
                 "tool:inspect",
                 "observation:adaptive.call",
                 "planning:true",
                 "planning:false",
+                "observation:model.call",
             ],
             "each provider wait must be visible and must stop before a gathered op starts"
         );
@@ -2556,9 +2986,19 @@ mod tests {
                 assert!(run(context).await.result.is_err());
             }
 
+            let expected = if cancelled {
+                vec!["observation:loop.phase", "planning:true", "planning:false"]
+            } else {
+                vec![
+                    "observation:loop.phase",
+                    "planning:true",
+                    "planning:false",
+                    "observation:model.call",
+                ]
+            };
             assert_eq!(
                 sink.lock().unwrap().events,
-                vec!["observation:loop.phase", "planning:true", "planning:false",],
+                expected,
                 "the RAII planning bracket must clear on every exit"
             );
         }
@@ -2652,6 +3092,197 @@ mod tests {
         }
     }
 
+    fn routed_group(name: &str, tool: &str, signals: &[&str]) -> ToolGroup {
+        ToolGroup {
+            name: name.into(),
+            description: format!("{name} integration"),
+            tools: vec![tool.into()],
+            surface_when: signals
+                .iter()
+                .map(|signal| flux_evidence::SignalMatch {
+                    kind: KIND_TURN_INTENT.into(),
+                    signal: Some((*signal).into()),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_strong_routing_match_cannot_be_dropped_by_the_intent_model() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![native_call(
+            "intent",
+            DECLARE_INTENT,
+            json!({
+                "intent": "post a fixture update",
+                "capability_families": []
+            }),
+        )]);
+        context.conversation = vec![Message::user_text("post this to company chat")];
+        context.groups = vec![routed_group(
+            "plugin.fixture-chat",
+            "change",
+            &["fixture chat", "company chat", "chat.example.com"],
+        )];
+
+        let result = detect_intent_stage(context).await.result.unwrap();
+        assert_eq!(result["kind"], "intent");
+        assert_eq!(result["families"], json!(["plugin.fixture-chat"]));
+        assert_eq!(result["operations"], json!(["change"]));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_routing_asks_before_exposing_an_integration_schema() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![prose("used the selected integration")]);
+        context.conversation = vec![Message::user_text("post this to chat")];
+        context.groups = vec![
+            routed_group("plugin.fixture-read", "inspect", &["chat"]),
+            routed_group("plugin.fixture-write", "change", &["chat"]),
+        ];
+
+        let decision = detect_intent_stage(context.clone()).await.result.unwrap();
+        assert_eq!(decision["kind"], "decision");
+        assert_eq!(decision["question"]["options"].as_array().unwrap().len(), 2);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "an exact ambiguity is resolved before a provider request or integration schema"
+        );
+
+        let resumed = explore_stage(
+            context,
+            json!({"state": decision["state"].clone(), "decision": "1"}),
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(resumed["kind"], "chat");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.iter().any(|tool| tool.name == "inspect"));
+        assert!(!requests[0].tools.iter().any(|tool| tool.name == "change"));
+    }
+
+    #[tokio::test]
+    async fn routing_never_offers_an_unwired_group() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![native_call(
+            "intent",
+            DECLARE_INTENT,
+            json!({"intent": "answer conversationally", "capability_families": []}),
+        )]);
+        context.conversation = vec![Message::user_text("post this to ghost chat")];
+        context.groups = vec![routed_group("plugin.ghost", "ghost.send", &["ghost chat"])];
+
+        let result = detect_intent_stage(context).await.result.unwrap();
+        assert_eq!(result["kind"], "intent");
+        assert_eq!(result["families"], json!([]));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn logical_model_call_budget_survives_a_decision_resume() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({"intent": "choose safely", "capability_families": []}),
+            ),
+            native_call(
+                "decision",
+                REQUEST_DECISION,
+                json!({"prompt": "Which path?", "options": ["a", "b"]}),
+            ),
+            prose("this response must never be requested"),
+        ]);
+        context.adaptive_policy.max_model_calls = 2;
+
+        let intent = detect_intent_stage(context.clone()).await.result.unwrap();
+        let decision = explore_stage(context.clone(), json!({"state": intent["state"].clone()}))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(decision["kind"], "decision");
+
+        let error = explore_stage(
+            context,
+            json!({"state": decision["state"].clone(), "decision": "a"}),
+        )
+        .await
+        .result
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("model-call budget exhausted"), "{error}");
+        assert!(error.contains("2/2"), "{error}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            2,
+            "resume must stop before a third provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn built_in_stage_policy_overrides_model_effort_and_tokens_independently() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({"intent": "answer", "capability_families": []}),
+            ),
+            prose("done"),
+        ]);
+        context.adaptive_policy.intent = AgentStagePolicy {
+            model: Some("fast-router".into()),
+            effort: Some(Effort::Low),
+            max_tokens: Some(333),
+            max_calls: Some(1),
+        };
+        context.adaptive_policy.explore = AgentStagePolicy {
+            model: Some("deep-explorer".into()),
+            effort: Some(Effort::High),
+            max_tokens: Some(777),
+            max_calls: Some(2),
+        };
+        let executor = context.executor.clone();
+
+        assert_eq!(run(context).await.result.unwrap()["kind"], "chat");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].model, "fast-router");
+        assert_eq!(requests[0].effort, Some(Effort::Low));
+        assert_eq!(requests[0].max_tokens, 333);
+        assert_eq!(requests[1].model, "deep-explorer");
+        assert_eq!(requests[1].effort, Some(Effort::High));
+        assert_eq!(requests[1].max_tokens, 777);
+        assert_eq!(requests[0].trace.as_ref().unwrap().stage, "intent");
+        assert_eq!(requests[1].trace.as_ref().unwrap().stage, "explore");
+        let evidence = executor.evidence();
+        let calls = evidence.by_kind("model.call").collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].data["stage"], "intent");
+        assert_eq!(calls[0].data["operations"], 1);
+        assert!(calls[0].data["duration_us"].is_number());
+        assert!(calls[0].data["ttft_us"].is_number());
+        assert_eq!(calls[1].data["stage"], "explore");
+    }
+
     #[test]
     fn semantic_families_cannot_escape_permission_or_with_tools_ceiling() {
         let TestHarness {
@@ -2733,6 +3364,8 @@ mod tests {
             native_step: 0,
             last_error: String::new(),
             pending: None,
+            intent_calls: 0,
+            explore_calls: 0,
         };
 
         let error = selected_specs_for_state(&state, &families, &context)
@@ -3146,6 +3779,7 @@ mod tests {
             opts: StageOptions::default(),
             max_native_rounds: MAX_NATIVE_ROUNDS,
             remaining_token_budget: None,
+            adaptive_policy: AdaptiveLoopPolicy::default(),
         };
 
         let output = run(ctx).await.result.unwrap();
@@ -3379,10 +4013,13 @@ mod tests {
             )
         }));
         let TestHarness {
-            context: ctx,
+            context: mut ctx,
             write_calls,
             ..
         } = staged_context(responses);
+        // This fixture isolates the separate per-invocation native-round guard. The normal logical
+        // turn budget is intentionally lower/equal and is covered by its own resume test.
+        ctx.adaptive_policy.max_model_calls = MAX_NATIVE_ROUNDS + 2;
 
         let error = run(ctx).await.result.unwrap_err().to_string();
 

@@ -303,7 +303,7 @@ struct EmojiListInput {
 struct IndexBuildInput {}
 
 fn manifest_builder() -> PluginBuilder {
-    PluginBuilder::new("slack", env!("CARGO_PKG_VERSION"))
+    let builder = PluginBuilder::new("slack", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
             http_hosts: vec!["slack.com".into(), "*.slack.com".into()],
@@ -552,7 +552,26 @@ fn manifest_builder() -> PluginBuilder {
                 "Build the Slack channel and user reverse-lookup indexes.",
             ),
             index_build,
-        )
+        );
+    let mut tools = builder
+        .manifest()
+        .operations
+        .into_iter()
+        .map(|operation| operation.name)
+        .collect::<Vec<_>>();
+    tools.push(VALIDATE_OP.into());
+    builder.group(ToolGroup {
+        name: "plugin.slack".into(),
+        description: "Slack company-chat messaging, channels, users, files, and search.".into(),
+        tools,
+        surface_when: ["slack", "chat", "company chat", "team chat", "slack.com"]
+            .into_iter()
+            .map(|signal| SignalMatch {
+                kind: KIND_TURN_INTENT.into(),
+                signal: Some(signal.into()),
+            })
+            .collect(),
+    })
 }
 
 /// A contributing datasource: searchable, gettable, and feedable by `slack.index.build`.

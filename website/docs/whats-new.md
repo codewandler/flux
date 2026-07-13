@@ -12,6 +12,37 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Adaptive turns have an explicit model-call budget and per-stage controls.** A logical turn uses
+  at most 12 model calls by default, even across repairs and questions that pause for your reply.
+  Use `--max-model-calls` or project config to change the total; intent and exploration can also
+  inherit or override effort, output size, call count, and a model on the same provider.
+- **Loop diagnostics show where model time and context go.** `--show-loop` now reports each model
+  stage's round, total time, time to first response, operation count, and schema size. The audit trail
+  retains those redacted measurements alongside approval wait and batch execution time; exact
+  request bodies remain behind the explicit sensitive trace setting.
+
+### Improved
+
+- **Integration routing uses the aliases and capabilities integrations declare.** Requests can
+  select a loaded integration from names such as “company chat” or a pasted service URL without
+  loading every installed operation first. One clear match cannot be dropped by the router; several
+  matches ask you to choose. Installed but unusable integrations are never offered.
+
+### Fixed
+
+- **Questions can pause and resume repeatedly without replaying completed work.** This includes a
+  question discovered after an approved batch has already executed. Later questions render normally
+  instead of leaking raw JSON, and separate sessions sharing one long-lived agent no longer inherit
+  each other's surfaced integrations.
+
+### Action needed
+
+- **Rust integrations using exhaustive agent or provider-request struct literals need new fields.**
+  Add the adaptive policy and host-only trace fields, or construct values with the provided defaults
+  and request constructor. No trace metadata is sent to model providers.
+
 ## [0.20.1] - 2026-07-13
 
 ### Fixed

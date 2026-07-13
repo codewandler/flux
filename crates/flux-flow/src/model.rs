@@ -4,6 +4,7 @@
 //! operation schemas and returns stage-owned values; authored Flux controls the outer loop.
 
 use futures::StreamExt;
+use std::time::Instant;
 
 use flux_core::{Chunk, ContentBlock, Result, StopReason, Usage};
 use flux_provider::{Effort, Provider, Request};
@@ -26,6 +27,18 @@ impl Default for StageOptions {
     }
 }
 
+/// Redacted measurements captured at the provider-stream boundary for one model call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelCallMetrics {
+    pub duration_us: u64,
+    pub ttft_us: Option<u64>,
+    pub chunks: u64,
+    pub system_bytes: usize,
+    pub message_bytes: usize,
+    pub operations: usize,
+    pub schema_bytes: usize,
+}
+
 /// Consume one provider stream without assigning execution semantics to its content.
 ///
 /// Usage is returned beside errors because tokens reported before a malformed/failing frame remain
@@ -44,11 +57,36 @@ pub(crate) async fn stream_blocks<'a, 'b>(
         Option<(u32, String)>,
     )>,
     Usage,
+    ModelCallMetrics,
 ) {
+    let started = Instant::now();
     let mut usage = Usage::default();
+    let mut metrics = ModelCallMetrics {
+        system_bytes: request
+            .system_text()
+            .map(|text| text.len())
+            .unwrap_or_default(),
+        message_bytes: serde_json::to_vec(&request.messages)
+            .map(|value| value.len())
+            .unwrap_or_default(),
+        operations: request.tools.len(),
+        schema_bytes: request
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::to_vec(&tool.input_schema)
+                    .map(|value| value.len())
+                    .unwrap_or_default()
+            })
+            .sum(),
+        ..ModelCallMetrics::default()
+    };
     let mut stream = match provider.stream(request).await {
         Ok(stream) => stream,
-        Err(error) => return (Err(error), usage),
+        Err(error) => {
+            metrics.duration_us = elapsed_us(started);
+            return (Err(error), usage, metrics);
+        }
     };
     let mut blocks = Vec::new();
     let mut text = String::new();
@@ -56,6 +94,8 @@ pub(crate) async fn stream_blocks<'a, 'b>(
     let mut diagnostic = None;
 
     while let Some(chunk) = stream.next().await {
+        metrics.ttft_us.get_or_insert_with(|| elapsed_us(started));
+        metrics.chunks += 1;
         match chunk {
             Ok(Chunk::ThinkingDelta(delta)) => {
                 if let Some(sink) = thinking_sink.as_deref_mut() {
@@ -74,9 +114,17 @@ pub(crate) async fn stream_blocks<'a, 'b>(
                 detail,
             }) => diagnostic = Some((dropped_frames, detail)),
             Ok(_) => {}
-            Err(error) => return (Err(error), usage),
+            Err(error) => {
+                metrics.duration_us = elapsed_us(started);
+                return (Err(error), usage, metrics);
+            }
         }
     }
 
-    (Ok((blocks, text, stop_reason, diagnostic)), usage)
+    metrics.duration_us = elapsed_us(started);
+    (Ok((blocks, text, stop_reason, diagnostic)), usage, metrics)
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u64::MAX as u128) as u64
 }

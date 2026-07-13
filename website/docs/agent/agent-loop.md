@@ -37,13 +37,21 @@ Intent and capability signals control visibility, not authority. A signal can su
 operation inside the agent's tool, permission, policy, and app capability ceilings. Every selected
 operation still passes through the executor.
 
+Integration manifests contribute a compact routing index of declared aliases, semantic capabilities
+such as `chat`, and URL hosts. One exact live match is mandatory evidence the intent model cannot
+drop. Several matches ask you to choose before any integration schema is exposed. Only loaded,
+wired integrations enter the index, and surfaced capabilities stay stable within one session without
+leaking into another session on a shared engine.
+
 Operation metadata—not prompt wording—decides staging:
 
-- Low-risk, idempotent, non-mutating calls may gather evidence immediately.
-- Mutating, destructive, opaque, or non-idempotent calls are captured as literal `{op, input}` data.
+- Low-risk, side-effect-free reads may gather evidence immediately, including fresh reads such as
+  the current clock whose values must not be cached.
+- Mutating, destructive, or opaque calls are captured as literal `{op, input}` data.
 
 The host validates every input against the exact registered schema and constructs the ordered batch.
-The model cannot label a write as a read or mint an approval receipt.
+The model cannot label a write as a read or mint an approval receipt. Idempotency controls reuse;
+effects, risk, concrete intents, and staging policy control whether a call may gather.
 
 ## Why not generate one Flux plan?
 
@@ -67,7 +75,9 @@ Flux now places determinism at the useful seams:
 Exploration may return a typed decision request. The loop renders the question and suspends at an
 ordinary Flux-Lang `await`. The flow store retains every prior binding, including the opaque native
 conversation ledger. The next user message resumes that exact state instead of asking a model to
-reconstruct it.
+reconstruct it. Decisions are repeatable: ambiguity during routing, a question before execution, and
+a question discovered after an execution report all park on the same durable `agent.decision` await.
+Resuming cannot reconstruct or replay a batch whose one-shot receipt was already consumed.
 
 After approval, a receipt is valid for one exact batch, session, caller/authority context, and policy
 context, and can be consumed only once. Changed, stale, reused, denied, or cross-session receipts fail
@@ -93,8 +103,37 @@ flux run --show-loop "update CHANGELOG.md after checking the current version"
 flux run --trace-loop "update CHANGELOG.md after checking the current version"
 ```
 
-`/evidence` shows intent, tool, approval, batch, and execution observations recorded for the session.
-Normal operation calls and results remain visible independently of these flags.
+`--show-loop` also prints one compact line per model call with stage, round, wall time, TTFT,
+operation count, and schema size. Redacted `model.call` evidence retains session/turn correlation;
+approval outcomes include wait time and executed batches include duration. `FLUX_MODEL_TRACE=1`
+adds provider transport milestones. Exact request bodies appear only with the explicitly sensitive
+`FLUX_MODEL_TRACE=full` setting. `/evidence` shows the durable trail.
+
+## Bound or tune the built-in stages
+
+One logical adaptive turn has a 12-call default ceiling spanning intent repair, exploration, and
+every decision resume. Exceeding it fails clearly instead of returning an ungrounded answer. Use
+`--max-model-calls` for a one-off override, or configure the stages:
+
+```toml
+[agent.adaptive]
+max_model_calls = 10
+
+[agent.adaptive.intent]
+model = "codex/gpt-5.5"
+effort = "low"
+max_tokens = 1024
+max_calls = 2
+
+[agent.adaptive.explore]
+effort = "high"
+max_tokens = 8192
+max_calls = 8
+```
+
+Missing values inherit the agent. Stage models must use the agent's existing provider; a matching
+provider prefix is stripped, while a cross-provider override fails before any request. SDK callers
+set the same policy through `AgentSpec` or the client builder.
 
 ## Select or author a loop
 

@@ -151,11 +151,62 @@ pub struct AgentConfig {
     /// Named model stages registered as typed guarded operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stages: BTreeMap<String, ModelStageConfig>,
+    /// Policy for the shipped adaptive loop's built-in model stages.
+    #[serde(default, skip_serializing_if = "AdaptiveAgentConfig::is_default")]
+    pub adaptive: AdaptiveAgentConfig,
 }
 
 impl AgentConfig {
     fn is_default(&self) -> bool {
-        self.loop_spec.is_none() && self.stages.is_empty()
+        self.loop_spec.is_none() && self.stages.is_empty() && self.adaptive.is_default()
+    }
+}
+
+/// Resource and model policy for one logical adaptive turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveAgentConfig {
+    /// Total provider-call ceiling across intent, repairs, exploration, and decision resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_calls: Option<usize>,
+    /// Intent-stage overrides; absent values inherit the agent settings.
+    #[serde(default, skip_serializing_if = "AdaptiveStageConfig::is_default")]
+    pub intent: AdaptiveStageConfig,
+    /// Exploration-stage overrides; absent values inherit the agent settings.
+    #[serde(default, skip_serializing_if = "AdaptiveStageConfig::is_default")]
+    pub explore: AdaptiveStageConfig,
+}
+
+impl AdaptiveAgentConfig {
+    fn is_default(&self) -> bool {
+        self.max_model_calls.is_none() && self.intent.is_default() && self.explore.is_default()
+    }
+}
+
+/// Optional policy overrides for one built-in adaptive model stage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveStageConfig {
+    /// Same-provider model override; a provider prefix must match the agent provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Provider reasoning-effort spelling (`low`, `medium`, `high`, `xhigh`, or `max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Per-call output-token ceiling; absent inherits the agent ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Provider-call ceiling for this stage within one logical turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<usize>,
+}
+
+impl AdaptiveStageConfig {
+    fn is_default(&self) -> bool {
+        self.model.is_none()
+            && self.effort.is_none()
+            && self.max_tokens.is_none()
+            && self.max_calls.is_none()
     }
 }
 
@@ -544,6 +595,7 @@ fn merge(user: Config, project: Config) -> Config {
                 stages.extend(project.agent.stages);
                 stages
             },
+            adaptive: merge_adaptive_agent(user.agent.adaptive, project.agent.adaptive),
         },
         // Concatenate grants like permissions — a project policy refines (adds to) the user's, it
         // doesn't silently discard it. (Previously `project.policy.or(user.policy)` dropped every
@@ -630,6 +682,29 @@ fn merge_sandbox(user: SandboxConfig, project: SandboxConfig) -> SandboxConfig {
             (None, None) => None,
         },
         writable: dedupe([project.writable, user.writable].concat()),
+    }
+}
+
+fn merge_adaptive_agent(
+    user: AdaptiveAgentConfig,
+    project: AdaptiveAgentConfig,
+) -> AdaptiveAgentConfig {
+    AdaptiveAgentConfig {
+        max_model_calls: project.max_model_calls.or(user.max_model_calls),
+        intent: merge_adaptive_stage(user.intent, project.intent),
+        explore: merge_adaptive_stage(user.explore, project.explore),
+    }
+}
+
+fn merge_adaptive_stage(
+    user: AdaptiveStageConfig,
+    project: AdaptiveStageConfig,
+) -> AdaptiveStageConfig {
+    AdaptiveStageConfig {
+        model: project.model.or(user.model),
+        effort: project.effort.or(user.effort),
+        max_tokens: project.max_tokens.or(user.max_tokens),
+        max_calls: project.max_calls.or(user.max_calls),
     }
 }
 
@@ -881,6 +956,18 @@ mod tests {
 [agent]
 loop = "loops/support.flux"
 
+[agent.adaptive]
+max_model_calls = 9
+
+[agent.adaptive.intent]
+model = "google/gemini-2.5-flash"
+effort = "low"
+max_tokens = 512
+max_calls = 2
+
+[agent.adaptive.explore]
+max_calls = 6
+
 [agent.stages.classify]
 prompt = "Classify the support request and return its typed result."
 input_schema = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }
@@ -897,12 +984,48 @@ effort = "low"
             config.agent.loop_spec.as_deref(),
             Some("loops/support.flux")
         );
+        assert_eq!(config.agent.adaptive.max_model_calls, Some(9));
+        assert_eq!(
+            config.agent.adaptive.intent.model.as_deref(),
+            Some("google/gemini-2.5-flash")
+        );
+        assert_eq!(config.agent.adaptive.intent.effort.as_deref(), Some("low"));
+        assert_eq!(config.agent.adaptive.intent.max_tokens, Some(512));
+        assert_eq!(config.agent.adaptive.intent.max_calls, Some(2));
+        assert_eq!(config.agent.adaptive.explore.max_calls, Some(6));
         let stage = &config.agent.stages["classify"];
         assert_eq!(stage.input_schema["required"][0], "text");
         assert_eq!(stage.output_schema["required"][0], "queue");
         assert_eq!(stage.tools, vec!["search"]);
         assert_eq!(stage.max_tokens, 768);
         assert_eq!(stage.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn adaptive_policy_merges_project_fields_without_dropping_user_defaults() {
+        let mut user = Config::default();
+        user.agent.adaptive.max_model_calls = Some(11);
+        user.agent.adaptive.intent.model = Some("fast-router".into());
+        user.agent.adaptive.intent.max_tokens = Some(512);
+        user.agent.adaptive.explore.effort = Some("medium".into());
+
+        let mut project = Config::default();
+        project.agent.adaptive.max_model_calls = Some(8);
+        project.agent.adaptive.intent.max_tokens = Some(768);
+        project.agent.adaptive.explore.max_calls = Some(6);
+
+        let merged = merge(user, project);
+        assert_eq!(merged.agent.adaptive.max_model_calls, Some(8));
+        assert_eq!(
+            merged.agent.adaptive.intent.model.as_deref(),
+            Some("fast-router")
+        );
+        assert_eq!(merged.agent.adaptive.intent.max_tokens, Some(768));
+        assert_eq!(
+            merged.agent.adaptive.explore.effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(merged.agent.adaptive.explore.max_calls, Some(6));
     }
 
     #[test]

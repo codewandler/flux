@@ -6,6 +6,38 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-76: adaptive turns now have one durable cognition budget and stage policy.** The default
+  12-call ceiling spans intent repair, exploration, and every decision resume. `AgentSpec`, the SDK,
+  `[agent.adaptive]`, and CLI `--max-model-calls` expose the total; intent/explore config accepts
+  inherited same-provider model, effort, token, and per-stage call overrides. Cross-provider or zero
+  limits fail before a wire call. Every built-in request emits redacted, durable `model.call`
+  telemetry correlated by session/turn/stage/round with TTFT, duration, usage, and request/schema
+  sizes; provider traces carry the same correlation, while approval and execution observations now
+  include their own durations. `--show-loop` renders the compact call timings.
+
+### Changed
+
+- **BREAKING (Rust API):** `AgentSpec` gains `adaptive_policy`, and provider `Request` gains a
+  host-only `trace` field. Downstream exhaustive struct literals must provide the field or use
+  `..Default::default()` / `Request::new`. This requires the next release to use a pre-1.0 minor
+  bump; serialized provider payloads are unchanged because request correlation never reaches a
+  vendor codec.
+
+### Fixed
+
+- **A-76: the adaptive outer loop is repeatable, session-isolated, and deterministically routable.**
+  Every typed question—including ambiguity before schemas load and a question discovered after
+  execution—parks on the same durable `agent.decision` await and resumes the native ledger without
+  replaying a consumed batch. Later-round questions render as authored CLI prompts instead of raw
+  JSON. Monotonic capability surfacing is keyed by session on shared engines. Loaded integration
+  manifests contribute compact alias, semantic-capability, and URL-host hints: one exact live match
+  cannot be dropped by the intent model, several matches ask the user, and unloaded/unwired plugins
+  are never candidates. Failing-first coverage includes repeated decisions, post-execution
+  no-replay, shared-session isolation, budget persistence, stage policy, ambiguous routing, and
+  trace correlation.
+
 ## [0.20.1] - 2026-07-13
 
 ### Fixed

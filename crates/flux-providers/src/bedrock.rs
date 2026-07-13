@@ -1515,6 +1515,7 @@ mod tests {
             stop_sequences: vec![],
             thinking: false,
             effort: None,
+            trace: None,
             metadata: serde_json::Map::new(),
         };
         let body = BedrockAnthropic.build_body(&req).unwrap();

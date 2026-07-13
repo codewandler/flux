@@ -90,6 +90,19 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   reproducible test is `scripts/eval-adaptive-support.sh`; `task install`, workspace
   build/test/clippy/fmt/codegate, generated-doc sync, SDK/CLI/A2A, and hermetic voice tests are green.
 
+- **2026-07-13 adaptive-loop hardening (A-76, outside the paused autonomous loop):** deterministic
+  tests exposed and closed three post-cutover structural gaps: repeated decisions now reuse one
+  durable await, an approved non-idempotent action executes exactly once even when a later question
+  suspends the turn, and capability stickiness is isolated by session on a shared engine. Loaded
+  integrations contribute compact alias/capability/URL routing evidence, with ambiguity resolved
+  before schemas load and unwired plugins excluded. A durable 12-call logical-run ceiling survives
+  decision resume, stage-level model/effort/token/call policy is explicit, and each built-in request
+  now records correlated TTFT/duration/usage/schema measurements. An installed DeepSeek V4 Flash
+  Nitro smoke routed a live-time request through `now` and exposed its 7.5-second stage breakdown;
+  `task install` and the complete root/plugin gates pass. The live support matrix still requires a
+  fresh three-trial run before making a new cross-model quality claim; its report now includes
+  per-stage call counts and latency.
+
 - **2026-07-13 post-cutover semantic-expansion hardening (A-74, outside the paused autonomous
   loop):** live session `s_1162` selected Slack correctly, then needed a second family to retrieve a
   current Bitcoin price. The next native round rejected the accumulated capability state because it

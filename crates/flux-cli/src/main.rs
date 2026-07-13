@@ -23,7 +23,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::{AgentLoopSpec, AgentSpec, DEFAULT_SYSTEM_PROMPT};
+use flux_agent::{
+    AdaptiveLoopPolicy, AgentLoopSpec, AgentSpec, AgentStagePolicy, DEFAULT_SYSTEM_PROMPT,
+};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
@@ -149,6 +151,11 @@ struct AgentFlags {
     /// rejected at parse time.
     #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
+
+    /// Maximum provider calls across one logical adaptive turn, including intent repairs,
+    /// exploration, and every decision resume. Overrides `[agent.adaptive] max_model_calls`.
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_model_calls: Option<usize>,
 
     /// Per-turn token budget (all tiers, summed across the turn's model calls): once crossed, the
     /// turn ends honestly with a budget-exceeded answer instead of consulting the model again.
@@ -867,6 +874,57 @@ fn parse_effort(value: &str) -> Result<Effort> {
         "max" => Ok(Effort::Max),
         _ => anyhow::bail!("expected low, medium, high, xhigh, or max; got {value:?}"),
     }
+}
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("expected a positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("expected a positive integer greater than zero".into());
+    }
+    Ok(parsed)
+}
+
+fn adaptive_stage_policy(
+    name: &str,
+    config: &flux_config::AdaptiveStageConfig,
+) -> Result<AgentStagePolicy> {
+    if config.max_tokens == Some(0) {
+        bail!("[agent.adaptive.{name}] max_tokens must be greater than zero");
+    }
+    if config.max_calls == Some(0) {
+        bail!("[agent.adaptive.{name}] max_calls must be greater than zero");
+    }
+    let effort = config
+        .effort
+        .as_deref()
+        .map(parse_effort)
+        .transpose()
+        .with_context(|| format!("[agent.adaptive.{name}] effort"))?;
+    Ok(AgentStagePolicy {
+        model: config.model.clone(),
+        effort,
+        max_tokens: config.max_tokens,
+        max_calls: config.max_calls,
+    })
+}
+
+fn adaptive_loop_policy(
+    flags: &AgentFlags,
+    config: &flux_config::AgentConfig,
+) -> Result<AdaptiveLoopPolicy> {
+    if config.adaptive.max_model_calls == Some(0) {
+        bail!("[agent.adaptive] max_model_calls must be greater than zero");
+    }
+    Ok(AdaptiveLoopPolicy {
+        max_model_calls: flags
+            .max_model_calls
+            .or(config.adaptive.max_model_calls)
+            .unwrap_or(flux_flow::DEFAULT_ADAPTIVE_MODEL_CALLS),
+        intent: adaptive_stage_policy("intent", &config.adaptive.intent)?,
+        explore: adaptive_stage_policy("explore", &config.adaptive.explore)?,
+    })
 }
 
 /// `flux render --view` — CLI mirror of [`flux_tools::render::View`].
@@ -1892,15 +1950,22 @@ struct LazyProvider {
     spec: String,
     /// The provider prefix of `spec`, for `Provider::name` (a `&str` getter needs owned storage).
     display: String,
+    /// Unresolved provider-local default model carried by the engine until first construction.
+    default_model: String,
     cell: tokio::sync::OnceCell<(Box<dyn Provider>, String)>,
 }
 
 impl LazyProvider {
     fn new(spec: String) -> Self {
         let display = spec.split('/').next().unwrap_or("model").to_string();
+        let default_model = spec
+            .split_once('/')
+            .map(|(_, model)| model.to_string())
+            .unwrap_or_else(|| spec.clone());
         Self {
             spec,
             display,
+            default_model,
             cell: tokio::sync::OnceCell::new(),
         }
     }
@@ -1924,9 +1989,10 @@ impl Provider for LazyProvider {
                 Ok::<_, flux_core::Error>((Box::new(native) as Box<dyn Provider>, model))
             })
             .await?;
-        // The engine carried the UNRESOLVED model spec (resolution normally happens at eager
-        // construction) — swap in the resolved id for the wire.
-        if req.model != *resolved_model {
+        // The engine's inherited model is unresolved on this lazy path, so replace only that exact
+        // default. An explicitly configured same-provider stage model is already provider-local and
+        // must survive instead of being silently overwritten by the parent default.
+        if req.model == self.default_model {
             req.model = resolved_model.clone();
         }
         provider.stream(req).await
@@ -2044,17 +2110,36 @@ fn implicit_plugin_group(
     }
 
     let intent = manifest.name.to_lowercase();
+    let mut routing = std::collections::BTreeSet::from([intent.clone()]);
+    routing.extend(
+        manifest
+            .capabilities
+            .http_hosts
+            .iter()
+            .chain(
+                manifest
+                    .endpoints
+                    .iter()
+                    .flat_map(|endpoint| endpoint.http_hosts.iter()),
+            )
+            .map(|host| host.trim().trim_start_matches("*.").to_lowercase())
+            .filter(|host| !host.is_empty()),
+    );
     Some(flux_evidence::ToolGroup {
         name: format!("plugin.{intent}"),
         description: format!(
-            "Operations from the installed `{}` integration, surfaced when the current request names it.",
-            manifest.name
+            "Operations from the live `{}` integration. Routing hints: {}.",
+            manifest.name,
+            routing.iter().cloned().collect::<Vec<_>>().join(", ")
         ),
         tools,
-        surface_when: vec![flux_evidence::SignalMatch {
-            kind: flux_evidence::KIND_TURN_INTENT.into(),
-            signal: Some(intent),
-        }],
+        surface_when: routing
+            .into_iter()
+            .map(|signal| flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_TURN_INTENT.into(),
+                signal: Some(signal),
+            })
+            .collect(),
     })
 }
 
@@ -2547,7 +2632,7 @@ async fn build_agent_with(
             })?;
             if !flux_flow::statically_gather_safe(registered.as_ref()) {
                 anyhow::bail!(
-                    "[agent.stages.{name}] tool `{tool}` is not statically gather-safe (it must be low-risk, idempotent, non-mutating, and not capture-only)"
+                    "[agent.stages.{name}] tool `{tool}` is not statically gather-safe (it must be low-risk, side-effect-free, non-mutating, and not capture-only; freshness/non-cacheability is allowed)"
                 );
             }
         }
@@ -2663,6 +2748,7 @@ async fn build_agent_with(
         )
         .await?,
         groups,
+        adaptive_policy: adaptive_loop_policy(flags, &cfg.agent)?,
         ambient_signals,
         compact_threshold_chars: compact_threshold(),
         cwd: cwd.clone(),
@@ -4964,6 +5050,48 @@ fn format_operation_timing(timing: flux_core::OperationTiming) -> String {
     }
 }
 
+fn format_model_call(o: &flux_evidence::Observation) -> String {
+    let stage = o
+        .data
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("model");
+    let round = o.data.get("round").and_then(Value::as_u64).unwrap_or(0);
+    let duration = o
+        .data
+        .get("duration_us")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_micros)
+        .map(style::fmt_elapsed)
+        .unwrap_or_else(|| "?".into());
+    let ttft = o
+        .data
+        .get("ttft_us")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_micros)
+        .map(style::fmt_elapsed)
+        .unwrap_or_else(|| "n/a".into());
+    let operations = o
+        .data
+        .get("operations")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let schema_bytes = o
+        .data
+        .get("schema_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let schema = if schema_bytes >= 1024 {
+        format!("{:.1} KiB", schema_bytes as f64 / 1024.0)
+    } else {
+        format!("{schema_bytes} B")
+    };
+    format!(
+        "◇ model {stage} #{round} · {duration} · ttft {ttft} · {operations} op{} · {schema} schema",
+        if operations == 1 { "" } else { "s" }
+    )
+}
+
 /// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr,
 /// in the "Refined" style: a syntax-highlighted plan, colored `→`/`✓`/`✗` markers, a live spinner while
 /// each op runs, and a completion rule with timing. All color is tty/`NO_COLOR`/`--color`-aware.
@@ -5232,6 +5360,8 @@ impl AgentSink for CliSink {
             );
         } else if o.kind == "turn.cancelled" {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
+        } else if o.kind == "model.call" && flux_flow::engine::show_loop() {
+            eprintln!("{}", style::dim(&format_model_call(o)));
         } else if o.kind == "loop.phase" {
             self.record_phase(o);
         } else if o.kind == flux_evidence::KIND_TURN_INTENT
@@ -6763,6 +6893,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     }
     if flags.turn_budget.is_some() {
         bail!("`--turn-budget` only applies to the built-in coding agent, not `flux app run <program>`");
+    }
+    if flags.max_model_calls.is_some() {
+        bail!("`--max-model-calls` only applies to the built-in coding agent, not `flux app run <program>`");
     }
     if flags.agent_loop.is_some() {
         bail!("`--loop` only applies to the built-in coding agent, not `flux app run <program>`");
@@ -9273,7 +9406,23 @@ mod tests {
         PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
+    use flux_provider::{ChunkStream, Provider, Request};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingModelProvider(Arc<Mutex<Vec<Request>>>);
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingModelProvider {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        async fn stream(&self, request: Request) -> flux_core::Result<ChunkStream> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
 
     #[test]
     fn reasoning_controls_are_visible_in_agent_help() {
@@ -9288,6 +9437,45 @@ mod tests {
         assert!(help.contains("adaptive"), "{help}");
         assert!(help.contains("low"), "{help}");
         assert!(help.contains("high"), "{help}");
+        assert!(help.contains("--max-model-calls"), "{help}");
+    }
+
+    #[tokio::test]
+    async fn lazy_provider_resolves_only_the_inherited_default_model() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let lazy = super::LazyProvider::new("codex/unresolved-parent".into());
+        let initialized = lazy.cell.set((
+            Box::new(CapturingModelProvider(requests.clone())),
+            "resolved-parent".into(),
+        ));
+        assert!(initialized.is_ok());
+
+        let _stage_stream = lazy
+            .stream(Request::new("stage-model", "stage"))
+            .await
+            .unwrap();
+        let _default_stream = lazy
+            .stream(Request::new("unresolved-parent", "default"))
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].model, "stage-model");
+        assert_eq!(requests[1].model, "resolved-parent");
+    }
+
+    #[test]
+    fn adaptive_config_rejects_zero_stage_limits_before_provider_setup() {
+        let flags = super::AgentFlags::from_model_yes(Some("mock"), true);
+        let mut config = flux_config::AgentConfig::default();
+        config.adaptive.explore.max_calls = Some(0);
+        let error = super::adaptive_loop_policy(&flags, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[agent.adaptive.explore] max_calls must be greater than zero"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -12523,7 +12711,9 @@ mod tests {
         for agent_cmd in ["run", "tui"] {
             let longs = longs_of(agent_cmd);
             assert!(
-                has(&longs, "max-tokens") && has(&longs, "continue"),
+                has(&longs, "max-tokens")
+                    && has(&longs, "max-model-calls")
+                    && has(&longs, "continue"),
                 "`{agent_cmd}` should carry the turn flags: {longs:?}"
             );
         }
@@ -12593,6 +12783,7 @@ mod tests {
         // Zero is invalid where it would alias (1-based --turn) or instantly fail/mislead.
         err(&["flux", "replay", "--turn", "0"]);
         err(&["flux", "run", "--max-tokens", "0", "hi"]);
+        err(&["flux", "run", "--max-model-calls", "0", "hi"]);
         err(&["flux", "run", "--turn-budget", "0", "hi"]);
         err(&["flux", "eval", "not-an-adapter"]);
         err(&["flux", "eval", "synthetic", "--trials", "0"]);

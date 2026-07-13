@@ -23,7 +23,9 @@ exploring…
 ```
 
 The model receives the exact native schemas for the selected operations. Its `read` calls are
-low-risk, idempotent evidence gathering, so they execute immediately through the safety envelope.
+low-risk, side-effect-free evidence gathering, so they execute immediately through the safety
+envelope. Fresh reads such as the current clock may also gather immediately even though their
+results are deliberately never cached.
 The `write` call is different: flux captures it as literal `{op, input}` data and freezes it into an
 immutable action batch. It has not executed at that point.
 
