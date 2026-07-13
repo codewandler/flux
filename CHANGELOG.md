@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-13
+
 ### Added
 
 - **A-76: adaptive turns now have one durable cognition budget and stage policy.** The default

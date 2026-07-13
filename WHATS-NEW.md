@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-13
+
 ### New
 
 - **Adaptive turns have an explicit model-call budget and per-stage controls.** A logical turn uses
