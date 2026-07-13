@@ -5,6 +5,7 @@
 //! Flux AST. Every gathered or approved action still runs through the shared [`Executor`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -45,6 +46,23 @@ pub struct EngineLoopHost {
     receipts: crate::staged::ReceiptBook,
     groups: Mutex<Vec<flux_evidence::ToolGroup>>,
     model_stages: Mutex<BTreeMap<String, crate::staged::ModelStageDefinition>>,
+    /// Active `run_authored_flow` reentry depth, guarding against runaway `flow_run` recursion
+    /// (flow → `flow_run` → flow → …). Mirrors the reentry cap the retired `run_plan` host held.
+    authored_depth: AtomicU32,
+}
+
+/// Hard cap on authored-flow reentry (`run_authored_flow`). A stored flow that calls `flow_run` on
+/// itself — or a mutually recursive pair — otherwise recurses until the task stack is exhausted.
+const MAX_AUTHORED_FLOW_DEPTH: u32 = 16;
+
+/// RAII decrement for [`EngineLoopHost::authored_depth`], so the counter unwinds on every return
+/// path (including the over-cap error and a panic).
+struct AuthoredDepthGuard<'a>(&'a AtomicU32);
+
+impl Drop for AuthoredDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl EngineLoopHost {
@@ -85,6 +103,7 @@ impl EngineLoopHost {
                 receipts: crate::staged::ReceiptBook::default(),
                 groups: Mutex::new(Vec::new()),
                 model_stages: Mutex::new(BTreeMap::new()),
+                authored_depth: AtomicU32::new(0),
             });
             *captured.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -484,6 +503,16 @@ impl LoopHost for EngineLoopHost {
     }
 
     async fn run_authored_flow(&self, ast: Value) -> Result<Value> {
+        // Bound reentry BEFORE any work: `flow_run` delegates here, and an authored flow that runs
+        // itself (or a mutually recursive pair) would otherwise recurse until the stack is exhausted.
+        let depth = self.authored_depth.fetch_add(1, Ordering::SeqCst);
+        let _depth_guard = AuthoredDepthGuard(&self.authored_depth);
+        if depth >= MAX_AUTHORED_FLOW_DEPTH {
+            return Err(Error::Other(format!(
+                "run_authored_flow: authored-flow reentry depth exceeded {MAX_AUTHORED_FLOW_DEPTH} \
+                 (a recursive or mutually recursive `flow_run` cycle?)"
+            )));
+        }
         let ast: crate::ast::DraftAst = serde_json::from_value(ast)
             .map_err(|error| Error::Other(format!("run_authored_flow: invalid AST: {error}")))?;
         let executor = self.executor()?;
