@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-13
+
 ### New
 
 - **Every agent turn now runs through an authored adaptive loop.** Flux first identifies intent,

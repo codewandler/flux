@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-13
+
 ### Added
 
 - **A-73: Flux-authored adaptive outer loops are the agent runtime** (Agent + Language pillars;
