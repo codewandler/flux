@@ -57,6 +57,9 @@
 
 ### Fixed
 
+- **Answers grounded in several files can cite the right source reliably.** Read and search results
+  keep a concise source label when they are fed into the next planning step, instead of arriving as
+  indistinguishable blocks that invite the model to guess filenames.
 - **Approval time is reported separately from tool execution.** A command that waits for your answer
   no longer appears to have spent those seconds reading a file, writing output, or calling a model;
   CLI and TUI timing show both phases explicitly.

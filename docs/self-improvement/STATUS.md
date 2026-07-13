@@ -49,6 +49,14 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   Verification: 20 consecutive 64-thread `flux-system` runs passed, followed by the exact
   `task install` (workspace library tests plus replacement of both `flux` and `flux-lsp`).
 
+- **2026-07-13 matched-effort request-shape/citation probe:** low, medium, and high Codex runs all
+  computed the support fixture correctly, but low/medium invented source filenames because gathered
+  values reached the next model call as anonymous `[read]` blocks. The runtime now retains bounded,
+  allow-listed read/grep provenance in feedback; two fresh runs cited every real source correctly.
+  The trace also isolated the next latency defect: four consecutive matched runs emitted the same
+  invalid positional `grep` arguments, and the repair call alone cost 6–10 seconds plus roughly 17k
+  input tokens each time. This remains targeted harness hardening outside the paused autonomous loop.
+
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →
   candidate eval → `score_compare` → keep+tag **or** revert → `improve_log`.

@@ -1688,7 +1688,7 @@ fn exec_body<'a>(
                         "loop.node",
                         serde_json::json!({"node": "call", "op": op, "bind": name.0}),
                     );
-                    let outcome =
+                    let (outcome, provenance) =
                         run_call(store, executor, session_id, op, args, Some(bind), sink).await?;
                     *steps += 1;
                     if outcome.is_error {
@@ -1700,7 +1700,8 @@ fn exec_body<'a>(
                     // a plan's reads, not just the last one. Oversized views are trimmed so one huge
                     // result can't blow the round's context budget (the canonical value is untouched).
                     let view = executor.trim_output(outcome.view.clone(), op);
-                    transcript.push(format!("[${} = {op}]\n{}", name.0, legible_view(&view)));
+                    let label = provenance.as_deref().unwrap_or(op);
+                    transcript.push(format!("[${} = {label}]\n{}", name.0, legible_view(&view)));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
@@ -1710,7 +1711,7 @@ fn exec_body<'a>(
                         "loop.node",
                         serde_json::json!({"node": "call", "op": op}),
                     );
-                    let outcome =
+                    let (outcome, provenance) =
                         run_call(store, executor, session_id, op, args, None, sink).await?;
                     *steps += 1;
                     if outcome.is_error {
@@ -1720,7 +1721,8 @@ fn exec_body<'a>(
                     // (line-numbered read, diff, …). Control flow (`when`/`return`) stays canonical.
                     // Oversized views are trimmed (canonical value untouched).
                     let view = executor.trim_output(outcome.view.clone(), op);
-                    transcript.push(format!("[{op}]\n{}", legible_view(&view)));
+                    let label = provenance.as_deref().unwrap_or(op);
+                    transcript.push(format!("[{label}]\n{}", legible_view(&view)));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
@@ -1980,7 +1982,7 @@ fn exec_body<'a>(
                             }
                             None => args.clone(),
                         };
-                        let outcome = run_call(
+                        let (outcome, provenance) = run_call(
                             store,
                             executor,
                             session_id,
@@ -1997,7 +1999,8 @@ fn exec_body<'a>(
                         // Transcript views are trimmed to the host's output budget, like every
                         // other transcript push (F20a); the canonical value is untouched.
                         let view = executor.trim_output(outcome.view.clone(), op);
-                        transcript.push(format!("[pipe {op}]\n{view}"));
+                        let label = provenance.as_deref().unwrap_or(op);
+                        transcript.push(format!("[pipe {label}]\n{view}"));
                         last = outcome.view;
                         prev = outcome.value_id;
                     }
@@ -2058,7 +2061,7 @@ fn exec_body<'a>(
                         ty: ty_label.as_deref(),
                         visibility: Visibility::Visible,
                     };
-                    let outcome =
+                    let (outcome, provenance) =
                         run_call(store, executor, session_id, op, args, Some(bspec), sink).await?;
                     *steps += 1;
                     if outcome.is_error {
@@ -2067,7 +2070,8 @@ fn exec_body<'a>(
                     // Transcript views are trimmed to the host's output budget, like every other
                     // transcript push (F20a); the canonical value is untouched.
                     let view = executor.trim_output(outcome.view.clone(), op);
-                    transcript.push(format!("[${} = memo {op}]\n{view}", name.0));
+                    let label = provenance.as_deref().unwrap_or(op);
+                    transcript.push(format!("[${} = memo {label}]\n{view}", name.0));
                     last = outcome.view;
                     last_value = outcome.value_id;
                 }
@@ -2683,7 +2687,7 @@ fn exec_body<'a>(
                     // a var/lit resolves without dispatch. The model picks *which* declared case runs.
                     let label = match selector.as_ref() {
                         Node::Call { op, args } => {
-                            let outcome =
+                            let (outcome, _) =
                                 run_call(store, executor, session_id, op, args, None, sink).await?;
                             *steps += 1;
                             if outcome.is_error {
@@ -3130,7 +3134,7 @@ async fn eval_cond(
 ) -> Result<bool> {
     match node {
         Node::Call { op, args } => {
-            let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+            let (outcome, _) = run_call(store, executor, session_id, op, args, None, sink).await?;
             *steps += 1;
             if outcome.is_error {
                 // A denial is a deliberate refusal, not a falsy answer: reading it as `false`
@@ -3227,12 +3231,15 @@ async fn run_call(
     args: &[Node],
     bind: Option<BindSpec<'_>>,
     sink: &mut dyn FlowSink,
-) -> Result<CallOutcome> {
+) -> Result<(CallOutcome, Option<String>)> {
     let arg_values = args
         .iter()
         .map(|a| eval_arg(a, store, session_id))
         .collect::<Result<Vec<_>>>()?;
     let input = map_args_to_input(op, arg_values, executor.catalog())?;
+    // A concise, bounded, allow-listed source label for later model feedback. This deliberately
+    // reuses the read/grep-only summary seam rather than dumping arbitrary inputs into context.
+    let provenance = op_summary_prefix(op, &input);
     sink.tool_call(op, &input);
     let composite = executor.catalog().composite(op);
     let outcome = if let Some(composite) = composite {
@@ -3252,7 +3259,7 @@ async fn run_call(
             timing: outcome.timing,
         },
     );
-    Ok(outcome)
+    Ok((outcome, provenance))
 }
 
 /// A pure value node evaluated to its canonical text, stored value, and transcript tag.
@@ -3693,7 +3700,7 @@ async fn eval_return(
             Ok((value_text(&value), Some(vid)))
         }
         Node::Call { op, args } => {
-            let outcome = run_call(store, executor, session_id, op, args, None, sink).await?;
+            let (outcome, _) = run_call(store, executor, session_id, op, args, None, sink).await?;
             *steps += 1;
             if outcome.is_error {
                 return Err(call_failure(&format!("return step `{op}`"), &outcome));
@@ -4918,7 +4925,7 @@ mod tests {
 
         let store_plan = MemStore::new();
         let mut sink = BufferSink::default();
-        execute_plan(&store_plan, &host, "s", &body, &plan, &mut sink)
+        let plan_outcome = execute_plan(&store_plan, &host, "s", &body, &plan, &mut sink)
             .await
             .unwrap();
 
@@ -4928,9 +4935,22 @@ mod tests {
             ..Default::default()
         };
         let mut sink2 = BufferSink::default();
-        execute_flow(&store_flow, &host, "s", &ast, &mut sink2)
+        let flow_outcome = execute_flow(&store_flow, &host, "s", &ast, &mut sink2)
             .await
             .unwrap();
+
+        for outcome in [&plan_outcome, &flow_outcome] {
+            assert!(
+                outcome.transcript.contains("[$a = read x]"),
+                "the first read keeps its resolved path: {}",
+                outcome.transcript
+            );
+            assert!(
+                outcome.transcript.contains("[$b = read y]"),
+                "the second read keeps its distinct resolved path: {}",
+                outcome.transcript
+            );
+        }
 
         for sym in ["a", "b", "c"] {
             let vp = store_plan

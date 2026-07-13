@@ -75,6 +75,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **C-55: gathered read results retain their source path in later model rounds**
+  (`docs/designs/operation-feedback-provenance.md`). Flux-Lang feedback labels now reuse the
+  existing bounded, safe read/grep argument summary, so multiple results arrive as
+  `[read handbook/plans.md]` rather than indistinguishable `[read]` blocks. Canonical values, result
+  bodies, replay, and authorization are unchanged; arbitrary operation inputs are never dumped.
 - **D-167: parallel sandbox tests no longer break process execution during `task install`**
   (`docs/designs/test-environment-isolation.md`). Bubblewrap/PATH discovery tests use an injected
   search path instead of replacing the process-wide `PATH` observed by unrelated `flux-system`
