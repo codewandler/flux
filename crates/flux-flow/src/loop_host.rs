@@ -242,6 +242,7 @@ impl EngineLoopHost {
                 sink,
                 audit,
                 advertised,
+                authored_ceiling: None,
                 groups,
                 opts: options,
                 max_native_rounds: 12,
@@ -325,6 +326,7 @@ impl EngineLoopHost {
             )));
         }
         context.advertised = tools;
+        context.authored_ceiling = Some(context.advertised.clone());
         context.conversation = vec![Message::user_text(goal)];
         context.max_native_rounds = max_rounds.min(12);
         let intent = crate::staged::scoped_segment_state(&context, goal)?;

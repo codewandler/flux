@@ -29,9 +29,19 @@ signals to operation groups, then intersects the result with the live registry, 
 permissions, and active `with_tools` scopes. A signal never grants authority and never invokes an
 operation. An authored loop may call a deterministic mandatory operation explicitly.
 
+Capability visibility is monotonic for one adaptive turn. Host evidence creates the initial surface;
+each accepted `turn.intent` family is accumulated in the durable stage state and remains available to
+later gather, action, repair, presentation, and `await`-resume phases. Every native round re-expands
+that state from the live registry and re-applies the agent-tool, bare-deny, active `with_tools`, and
+any authored model-stage tool ceiling. It does **not** intersect an accumulated semantic signal back down to the immutable
+turn-start surface, and it does not carry a model-inferred family into an unrelated later user turn.
+Accepted expansions are audited as `turn.capability_signal` observations.
+
 Each operation declares a staging disposition: `Infer`, `Gather`, or `Capture`. `Infer` uses the
-existing conservative risk/idempotency/effect/intent test. `Gather` is valid only for low-risk,
-idempotent, non-mutating calls; invalid declarations fail closed to `Capture`. Opaque delegators are
+existing conservative risk/effect/intent test. `Gather` is valid only for low-risk,
+side-effect-free, non-mutating calls; invalid declarations fail closed to `Capture`. Idempotency
+controls repeat/cache semantics, not whether a read needs action approval: a fresh clock or status
+read remains gather-safe. Opaque delegators are
 `Capture` unless their real transitive contract proves otherwise.
 
 ## Default loop

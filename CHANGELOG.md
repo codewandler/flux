@@ -8,6 +8,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A-75: intent routing no longer hides arbitrary live operations behind lossy family previews.**
+  Ungrouped virtual families now expose every registered operation name instead of silently dropping
+  members after the first eight, and the router explicitly treats live/runtime/workspace/network
+  facts as evidence requirements. Low-risk side-effect-free reads whose results must stay fresh are
+  gathered immediately; non-cacheability no longer turns them into approval-gated actions. Session
+  `s_1169` (`get the current time`) now routes to `now` and answers from its result. Failing-first
+  coverage: `virtual_family_index_never_hides_a_registered_operation` and
+  `gather_safety_is_contract_and_concrete_intent_based`.
+- **A-74: later evidence can expand capabilities for the whole adaptive turn without escaping its
+  hard ceiling** (Agent pillar; `docs/designs/adaptive-outer-loops.md`). Session `s_1162` exposed a
+  snapshot bug: Slack intent succeeded, exploration signaled a second family for live Bitcoin-price
+  retrieval, then Flux compared the accumulated state with the smaller turn-start surface and
+  aborted. Semantic `turn.intent` families now remain visible through gather, action, repair, and
+  suspension resume, while every native round re-applies the live registry, agent tool, bare-deny,
+  `with_tools`, and authored stage ceilings. `turn.capability_signal` makes each expansion auditable,
+  and genuine stale state names each missing operation and reason. Failing-first coverage:
+  `semantic_capability_signal_expands_beyond_initial_surface_within_live_ceiling`,
+  `semantic_families_cannot_escape_permission_or_with_tools_ceiling`, and
+  `stale_capability_state_names_each_unavailable_operation_and_reason`.
 - **The nested plugin SDK now carries adaptive-loop staging metadata in every operation helper.**
   `read_op`, `write_op`, and `internal_op` default to conservative inference and re-export the typed
   disposition for plugin authors, restoring the plugin workspace build under the 0.20 API.

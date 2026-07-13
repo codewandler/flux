@@ -5842,7 +5842,10 @@ impl Provider for MockCliProvider {
                 .filter_map(|line| {
                     let line = line.strip_prefix("- ")?;
                     let (family, details) = line.split_once(" (")?;
-                    let examples = details.split_once("e.g. ")?.1.split_once("):")?.0;
+                    let members = details.split_once("; ")?.1.split_once("):")?.0;
+                    let examples = members
+                        .strip_prefix("e.g. ")
+                        .or_else(|| members.strip_prefix("operations "))?;
                     let contains_target = family == target
                         || examples
                             .split(',')

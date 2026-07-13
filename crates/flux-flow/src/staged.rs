@@ -10,7 +10,7 @@ use flux_evidence::{Observation, Phase as EvidencePhase, ToolGroup, KIND_TURN_IN
 use flux_lang::ast::{DraftAst, Node, SymbolName};
 use flux_provider::{Effort, Provider, Request, SystemSegment, ToolDef};
 use flux_runtime::{effective_group, Executor};
-use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
+use flux_spec::{AccessKind, Effect, Risk, ToolSpec};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -35,7 +35,9 @@ const MAX_NATIVE_SCHEMA_CHARS: usize = 128_000;
 const INTENT_SYSTEM: &str = "You are Flux's intent router. Understand the user's request and call \
 declare_intent exactly once. Select only the smallest capability families needed. This is routing, \
 not execution: do not answer the request, call any operation, or invent a family. An empty family \
-list is correct when the request needs no operation. Do not select cognition/model families merely \
+list is correct only when the answer needs no live, runtime, workspace, network, service, or other \
+external fact. Never assume those facts are already known: select the matching evidence capability. \
+Do not select cognition/model families merely \
 to reason, calculate, summarize, cite, or write an answer: you already do those things. Select them \
 only when the user explicitly asks for a separate model-backed operation.";
 
@@ -72,7 +74,14 @@ pub(crate) struct StagedContext {
     /// Durable turn scope used to record host-built execution graphs for replay/fork. The model
     /// never supplied these graphs; the host derived them from validated native calls.
     pub audit: Option<(Arc<flux_events::EventStore>, i64)>,
+    /// Operations surfaced by host evidence at the turn boundary. Semantic `turn.intent` families
+    /// may grow beyond this snapshot for the current adaptive state, but never beyond the live
+    /// registry/permission/`with_tools` ceiling recomputed by [`live_visible_specs`].
     pub advertised: HashSet<String>,
+    /// Optional exact ceiling owned by an authored model stage such as `ai_segment`. Normal
+    /// adaptive turns leave this unset; a stage that names tools explicitly sets it so semantic
+    /// discovery cannot widen beyond the author's list.
+    pub authored_ceiling: Option<HashSet<String>>,
     pub groups: Vec<ToolGroup>,
     pub opts: StageOptions,
     /// Maximum provider rounds one invocation of a native stage may consume.
@@ -119,6 +128,10 @@ struct Family {
     name: String,
     description: String,
     specs: Vec<ToolSpec>,
+    /// Virtual families have no authored semantic manifest, so their member names are the routing
+    /// contract and must be listed exhaustively. Authored groups may use their description plus a
+    /// compact sample because the group itself is the semantic contract.
+    exhaustive_members: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -350,11 +363,8 @@ pub(crate) async fn detect_intent_stage(ctx: StagedContext) -> StagedRun {
 /// segment already names its exact tool ceiling, so every discoverable family inside that ceiling is
 /// selected deterministically and the normal exploration ledger starts from `goal`.
 pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Value> {
-    let families = build_families(
-        &ctx.executor.registry().specs(),
-        &ctx.groups,
-        &ctx.advertised,
-    );
+    let specs = live_visible_specs(ctx);
+    let families = build_families(&specs, &ctx.groups, &ctx.advertised);
     if families.is_empty() {
         return Err(Error::Other(
             "ai_segment has no registered operation inside its capability scope".into(),
@@ -406,11 +416,8 @@ fn ensure_control_names_free(ctx: &StagedContext) -> Result<()> {
 
 async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Result<Value> {
     ensure_control_names_free(ctx)?;
-    let families = build_families(
-        &ctx.executor.registry().specs(),
-        &ctx.groups,
-        &ctx.advertised,
-    );
+    let specs = live_visible_specs(ctx);
+    let families = build_families(&specs, &ctx.groups, &ctx.advertised);
     if families.is_empty() {
         return Err(Error::Other(
             "adaptive planning has no registered capability families".into(),
@@ -791,15 +798,11 @@ async fn adaptive_explore(
     // The `ai_segment` entry point seeds exploration without going through `detect_intent_inner`, so
     // re-assert the control-tool reservation here to cover every path into the exploration stage.
     ensure_control_names_free(ctx)?;
-    let families = build_families(
-        &ctx.executor.registry().specs(),
-        &ctx.groups,
-        &ctx.advertised,
-    );
-
     let round_limit = native_round_limit(ctx);
     for _round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
+        let specs = live_visible_specs(ctx);
+        let families = build_families(&specs, &ctx.groups, &ctx.advertised);
         let selected = selected_specs_for_state(&state, &families, ctx)?;
         let mut selected_by_native = BTreeMap::<String, ToolSpec>::new();
         for spec in &selected {
@@ -893,6 +896,15 @@ async fn adaptive_explore(
         if calls[0].1 == SIGNAL_CAPABILITIES {
             let (call_id, _, input) = &calls[0];
             let added = apply_capability_signal(&mut state, input, &families)?;
+            observe(
+                ctx,
+                "turn.capability_signal",
+                json!({
+                    "families": &state.declaration.families,
+                    "new_operations": &added,
+                    "reason": input.get("reason").and_then(Value::as_str).unwrap_or_default(),
+                }),
+            );
             state.messages.push(Message::user(vec![
                 ContentBlock::tool_result_text(
                     call_id.clone(),
@@ -1083,7 +1095,7 @@ fn build_families(
         }
 
         let physical = effective_group(spec, groups);
-        let (name, description, discoverable) = match physical {
+        let (name, description, discoverable, exhaustive_members) = match physical {
             Some(name) => {
                 let manifest = groups.iter().find(|g| g.name == name);
                 let semantic = manifest
@@ -1093,7 +1105,7 @@ fn build_families(
                     .map(|g| g.description.clone())
                     .filter(|d| !d.trim().is_empty())
                     .unwrap_or_else(|| format!("Registered `{name}` operations."));
-                (name.to_string(), description, semantic || active)
+                (name.to_string(), description, semantic || active, false)
             }
             None => {
                 let name = virtual_family(spec);
@@ -1101,6 +1113,7 @@ fn build_families(
                     name.to_string(),
                     virtual_description(name).to_string(),
                     advertised.contains(&spec.name),
+                    true,
                 )
             }
         };
@@ -1111,6 +1124,7 @@ fn build_families(
             name,
             description,
             specs: Vec::new(),
+            exhaustive_members,
         });
         family.specs.push(spec.clone());
     }
@@ -1156,15 +1170,25 @@ fn virtual_description(name: &str) -> &'static str {
 fn family_index(families: &BTreeMap<String, Family>) -> String {
     let mut out = String::from("Registered capability families (only these names are valid):\n");
     for family in families.values() {
+        let member_limit = if family.exhaustive_members {
+            usize::MAX
+        } else {
+            8
+        };
         let sample = family
             .specs
             .iter()
-            .take(8)
+            .take(member_limit)
             .map(|s| s.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let member_label = if family.exhaustive_members {
+            "operations"
+        } else {
+            "e.g."
+        };
         out.push_str(&format!(
-            "- {} ({} operation{}; e.g. {}): {}\n",
+            "- {} ({} operation{}; {member_label} {}): {}\n",
             family.name,
             family.specs.len(),
             if family.specs.len() == 1 { "" } else { "s" },
@@ -1365,11 +1389,22 @@ fn selected_specs_for_state(
     // Re-expand the accumulated family signals from the LIVE registry on every stage call. This
     // keeps wiring/policy/tool-subset changes fail-closed instead of trusting serialized operation
     // names from an earlier turn.
-    let selected = selected_specs(&state.declaration, families)?;
-    let selected = selected
-        .into_iter()
-        .filter(|spec| ctx.advertised.contains(&spec.name))
+    let unavailable_families = state
+        .declaration
+        .families
+        .iter()
+        .filter(|name| !families.contains_key(name.as_str()))
+        .cloned()
         .collect::<Vec<_>>();
+    if !unavailable_families.is_empty() {
+        return Err(stale_capability_state_error(
+            state,
+            families,
+            ctx,
+            Some(&unavailable_families),
+        ));
+    }
+    let selected = selected_specs(&state.declaration, families)?;
     let names = selected
         .iter()
         .map(|spec| spec.name.as_str())
@@ -1379,12 +1414,85 @@ fn selected_specs_for_state(
         .iter()
         .any(|name| !names.contains(name.as_str()))
     {
-        return Err(Error::Other(
-            "adaptive capability state contains an operation that is no longer registered, wired, and surfaced"
-                .into(),
-        ));
+        return Err(stale_capability_state_error(state, families, ctx, None));
     }
     Ok(selected)
+}
+
+/// Snapshot the hard operation ceiling live at this stage boundary. The registry already reflects
+/// the agent's configured tool subset; `operation_visible` adds bare-deny and active `with_tools`
+/// enforcement. Semantic signals may expand turn-local visibility only inside this set.
+fn live_visible_specs(ctx: &StagedContext) -> Vec<ToolSpec> {
+    ctx.executor
+        .registry()
+        .specs()
+        .into_iter()
+        .filter(|spec| {
+            ctx.executor.operation_visible(&spec.name)
+                && ctx
+                    .authored_ceiling
+                    .as_ref()
+                    .is_none_or(|ceiling| ceiling.contains(&spec.name))
+        })
+        .collect()
+}
+
+fn stale_capability_state_error(
+    state: &AdaptiveState,
+    families: &BTreeMap<String, Family>,
+    ctx: &StagedContext,
+    unavailable_families: Option<&[String]>,
+) -> Error {
+    let selected_live = state
+        .declaration
+        .families
+        .iter()
+        .filter_map(|name| families.get(name))
+        .flat_map(|family| family.specs.iter().map(|spec| spec.name.as_str()))
+        .collect::<HashSet<_>>();
+    let mut unavailable = state
+        .selected
+        .iter()
+        .filter(|name| !selected_live.contains(name.as_str()))
+        .map(|name| format!("`{name}` ({})", operation_unavailable_reason(ctx, name)))
+        .collect::<Vec<_>>();
+    unavailable.sort();
+    let family_detail = unavailable_families
+        .filter(|families| !families.is_empty())
+        .map(|families| format!("; unavailable families: {}", families.join(", ")))
+        .unwrap_or_default();
+    Error::Other(format!(
+        "adaptive capability state is no longer valid{family_detail}; unavailable operations: {}",
+        if unavailable.is_empty() {
+            "(none recorded)".into()
+        } else {
+            unavailable.join(", ")
+        }
+    ))
+}
+
+fn operation_unavailable_reason(ctx: &StagedContext, name: &str) -> &'static str {
+    if ctx.executor.registry().get(name).is_none() {
+        return "not registered";
+    }
+    if ctx
+        .authored_ceiling
+        .as_ref()
+        .is_some_and(|ceiling| !ceiling.contains(name))
+    {
+        return "outside the authored stage tool ceiling";
+    }
+    if ctx
+        .executor
+        .active_cap_scope()
+        .is_some_and(|scope| !scope.iter().any(|allowed| allowed == name))
+    {
+        return "outside the active with_tools scope";
+    }
+    if !ctx.executor.operation_visible(name) {
+        return "denied by operation permissions";
+    }
+    "no longer wired to a selected discoverable family"
 }
 
 fn adaptive_result(kind: &str, state: &AdaptiveState, extra: Value) -> Result<Value> {
@@ -1609,7 +1717,10 @@ fn validate_action_batch(
         return Err(Error::Other("an action batch cannot be empty".into()));
     }
     for action in &batch.actions {
-        if !selected.contains(&action.op) || !ctx.advertised.contains(&action.op) {
+        // `selected` was rebuilt from `live_visible_specs` in this native round. Requiring the
+        // immutable turn-start surface as well would incorrectly discard a semantic family that
+        // exploration added later in this same turn.
+        if !selected.contains(&action.op) {
             return Err(Error::Other(format!(
                 "action `{}` is outside the intent-selected capability ceiling",
                 action.op
@@ -1783,11 +1894,7 @@ fn gather_safe(
     if disposition == flux_spec::StagingDisposition::Capture {
         return false;
     }
-    if spec.risk != Risk::Low
-        || spec.idempotency != Idempotency::Idempotent
-        || intents.is_mutating()
-        || intents.is_destructive()
-    {
+    if spec.risk != Risk::Low || intents.is_mutating() || intents.is_destructive() {
         return false;
     }
     if spec.effects.is_empty() {
@@ -1983,6 +2090,7 @@ mod tests {
         AllowApprover, ApprovalChoice, Approver, PermissionManager, Tool, ToolContext,
         ToolRegistry, ToolResult,
     };
+    use flux_spec::Idempotency;
     use flux_system::{System, Workspace};
 
     use super::*;
@@ -2268,6 +2376,7 @@ mod tests {
             sink: Arc::new(Mutex::new(NoopSink)),
             audit: None,
             advertised: HashSet::from(["inspect".into(), "change".into()]),
+            authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
             max_native_rounds: MAX_NATIVE_ROUNDS,
@@ -2516,6 +2625,273 @@ mod tests {
     }
 
     #[test]
+    fn virtual_family_index_never_hides_a_registered_operation() {
+        let specs = (0..12)
+            .map(|index| {
+                spec(
+                    &format!("runtime_fact_{index:02}"),
+                    vec![Effect::Read],
+                    vec![],
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let advertised = specs
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect::<HashSet<_>>();
+        let families = build_families(&specs, &[], &advertised);
+        let index = family_index(&families);
+
+        for spec in specs {
+            assert!(
+                index.contains(&spec.name),
+                "ungrouped operation `{}` was hidden from intent routing",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_families_cannot_escape_permission_or_with_tools_ceiling() {
+        let TestHarness {
+            context: original, ..
+        } = staged_context(Vec::new());
+        let semantic_group = ToolGroup {
+            name: "plugin.fixture".into(),
+            description: "Fixture integration".into(),
+            tools: vec!["change".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: KIND_TURN_INTENT.into(),
+                signal: Some("fixture".into()),
+            }],
+        };
+
+        let denied_executor = Arc::new(Executor::new(
+            original.executor.registry().clone(),
+            PermissionManager::from_rules(&["change".into()], &["change".into()]),
+            Arc::new(AllowApprover),
+            original.executor.context().clone(),
+        ));
+        let mut denied = original.clone();
+        denied.executor = denied_executor;
+        denied.groups = vec![semantic_group.clone()];
+        let specs = live_visible_specs(&denied);
+        let families = build_families(&specs, &denied.groups, &denied.advertised);
+        assert!(
+            !families.contains_key("plugin.fixture"),
+            "a turn-intent family must not re-grant a bare-denied operation"
+        );
+
+        let mut scoped = original;
+        scoped.groups = vec![semantic_group];
+        let _scope = scoped.executor.push_cap_scope(&["inspect".into()]);
+        let specs = live_visible_specs(&scoped);
+        let families = build_families(&specs, &scoped.groups, &scoped.advertised);
+        assert!(
+            !families.contains_key("plugin.fixture"),
+            "a turn-intent family must not widen an active with_tools ceiling"
+        );
+
+        let TestHarness {
+            context: mut authored,
+            ..
+        } = staged_context(Vec::new());
+        authored.groups = vec![ToolGroup {
+            name: "plugin.fixture".into(),
+            description: "Fixture integration".into(),
+            tools: vec!["change".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: KIND_TURN_INTENT.into(),
+                signal: Some("fixture".into()),
+            }],
+        }];
+        authored.authored_ceiling = Some(HashSet::from(["inspect".into()]));
+        let specs = live_visible_specs(&authored);
+        let families = build_families(&specs, &authored.groups, &authored.advertised);
+        assert!(
+            !families.contains_key("plugin.fixture"),
+            "semantic discovery must not widen an ai_segment's authored tool list"
+        );
+    }
+
+    #[test]
+    fn stale_capability_state_names_each_unavailable_operation_and_reason() {
+        let TestHarness { context, .. } = staged_context(Vec::new());
+        let specs = live_visible_specs(&context);
+        let families = build_families(&specs, &context.groups, &context.advertised);
+        let state = AdaptiveState {
+            version: 1,
+            declaration: IntentDeclaration {
+                intent: "inspect stale evidence".into(),
+                families: vec!["workspace.read".into()],
+            },
+            selected: vec!["inspect".into(), "removed.inspect".into()],
+            messages: vec![Message::user_text("inspect")],
+            proposed: Vec::new(),
+            gathered: Vec::new(),
+            native_step: 0,
+            last_error: String::new(),
+            pending: None,
+        };
+
+        let error = selected_specs_for_state(&state, &families, &context)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`removed.inspect`"), "{error}");
+        assert!(error.contains("not registered"), "{error}");
+        assert!(
+            !error.contains("`inspect` ("),
+            "live operations must not be blamed: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_capability_signal_expands_beyond_initial_surface_within_live_ceiling() {
+        let responses = vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({
+                    "intent": "post the current Bitcoin price to Slack",
+                    "capability_families": ["plugin.slack"]
+                }),
+            ),
+            native_call(
+                "expand",
+                SIGNAL_CAPABILITIES,
+                json!({
+                    "capability_families": ["plugin.websearch"],
+                    "reason": "the current price requires a live public source"
+                }),
+            ),
+            native_call("price", "inspect", json!({"key": "current-bitcoin-price"})),
+            prose("The current fixture price is grounded."),
+        ];
+        let TestHarness {
+            mut context,
+            requests,
+            read_calls,
+            write_calls,
+            ..
+        } = staged_context(responses);
+        context.conversation = vec![Message::user_text(
+            "Post the current Bitcoin price to my Slack DM",
+        )];
+        context.advertised = HashSet::from(["change".into()]);
+        context.groups = vec![
+            ToolGroup {
+                name: "plugin.slack".into(),
+                description: "Company chat".into(),
+                tools: vec!["change".into()],
+                surface_when: vec![flux_evidence::SignalMatch {
+                    kind: KIND_TURN_INTENT.into(),
+                    signal: Some("slack".into()),
+                }],
+            },
+            ToolGroup {
+                name: "plugin.websearch".into(),
+                description: "Public web search".into(),
+                tools: vec!["inspect".into()],
+                surface_when: vec![flux_evidence::SignalMatch {
+                    kind: KIND_TURN_INTENT.into(),
+                    signal: Some("websearch".into()),
+                }],
+            },
+        ];
+
+        let output = run(context).await.result.unwrap();
+        assert_eq!(output["kind"], "chat");
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(!requests[1].tools.iter().any(|tool| tool.name == "inspect"));
+        let expanded = requests[2]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "inspect")
+            .expect("the accepted semantic signal must surface web search on the next round");
+        assert!(
+            requests[2].tools.iter().any(|tool| tool.name == "change"),
+            "previously surfaced evidence must remain available for the whole adaptive turn"
+        );
+        assert_eq!(
+            expanded.input_schema,
+            json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_capability_signal_can_propose_an_action_beyond_initial_surface() {
+        let responses = vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({
+                    "intent": "inspect a fact and then update the matching service",
+                    "capability_families": ["plugin.lookup"]
+                }),
+            ),
+            native_call(
+                "expand",
+                SIGNAL_CAPABILITIES,
+                json!({
+                    "capability_families": ["plugin.action"],
+                    "reason": "the inspected fact identifies the required service action"
+                }),
+            ),
+            native_call("write", "change", json!({"value": "new"})),
+            native_call(
+                "finalize",
+                FINALIZE_PLAN,
+                json!({"instructions": "Report the guarded action result."}),
+            ),
+        ];
+        let TestHarness {
+            mut context,
+            write_calls,
+            ..
+        } = staged_context(responses);
+        context.advertised = HashSet::from(["inspect".into()]);
+        context.groups = vec![
+            ToolGroup {
+                name: "plugin.lookup".into(),
+                description: "Lookup service facts".into(),
+                tools: vec!["inspect".into()],
+                surface_when: vec![flux_evidence::SignalMatch {
+                    kind: KIND_TURN_INTENT.into(),
+                    signal: Some("lookup".into()),
+                }],
+            },
+            ToolGroup {
+                name: "plugin.action".into(),
+                description: "Act on a service".into(),
+                tools: vec!["change".into()],
+                surface_when: vec![flux_evidence::SignalMatch {
+                    kind: KIND_TURN_INTENT.into(),
+                    signal: Some("action".into()),
+                }],
+            },
+        ];
+
+        let output = run(context).await.result.unwrap();
+        assert_eq!(output["kind"], "batch");
+        assert_eq!(output["batch"]["actions"][0]["op"], "change");
+        assert_eq!(
+            write_calls.load(Ordering::SeqCst),
+            0,
+            "the newly surfaced action must remain inert until approval"
+        );
+    }
+
+    #[test]
     fn provider_native_alias_is_portable_stable_and_keeps_canonical_name_in_description() {
         let operation = "plugin.with-a-very-long-namespace.operation.with.dots.and.more.characters";
         let alias = native_tool_name(operation);
@@ -2571,6 +2947,17 @@ mod tests {
             flux_spec::StagingDisposition::Infer,
             flux_spec::IntentSet::new()
         ));
+
+        let mut fresh_read = spec("clock", vec![Effect::Read], vec![], None);
+        fresh_read.idempotency = Idempotency::NonIdempotent;
+        assert!(
+            gather_safe(
+                &fresh_read,
+                flux_spec::StagingDisposition::Infer,
+                flux_spec::IntentSet::new()
+            ),
+            "freshness/cacheability must not turn a side-effect-free read into an action"
+        );
 
         let write = spec(
             "write",
@@ -2754,6 +3141,7 @@ mod tests {
             sink: Arc::new(Mutex::new(NoopSink)),
             audit: None,
             advertised: HashSet::from([operation.into()]),
+            authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
             max_native_rounds: MAX_NATIVE_ROUNDS,

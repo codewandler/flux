@@ -14,6 +14,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **Requests for live facts reliably select an evidence operation.** Capability summaries no longer
+  hide less common operations, and fresh read-only facts such as the current clock can be gathered
+  directly without an unnecessary approval step.
+- **Capabilities discovered during exploration remain available for the rest of the turn.** An
+  agent can start with Slack, discover that it also needs web search, gather the live fact, and still
+  return to Slack for the proposed action. Each expansion remains bounded by the configured tools,
+  permissions, and active flow scope; unrelated later turns do not inherit it.
 - **The bundled plugin pack builds against the new adaptive agent operation metadata.** Plugin
   authors can also set the same typed exploration-versus-action hint in custom integrations.
 

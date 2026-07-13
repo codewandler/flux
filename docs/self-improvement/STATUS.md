@@ -90,6 +90,24 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   reproducible test is `scripts/eval-adaptive-support.sh`; `task install`, workspace
   build/test/clippy/fmt/codegate, generated-doc sync, SDK/CLI/A2A, and hermetic voice tests are green.
 
+- **2026-07-13 post-cutover semantic-expansion hardening (A-74, outside the paused autonomous
+  loop):** live session `s_1162` selected Slack correctly, then needed a second family to retrieve a
+  current Bitcoin price. The next native round rejected the accumulated capability state because it
+  intersected the valid later signal with the immutable turn-start surface. Turn-local semantic
+  visibility now grows monotonically in the durable adaptive state while every native round still
+  re-applies the live registry, agent tool, bare-deny, `with_tools`, and authored-stage ceiling. A failing-first
+  Slack→web-search fixture pins the exact regression; denied and operator-gated operations remain
+  unavailable, and genuine drift names each missing operation and reason. The unrelated code-review
+  edits were ruled out by process/source timestamps: the failing executable predated them.
+
+- **2026-07-13 post-cutover routing completeness (A-75, outside the paused autonomous loop):** live
+  session `s_1169` selected no capability for `get the current time` even though `now` was registered.
+  Virtual-family previews had silently omitted every member after eight, and the router did not state
+  that live facts require evidence. A failing-first arbitrary twelve-operation fixture now pins a
+  lossless routing index for all ungrouped operations; gather safety no longer conflates a fresh,
+  non-cacheable result with a mutating action. Candidate session `s_1170` routed `core` → `now` and
+  returned its actual UTC value without approval (7.1s, 4.7k context).
+
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →
   candidate eval → `score_compare` → keep+tag **or** revert → `improve_log`.
