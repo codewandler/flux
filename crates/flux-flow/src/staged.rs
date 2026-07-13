@@ -391,7 +391,9 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
     )
 }
 
-async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Result<Value> {
+/// Names the exploration stage claims for its own control tools. A registered operation sharing one
+/// would collide with the control tool in the provider request and be misrouted, so reserve them.
+fn ensure_control_names_free(ctx: &StagedContext) -> Result<()> {
     for reserved in [FINALIZE_PLAN, REQUEST_DECISION, SIGNAL_CAPABILITIES] {
         if ctx.executor.registry().get(reserved).is_some() {
             return Err(Error::Other(format!(
@@ -399,6 +401,11 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
             )));
         }
     }
+    Ok(())
+}
+
+async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Result<Value> {
+    ensure_control_names_free(ctx)?;
     let families = build_families(
         &ctx.executor.registry().specs(),
         &ctx.groups,
@@ -498,6 +505,11 @@ async fn run_model_stage_inner(
             )));
         }
         let native = native_tool_name(operation);
+        if native == RETURN_STAGE_RESULT {
+            return Err(Error::Other(format!(
+                "model stage `{name}` tool `{operation}` collides with the reserved return operation `{RETURN_STAGE_RESULT}`"
+            )));
+        }
         if let Some(previous) = by_native.insert(native.clone(), spec) {
             return Err(Error::Other(format!(
                 "model stage `{name}` native alias collision: `{}` and `{operation}` map to `{native}`",
@@ -776,6 +788,9 @@ async fn adaptive_explore(
     mut state: AdaptiveState,
     usages: &mut Vec<Usage>,
 ) -> Result<Value> {
+    // The `ai_segment` entry point seeds exploration without going through `detect_intent_inner`, so
+    // re-assert the control-tool reservation here to cover every path into the exploration stage.
+    ensure_control_names_free(ctx)?;
     let families = build_families(
         &ctx.executor.registry().specs(),
         &ctx.groups,
@@ -1776,7 +1791,13 @@ fn gather_safe(
         return false;
     }
     if spec.effects.is_empty() {
-        return true;
+        // No declared effects does not mean inert: an operation that reaches a code-running or
+        // local-system host capability can still act during exploration. Trust an empty effect set
+        // as gather-safe only when the access set is equally inert (a pure op declares neither).
+        return !spec
+            .access
+            .iter()
+            .any(|access| matches!(access, AccessKind::Process | AccessKind::LocalSystem));
     }
     let allowed = spec
         .effects
@@ -1968,6 +1989,30 @@ mod tests {
 
     static TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
+    /// A per-test workspace directory that removes itself on drop, so a run never leaks the
+    /// `flux-staged-*` temp directories even when an assertion fails mid-test.
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let sequence = TEST_DIR.fetch_add(1, Ordering::SeqCst);
+            let root =
+                std::env::temp_dir().join(format!("{label}-{}-{sequence}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     struct NoopSink;
     impl AgentSink for NoopSink {}
 
@@ -2146,6 +2191,8 @@ mod tests {
         requests: Arc<Mutex<Vec<Request>>>,
         read_calls: Arc<AtomicU64>,
         write_calls: Arc<AtomicU64>,
+        // Held so the workspace directory is cleaned up when the harness is dropped.
+        _root: TempRoot,
     }
 
     fn staged_context(responses: Vec<Vec<Chunk>>) -> TestHarness {
@@ -2197,13 +2244,8 @@ mod tests {
             calls: write_calls.clone(),
         }));
 
-        let sequence = TEST_DIR.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
-            "flux-staged-test-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let system = Arc::new(System::new(Workspace::new(&root).unwrap()));
+        let temp = TempRoot::new("flux-staged-test");
+        let system = Arc::new(System::new(Workspace::new(temp.path()).unwrap()));
         let executor = Arc::new(Executor::new(
             registry,
             PermissionManager::from_rules(&["inspect".into(), "change".into()], &[]),
@@ -2236,6 +2278,7 @@ mod tests {
             requests,
             read_calls,
             write_calls,
+            _root: temp,
         }
     }
 
@@ -2290,6 +2333,7 @@ mod tests {
             requests,
             read_calls,
             write_calls,
+            ..
         } = staged_context(responses);
         let definition = ModelStageDefinition {
             prompt: "Score the fixture after inspecting it.".into(),
@@ -2544,6 +2588,29 @@ mod tests {
             flux_spec::StagingDisposition::Gather,
             flux_spec::IntentSet::new()
         ));
+
+        // A pure op (no effects, no access) stays gather-safe.
+        let pure = spec("compute", vec![], vec![], None);
+        assert!(gather_safe(
+            &pure,
+            flux_spec::StagingDisposition::Infer,
+            flux_spec::IntentSet::new()
+        ));
+
+        // An operation that declares no effects but reaches a code-running / local-system host
+        // capability is NOT gather-safe: the empty effect set must not read as inert.
+        let process = spec("shell_probe", vec![], vec![AccessKind::Process], None);
+        assert!(!gather_safe(
+            &process,
+            flux_spec::StagingDisposition::Infer,
+            flux_spec::IntentSet::new()
+        ));
+        let local_system = spec("host_probe", vec![], vec![AccessKind::LocalSystem], None);
+        assert!(!gather_safe(
+            &local_system,
+            flux_spec::StagingDisposition::Infer,
+            flux_spec::IntentSet::new()
+        ));
     }
 
     #[tokio::test]
@@ -2565,6 +2632,7 @@ mod tests {
             requests,
             read_calls,
             write_calls,
+            ..
         } = staged_context(responses);
 
         let output = run(ctx).await.result.unwrap();
@@ -2649,17 +2717,12 @@ mod tests {
             result: "plugin-evidence".into(),
             calls: calls.clone(),
         }));
-        let sequence = TEST_DIR.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
-            "flux-staged-alias-test-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = TempRoot::new("flux-staged-alias-test");
         let executor = Arc::new(Executor::new(
             registry,
             PermissionManager::from_rules(&[operation.into()], &[]),
             Arc::new(AllowApprover),
-            ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap()))),
+            ToolContext::new(Arc::new(System::new(Workspace::new(temp.path()).unwrap()))),
         ));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider: Arc<dyn Provider> = Arc::new(CaptureProvider {
@@ -2777,6 +2840,7 @@ mod tests {
             requests,
             read_calls,
             write_calls,
+            ..
         } = staged_context(responses);
 
         let staged = run(ctx).await;
@@ -2850,6 +2914,7 @@ mod tests {
             requests,
             read_calls,
             write_calls,
+            ..
         } = staged_context(responses);
 
         assert_eq!(run(ctx).await.result.unwrap()["kind"], "chat");
@@ -3076,12 +3141,8 @@ mod tests {
         flux_tools::register_reflect(&mut registry);
         flux_tools::register_evidence(&mut registry);
 
-        let sequence = TEST_DIR.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
-            "flux-staged-engine-test-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = TempRoot::new("flux-staged-engine-test");
+        let root = temp.path().to_path_buf();
         let events = Arc::new(EventStore::in_memory().unwrap());
         let session = events.create_session("capture/test-model").unwrap();
         let approval_requests = Arc::new(AtomicU64::new(0));
