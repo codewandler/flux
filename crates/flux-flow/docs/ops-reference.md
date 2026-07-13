@@ -1,7 +1,9 @@
 # Flux-Flow — Registered ops
 
-The operations the engine advertises to the planner. These are an **engine** concern (provided by
-`flux-tools` and surfaced through the live `ToolRegistry`), not part of the Flux-Lang language — see
+The operations available through the engine's live `ToolRegistry`. The analyzer resolves authored
+Flux calls against these contracts, and model-backed stages receive only the provider-native schemas
+inside their capability ceiling. Operations are an **engine** concern (mostly provided by
+`flux-tools`), not part of the Flux-Lang language — see
 [`flux-lang/docs/reference.md`](../../flux-lang/docs/reference.md) for the language itself.
 
 ## Registered ops quick reference
@@ -62,7 +64,7 @@ optional arguments are in `[brackets]`.
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
 | `git_unstage` | `paths` | Low | Unstage files |
 | `flow_list` | | Low | List reusable flows and composite ops under `.flux/flows` / `~/.flux/flows` (and the legacy `.flux/ops` / `@global_ops`) — each with its description and params |
-| `flow_run` | `name[, inputs]` | Medium | Run a stored flow by name from the flows home; `inputs` (a JSON object) are seeded as `$key` binds. Runs in the current session by re-entering `run_plan` (needs a `LoopHost`) |
+| `flow_run` | `name[, inputs]` | Medium | Run a stored flow by name from the flows home; `inputs` (a JSON object) are seeded as `$key` binds. Runs as an authored flow in the current session (needs a `LoopHost`) |
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,
 `python_run`, `pytest`, `npm`, `node_run`, `make`) may pause for user approval (controlled by the
@@ -135,50 +137,39 @@ their own dispatch). See [`flux-lang-evolution.md`](../../../docs/designs/flux-l
 
 ## Agent-loop ops (the self-hosted turn loop)
 
-The turn loop is itself a Flux-Lang flow — `crates/flux-flow/assets/agent-loop.flux` — and these ops are
-what let it call the model and run plans reflexively. They are how flux-lang self-hosts the agent loop:
-`plan` re-enters the planner, `run_plan` re-enters the interpreter (over the same session + envelope),
-`ai_segment` runs a bounded, tool-scoped sequence of the two on behalf of a deterministic flow, and
-the evidence ops let the loop emit and read its own runtime observations and grade outcomes. Every one
-still dispatches through the same `Executor` envelope — no bypass.
-
-The loop is **phased** (A-14, design [`multipass-agent-loop.md`](../../../docs/designs/multipass-agent-loop.md)):
-one **orient** `plan` call (a three-way contract — prose chat, the full execution plan, or a small
-read-only `gather: true` plan + `brief`), a bounded **gather** pass (`repeat 3`, skipped entirely when
-orient already settled), then the standard **execute** plan/run/revise pass (`repeat 25`, unchanged
-guards). `phase` (`"orient"`/`"gather"`/`"execute"`) selects the planner's per-phase instruction segment;
-`settled` on the returned `Plan` is `""` only for an accepted `gather: true` plan (gating the gather
-pass's `until $settled`), truthy otherwise. A `gather: true` plan is enforced, not trusted — effect-clean
-and capped at ~12 call nodes — and the execute phase always rejects a further `gather: true` emission
-(the budget is spent). If the gather budget exhausts before settling, the leftover gather plan simply
-runs as the execute pass's first iteration.
+The turn loop is the authored Flux-Lang flow in `crates/flux-flow/assets/agent-loop.flux`. Its model
+boundaries return stage-owned typed values or provider-native operation calls; a model never emits a
+Flux program. Host-built action batches separate proposal from execution, and every leaf operation
+still dispatches through the same `Executor` envelope.
 
 | op | signature | description |
 |---|---|---|
-| `plan` | `[feedback, phase]` | Ask the model to emit a plan from the working conversation → a `Plan` `{kind: "plan"\|"chat"\|"error", text?, ast?, complete?, settled}` (JSON). `phase` is `"orient"`/`"gather"`/`"execute"` — absent or unrecognized behaves as `"execute"` (byte-compatible with a phase-less/pre-A-14 caller, e.g. an ejected loop). `complete` is the model's completion directive (`{primer?, instructions}`) or `null`. The model stays the planner; this wraps the compile step. |
-| `run_plan` | `plan` | Execute an emitted plan in the **current** session → an `Outcome` `{transcript, result, steps, suspension?, failure}`. Re-validated and run through the same approval+IO envelope; bounded by a reentry-depth cap. `failure` is `null` when this round ran clean; otherwise a reified mid-plan halt (design [`multipass-agent-loop.md`](../../../docs/designs/multipass-agent-loop.md) Part 2) — `{node, stmt, op, kind, fatal, message, plan, completed[]}` — that a corrected re-emission fast-forwards the matching completed prefix of (A-16/A-17; never propagated as `Err`). When the plan carried `complete` and ran to success, the **next** `plan` call renders the final message from the results (a toolless model call) and returns it as `{kind: "chat"}` — the complete fast-path. |
-| `ai_segment` | `goal, tools, max_rounds[, until]` | Delegate a **bounded segment** of model turns from inside a deterministic flow (D-131, design [`flow-driven-session.md`](../../../docs/designs/flow-driven-session.md)) → `{result}` (the segment's final answer: its closing prose, or the last non-empty round result). The `goal` is fed to the planner each round; the delegated leaf ops are confined to `tools` for the segment's lifetime (a cap-scope dispatch floor **and** a restricted advertised catalog, so an out-of-scope op is refused and never even emitted); the run is capped at the required `max_rounds` and exits early on natural completion (a prose/error plan) or the optional `until` symbol becoming bound to a non-empty value in the session. Planner spend folds into the enclosing turn's usage. |
+| `detect_intent` | | Run the typed intent stage over the current conversation → `{kind, intent, families, operations, state}`. Capability families are intersected with the live, wired, permitted registry; signals never grant authority. |
+| `explore` | `state[, decision, report]` | Continue the bounded provider-native stage ledger. Gather-safe calls execute through `Executor`; effectful calls are captured. Returns a typed step with `kind: "chat"\|"decision"\|"batch"\|"error"`, the durable `state`, and the corresponding `text`, `question`, or host-built `batch`. A decision or execution report closes the matching pending native call. |
+| `approve_batch` | `batch` | Validate the live operation schemas, compute aggregate risk, request one batch approval, and return an `ApprovalReceipt`. The opaque receipt is bound to the exact batch, session, caller/authority context, and policy context. |
+| `execute_batch` | `batch, receipt` | Consume a matching one-shot receipt and execute the ordered actions through `Executor`. Missing, changed, stale, reused, denied, or cross-context receipts fail closed. Returns an `ExecutionReport`; after one action fails, later actions are marked skipped. |
+| `present_results` | `step` or `approval` | Render a terminal chat/error/decision step or an approval denial into user-facing text without giving that text execution semantics. |
+| `ai_segment` | `goal, tools, max_rounds[, until]` | Run a bounded adaptive segment inside a deterministic flow. The authored `tools` list is a hard live capability ceiling; reads gather evidence, effects use the same batch path, and the result is returned as `{result, state[, decision]}`. Provider usage folds into the enclosing turn. |
 | `op.register` | `source, scope[, replace, expose]` | Register exactly one top-level Flux-Lang composite `op` for later reuse. `scope` is `turn`, `session`, `project`, or `global`; project/global writes are guarded filesystem writes, and all registered inner ops still dispatch through the normal envelope. |
-| `observe` | `kind[, data]` | Append an observation to the run's shared evidence log (the same log the runtime records `tool_call` markers into). The loop itself emits `loop.phase` (at every `plan` entry, payload `{phase}`), `flow.brief` (the moment a `brief` is accepted, payload `{goal, needs}`), `turn.gather` (each gather round's `Outcome`), `turn.iteration` (each clean execute round's `Outcome`), and `turn.revision` (an execute round whose `Outcome.failure` was set — A-17). `run_plan` itself streams (not through this log) `flow.plan` (the compiled plan tree — `resumed`/`gather`/`phase` flags let a surface render it correctly) and, on a halt, `flow.halt` (`{step, of, op, kind, fatal}`, a real-time cue distinct from the fed-back transcript text). |
-| `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log) — so a flow can branch on what has happened so far. |
+| `observe` | `kind[, data]` | Append an observation to the shared evidence log. The adaptive loop records stage transitions, intent, action-batch proposal/approval/execution, and turn execution reports. |
+| `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log). |
 | `metrics` | | Summary counts from the evidence log: `{tool_calls, tool_errors, iterations}`. |
-| `grade` | `criterion` | Evaluate a verifiable pass/fail `Criterion` (`command`/`file_content`/`all`) against the workspace → `"true"`/`"false"`, reusing the eval harness's own grader (`flux-eval`). |
+| `grade` | `criterion` | Evaluate a verifiable pass/fail `Criterion` (`command`/`file_content`/`all`) against the workspace → `"true"`/`"false"`, reusing the eval harness's grader (`flux-eval`). |
 
-The brief accepted alongside a `gather: true` plan is **host-carried for the rest of the turn**: it is
-prepended to every subsequent `plan` call's feedback message (not just the immediate next round), so a
-multi-round gather — or the execute phase that follows it — never loses the thread. It resets at the
-start of the next turn.
+The standard artifacts are `IntentSet`, `DecisionRequest`, `ActionBatch`, `ApprovalReceipt`, and
+`ExecutionReport`, but custom model stages are ordinary operations and may define unrelated input and
+output schemas. Config stages live under `[agent.stages.<name>]`; SDK callers can register a typed
+`stage_fn::<I, O, _, _, _>(...)`. A model stage may call only explicitly declared, statically
+gather-safe tools.
 
-**Visibility:** `plan`/`run_plan`/`ai_segment` are tagged to a never-surfaced `reflect` group, so the
-model never sees them in its catalog — only a pre-authored flow (the agent loop, a flow-driven session,
-or `flux flow run`) can call them, and only when a `LoopHost` is installed (the engine installs one per
-turn, and the flow-driven paths — `start_flow_turn`/`resume_suspended` — arm it too). `op.register` is a model-facing root op,
-available only when the engine installs a composite registrar. `observe`/`evidence`/`metrics` are ordinary
-builtins; `grade` is in the evidence-gated `eval` group. `flow_list`/`flow_run` (registered by the CLI
-host's `flux_tools::register_flows`, not base `register_builtins`) are **model-facing**; `flow_run` also
-needs a `LoopHost`, since it re-enters `run_plan` to run the resolved flow.
+**Visibility:** the loop machinery is tagged to a never-surfaced host group. A model cannot invoke
+`detect_intent`, batch approval/execution, or `present_results`; only an analyzed authored flow may do
+so when a `LoopHost` is installed. `op.register`, `flow_list`, and `flow_run` remain model-facing root
+operations when their surface installs them. `flow_run` enters the authored-flow host in the current
+session and keeps the same capability and safety envelope.
 
-On the **user-facing** surface these machinery ops are filtered out by default so the turn shows real
-work, not plumbing. `flux run --show-loop` (or `FLUX_SHOW_LOOP=1`) reveals them so you can watch the
-loop iterate; the REPL `/evidence` command prints the evidence log they write; and `flux loop
-show`/`eject` reads or scaffolds the loop itself. See [docs/agent-loop.md](../../../docs/agent-loop.md).
+User-facing surfaces hide machinery operations by default. `flux run --show-loop` (or
+`FLUX_SHOW_LOOP=1`) reveals them, `--trace-loop` traces structural nodes, `/evidence` prints the audit
+observations, and `flux loop show`/`eject` prints or scaffolds the preset. An ejected file takes effect
+only when selected explicitly with `--loop` or `[agent] loop = "..."`. See
+[docs/agent-loop.md](../../../docs/agent-loop.md).

@@ -33,9 +33,9 @@ enum Command {
     Skill,
     /// Print the JSON Schema of the Flux-Lang AST.
     Schema {
-        /// Print the model-facing merged schema — one `Node` object (`kind` enum + the union of
-        /// every kind's properties) — instead of the strict per-kind union. This is the schema
-        /// the planner advertises on `emit_plan` by default (the L-71 cutover).
+        /// Print a compact merged schema — one `Node` object (`kind` enum + the union of every
+        /// kind's properties) — instead of the strict per-kind union. Useful for language tooling
+        /// and compatibility analysis; agent models do not generate executable ASTs.
         #[arg(long)]
         merged: bool,
     },

@@ -10,7 +10,7 @@ and a workspace root; the SDK wires the Flux-Lang agent loop, built-in operation
 and session storage.
 
 There is only one agent turn engine. `Client`, the CLI, sub-agents, and served agents all assemble
-`flux_flow::engine::FlowEngine`, whose turn loop is itself the editable
+`flux_flow::engine::FlowEngine`, whose turn loop is an authored
 [`agent-loop.flux`](../agent/agent-loop.md). `FlowClient` is the other view of the same architecture:
 it exposes an individual flow's lifecycle directly instead of driving a conversation.
 
@@ -32,7 +32,7 @@ Ollama, Bedrock, and subscription-backed providers live in `flux-providers`.
 | Need | Use | Why |
 |---|---|---|
 | Run conversational agent turns | `flux_sdk::Client` | The complete self-hosted Flux-Lang agent loop, session, tools, and envelope behind one `run` call. |
-| Compile or run one flow explicitly | `flux_sdk::FlowClient` | Direct control over parse/compile, analysis, optimization, seeded inputs, and execution. This is the recommended AI-app flow API. |
+| Parse or run one flow explicitly | `flux_sdk::FlowClient` | Direct control over parsing, analysis, optimization, seeded inputs, and execution. This is the recommended AI-app flow API. |
 | Build a flow in Rust | `flux_sdk::dsl` | Typed builder ergonomics that produce the same `DraftAst`; execute it with `FlowClient`. |
 | Build language tooling or a custom host | `flux_lang` | The standalone AST, parser/formatter, analyzer, optimizer, schema, DSL, program declarations, and reference-interpreter traits. |
 | Own engine/session internals | `flux_flow` | Advanced `FlowEngine`, guarded runtime adapters, durable store, replay, suspension, and voice-driver integration. |
@@ -53,14 +53,15 @@ let out = client.run("Summarize the README").await?;
 println!("{}", out.text); // TurnOutput: text, tool_calls, usage
 ```
 
-`Client` does not wrap a legacy or provider-native tool loop. Each turn runs the same
-`FlowEngine` as the CLI: the model emits Flux-Lang plans, the engine dispatches their operations,
-and `agent-loop.flux` decides when to gather, revise, or answer.
+Each `Client` turn runs the same `FlowEngine` as the CLI. Typed stages detect intent and call exact
+provider-native operation schemas; `agent-loop.flux` owns evidence gathering, decisions, action-batch
+approval/execution, repair, and presentation. The model never emits executable Flux.
 
 The builder carries `allow`/`deny` permission rules, `auto_approve(true)` for trusted headless use,
-an optional system prompt and context blocks, model/token/iteration limits, and the OS-sandbox
-posture. Because a library has no approval UI, reads are pre-allowed and other gated operations deny
-by default unless you provide a broader policy.
+an optional system prompt and context blocks, model/token/iteration limits, explicit
+`agent_loop(AgentLoopSpec)`, typed `register_op(stage_fn(...))` stages, and the OS-sandbox posture.
+Because a library has no approval UI, reads are pre-allowed and other gated operations deny by
+default unless you provide a broader policy.
 
 ### `FlowClient`: one flow's lifecycle
 
@@ -70,16 +71,17 @@ let client = flux_sdk::FlowClient::builder()
     .auto_approve(true)
     .build(provider, ".")?; // provider: Arc<dyn flux_provider::Provider>
 
-let ast = client.compile("read the doc and show it", None).await?;
+let ast = client.parse(r#"flow show-doc -> String
+  $doc = read("README.md")
+  return $doc"#)?;
 client
     .analyze(&ast)
     .map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
 let out = client.execute(&ast).await?;
 ```
 
-Use `parse` instead of `compile` for stored Flux-Lang text when no model call should occur. Use
-`run` for the one-call natural-language pipeline, or `run_flow` for deterministic stored text plus
-inputs. The full registration, policy, optimization, result, and suspension contract is in the
+Use `run_flow` as the parse/analyze/execute convenience for stored text plus inputs. The full
+registration, policy, optimization, result, and suspension contract is in the
 [`FlowClient` guide](./flow-client.md).
 
 ### `dsl`: author the AST in Rust
@@ -107,7 +109,7 @@ let out = client.execute(&flow).await?;
 ```
 
 The DSL is a construction convenience, not a second language or a type-checker. It produces the
-same `flux_lang::ast::DraftAst` as text parsing or model compilation; always analyze it against the
+same `flux_lang::ast::DraftAst` as text parsing; always analyze it against the
 actual operation catalog before execution.
 
 ## The lower-level libraries
@@ -120,7 +122,7 @@ replace a host boundary rather than configure it:
   traits. Use it for parsers, editors, validators, schemas, custom catalogs, or a non-flux host.
 - **`codewandler-flux-flow` / `flux_flow`** adapts the language to a provider, the real tool
   registry, `Executor::dispatch`, event/value stores, and agent sinks. Use `FlowEngine` when the host
-  must own cancellable turns, reviewed-plan execution, cross-turn `await` sessions,
+  must own cancellable turns, adaptive batch approval, cross-turn `await` sessions,
   [replay](../agent/time-machine.md), or [flow-driven voice](../agent/realtime.md).
 
 Direct `flux-lang` interpretation does not silently inherit flux's concrete safety envelope: the
@@ -134,12 +136,12 @@ hermetic provider and no API key. The repository ships runnable examples:
 
 ```sh
 cargo run -p codewandler-flux-sdk --example client_basic
-cargo run -p codewandler-flux-sdk --example flow_compile
+cargo run -p codewandler-flux-sdk --example parameterized_flow
 cargo run -p codewandler-flux-sdk --example dsl_loops
 ```
 
-`client_basic` exercises the self-hosted agent loop; `flow_compile` covers natural language to AST
-to execution; `dsl_loops` executes a Rust-authored `each` loop against a temporary workspace.
+`client_basic` exercises the adaptive authored loop; `parameterized_flow` parses and executes authored
+text; `dsl_loops` executes a Rust-authored `each` loop against a temporary workspace.
 
 ## Recipes
 
@@ -162,7 +164,7 @@ The CLI exposes the same cookbook through `flux preset list`, `flux preset help`
 ## Related docs
 
 - [`FlowClient`](./flow-client.md) — the direct lifecycle and extension surface.
-- [The agent loop](../agent/agent-loop.md) — how `Client` and the CLI orient, gather, execute, and revise.
+- [The agent loop](../agent/agent-loop.md) — how `Client` and the CLI detect intent, explore, approve, execute, and repair.
 - [Flux-Lang overview](../language/overview.md) — the language all of these surfaces share.
 - [Safety and approvals](../agent/safety.md) — the envelope embedded applications inherit.
 - [Multi-agent programs](../agent/programs.md) — event-triggered applications whose journeys are flows.

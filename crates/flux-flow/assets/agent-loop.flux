@@ -1,49 +1,59 @@
 flow agent-loop -> string
   $answer = fmt("")
-  $feedback = fmt("")
   $done = fmt("")
 
-  # Pass 1 -- orient: one planner call, a three-way contract -- trivial request -> prose chat;
-  # simple/actionable request -> the full execution plan; complex/context-hungry request -> a
-  # small read-only gather plan + brief. $settled is "" only for the gather case.
-  $plan = plan({ feedback: $feedback, phase: "orient" })
-  $settled = $plan.settled
+  # The model declares intent; the host intersects its signals with the live, wired, permitted
+  # registry. This stage cannot call a leaf operation or grant authority.
+  $intent = detect_intent()
+  $step = $intent
+  $intent_kind = $intent.kind
+  match $intent_kind
+    case "error"
+      $answer = present_results({ step: $intent })
+      $done = fmt("true")
+    default
+      # Exploration uses provider-native schemas. Safe reads run through the envelope immediately;
+      # effectful calls are captured into a host-built ActionBatch.
+      $step = explore({ state: $intent.state })
 
-  # Pass 2 -- gather: bounded, read-only, approval-free rounds while not yet settled. Skipped
-  # entirely when orient already settled, so a trivial/simple turn adds zero latency here.
-  unless $settled
-    repeat 3
-      until $settled
-      $ran = run_plan($plan)
-      $feedback = $ran.transcript
-      do observe "turn.gather", $ran
-      $plan = plan({ feedback: $feedback, phase: "gather" })
-      $settled = $plan.settled
+  # A decision discovered during exploration is a real durable suspension point in this authored
+  # flow. A false condition skips it; on resume the existing flow store restores every prior bind,
+  # including the opaque native conversation ledger inside $step.state.
+  $question = $step.question?
+  when $question
+    $answer = present_results({ step: $step })
+  await $decision = "agent.decision" when $question
+  when $question
+    $step = explore({ state: $step.state, decision: $decision })
 
-  # Pass 3 -- plan / execute / revise: the standard loop, unchanged guards. A leftover gather
-  # plan (the budget exhausted before settling) simply runs as the first execute iteration.
+  # Execute/revise is bounded. Each batch gets a separate aggregate approval and a one-shot receipt;
+  # execution reports return to the same native ledger, so only failed work is repaired.
   repeat 25
     until $done
-    $kind = $plan.kind
+    $kind = $step.kind
     match $kind
       case "chat"
-        $answer = $plan.text
+        $answer = present_results({ step: $step })
         $done = fmt("true")
       case "error"
-        $answer = $plan.text
+        $answer = present_results({ step: $step })
         $done = fmt("true")
-      default
-        $ran = run_plan($plan)
-        $feedback = $ran.transcript
-        # A-17 -- revise wiring: $ran.failure is a reified halt (design Part 2) when this round's
-        # plan failed mid-way -- absent (host-normalized to null) on a clean run. Route the
-        # observation on it so a revision round is told apart from a plain iteration; the
-        # feedback text itself (kind-specific guidance, the fatal/retryable distinction, the
-        # denial re-emission guard) is already built by the host into $ran.transcript above.
-        $failure = $ran.failure
-        when $failure
-          do observe "turn.revision", $ran
+      case "decision"
+        # A second decision after an execution report is surfaced honestly. The next refinement is
+        # a repeatable top-level decision sub-flow; never guess or execute past it.
+        $answer = present_results({ step: $step })
+        $done = fmt("true")
+      case "batch"
+        $receipt = approve_batch({ batch: $step.batch })
+        $approved = $receipt.approved
+        when $approved
+          $report = execute_batch({ batch: $step.batch, receipt: $receipt })
+          observe({ kind: "turn.execution", data: $report })
+          $step = explore({ state: $step.state, report: $report })
         else
-          do observe "turn.iteration", $ran
-        $plan = plan({ feedback: $feedback, phase: "execute" })
+          $answer = present_results({ approval: $receipt })
+          $done = fmt("true")
+      default
+        $answer = fmt("The adaptive loop returned an unknown stage result and stopped safely.")
+        $done = fmt("true")
   return $answer

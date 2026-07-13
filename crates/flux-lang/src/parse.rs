@@ -125,7 +125,7 @@ fn is_flow_header(t: &str) -> bool {
 }
 
 /// Parse a `.flux` **module** from native flux-lang text: a multi-agent [`Program`] — any of the
-/// `permissions`/`agent`/`channel`/`datasource`/`trigger`/`journey` declarations plus top-level
+/// `permissions`/`agent_loop`/`agent`/`channel`/`datasource`/`trigger`/`journey` declarations plus top-level
 /// `flow`s — or, when the file is a lone `flow`, a bare [`Module::Flow`]. The backend of
 /// [`crate::program::Module::parse_str`]; module declarations are pure data (the L6 hosts give them
 /// runtime meaning), so this adds **no** new node kinds.
@@ -181,6 +181,14 @@ pub(crate) fn parse_program_text(src: &str) -> Result<Module> {
                 .agents
                 .push(parse_agent_decl(rest, region).map_err(|e| err_at(line, e))?);
             saw_module_decl = true;
+        } else if let Some(rest) = kw(header, "agent_loop") {
+            let name = decl_name(rest, "agent_loop").map_err(|e| err_at(line, e))?;
+            let flow =
+                parse_flow_decl(&format!("flow {name}"), region).map_err(|e| err_at(line, e))?;
+            program
+                .agent_loops
+                .push(crate::program::AgentLoopDecl { name, flow });
+            saw_module_decl = true;
         } else if let Some(rest) = kw(header, "channel") {
             program
                 .channels
@@ -216,7 +224,7 @@ pub(crate) fn parse_program_text(src: &str) -> Result<Module> {
             return Err(perr_at(
                 line.number,
                 &format!(
-                    "unknown top-level declaration: `{header}` (expected permissions / agent / \
+                    "unknown top-level declaration: `{header}` (expected permissions / agent_loop / agent / \
                      channel / datasource / trigger / journey / op / flow)"
                 ),
             ));
@@ -405,6 +413,7 @@ fn parse_agent_decl(name_str: &str, region: &[Line]) -> Result<AgentDecl> {
                 decl.datasources = as_string_list(&parse_setting(val)?, "datasources")?
             }
             "description" => decl.description = Some(string_value(val, "description")?),
+            "loop" => decl.agent_loop = Some(string_value(val, "loop")?),
             "allow" => {
                 if saw_allow {
                     return Err(perr("duplicate agent attribute `allow`"));
@@ -1996,7 +2005,7 @@ fn parse_checkpoint(rest: &str) -> Result<(Node, usize)> {
     Ok((Node::Checkpoint { label }, 1))
 }
 
-/// `await [$b[: T] =] "source"` — pause for an external event, optionally binding its payload.
+/// `await [$b[: T] =] "source" [when condition]` — optionally pause for an external event.
 fn parse_await(rest: &str) -> Result<(Node, usize)> {
     let rest = rest.trim_start();
     let (binding, as_type, src) = if let Some(r) = rest.strip_prefix('$') {
@@ -2021,14 +2030,25 @@ fn parse_await(rest: &str) -> Result<(Node, usize)> {
         (None, None, rest)
     };
     let (source, tail) = take_string(src.trim_start(), "await")?;
-    if !tail.trim().is_empty() {
-        return Err(perr("trailing text after `await` source"));
-    }
+    let tail = tail.trim();
+    let condition = if tail.is_empty() {
+        None
+    } else if let Some(raw) = tail.strip_prefix("when ") {
+        Some(Box::new(parse_condition_expr(
+            raw,
+            "`await ... when` condition",
+        )?))
+    } else {
+        return Err(perr(
+            "trailing text after `await` source (expected `when <condition>`)",
+        ));
+    };
     Ok((
         Node::Await {
             binding,
             source,
             as_type,
+            condition,
         },
         1,
     ))
@@ -2946,11 +2966,13 @@ mod tests {
                     binding: Some("reply".into()),
                     source: "user_input".into(),
                     as_type: None,
+                    condition: Some(Box::new(var("decision_needed"))),
                 },
                 Node::Await {
                     binding: None,
                     source: "webhook".into(),
                     as_type: None,
+                    condition: None,
                 },
             ],
             ..Default::default()
@@ -2965,7 +2987,10 @@ mod tests {
         assert!(text.contains("memo $n: String = \"hi\""), "{text}");
         assert!(text.contains("once \"charge\" -> $receipt"), "{text}");
         assert!(text.contains("checkpoint \"phase-1\""), "{text}");
-        assert!(text.contains("await $reply = \"user_input\""), "{text}");
+        assert!(
+            text.contains("await $reply = \"user_input\" when $decision_needed"),
+            "{text}"
+        );
         assert!(text.contains("await \"webhook\""), "{text}");
         assert_round_trips(&ast);
     }
@@ -3437,7 +3462,7 @@ mod tests {
                         body: vec![call("echo", vec![lit(s("err"))])],
                     },
                 ],
-                default: vec![bind("r", call("run_plan", vec![var("plan")]))],
+                default: vec![bind("r", call("present_results", vec![var("plan")]))],
             }],
             ..Default::default()
         };

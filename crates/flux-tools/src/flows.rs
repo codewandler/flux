@@ -4,15 +4,15 @@
 //! (global — the `@global_flows` named root the CLI registers), plus the legacy
 //! `.flux/ops` / `@global_ops` dirs, kept readable during the ops→flows unification.
 //! `flow_list` enumerates them (flows *and* composite ops, with descriptions + params);
-//! `flow_run` runs a named flow in the CURRENT session through the same depth-guarded
-//! `run_plan` reentry the reflect pack uses — so it inherits the approval + IO envelope,
-//! the provider, and the session, holding no engine state of its own.
+//! `flow_run` runs a named flow in the CURRENT session through the engine's depth-guarded authored
+//! flow host, so it inherits the approval + IO envelope, provider, and session while holding no
+//! engine state of its own.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use flux_core::{Error, Result};
 use flux_lang::ast::{DraftAst, Node, Param};
@@ -189,8 +189,8 @@ impl StoredFlowCatalog {
     }
 }
 
-/// Register the flow discovery/run pack. Like the reflect pack, `flow_run` is only meaningful
-/// with a model-in-the-loop host installed, but it stays model-facing (unlike `run_plan`).
+/// Register the flow discovery/run pack. `flow_run` needs the model-in-the-loop host for nested
+/// authored execution and remains model-facing.
 pub fn register_flows(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FlowListTool));
     registry.register(Arc::new(FlowRunTool));
@@ -398,8 +398,7 @@ impl Tool for FlowRunTool {
 
         let ast_json = serde_json::to_value(&ast)
             .map_err(|e| Error::Other(format!("flow_run: serialize flow: {e}")))?;
-        let plan = json!({ "kind": "plan", "ast": ast_json, "complete": true });
-        let outcome = loop_host(ctx)?.run_plan(plan).await?;
+        let outcome = loop_host(ctx)?.run_authored_flow(ast_json).await?;
         Ok(ToolResult::ok(
             serde_json::to_string(&outcome).unwrap_or_default(),
         ))

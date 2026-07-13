@@ -1,6 +1,6 @@
 //! The runtime adapter over the existing tool registry: a read-only [`OpRegistry`] view that presents
 //! `flux_runtime::ToolRegistry` as a catalog of Flux-Lang operations, plus the [`ThingResolver`] /
-//! [`ModelClient`] seams the runtime and compiler use.
+//! [`ModelClient`] seams the runtime and model-backed operations use.
 //!
 //! The pure op contracts ([`OpSpec`], [`OpSignature`], [`OpCatalog`], [`schema_params`]) live in
 //! `flux-lang`; this module re-exports them so existing `flux_flow::registry::*` paths keep working.
@@ -22,7 +22,7 @@ pub use flux_lang::opspec::{schema_params, OpCatalog, OpSignature, OpSpec};
 use flux_lang::program::CompositeOpDecl;
 
 /// A read-only adapter presenting the existing [`ToolRegistry`] as a registry of operations the
-/// compiler can target. Existing tools *are* operations — no separate registration is required.
+/// analyzer and typed stages can target. Existing tools *are* operations — no separate registration is required.
 ///
 /// `advertised` optionally restricts the **catalog** (`op_names`/`signatures` — what the model is
 /// shown) to a precomputed allow-set of op names (evidence-gated surfacing; see
@@ -68,7 +68,7 @@ impl<'a> OpRegistry<'a> {
         self.advertised.as_ref().is_none_or(|a| a.contains(name))
     }
 
-    /// The names of every **advertised** operation, sorted (prompt-rendered — must be byte-stable).
+    /// The names of every **advertised** operation, sorted (model-stage catalogs must be byte-stable).
     pub fn op_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .tools
@@ -86,8 +86,8 @@ impl<'a> OpRegistry<'a> {
         names
     }
 
-    /// The signature of every **advertised** operation, name-sorted: the catalog is rendered into
-    /// the planner system prompt, and an unstable order breaks provider prompt caching (A-03).
+    /// The signature of every **advertised** operation, name-sorted. Stable order preserves provider
+    /// prompt caching for model-stage catalogs.
     pub fn signatures(&self) -> Vec<OpSignature> {
         let mut signatures: Vec<OpSignature> = self
             .tools
@@ -105,97 +105,6 @@ impl<'a> OpRegistry<'a> {
         );
         signatures.sort_by(|a, b| a.name.cmp(&b.name));
         signatures
-    }
-
-    /// The ops a **model-emitted** plan names that are registered but not advertised this turn — the
-    /// enforcement side of evidence-gated surfacing (A-04). Advertisement alone doesn't stop a model
-    /// that *names* a hidden op (the planner prompt itself mentions `bash`), so the compiler rejects
-    /// plans calling these. Empty when the registry is unrestricted (`advertised: None` — the
-    /// pre-authored `flow run` / composite paths) or when every named op is surfaced. Unknown names
-    /// are not reported here — `analyze_flow`'s unknown-operation diagnostic owns those.
-    ///
-    /// A composite **call** is never itself reported — composites are user/agent-registered
-    /// compositions resolved by name, not part of the advertised-name set — but its **body** is
-    /// walked transitively (L-30). Without that, a turn/session-scoped composite installed via
-    /// `op.register` could launder a hidden op past this gate: `analyze_composites` validates a
-    /// composite's body against the FULL tool registry at registration time (registry.rs's own
-    /// scratch catalog, `advertised: None`), not the turn's advertised set, so registering a
-    /// composite whose body calls `bash` succeeds even when `bash` is hidden this turn. This
-    /// mirrors the gather gate's transitivity through composite bodies (A-13/L-29) — there via a
-    /// composite's own declared effects, here via body expansion, because "advertised" is a
-    /// turn-local fact a composite's static metadata can't capture at registration time.
-    pub fn hidden_ops_in(&self, body: &[Node]) -> Vec<String> {
-        if self.advertised.is_none() {
-            return Vec::new();
-        }
-        let mut out: Vec<String> = Vec::new();
-        let mut visiting: Vec<String> = Vec::new();
-        self.collect_hidden_ops(body, &mut visiting, &mut out);
-        out
-    }
-
-    /// Depth-first helper behind [`hidden_ops_in`](Self::hidden_ops_in). `visiting` guards against a
-    /// composite cycle looping forever if one ever slips past `analyze_composites`'s own cycle check
-    /// (defense in depth — real cycles are already rejected at registration).
-    fn collect_hidden_ops(&self, body: &[Node], visiting: &mut Vec<String>, out: &mut Vec<String>) {
-        for_each_node(body, &mut |node| {
-            let Node::Call { op, .. } = node else {
-                return;
-            };
-            if let Some(composite) = self.composites.iter().find(|c| c.name == *op) {
-                if !visiting.contains(&composite.name) {
-                    visiting.push(composite.name.clone());
-                    self.collect_hidden_ops(&composite.body.body, visiting, out);
-                    visiting.pop();
-                }
-                return;
-            }
-            let registered = self.tools.get(op).is_some();
-            if registered && !self.is_advertised(op) && !out.contains(op) {
-                out.push(op.clone());
-            }
-        });
-    }
-
-    /// The ops a plan calls that escape the read-only gather sandbox — the enforcement side of
-    /// gather-plan validation (A-13: a `gather: true` plan must call none of these). An op is
-    /// gather-safe when its effects stay within a *read-only orientation*: `Read` and `Filesystem`
-    /// (a filesystem **read**, e.g. `grep`/`glob` carry `[Read, Filesystem]`), plus a bare `Process`
-    /// read-command like `git_status` (`Effect::Process` at `Risk::Low` — a deliberate A-13
-    /// classification, pinned by `mutating_ops_in_flags_write_effect_and_composite_transitively`).
-    /// Anything that escapes that sandbox is mutating and is reported here: a `Write`, `Network`
-    /// (`http`/`run_plan`), `Browser`, or `LocalSystem` effect (arbitrary local execution — `cargo`/
-    /// `bash` carry `[Process, LocalSystem]`), plus any `Destructive`-risk op. Before L-29 this only
-    /// caught `Write`/`Destructive`, so an advertised `[Network]` or `[Process, LocalSystem]` op
-    /// slipped through a "read-only orientation" round undetected. A composite call counts via its
-    /// OWN declared `effects` ([`get`](Self::get) resolves it to [`composite_signature`]), which
-    /// [`analyze_composites`] validates at registration to already cover the composite's body
-    /// transitively — so no separate body expansion is needed here. Unknown names are not reported
-    /// (`analyze_flow`'s unknown-operation diagnostic owns those). Empty means the plan is
-    /// effect-clean.
-    pub fn mutating_ops_in(&self, body: &[Node]) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for_each_node(body, &mut |node| {
-            if let Node::Call { op, .. } = node {
-                if out.contains(op) {
-                    return;
-                }
-                if let Some(sig) = self.get(op) {
-                    // Effects that escape a read-only orientation. `Read`/`Filesystem` (filesystem
-                    // reads) and bare `Process` (fixed read-commands) stay gather-safe.
-                    let escapes = sig.effects.iter().any(|e| {
-                        matches!(
-                            e,
-                            Effect::Write | Effect::Network | Effect::Browser | Effect::LocalSystem
-                        )
-                    });
-                    if escapes || sig.risk == Risk::Destructive {
-                        out.push(op.clone());
-                    }
-                }
-            }
-        });
-        out
     }
 
     /// The signature of one operation, if registered. Not filtered by surfacing — resolution must
@@ -242,7 +151,7 @@ impl OpCatalog for OpRegistry<'_> {
 /// ([`Tool::semantic_effects`]) into [`OpSignature::semantic_effects`] — the D-138 manifest→catalog
 /// adapter: a plugin's manifest-declared `OperationSpec::semantic_effects` (`Money`/`Delete`/
 /// `SendExternal`, or any built-in `Tool` impl that overrides the same hook) survives from the
-/// registered tool all the way to the catalog the analyzer/planner see, with no authored `effect:`
+/// registered tool all the way to the catalog the analyzer and typed stages see, with no authored `effect:`
 /// tag required at the call site. Unknown tags are silently dropped rather than erroring — a
 /// forward-compatible tag from a newer catalog degrades to "no extra semantic tier" instead of
 /// breaking resolution.
@@ -274,6 +183,7 @@ fn composite_signature(op: &CompositeOpDecl) -> OpSignature {
         required_params: op.params.iter().map(|p| p.name.0.clone()).collect(),
         optional_params: Vec::new(),
         param_types,
+        output: op.returns.clone().unwrap_or(flux_lang::ast::TypeRef::Any),
         // Composite ops don't yet have their own declared semantic-effect tier (they compose
         // existing ops rather than being a leaf `OpSpec`/`OperationSpec`); leave empty for now.
         semantic_effects: Vec::new(),
@@ -301,7 +211,7 @@ pub fn analyze_composites(
                 op.name
             )));
         }
-        // Composites validate through the same typed gate as model plans (L-16/F9): full
+        // Composites validate through the same typed gate as any authored flow (L-16/F9): full
         // structural analysis + lowering. Params seed the definedness scope; no session set.
         lower(&op.body, &catalog, &std::collections::HashSet::new())
             .map(|_| ())

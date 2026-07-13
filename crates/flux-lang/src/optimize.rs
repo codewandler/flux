@@ -488,6 +488,7 @@ mod tests {
                 required_params: vec!["x".into()],
                 optional_params: Vec::new(),
                 param_types: Default::default(),
+                output: crate::ast::TypeRef::Any,
                 semantic_effects: Vec::new(),
             };
             match name {

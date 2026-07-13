@@ -67,7 +67,7 @@ fn test_dir(label: &str) -> PathBuf {
 }
 
 /// A provider that records the cognition prompt and returns one deterministic answer. The tutorial
-/// flow is authored (not planner-compiled), so this provider is called exactly once by `ai.reason`.
+/// flow is authored, so this provider is called exactly once by `ai.reason`.
 struct PromptCapture {
     prompts: Arc<Mutex<Vec<String>>>,
 }
@@ -235,6 +235,7 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
     let docs_root = repo_path("website/docs");
     let declarations = [
         "permissions",
+        "agent_loop ",
         "agent ",
         "channel ",
         "datasource ",
@@ -273,24 +274,28 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
 }
 
 #[test]
-fn tutorial_plan_copy_matches_bounded_gather_semantics() {
+fn tutorial_agent_copy_matches_the_adaptive_batch_semantics() {
     let lesson = read("website/docs/tutorial/first-agent.md");
-    let tooling = read("website/docs/language/tooling.md");
+    let loop_docs = read("website/docs/agent/agent-loop.md");
     for (rel, docs) in [
         ("tutorial/first-agent.md", lesson.as_str()),
-        ("language/tooling.md", tooling.as_str()),
+        ("agent/agent-loop.md", loop_docs.as_str()),
     ] {
         assert!(
-            docs.contains("read-only gather"),
-            "{rel} must disclose plan mode's automatic gather"
+            docs.contains("native") && docs.contains("schema"),
+            "{rel} must disclose provider-native operation schemas"
         );
         assert!(
-            docs.contains("returned") && docs.contains("plan") && docs.contains("unexecuted"),
-            "{rel} must distinguish gather from the returned plan"
+            docs.contains("action batch") && docs.contains("captur"),
+            "{rel} must distinguish effect capture from execution"
         );
         assert!(
-            !docs.contains("the files have not been read") && !docs.contains("nothing runs"),
-            "{rel} regressed to the pre-A-18 plan-mode claim"
+            docs.contains("one-shot") && docs.contains("receipt"),
+            "{rel} must explain receipt-bound batch execution"
+        );
+        assert!(
+            !docs.contains("flux plan"),
+            "{rel} mentions the retired compiler CLI"
         );
     }
 }
@@ -566,6 +571,7 @@ fn plugin_and_sdk_docs_track_the_shipped_surfaces() {
     assert!(!sdk.contains("not published to crates.io"));
     assert!(!sdk.contains("tag = \"v0.6.0\""));
     assert!(!sdk.contains("cargo run -p flux-sdk"));
+    assert!(!sdk.contains("flow_compile"));
 }
 
 #[test]
@@ -595,14 +601,13 @@ fn sdk_docs_map_the_shared_engine_and_flowclient_lifecycle() {
         "auto_approve",
         "approver",
         "with_sandbox",
-        "compile_options",
+        "storage",
         "without_prelude",
         "register_op",
         "register_pack",
         "with_sub_agents",
         "register_composites",
         "register_prelude",
-        "compile",
         "parse",
         "parse_module",
         "analyze",
@@ -612,7 +617,6 @@ fn sdk_docs_map_the_shared_engine_and_flowclient_lifecycle() {
         "execute",
         "execute_with",
         "execute_optimized",
-        "run",
         "run_flow",
         "run_voice_session",
     ] {
@@ -633,6 +637,9 @@ fn sdk_docs_map_the_shared_engine_and_flowclient_lifecycle() {
         );
     }
     assert!(flow.contains("one-flow façade, not a durable conversation host"));
+    assert!(overview.contains("`agent_loop(AgentLoopSpec)`"));
+    assert!(overview.contains("`register_op(stage_fn(...))`"));
+    assert!(!overview.contains("model emits Flux-Lang plans"));
 
     let crate_readme = read("crates/flux-sdk/README.md");
     assert!(crate_readme.contains("There is one turn engine"));

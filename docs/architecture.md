@@ -73,7 +73,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 ### Agent pillar
 | Crate | Layer | Role | Disposition |
 |---|---|---|---|
-| `flux-flow` | L3 | the FlowEngine (the one turn loop) + the `AgentSink` streaming trait: compile NL→plan, execute the DAG, session store; also the realtime voice driver (`voice/`) — model-driven or deferring to flow suspensions | — |
+| `flux-flow` | L3 | the FlowEngine (the one authored turn loop) + typed model stages, native-schema exploration, action batches, the `AgentSink` streaming trait, authored-flow execution, session store, and realtime voice driver | — |
 | `flux-agent` | L3 | the Agent pillar: `AgentSpec` + markdown `Role` definitions, assembled onto `FlowEngine` | — |
 | `flux-orchestrate` | L3 | sub-agents + multi-agent orchestration | — |
 | `flux-cognition` | L3 | model-backed ops (`ai.extract` / `rank` / `judge` / …) | — |
@@ -163,21 +163,22 @@ provider is a small composition, never a fork of the loop. Streaming is a
 
 - **The turn loop is itself Flux-Lang.** `flux-flow`'s `FlowEngine::run_turn_cancellable` is a thin Rust
   *bootstrap* that runs `crates/flux-flow/assets/agent-loop.flux` — the loop logic lives in flux-lang, not
-  Rust. Each turn that flow does: `plan` (re-enter the planner → a typed graph or a prose answer) →
-  `match` on the result → `run_plan` (execute the graph through the same envelope) → feed the transcript
-  back as `$feedback` → repeat until the model answers in prose. The reflexive ops
-  `plan`/`run_plan`/`ai_segment` and the evidence ops `observe`/`evidence`/`grade`/`metrics` are what let
-  the loop call the model and reason over its own runtime evidence (see
-  `flux-flow/docs/ops-reference.md`). The same engine also runs the loop **inverted**: a flow-driven
-  session (`FlowEngine::start_flow_turn`, design `docs/designs/flow-driven-session.md`) makes an authored
-  flow the conversation driver — over text or the realtime voice channel (`docs/designs/flow-driven-voice.md`)
-  — with the model consulted only inside a bounded, tool-scoped `ai_segment`. A workspace can override the loop
-  with its own `.flux/agent-loop.flux`. The loop is cancellable (a `CancellationToken`). This is the
-  **one** turn loop everywhere — CLI/server/TUI, the SDK (`flux_sdk::Client` assembles a `FlowEngine`
+  Rust. The default does `detect_intent` → capability-scoped `explore` → optional decision/`await` →
+  host-built `ActionBatch` → `approve_batch` → `execute_batch` → `present_results`. The model receives
+  exact provider-native operation schemas and maintains a typed stage ledger; it never emits Flux.
+  Safe reads gather evidence immediately through `Executor`, while effects are inert until the host
+  freezes and approves the batch. Execution reports return to the same ledger for local correction.
+  The same engine also runs flow-driven sessions (`FlowEngine::start_flow_turn`) where an authored flow
+  owns a longer conversation over text or realtime voice and invokes bounded, tool-scoped
+  `ai_segment`s. Loop selection is explicit through `AgentLoopSpec`, `--loop`, config, a role, or an app
+  `agent_loop` declaration; a file named `.flux/agent-loop.flux` has no implicit effect. The loop is
+  cancellable (a `CancellationToken`). This is the
+  **one** conversational text-agent loop everywhere — CLI/server/TUI, the SDK (`flux_sdk::Client` assembles a `FlowEngine`
   via `AgentSpec`; `flux_sdk::FlowClient` is the declarative flow door), and sub-agents
   (`flux-orchestrate`). `flux-flow` owns the `AgentSink` streaming trait; `flux-agent` is the
   agent-definition crate (`AgentSpec` + markdown `Role`). The classic provider-native `Agent` loop is
-  gone. The loop is filtered from the surface by default; watch it with
+  gone. The explicitly selected provider-owned realtime voice mode is the documented exception; it
+  still dispatches effects through `Executor`. The loop machinery is filtered from the surface by default; watch it with
   `flux run --show-loop`, inspect its evidence with the REPL `/evidence`, and read or scaffold it with
   `flux loop show`/`eject` — see [the agent-loop guide](agent-loop.md).
 - **Session shape is a hard invariant.** The persisted message log must always be a valid

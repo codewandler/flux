@@ -34,7 +34,7 @@ use flux_policy::{
     Request as PolicyRequest, ResourceKind, ResourceRef, Trust, TrustKind, TrustLevel,
 };
 use flux_secret::Redactor;
-use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, ToolSpec};
+use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, StagingDisposition, ToolSpec};
 use flux_system::{PathAccess, System};
 
 /// The result of executing a tool.
@@ -147,36 +147,85 @@ pub trait Spawner: Send + Sync {
     ) -> flux_core::Result<SpawnOutcome>;
 }
 
-/// The reflexive capability: re-enter the planner and the interpreter from *within* a flow. Defined
-/// here (L2) and injected into [`ToolContext`] so the `plan`/`run_plan` ops can delegate without
-/// `flux-runtime` depending on the engine — the same seam as [`Spawner`]. The engine (L3) installs a
-/// concrete `LoopHost` per turn, wired to the live provider + session + sink. This is what lets the
-/// agent loop be written in flux-lang: "ask the planner" and "run a plan" become ordinary gated ops
-/// that traverse [`Executor::dispatch`] like any other — the LLM stays the planner, never the runtime.
+/// Host capabilities used by model-backed stages inside an authored Flux-Lang outer loop. Defined
+/// here (L2) so guarded tools can delegate without depending on the L3 engine. Models return typed
+/// stage values and provider-native calls; only caller-authored Flux reaches deterministic execution.
 #[async_trait]
 pub trait LoopHost: Send + Sync {
-    /// Re-enter the planner (the model) to produce a plan from `input` (the working feedback /
-    /// conversation) → a `Plan` artifact (`{kind: "chat"|"plan"|"error", text?, ast?, complete?}`) as
-    /// JSON. Wraps the engine's compile step.
-    async fn plan(&self, input: serde_json::Value) -> flux_core::Result<serde_json::Value>;
-    /// Re-enter the interpreter to run an emitted plan in the CURRENT session → an `Outcome` artifact
-    /// (`{transcript, result, steps, suspension?, failure}`) as JSON. Bounded by a reentry-depth cap.
-    /// Wraps the engine's execute step. `failure` is always present — `null` on a clean run, or a
-    /// reified mid-plan halt object (design `docs/designs/multipass-agent-loop.md` Part 2, A-16/A-17)
-    /// a caller can route on (e.g. the agent loop's `when $ran.failure`); never a missing key, since
-    /// flux-lang's dotted field-access sugar errors on one.
-    async fn run_plan(&self, plan: serde_json::Value) -> flux_core::Result<serde_json::Value>;
+    /// Detect one turn's intent and resolve the initial capability signals into a durable stage
+    /// artifact. Adaptive hosts override this; tool-only runtimes fail clearly.
+    async fn detect_intent(&self) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "detect_intent: this host does not provide an adaptive loop".into(),
+        ))
+    }
 
-    /// Hand a **bounded run of model turns** to the loop under a capability scope and an explicit
-    /// exit condition, then return control to the caller — the "deterministic skeleton with a
-    /// visibly-bounded non-deterministic segment" (D-131). `input` carries `goal` (the instruction
-    /// handed to the model), `tools` (the capability scope for the delegated leaf ops), `max_rounds`
-    /// (required cap), and an optional `until` (a symbol name — exit early once it is bound to a
-    /// non-empty value). Returns `{result}` (the segment's answer) as JSON. The default is an error:
-    /// a host without a real planner cannot delegate.
+    /// Continue native-schema exploration from a typed state artifact. The input may also carry a
+    /// resumed user decision or an execution report from the previous action batch.
+    async fn explore(&self, _input: serde_json::Value) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "explore: this host does not provide an adaptive loop".into(),
+        ))
+    }
+
+    /// Ask for aggregate approval and mint an opaque one-shot receipt for one exact action batch.
+    async fn approve_batch(
+        &self,
+        _input: serde_json::Value,
+    ) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "approve_batch: this host does not provide an adaptive loop".into(),
+        ))
+    }
+
+    /// Consume a matching approval receipt and execute the batch through the safety envelope.
+    async fn execute_batch(
+        &self,
+        _input: serde_json::Value,
+    ) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "execute_batch: this host does not provide an adaptive loop".into(),
+        ))
+    }
+
+    /// Turn a terminal adaptive artifact into the channel-neutral answer text.
+    async fn present_results(
+        &self,
+        _input: serde_json::Value,
+    ) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "present_results: this host does not provide an adaptive loop".into(),
+        ))
+    }
+
+    /// Run a named, host-configured model stage through its exact typed operation contract.
+    async fn model_stage(
+        &self,
+        name: &str,
+        _input: serde_json::Value,
+    ) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(format!(
+            "model stage `{name}` is not configured on this host"
+        )))
+    }
+
+    /// Execute a caller-authored Flux AST in the current session. This is deterministic language
+    /// execution, not model planning; hosts revalidate it against the live operation catalog.
+    async fn run_authored_flow(
+        &self,
+        _ast: serde_json::Value,
+    ) -> flux_core::Result<serde_json::Value> {
+        Err(flux_core::Error::Other(
+            "run_authored_flow: this host does not provide Flux execution".into(),
+        ))
+    }
+
+    /// Hand a bounded run of native-schema model stages to the loop under an exact capability scope,
+    /// then return control to the caller. Proposed effects use the same batch approval seam as the
+    /// default adaptive loop.
     async fn ai_segment(&self, _input: serde_json::Value) -> flux_core::Result<serde_json::Value> {
         Err(flux_core::Error::Other(
-            "ai_segment: this host does not provide a reflexive planner".into(),
+            "ai_segment: this host does not provide adaptive model stages".into(),
         ))
     }
 }
@@ -214,8 +263,9 @@ pub struct ToolContext {
     pub system: Arc<System>,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
-    /// The reflexive capability (`plan`/`run_plan`), installed per turn by the engine. `None` outside a
-    /// model-in-the-loop run — the ops then return a clear error rather than silently doing nothing.
+    /// The authored outer-loop capability, installed per turn by the engine. `None` outside a
+    /// model-in-the-loop run — adaptive stage ops then return a clear error rather than silently
+    /// doing nothing.
     pub loop_host: Option<Arc<dyn LoopHost>>,
     /// Root op registration capability (`op.register`), installed by a model-in-the-loop engine.
     /// Kept separate from [`LoopHost`] so other hosts can opt into composite registration without
@@ -316,7 +366,7 @@ impl ToolContext {
         self
     }
 
-    /// Install the reflexive capability (the engine does this per turn before running the loop).
+    /// Install the authored outer-loop capability (the engine does this per turn).
     pub fn with_loop_host(mut self, loop_host: Arc<dyn LoopHost>) -> Self {
         self.loop_host = Some(loop_host);
         self
@@ -389,6 +439,13 @@ pub trait Tool: Send + Sync {
     /// Pre-execution intents (the approval-risk signal).
     fn intents(&self, _params: &Value) -> IntentSet {
         IntentSet::new()
+    }
+
+    /// Whether the adaptive loop may use this operation while gathering evidence or must capture
+    /// it for later approval. This is never an authorization bypass: concrete intents and the
+    /// tool's risk/effect/idempotency contract can only make the effective disposition stricter.
+    fn staging_disposition(&self) -> StagingDisposition {
+        StagingDisposition::Infer
     }
 
     /// Declared SEMANTIC-effect tags this tool carries beyond its host [`ToolSpec::effects`] — e.g.
@@ -517,14 +574,14 @@ pub fn shell_opt_in() -> bool {
     }
 }
 
-/// The group tag for the reflexive loop-machinery ops (`plan`/`run_plan`). It is never surfaced by a
-/// workspace signal, so these ops stay out of the model-facing catalog while remaining dispatchable
-/// by the agent loop. Shared so the tag and the catalog filters can't drift.
+/// The group tag for authored outer-loop machinery. It is never surfaced by a workspace signal, so
+/// these ops stay out of the model-facing catalog while remaining dispatchable by the agent loop.
+/// Shared so the tag and the catalog filters cannot drift.
 pub const REFLECT_GROUP: &str = "reflect";
 
 /// The group an op effectively belongs to: a manifest group that lists it in `tools` wins (so config
 /// can (re)assign membership), otherwise the op's own [`ToolSpec::group`] tag. `None` ⇒ *core*.
-fn effective_group<'a>(
+pub fn effective_group<'a>(
     spec: &'a ToolSpec,
     groups: &'a [flux_evidence::ToolGroup],
 ) -> Option<&'a str> {
@@ -892,7 +949,7 @@ pub struct Executor {
     registry: ToolRegistry,
     perms: Mutex<PermissionManager>,
     /// Interior-mutable so a surface can swap the approver (e.g. the TUI's modal) even when the executor
-    /// is shared as an `Arc<Executor>` — which it is once the reflexive loop host re-enters it.
+    /// is shared as an `Arc<Executor>` — which it is once the authored loop host is installed.
     approver: Mutex<Arc<dyn Approver>>,
     ctx: ToolContext,
     hooks: Vec<Arc<dyn PreToolHook>>,
@@ -1113,7 +1170,7 @@ impl Executor {
     }
 
     /// Approve a whole plan once, then keep it pre-approved while the returned guard is held. If already
-    /// inside an approved scope (a nested `run_plan`) or the user trusts all plans, returns a guard
+    /// inside an approved scope (a nested authored flow) or the user trusts all plans, returns a guard
     /// without prompting. `None` means the approver rejected the plan. The request comes from the plan's
     /// risk preview — the plan tree itself was already rendered (the `flow.plan` observation). The
     /// scope's destructive disclosure follows the request's `destructive` flag on every arm: whoever
@@ -1133,12 +1190,61 @@ impl Executor {
         }
     }
 
+    /// Ask for aggregate approval without opening an execution scope. Adaptive loops use this to
+    /// mint a one-shot receipt in one stage and execute in a later stage; the caller must validate
+    /// that receipt and call [`enter_approved_scope`](Self::enter_approved_scope) only while the
+    /// exact approved batch is dispatched.
+    pub async fn request_plan_approval(&self, plan: &PlanApprovalRequest) -> bool {
+        if self.in_approved_scope() {
+            return true;
+        }
+        let approver = self.approver.lock().unwrap().clone();
+        match approver.request_plan(plan).await {
+            ApprovalChoice::Allow => true,
+            ApprovalChoice::AllowAlways(_) => {
+                self.trust_all.store(true, Ordering::SeqCst);
+                true
+            }
+            ApprovalChoice::Deny => false,
+        }
+    }
+
+    /// Stable snapshot of the authority context an approval was made under. It contains no secret
+    /// values: only caller/trust/policy metadata, allow rules, and the active capability ceiling.
+    /// Receipt owners bind this byte string at approval and require an exact match at execution;
+    /// dispatch still re-evaluates every policy and permission rule afterward.
+    pub fn approval_context(&self) -> String {
+        let (caller, trust) = self.identity.get();
+        serde_json::to_string(&json!({
+            "caller": caller,
+            "trust": trust,
+            "policy": self.policy,
+            "allow_rules": self.perms.lock().unwrap().allow_rules(),
+            "capability_scope": self.active_cap_scope(),
+        }))
+        .unwrap_or_default()
+    }
+
     /// The effective tool-name allowlist of the innermost active `with_tools` scope, or `None` when no
     /// scope is active. Delegates to the shared [`ToolContext::active_cap_scope`] so a spawned
     /// sub-agent (built over a fresh `Executor` but a context that still carries this same `Arc`) sees
     /// the identical set [`Executor::dispatch`] just checked.
     pub fn active_cap_scope(&self) -> Option<Vec<String>> {
         self.ctx.active_cap_scope()
+    }
+
+    /// Whether an operation may be surfaced for argument selection. This is a visibility ceiling,
+    /// not authorization: literal dispatch still rechecks subject-scoped rules, policy, hooks, and
+    /// approval. A bare deny or an active `with_tools` miss is knowable before arguments exist and
+    /// therefore removes the operation from model context entirely.
+    pub fn operation_visible(&self, name: &str) -> bool {
+        if self
+            .active_cap_scope()
+            .is_some_and(|scope| !scope.iter().any(|allowed| allowed == name))
+        {
+            return false;
+        }
+        !self.perms.lock().unwrap().is_bare_denied(name)
     }
 
     /// Push a new capability scope, **narrowing** the effective allowlist: the pushed set is
@@ -1182,10 +1288,10 @@ impl Executor {
         *self.approver.lock().unwrap() = approver;
     }
 
-    /// Install the reflexive [`LoopHost`] capability onto this executor's [`ToolContext`], so the
-    /// `plan`/`run_plan` ops dispatched through it can re-enter the planner/interpreter. Done by the
-    /// engine once per turn, after the executor is built (the host holds a `Weak` back to this same
-    /// executor, so it can only be wired in afterwards). Mirrors [`set_approver`](Self::set_approver).
+    /// Install the [`LoopHost`] capability onto this executor's [`ToolContext`], so authored-loop
+    /// stages can consult the model, run nested authored flows, and execute approved batches. Done
+    /// by the engine once per turn, after the executor is built (the host holds a `Weak` back to
+    /// this same executor, so it can only be wired in afterwards).
     pub fn set_loop_host(&mut self, loop_host: Arc<dyn LoopHost>) {
         self.ctx.loop_host = Some(loop_host);
     }
@@ -1196,8 +1302,9 @@ impl Executor {
     }
 
     /// Pre-allow these op names (they dispatch without an approval prompt). The engine uses this to
-    /// whitelist its own loop machinery (`plan`/`run_plan`/`observe`/…) — internal control flow, not
-    /// user-facing actions. A `deny` rule still wins, and the *inner* ops a plan runs gate individually.
+    /// whitelist its own loop machinery (`detect_intent`/`explore`/`approve_batch`/…) — internal
+    /// control flow, not user-facing actions. A `deny` rule still wins, and leaf ops still gate
+    /// individually through dispatch.
     pub fn allow(&self, rules: &[&str]) {
         let mut perms = self.perms.lock().unwrap();
         for r in rules {
@@ -2185,6 +2292,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operation_visibility_intersects_bare_denies_and_active_capability_scope() {
+        let permissions = PermissionManager::from_rules(&[], &["echo".into()]);
+        let executor = Executor::new(
+            registry_two_tools(),
+            permissions,
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        assert!(!executor.operation_visible("echo"));
+        assert!(executor.operation_visible("ping"));
+
+        let _scope = executor.push_cap_scope(&["echo".to_string()]);
+        assert!(!executor.operation_visible("echo"), "deny still wins");
+        assert!(
+            !executor.operation_visible("ping"),
+            "the active capability scope is also a visibility ceiling"
+        );
+    }
+
     #[tokio::test]
     async fn scope_denial_wins_even_when_policy_and_permissions_would_allow() {
         // The permission rules explicitly allow `echo`, and there's no policy floor configured — the
@@ -2354,6 +2481,28 @@ mod tests {
             "Deny → no scope"
         );
         assert!(!ex.in_approved_scope());
+    }
+
+    #[tokio::test]
+    async fn request_plan_approval_does_not_open_an_execution_scope() {
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::Allow,
+        });
+        let ex = Executor::new(
+            registry(),
+            PermissionManager::new(),
+            approver.clone(),
+            test_ctx(),
+        );
+
+        assert!(ex.request_plan_approval(&plan_request("medium", 1)).await);
+        assert!(approver.asked.load(Ordering::Relaxed));
+        assert!(
+            !ex.in_approved_scope(),
+            "approval and execution are separate phases; the receipt holder opens the scope later"
+        );
+        assert!(!ex.approval_context().is_empty());
     }
 
     #[tokio::test]

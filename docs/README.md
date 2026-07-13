@@ -5,18 +5,18 @@ records, story status, implementation notes, and crate references. The public us
 in [`../website`](../website) and is deployed to `https://codewandler.github.io/flux/`.
 
 **flux is a deterministic agent platform** built on one thesis —
-**the LLM is not the runtime**: the model compiles a request into a typed, readable Flux-Lang plan,
-and a deterministic Rust runtime executes that plan through one mandatory safety envelope
-(authorization → approval → guarded IO). You see the plan before it runs; the same plan re-runs.
+**the LLM is not the runtime**: typed model stages interpret intent and gather evidence, while an
+authored Flux-Lang loop freezes effects into an action batch and a deterministic Rust runtime executes
+it through one mandatory safety envelope (authorization → approval → guarded IO). The model never
+authors executable Flux.
 
 ## The three pillars
 1. **The Agent** — a zero-config personal coding agent (CLI/TUI), an embeddable Rust SDK, and an
    HTTP server. What most people touch. *Within this pillar*, surface priority is
    CLI/TUI → SDK → platform.
-2. **The Language (Flux-Lang)** — the typed plan format the agent compiles into:
-   **machine-generated** (emitted from NL as JSON or native text), **human-readable** (audit every
-   plan before it runs), **lightly human-editable** (nudge a plan, don't write one from scratch).
-   *Not* a hand-written general-purpose language.
+2. **The Language (Flux-Lang)** — a small language for authored, analyzer-validated flows, reusable
+   operations, agent outer loops, and durable journeys. It places deterministic control flow around
+   explicit model stages and guarded effects; it is not model output or a general-purpose language.
 3. **The Improvement Loop** — `flux-eval` + the self-improvement harness, kept in-repo because it is
    used directly to make flux better at real coding work.
 

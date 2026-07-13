@@ -4,8 +4,9 @@ The high-level library API for [flux](https://github.com/codewandler/flux) — e
 policy-gated agent in your own Rust program. You supply a `Provider` (a model backend) and a workspace
 root; the SDK wires the agent loop, the built-in tools, the safety envelope, and a session.
 
-The guiding idea is **"the LLM is not the runtime"**: the model emits a Flux-Lang plan (an execution
-graph), and a deterministic engine runs it through a non-bypassable safety envelope.
+The guiding idea is **"the LLM is not the runtime"**: typed model stages may interpret intent and
+propose native operation calls, but an authored Flux-Lang loop and deterministic engine own control
+flow, approval, and execution through a non-bypassable safety envelope. The model never emits Flux.
 There is one turn engine: `Client`, the CLI, sub-agents, and served agents all assemble
 `flux_flow::engine::FlowEngine`, whose loop is itself a Flux-Lang program.
 
@@ -25,7 +26,7 @@ but the **import paths are unprefixed** — the crate `codewandler-flux-sdk` is 
 | Surface | What it is | Example |
 |---|---|---|
 | [`Client`] | A conversational turn through the self-hosted Flux-Lang agent loop and safety envelope. | `examples/client_basic.rs` |
-| [`FlowClient`] | The direct Flux-Lang lifecycle: parse/compile, analyze, optimize, seed, and execute. | `examples/flow_compile.rs` |
+| [`FlowClient`] | The direct authored Flux-Lang lifecycle: parse, analyze, optimize, seed, and execute. | `examples/parameterized_flow.rs` |
 | [`dsl`] | Author the AST **in Rust** — builder primitives (loops + control-flow) that compile to the Flux-Lang AST, then run via `FlowClient`. | `examples/dsl_loops.rs` |
 
 All three examples are hermetic (a mock provider) and run with no API key:
@@ -33,7 +34,7 @@ All three examples are hermetic (a mock provider) and run with no API key:
 ```sh
 cargo run -p codewandler-flux-sdk --example dsl_loops      # build loops/control-flow with the DSL, execute them
 cargo run -p codewandler-flux-sdk --example client_basic   # the self-hosted Flux-Lang agent loop
-cargo run -p codewandler-flux-sdk --example flow_compile   # NL → AST → execute
+cargo run -p codewandler-flux-sdk --example parameterized_flow # parse authored Flux → execute
 ```
 
 Two **domain** examples show the DSL on real tasks, with the model/datasource adapters mocked (registered
@@ -94,16 +95,30 @@ println!("{}", out.text);
 # Ok(()) }
 ```
 
-`Client` runs the same `FlowEngine` as the CLI. The model emits typed plans (or prose), and the
-editable `agent-loop.flux` controls gather, execute, revise, and completion passes; there is no
-separate provider-native tool loop.
+`Client` runs the same `FlowEngine` as the CLI. The default authored loop performs typed intent
+routing, native-schema exploration, batch approval/execution, local repair, and presentation. Select
+another loop explicitly with `ClientBuilder::agent_loop`; an ejected `agent-loop.flux` is not loaded
+merely because the file exists.
+
+Custom typed stages are ordinary guarded operations. `stage_fn::<I, O, _, _, _>` derives unrelated
+input and output schemas, so the Flux analyzer sees the real `O` type at call sites:
+
+```rust,ignore
+let client = Client::builder()
+    .register_op(flux_sdk::stage_fn(
+        "classify_ticket",
+        "Classify one support ticket",
+        |input: Ticket| async move { Ok::<Classified, String>(classify(input)) },
+    ))
+    .build(provider, ".")?;
+```
 
 ## Direct-flow lifecycle and lower-level crates
 
 `FlowClient` is the recommended AI-application API when the application owns a flow. It exposes
-natural-language `compile`, deterministic `parse`/`parse_module`, `analyze`/`analyze_seeded`,
-`optimize`, `execute`/`execute_with`, `execute_optimized`, and the `run`/`run_flow` convenience
-pipelines. Its builder carries permission, approval, sandbox, and compiler-budget controls; the
+deterministic `parse`/`parse_module`, `analyze`/`analyze_seeded`,
+`optimize`, `execute`/`execute_with`, `execute_optimized`, and the `run_flow` convenience pipeline.
+Its builder carries permission, approval, and sandbox controls; the
 client can register custom operations, packs, composite ops, artifact definitions, and sub-agents.
 
 Use the lower-level published libraries only when you need to replace a host boundary:

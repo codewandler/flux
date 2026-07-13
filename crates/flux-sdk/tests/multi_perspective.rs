@@ -11,11 +11,8 @@
 //! roles (top-level provider for `synth`, sub-agent factory provider for the three scouts),
 //! disambiguating on `req.system_text()`. It also mirrors two verified chunk-shape gotchas:
 //! `synth`'s `run_model` (`flux-cognition/src/lib.rs`) collects ONLY `Chunk::TextDelta`, while a
-//! sub-agent `task` result is read from the engine's `Chat(text)` path, which only sees
-//! `Chunk::Block(ContentBlock::Text)` when blocks are non-empty (`compile.rs`'s
-//! `stream_blocks`/`compile_turn_inner`: a non-empty `blocks` vec makes the accumulated `TextDelta`
-//! text a no-op, so emitting `Block(Text)` alone is exactly what strict_review.rs already does for
-//! its reviewer roles).
+//! sub-agent `task` result is read from the adaptive exploration stage's text path. Each scout first
+//! emits the required `declare_intent` signal and then returns one `Block(Text)` JSON answer.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -103,6 +100,7 @@ impl Provider for MultiPerspectiveMockProvider {
     }
 
     async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        let intent_stage = req.tools.iter().any(|tool| tool.name == "declare_intent");
         let system = req.system_text().unwrap_or_default();
         let user_text = req
             .messages
@@ -110,10 +108,27 @@ impl Provider for MultiPerspectiveMockProvider {
             .map(|m| m.text())
             .collect::<Vec<_>>()
             .join("\n");
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("SYSTEM:{system}\nUSER:{user_text}"));
+        self.log.lock().unwrap().push(format!(
+            "STAGE:{}\nSYSTEM:{system}\nUSER:{user_text}",
+            if intent_stage { "intent" } else { "explore" }
+        ));
+
+        if intent_stage {
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "answer the assigned scout question",
+                        "capability_families": [],
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
 
         if system.contains("synthesize") {
             // `synth`'s `run_model` collects ONLY `Chunk::TextDelta` (flux-cognition/src/lib.rs)
@@ -151,8 +166,7 @@ impl Provider for MultiPerspectiveMockProvider {
             scout_answer(summary, marker)
         };
 
-        // A sub-agent `task` result is read from the engine's `Chat(text)` path, which is built
-        // from `Chunk::Block` content (see module docs) — mirrors strict_review.rs's reviewer mock.
+        // A sub-agent `task` result is read from the adaptive stage's chat result.
         let chunks = vec![
             Chunk::Block(ContentBlock::Text { text }),
             Chunk::Done {
@@ -239,10 +253,13 @@ async fn multi_perspective_fans_out_merges_and_synthesizes_a_cited_answer() {
 
     let recorded = log.lock().unwrap().clone();
 
-    // Each scout role was spawned exactly once — its distinctive system-prompt phrase shows up in
-    // exactly one recorded request.
+    // Each scout role was spawned exactly once: one intent request and one answer request. Count
+    // only the answer stage so protocol staging is explicit without confusing requests with spawns.
     for phrase in ["TECHNICAL scout", "PRODUCT scout", "RISK scout"] {
-        let count = recorded.iter().filter(|r| r.contains(phrase)).count();
+        let count = recorded
+            .iter()
+            .filter(|r| r.starts_with("STAGE:explore") && r.contains(phrase))
+            .count();
         assert_eq!(
             count, 1,
             "expected `{phrase}` to appear in exactly one recorded request, got {count}: {recorded:?}"

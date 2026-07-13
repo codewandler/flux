@@ -57,9 +57,9 @@ impl Approver for SubAgentApprover {
         }
     }
 
-    /// The plan-level face of the same policy — a sub-agent's real work arrives as an `emit_plan`
-    /// graph approved as one unit, so the destructive deny must fire HERE, not only per-op (an
-    /// approved plan's ops skip the per-op gate). Denies on the plan's aggregate intents AND on the
+    /// The aggregate face of the same policy — an authored flow or host-built action batch may be
+    /// approved as one unit, so the destructive deny must fire HERE, not only per-op. Denies on the
+    /// batch's aggregate intents AND on the
     /// declared-destructive flag, which also covers spec-level `Risk::Destructive` ops (e.g.
     /// composites) whose concrete intents aren't statically visible. A destructive command assembled
     /// at runtime from `$symbols` is caught by the dispatcher's undisclosed-destructive re-fire,
@@ -271,8 +271,8 @@ impl Spawner for LocalSpawner {
 
         // Scoped toolset; sub-agents run autonomously under the policy-bounded headless approver
         // (auto-approve scoped, policy-permitted calls; refuse destructive ones — unless an approver
-        // is injected). `register_agent_ops` adds the reflexive ops (`plan`/`run_plan`/…) the flux-lang
-        // agent loop calls — sub-agents run the same audited loop as the top-level agent.
+        // is injected). `register_agent_ops` adds the typed stages the Flux-Lang agent loop calls —
+        // sub-agents run the same audited loop as the top-level agent.
         //
         // `effective_tools` is the role's own allowlist further intersected with the caller's active
         // capability scope (if any) — narrow-only, same rule as `Executor::push_cap_scope`. A role with
@@ -341,7 +341,7 @@ impl Spawner for LocalSpawner {
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
-        let mut spec = role.to_spec(&self.default_model);
+        let mut spec = role.to_spec(&self.default_model)?;
         spec.thinking = role.thinking.unwrap_or(self.default_thinking);
         spec.effort = role.effort.or(self.default_effort);
         // A-41: a role's `model:` override speaks the same provider-prefixed spec form `-m` accepts
@@ -874,9 +874,52 @@ impl Tool for TaskTool {
 mod tests {
     use super::*;
     use flux_core::{Chunk, ContentBlock, StopReason};
-    use flux_provider::{ChunkStream, Request, StaticProvider};
+    use flux_provider::{ChunkStream, Request};
     use flux_system::Workspace;
     use serde_json::json;
+
+    fn request_has_tool(request: &Request, name: &str) -> bool {
+        request.tools.iter().any(|tool| tool.name == name)
+    }
+
+    fn intent_chunks(intent: &str, families: &[&str]) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "intent".into(),
+                name: "declare_intent".into(),
+                input: json!({
+                    "intent": intent,
+                    "capability_families": families,
+                }),
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
+    fn native_call(id: &str, name: &str, input: Value) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
+    fn prose_chunks(text: &str) -> Vec<Chunk> {
+        vec![
+            Chunk::TextDelta(text.into()),
+            Chunk::Block(ContentBlock::Text { text: text.into() }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+        ]
+    }
 
     /// Mock provider: returns a fixed text reply (one canned turn).
     struct MockProvider;
@@ -885,16 +928,12 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            let chunks = vec![
-                Chunk::TextDelta("scouted: 3 files".into()),
-                Chunk::Block(ContentBlock::Text {
-                    text: "scouted: 3 files".into(),
-                }),
-                Chunk::Done {
-                    stop_reason: Some(StopReason::EndTurn),
-                },
-            ];
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("complete the assigned task", &[])
+            } else {
+                prose_chunks("scouted: 3 files")
+            };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -908,17 +947,14 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            let chunks = vec![
-                Chunk::TextDelta("did the subtask".into()),
-                Chunk::Block(ContentBlock::Text {
-                    text: "did the subtask".into(),
-                }),
-                Chunk::Usage(self.0.clone()),
-                Chunk::Done {
-                    stop_reason: Some(StopReason::EndTurn),
-                },
-            ];
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("complete the assigned task", &[])
+            } else {
+                let mut chunks = prose_chunks("did the subtask");
+                chunks.insert(chunks.len() - 1, Chunk::Usage(self.0.clone()));
+                chunks
+            };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -944,11 +980,8 @@ mod tests {
             "---\ndescription: recon\ntools: [read]\n---\nYou are a scout.",
             "scout",
         ));
-        // D-60 dogfood: `StaticProvider` is a drop-in for the hand-rolled fixed-text `MockProvider`
-        // below (same canned reply, same shape) — this call site swaps to it so it isn't the only
-        // place still rolling its own.
         let spawner = LocalSpawner::new(
-            Arc::new(|| Ok(Box::new(StaticProvider::new("scouted: 3 files")))),
+            Arc::new(|| Ok(Box::new(MockProvider))),
             Arc::new(roles),
             ToolRegistry::new(),
             temp_system(),
@@ -984,12 +1017,11 @@ mod tests {
         async fn stream(&self, req: Request) -> Result<ChunkStream> {
             *self.seen_model.lock().unwrap() = Some(req.model.clone());
             *self.seen_reasoning.lock().unwrap() = Some((req.thinking, req.effort));
-            let chunks = vec![
-                Chunk::Block(ContentBlock::Text { text: "ok".into() }),
-                Chunk::Done {
-                    stop_reason: Some(StopReason::EndTurn),
-                },
-            ];
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("complete the assigned task", &[])
+            } else {
+                prose_chunks("ok")
+            };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -1134,7 +1166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_sub_agent_runs_a_plan_with_loop_machinery() {
+    async fn restricted_sub_agent_runs_native_tool_with_loop_machinery() {
         use flux_runtime::{Tool, ToolContext};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1151,9 +1183,8 @@ mod tests {
             }
         }
 
-        // Plan (call 0) — a one-op plan, no `complete` — then prose (call 1). Running the plan drives
-        // the loop's `observe`, so this fails unless `register_agent_ops` re-added the evidence ops
-        // after the role's `tools: [ping]` subset dropped them.
+        // Intent, one native `ping` call, then prose. This fails unless `register_agent_ops`
+        // re-added the adaptive/evidence machinery after the role's subset dropped it.
         struct PlanMock {
             calls: AtomicUsize,
         }
@@ -1162,29 +1193,19 @@ mod tests {
             fn name(&self) -> &str {
                 "mock"
             }
-            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("ping the workspace", &["core"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
                 let n = self.calls.fetch_add(1, Ordering::Relaxed);
                 let chunks = if n == 0 {
-                    let ast = json!({ "body": [{ "kind": "call", "op": "ping", "args": [] }] });
-                    vec![
-                        Chunk::Block(ContentBlock::ToolUse {
-                            id: "p".into(),
-                            name: "emit_plan".into(),
-                            input: json!({ "ast": ast }),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
-                    ]
+                    native_call("ping-1", "ping", json!({}))
                 } else {
-                    vec![
-                        Chunk::Block(ContentBlock::Text {
-                            text: "done scouting".into(),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::EndTurn),
-                        },
-                    ]
+                    prose_chunks("done scouting")
                 };
                 Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
             }
@@ -1222,7 +1243,7 @@ mod tests {
         assert_eq!(out.text, "done scouting");
         assert!(
             system.read_file("PINGED.marker").await.is_ok(),
-            "the plan's op executed through the loop"
+            "the native op executed through the loop"
         );
     }
 
@@ -1484,11 +1505,11 @@ mod tests {
         );
     }
 
-    /// C-06 sub-agent rollup, end-to-end: a PARENT turn whose plan calls `task` to delegate to a
+    /// C-06 sub-agent rollup, end-to-end: a parent adaptive turn that calls `task` to delegate to a
     /// sub-agent must include the sub-agent's token spend in the parent turn's own `TurnEnded.usage`
     /// total — the failing-first acceptance test named by the story
-    /// (`parent_turn_includes_subagent_usage`). The parent's own planner call bills nothing here (a
-    /// bare `emit_plan`/prose mock carries no `Chunk::Usage`), isolating the assertion to: did the
+    /// (`parent_turn_includes_subagent_usage`). The parent's own model-stage calls bill nothing,
+    /// isolating the assertion to whether
     /// child's tokens actually reach the parent's total.
     #[tokio::test]
     async fn parent_turn_includes_subagent_usage() {
@@ -1514,8 +1535,8 @@ mod tests {
             1024,
         ));
 
-        // The parent's own planner: round 0 emits a plan calling `task`; round 1 answers in prose (no
-        // usage on either call — the point is to isolate the sub-agent's contribution).
+        // The parent declares delegation intent, captures and finalizes `task`, then answers from
+        // the execution report (no parent usage — the point is to isolate the child's contribution).
         struct ParentMock {
             calls: AtomicUsize,
         }
@@ -1524,32 +1545,25 @@ mod tests {
             fn name(&self) -> &str {
                 "mock"
             }
-            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("delegate the task", &["process"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
                 let n = self.calls.fetch_add(1, Ordering::Relaxed);
                 let chunks = if n == 0 {
-                    let ast = json!({ "body": [{
-                        "kind": "call", "op": "task",
-                        "args": [{ "kind": "lit", "value": { "role": "worker", "task": "do it" } }]
-                    }] });
-                    vec![
-                        Chunk::Block(ContentBlock::ToolUse {
-                            id: "p".into(),
-                            name: "emit_plan".into(),
-                            input: json!({ "ast": ast }),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
-                    ]
+                    native_call("task-1", "task", json!({"role": "worker", "task": "do it"}))
+                } else if n == 1 {
+                    native_call(
+                        "finalize-1",
+                        "finalize_plan",
+                        json!({"instructions": "Report the delegated task result."}),
+                    )
                 } else {
-                    vec![
-                        Chunk::Block(ContentBlock::Text {
-                            text: "delegated to the worker".into(),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::EndTurn),
-                        },
-                    ]
+                    prose_chunks("delegated to the worker")
                 };
                 Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
             }
@@ -1561,15 +1575,7 @@ mod tests {
         register_agent_ops(&mut registry);
         let executor = Executor::new(
             registry,
-            PermissionManager::from_rules(
-                &[
-                    "task".into(),
-                    "plan".into(),
-                    "run_plan".into(),
-                    "observe".into(),
-                ],
-                &[],
-            ),
+            PermissionManager::from_rules(&["task".into()], &[]),
             Arc::new(flux_runtime::AllowApprover),
             ToolContext::new(system.clone()).with_spawner(spawner),
         );
@@ -1639,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sub_agent_refuses_destructive_command() {
+    async fn sub_agent_refuses_destructive_native_action_batch() {
         use flux_policy::{Caller, CallerKind, Principal, Trust, TrustKind, TrustLevel};
         use flux_runtime::{Tool, ToolContext};
         use flux_spec::{
@@ -1673,7 +1679,7 @@ mod tests {
             }
         }
 
-        // Mock provider: turn 1 calls `danger`, turn 2 finishes with text.
+        // The native call is captured into a host-built batch and finalized for aggregate approval.
         struct DestructiveMock {
             calls: AtomicUsize,
         }
@@ -1682,29 +1688,25 @@ mod tests {
             fn name(&self) -> &str {
                 "mock"
             }
-            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("run a destructive command", &["process"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
                 let n = self.calls.fetch_add(1, Ordering::Relaxed);
                 let chunks = if n == 0 {
-                    vec![
-                        Chunk::Block(ContentBlock::ToolUse {
-                            id: "b".into(),
-                            name: "danger".into(),
-                            input: json!({}),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
-                    ]
+                    native_call("danger-1", "danger", json!({}))
+                } else if n == 1 {
+                    native_call(
+                        "finalize-1",
+                        "finalize_plan",
+                        json!({"instructions": "Report whether the command ran."}),
+                    )
                 } else {
-                    vec![
-                        Chunk::TextDelta("done".into()),
-                        Chunk::Block(ContentBlock::Text {
-                            text: "done".into(),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::EndTurn),
-                        },
-                    ]
+                    prose_chunks("done")
                 };
                 Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
             }
@@ -1751,139 +1753,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out.text, "done");
+        assert!(
+            out.text.contains("not approved"),
+            "unexpected result: {}",
+            out.text
+        );
         // The destructive tool was refused → its marker was never written.
         assert!(system.read_file("EXECUTED.marker").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn sub_agent_denies_destructive_plan_from_emit_plan() {
-        use flux_policy::{Caller, CallerKind, Principal, Trust, TrustKind, TrustLevel};
-        use flux_runtime::{Tool, ToolContext};
-        use flux_spec::{
-            Effect, Intent, IntentBehavior, IntentCertainty, IntentRole, IntentSet, IntentTarget,
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // The REAL sub-agent path: the child's only tool is `emit_plan`, its work runs as a plan
-        // approved as one unit — so the destructive backstop must fire at PLAN approval (an approved
-        // plan's inner ops skip the per-op gate). Before C-12, request_plan forwarded an empty
-        // IntentSet and this destructive plan executed; the direct-ToolUse sibling test above never
-        // exercises this path (the pure-DAG planner nudges bare tool calls away).
-        struct FakeDestructive;
-        #[async_trait]
-        impl Tool for FakeDestructive {
-            fn spec(&self) -> ToolSpec {
-                ToolSpec::read_only("danger", "d", json!({"type": "object"}))
-                    .with_effects(vec![Effect::Process])
-            }
-            fn intents(&self, _p: &Value) -> IntentSet {
-                let mut s = IntentSet::new();
-                s.push(Intent {
-                    behavior: IntentBehavior::CommandExecution,
-                    target: IntentTarget::Process {
-                        command: "rm -rf x".into(),
-                    },
-                    role: IntentRole::ProcessCommand,
-                    certainty: IntentCertainty::Certain,
-                });
-                s
-            }
-            async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
-                ctx.system.write_file("EXECUTED.marker", "1").await?;
-                Ok(ToolResult::ok("ran"))
-            }
-        }
-
-        // Mock provider: turn 1 emits a PLAN that calls `danger`; turn 2 answers in prose.
-        struct DestructivePlanMock {
-            calls: AtomicUsize,
-        }
-        #[async_trait]
-        impl Provider for DestructivePlanMock {
-            fn name(&self) -> &str {
-                "mock"
-            }
-            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
-                let n = self.calls.fetch_add(1, Ordering::Relaxed);
-                let chunks = if n == 0 {
-                    vec![
-                        Chunk::Block(ContentBlock::ToolUse {
-                            id: "p".into(),
-                            name: "emit_plan".into(),
-                            input: json!({
-                                "ast": { "body": [{
-                                    "kind": "bind", "name": "out",
-                                    "value": { "kind": "call", "op": "danger", "args": [] }
-                                }]}
-                            }),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
-                    ]
-                } else {
-                    vec![
-                        Chunk::TextDelta("done".into()),
-                        Chunk::Block(ContentBlock::Text {
-                            text: "done".into(),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::EndTurn),
-                        },
-                    ]
-                };
-                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
-            }
-        }
-
-        let system = temp_system();
-        let mut base = ToolRegistry::new();
-        base.register(Arc::new(FakeDestructive));
-        let mut roles = RoleRegistry::default();
-        roles.insert(parse_role("---\n---\nworker", "worker"));
-
-        let caller = Caller {
-            principal: Principal {
-                id: "t".into(),
-                name: "t".into(),
-                kind: CallerKind::User,
-            },
-            groups: Vec::new(),
-            source: "test".into(),
-        };
-        let trust = Trust {
-            kind: TrustKind::Invocation,
-            level: TrustLevel::Privileged,
-            scopes: Vec::new(),
-        };
-        let spawner = LocalSpawner::new(
-            Arc::new(|| {
-                Ok(Box::new(DestructivePlanMock {
-                    calls: AtomicUsize::new(0),
-                }))
-            }),
-            Arc::new(roles),
-            base,
-            system.clone(),
-            "mock",
-            1024,
-        )
-        .with_authorization(flux_policy::default_local_grants(), caller, trust);
-
-        let out = spawner
-            .spawn(
-                SpawnRequest::new("worker", "delete things"),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.text, "done");
-        // The destructive PLAN was denied at plan approval → the op never executed.
-        assert!(
-            system.read_file("EXECUTED.marker").await.is_err(),
-            "an emit_plan-carried destructive op must not execute under SubAgentApprover"
-        );
     }
 
     #[test]
@@ -2203,7 +2079,7 @@ mod tests {
         }
     }
 
-    /// A provider that plans a single `ping` call (turn 0) then finishes with prose (turn 1).
+    /// A provider that selects and calls `ping`, then finishes with prose.
     struct PingPlanMock {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -2212,30 +2088,21 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            if request_has_tool(&request, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("ping the workspace", &["core"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
             let n = self
                 .calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let chunks = if n == 0 {
-                vec![
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "p".into(),
-                        name: "emit_plan".into(),
-                        input: json!({ "ast": { "body": [{ "kind": "call", "op": "ping", "args": [] }] } }),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
+                native_call("ping-1", "ping", json!({}))
             } else {
-                vec![
-                    Chunk::Block(ContentBlock::Text {
-                        text: "done".into(),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::EndTurn),
-                    },
-                ]
+                prose_chunks("done")
             };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
@@ -2320,30 +2187,21 @@ mod tests {
             fn name(&self) -> &str {
                 "mock"
             }
-            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("probe workspace confinement", &["core"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
                 let n = self
                     .calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let chunks = if n == 0 {
-                    vec![
-                        Chunk::Block(ContentBlock::ToolUse {
-                            id: "p".into(),
-                            name: "emit_plan".into(),
-                            input: json!({ "ast": { "body": [{ "kind": "call", "op": "escape_probe", "args": [] }] } }),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
-                    ]
+                    native_call("probe-1", "escape_probe", json!({}))
                 } else {
-                    vec![
-                        Chunk::Block(ContentBlock::Text {
-                            text: "done".into(),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::EndTurn),
-                        },
-                    ]
+                    prose_chunks("done")
                 };
                 Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
             }
@@ -2536,6 +2394,7 @@ mod tests {
             model: None,
             thinking: None,
             effort: None,
+            agent_loop: None,
             tools: Some(Vec::new()),
             prompt: "You are a scout.".into(),
         }]);
@@ -2578,8 +2437,8 @@ mod tests {
             }
         }
 
-        /// Role-discriminating mock: a "DELEGATE" role plans `task("inner", …)`; a leaf "inner" role
-        /// plans `ping`. Per-instance call counter (a fresh provider is built per sub-agent).
+        /// Role-discriminating adaptive mock: a "DELEGATE" role proposes `task("inner", …)`; a
+        /// leaf "inner" role gathers with `ping`. Each sub-agent gets a fresh provider instance.
         struct DepthMock {
             calls: std::sync::atomic::AtomicUsize,
         }
@@ -2589,37 +2448,40 @@ mod tests {
                 "mock"
             }
             async fn stream(&self, req: Request) -> Result<ChunkStream> {
+                let is_delegator = req.system_text().unwrap_or_default().contains("DELEGATE");
+                if request_has_tool(&req, "declare_intent") {
+                    let families = if is_delegator {
+                        vec!["process"]
+                    } else {
+                        vec!["core"]
+                    };
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("complete the assigned role", &families)
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
                 let n = self
                     .calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let is_delegator = req.system_text().unwrap_or_default().contains("DELEGATE");
                 let chunks = if n == 0 {
-                    let ast = if is_delegator {
-                        json!({ "body": [{ "kind": "call", "op": "task", "args": [
-                            { "kind": "lit", "value": { "role": "inner", "task": "do the thing" } }
-                        ] }] })
+                    if is_delegator {
+                        native_call(
+                            "task-1",
+                            "task",
+                            json!({"role": "inner", "task": "do the thing"}),
+                        )
                     } else {
-                        json!({ "body": [{ "kind": "call", "op": "ping", "args": [] }] })
-                    };
-                    vec![
-                        Chunk::Block(ContentBlock::ToolUse {
-                            id: "p".into(),
-                            name: "emit_plan".into(),
-                            input: json!({ "ast": ast }),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
-                    ]
+                        native_call("ping-1", "ping", json!({}))
+                    }
+                } else if n == 1 && is_delegator {
+                    native_call(
+                        "finalize-1",
+                        "finalize_plan",
+                        json!({"instructions": "Report the nested task result."}),
+                    )
                 } else {
-                    vec![
-                        Chunk::Block(ContentBlock::Text {
-                            text: "done".into(),
-                        }),
-                        Chunk::Done {
-                            stop_reason: Some(StopReason::EndTurn),
-                        },
-                    ]
+                    prose_chunks("done")
                 };
                 Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
             }

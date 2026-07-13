@@ -77,14 +77,13 @@ const CURSOR: &str = "▍";
 /// `FLUX_VERBOSE`), whose promise is tool output in full, no truncation.
 const MAX_DETAIL: usize = 30;
 
-/// The footer's planning-spinner label (A-15, mirrors the CLI's `phase_spinner_label`):
-/// phase-derived so it reads "orienting…"/"gathering…" for the collect passes and "planning…" for
-/// the execute pass's first round. "revising…" only once the execute phase has already produced a
-/// round THIS turn — a plain counter over the `loop.phase` observations already reaching the
-/// sink, not a new flux-flow signal. A phase-less turn (no `loop.phase` observed) falls back to
-/// today's "composing plan…".
+/// The footer's model-stage spinner label (mirrors the CLI's `phase_spinner_label`). Current turns
+/// use `intent`/`explore`; the older `orient`/`gather`/`execute` labels remain readable when a
+/// historical session is projected. A phase-less turn falls back to a neutral label.
 fn loop_phase_label(phase: Option<&str>, execute_rounds: usize) -> &'static str {
     match phase {
+        Some("intent") => "routing intent…",
+        Some("explore") => "exploring…",
         Some("orient") => "orienting…",
         Some("gather") => "gathering…",
         Some("execute") => {
@@ -94,7 +93,7 @@ fn loop_phase_label(phase: Option<&str>, execute_rounds: usize) -> &'static str 
                 "planning…"
             }
         }
-        _ => "composing plan…",
+        _ => "working…",
     }
 }
 
@@ -145,14 +144,6 @@ const COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "quit",
         desc: "exit flux",
-    },
-    SlashCmd {
-        name: "plan",
-        desc: "toggle reviewed plan mode",
-    },
-    SlashCmd {
-        name: "run",
-        desc: "execute the pending plan",
     },
     SlashCmd {
         name: "compact",
@@ -206,7 +197,7 @@ fn slash_matches(query: &str) -> Vec<&'static SlashCmd> {
 const HELP_TEXT: &str = "keys: ↵ send/queue · Ctrl-J or Alt-↵ newline · ↑/↓ history\n\
     PgUp/PgDn or wheel scroll · Ctrl-End latest · Ctrl-E details\n\
     Ctrl-C interrupt/clear/quit · Ctrl-D quit · Esc close panel\n\
-commands: /plan /run /model /shell /tools /evidence /session /sessions /resume\n\
+commands: /model /shell /tools /evidence /session /sessions /resume\n\
     /new /clear /compact /queue /quit";
 
 /// One item in the transcript. Each renders to one or more styled [`Line`]s at a given width.
@@ -216,14 +207,16 @@ enum Entry {
     User(String),
     /// An assistant reply — plain while streaming, Markdown once done (cached per width).
     Assistant(Assistant),
-    /// Live extended-thinking tokens streamed during the planning phase, rendered as Markdown
+    /// Live extended-thinking tokens streamed during a model-backed stage, rendered as Markdown
     /// once sealed (same `Assistant` widget, distinct entry so it doesn't merge with the reply).
     Thinking(Assistant),
     /// A dispatched tool/op call + (once it returns) its result — rendered as one card.
     Tool(ToolEntry),
     /// An observation/notice (skill activation, destructive flag, error).
     Notice { text: String, sev: Sev },
-    /// The planner's compiled DAG (the `flow.plan` observation payload) — a full execution plan.
+    /// The accepted adaptive intent, reconstructed from the durable `turn.intent` observation.
+    Intent(IntentEntry),
+    /// A durable authored or host-built DAG (`flow.plan` observation payload).
     Plan(serde_json::Value),
     /// The orient/gather grounding artifact (design Part 1's `brief: {goal, needs[]}`, A-15):
     /// rendered the moment it's accepted, immediately and compactly.
@@ -231,6 +224,13 @@ enum Entry {
     /// A bounded, read-only gather round's compiled plan (the `flow.plan` observation payload,
     /// A-15) — rendered as a compact one-liner rather than the full tree + risk badge `Plan` gets.
     GatherPlan(serde_json::Value),
+}
+
+#[derive(Debug)]
+struct IntentEntry {
+    intent: String,
+    families: Vec<String>,
+    operations: Vec<String>,
 }
 
 /// A tool/op call paired with its result, rendered as a card: a `→ verb arg … [badge]` header, a
@@ -476,9 +476,6 @@ pub struct ChatState {
     /// Whether the NEXT `Plan` entry is a bounded, read-only gather round rather than the full
     /// execution plan (mirrors the CLI's `CliSink::gather_mode` — same derivation, same caveats).
     gather_mode: bool,
-    /// Manual plan mode: prompts compile a plan and `/run` executes the latest one.
-    plan_mode: bool,
-    pending_plan: Option<flux_flow::ast::DraftAst>,
     /// Activity received while detached from the bottom of the transcript.
     unread: usize,
     next_action_id: u64,
@@ -542,8 +539,6 @@ impl ChatState {
             plan_phase: None,
             execute_rounds: 0,
             gather_mode: false,
-            plan_mode: false,
-            pending_plan: None,
             unread: 0,
             next_action_id: 1,
             active_action_id: None,
@@ -563,7 +558,7 @@ impl ChatState {
                 self.gather_mode = false;
             }
             "gather" => self.gather_mode = true,
-            "orient" => self.gather_mode = false,
+            "orient" | "intent" | "explore" => self.gather_mode = false,
             _ => {}
         }
         self.plan_phase = Some(phase.to_string());
@@ -984,6 +979,37 @@ impl ChatState {
                         out.push(Line::styled(raw.to_string(), style));
                     }
                 }
+                Entry::Intent(intent) => {
+                    let intent_cap = usize::from(width).saturating_sub(12).clamp(24, 160);
+                    out.push(Line::from(vec![
+                        Span::styled("◆ ", t.accent_style()),
+                        Span::styled("intent: ", t.accent_style().add_modifier(Modifier::BOLD)),
+                        Span::raw(truncate(&intent.intent, intent_cap)),
+                    ]));
+                    let capabilities = if intent.families.is_empty() {
+                        "none".to_string()
+                    } else {
+                        intent.families.join(", ")
+                    };
+                    let plural = if intent.operations.len() == 1 {
+                        "operation"
+                    } else {
+                        "operations"
+                    };
+                    out.push(Line::styled(
+                        format!(
+                            "  capabilities: {capabilities} · {} {plural}",
+                            intent.operations.len()
+                        ),
+                        t.muted_style(),
+                    ));
+                    if self.verbose && !intent.operations.is_empty() {
+                        out.push(Line::styled(
+                            format!("  operations: {}", intent.operations.join(", ")),
+                            t.muted_style(),
+                        ));
+                    }
+                }
                 Entry::Plan(data) => out.extend(plan::render(data, t)),
                 Entry::Brief { goal, needs } => {
                     out.push(Line::from(vec![
@@ -1164,9 +1190,8 @@ impl ChatState {
             Span::styled("flux", t.accent_style().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(
-                    "  {}{} · {}",
+                    "  {} · {}",
                     self.session_id,
-                    if self.plan_mode { " · PLAN" } else { "" },
                     self.model_spec.as_deref().unwrap_or(&self.model)
                 ),
                 t.muted_style(),
@@ -1210,14 +1235,6 @@ impl ChatState {
             Phase::Idle if self.unread > 0 => vec![Span::styled(
                 format!(" ↓ {} new · Ctrl-End latest", self.unread),
                 t.accent_style(),
-            )],
-            Phase::Idle if self.plan_mode => vec![Span::styled(
-                if self.pending_plan.is_some() {
-                    " PLAN · /run execute · send to refine"
-                } else {
-                    " PLAN · describe a task"
-                },
-                t.muted_style(),
             )],
             Phase::Idle => vec![Span::styled(
                 " Enter send · Ctrl-J newline · / commands",
@@ -1446,7 +1463,6 @@ impl ChatState {
         self.active_action_id = None;
         self.steps = 0;
         self.last_elapsed = None;
-        self.pending_plan = None;
         self.session_picker = None;
         self.session_sel = 0;
         self.plan_phase = None;
@@ -1500,6 +1516,9 @@ impl ChatState {
 
 fn historical_observation_entry(observation: &flux_evidence::Observation) -> Option<Entry> {
     match observation.kind.as_str() {
+        flux_evidence::KIND_TURN_INTENT => {
+            staged_intent_entry(&observation.data).map(Entry::Intent)
+        }
         flux_evidence::KIND_DESTRUCTIVE => Some(Entry::Notice {
             text: "⚠ destructive operation flagged".into(),
             sev: Sev::Warn,
@@ -1534,6 +1553,28 @@ fn historical_observation_entry(observation: &flux_evidence::Observation) -> Opt
         }),
         _ => None,
     }
+}
+
+fn staged_intent_entry(data: &serde_json::Value) -> Option<IntentEntry> {
+    let raw_intent = data.get("intent").and_then(|v| v.as_str())?;
+    let sanitized: String = raw_intent
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let intent = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let strings = |key: &str| {
+        data.get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    Some(IntentEntry {
+        intent,
+        families: strings("families"),
+        operations: strings("operations"),
+    })
 }
 
 /// Compose a one-row bar: `left` spans, padding, then `right` spans flush to `width`.
@@ -1966,9 +2007,9 @@ enum UiEvent {
         event: Box<UiEvent>,
     },
     Text(String),
-    /// A live thinking-token delta streamed during the planning phase.
+    /// A live thinking-token delta streamed during a model-backed stage.
     Thinking(String),
-    /// The planner is composing (`true`) / done (`false`) — drives the status line.
+    /// A model-backed stage is active (`true`) / done (`false`) — drives the status line.
     Planning(bool),
     /// The compiled plan (`flow.plan` observation `data`) — a full execution plan or a bounded
     /// gather round; the event loop tells them apart from `ChatState::gather_mode` (A-15).
@@ -1980,6 +2021,8 @@ enum UiEvent {
         goal: String,
         needs: Vec<String>,
     },
+    /// The accepted staged intent (`turn.intent`), retained in the transcript and replayable.
+    Intent(IntentEntry),
     ToolCall {
         name: String,
         input: serde_json::Value,
@@ -2004,7 +2047,6 @@ enum UiEvent {
         subjects: Vec<String>,
         reply: oneshot::Sender<ApprovalChoice>,
     },
-    PlanReady(Option<flux_flow::ast::DraftAst>),
     Finished,
 }
 
@@ -2088,6 +2130,10 @@ impl AgentSink for ChannelSink {
         } else if o.kind == "loop.phase" {
             if let Some(phase) = o.data.get("phase").and_then(|v| v.as_str()) {
                 self.send(UiEvent::Phase(phase.to_string()));
+            }
+        } else if o.kind == flux_evidence::KIND_TURN_INTENT {
+            if let Some(intent) = staged_intent_entry(&o.data) {
+                self.send(UiEvent::Intent(intent));
             }
         } else if o.kind == "flow.brief" {
             let goal = o
@@ -2383,6 +2429,7 @@ async fn event_loop(
                     }
                 }
                 UiEvent::Phase(phase) => state.record_loop_phase(&phase),
+                UiEvent::Intent(intent) => state.push(Entry::Intent(intent)),
                 UiEvent::Brief { goal, needs } => {
                     // A brief only ever accompanies a `gather: true` plan (mirrors the CLI):
                     // its arrival marks gather mode even when the phase alone (`orient`) is
@@ -2409,15 +2456,6 @@ async fn event_loop(
                 } => {
                     approval_queue.push_back((tool, subjects, reply));
                     show_next_approval(state, &mut pending_reply, &mut approval_queue);
-                }
-                UiEvent::PlanReady(plan) => {
-                    if let Some(plan) = plan {
-                        state.pending_plan = Some(plan);
-                        state.push(Entry::Notice {
-                            text: "plan ready · /run to execute · keep chatting to refine".into(),
-                            sev: Sev::Info,
-                        });
-                    }
                 }
                 UiEvent::Finished => {
                     if let Some((_tool, reply)) = pending_reply.take() {
@@ -2806,42 +2844,6 @@ async fn handle_command(
                 state.queue_sel = state.queue_sel.min(state.queue.len() - 1);
             }
         }
-        "plan" => {
-            state.plan_mode = !state.plan_mode;
-            state.pending_plan = None;
-            state.push(Entry::Notice {
-                text: format!(
-                    "plan mode {} · {}",
-                    if state.plan_mode { "on" } else { "off" },
-                    if state.plan_mode {
-                        "prompts compile only; /run executes the latest plan"
-                    } else {
-                        "prompts execute normally"
-                    }
-                ),
-                sev: Sev::Info,
-            });
-        }
-        "run" => {
-            if !state.plan_mode {
-                state.push(Entry::Notice {
-                    text: "plan mode is off · use /plan first".into(),
-                    sev: Sev::Warn,
-                });
-            } else if !state.queue.is_empty() {
-                state.push(Entry::Notice {
-                    text: "finish queued plan refinements before /run".into(),
-                    sev: Sev::Warn,
-                });
-            } else if let Some(plan) = state.pending_plan.take() {
-                *cancel = start_reviewed_plan(agent, tx, state, plan);
-            } else {
-                state.push(Entry::Notice {
-                    text: "no pending plan · describe a task first".into(),
-                    sev: Sev::Info,
-                });
-            }
-        }
         "shell" => {
             let was_on = flux_runtime::shell_opt_in();
             flux_runtime::set_shell_opt_in(!was_on);
@@ -3053,55 +3055,6 @@ fn command_is_read_only(name: &str, args: &str) -> bool {
         || (name == "sessions" && args != "--prune")
 }
 
-fn start_reviewed_plan(
-    agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
-    tx: &mpsc::UnboundedSender<UiEvent>,
-    state: &mut ChatState,
-    plan: flux_flow::ast::DraftAst,
-) -> CancellationToken {
-    let action_id = state.begin_action();
-    state.phase = Phase::Thinking;
-    state.turn_start = Some(Instant::now());
-    state.steps = 0;
-    state.follow = true;
-    state.unread = 0;
-    let cancel = CancellationToken::new();
-    let task_cancel = cancel.clone();
-    let task_agent = agent.clone();
-    let task_tx = tx.clone();
-    let session = state.session_id.clone();
-    tokio::spawn(async move {
-        let inner_tx = task_tx.clone();
-        let run = tokio::spawn(async move {
-            let mut sink = ChannelSink {
-                tx: inner_tx,
-                action_id,
-            };
-            let engine = task_agent.read().await;
-            engine
-                .run_reviewed_plan_cancellable(&session, &plan, &mut sink, &task_cancel)
-                .await
-        });
-        let error = match run.await {
-            Ok(Ok(_)) => None,
-            Ok(Err(error)) => Some(format!("run plan: {error}")),
-            Err(join) => Some(format!("reviewed plan crashed: {join}")),
-        };
-        if let Some(text) = error {
-            send_action_event(
-                &task_tx,
-                action_id,
-                UiEvent::Notice {
-                    text,
-                    sev: Sev::Err,
-                },
-            );
-        }
-        send_action_event(&task_tx, action_id, UiEvent::Finished);
-    });
-    cancel
-}
-
 fn start_compaction(
     agent: &Arc<tokio::sync::RwLock<FlowEngine>>,
     tx: &mpsc::UnboundedSender<UiEvent>,
@@ -3169,7 +3122,6 @@ fn start_turn(
     let cancel = CancellationToken::new();
     let task_agent = agent.clone();
     let task_sid = state.session_id.clone();
-    let plan_mode = state.plan_mode;
     let task_tx = tx.clone();
     let task_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -3183,17 +3135,9 @@ fn start_turn(
                 action_id,
             };
             let agent = task_agent.read().await;
-            if plan_mode {
-                let plan = agent
-                    .plan_turn(&task_sid, &input, &mut sink, &task_cancel)
-                    .await?;
-                sink.send(UiEvent::PlanReady(plan));
-                Ok(())
-            } else {
-                agent
-                    .run_turn_cancellable(&task_sid, &input, &mut sink, &task_cancel)
-                    .await
-            }
+            agent
+                .run_turn_cancellable(&task_sid, &input, &mut sink, &task_cancel)
+                .await
         });
         let note = match run.await {
             Ok(Ok(())) => None,
@@ -4214,9 +4158,7 @@ mod tests {
     }
 
     /// A-15 parity: the footer's spinner label is phase-derived, mirroring the CLI's
-    /// `CliSink`/`phase_spinner_label` — "orienting…"/"gathering…" for the collect passes,
-    /// "planning…" for the execute phase's first round, "revising…" once it has already produced
-    /// a round this turn, and today's "composing plan…" before any `loop.phase` is observed.
+    /// `CliSink`/`phase_spinner_label`, including historical phase labels and the neutral fallback.
     #[test]
     fn loop_phase_observation_drives_the_phase_labeled_spinner() {
         let mut state = ChatState::new("opus".into());
@@ -4226,8 +4168,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(
-            screen(&terminal).contains("composing plan…"),
-            "no loop.phase observed yet -> byte-compatible fallback"
+            screen(&terminal).contains("working…"),
+            "no loop.phase observed yet -> neutral fallback"
         );
 
         state.record_loop_phase("orient");
@@ -4241,6 +4183,16 @@ mod tests {
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(screen(&terminal).contains("gathering…"));
         assert!(state.gather_mode, "a gather-phase round renders compact");
+
+        state.record_loop_phase("intent");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("routing intent…"));
+
+        state.record_loop_phase("explore");
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("exploring…"));
 
         state.record_loop_phase("execute");
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
@@ -4260,9 +4212,8 @@ mod tests {
         );
     }
 
-    /// A-15 parity: the `ChannelSink` (the TUI's `AgentSink` wiring) forwards `loop.phase` and
-    /// `flow.brief` observations as their own `UiEvent`s, same as `flow.plan`/skill/destructive
-    /// already are.
+    /// A-15/A-72 parity: the `ChannelSink` forwards phase, brief, and accepted staged-intent
+    /// observations as their own `UiEvent`s, same as `flow.plan`/skill/destructive already are.
     #[test]
     fn channel_sink_forwards_phase_and_brief_observations() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4290,6 +4241,67 @@ mod tests {
             }
             _ => panic!("expected UiEvent::Brief"),
         }
+
+        sink.observation(&flux_evidence::Observation::new(
+            flux_evidence::KIND_TURN_INTENT,
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "intent": "answer from evidence",
+                "families": ["workspace.read"],
+                "operations": ["glob", "read"]
+            }),
+        ));
+        match untag(rx.try_recv().expect("an Intent event was sent")) {
+            UiEvent::Intent(intent) => {
+                assert_eq!(intent.intent, "answer from evidence");
+                assert_eq!(intent.families, vec!["workspace.read"]);
+                assert_eq!(intent.operations, vec!["glob", "read"]);
+            }
+            _ => panic!("expected UiEvent::Intent"),
+        }
+    }
+
+    #[test]
+    fn staged_intent_renders_concisely_live_and_from_history() {
+        let observation = flux_evidence::Observation::new(
+            flux_evidence::KIND_TURN_INTENT,
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "intent": "  answer   from\nworkspace evidence ",
+                "families": ["workspace.read"],
+                "operations": ["glob", "read"]
+            }),
+        );
+        let entry = historical_observation_entry(&observation)
+            .expect("the durable staged intent is replayable");
+        assert!(matches!(entry, Entry::Intent(_)));
+
+        let mut state = ChatState::new("mock".into());
+        state.push(entry);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let normal = screen(&terminal);
+        assert!(normal.contains("◆ intent: answer from workspace evidence"));
+        assert!(normal.contains("capabilities: workspace.read · 2 operations"));
+        assert!(!normal.contains("operations: glob, read"));
+
+        let mut verbose = ChatState::new("mock".into()).with_verbose(true);
+        verbose.push(Entry::Intent(
+            staged_intent_entry(&observation.data).expect("valid staged intent"),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| render(f, &verbose)).unwrap();
+        assert!(screen(&terminal).contains("operations: glob, read"));
+
+        let signal_only = flux_evidence::Observation::new(
+            flux_evidence::KIND_TURN_INTENT,
+            flux_evidence::Phase::Turn,
+            serde_json::json!({"signal": "slack"}),
+        );
+        assert!(
+            historical_observation_entry(&signal_only).is_none(),
+            "keyword-derived surfacing signals are not staged intent summaries"
+        );
     }
 
     /// A-17: the `ChannelSink` forwards a `flow.halt` observation as a `Notice`/`Sev::Err` — the

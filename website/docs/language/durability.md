@@ -52,7 +52,7 @@ unless peek $survey
   $survey = read("big.log")
 ```
 
-For caching across turns, prefer `memo`; `peek` is the in-plan conditional check.
+For caching across turns, prefer `memo`; `peek` is the in-flow conditional check.
 
 ## `await` — suspend until an event
 
@@ -87,12 +87,11 @@ $slot = ai_segment({goal: "Find a free 30-minute slot the caller accepts",
                     tools: ["calendar.read"], max_rounds: 3, until: "slot"})
 ```
 
-`ai_segment(goal, tools, max_rounds, until?)` hands the model a goal for at most `max_rounds`
-planning rounds, confined to `tools` (an out-of-scope op is refused and never runs), exiting early
-on a prose answer or when the `until` symbol becomes bound to a non-empty value — then control
-returns to the flow. It is a reflexive op like `plan`/`run_plan`: never advertised to the model,
-callable only from a pre-authored flow, and everything it dispatches crosses the same approval
-envelope.
+`ai_segment(goal, tools, max_rounds, until?)` starts a bounded native-schema stage, confined to
+`tools` (an out-of-scope operation is refused and never runs). Gather-safe calls supply evidence;
+effects use the same action-batch approval path as a normal turn. A prose result or typed decision
+returns control to the authored flow. `ai_segment` itself is host machinery, never advertised to a
+model, and everything it dispatches crosses the same approval envelope.
 
 ## `checkpoint` — durable resume point
 
@@ -170,7 +169,7 @@ saga
 | You want | Use |
 |---|---|
 | Cache an expensive value across turns | `memo` |
-| Skip recomputation within a plan | `peek` + `unless` |
+| Skip recomputation within a flow | `peek` + `unless` |
 | Wait for external input mid-flow | `await` |
 | Resume a long flow without repeating work | `checkpoint` |
 | Guarantee an effect fires at most once | `once` |

@@ -1,10 +1,10 @@
 //! `flux-lang` — the pure Flux-Lang language core.
 //!
-//! Flux-Lang is the planning language: the LLM emits a typed execution **graph** (an AST) and a
-//! deterministic runtime runs it. This crate is the *language* half of that idea, deliberately
-//! separated from the engine that compiles and executes it:
+//! Flux-Lang is an authored workflow language: applications place deterministic control flow around
+//! typed model stages and registered operations, and a deterministic runtime runs the AST. This crate
+//! is the language half, deliberately separated from the engine that executes it:
 //!
-//! - [`ast`] — the Draft AST the model emits, the typed HIR, the physical plan, the value model, the
+//! - [`ast`] — the Draft AST, typed HIR, physical plan, value model, the
 //!   semantic [`ast::FlowEffect`]s, and the run-event trace.
 //! - [`render`] — the AST pretty-printer (human-auditable projections).
 //! - [`format`] / [`parse`] — the canonical compact **text syntax** (the round-trippable `.flux`
@@ -18,14 +18,14 @@
 //!   key-sniffing module loader; pure-data decls the L6 `flux-app` host runs.
 //! - [`effects`] — lowering of semantic effects onto host [`flux_spec::Effect`] + policy actions.
 //! - [`schema`] — the single source of truth: a derived JSON Schema and the node-kind catalog that
-//!   drives the planner prompt and the generated skill/docs.
+//!   drives generated skill/docs and language tooling.
 //! - [`context_slice`] — automatic context slicing (KF4/L-56): derive the minimum model-visible
-//!   context for a planner repair round or a model-op call from HIR reads, field access paths, op
+//!   context for a model-op call or diagnostic UI from HIR reads, field access paths, op
 //!   schemas, and diagnostics, gated by visibility/secret/policy and a token budget.
 //!
 //! It is an **L0 leaf**: it depends only on other pure contracts (`flux-core`, `flux-spec`,
 //! `flux-policy`) and has no IO, no provider, no runtime, and no dependency on concrete tools. The
-//! engine crate `flux-flow` builds on top of it (compile → analyze → execute) and re-exports it.
+//! engine crate `flux-flow` builds on top of it (analyze → execute) and re-exports it.
 
 pub mod analyze;
 pub mod ast;

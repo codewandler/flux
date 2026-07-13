@@ -1,9 +1,6 @@
-//! Gate-level guard for the offline `mock` provider (F1): `flux run --yes -m mock` must actually
-//! execute its canned plan and write `flux-mock.txt`. The loop-unit tests drive the agent loop with
-//! a *scripted* provider, so they cannot catch a stale `MockCliProvider` AST that plan validation
-//! rejects — and a rejected plan is silently repaired into a prose "Finished." with a **zero exit**,
-//! which is exactly how this regressed unnoticed. This runs the real binary end-to-end under an
-//! isolated HOME + CWD, so the observable "did it write the file" contract is enforced by the gate.
+//! Gate-level guard for the offline `mock` provider: `flux run --yes -m mock` must route intent,
+//! propose an action through the native schema, approve/execute its host-built batch, and write
+//! `flux-mock.txt`. This runs the real binary end-to-end under an isolated HOME + CWD.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -67,6 +64,38 @@ fn mock_run_writes_flux_mock_file() {
         "unexpected flux-mock.txt content: {content:?}"
     );
     // `tmp` cleans itself up on drop (including on an earlier panic).
+}
+
+#[test]
+fn default_mock_run_surfaces_intent_in_plain_output() {
+    let tmp = TempDir::new("staged-intent-smoke");
+    let work = tmp.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["run", "--yes", "-m", "mock", "say hello"])
+        .current_dir(work)
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn adaptive flux");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "adaptive mock run exited non-zero\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("routing intent…"), "{stderr}");
+    assert!(stderr.contains("exploring…"), "{stderr}");
+    assert!(
+        stderr.contains("◆ intent: complete the offline mock turn"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("capabilities: workspace.write"), "{stderr}");
+    assert!(stderr.contains("operations"), "{stderr}");
 }
 
 #[cfg(unix)]

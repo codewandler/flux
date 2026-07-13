@@ -19,7 +19,7 @@ use flux_core::{Error, Result};
 pub use flux_evidence::ToolGroup;
 use flux_lang::ast::FlowEffect;
 use flux_runtime::{Tool, ToolContext, ToolResult};
-use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
+use flux_spec::{Effect, Idempotency, Risk, StagingDisposition, ToolSpec};
 use flux_system::net::PrivateNetAllow;
 
 /// JavaScript pre-tool hooks (QuickJS via `rquickjs`) — the other half of L4 extensibility, folded in
@@ -129,6 +129,11 @@ pub struct OperationSpec {
     /// Declared idempotency; `None` → `Idempotency::NonIdempotent`.
     #[serde(default)]
     pub idempotency: Option<Idempotency>,
+    /// Whether the adaptive loop should gather this operation during exploration or capture it in
+    /// the later action batch. `gather` remains subject to the ordinary risk/effect/intent checks;
+    /// it can never grant execution authority.
+    #[serde(default)]
+    pub staging: StagingDisposition,
     /// Secret purposes (auth-method names) this op needs the host to resolve (e.g. `"api_token"`).
     #[serde(default)]
     pub secret_purposes: Vec<String>,
@@ -2595,6 +2600,7 @@ pub struct PluginTool {
     /// The manifest-declared semantic-effect tags (D-138), carried alongside `spec` since a
     /// [`ToolSpec`] has no room for them — see [`Tool::semantic_effects`].
     semantic_effects: Vec<String>,
+    staging: StagingDisposition,
 }
 
 impl PluginTool {
@@ -2613,6 +2619,7 @@ impl PluginTool {
             operation,
             spec,
             semantic_effects,
+            staging: op.staging,
         }
     }
 }
@@ -2674,6 +2681,10 @@ impl Tool for PluginTool {
 
     fn semantic_effects(&self) -> Vec<String> {
         self.semantic_effects.clone()
+    }
+
+    fn staging_disposition(&self) -> StagingDisposition {
+        self.staging
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {

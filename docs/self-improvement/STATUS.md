@@ -62,6 +62,34 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   retrieval and took 26.6s, so broader latency remains open. This remains targeted harness hardening
   outside the paused autonomous loop.
 
+- **2026-07-13 fast-model/schema probe:** the exact emitted request corrected an important working
+  assumption: the planner receives the real schema only for `emit_plan`; a call inside its AST is
+  still generic `op: string` + `args: Node[]`. Operation-specific schemas stay in the registry for
+  validation and are summarized only as catalog prose (`read(...)`, `ai.reason(...)`) until an error
+  renders the live signature. On the same adversarial support fixture, OpenRouter Gemini 3.5 Flash
+  was correct in 2/3 merged-schema trials (7.1–22.8s) and fabricated every central fact once after a
+  failed plan; its strict-schema control still took 20.6s and invented the plan name. OpenRouter
+  DeepSeek V4 Flash Nitro was correct in 3/3 but took 25.6/30.7/53.3s and 4–10 model calls: it emitted
+  malformed AST once and attempted four direct `read` calls that Flux safely rejected. Codex low's
+  matched post-fix runs remained 3/3 at 13.2–14.4s with two calls. The next structural experiment is
+  phase/intent-narrowed **real operation schemas** (or deterministic lowering of native tool calls
+  into Flux plans), not more global prompt prose; keep merged-vs-strict/text as measured controls.
+
+- **2026-07-13 adaptive-loop cutover (A-73, outside the paused autonomous loop):** the A-71/A-72
+  experiment is now the default authored Flux-Lang outer loop rather than a hybrid compiler mode.
+  Models detect intent and explore with exact native operation schemas; the host freezes effects into
+  an `ActionBatch`, obtains a batch-bound one-shot approval receipt, and executes through the guarded
+  runtime. Typed decisions use the existing durable `await`, CLI/TUI show routing and exploration,
+  and callers can explicitly select a different authored loop or register independently typed model
+  and SDK stages. The NL-to-Flux compiler, planning commands, corpus/export surfaces, and implicit
+  `.flux/agent-loop.flux` override are removed. The installed-binary gate passed 12/12: Codex gpt-5.5
+  (`s_1150`–`s_1152`) used 4/4 provider calls, Gemini 3.5 Flash (`s_1153`–`s_1155`) 4/4, DeepSeek V4
+  Flash Nitro (`s_1156`–`s_1158`) 4–5/7, and GPT-5-mini (`s_1159`–`s_1161`) 4/6. Every answer cited
+  all required real paths, fabricated no path, and made zero legacy planner calls. Deterministic root
+  inventory guidance closed the only initial path-discovery miss without relaxing the gate. The
+  reproducible test is `scripts/eval-adaptive-support.sh`; `task install`, workspace
+  build/test/clippy/fmt/codegate, generated-doc sync, SDK/CLI/A2A, and hermetic voice tests are green.
+
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →
   candidate eval → `score_compare` → keep+tag **or** revert → `improve_log`.

@@ -32,7 +32,7 @@ use crate::TurnOutput;
 /// [`Client::open_session`](crate::Client::open_session), or
 /// [`Client::latest_session`](crate::Client::latest_session). Clones share the same session.
 ///
-/// One engine runs one turn at a time (the planner loop is stateful per turn), so concurrent
+/// One engine runs one turn at a time (the authored outer loop is stateful per turn), so concurrent
 /// `send`s — on one session or across sessions of the same client — serialize on the client's
 /// internal turn guard rather than interleaving.
 #[derive(Clone)]
@@ -68,8 +68,8 @@ impl Session {
     ///
     /// Durable: with persistent [`Storage::dir`](crate::Storage::dir) the suspension survives a
     /// process restart — reopen the session with
-    /// [`Client::open_session`](crate::Client::open_session) and `send` the answer. No planner runs
-    /// for the deterministic skeleton, but every op in the flow still dispatches through the one
+    /// [`Client::open_session`](crate::Client::open_session) and `send` the answer. No adaptive
+    /// model stage runs for the deterministic skeleton, but every op in the flow still dispatches through the one
     /// authorization → approval → guarded-IO envelope.
     pub async fn start_flow(&self, flow: &DraftAst) -> Result<TurnOutput> {
         let _turn = self.turn_guard.lock().await;
@@ -193,7 +193,7 @@ impl Session {
 
     /// Run a **flow-driven** full-duplex voice session (D-132): an authored `flow` owns the whole
     /// call. The flow speaks first — it runs to its first top-level `await` and the realtime model
-    /// speaks the authored prompt (STT/TTS only, no planner) — each caller utterance resumes the
+    /// speaks the authored prompt (STT/TTS only, no adaptive model stage) — each caller utterance resumes the
     /// suspension to the next prompt, and the flow completing hangs up (via
     /// [`VoiceSink::session_ended`]). This is the voice counterpart of
     /// [`start_flow`](Self::start_flow), and it rides the session's own persistent engine, so the
@@ -265,7 +265,7 @@ impl Session {
                 ..Default::default()
             },
         )?;
-        // Copy the conversation so the fork's planner (mode B) sees the same history.
+        // Copy the conversation so the fork's adaptive tail sees the same history.
         for m in self.engine.events.conversation(&self.id)? {
             self.engine.events.record_message(&fork_id, &m)?;
         }

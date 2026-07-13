@@ -1,6 +1,6 @@
-//! The agentic front door: [`flux_sdk::Client`] wraps the flux-flow engine (the model plans, the
-//! runtime runs the flux-lang agent loop), the safety envelope, and a session. Here a hermetic mock
-//! provider answers in prose (no plan) so the example runs with no API key.
+//! The agentic front door: [`flux_sdk::Client`] wraps the adaptive Flux-Lang outer loop, the safety
+//! envelope, and a session. Here a hermetic mock provider answers the typed stages so the example
+//! runs with no API key.
 //!
 //! Run with: `cargo run -p codewandler-flux-sdk --example client_basic`
 

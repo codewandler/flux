@@ -1,11 +1,10 @@
 //! Custom tools + approval policy (D-143), and the "one import" surface (D-146): a consumer builds
 //! a function-tool and an approval policy using only `flux_sdk::` paths — no direct `flux-runtime`
-//! or `flux-spec` dependency. Here the mock plans a call to the custom `greet` op, which dispatches
-//! through the same safety envelope as every built-in.
+//! or `flux-spec` dependency. Here the mock declares intent, calls the custom `greet` op with its
+//! native schema, then presents the result. The call dispatches through the same safety envelope as
+//! every built-in; the model never generates Flux code.
 //!
 //! Run with: `cargo run -p codewandler-flux-sdk --example custom_tool`
-
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use flux_core::{Chunk, ContentBlock, Result, StopReason};
@@ -14,30 +13,44 @@ use flux_sdk::approval::{ApprovalChoice, Approver, IntentSet};
 use flux_sdk::tools::{tool_fn, ToolSpec};
 use flux_sdk::Client;
 
-/// Plans a single `greet` call on the first turn, then answers in prose.
-struct PlanGreetMock {
-    calls: AtomicUsize,
-}
+/// Declares intent, calls `greet`, then answers in prose.
+struct GreetMock;
 
 #[async_trait]
-impl Provider for PlanGreetMock {
+impl Provider for GreetMock {
     fn name(&self) -> &str {
         "mock"
     }
-    async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-        let n = self.calls.fetch_add(1, Ordering::Relaxed);
-        let chunks = if n == 0 {
-            let ast = serde_json::json!({
-                "body": [{
-                    "kind": "call", "op": "greet",
-                    "args": [ { "kind": "lit", "value": { "name": "flux" } } ]
-                }]
-            });
+    async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        let intent_stage = req.tools.iter().any(|tool| tool.name == "declare_intent");
+        let has_result = req.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "greet"
+                )
+            })
+        });
+        let chunks = if intent_stage {
             vec![
                 Chunk::Block(ContentBlock::ToolUse {
-                    id: "p1".into(),
-                    name: "emit_plan".into(),
-                    input: serde_json::json!({ "ast": ast }),
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: serde_json::json!({
+                        "intent": "greet the requested person",
+                        "capability_families": ["core"],
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ]
+        } else if !has_result {
+            vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "greet".into(),
+                    name: "greet".into(),
+                    input: serde_json::json!({ "name": "flux" }),
                 }),
                 Chunk::Done {
                     stop_reason: Some(StopReason::ToolUse),
@@ -100,12 +113,7 @@ async fn main() -> Result<()> {
         .model("mock")
         .register_op(greet)
         .approver(std::sync::Arc::new(AllowGreetOnly))
-        .build(
-            Box::new(PlanGreetMock {
-                calls: AtomicUsize::new(0),
-            }),
-            ".",
-        )?;
+        .build(Box::new(GreetMock), ".")?;
 
     let out = client.run("greet flux for me").await?;
     println!("tools invoked: {:?}", out.tool_calls);

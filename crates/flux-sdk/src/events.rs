@@ -28,10 +28,8 @@ pub enum AgentEvent {
     /// `AgentSink::thinking_delta` — a chunk of the model's thinking stream, when the provider
     /// surfaces one.
     ThinkingDelta(String),
-    /// `AgentSink::planning` — the planner started (`true`) / finished (`false`) composing a plan.
+    /// `AgentSink::planning` — a model-backed stage started (`true`) / finished (`false`).
     Planning(bool),
-    /// `AgentSink::plan_delta` — a progressive plan-skeleton headline while the plan streams.
-    PlanDelta(String),
     /// `AgentSink::tool_call` — an op is about to dispatch with this input.
     ToolCall {
         /// The op name.
@@ -188,10 +186,6 @@ impl AgentSink for ChannelSink {
         self.collect.planning(active);
         let _ = self.tx.send(AgentEvent::Planning(active));
     }
-    fn plan_delta(&mut self, headline: &str) {
-        self.collect.plan_delta(headline);
-        let _ = self.tx.send(AgentEvent::PlanDelta(headline.to_string()));
-    }
     fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
         self.collect.tool_call(name, input);
         let _ = self.tx.send(AgentEvent::ToolCall {
@@ -236,10 +230,6 @@ impl AgentSink for TeeSink<'_> {
     fn planning(&mut self, active: bool) {
         self.collect.planning(active);
         self.consumer.planning(active);
-    }
-    fn plan_delta(&mut self, headline: &str) {
-        self.collect.plan_delta(headline);
-        self.consumer.plan_delta(headline);
     }
     fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
         self.collect.tool_call(name, input);

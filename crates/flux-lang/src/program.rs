@@ -50,12 +50,23 @@ pub struct AgentDecl {
     /// A human-readable role description (seeds the agent's system framing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Explicit outer-loop declaration name. Absent selects the host's adaptive preset.
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub agent_loop: Option<String>,
     /// Optional capability narrowing for this agent and the journeys it owns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<PermissionDecl>,
     /// An opaque settings bag — the L0 layer carries it verbatim; the engine interprets it.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub settings: serde_json::Value,
+}
+
+/// A named agent outer loop implemented by an ordinary Flux-Lang flow body.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AgentLoopDecl {
+    pub name: String,
+    #[serde(default)]
+    pub flow: DraftAst,
 }
 
 /// A channel: a named I/O surface the app listens and/or sends on (CLI, HTTP, Slack, …). The `kind`
@@ -196,6 +207,9 @@ pub struct Program {
     pub permissions: Option<PermissionDecl>,
     #[serde(default)]
     pub agents: Vec<AgentDecl>,
+    /// Explicit outer-loop programs referenced by [`AgentDecl::agent_loop`].
+    #[serde(default)]
+    pub agent_loops: Vec<AgentLoopDecl>,
     #[serde(default)]
     pub channels: Vec<ChannelDecl>,
     #[serde(default)]
@@ -324,6 +338,25 @@ journey handle
         assert_eq!(p.channels[0].kind, "cli");
         assert_eq!(p.triggers[0].on, "user_input");
         assert!(p.flow_named("handle").is_some(), "journey resolves by name");
+    }
+
+    #[test]
+    fn agent_may_reference_an_authored_outer_loop() {
+        let src = r#"
+agent_loop support
+  $intent = detect_intent()
+  return $intent.intent
+
+agent guide
+  model "mock"
+  loop "support"
+"#;
+        let Module::Program(program) = Module::parse_str(src).unwrap() else {
+            panic!("agent declarations make this a program")
+        };
+        assert_eq!(program.agent_loops.len(), 1);
+        assert_eq!(program.agent_loops[0].name, "support");
+        assert_eq!(program.agents[0].agent_loop.as_deref(), Some("support"));
     }
 
     #[test]

@@ -1086,7 +1086,16 @@ async fn run_top_level(
             i += 1;
             continue;
         }
-        if let Node::Await { source, .. } = &body[i] {
+        if let Node::Await {
+            source, condition, ..
+        } = &body[i]
+        {
+            if let Some(condition) = condition {
+                if !eval_await_condition(store, session_id, condition)? {
+                    i += 1;
+                    continue;
+                }
+            }
             let node = crate::ast::NodeId(i as u32);
             store.append_event(
                 session_id,
@@ -1318,7 +1327,16 @@ async fn run_top_level_resumable(
             i += 1;
             continue;
         }
-        if let Node::Await { source, .. } = &body[i] {
+        if let Node::Await {
+            source, condition, ..
+        } = &body[i]
+        {
+            if let Some(condition) = condition {
+                if !eval_await_condition(store, session_id, condition)? {
+                    i += 1;
+                    continue;
+                }
+            }
             let node = NodeId(i as u32);
             store.append_event(
                 session_id,
@@ -1330,12 +1348,9 @@ async fn run_top_level_resumable(
             // L-24: fold the reified await into the SAME halt-latch machinery a top-level failure
             // uses — `PlanHalted{kind: Awaiting}` opens the latch (see `ResumeLedger::fold`) over
             // exactly the prefix already ledgered above (`StatementCompleted` per completed
-            // statement), so the plan the model re-emits once the awaited input is available
-            // (design Part 2's cross-turn `[resume context]`) fast-forwards past that prefix instead
-            // of re-running it. `Awaiting` is never fatal and never matched by the denial
-            // re-emission guard (`run_plan_dispatch`'s step 3), so this never blocks a re-emission —
-            // and the ledger walk's `Node::Await` free-pass-through means a byte-identical `await`
-            // at this position in the new plan costs nothing to skip over.
+            // statement), so resuming the authored flow fast-forwards past that prefix instead of
+            // re-running it. `Awaiting` is never fatal or a denied-statement latch, and the ledger
+            // walk's `Node::Await` free-pass-through means the same `await` costs nothing to skip.
             let stmt = stmt_hash16(&body[i]);
             let halt = PlanHalt {
                 node,
@@ -3162,6 +3177,22 @@ async fn eval_cond(
     }
 }
 
+/// Conditional suspension is deliberately pure: unlike a `when`, reaching an `await` may persist
+/// and resume across a process boundary, so deciding whether to park must not dispatch an effect.
+fn eval_await_condition(store: &dyn ValueStore, session_id: &str, node: &Node) -> Result<bool> {
+    match node {
+        Node::Lit { .. } | Node::Var { .. } => Ok(json_truthy(&eval_arg(node, store, session_id)?)),
+        Node::Expr { formula, vars } => {
+            let resolved = resolve_expr_vars(vars, store, session_id)?;
+            Ok(eval_expr_value(formula, &resolved)?.truthy())
+        }
+        other => Err(FlowError::Runtime(format!(
+            "unsupported conditional await predicate `{}` (only lit, var, and expr are pure)",
+            node_kind(other)
+        ))),
+    }
+}
+
 /// JSON truthiness for conditions: null/false/0/empty are falsey; a string is truthy unless it is
 /// empty, `"false"`, or `"0"` (so a tool's textual `"false"` output reads as false).
 fn json_truthy(v: &serde_json::Value) -> bool {
@@ -3320,7 +3351,7 @@ fn eval_pure_node(
         } => {
             // Op results are stored as JSON *strings* (the canonical `content`), so a string input
             // that is really JSON is parsed first — this is what lets a flow pull
-            // `.kind`/`.transcript` out of a `plan`/`run_plan` result.
+            // structured fields out of a native operation or model-stage result.
             let jv = jq_parse_input(eval_arg(input, store, session_id)?);
             let result = eval_jq_path(path, &jv, *optional)?;
             // A scalar number/bool field extract keeps its JSON type (`$n = $obj.n` binds the
@@ -3806,7 +3837,7 @@ fn jq_parse_input(value: serde_json::Value) -> serde_json::Value {
 ///   empty. A dotted numeric segment (`.0`) indexes a list.
 ///
 /// In BOTH modes a PRESENT key whose value is `null` returns `null` (never an error — the
-/// present-but-optional idiom, e.g. `run_plan`'s `failure`), and a genuinely MALFORMED path
+/// present-but-optional idiom, e.g. an execution report's `failure`), and a genuinely MALFORMED path
 /// (unmatched `[`, a non-numeric bracket index) is a syntax error that always errors loudly.
 fn eval_jq_path(
     path: &str,
@@ -3831,7 +3862,7 @@ fn eval_jq_path(
         if !key.is_empty() {
             cur = match &cur {
                 // A PRESENT key returns its value (even `null` — that is the load-bearing
-                // present-but-optional idiom, e.g. `run_plan`'s `failure`, and is never an error).
+                // present-but-optional idiom, e.g. an execution report's `failure`, and is never an error).
                 // An ABSENT key is missing data: `null` when `optional`, else a loud error (L-53) so
                 // a typo'd field name fails fast instead of silently reading empty.
                 J::Object(map) => match map.get(key) {
@@ -3969,7 +4000,7 @@ fn value_text(v: &Value) -> String {
 /// already treats `Value::Null` as falsy, but a `jq`-extracted field is textified through here
 /// before it is ever tested — without this arm, `null` round-tripped to the literal text `"null"`,
 /// which `json_truthy`'s string rule reads as TRUTHY (only `""`/`"false"`/`"0"` are falsy text), so
-/// `$x = $obj.field` (a present-but-null field, e.g. `run_plan`'s optional `failure`) silently
+/// `$x = $obj.field` (a present-but-null field, e.g. an optional `failure`) silently
 /// became an always-true condition. See `jq_of_a_present_null_field_reads_falsy`.
 fn lit_text(v: &serde_json::Value) -> String {
     match v {
@@ -4427,6 +4458,7 @@ mod tests {
             required_params: required.iter().map(|s| s.to_string()).collect(),
             optional_params: optional.iter().map(|s| s.to_string()).collect(),
             param_types: Default::default(),
+            output: TypeRef::Any,
             semantic_effects: Vec::new(),
         }
     }
@@ -4874,6 +4906,7 @@ mod tests {
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 })
             }
@@ -4995,6 +5028,7 @@ mod tests {
                     required_params: vec!["x".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 })
             }
@@ -5143,6 +5177,7 @@ mod tests {
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 })
             }
@@ -5240,6 +5275,7 @@ mod tests {
                     required_params: vec!["path".into()],
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 })
             }
@@ -5353,6 +5389,7 @@ mod tests {
                     required_params: req.iter().map(|s| s.to_string()).collect(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 })
             };
@@ -7067,6 +7104,7 @@ mod tests {
             binding: binding.map(|b| SymbolName(b.into())),
             source: source.into(),
             as_type,
+            condition: None,
         }
     }
 
@@ -7131,6 +7169,50 @@ mod tests {
             Some(Value::String("hi".into())),
             "awaited value bound"
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_await_skips_when_false_and_suspends_when_true() {
+        let flow = |needed: bool| DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: "needed".into(),
+                    value: Box::new(Node::Lit {
+                        value: serde_json::json!(needed),
+                    }),
+                    ty: Some(TypeRef::Bool),
+                    effect: None,
+                },
+                Node::Await {
+                    binding: Some("reply".into()),
+                    source: "user_input".into(),
+                    as_type: None,
+                    condition: Some(Box::new(Node::Var {
+                        name: "needed".into(),
+                    })),
+                },
+                echo("after"),
+            ],
+            ..Default::default()
+        };
+
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let mut sink = BufferSink::default();
+        let skipped = execute_flow(&store, &host, "skip", &flow(false), &mut sink)
+            .await
+            .unwrap();
+        assert!(skipped.suspension.is_none());
+        assert_eq!(host.marks(), vec!["after"]);
+
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let mut sink = BufferSink::default();
+        let suspended = execute_flow(&store, &host, "wait", &flow(true), &mut sink)
+            .await
+            .unwrap();
+        assert!(suspended.suspension.is_some());
+        assert!(host.marks().is_empty());
     }
 
     #[tokio::test]
@@ -7587,7 +7669,7 @@ mod tests {
         );
     }
 
-    /// A-17: a field that is PRESENT but JSON `null` (e.g. `run_plan`'s optional `failure`, host-
+    /// A field that is PRESENT but JSON `null` (e.g. an execution report's optional `failure`, host-
     /// normalized to `null` on a round that didn't halt) must read FALSY once bound through `jq` and
     /// tested by `when`/`unless` — before `lit_text`'s null-to-`""` fix, `null` round-tripped to the
     /// literal text `"null"`, which `json_truthy`'s string rule reads as truthy (only `""`/`"false"`/
@@ -8721,6 +8803,7 @@ mod tests {
                 required_params: Vec::new(),
                 optional_params: Vec::new(),
                 param_types: Default::default(),
+                output: TypeRef::Any,
                 semantic_effects: Vec::new(),
             })
         }

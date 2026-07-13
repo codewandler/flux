@@ -1,9 +1,5 @@
-//! The root/reflexive op-pack: `plan` (ask the model for a plan), `run_plan` (execute an emitted plan
-//! in the current session), and `op.register` (install a Flux-Lang composite op for later reuse). These
-//! are **thin delegators** over capabilities installed on the [`ToolContext`] per turn (by flux-flow's
-//! `EngineLoopHost`); they hold no engine state themselves, so this pack depends on nothing beyond
-//! `flux-runtime`. The reflexivity that lets the agent loop be written *in flux-lang* lives entirely
-//! behind those traits — these ops only marshal JSON across them, then dispatch like any other op.
+//! Typed adaptive-stage operations and `op.register`. These are thin delegators over capabilities
+//! installed on the [`ToolContext`] by flux-flow; they hold no engine state themselves.
 
 use std::sync::Arc;
 
@@ -20,22 +16,242 @@ use flux_spec::{
     IntentSet, IntentTarget, Risk, ToolSpec,
 };
 
-/// Register root/reflexive ops. Kept **out** of [`register_builtins`](crate::register_builtins) on
-/// purpose: these ops are only meaningful when a model-in-the-loop host is installed. `plan` and
-/// `run_plan` are tagged to the hidden `reflect` group; `op.register` is model-facing.
+/// Register authored outer-loop ops. Kept **out** of [`register_builtins`](crate::register_builtins) on
+/// purpose: these ops are only meaningful when a model-in-the-loop host is installed. Adaptive
+/// machinery is tagged to the hidden `reflect` group; `op.register` is model-facing.
 pub fn register_reflect(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(PlanOp));
-    registry.register(Arc::new(RunPlanOp));
+    registry.register(Arc::new(DetectIntentOp));
+    registry.register(Arc::new(ExploreOp));
+    registry.register(Arc::new(ApproveBatchOp));
+    registry.register(Arc::new(ExecuteBatchOp));
+    registry.register(Arc::new(PresentResultsOp));
     registry.register(Arc::new(AiSegmentOp));
     registry.register(Arc::new(RegisterCompositeOp));
 }
 
-/// The installed reflexive capability, or a clear error if this context has none (the ops are
+/// Register one config-defined model stage as an ordinary typed operation. The operation itself is
+/// a thin delegator; the engine host owns the provider call and gather-only tool ceiling.
+pub fn register_model_stage(
+    registry: &mut ToolRegistry,
+    name: impl Into<String>,
+    description: impl Into<String>,
+    input_schema: Value,
+    output_schema: Value,
+) {
+    registry.register(Arc::new(ModelStageOp {
+        spec: ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            output_schema: Some(output_schema),
+            effects: vec![Effect::Network],
+            risk: Risk::Low,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Provider],
+            group: None,
+        },
+    }));
+}
+
+struct ModelStageOp {
+    spec: ToolSpec,
+}
+
+#[async_trait]
+impl Tool for ModelStageOp {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn staging_disposition(&self) -> flux_spec::StagingDisposition {
+        flux_spec::StagingDisposition::Capture
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let out = loop_host(ctx)?.model_stage(&self.spec.name, params).await?;
+        Ok(ToolResult::ok(out.to_string()))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExploreInput {
+    state: Value,
+    #[serde(default)]
+    decision: Option<Value>,
+    #[serde(default)]
+    report: Option<Value>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ApproveBatchInput {
+    batch: Value,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExecuteBatchInput {
+    batch: Value,
+    receipt: Value,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PresentResultsInput {
+    #[serde(default)]
+    step: Option<Value>,
+    #[serde(default)]
+    approval: Option<Value>,
+}
+
+fn adaptive_spec(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    output: &str,
+    effects: Vec<Effect>,
+    access: Vec<AccessKind>,
+) -> ToolSpec {
+    ToolSpec {
+        name: name.into(),
+        description: description.into(),
+        input_schema,
+        output_schema: Some(serde_json::json!({"$ref": format!("#/$defs/{output}")})),
+        effects,
+        risk: Risk::Low,
+        idempotency: Idempotency::NonIdempotent,
+        access,
+        group: Some(flux_runtime::REFLECT_GROUP.into()),
+    }
+}
+
+struct DetectIntentOp;
+
+#[async_trait]
+impl Tool for DetectIntentOp {
+    fn spec(&self) -> ToolSpec {
+        adaptive_spec(
+            "detect_intent",
+            "Detect the current turn's intent and resolve capability signals into a durable IntentSet artifact. Signals narrow visibility only; they grant no authority.",
+            flux_spec::empty_schema(),
+            "IntentSet",
+            vec![Effect::Network],
+            vec![AccessKind::Provider],
+        )
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        if !params.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Err(Error::Other(
+                "detect_intent: expected an empty argument object".into(),
+            ));
+        }
+        let out = loop_host(ctx)?.detect_intent().await?;
+        Ok(ToolResult::ok(out.to_string()))
+    }
+}
+
+struct ExploreOp;
+
+#[async_trait]
+impl Tool for ExploreOp {
+    fn spec(&self) -> ToolSpec {
+        adaptive_spec(
+            "explore",
+            "Continue evidence gathering and native-schema action proposal from a durable exploration state. May return chat, decision, or ActionBatch.",
+            flux_spec::tool_input_schema::<ExploreInput>(),
+            "ExploreResult",
+            vec![Effect::Network],
+            vec![AccessKind::Provider],
+        )
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let _input: ExploreInput = crate::parse_params(params.clone(), "explore")?;
+        let out = loop_host(ctx)?.explore(params).await?;
+        Ok(ToolResult::ok(out.to_string()))
+    }
+}
+
+struct ApproveBatchOp;
+
+#[async_trait]
+impl Tool for ApproveBatchOp {
+    fn spec(&self) -> ToolSpec {
+        adaptive_spec(
+            "approve_batch",
+            "Request aggregate approval for one immutable ActionBatch and return a one-shot receipt bound to its session, caller, and policy context.",
+            flux_spec::tool_input_schema::<ApproveBatchInput>(),
+            "ApprovalReceipt",
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let _input: ApproveBatchInput = crate::parse_params(params.clone(), "approve_batch")?;
+        let out = loop_host(ctx)?.approve_batch(params).await?;
+        Ok(ToolResult::ok(out.to_string()))
+    }
+}
+
+struct ExecuteBatchOp;
+
+#[async_trait]
+impl Tool for ExecuteBatchOp {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = adaptive_spec(
+            "execute_batch",
+            "Consume a matching one-shot approval receipt and dispatch every ActionBatch operation through authorization, approval, and guarded IO.",
+            flux_spec::tool_input_schema::<ExecuteBatchInput>(),
+            "ExecutionReport",
+            Vec::new(),
+            Vec::new(),
+        );
+        spec.risk = Risk::Medium;
+        spec
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let _input: ExecuteBatchInput = crate::parse_params(params.clone(), "execute_batch")?;
+        let out = loop_host(ctx)?.execute_batch(params).await?;
+        Ok(ToolResult::ok(out.to_string()))
+    }
+}
+
+struct PresentResultsOp;
+
+#[async_trait]
+impl Tool for PresentResultsOp {
+    fn spec(&self) -> ToolSpec {
+        adaptive_spec(
+            "present_results",
+            "Render a terminal adaptive stage artifact into channel-neutral answer text.",
+            flux_spec::tool_input_schema::<PresentResultsInput>(),
+            "String",
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let _input: PresentResultsInput = crate::parse_params(params.clone(), "present_results")?;
+        let out = loop_host(ctx)?.present_results(params).await?;
+        Ok(ToolResult::ok(out.as_str().unwrap_or_default().to_string()))
+    }
+}
+
+/// The installed outer-loop capability, or a clear error if this context has none (the ops are
 /// registered but no model-in-the-loop host is wired — e.g. an ordinary dispatch outside a loop run).
 fn loop_host(ctx: &ToolContext) -> Result<&dyn LoopHost> {
     ctx.loop_host.as_deref().ok_or_else(|| {
         Error::Other(
-            "`plan`/`run_plan` need a model-in-the-loop host, but none is installed in this context"
+            "adaptive stages need a model-in-the-loop host, but none is installed in this context"
                 .into(),
         )
     })
@@ -78,29 +294,6 @@ fn register_subject(params: &Value) -> Option<String> {
     }
 }
 
-/// Arguments for the `plan` op.
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PlanInput {
-    /// working feedback / conversation seed for the planner
-    #[serde(default)]
-    feedback: Option<String>,
-    /// which pass of the phased turn loop is calling (A-14): "orient", "gather", or "execute";
-    /// absent/unrecognized behaves as "execute" (byte-compatible with pre-A-14 callers)
-    #[serde(default)]
-    phase: Option<String>,
-}
-
-/// Arguments for the `run_plan` op.
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct RunPlanInput {
-    /// the Plan emitted by `plan` (its `ast` is executed)
-    plan: serde_json::Value,
-}
-
 /// Arguments for the `ai_segment` op (D-131).
 #[allow(dead_code)]
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -112,10 +305,6 @@ struct AiSegmentInput {
     tools: Vec<String>,
     /// the required cap on delegated model rounds (the segment is always bounded)
     max_rounds: u32,
-    /// optional early-exit: the name of a symbol; the segment returns as soon as it is bound to a
-    /// non-empty value (e.g. `"slots"` to exit once `$slots` is complete)
-    #[serde(default)]
-    until: Option<String>,
 }
 
 /// Where a registered composite op is reusable.
@@ -145,106 +334,9 @@ struct RegisterCompositeInput {
     expose: Option<bool>,
 }
 
-/// `plan(feedback?, phase?) -> Plan` — re-enter the planner (the model) to produce a plan from the
-/// working feedback/conversation. Returns a `Plan` object `{kind: "plan"|"chat"|"error", text?, ast?,
-/// complete?, settled}` as JSON text. The model stays the planner; this op only wraps the audited
-/// compile step. `phase` selects the multi-pass loop's per-phase instruction segment (A-14); absent
-/// behaves as `"execute"`, so pre-A-14 callers (an ejected/overridden loop) are byte-compatible.
-struct PlanOp;
-
-#[async_trait]
-impl Tool for PlanOp {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "plan".into(),
-            description: "Ask the model to emit a plan from the working feedback/conversation. Returns \
-                          a Plan object {kind: \"plan\"|\"chat\"|\"error\", text?, ast?, complete?, \
-                          settled}. `phase` (\"orient\"|\"gather\"|\"execute\", default \"execute\") \
-                          selects the multi-pass loop's current pass. The model stays the planner — \
-                          this re-enters only the compile step, through the same audited envelope as \
-                          any op."
-                .into(),
-            input_schema: flux_spec::tool_input_schema::<PlanInput>(),
-            output_schema: None,
-            // A model call travels over the network and needs the provider; lowered like a cognition op.
-            effects: vec![Effect::Network],
-            risk: Risk::Low,
-            idempotency: Idempotency::NonIdempotent,
-            access: vec![AccessKind::Provider],
-            // The `reflect` group never surfaces from workspace signals, so these ops stay OUT of the
-            // model-facing catalog in ordinary turns — yet a pre-authored flow can still call them
-            // (`OpRegistry::get` resolves any registered op; gating only filters advertising).
-            group: Some(flux_runtime::REFLECT_GROUP.into()),
-        }
-    }
-
-    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        // Validate the argument shape against the typed schema, then forward the raw object to the
-        // host (which seeds the planner from the `feedback` field directly).
-        let _args: PlanInput = crate::parse_params(params.clone(), "plan")?;
-        let plan = loop_host(ctx)?.plan(params).await?;
-        Ok(ToolResult::ok(
-            serde_json::to_string(&plan).unwrap_or_default(),
-        ))
-    }
-}
-
-/// `run_plan(plan) -> Outcome` — execute an emitted plan in the CURRENT session and return its Outcome
-/// `{transcript, result, steps, suspension?, failure}` as JSON text. `failure` is always present —
-/// `null` on a clean run, or a reified mid-plan halt object a caller can route on (design
-/// `docs/designs/multipass-agent-loop.md` Part 2, A-16/A-17). The plan is re-validated and every
-/// inner op runs through the same approval+IO envelope; bounded by a host reentry-depth cap.
-struct RunPlanOp;
-
-#[async_trait]
-impl Tool for RunPlanOp {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "run_plan".into(),
-            description: "Execute an emitted plan in the current session and return its Outcome \
-                          {transcript, result, steps, suspension?, failure}. `failure` is null on a \
-                          clean run, or a reified mid-plan halt to route on. The plan is re-validated \
-                          and every op runs through the same approval+IO envelope; bounded by a \
-                          reentry-depth cap."
-                .into(),
-            input_schema: flux_spec::tool_input_schema::<RunPlanInput>(),
-            output_schema: None,
-            // No host effects of its own: the inner ops declare and gate their own effects at their own
-            // dispatch. Medium + non-idempotent so a risk pass never mistakes it for an inert read.
-            effects: Vec::new(),
-            risk: Risk::Medium,
-            idempotency: Idempotency::NonIdempotent,
-            access: Vec::new(),
-            // Hidden from the model-facing catalog (see `plan`), reachable by pre-authored flows.
-            group: Some(flux_runtime::REFLECT_GROUP.into()),
-        }
-    }
-
-    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        // The plan reaches us either named (`{"plan": …}`) or — when a lone object arg is passed
-        // straight through as the input — as the whole `params`. And a stored op result is a JSON
-        // *string*, so accept a string and parse it. All three shapes collapse to the Plan value.
-        let raw = match params.get("plan") {
-            Some(v) => v.clone(),
-            None => params,
-        };
-        let plan = match raw {
-            Value::String(s) => serde_json::from_str::<Value>(&s)
-                .map_err(|e| Error::Other(format!("run_plan: `plan` is not valid JSON: {e}")))?,
-            other => other,
-        };
-        let outcome = loop_host(ctx)?.run_plan(plan).await?;
-        Ok(ToolResult::ok(
-            serde_json::to_string(&outcome).unwrap_or_default(),
-        ))
-    }
-}
-
-/// `ai_segment(goal, tools, max_rounds, until?) -> {result}` — hand a BOUNDED run of model turns to
-/// the loop under a capability scope + explicit exit condition, then return control (D-131). The
-/// delegated leaf ops are confined to `tools`; the run is capped at `max_rounds` and exits early on
-/// natural completion or the optional `until` symbol becoming bound. Reflexive like `plan`/`run_plan`
-/// — it re-enters the same audited planner+interpreter behind the [`LoopHost`] seam.
+/// `ai_segment(goal, tools, max_rounds) -> {result}` — hand a bounded native-schema stage run to the
+/// loop under an exact capability scope, then return control. Proposed effects become action batches
+/// and traverse the same approval and execution seams as the default adaptive loop.
 struct AiSegmentOp;
 
 #[async_trait]
@@ -255,19 +347,18 @@ impl Tool for AiSegmentOp {
             description: "Hand a bounded run of model turns to the loop under a capability scope and \
                           an explicit exit condition, then return control to the flow. `tools` is the \
                           scope the delegated model may call within; `max_rounds` caps the run; \
-                          optional `until` names a symbol that ends the segment early once bound. \
-                          Returns {result}. The model stays the planner; leaf ops run through the same \
-                          approval+IO envelope."
+                          Returns {result}. Gather calls and approved actions run through the same \
+                          authorization, approval, and guarded-IO envelope."
                 .into(),
             input_schema: flux_spec::tool_input_schema::<AiSegmentInput>(),
             output_schema: None,
-            // Like `plan`: the delegated planner calls travel the network; the inner leaf ops declare
-            // and gate their own effects at their own dispatch.
+            // The delegated model calls travel the network; leaf ops declare and gate their own
+            // effects at their own dispatch.
             effects: vec![Effect::Network],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Provider],
-            // Hidden from the model-facing catalog (see `plan`), reachable by pre-authored flows.
+            // Hidden from the model-facing catalog, reachable by pre-authored flows.
             group: Some(flux_runtime::REFLECT_GROUP.into()),
         }
     }

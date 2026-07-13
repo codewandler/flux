@@ -1,13 +1,13 @@
 ---
 title: Build your first Flux app
-description: A beginner tutorial that starts with one guarded agent run and ends with a local, model-backed documentation assistant.
+description: A beginner tutorial from one adaptive CLI turn to an authored flow and reliable documentation-assistant journey.
 ---
 
 # Build your first Flux app
 
 This tutorial takes you from a prompt at the command line to a small application written in
-Flux-Lang. You will first let a model propose a plan, then write a reusable plan yourself, and
-finally connect an agent to a local documentation collection and a terminal channel.
+Flux-Lang. You will watch typed intent and evidence gathering, write a reusable flow, then discover
+why an important application rule belongs in a deterministic journey rather than a prompt.
 
 Allow about **35–45 minutes**. You need basic terminal skills and a text editor, but you do not need
 to know Rust, Flux-Lang, or any agent framework.
@@ -18,16 +18,18 @@ The finished app is a local assistant for a fictional product handbook. It start
 indexes two Markdown files, and requires every model-written answer to pass through an authored,
 scoped retrieval journey.
 
-Along the way you will learn the three ways work enters flux:
+Along the way you will use three levels of control:
 
-1. **A request** — the model compiles your words into a typed plan.
-2. **A flow** — you write the plan directly in Flux-Lang.
-3. **An app** — declarations connect permissions, agents, channels, datasources, triggers, and journeys.
+1. **An adaptive request** — typed stages infer intent, gather evidence through exact native schemas,
+   and capture effects in an approval batch.
+2. **A flow** — you author repeatable computation directly in Flux-Lang.
+3. **An app journey** — declarations connect permissions, agents, channels, datasources, triggers,
+   decisions, and delivery.
 
-All three use the same runtime and the same safety envelope:
+All three use the same runtime and safety envelope:
 
 ```text
-authorization -> approval -> guarded IO
+authorization → approval → guarded IO
 ```
 
 ## Before you start
@@ -47,18 +49,16 @@ This tutorial uses a **real model**. The commands use the `sonnet` alias, which 
 flux auth status
 ```
 
-You can use another provider instead. Replace `sonnet` in every `-m sonnet` argument with your model
-spec, such as `claude/sonnet` after `flux auth login claude` or `openai/gpt-5` with
-`OPENAI_API_KEY`. See [Providers and models](./agent/providers.md) for every supported route.
+You can substitute another configured model in every `-m sonnet` argument—for example
+`claude/sonnet`, `codex/gpt-5.5`, or an OpenRouter model. See
+[Providers and models](./agent/providers.md).
 
 :::note
-The offline `mock` provider is useful for checking an installation, but its replies are canned. It
-cannot complete this tutorial's grounded question-answering exercises.
+The offline `mock` provider checks installation and runtime wiring, but its canned replies cannot
+complete the grounded question-answering exercises.
 :::
 
 ## Create the tutorial workspace
-
-Make a clean directory so every file operation stays inside an obvious, disposable workspace:
 
 ```bash
 mkdir flux-tutorial
@@ -66,7 +66,7 @@ cd flux-tutorial
 mkdir docs
 ```
 
-Create `docs/product.md` in your editor:
+Create `docs/product.md`:
 
 ```markdown
 # Northstar Notes
@@ -75,7 +75,7 @@ Northstar Notes is a shared note-taking service for small teams. Workspaces can 
 as Markdown. Offline edits synchronize automatically when a device reconnects.
 ```
 
-Create `docs/policies.md` beside it:
+Create `docs/policies.md`:
 
 ```markdown
 # Northstar policies
@@ -99,5 +99,4 @@ Keep your terminal in `flux-tutorial` for the rest of the series.
 
 ## Next
 
-Continue to [Run an agent safely](./tutorial/first-agent.md) to turn a plain-language request into an
-inspectable plan.
+Continue to [Run an adaptive agent safely](./tutorial/first-agent.md).

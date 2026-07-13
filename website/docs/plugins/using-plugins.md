@@ -81,7 +81,8 @@ flux plugin call websearch websearch.search '{"query":"warm transfer"}'
 still decide which operations may execute. For open-ended CLI turns, ungrouped plugin operations are
 advertised on demand: name the integration in the request (for example, “list the open GitLab merge
 requests” or “post this in Slack”) and Flux surfaces that integration's catalog for the rest of the
-engine session. Unrelated installed plugins stay out of the planner prompt. Direct `flux plugin call`
+engine session. Unrelated installed plugins stay out of native model-stage catalogs. Only operations
+from installed plugins that are actually loaded and wired can surface. Direct `flux plugin call`
 and authored app/flow operation lists are unchanged.
 
 ## Local / dev install

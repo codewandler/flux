@@ -148,8 +148,8 @@ impl flux_lang::store::DurableStore for FlowStore {
     }
 }
 
-/// The open halt latch [`FlowStore::open_halted_plan`] returns: the unresumed halt event alongside
-/// the ledger a resumed `run_plan` fast-forwards against (design `multipass-agent-loop.md` Part 2).
+/// The open halt latch [`FlowStore::open_halted_plan`] returns: the unresumed authored-flow halt
+/// alongside the ledger a corrected resume fast-forwards against.
 #[derive(Debug, Clone)]
 pub struct OpenHalt {
     /// The failed statement's identity, classification, and message.
@@ -419,16 +419,15 @@ impl FlowStore {
         Ok(halt.map(|halt| OpenHalt { halt, ledger }))
     }
 
-    /// The persisted conversation for a session — the `user → assistant` message log projected from the
-    /// unified event store. Used by the reflexive `plan` op to seed the planner's working conversation
-    /// with the real history (the loop-carried `$feedback` is layered on top, ephemerally).
+    /// The persisted conversation for a session — the `user → assistant` message log projected from
+    /// the unified event store. Model stages use it as their durable conversational history.
     pub fn conversation(&self, session_id: &str) -> Result<Vec<flux_core::Message>> {
         self.events.conversation(session_id)
     }
 
     /// Incremental conversation replay: the message/compacted events with `stream_seq > after_seq`,
     /// so a caller maintaining a cached conversation can fetch only what was appended since instead of
-    /// re-reading the whole log every planner round. See [`EventStore::conversation_delta`].
+    /// re-reading the whole log every model stage. See [`EventStore::conversation_delta`].
     pub fn conversation_delta(
         &self,
         session_id: &str,
@@ -540,7 +539,7 @@ impl FlowStore {
             Ok((flow_name, body_json, node, source)) => {
                 // One-shot: clear the row regardless. A body that no longer deserializes (e.g. AST
                 // schema drift across an upgrade) is discarded and reported as "no suspension" so the
-                // turn recovers with a fresh compile rather than hard-erroring on every future turn.
+                // turn recovers through a fresh adaptive drive rather than hard-erroring forever.
                 conn.execute(
                     "DELETE FROM suspensions WHERE session_id = ?1",
                     [session_id],
@@ -616,6 +615,7 @@ mod tests {
             binding: Some(SymbolName("x".into())),
             source: "user_input".into(),
             as_type: None,
+            condition: None,
         }];
         assert!(
             s.take_suspension("sess").unwrap().is_none(),

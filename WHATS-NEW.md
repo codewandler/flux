@@ -17,8 +17,16 @@
 
 ### New
 
+- **Every agent turn now runs through an authored adaptive loop.** Flux first identifies intent,
+  narrows the live capability set, explores with each operation's exact schema, and captures proposed
+  effects into one visible action batch. The batch receives explicit approval and then executes
+  through the same guarded runtime; the model never generates executable Flux code.
+- **You can define a different outer loop when the built-in one is not your application.** Select an
+  explicit `.flux` loop from the CLI, config, an app agent, a role, or the SDK. Embedded applications
+  can also register strongly typed Rust stages, while config-defined model stages declare their own
+  input and output schemas.
 - **Reasoning effort is now a real per-agent control.** Use `--think` and/or
-  `--effort low|medium|high|xhigh|max`; the choice follows planning, final answers, compaction,
+  `--effort low|medium|high|xhigh|max`; the choice follows intent, exploration, final answers, compaction,
   cognition operations, and sub-agents unless a role deliberately overrides it.
 - **Model calls can explain their request shape and latency.** Set `FLUX_MODEL_TRACE=1` for safe
   request-size, cache, retry, first-response, usage, and total-time records. A `full` mode can print
@@ -32,12 +40,16 @@
 
 ### Improved
 
+- **Agent turns now show what they are doing from the start.** The CLI and terminal UI display
+  `routing intent…` and `exploring…` during the initial model consultations, then retain the accepted
+  intent and selected capability families in the transcript. Verbose mode also shows the exact
+  operations selected, and the final elapsed time now includes this initial work.
 - **Plugin-heavy commands start much faster.** Installed integrations now verify, start, and exchange
   manifests concurrently with bounded fan-out while preserving stable operation ordering and the
   same safety checks. An 18-plugin local setup improved from about 2.23 seconds to 0.59 seconds for
-  a warm offline plan.
+  a warm offline startup.
 - **Installed integrations no longer make unrelated agent turns carry their entire tool catalog.**
-  Flux keeps plugin operations out of the planner prompt until your request names that integration,
+  Flux keeps plugin operations out of model-stage catalogs until your request names that integration,
   then makes only that integration available for the session. On a plugin-heavy installation this
   cut a measured tiny prompt from about 42k to 14k input tokens while keeping named integrations
   discoverable.
@@ -46,6 +58,13 @@
   through scoped retrieval before the model writes it.
 
 ### Action needed
+
+- **The old model-to-Flux planning commands and APIs have been removed.** `flux plan`, REPL `/plan`
+  and `/run`, `--staged`, natural-language `FlowClient::compile`, and planner-corpus export no longer
+  exist. Use the normal adaptive `flux run` path for conversational work, and author `.flux` files
+  when you need fixed control flow. Existing authored flows and historical session reads remain.
+- **A project file named `.flux/agent-loop.flux` no longer overrides the agent silently.** Select a
+  custom loop explicitly with `--loop`, config, your app/role declaration, or the SDK.
 
 - **Skills are now manual-only.** Installing a skill or mentioning one of its trigger words no longer
   changes an agent prompt. Pass repeatable `--skill <name>` in the CLI, or explicitly add skills to
@@ -57,19 +76,20 @@
 
 ### Fixed
 
-- **Plans no longer commonly waste a model call repairing operation arguments.** The plan schema now
-  explains the named-input shape exactly where an operation call is constructed, and any remaining
-  error shows the valid plan shape and that operation's accepted parameters.
+- **Agents stop guessing file paths when a request does not name one.** They inventory the workspace
+  first, and invalid wildcard or missing-path reads return a concrete recovery instruction. This
+  keeps multi-file answers grounded without spending repeated model calls on path repair.
+
 - **Answers grounded in several files can cite the right source reliably.** Read and search results
   keep a concise source label when they are fed into the next planning step, instead of arriving as
   indistinguishable blocks that invite the model to guess filenames.
 - **Approval time is reported separately from tool execution.** A command that waits for your answer
   no longer appears to have spent those seconds reading a file, writing output, or calling a model;
   CLI and TUI timing show both phases explicitly.
-- **The beginner tutorial now completes reliably.** Context packs pass the selected handbook text
-  into AI reasoning instead of only its variable names, GPT-5 requests use the token-limit field its
-  API accepts, and the tutorial explains the model-call approval and plan mode's bounded read-only
-  gathering accurately.
+- **The beginner tutorial now completes reliably and explains the architecture it demonstrates.**
+  Context packs pass selected handbook text into AI reasoning, GPT-5 requests use the token-limit
+  field its API accepts, and the lesson now starts with adaptive evidence gathering before turning
+  the same requirement into a deterministic flow and owned app journey.
 - **App datasources are now real per-agent boundaries.** An app agent is told which named knowledge
   sources it can use; searches are automatically scoped when there is one source, and attempts to
   query an undeclared source are rejected.

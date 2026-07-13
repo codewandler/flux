@@ -1,24 +1,24 @@
 # Flux-Lang Semantics
 
-Flux-Lang is the language pillar of flux: the typed plan format a model emits and a deterministic
-runtime executes. It is deliberately small in purpose even though the node catalog has grown: it is an
-agent working language, not a general-purpose programming language.
+Flux-Lang is the language pillar of flux: an authored, typed workflow language a deterministic runtime
+executes. It is deliberately small in purpose even though the node catalog has grown: it is an agent
+orchestration language, not model output and not a general-purpose programming language.
 
 The shortest version:
 
-> The model writes a readable, analyzer-validated plan over symbols. The runtime resolves those symbols
-> to immutable values and dispatches every real-world effect through the same authorization -> approval
-> -> guarded IO envelope.
+> Authors place deterministic control flow around typed model stages and operations. The runtime
+> resolves immutable symbols and dispatches every real-world effect through the same authorization →
+> approval → guarded IO envelope.
 
 ## The Semantic Core
 
 1. **A flow is an executable AST.** JSON `DraftAst`, native `.flux` text, and Rust DSL builders all
-   describe the same tree of nodes. The lifecycle is compile or parse -> analyze/lower -> optionally
+   describe the same tree of nodes. The lifecycle is construct or parse → analyze/lower → optionally
    optimize -> execute. The parser and formatter are tooling; the semantics live in the AST and the
    reference interpreter.
 2. **Symbols are not values.** A symbol such as `$draft` names a value id in the session store. Values
-   are immutable; a revision is another value id, not mutation in place. The model sees summaries,
-   transcripts, and explicit context packs. The runtime alone dereferences values.
+   are immutable; a revision is another value id, not mutation in place. A typed model stage sees only
+   its declared input and capability-scoped operation schemas. The runtime alone dereferences values.
 3. **`call` is the operation boundary.** The language knows how to call registered operations, but it
    does not own filesystem, process, provider, or network IO. The `flux-flow` engine adapts `call` onto
    `Executor::dispatch`, so policy, approval, redaction, and guarded IO remain the only production path
@@ -44,7 +44,7 @@ The shortest version:
 
 ## What It Is Not
 
-Flux-Lang is not a ReAct transcript where the LLM schedules each tool call live. It is not a shell
+Flux-Lang is not a model-generated plan or a ReAct transcript where the LLM owns the runtime loop. It is not a shell
 script: untrusted text never becomes a shell command, and process execution is an operation guarded by
 the runtime. It is not a hand-wired dataflow DAG; authors write structured control flow and the
 dependency DAG is derived from symbol reads. It is not a behavior tree: there is no root tick loop or
@@ -53,9 +53,9 @@ not a transition system.
 
 ## Programs And Composite Ops
 
-A `.flux` module can also declare agents, channels, datasources, triggers, journeys, top-level flows,
-and module-local composite ops. These declarations are pure data in `flux-lang`; L6 hosts give them
-runtime meaning. A journey is still an ordinary flow. A composite op is a scoped sub-flow that can be
+A `.flux` module can also declare agents, agent loops, channels, datasources, triggers, journeys,
+top-level flows, and module-local composite ops. These declarations are pure data in `flux-lang`; L6
+hosts give them runtime meaning. A journey is still an ordinary flow. A composite op is a scoped sub-flow that can be
 called like an operation when the host registers the module's composites; its inner calls still traverse
 the same operation dispatch envelope.
 

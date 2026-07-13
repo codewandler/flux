@@ -94,8 +94,14 @@ pub async fn replay_prefix(
             "session {src} is not forkable: no cassette cells recorded (pre-C-43 run, or FLUX_CASSETTE=0)"
         )));
     }
-    let (plans, _) = plans_by_key(events, src)?;
-    let exec_keys = execution_keys(&trace);
+    let (plans, accepted_order) = plans_by_key(events, src)?;
+    let mut exec_keys = execution_keys(&trace);
+    // Host-derived native-call graphs use the non-resumable executor: their cassette cells and
+    // accepted source are durable, but they do not emit statement-ledger rows. Preserve fork for
+    // those adaptive turns by using accepted execution order, exactly as replay_session does.
+    if exec_keys.is_empty() {
+        exec_keys = accepted_order;
+    }
     let Some(target_key) = exec_keys.last().cloned() else {
         return Err(fork_err(format!(
             "session {src} has no executed plan to fork"
@@ -136,7 +142,6 @@ pub async fn replay_prefix(
             ast,
             &[],
             ledger,
-            None,
             sink,
         )
         .await?;
@@ -174,7 +179,6 @@ pub async fn replay_prefix(
             fork_session,
             &truncated,
             &[],
-            None,
             None,
             sink,
         )
@@ -274,7 +278,6 @@ pub async fn diverge_inject(
         &tail,
         &[],
         None,
-        None,
         sink,
     )
     .await
@@ -305,7 +308,6 @@ pub async fn diverge_edit(
         edited,
         &[],
         Some(&prefix.ledger),
-        None,
         sink,
     )
     .await

@@ -433,7 +433,7 @@ async fn flow_owns_two_voice_turns() {
 // --- D-132: flow-driven voice (a FlowEngine owns the whole call) ---------------------------------
 
 /// A provider that must NOT be called on the deterministic flow-driven path — counts calls so the
-/// test can assert zero planner invocations (D-132 invariant 1).
+/// test can assert zero adaptive-stage invocations (D-132 invariant 1).
 struct CountingProvider {
     calls: Arc<AtomicUsize>,
 }
@@ -498,7 +498,7 @@ fn flow_engine(events: Arc<EventStore>, calls: Arc<AtomicUsize>) -> FlowEngine {
 #[tokio::test]
 async fn flow_driven_voice_session_speaks_authored_prompts_and_hangs_up() {
     // A two-`await` flow owns the whole call: it speaks first, resumes on each caller turn, and ends
-    // the call when it completes — with ZERO planner invocations (echo + await only).
+    // the call when it completes — with ZERO adaptive-stage invocations (echo + await only).
     let events = Arc::new(EventStore::in_memory().unwrap());
     let sid = events.create_session("mock").unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -519,6 +519,7 @@ async fn flow_driven_voice_session_speaks_authored_prompts_and_hangs_up() {
         binding: Some(SymbolName(name.into())),
         source: "user_input".into(),
         as_type: None,
+        condition: None,
     };
     let flow = DraftAst {
         body: vec![
@@ -569,11 +570,11 @@ async fn flow_driven_voice_session_speaks_authored_prompts_and_hangs_up() {
             "Booked!".to_string()
         ]
     );
-    // Invariant 1: the deterministic skeleton never called the planner.
+    // Invariant 1: the deterministic skeleton never called an adaptive model stage.
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
-        "flow-driven voice invoked no planner"
+        "flow-driven voice invoked no adaptive model stage"
     );
     // Invariant 4: completion fired the terminal hangup hook with the final line.
     assert_eq!(sink.ended.as_deref(), Some("Booked!"));

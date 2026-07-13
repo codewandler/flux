@@ -37,8 +37,23 @@ impl flux_provider::Provider for SlowProvider {
     }
     async fn stream(
         &self,
-        _req: flux_provider::Request,
+        req: flux_provider::Request,
     ) -> flux_core::Result<flux_provider::ChunkStream> {
+        if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+            return Ok(Box::pin(futures::stream::iter(vec![
+                Ok(flux_core::Chunk::Block(flux_core::ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "answer the current message",
+                        "capability_families": [],
+                    }),
+                })),
+                Ok(flux_core::Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::ToolUse),
+                }),
+            ])));
+        }
         Ok(Box::pin(async_stream::stream! {
             yield Ok(flux_core::Chunk::TextDelta("thinking ".into()));
             tokio::time::sleep(Duration::from_millis(800)).await;

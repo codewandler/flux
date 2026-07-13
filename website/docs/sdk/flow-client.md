@@ -6,25 +6,24 @@ description: "Build, extend, analyze, optimize, and execute Flux-Lang flows thro
 # FlowClient
 
 `FlowClient` is the recommended SDK surface when your application owns a flow. It exposes the
-Flux-Lang lifecycle directly while reusing `flux-flow`'s compiler, analyzer, runtime adapter, value
+Flux-Lang lifecycle directly while reusing `flux-flow`'s analyzer, runtime adapter, value
 store, operation registry, and safety envelope.
 
 Use the conversational [`Client`](./overview.md#client-conversational-turns) when you want the full
-self-hosted agent loop to gather context and revise plans across a turn. Use `FlowClient` when you
-already have a flow, want to compile one instruction, or need explicit lifecycle control.
+adaptive outer loop. Use `FlowClient` when you already own the authored flow or need explicit
+lifecycle control.
 
 ## Lifecycle at a glance
 
 | Starting point | Validate | Execute | Model calls before execution |
 |---|---|---|---|
-| Natural-language instruction | `compile` then `analyze` | `execute`, or `run` for all three | Yes: compilation |
 | Flux-Lang text | `parse` then `analyze` | `execute`, or `run_flow` with inputs | No, unless the authored flow calls a model op |
 | Rust DSL / existing `DraftAst` | `analyze` | `execute` | No, unless the AST calls a model op |
 | Seeded `DraftAst` | `analyze_seeded` | `execute_with` | No, unless the AST calls a model op |
 | Read-parallelized AST | `optimize` | `execute_optimized` | No, unless the AST calls a model op |
 
-The `run` and `run_flow` convenience pipelines abort on parse/compile/analysis failure before
-execution. When invoking the stages separately, call `analyze` (or `analyze_seeded`) yourself before
+The `run_flow` convenience pipeline aborts on parse/analysis failure before execution. When invoking
+the stages separately, call `analyze` (or `analyze_seeded`) yourself before
 `execute`; the direct execute methods assume the supplied AST is ready. Once execution begins, every
 effectful `call` still passes through `Executor::dispatch`, and parsing or seeding data never grants
 a capability.
@@ -45,16 +44,15 @@ The builder assembles the built-in operations and provider-backed cognition oper
 registry, creates a guarded workspace rooted at the supplied path, and uses an in-memory flow store.
 Its controls are:
 
-- `model` selects the planner and cognition-op model.
+- `model` selects the cognition-operation model.
 - `allow` and `deny` add permission rules; deny rules take precedence.
 - `auto_approve(true)` installs a headless allow-all approver. The default is deny when a call needs
   approval because a library has no prompt UI.
 - `approver` installs your own per-operation `Approver` and overrides `auto_approve`.
 - `with_sandbox` pins an explicit OS-sandbox posture. Without it, the builder resolves the posture
   from the `FLUX_SANDBOX*` environment settings.
-- `storage(Storage::dir(...))` persists durable-construct state (`once`/`checkpoint`) across
-  processes. The default store is in memory.
-- `compile_options` changes the natural-language compiler's attempt, step, and token budgets.
+- `storage` accepts `Storage::dir(...)` to persist durable-construct state (`once`/`checkpoint`)
+  across processes. The default store is in memory.
 - `without_prelude` starts with an empty artifact-definition map instead of the standard
   `Claim`/`Evidence`/`Ctx`/`Answer` family.
 
@@ -64,9 +62,11 @@ dispatcher or guarded IO, but it removes the human approval stop for calls that 
 ## Extend the operation and type surface
 
 A new client exposes `registry`, `op_names`, and `prelude_defs` for inspection. Mutating registration
-methods return `&mut Self`, so a host can assemble its domain before compiling or analyzing flows:
+methods return `&mut Self`, so a host can assemble its domain before analyzing flows:
 
 - `register_op` adds one `Arc<dyn Tool>`.
+- `register_op(stage_fn::<I, O, _, _, _>(...))` adds a closure-backed typed operation with
+  independent derived input/output schemas; the analyzer infers `O` at its call sites.
 - `register_pack` installs a group of tools into the registry.
 - `with_sub_agents` registers `task` and attaches a `SubAgents` spawner. If the bundle has no
   wall-clock limit, the SDK supplies a ten-minute default.
@@ -79,15 +79,10 @@ All registered tools still execute through the same permission, approval, redact
 path. A composite operation is a nested flow; its inner calls do not inherit authority from the
 wrapper.
 
-## Compile or parse
+## Parse or construct
 
 ```rust
-// Model-backed natural language -> DraftAst, with bounded parse/analyze repair.
-let compiled = client
-    .compile("read README.md and return its heading", None)
-    .await?;
-
-// Deterministic Flux-Lang text -> the same DraftAst, with no provider call.
+// Authored Flux-Lang text -> DraftAst, with no provider call.
 let parsed = client.parse(
     r#"flow heading
   $doc = read("README.md")
@@ -95,23 +90,14 @@ let parsed = client.parse(
 )?;
 ```
 
-`compile(text, view)` can receive a `SessionView` so the planner may refer to existing symbols.
 `parse(text)` is total and returns an error for malformed source rather than panicking.
 `parse_module(text)` also recognizes module-level flows, composite operations, and multi-agent
-program declarations. Treat the AST returned by `compile` as a draft and run `analyze` against the
-client's final registry before calling `execute`.
-
-`run(text)` is the natural-language convenience pipeline:
-
-```text
-compile -> analyze -> execute
-```
-
-It is not the conversational agent loop: it compiles and executes one flow once.
+program declarations. Rust callers can instead construct the same `DraftAst` through
+`flux_sdk::dsl`. In both cases, analyze against the client's final registry before execution.
 
 ## Analyze effects and optimize
 
-Always analyze text, compiled ASTs, or DSL output against the client's final registry:
+Always analyze parsed text, existing ASTs, or DSL output against the client's final registry:
 
 ```rust
 client
@@ -198,7 +184,7 @@ are re-exported from `flux_sdk::flow`.
   call, use `VoiceSessionDriver::run_flow_turns` with `EngineVoiceHandler`, which owns a
   `FlowEngine`. See [Realtime voice](../agent/realtime.md).
 
-For cancellable conversational turns, reviewed-plan execution, hermetic replay, forks, durable
+For cancellable conversational turns, adaptive batch approval, hermetic replay, forks, durable
 sessions, or flow-driven voice, drop to `flux_flow::engine::FlowEngine` rather than rebuilding those
 seams around `FlowClient`.
 

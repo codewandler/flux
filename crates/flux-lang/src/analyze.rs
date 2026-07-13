@@ -279,8 +279,14 @@ fn nested_bodies(node: &Node) -> Vec<&[Node]> {
         // Leaf / pure-expression nodes: no dispatch-capable child positions. Call args, template
         // leaves, `expr` vars, and `jq`/`parse` inputs are argument positions — the analyzer
         // rejects call/control nodes there, so there is nothing for the cap-scope pass to see.
+        Node::Await {
+            condition: Some(condition),
+            ..
+        } => vec![from_ref(condition.as_ref())],
         Node::Call { .. }
-        | Node::Await { .. }
+        | Node::Await {
+            condition: None, ..
+        }
         | Node::Peek { .. }
         | Node::Var { .. }
         | Node::Lit { .. }
@@ -479,13 +485,15 @@ pub fn lower(
     })
 }
 
-/// Infer an expression's type for argument checking. Literals, `var`s (via `scope`), and `fmt` (always
-/// a string) infer precisely; everything else is `Any` (lenient — no false positives on op outputs).
-fn infer_type(node: &Node, scope: &HashMap<String, TypeRef>) -> TypeRef {
+/// Infer an expression's type for argument checking. Registered calls use the operation catalog's
+/// declared output, which lets authored stage graphs pass typed artifacts without repeating bind
+/// annotations. Unknown outputs remain `Any` and preserve the analyzer's lenient behavior.
+fn infer_type(node: &Node, scope: &HashMap<String, TypeRef>, ops: &dyn OpCatalog) -> TypeRef {
     match node {
         Node::Lit { value } => lit_type(value),
         Node::Var { name } => scope.get(&name.0).cloned().unwrap_or(TypeRef::Any),
         Node::Fmt { .. } => TypeRef::String,
+        Node::Call { op, .. } => ops.lookup(op).map(|sig| sig.output).unwrap_or(TypeRef::Any),
         _ => TypeRef::Any,
     }
 }
@@ -594,7 +602,7 @@ fn check_call_types(
                 };
                 if let Some(pname) = pname {
                     if let Some(ptype) = sig.param_types.get(&pname) {
-                        let atype = infer_type(&args[0], scope);
+                        let atype = infer_type(&args[0], scope, ops);
                         if types_conflict(&atype, ptype) {
                             d.add(format!(
                                 "op `{op}` parameter `{pname}` expects {}, got {}",
@@ -710,9 +718,25 @@ fn type_check_body(
                 if let Node::Call { op, args } = value.as_ref() {
                     d.with("value", |d| check_call_types(op, args, ops, scope, d));
                 }
-                scope.insert(name.0.clone(), ty.clone().unwrap_or(TypeRef::Any));
+                scope.insert(
+                    name.0.clone(),
+                    ty.clone().unwrap_or_else(|| infer_type(value, scope, ops)),
+                );
             }
             Node::Call { op, args } => check_call_types(op, args, ops, scope, d),
+            Node::Await {
+                binding,
+                as_type,
+                condition,
+                ..
+            } => {
+                if let Some(Node::Call { op, args }) = condition.as_deref() {
+                    d.with("condition", |d| check_call_types(op, args, ops, scope, d));
+                }
+                if let Some(binding) = binding {
+                    scope.insert(binding.0.clone(), as_type.clone().unwrap_or(TypeRef::Any));
+                }
+            }
             Node::Return { value } => {
                 if let Node::Call { op, args } = value.as_ref() {
                     d.with("value", |d| check_call_types(op, args, ops, scope, d));
@@ -979,9 +1003,13 @@ pub fn for_each_node(body: &[Node], f: &mut impl FnMut(&Node)) {
                 }
             }
             Node::List { items } => for_each_node(items, f),
+            Node::Await { condition, .. } => {
+                if let Some(condition) = condition {
+                    for_each_node(std::slice::from_ref(condition.as_ref()), f);
+                }
+            }
             // Leaf nodes (no nested node bodies).
-            Node::Await { .. }
-            | Node::Checkpoint { .. }
+            Node::Checkpoint { .. }
             | Node::Peek { .. }
             | Node::Var { .. }
             | Node::Lit { .. }
@@ -1263,9 +1291,13 @@ fn annotate_node(
                 });
             }
         }
+        Node::Await { condition, .. } => {
+            if let Some(condition) = condition {
+                annotate_node(condition, ops, None, d, out);
+            }
+        }
         // Leaf nodes: no nested node positions, so none can themselves be (or contain) a `call`.
-        Node::Await { .. }
-        | Node::Checkpoint { .. }
+        Node::Checkpoint { .. }
         | Node::Peek { .. }
         | Node::Var { .. }
         | Node::Lit { .. }
@@ -1393,6 +1425,17 @@ fn check_cond_kind(cond: &Node, what: &str, d: &mut Diags) {
              `$name`",
             node_kind_label(cond)
         ));
+    }
+}
+
+fn check_await_cond_kind(cond: &Node, d: &mut Diags) {
+    if !matches!(
+        cond,
+        Node::Lit { .. } | Node::Var { .. } | Node::Expr { .. }
+    ) {
+        d.add(
+            "`await ... when` must be a pure `lit`, `var`, or `expr` condition — suspension routing cannot dispatch an operation",
+        );
     }
 }
 
@@ -1928,8 +1971,14 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
                 });
             }
         }
-        Node::Await { binding, .. } => {
+        Node::Await {
+            binding, condition, ..
+        } => {
             check_opt_decl_name(binding, "`await` `binding`", d);
+            if let Some(condition) = condition {
+                check_await_cond_kind(condition, d);
+                d.with("condition", |d| check_node(condition, ops, bound, d));
+            }
         }
         Node::Var { name } => {
             // Reference-side of F8: a dotted/spaced `var` name can never be satisfied (no binder
@@ -2177,6 +2226,7 @@ mod tests {
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 })
         }
@@ -2200,6 +2250,7 @@ mod tests {
                 required_params: required.iter().map(|s| s.to_string()).collect(),
                 optional_params: optional.iter().map(|s| s.to_string()).collect(),
                 param_types: Default::default(),
+                output: TypeRef::Any,
                 semantic_effects: Vec::new(),
             };
             match name {
@@ -2523,6 +2574,7 @@ mod tests {
             binding: None,
             source: "user_input".into(),
             as_type: None,
+            condition: None,
         };
         let lit = || Node::Lit {
             value: serde_json::json!("x"),
@@ -2594,17 +2646,25 @@ mod tests {
     struct TypeCat;
     impl OpCatalog for TypeCat {
         fn lookup(&self, name: &str) -> Option<OpSignature> {
-            (name == "dbl").then(|| OpSignature {
-                name: "dbl".into(),
+            matches!(name, "dbl" | "string_len").then(|| OpSignature {
+                name: name.into(),
                 description: String::new(),
                 effects: Vec::new(),
                 risk: flux_spec::Risk::Low,
                 idempotency: flux_spec::Idempotency::Idempotent,
-                required_params: vec!["n".into()],
+                required_params: vec![if name == "dbl" { "n" } else { "text" }.into()],
                 optional_params: Vec::new(),
-                param_types: [("n".to_string(), crate::ast::TypeRef::Number)]
-                    .into_iter()
-                    .collect(),
+                param_types: [(
+                    if name == "dbl" { "n" } else { "text" }.to_string(),
+                    if name == "dbl" {
+                        TypeRef::Number
+                    } else {
+                        TypeRef::String
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                output: TypeRef::Number,
                 semantic_effects: Vec::new(),
             })
         }
@@ -2624,6 +2684,7 @@ mod tests {
                 required_params: vec!["items".into()],
                 optional_params: vec!["vars".into(), "where".into()],
                 param_types: Default::default(),
+                output: TypeRef::Any,
                 semantic_effects: Vec::new(),
             })
         }
@@ -2705,8 +2766,8 @@ mod tests {
         });
         assert!(lower(&good, &TypeCat, &HashSet::new()).is_ok());
 
-        // A var of unknown (Any) type passes leniently — no false positive.
-        let lenient = DraftAst {
+        // An unannotated bind inherits the called op's declared output type.
+        let inferred = DraftAst {
             body: vec![
                 Node::Bind {
                     name: "x".into(),
@@ -2720,15 +2781,17 @@ mod tests {
                     effect: None,
                 },
                 Node::Call {
-                    op: "dbl".into(),
+                    op: "string_len".into(),
                     args: vec![Node::Var { name: "x".into() }],
                 },
             ],
             ..Default::default()
         };
+        let err = lower(&inferred, &TypeCat, &HashSet::new()).unwrap_err();
         assert!(
-            lower(&lenient, &TypeCat, &HashSet::new()).is_ok(),
-            "an Any-typed var argument must pass leniently"
+            err.iter()
+                .any(|d| d.message.contains("expects String, got Number")),
+            "expected the bind to inherit dbl's Number output, got {err:?}"
         );
 
         // A param declared `Number` is tracked: passing it where a Number is wanted is fine; a
@@ -4397,6 +4460,7 @@ mod tests {
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: Vec::new(),
                 }),
                 "charge_card" => Some(OpSignature {
@@ -4408,6 +4472,7 @@ mod tests {
                     required_params: Vec::new(),
                     optional_params: Vec::new(),
                     param_types: Default::default(),
+                    output: TypeRef::Any,
                     semantic_effects: vec![FlowEffect::Money],
                 }),
                 _ => None,

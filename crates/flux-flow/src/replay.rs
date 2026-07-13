@@ -2,7 +2,7 @@
 //! come from the durable `PlanAttempted.plan_source` (parsed deterministically, no model call),
 //! leaf-op outputs are served from the C-43 cassette (no live IO, side effects never re-fire).
 //!
-//! The driver does NOT re-drive the agent loop (no planner, no approval machinery): it re-executes
+//! The driver does NOT re-drive the agent loop (no model stages, no approval machinery): it re-executes
 //! the recorded *executions* in recorded order. The execution list is derived from the trace
 //! itself — `StatementCompleted`/`PlanHalted` rows carry the plan's `flow_key` — which reproduces
 //! the loop host's dispositions by construction: a plan that was accepted but never executed (the
@@ -198,7 +198,6 @@ pub async fn replay_session(
             ast,
             &[],
             ledger,
-            None,
             sink,
         )
         .await?;

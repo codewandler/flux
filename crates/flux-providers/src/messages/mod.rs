@@ -443,8 +443,8 @@ fn map_messages_stream_inner(
                     }
                     WireDelta::InputJsonDelta { partial_json } => {
                         // L-23: surface the fragment as a `ToolInputDelta` too (in addition to the
-                        // existing accumulation this codec always did) so a caller can render an
-                        // `emit_plan` plan skeleton progressively — purely additive, the completed
+                        // existing accumulation this codec always did) so a caller can trace or
+                        // render a large native tool input progressively — purely additive, the completed
                         // `Chunk::Block` below remains the sole source of truth for the final call.
                         let name = if let Some(BlockAcc::ToolUse { json, name, .. }) =
                             blocks.get_mut(&index)

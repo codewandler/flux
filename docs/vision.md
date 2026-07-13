@@ -7,11 +7,11 @@ the principles below.
 ## What flux is
 
 A Rust **agent SDK, harness, and coding agent** built as one Cargo workspace of small,
-strictly-layered crates. Its defining idea: **the LLM is not the runtime.** Instead of letting the
-model drive execution tool-by-tool, flux uses it as a **compiler front-end** — the model turns a
-request into a typed, readable execution **plan** (a Flux-Lang graph), and a deterministic Rust
-runtime executes that plan through one mandatory chain (**authorization → approval → guarded IO**).
-You see the plan before it runs, and the same plan can be re-run.
+strictly-layered crates. Its defining idea: **the LLM is not the runtime.** Models participate inside
+typed stages: they interpret intent, gather evidence through exact native operation schemas, ask for
+decisions, and propose literal actions. Authored Flux-Lang owns control flow, and a deterministic Rust
+runtime freezes effects into batches and executes them through one mandatory chain
+(**authorization → approval → guarded IO**). The model never authors executable Flux.
 
 ## Three pillars
 
@@ -21,10 +21,10 @@ tools, and orchestration are shared machinery beneath them:
 1. **The Agent** — a zero-config personal coding agent (CLI/TUI), an embeddable Rust SDK, and a
    deployable HTTP server. The pillar most users touch; its internal surface priority is set out in
    *Audience & priority* below.
-2. **The Language (Flux-Lang)** — the typed plan format the agent compiles into. It is
-   **machine-generated** (emitted from natural language as JSON or native text), **human-readable**
-   (you audit every plan before it runs), and **lightly human-editable** (nudge a plan, not author
-   one from scratch). It is deliberately *not* a hand-written general-purpose language.
+2. **The Language (Flux-Lang)** — the authored workflow language for deterministic flows, reusable
+   operations, adaptive agent loops, and durable journeys. It is readable, analyzer-validated, and
+   deliberately smaller than a general-purpose language. Models are called *from* typed stages; they
+   do not generate the program.
 3. **The Improvement Loop** — the eval + self-improvement harness (`flux-eval`), kept inside the repo
    because it is used directly to make flux better at real coding work; the closer to the code, the
    better.
@@ -32,15 +32,15 @@ tools, and orchestration are shared machinery beneath them:
 ## North star: the LLM is not the runtime
 
 **The single property flux must get right above all else is that the model proposes and the runtime
-disposes.** Mainstream agents make the LLM the *runtime scheduler* — it picks each step live, and the
-whole transcript is re-sent every turn so it can choose the next move. That is slow, expensive,
-non-deterministic, and injectable. flux inverts it: the model is a compiler front-end that emits a
-typed execution graph; a deterministic Rust runtime resolves symbols to stored values and executes
-registered operations under policy. Everything else flux is proud of **falls out of that inversion**:
+disposes.** Mainstream agents let an LLM's transcript become the runtime contract. Flux gives the
+model bounded semantic jobs while authored control flow and host-owned contracts decide what can
+happen: signals narrow a live catalog, reads return evidence, effects become immutable action
+batches, and execution remains under policy. Everything else flux is proud of falls out of that
+boundary:
 
-- **Determinism & repeatability** — a plan is an artifact; re-running it costs the fewest model calls.
-- **Token savings & speed** — raw tool outputs are stored as symbols, not re-sent every turn.
-- **Auditability** — a turn *is* a graph you read like Go or Rust before it runs, not a black box.
+- **Determinism & repeatability** — authored flows own order, bounds, branches, suspension, and resume.
+- **Token savings & speed** — a native stage keeps one valid provider ledger and repairs locally.
+- **Auditability** — intent, evidence, proposed batches, receipts, and execution reports are explicit.
 - **Safety by construction** — every plan node lowers onto one envelope. All IO goes through
   `flux-system`; all ops through `Executor::dispatch`. Default-deny authorization (grants over
   subjects × resources × actions, gated by trust + scopes, with a usable local default so the agent
@@ -73,8 +73,8 @@ is unchanged; these are platform-tier capabilities, hardened as the earlier tier
 
 ## Principles
 
-1. **The LLM is not the runtime** (the north star, above) governs everything: a turn compiles to a
-   plan the runtime executes; the model never drives IO directly. **Non-bypassable safety** is the
+1. **The LLM is not the runtime** (the north star, above) governs everything: a model participates in
+   typed stages but never authors executable Flux or drives IO directly. **Non-bypassable safety** is the
    hard invariant this buys — no tool, plugin, sub-agent, or surface path reaches real
    filesystem / process / network IO without traversing the one envelope, and a bypass is a release
    blocker.
@@ -115,7 +115,7 @@ safety tests are the price of entry. See [AGENTS.md](../AGENTS.md) for the contr
 
 ## How success is measured
 
-- Every turn is an auditable plan a user can read before it runs, and the same plan re-runs deterministically.
+- Every effect is traceable from intent and evidence through an approved batch to guarded execution.
 - A reviewer can trace *every* IO path to the envelope and find no bypass.
 - `flux` is a tool the author reaches for by default for real coding tasks.
 - A third party can build a safe agent on `flux-sdk` without touching the core.

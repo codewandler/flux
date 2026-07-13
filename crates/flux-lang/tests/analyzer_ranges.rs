@@ -27,6 +27,7 @@ impl OpCatalog for MiniCatalog {
             required_params: required,
             optional_params: vec![],
             param_types: Default::default(),
+            output: flux_lang::ast::TypeRef::Any,
             semantic_effects: vec![],
         })
     }

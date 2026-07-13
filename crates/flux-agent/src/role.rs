@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use flux_core::{Error, Result};
 use flux_provider::Effort;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,9 @@ pub struct Role {
     /// Reasoning-effort override; `None` inherits the parent's setting for spawned roles.
     #[serde(default)]
     pub effort: Option<Effort>,
+    /// `adaptive` or inline Flux-Lang source for this role's outer loop.
+    #[serde(default, rename = "loop")]
+    pub agent_loop: Option<String>,
     /// Tool allowlist. `None` (no `tools` key) inherits all tools available to the parent;
     /// `Some([])` (an explicit empty list) grants none.
     #[serde(default)]
@@ -37,8 +41,17 @@ impl Role {
     /// An [`AgentSpec`] for this role: the role body becomes the system prompt, `tools` becomes the
     /// tool selection, and the model falls back to `default_model` when the role doesn't override it.
     /// Turn settings (`max_tokens`, `max_iterations`, …) take spec defaults; the caller can override.
-    pub fn to_spec(&self, default_model: &str) -> AgentSpec {
-        AgentSpec {
+    pub fn to_spec(&self, default_model: &str) -> Result<AgentSpec> {
+        let agent_loop = match self.agent_loop.as_deref() {
+            Some(source) => crate::AgentLoopSpec::parse(source).map_err(|error| {
+                Error::Other(format!(
+                    "role `{}` has an invalid agent loop: {error}",
+                    self.name
+                ))
+            })?,
+            None => crate::AgentLoopSpec::default(),
+        };
+        Ok(AgentSpec {
             model: self
                 .model
                 .clone()
@@ -47,8 +60,9 @@ impl Role {
             tools: self.tools.clone(),
             thinking: self.thinking.unwrap_or(false),
             effort: self.effort,
+            agent_loop,
             ..AgentSpec::default()
-        }
+        })
     }
 }
 
@@ -62,6 +76,8 @@ struct RoleFrontmatter {
     model: Option<String>,
     thinking: Option<bool>,
     effort: Option<Effort>,
+    #[serde(rename = "loop")]
+    agent_loop: Option<String>,
     tools: Option<Vec<String>>,
 }
 
@@ -84,6 +100,7 @@ pub fn parse_role(content: &str, name_fallback: &str) -> Role {
         model: meta.model.filter(|m| !m.is_empty()),
         thinking: meta.thinking,
         effort: meta.effort,
+        agent_loop: meta.agent_loop,
         tools: meta.tools,
         prompt: body.trim().to_string(),
     }
@@ -193,7 +210,7 @@ mod tests {
     #[test]
     fn to_spec_inherits_model_and_carries_tools() {
         let r = parse_role("---\ntools: [read, grep]\n---\nBe terse.", "scout");
-        let spec = r.to_spec("default-model");
+        let spec = r.to_spec("default-model").unwrap();
         assert_eq!(spec.model, "default-model"); // role omitted model → inherit
         assert_eq!(spec.system_prompt, "Be terse.");
         assert_eq!(
@@ -202,7 +219,7 @@ mod tests {
         );
 
         let r2 = parse_role("---\nmodel: haiku\n---\nx", "s");
-        assert_eq!(r2.to_spec("default-model").model, "haiku"); // role overrides
+        assert_eq!(r2.to_spec("default-model").unwrap().model, "haiku"); // role overrides
     }
 
     #[test]
@@ -211,7 +228,7 @@ mod tests {
             "---\nthinking: true\neffort: xhigh\n---\nInvestigate deeply.",
             "investigator",
         );
-        let spec = r.to_spec("parent-model");
+        let spec = r.to_spec("parent-model").unwrap();
         assert!(spec.thinking);
         assert_eq!(spec.effort, Some(flux_provider::Effort::Xhigh));
     }

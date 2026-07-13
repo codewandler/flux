@@ -1,5 +1,5 @@
-//! The Flux-Lang **language skill**: a self-contained reference an LLM reads to author Flux-Lang
-//! ASTs. It is generated — the node-kind table comes from [`crate::schema::node_kind_catalog`] (the
+//! The Flux-Lang **language skill**: a self-contained reference for authoring durable Flux-Lang
+//! programs. It is generated — the node-kind table comes from [`crate::schema::node_kind_catalog`] (the
 //! `Node` doc-comments), so it can never drift from the types. Unlike the engine's skill it carries
 //! **no registered-ops table**: operations are provided by the host runtime, not the language.
 //!
@@ -22,20 +22,22 @@ pub fn render() -> String {
 }
 
 const HEAD: &str = r##"---
-description: How to author Flux-Lang — the typed execution-graph language an LLM emits (node kinds, control flow, pure expressions). Operations are host-provided.
-triggers: [flux-lang, fluxlang, flux-flow, emit_plan, ast, plan, flow, dag]
+description: How to author Flux-Lang — typed, deterministic agent control flow with explicit operations, branches, and durable state.
+triggers: [flux-lang, fluxlang, flux-flow, ast, flow, journey, dag]
 ---
 
 # Flux-Lang — the language
 
-Flux-Lang is a small language **built for LLMs**. You express a task as a typed JSON **execution graph**
-(an AST) and a deterministic runtime runs it — instead of acting tool-by-tool, you emit one readable
-plan. Control flow, iteration, error handling, and pure data shaping are all **nodes** in the graph,
-never hidden inside an op's arguments. The runtime stores results as **symbols** and resolves them to
-**values**, so raw outputs are referenced by name, not re-sent every step.
+Flux-Lang is the typed language for the parts of an agent that must be reliable. Developers and
+coding agents author a readable `.flux` program; the analyzer lowers it to this JSON execution-graph
+representation and a deterministic runtime executes it. A conversational model does **not** generate
+the executable graph during a turn: model-backed stages return typed values or native operation
+calls inside control flow the application already owns. Iteration, error handling, and data shaping
+are explicit nodes. Results are stored as **symbols** and resolved to **values**.
 
 The **operations** a `call` node targets (file reads, shell, sub-agents, …) are advertised by the host
-runtime — they are not part of the language. This reference covers the language itself.
+runtime — they are not part of the language. Prefer Flux text for checked-in programs; this reference
+also documents the canonical AST used by analyzers, SDKs, and durable execution.
 
 ## Top-level shape
 
@@ -62,8 +64,8 @@ const BODY: &str = r##"
   whole value as an argument with a `var` node.
 - **Shape data with pure nodes** — `expr` (arithmetic), `fmt` (interpolation), `jq` (path extraction),
   `parse` (coercion). They do no IO and need no approval.
-- **Keep one task in one plan.** Put gathering, work, and verification in a single graph rather than
-  many tiny plans.
+- **Give each flow one durable responsibility.** Compose flows and journeys explicitly instead of
+  asking a turn-time model to invent control flow.
 - **Bounded iteration only.** `repeat` needs `max`; `loop` needs `for_ms`; the analyzer rejects
   unbounded loops.
 

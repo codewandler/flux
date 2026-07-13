@@ -18,8 +18,8 @@ pub enum Role {
 
 /// Sentinel key a wire codec places in a [`ContentBlock::ToolUse`] input when the model's
 /// argument JSON could not be parsed even after repair. Carrying the failure as *data* keeps the
-/// provider stream alive so the consumer — the planner's `emit_plan` decode, or a direct tool's
-/// input validation — can reject the call with repairable feedback the model retries on, instead
+/// provider stream alive so the consumer's native tool-input validation can reject the call with
+/// repairable feedback the model retries on, instead
 /// of the whole turn dying on a codec error (s_368 lost a turn after seven accepted rounds to a
 /// truncated tool-args blob).
 pub const ARGS_PARSE_ERROR_KEY: &str = "__args_parse_error";

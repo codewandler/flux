@@ -27,12 +27,6 @@ use flux_lang::host::OpOutcome;
 use flux_lang::runtime::sha256_hex;
 use flux_secret::Redactor;
 
-/// Ops never cassetted: the loop-machinery pair is host-internal (hidden from model plans; their
-/// "outputs" are whole transcripts) — recording them would bloat the tape with cells replay never
-/// consumes, and serving them from tape would be meaningless (the replay driver re-executes inner
-/// plans directly and never re-drives the outer loop).
-const SKIP_OPS: &[&str] = &["plan", "run_plan"];
-
 /// Capture kill-switch: on by default (without capture there is nothing to replay; every cell is
 /// scrubbed through the same redactor as `plan_source`, C-22), disabled with `FLUX_CASSETTE=0`.
 pub fn enabled() -> bool {
@@ -150,9 +144,6 @@ impl RecordScope {
     /// Append the cell for one completed dispatch. Failures to append are swallowed (recording is
     /// telemetry-grade: it must never fail a live turn), matching `record_plan_attempt`'s posture.
     pub fn record(&self, redactor: &Redactor, op: &str, input_json: &str, outcome: &OpOutcome) {
-        if SKIP_OPS.contains(&op) {
-            return;
-        }
         let input_hash = sha256_hex(input_json);
         let red_input = redactor.redact(input_json);
         let input_hash_redacted = (red_input != input_json).then(|| sha256_hex(&red_input));

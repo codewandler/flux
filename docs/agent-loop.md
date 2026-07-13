@@ -1,251 +1,151 @@
 # The agent loop
 
-flux's turn loop **is itself a Flux-Lang program**. When you run `flux run "…"` (or type into the
-REPL), the engine doesn't run a hardcoded Rust loop — it executes
-[`crates/flux-flow/assets/agent-loop.flux`](../crates/flux-flow/assets/agent-loop.flux), and the Rust
-side (`FlowEngine::run_turn_cancellable`) is just a thin bootstrap. This is the thesis — *the LLM is
-not the runtime* — taken all the way down: even the loop that orchestrates the model's steps is a
-readable plan, run through the same safety envelope as everything else.
+flux's turn loop is an authored Flux-Lang program. `FlowEngine::run_turn_cancellable` only supplies
+the session, cancellation token, provider, operation registry, and safety envelope; the program in
+[`crates/flux-flow/assets/agent-loop.flux`](../crates/flux-flow/assets/agent-loop.flux) owns the
+sequence. The same loop runs in the CLI, SDK `Client`, server/A2A, sub-agents, and app agents.
+Flow-driven voice selects an explicit authored flow over the same durable suspension/runtime seams;
+the experimental model-driven realtime mode is a separate, explicitly selected provider-owned loop.
 
-The loop has three passes (design [`multipass-agent-loop.md`](designs/multipass-agent-loop.md)):
+The key boundary is deliberate: **the model does not generate Flux code**. Flux owns the reliable
+control flow; a model participates only inside typed stages and through provider-native operation
+calls.
 
-```
-flow agent-loop -> string
-  $answer = fmt("")
-  $feedback = fmt("")
-  $done = fmt("")
+## The default adaptive loop
 
-  # Pass 1 -- orient: one planner call, a three-way contract -- trivial request -> prose chat;
-  # simple/actionable request -> the full execution plan; complex/context-hungry request -> a
-  # small read-only gather plan + brief. $settled is "" only for the gather case.
-  $plan = plan({ feedback: $feedback, phase: "orient" })
-  $settled = $plan.settled
+The built-in loop performs this bounded sequence:
 
-  # Pass 2 -- gather: bounded, read-only, approval-free rounds while not yet settled. Skipped
-  # entirely when orient already settled, so a trivial/simple turn adds zero latency here.
-  unless $settled
-    repeat 3
-      until $settled
-      $ran = run_plan($plan)
-      $feedback = $ran.transcript
-      do observe "turn.gather", $ran
-      $plan = plan({ feedback: $feedback, phase: "gather" })
-      $settled = $plan.settled
-
-  # Pass 3 -- plan / execute / revise: the standard loop, unchanged guards. A leftover gather
-  # plan (the budget exhausted before settling) simply runs as the first execute iteration.
-  repeat 25
-    until $done
-    $kind = $plan.kind
-    match $kind
-      case "chat"
-        $answer = $plan.text
-        $done = fmt("true")
-      case "error"
-        $answer = $plan.text
-        $done = fmt("true")
-      default
-        $ran = run_plan($plan)
-        $feedback = $ran.transcript
-        # $ran.failure is a reified mid-plan halt (design Part 2) when this round's plan failed
-        # part-way through — null (host-normalized, never a missing key) on a clean run. Routing on
-        # it tells a revision round (the model is repairing a halt) apart from a plain iteration.
-        $failure = $ran.failure
-        when $failure
-          do observe "turn.revision", $ran
-        else
-          do observe "turn.iteration", $ran
-        $plan = plan({ feedback: $feedback, phase: "execute" })
-  return $answer
+```text
+detect_intent
+  -> intersect signals with registered + wired + permitted operations
+  -> explore using those operations' exact native schemas
+       -> safe reads execute through the envelope and return evidence
+       -> a question parks on await and resumes the same state
+       -> effectful calls are captured, not executed
+  -> freeze captured calls into an immutable ActionBatch
+  -> approve_batch -> one-shot receipt bound to batch/session/caller/policy
+  -> execute_batch -> authorization -> approval scope -> guarded IO
+       -> failures return to the same native model ledger for local correction
+  -> present_results
 ```
 
-`plan` re-enters the planner (the model compiles your request into a typed graph), `run_plan`
-executes that graph **in the same session through the same approval + IO envelope**, and the
-transcript is fed back as `$feedback` so the next `plan` sees what happened. The loop ends when the
-model answers in prose.
+Intent and capability signals control visibility, not authority. A signal can surface only an
+operation that is present in the live registry and inside the agent's tool, permission, policy, and
+`with_tools` ceilings. Every selected operation still traverses `Executor::dispatch`.
 
-**Orient is the turn's first `plan` call, not an extra round-trip** — a trivial or simple/actionable
-request costs exactly as many provider calls as the old single-pass loop did; the gather pass never
-runs its body when orient already settled. `phase` threads through the already-opaque `plan` input
-(no protocol change), and `settled` is `""` only while an accepted `gather: true` plan is still being
-worked (the model's own signal, enforced effect-clean and capped at ~12 call nodes at compile time —
-never trusted blindly). The grounding `brief` a gather round carries is host-carried for the rest of
-the turn — prepended to every subsequent `plan` feedback message, gather or execute — so a multi-round
-gather never loses the thread. If the 3-round gather budget exhausts before settling, the leftover
-plan just runs as the execute pass's first iteration — nothing is discarded.
+Exploration distinguishes two kinds of native calls:
 
-A workspace `.flux/agent-loop.flux` override written before this phased loop shipped (a bare
-`plan($feedback)`, no `phase`) keeps working unchanged: a phase-less `plan` call behaves as the
-`execute` phase — byte-compatible with the pre-multipass contract.
+- A low-risk, idempotent read may run immediately so its actual redacted result becomes evidence.
+- A mutating, destructive, opaque, or non-idempotent call is captured as literal `{op, input}` data.
+  The host validates it against the live schema and later freezes it into an ordered batch.
 
-**A mid-plan failure doesn't discard the plan (design Part 2, patch-and-continue).** When an
-execute-phase plan fails part-way through, `run_plan` never errors the turn — it returns the
-completed prefix's transcript plus a reified `failure` (`{node, stmt, op, kind, fatal, message,
-completed[]}`) and the plan rendered with ✓/✗/· status markers. The loop observes `turn.revision`
-instead of `turn.iteration` for that round (routing on `$ran.failure`) and feeds the structured
-feedback to the next `plan` call. If the model re-emits a corrected plan that keeps the completed
-statements byte-identical, the runtime fast-forwards past them (rehydrating their recorded values,
-never re-dispatching them) and executes only the fixed suffix — the CLI/TUI render the halt in real
-time (`✗ step 4/9 edit failed — revising…`) and the resumed plan's reused prefix marked `✓ (done)`.
-A denied/refused statement is never silently re-dispatched unchanged; the model must choose a
-different approach.
+The model cannot mark a write as a read. Each operation's effects, risk, idempotency, concrete
+intents, and staging disposition are host-owned contracts.
 
-These reflexive ops — `plan`/`run_plan`/`ai_segment` plus the evidence ops
-`observe`/`evidence`/`metrics`/`grade` — are documented in
-[`crates/flux-flow/docs/ops-reference.md`](../crates/flux-flow/docs/ops-reference.md).
+## Why this replaced model-generated plans
 
-The loop also runs **inverted**: a flow-driven session (`FlowEngine::start_flow_turn`) makes an
-authored flow the conversation driver — its authored prompts are the assistant turns, resumes are
-deterministic, and the model is consulted only where the flow delegates a bounded
-`ai_segment(goal, tools, max_rounds, until?)`. Same ops, same envelope, opposite ownership. Design:
-[`designs/flow-driven-session.md`](designs/flow-driven-session.md) (and
-[`designs/flow-driven-voice.md`](designs/flow-driven-voice.md) for the realtime/voice channel).
+A one-shot model-generated graph asked the least reliable component to choose operations, reproduce
+their argument schemas inside a second language, and invent all control flow before it had evidence.
+Failures often required regenerating the whole graph. The adaptive loop keeps the useful model work
+— interpreting intent, selecting among visible capabilities, and reasoning over evidence — while
+placing determinism at the seams where mistakes have consequences.
 
-By design the loop is **invisible** during a normal turn: the machinery ops are filtered from the
-surface so you see the real work (`read`/`edit`/`bash`/…), not the plumbing. The commands below let
-you watch it, inspect what it recorded, and rewrite it.
+The resulting division is:
 
-## Watch it work live — `--show-loop`
+| Concern | Owner |
+|---|---|
+| intent, semantic choice, answer wording | typed model stage |
+| operation schemas and visibility | live host registry |
+| flow order, bounds, branching, await/resume | authored Flux-Lang |
+| batch identity and approval receipt | host runtime |
+| effects | authorization → approval → guarded IO |
+| replay/audit | event and flow stores |
+
+## Decisions and durable resume
+
+An exploration stage may return a typed decision request. The outer loop presents the question and
+parks on Flux-Lang's ordinary `await`. The flow store retains the prior bindings, including the
+opaque native-stage ledger. The user's next message resumes that exact flow; it does not ask a model
+to reconstruct the earlier evidence or plan.
+
+If execution returns a partial failure, completed actions remain recorded and the report goes back
+to the same exploration ledger. The model may correct only failed work and propose a new batch.
+Receipts are one-shot: changed, stale, reused, denied, cross-session, or authority-mismatched batches
+are rejected.
+
+## Observe it
+
+The initial provider wait is visible in the CLI:
+
+```text
+intent…
+◆ intent: update the release notes
+  capabilities: workspace.read, workspace.write
+exploring…
+```
+
+Use `--show-loop` to include the authored machinery operations, and `--trace-loop` for the structural
+Flux nodes:
 
 ```bash
-flux run --show-loop "fix the failing test"
+flux run --show-loop "update CHANGELOG.md after checking the current version"
+flux run --trace-loop "update CHANGELOG.md after checking the current version"
 ```
 
-`--show-loop` (or `FLUX_SHOW_LOOP=1`) stops the surface from filtering the loop machinery, so each
-iteration streams as it happens:
+Normal operation calls and results remain visible independently. Provider request/stream timing can
+be recorded with the model-trace controls documented in the CLI reference. `/evidence` shows the
+shared audit observations for the current session.
 
-```
-→ [1/25] plan       ask the model (phase: orient)
-  ✓ {"kind":"plan","ast":{…},"complete":null,"settled":"true"}
-→ [2/25] run plan   execute the emitted graph
-    … the inner ops (read/edit/cargo_test) stream and gate here …
-→ [4/25] observe    turn.iteration
-→ [5/25] plan       ask the model (phase: execute)
-  ✓ {"kind":"chat","text":"Fixed — the test passes now.","settled":"true"}
-```
+## Select or author a loop
 
-A complex/context-hungry request instead settles late: orient's gather plan runs a `turn.gather`
-round (not `turn.iteration`) before the execute pass ever starts, and a `flow.brief` observation
-marks the moment its grounding artifact was accepted.
-
-A mid-plan failure adds one more shape to watch for: `run_plan` emits a `flow.halt` observation the
-instant it halts (rendered as `✗ step 4/9 edit failed — revising…`), and the round's own `observe`
-call fires `turn.revision` instead of `turn.iteration`:
-
-```
-→ [2/25] run plan   execute the emitted graph
-    … completed steps stream normally, then the failing one …
-  ✗ step 2/3 edit failed — revising…
-→ [4/25] observe    turn.revision
-→ [5/25] plan       ask the model (phase: execute)
-  ✓ {"kind":"plan","ast":{…},"settled":"true"}
-→ [6/25] run plan   execute the emitted graph   (statement 0 skipped — fast-forwarded)
-→ [8/25] observe    turn.iteration
-```
-
-The machinery ops are pre-authorized engine control flow, so revealing them never adds approval
-prompts. (`-v`/`--verbose` is separate — it un-caps tool *output*; combine them for the fullest view.)
-
-## Trace the loop's structure — `--trace-loop`
-
-`--show-loop` reveals *which ops* the loop dispatches; `--trace-loop` (or `FLUX_TRACE_LOOP=1`) goes
-one level deeper and traces the loop program's own **structure** — one dim line per outer-loop round
-and per structural AST node it executes (op calls with their bind name, which `when`/`unless`/`match`
-branch was taken, `return`, and an until-guard exit) — while leaving the loop's normal output
-completely unchanged when the flag is off:
+Adaptive is the default. Selection is always explicit; merely creating `.flux/agent-loop.flux` does
+not change runtime behavior.
 
 ```bash
-flux run --trace-loop "fix the failing test"
+flux run --loop adaptive "summarize this repository"
+flux run --loop loops/support.flux "triage this request"
+
+flux loop show                 # print the built-in preset
+flux loop eject                # copy it to .flux/agent-loop.flux for editing
+flux run --loop .flux/agent-loop.flux "use my loop"
 ```
 
-```
-⟳ round 1/25
-· plan → $plan
-· when $settled → else
-⟳ round 4/25
-· run_plan → $ran
-· match $ran.failure = null → default
-· return $answer
-```
-
-This only traces the **outer** agent loop (`agent-loop.flux`) — a plan's own internal ops still
-stream via the normal tool-call output, never through this trace. The observations are live-only:
-they never touch the value store, the run-event trail, or `/evidence`'s log.
-
-## Convergence guards — why a turn ends by itself
-
-The execute loop is capped at 25 rounds, but four guards usually end a stuck turn much earlier —
-each with an honest "Stopping: …" message that says what happened and what was gathered:
-
-- **Transcript stall** — the exact same step + result repeating (escalates at 2, stops at 4).
-- **Deterministic-failure stall** — the same structured failure recurring across otherwise-varied
-  plans (same thresholds).
-- **Redundancy** — read-only rounds that bind *no new evidence*: re-reads under renamed symbols and
-  read windows slid over already-covered lines both count as redundant (escalates at 2, stops at 3;
-  exact repeat reads are served from a write-invalidated cache with an `already read as $X` note).
-- **Breadth** — read-only rounds *regardless of freshness*: a model that keeps finding
-  novel-but-marginal things to read (a new grep pattern every round) never trips the redundancy
-  guards, so after 6 consecutive read-only rounds the loop injects "answer now from the session
-  symbols, or name precisely what is missing", and after 10 it ends the turn honestly. Any
-  effectful op (edit/write/bash…) resets the count — read→fix iteration is never punished.
-
-Legitimately read-heavy workflows raise (or disable) the breadth ladder in `.flux/config.toml`
-instead of fighting it:
+Project config uses the same selector:
 
 ```toml
-[limits]
-readonly_rounds_escalate = 12   # 0 disables the escalation rung
-readonly_rounds_stop = 20       # 0 disables the honest stop
+[agent]
+loop = "loops/support.flux"
 ```
 
-An opt-in per-turn **token budget** (`--turn-budget`, `FLUX_TURN_TOKEN_BUDGET`, or
-`[limits] turn_token_budget`) adds a hard cost ceiling on top; it stays off by default.
+Roles may carry `agent_loop` source in frontmatter. `AgentSpec::agent_loop` and the SDK builder use
+`AgentLoopSpec`. A Flux app can declare and select a loop in the same source file:
 
-## Inspect the evidence trail — `/evidence`
+```flux
+agent_loop support
+  $intent = detect_intent()
+  $step = explore({ state: $intent.state })
+  $answer = present_results({ step: $step })
+  return $answer
 
-The loop and the dispatcher record an audit trail as the turn runs — tool calls, tool errors,
-per-iteration markers, and any observation a flow emits. In the REPL:
-
-```
-/evidence
-  evidence: 7 observations, 2 iterations, 1 error
-    turn      tool_call        {"tool":"read"}
-    turn      tool_error       {"tool":"cargo_test"}
-    turn      turn.iteration   {"steps":3}
-    …
+agent guide
+  model "openrouter/google/gemini-2.5-flash"
+  loop "support"
 ```
 
-This is the same shared log the `observe`/`evidence`/grading ops read, which is what makes the loop
-*evidence-based*: it can branch on its own runtime observations. The trail is also **durable**: at
-the end of every turn the engine flushes the log's new entries to the session's event store
-(`events.db`) as `observation` events, and each planning attempt is recorded with the accepted
-plan's fingerprint and its readable rendered graph — so a session's evidence survives process exit
-and can be read offline (`flux_events::projection::observations`).
+Custom loops are ordinary validated Flux-Lang. They may combine deterministic operations,
+`detect_intent`, `explore`, `approve_batch`, `execute_batch`, `present_results`, `ai_segment`,
+`observe`, and `await`. Unknown operations fail validation before a turn starts.
 
-## Read & customize the loop — `flux loop`
+## Flow versus journey
 
-```bash
-flux loop show     # print the active loop (built-in, or a workspace override) + its source
-flux loop eject    # write the built-in to .flux/agent-loop.flux so you can edit it
-flux loop eject --force   # overwrite an existing override with the built-in
-```
+A **flow** is a reusable deterministic computation: typed inputs, explicit operations and control
+flow, and a result. A **journey** is the application-level interaction lifecycle around one or more
+flows: triggers, channels, conversations, decisions, waits, and delivery. A journey can call flows;
+an agent loop is a specialized flow that drives one conversational turn.
 
-A workspace `.flux/agent-loop.flux` **overrides** the built-in loop — the engine parses and runs it
-on the next turn (an invalid override is reported by `flux loop show` and fails the turn rather than
-silently falling back). `eject` is just a convenience that drops the built-in text there for you to
-edit; you can also write the file by hand. Because the loop is ordinary Flux-Lang, you can change the
-iteration cap, add a `grade`-based stop condition, emit extra observations, or restructure the
-control flow entirely — all within the same envelope.
+That distinction is useful, not restrictive. A docs assistant journey can own the invariant “search
+the handbook before every answer,” while its retrieval and answer-building steps remain reusable
+flows and typed model stages.
 
-## How it fits together
-
-- **The loop is a plan**, not Rust — `assets/agent-loop.flux`, overridable per workspace.
-- **The reflexive ops** (`plan`/`run_plan`/`ai_segment`) are tagged to a never-surfaced `reflect`
-  group, so the model never sees them; only a pre-authored flow (the loop, a flow-driven session, or
-  `flux flow run`) can call them.
-- **Everything still dispatches through `Executor`** — the no-bypass safety envelope holds
-  recursively, even for a plan that runs a plan.
-
-See [architecture.md](architecture.md#agent-loop-sessions-context) for where this sits in the crate
-layering, and [`ops-reference.md`](../crates/flux-flow/docs/ops-reference.md#agent-loop-ops-the-self-hosted-turn-loop)
-for the op signatures.
+See [architecture.md](architecture.md#agent-loop-sessions-context) and the
+[engine operation reference](../crates/flux-flow/docs/ops-reference.md).

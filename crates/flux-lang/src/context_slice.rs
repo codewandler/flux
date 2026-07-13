@@ -620,6 +620,7 @@ mod tests {
             required_params: required.iter().map(|s| s.to_string()).collect(),
             optional_params: optional.iter().map(|s| s.to_string()).collect(),
             param_types: Map::new(),
+            output: crate::ast::TypeRef::Any,
             semantic_effects: Vec::new(),
         }
     }

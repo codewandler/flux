@@ -2,9 +2,8 @@
 //!
 //! Both surfaces share the *content* — what to show for a `bash`/`read`/`grep`/… call — while each
 //! applies its own styling (the CLI via `style`, the TUI via ratatui). So this module returns plain
-//! strings and never emits ANSI. The agent's only model-facing tool is the planner's `emit_plan`; the
-//! ops formatted here are the plan nodes the runtime dispatches (their input is the tool's normal
-//! schema-shaped JSON).
+//! strings and never emits ANSI. Model stages call operations through their native schemas; authored
+//! Flux flows call the same operations as graph nodes. This formatter handles both paths.
 
 use serde_json::Value;
 

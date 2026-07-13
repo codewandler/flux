@@ -813,6 +813,17 @@ impl Engine {
             .iter()
             .map(|source| source.name.as_str())
             .collect();
+        let loop_names: HashSet<&str> = self
+            .program
+            .agent_loops
+            .iter()
+            .map(|agent_loop| agent_loop.name.as_str())
+            .collect();
+        if loop_names.len() != self.program.agent_loops.len() {
+            return Err(Error::Other(
+                "agent loop declaration names must be unique".into(),
+            ));
+        }
         let composites: HashMap<String, &[Node]> = self
             .program
             .ops
@@ -824,6 +835,14 @@ impl Engine {
             validate_permission_decl("program permissions", permissions, &known)?;
         }
         for agent in &self.program.agents {
+            if let Some(agent_loop) = agent.agent_loop.as_deref() {
+                if !loop_names.contains(agent_loop) {
+                    return Err(Error::Other(format!(
+                        "agent `{}` names unknown agent loop `{agent_loop}`",
+                        agent.name
+                    )));
+                }
+            }
             if let Some(permissions) = &agent.permissions {
                 validate_permission_decl(
                     &format!("agent `{}` permissions", agent.name),
@@ -1357,6 +1376,13 @@ impl Engine {
             .provider
             .clone()
             .ok_or_else(|| Error::Other(format!("agent `{name}` needs a model provider")))?;
+        let agent_loop = decl.agent_loop.as_deref().and_then(|name| {
+            self.program
+                .agent_loops
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .map(|candidate| candidate.flow.clone())
+        });
         let engine = Arc::new(
             build_agent_engine(
                 decl,
@@ -1368,6 +1394,7 @@ impl Engine {
                 self.redactor.clone(),
                 self.system.clone(),
                 &self.host_permissions,
+                agent_loop,
             )
             .await?,
         );
@@ -1783,9 +1810,10 @@ async fn build_agent_engine(
     redactor: Redactor,
     system: Arc<System>,
     host_permissions: &HostPermissionRules,
+    agent_loop: Option<flux_lang::ast::DraftAst>,
 ) -> Result<FlowEngine> {
     let available = registry.names();
-    let profile = resolve_agent_runtime_profile(
+    let mut profile = resolve_agent_runtime_profile(
         decl,
         app_permissions,
         Some(provider.clone()),
@@ -1796,12 +1824,15 @@ async fn build_agent_engine(
         host_permissions,
     )
     .await?;
+    if let Some(agent_loop) = agent_loop {
+        profile.spec.agent_loop = flux_agent::AgentLoopSpec::Flux(agent_loop);
+    }
     let ctx = ToolContext::new(system).with_redactor(redactor);
     let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
-    // The agent loop's planner reads the turn's conversation via the FlowStore (`store.conversation()`),
+    // Adaptive model stages read the turn's conversation via the FlowStore (`store.conversation()`),
     // which delegates to the FlowStore's *internal* event log. Back it with the SAME `events` store the
     // engine records the user message into — otherwise `in_memory()` mints a fresh, empty EventStore and
-    // the planner sees no conversation, so the model only ever gets the system prompt (never the user's
+    // the stages see no conversation, so the model only ever gets the system prompt (never the user's
     // message). This is what makes an `agent`-bound trigger actually answer the inbound mention.
     let flow = FlowStore::in_memory_with_events(events.clone()).map_err(other)?;
     profile
@@ -1997,12 +2028,40 @@ impl AgentSink for UsageCapture<'_> {
 mod agent_target_tests {
     use super::*;
     use async_trait::async_trait;
-    use flux_core::{Chunk, Role, StopReason};
+    use flux_core::{Chunk, ContentBlock, Role, StopReason};
     use flux_lang::program::Module;
     use flux_provider::{ChunkStream, Request};
 
-    /// A provider that answers every turn with the same prose (no plan) — enough to drive an agent turn
-    /// to a final reply hermetically (no network, no real model).
+    fn intent_or_reply(req: &Request, reply: String, usage: Option<Usage>) -> Vec<Chunk> {
+        let mut chunks = if req.tools.len() == 1 && req.tools[0].name == "declare_intent" {
+            vec![Chunk::Block(ContentBlock::ToolUse {
+                id: "intent-1".into(),
+                name: "declare_intent".into(),
+                input: json!({
+                    "intent": "answer the current message",
+                    "capability_families": []
+                }),
+            })]
+        } else {
+            vec![Chunk::TextDelta(reply)]
+        };
+        if let Some(usage) = usage {
+            chunks.push(Chunk::Usage(usage));
+        }
+        chunks.push(Chunk::Done {
+            stop_reason: Some(
+                if req.tools.len() == 1 && req.tools[0].name == "declare_intent" {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                },
+            ),
+        });
+        chunks
+    }
+
+    /// A provider that follows the adaptive intent protocol and then answers with fixed prose —
+    /// enough to drive an agent turn hermetically (no network, no real model).
     struct ReplyProvider {
         reply: String,
     }
@@ -2011,13 +2070,8 @@ mod agent_target_tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            let chunks = vec![
-                Chunk::TextDelta(self.reply.clone()),
-                Chunk::Done {
-                    stop_reason: Some(StopReason::EndTurn),
-                },
-            ];
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = intent_or_reply(&req, self.reply.clone(), None);
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -2033,18 +2087,16 @@ mod agent_target_tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            let chunks = vec![
-                Chunk::TextDelta(self.reply.clone()),
-                Chunk::Usage(Usage {
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = intent_or_reply(
+                &req,
+                self.reply.clone(),
+                Some(Usage {
                     input_tokens: 100,
                     output_tokens: 40,
                     ..Default::default()
                 }),
-                Chunk::Done {
-                    stop_reason: Some(StopReason::EndTurn),
-                },
-            ];
+            );
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -2058,6 +2110,10 @@ mod agent_target_tests {
             "mock"
         }
         async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            if req.tools.len() == 1 && req.tools[0].name == "declare_intent" {
+                let chunks = intent_or_reply(&req, String::new(), None);
+                return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            }
             let echo = req
                 .messages
                 .iter()
@@ -2191,6 +2247,7 @@ journey pong
         let decl = AgentDecl {
             name: "a".into(),
             model: None,
+            agent_loop: None,
             tools: vec!["search".into(), "now".into()],
             datasources: vec!["handbook".into()],
             description: Some("be terse".into()),
@@ -2269,6 +2326,7 @@ journey pong
         let decl = AgentDecl {
             name: "guide".into(),
             model: None,
+            agent_loop: None,
             tools: vec!["search".into(), "sources".into()],
             datasources: vec!["handbook".into()],
             description: Some("answer from docs".into()),
@@ -2288,6 +2346,7 @@ journey pong
             Redactor::new(),
             Arc::new(System::new(Workspace::new(".").unwrap())),
             &HostPermissionRules::default(),
+            None,
         )
         .await
         .unwrap();
@@ -2335,6 +2394,7 @@ journey pong
         let base = AgentDecl {
             name: "a".into(),
             model: None,
+            agent_loop: None,
             tools: vec![],
             datasources: vec![],
             description: Some("be terse".into()),
@@ -2379,6 +2439,7 @@ journey pong
         let decl = AgentDecl {
             name: "reasoner".into(),
             model: None,
+            agent_loop: None,
             tools: vec![],
             datasources: vec![],
             description: None,
@@ -2408,6 +2469,7 @@ journey pong
         let decl = AgentDecl {
             name: "a".into(),
             model: None,
+            agent_loop: None,
             tools: vec![],
             datasources: vec![],
             description: Some("be terse".into()),
@@ -2458,6 +2520,7 @@ journey pong
         let decl = AgentDecl {
             name: "a".into(),
             model: None,
+            agent_loop: None,
             tools: vec![],
             datasources: vec![],
             description: Some("be terse".into()),
@@ -2540,8 +2603,14 @@ trigger t1
             .usage
             .as_ref()
             .expect("an agent turn that reports usage must carry it onto the JourneyRun");
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(
+            usage.input_tokens, 100,
+            "turn input is the latest stage's context-window occupancy"
+        );
+        assert_eq!(
+            usage.output_tokens, 80,
+            "intent + exploration output is cumulative"
+        );
         assert_eq!(
             runs[0].model, "mock",
             "the driving engine's own canonical model spec, not some other default"

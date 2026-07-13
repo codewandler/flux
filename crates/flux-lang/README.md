@@ -1,21 +1,21 @@
 # flux-lang
 
-**Flux-Lang is a small programming language built for LLMs.** Instead of acting tool-by-tool, a model
-expresses a whole task as a typed **execution graph** — an AST — and a deterministic runtime executes
-it. The defining principle of the surrounding project holds here in miniature:
+**Flux-Lang is a small authored workflow language for AI applications.** It places deterministic
+control flow around typed model stages and registered operations, and a deterministic runtime executes
+the resulting AST. The defining principle of the surrounding project holds here in miniature:
 
-> **The LLM plans. The runtime runs.** The model is a compiler front-end that emits a readable plan;
+> **The LLM is not the runtime.** Authors define the flow; models contribute bounded typed judgment;
 > the runtime resolves *symbols* to stored *values* and runs registered *operations* under policy.
 
 Designed-for-AI shows up in the language itself:
 
 - **Simple, explicit control structures.** Loops (`repeat`/`each`/`loop`), branches (`when`/`unless`),
   error handling (`try`/`retry`), concurrency (`parallel`/`race`) — all are *nodes in the graph*, never
-  hidden inside a shell string. A turn is a program you read like Go or Rust before it runs.
-- **Token-efficient by construction.** Results are stored as **symbols** and referenced by name, so raw
-  outputs aren't re-sent every step. The model sees a compact symbolic view, not a growing transcript.
-- **Auditable & deterministic.** The plan is an artifact: it can be rendered, diffed, and re-run with
-  the fewest possible model calls.
+  hidden inside a shell string. A flow is a program you read like Go or Rust before it runs.
+- **Token-efficient by construction.** Results are stored as **symbols** and referenced by name; an
+  explicit context pack controls which materialized values a model-backed operation receives.
+- **Auditable & deterministic.** A flow is an artifact: it can be rendered, diffed, and re-run while
+  non-deterministic boundaries stay explicit.
 - **Operations are injected, not built in.** The language knows *node kinds*, not tools — a `call`
   targets whatever operations the host advertises. That keeps the language a pure, reusable core.
 
@@ -46,7 +46,7 @@ So — a behaviour tree? a DAG? Neither, exactly:
 | a **hand-wired DAG / dataflow graph** (Airflow-style) | you write structured *code*; the dependency **DAG is *derived*** from single-assignment data, not drawn by hand |
 | a **general-purpose language** | no recursion, unbounded loops, mutable state, or goto (deliberate — PRD §4) |
 | a **state machine / actor** | no explicit states/transitions; `await` is suspend/resume, not an FSM |
-| an **LLM agent loop** (ReAct) | the model **compiles** the plan once; the runtime schedules it — the model is not the scheduler |
+| an **LLM-owned agent loop** (ReAct) | an authored Flux flow owns the loop; models run only inside typed operations/stages |
 
 In one line:
 
@@ -81,7 +81,7 @@ caching / dead-step elimination the optimizer targets.
 | `effects` | lower semantic `FlowEffect`s onto host effects + policy actions |
 | `render` | render an AST as a human-readable (one-way) execution tree |
 | `schema` | the single source of truth: the AST's JSON Schema + the node-kind catalog |
-| `skill` | the generated language skill an LLM reads to author Flux-Lang |
+| `skill` | the generated, explicitly installable reference for authoring Flux-Lang |
 | `runtime` | the **reference interpreter** — runs a flow against injected `host`/`store`/`sink` traits |
 | `host` / `store` / `sink` | the L0 trait seams the interpreter dispatches effects through |
 
@@ -91,7 +91,7 @@ an embedder (the `flux-flow` engine) adapts its safety envelope onto `OpHost`/`V
 
 ## Authoring flows in Rust (the `dsl`)
 
-Besides the text syntax and an LLM-emitted AST, a flow can be built natively in Rust with the `dsl`
+Besides the text syntax and JSON AST, a flow can be built natively in Rust with the `dsl`
 builder primitives — they compile to the same `DraftAst`. Loops (`each`/`repeat`/`loop_for`/`race`) and
 control-flow (`match`/`route`/`fallback`/`timeout`/`budget`) are first-class:
 

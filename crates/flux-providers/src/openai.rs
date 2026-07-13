@@ -397,8 +397,8 @@ pub(crate) fn map_chat_stream(
                                 slot.2.push_str(&fragment);
                                 // A-43: surface the fragment as a `ToolInputDelta` too (in addition
                                 // to the existing accumulation this codec always did), mirroring
-                                // the Messages codec's L-23 wiring, so a caller can render an
-                                // `emit_plan` plan skeleton progressively on this wire too — purely
+                                // the Messages codec's L-23 wiring, so a caller can trace or render
+                                // a large native tool input progressively on this wire too — purely
                                 // additive, the completed `Chunk::Block` below remains the sole
                                 // source of truth for the final call. `name` carries forward from
                                 // `slot.1` since only the first fragment's delta typically carries
@@ -1378,14 +1378,14 @@ mod tests {
         assert_eq!(usage.expect("usage chunk").reported_cost_usd, None);
     }
 
-    /// A-32 (s_368): deepseek-v4-flash:nitro stopped emitting mid-args — a ~19KB `emit_plan`
-    /// blob cut off inside a list ("EOF while parsing a list at line 1 column 19189"). The codec
+    /// A-32 (s_368): deepseek-v4-flash:nitro stopped emitting mid-args — a large native tool input
+    /// cut off inside a list ("EOF while parsing a list at line 1 column 19189"). The codec
     /// must balance-close the truncation and yield a usable tool_use block instead of failing the
     /// stream, which killed the whole turn.
     #[tokio::test]
     async fn chat_tool_args_truncated_mid_list_are_repaired() {
         let sse = concat!(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"emit_plan\",\"arguments\":\"{\\\"ast\\\":{\\\"body\\\":[1,2\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"lines\\\":[1,2\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n",
         );
@@ -1405,8 +1405,8 @@ mod tests {
 
         match &blocks[0] {
             ContentBlock::ToolUse { name, input, .. } => {
-                assert_eq!(name, "emit_plan");
-                assert_eq!(input["ast"]["body"], json!([1, 2]));
+                assert_eq!(name, "write");
+                assert_eq!(input["lines"], json!([1, 2]));
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
@@ -1448,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn chat_tool_args_unrepairable_yield_parse_error_sentinel() {
         let sse = concat!(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"emit_plan\",\"arguments\":\"{\\\"a\\\" \\\"b\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"a\\\" \\\"b\\\"}\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n",
         );

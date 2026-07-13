@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-  A Rust agent platform for typed plans, guarded execution, and replayable evidence.
+  A Rust agent platform for typed stages, authored flows, guarded execution, and replayable evidence.
 </p>
 
 <p align="center">
@@ -24,23 +24,25 @@
 
 ## The LLM is not the runtime
 
-In flux, the model never becomes the execution engine. It turns a request into a typed, inspectable
-Flux-Lang plan; a deterministic Rust runtime owns what happens next.
+In flux, the model never becomes the execution engine—or the author of executable Flux code. It
+declares intent, explores through exact provider-native operation schemas, and proposes literal
+actions. An authored Flux-Lang loop and deterministic Rust runtime own what happens next.
 
 ```text
-request  ── model ──▶  typed plan  ── runtime ──▶  authorization → approval → guarded IO
+request → typed intent → scoped exploration → action batch → approval → guarded execution
+                       authored Flux-Lang + deterministic runtime
 ```
 
-That hard boundary makes plans reviewable before they run, repeatable after they run, and governable
-at every effect. The same execution envelope covers local tools, plugins, sub-agents, the SDK, and
-the server.
+That hard boundary makes effects reviewable before they run, authored workflows repeatable, and every
+operation governable. The same execution envelope covers local tools, plugins, sub-agents, the SDK,
+and the server.
 
 ## What flux includes
 
 Flux is one platform with three co-equal pillars:
 
 - **Agent**: local CLI/TUI, Rust SDK, HTTP server, and A2A support.
-- **Flux-Lang**: typed plans for orchestration and structure, with editor support — the in-repo
+- **Flux-Lang**: typed, authored flows for orchestration and reliable structure, with editor support — the in-repo
   `flux-lsp` language server (diagnostics, completion, hover, formatting) and a
   [tree-sitter grammar](https://github.com/codewandler/flux-tree-sitter) for Helix/Neovim/Zed
   highlighting.
@@ -48,7 +50,7 @@ Flux is one platform with three co-equal pillars:
 
 Use flux when you want:
 
-- a plan you can inspect and review before execution
+- an action batch you can inspect and approve before execution
 - guardrails that are explicit and consistent
 - deterministic replay/fork/diff workflows
 - an embeddable agent surface inside your own product
@@ -87,11 +89,11 @@ Release assets (including checksums and plugin-release checks) are in each
 # Start a normal turn
 flux run "add a test for the parser"
 
-# Inspect what would run
-flux plan "summarize README.md into SUMMARY.txt"
+# Reveal intent, capability selection, and batch machinery
+flux run --show-loop "summarize README.md into SUMMARY.txt"
 
-# Show plan as JSON and exit (never runs)
-flux plan -o json "print hello world 3 times"
+# Inspect the authored outer loop; ejecting it does not activate it implicitly
+flux loop show
 
 # Start REPL / TUI / server
 flux
@@ -139,7 +141,7 @@ Configuration precedence is:
 model = "claude/opus"
 
 [private_net]
-web_fetch = ["localhost"]
+web = ["localhost"]
 
 [private_net.plugins]
 prometheus = ["prometheus.local"]
@@ -169,11 +171,11 @@ No bypass path exists:
 
 - workspace file/process/net operations are guarded by `flux-system`
 - unsafe/ambiguous commands can be denied at analysis or approval time
-- destructive intent is surfaced at plan level and re-checked at dispatch time
+- effectful native calls are frozen into an approved batch and re-checked at dispatch time
 - all secrets are registered with the redactor and scrubbed from tool output/logs
 - evidence is persisted per session and event for auditability
 
-Sub-agents inherit the same safety chain; their plans are validated with the same checks.
+Sub-agents inherit the same safety chain; their loops and operation calls are validated with the same checks.
 
 ## Capabilities and operations
 
@@ -182,7 +184,7 @@ Sub-agents inherit the same safety chain; their plans are validated with the sam
 - Skills are loaded from project `.flux/skills` and standard global skill directories.
 - Plugin operations are manifest-scoped; privileges are explicit and enforced.
 - Approval and policy hooks (`.flux/hooks/*.js`) can validate/transform/deny calls.
-- REPL slash commands include `/plan`, `/run`, `/tools`, `/session`, `/compact`, `/evidence`, and more.
+- REPL slash commands include `/tools`, `/sessions`, `/compact`, `/evidence`, and more.
 - `flux tui` provides the same daily-driver controls in a dense borderless UI, with a visible FIFO
   follow-up queue, session picker/replay, multiline paste, and live model switching.
 

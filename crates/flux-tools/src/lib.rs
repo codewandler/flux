@@ -308,7 +308,7 @@ struct ProcRunInput {
 struct GlobInput {
     /// Glob, e.g. `*.rs` or `src/*`
     pattern: String,
-    /// Subdirectory to search (default `.`)
+    /// Literal existing subdirectory to search (default `.`); put wildcards in `pattern`, not here
     #[serde(default)]
     path: Option<String>,
 }
@@ -1302,7 +1302,9 @@ impl Tool for GlobTool {
             "glob",
             "List workspace files matching a glob pattern. `*` matches any characters (including \
              `/`), so `*.rs` finds all Rust files and `src/*` everything under src. Optional \
-             `path` scopes the search to a subdirectory. Patterns match workspace-relative paths.",
+             `path` scopes the search to one literal existing subdirectory and must not contain \
+             wildcards. Patterns match workspace-relative paths. To inventory the whole workspace, \
+             use `pattern: \"*\"` and omit `path`.",
             tool_input_schema::<GlobInput>(),
         )
         .with_effects(vec![Effect::Read, Effect::Filesystem])
@@ -1325,6 +1327,14 @@ impl Tool for GlobTool {
         let args: GlobInput = parse_params(params, "glob")?;
         let pattern = args.pattern.as_str();
         let base = args.path.as_deref().unwrap_or(".");
+        if base.contains('*') || base.contains('?') {
+            return Ok(ToolResult::error(
+                "glob: `path` is a literal directory, not a pattern. Put all wildcards in \
+                 `pattern`; to inventory the whole workspace, call glob with `pattern: \"*\"` and \
+                 omit `path`."
+                    .to_string(),
+            ));
+        }
         let files = ctx.system.walk_files(base, WALK_FILE_CAP).await?;
         let mut matches: Vec<String> = files
             .into_iter()
@@ -1566,9 +1576,8 @@ impl Tool for ReadManyTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only(
             "read_many",
-            "Read several files at once (each section is headed `==> path <==`). Prefer `read` \
-             with an array or glob pattern — `read_many` is a legacy alias kept for backward \
-             compatibility.",
+            "Read several known files in one operation (each section is headed `==> path <==`). \
+             Prefer this over sequential `read` calls once multiple relevant paths are known.",
             tool_input_schema::<ReadManyInput>(),
         )
         .with_effects(vec![Effect::Read, Effect::Filesystem])
@@ -1600,6 +1609,10 @@ impl Tool for ReadManyTool {
                 "read_many: `paths` must be a non-empty array of strings".to_string(),
             ));
         }
+        let existence =
+            futures::future::join_all(args.paths.iter().map(|path| ctx.system.path_exists(path)))
+                .await;
+        let all_missing = existence.iter().all(|result| matches!(result, Ok(false)));
         let sections =
             futures::future::join_all(args.paths.iter().map(|p| read_section(ctx, p))).await;
         let mut canonical = Vec::with_capacity(sections.len());
@@ -1607,6 +1620,13 @@ impl Tool for ReadManyTool {
         for (c, v) in sections {
             canonical.push(c);
             view.push(v);
+        }
+        if all_missing {
+            let repair = "No requested path exists. Do not guess another filename. Discover the \
+                          workspace once with glob using `pattern: \"*\"` and no `path`, then read \
+                          the returned relevant paths together.";
+            canonical.push(repair.to_string());
+            view.push(repair.to_string());
         }
         Ok(ToolResult::ok_view(
             canonical.join("\n\n"),
@@ -3597,6 +3617,24 @@ mod tests {
         assert!(r.content.contains("==> b.txt <==") && r.content.contains("bbb"));
         // A missing path shows an error section but does not fail the whole call.
         assert!(r.content.contains("==> missing.txt <== (error"));
+        assert!(!r.content.contains("Do not guess another filename"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_many_all_missing_gives_one_root_inventory_repair() {
+        let (dir, c) = ctx();
+        let r = ReadManyTool
+            .execute(
+                &c,
+                json!({"paths": ["handbook/customer.md", "data/incidents.csv"]}),
+            )
+            .await
+            .unwrap();
+        assert!(r.content.contains("No requested path exists"));
+        assert!(r.content.contains("Do not guess another filename"));
+        assert!(r.content.contains("`pattern: \"*\"`"));
+        assert!(r.content.contains("no `path`"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3738,6 +3776,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none.content, "no files match");
+
+        let wildcard_path = GlobTool
+            .execute(&c, json!({"pattern": "**/*", "path": "src/*"}))
+            .await
+            .unwrap();
+        assert!(wildcard_path.is_error);
+        assert!(wildcard_path.content.contains("literal directory"));
+        assert!(wildcard_path.content.contains("omit `path`"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

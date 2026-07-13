@@ -59,6 +59,7 @@ fn composite_signature(op: &CompositeOpDecl) -> OpSignature {
         required_params: op.params.iter().map(|param| param.name.0.clone()).collect(),
         optional_params: Vec::new(),
         param_types,
+        output: op.returns.clone().unwrap_or(flux_lang::ast::TypeRef::Any),
         // Composite ops don't yet declare their own semantic-effect tier (D-138 scopes catalog
         // semantics to leaf ops); see `flux_flow::registry::composite_signature`.
         semantic_effects: Vec::new(),

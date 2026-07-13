@@ -6,8 +6,8 @@ description: "Provider/model routing, credentials, and the current model capabil
 # Providers and models
 
 flux keeps model transport separate from the agent runtime. A provider is a wire codec plus a
-credential source: how a request is serialized and how it authenticates. The runtime still owns plans,
-tool dispatch, approval, and guarded IO.
+credential source: how a request is serialized and how it authenticates. The runtime still owns the
+authored outer loop, capability ceilings, action batches, approval, and guarded IO.
 
 Use this page to choose `-m <provider>/<model>`, configure credentials, and understand which providers
 support prompt caching or subscription credentials.
@@ -58,17 +58,15 @@ text-leaked tool calls.
 
 ## Model capability floor
 
-flux's planner asks the model to emit a typed Flux-Lang plan (the `emit_plan` tool) that passes a
-strict validator, with a bounded repair loop when a first attempt is rejected. Frontier and mid-tier
-models (Claude, GPT-5-class, Codex, and the stronger OpenRouter models) clear this reliably;
-**small/weak models can fail the planner contract even on trivial requests** — the repair loop
-exhausts its budget on malformed tool-call JSON or an invalid plan and the run errors rather than
-silently degrading. Routing is per-`-m`, so if a model can't produce a valid plan, point a capable
-model at the planning turn (and, if you like, cheaper models at sub-agents).
+The default loop uses two ordinary function-calling contracts: a small typed intent declaration and
+provider-native calls against the exact live operation schemas. The model never has to reproduce an
+operation inside a Flux AST. Invalid arguments return schema diagnostics in the same native ledger so
+the model can correct the call locally; rounds and token use are bounded.
 
-The runtime also guards a related weak-model failure mode: a model that calls a read/search op and
-then *repeats the same call* instead of making progress is caught by the loop's stall guards, which
-escalate and then stop with an honest "could not make progress" instead of looping indefinitely.
+Use a model with reliable function calling. A model that cannot emit the intent tool, repeatedly
+calls unavailable operations, or does not make progress stops with an explicit error rather than
+gaining a fallback execution path. Smaller models can still be useful for narrow config/SDK stages
+whose input, output, and gather-tool ceilings are tightly constrained.
 
 ## Credentials
 
@@ -94,8 +92,8 @@ needed.
 
 `--think` asks capable models to expose adaptive thinking. `--effort
 low|medium|high|xhigh|max` sets the provider-mapped reasoning effort. They are independent: use one
-or both. The setting follows the whole agent call graph — planner and repair calls, grounded final
-rendering, context compaction, cognition operations, and sub-agents that do not override it.
+or both. The setting follows the whole agent call graph—intent, exploration, repair, presentation,
+context compaction, cognition operations, and sub-agents that do not override it.
 
 ```bash
 flux run -m codex/gpt-5.5 --effort low "summarize this repository"
@@ -112,8 +110,8 @@ the thinking channel; merely opening the TUI or attaching a streaming consumer d
 Set `FLUX_MODEL_TRACE=1` to write one credential-free JSON summary before each native model request
 and one correlated terminal record to stderr. It reports request and cache-segment sizes, selected
 thinking/effort, response-header time, first thinking/tool/text time, retries, usage, and total stream
-time. It applies consistently to planning, repair, final rendering, compaction, cognition calls, and
-sub-agents.
+time. It applies consistently to intent, exploration, repair, presentation, compaction, cognition
+calls, and sub-agents.
 
 ```bash
 FLUX_MODEL_TRACE=1 flux run -m codex/gpt-5.5 --effort low "explain this failure"

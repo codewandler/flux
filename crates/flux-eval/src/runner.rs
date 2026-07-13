@@ -318,7 +318,7 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
     // Add security posture last: benchmark-controlled `spec.env` must not be able to downgrade the
     // parent CLI's resolved sandbox mode or redirect its backend after the harness decided it.
     env.extend(sandbox_child_env());
-    // In watch mode, reveal the loop machinery so the observer sees plan/run_plan/observe.
+    // In watch mode, reveal authored-loop stages and evidence events.
     if ctx.watch {
         env.push(("FLUX_SHOW_LOOP".to_string(), "1".to_string()));
     }

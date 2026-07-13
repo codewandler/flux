@@ -123,11 +123,9 @@ pub enum Chunk {
     /// and `partial_json` is the next raw text fragment to append to that call's accumulating
     /// argument buffer. Purely additive/advisory (L-23): [`Chunk::Block`] remains the sole source
     /// of truth for the finished call, emitted once as usual when the block completes — a
-    /// consumer that only cares about the final result can ignore every delta. Added so a large
-    /// `emit_plan` tool call's plan skeleton can render progressively while it is still streaming,
-    /// instead of only once the whole call completes. Not every codec emits this yet (currently
-    /// the shared Messages-protocol codec only); its absence is not a regression, just no live
-    /// skeleton for that wire.
+    /// consumer that only cares about the final result can ignore every delta. Useful for tracing
+    /// latency and showing progress while a tool with a large argument object is streaming. Not
+    /// every codec emits this; its absence does not affect the completed tool call.
     ToolInputDelta { name: String, partial_json: String },
     /// Updated token usage (may be emitted more than once per turn).
     Usage(Usage),

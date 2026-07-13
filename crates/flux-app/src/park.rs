@@ -107,6 +107,7 @@ fn ask_await(binding: Option<SymbolName>, as_type: Option<flux_lang::ast::TypeRe
         binding,
         source: ASK_REPLY_SOURCE.to_string(),
         as_type,
+        condition: None,
     }
 }
 

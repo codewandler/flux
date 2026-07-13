@@ -29,6 +29,9 @@ enable_shell = false
 allow = ["read", "glob", "grep", "search", "Bash(git:*)"]
 deny  = ["Bash(rm:*)"]
 
+[agent]
+loop = "adaptive"
+
 [private_net]
 web = ["docs.internal.example"]
 
@@ -40,8 +43,6 @@ prometheus = ["prometheus.internal.example"]
 
 [limits]
 turn_token_budget = 120000
-readonly_rounds_escalate = 6
-readonly_rounds_stop = 10
 
 [skills]
 dirs = ["team/skills"]
@@ -79,6 +80,32 @@ actions   = ["workspace.write"]
 | `browser_bin` | Chromium executable for `browser.*`; otherwise `FLUX_BROWSER_BIN`, then `PATH`. |
 | `enable_shell` | Surface the high-risk `bash` and `proc.run` shell group. Off by default. |
 | `allow_private_net` | Deprecated compatibility switch that grants all private hosts to native web ops. Prefer `[private_net] web`. It never grants plugins. |
+
+## Agent loop and typed model stages
+
+`[agent] loop` is `"adaptive"` (the default) or a workspace-relative Flux-Lang file. Selection is
+explicit: `.flux/agent-loop.flux` has no effect merely because it exists.
+
+Config may register model-backed stages as ordinary typed guarded operations. Input and output have
+independent JSON Schemas; there is no common stage envelope:
+
+```toml
+[agent]
+loop = "loops/support.flux"
+
+[agent.stages.classify]
+prompt = "Classify the support request and return its typed result."
+input_schema = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }
+output_schema = { type = "object", properties = { queue = { type = "string" }, urgent = { type = "boolean" } }, required = ["queue", "urgent"], additionalProperties = false }
+tools = ["search"]
+model = "google/gemini-2.5-flash"
+max_tokens = 768
+effort = "low"
+```
+
+`tools` is a hard gather-only ceiling. Each named operation must be registered, visible to the
+agent, and statically low-risk, idempotent, and non-mutating. The stage cannot use the list to gain
+authority or execute writes while reasoning.
 
 ## Permissions and policy
 
@@ -125,8 +152,6 @@ access. Every admitted private request is audited.
 | `[limits]` key | Default | Meaning |
 |---|---:|---|
 | `turn_token_budget` | off | Stop consulting models after cumulative turn usage crosses this ceiling. `--turn-budget`, then `FLUX_TURN_TOKEN_BUDGET`, override it. |
-| `readonly_rounds_escalate` | `6` | Consecutive read-only planner rounds before an “answer now” escalation; `0` disables. |
-| `readonly_rounds_stop` | `10` | Consecutive read-only planner rounds before the turn stops honestly; `0` disables. |
 
 ## Skills and workspace access
 

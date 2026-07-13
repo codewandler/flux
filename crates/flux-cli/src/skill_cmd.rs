@@ -248,12 +248,12 @@ pub fn render_lang_skill() -> RenderedSkill {
     let (_, body) = flux_markdown::split_frontmatter(&generated);
     rendered(
         "flux-lang",
-        "Use when authoring Flux-Lang plans, text syntax, AST nodes, and deterministic execution graphs.",
+        "Use when authoring Flux-Lang flows, text syntax, AST nodes, and deterministic execution graphs.",
         body.trim().to_string(),
     )
 }
 
-/// Render the operation skill from the live registry adapter used by the planner/analyzer.
+/// Render the operation skill from the live registry adapter used by typed stages and the analyzer.
 pub fn render_ops_skill(registry: &ToolRegistry, groups: &[ToolGroup]) -> RenderedSkill {
     let specs_by_name: BTreeMap<String, ToolSpec> = registry
         .specs()

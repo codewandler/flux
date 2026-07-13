@@ -74,7 +74,7 @@ composite `op`, analyzes it against the live operation catalog, and installs it 
 
 Session scope is the safe default for agent-created vocabulary. Project/global scopes are guarded
 filesystem writes. `replace` must be explicit when a name already exists. `expose` overrides the
-declaration's `expose` metadata: exposed ops enter planner catalogs; unexposed ops remain callable by
+declaration's `expose` metadata: exposed ops enter model-stage catalogs; unexposed ops remain callable by
 other declarations that already know their name.
 
 For authored, reviewed definitions, prefer committing them under `.flux/flows/`; reserve

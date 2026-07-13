@@ -1,13 +1,13 @@
 ---
 title: Execution model
-description: How a Flux-Lang plan runs — the compile/analyze/optimize/execute lifecycle, symbols and values, operation dispatch, truthiness, and suspension.
+description: How a Flux-Lang flow runs — the parse/analyze/optimize/execute lifecycle, symbols and values, operation dispatch, truthiness, and suspension.
 ---
 
 # Execution model
 
-This page explains what happens after flux receives a plan: parsing, analysis, optimization,
-execution, value storage, dispatch, errors, and suspension. Execution is deterministic except where a
-plan explicitly calls a model or waits for external input.
+This page explains what happens after flux receives an authored flow: parsing, analysis,
+optimization, execution, value storage, dispatch, errors, and suspension. Execution is deterministic
+except where a flow explicitly calls a model or waits for external input.
 
 ## Lifecycle
 
@@ -15,9 +15,9 @@ plan explicitly calls a model or waits for external input.
 parse (or receive JSON) -> analyze -> optimize -> execute
 ```
 
-1. **Parse.** Text is parsed into the AST; a JSON plan is deserialized into the same AST. The
+1. **Parse.** Text is parsed into the AST; a JSON AST is deserialized into the same structure. The
    two forms are interchangeable from here on.
-2. **Analyze.** The analyzer lowers the plan to a typed form and rejects what it cannot reason
+2. **Analyze.** The analyzer lowers the flow to a typed form and rejects what it cannot reason
    about: unknown operations, wrong arity, incompatible argument types, unbounded loops
    (`repeat` needs a count, `loop` needs a deadline), nested suspend points (`await` and
    `checkpoint` are top-level only), and concurrency hazards (duplicate branch names, `return`
@@ -38,35 +38,16 @@ parse (or receive JSON) -> analyze -> optimize -> execute
 4. **Execute.** The interpreter runs the body top to bottom, dispatching every operation
    through the safety envelope and recording a run trace.
 
-A plan that fails analysis never executes at all. That is the point: malformed plans are
+A flow that fails analysis never executes at all. That is the point: malformed flows are
 rejected before they can touch the world.
 
-## How a model emits a plan
+## JSON AST tooling
 
-On the wire, every node is the same shape: a JSON object whose `kind` field names the node type
-and whose remaining fields are that kind's properties —
-
-```json
-{"kind": "retry", "max": 3, "body": [{"kind": "call", "op": "cargo_test"}]}
-```
-
-The planner emits a whole plan as one such tree through a single tool call, and there are two
-JSON Schemas that describe it:
-
-- The **strict schema** (`fluxlang schema`) spells out each node kind as its own variant with its
-  exact required fields — the full-fidelity contract, right for validators and editor tooling.
-- The **model-facing merged schema** (`fluxlang schema --merged`) collapses all node kinds into
-  **one** object type: `kind` is an enum of every node kind, and the properties are the union
-  across kinds, each optional. It is about a third of the strict schema's size, which matters
-  when the schema rides along on every planning call — measured on a fixed planning corpus, it
-  matched the strict schema's first-emission acceptance at roughly a quarter less input cost, so
-  it is the schema flux's planner advertises by default.
-
-Both describe the same wire format, and the merged form gives up no safety: which fields a kind
-requires — and where a node may appear at all (`checkpoint` at top level, pure leaves inside
-`obj`/`list`) — is context the analyzer checks anyway, on every plan, whichever schema the
-emitter saw. A plan that names a wrong field is rejected with a correction the model responds
-to, exactly like any other analysis failure.
+Every node's programmatic form is a JSON object whose `kind` field names the node type. The strict
+schema (`fluxlang schema`) spells out each variant for validators and tooling. The merged schema
+(`fluxlang schema --merged`) is a compact union used by language-workbench experiments and external
+hosts. Neither schema is part of the conversational model contract: the default agent calls live
+operations through their provider-native schemas and never emits an AST.
 
 ## Symbols and values
 
@@ -78,7 +59,7 @@ Symbols are names; values are immutable records in a value store the runtime own
 - An unbound symbol reference is a hard error at evaluation time.
 
 Because there is no hidden mutable environment, a run is fully described by its value log and
-run trace. That is what makes plans auditable and replayable — you can always answer "what did
+run trace. That is what makes flows auditable and replayable—you can always answer "what did
 this symbol hold when that step ran?"
 
 ## Operation dispatch
@@ -168,7 +149,7 @@ cross-turn story — including `memo`, `once`, `scope`, and `saga` — is in
 
 ## What this buys you
 
-- **Reviewability.** A plan is a value you can read before anything runs.
+- **Reviewability.** An authored flow and any proposed action batch are explicit values.
 - **Auditability.** The value log and run trace record what happened, in order, with inputs.
 - **Replayability.** Deterministic execution over immutable values means a stored flow can be
   re-run — and a suspended one resumed — without guessing at hidden state.

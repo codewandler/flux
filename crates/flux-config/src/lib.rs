@@ -142,6 +142,52 @@ pub struct SkillsConfig {
     pub dirs: Vec<String>,
 }
 
+/// Agent-runtime selection and declarative model-backed stages.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// `adaptive` or a workspace-relative Flux-Lang source file. Absent selects `adaptive`.
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_spec: Option<String>,
+    /// Named model stages registered as typed guarded operations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stages: BTreeMap<String, ModelStageConfig>,
+}
+
+impl AgentConfig {
+    fn is_default(&self) -> bool {
+        self.loop_spec.is_none() && self.stages.is_empty()
+    }
+}
+
+/// A config-defined model stage. The input/output schemas are the stage's direct operation
+/// contract; no common stage-result envelope is imposed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelStageConfig {
+    /// Stable model instruction for this stage.
+    pub prompt: String,
+    /// JSON Schema accepted by the operation.
+    pub input_schema: serde_json::Value,
+    /// JSON Schema returned by the operation.
+    pub output_schema: serde_json::Value,
+    /// Optional model override; absent inherits the agent model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional gather-only native operation ceiling for the stage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Per-call generation cap.
+    #[serde(default = "default_stage_max_tokens")]
+    pub max_tokens: u32,
+    /// Optional provider reasoning-effort spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+fn default_stage_max_tokens() -> u32 {
+    4096
+}
+
 impl SkillsConfig {
     fn is_default(&self) -> bool {
         self.dirs.is_empty()
@@ -225,6 +271,9 @@ pub struct Config {
     pub enable_shell: bool,
     #[serde(default)]
     pub permissions: Permissions,
+    /// Agent outer-loop and typed stage configuration.
+    #[serde(default, skip_serializing_if = "AgentConfig::is_default")]
+    pub agent: AgentConfig,
     /// Extra authorization grants, layered onto the built-in local defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<AuthorizationPolicy>,
@@ -308,15 +357,6 @@ pub struct Limits {
     /// `FLUX_TURN_TOKEN_BUDGET` and the `--turn-budget` flag (flag > env > config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_token_budget: Option<u64>,
-    /// Consecutive read-only planner rounds before the loop injects the "answer now" escalation
-    /// (A-29's breadth ladder). Absent = the built-in default (6); 0 disables the rung. Raise it
-    /// for legitimately read-heavy workflows instead of defeating the detector.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readonly_rounds_escalate: Option<u32>,
-    /// Consecutive read-only planner rounds before the loop ends the turn honestly (A-29).
-    /// Absent = the built-in default (10); 0 disables the rung.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readonly_rounds_stop: Option<u32>,
 }
 
 impl Limits {
@@ -497,6 +537,14 @@ fn merge(user: Config, project: Config) -> Config {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
             deny: [user.permissions.deny, project.permissions.deny].concat(),
         },
+        agent: AgentConfig {
+            loop_spec: project.agent.loop_spec.or(user.agent.loop_spec),
+            stages: {
+                let mut stages = user.agent.stages;
+                stages.extend(project.agent.stages);
+                stages
+            },
+        },
         // Concatenate grants like permissions — a project policy refines (adds to) the user's, it
         // doesn't silently discard it. (Previously `project.policy.or(user.policy)` dropped every
         // user grant the moment a project defined any policy block.)
@@ -514,14 +562,6 @@ fn merge(user: Config, project: Config) -> Config {
                 .limits
                 .turn_token_budget
                 .or(user.limits.turn_token_budget),
-            readonly_rounds_escalate: project
-                .limits
-                .readonly_rounds_escalate
-                .or(user.limits.readonly_rounds_escalate),
-            readonly_rounds_stop: project
-                .limits
-                .readonly_rounds_stop
-                .or(user.limits.readonly_rounds_stop),
         },
         server: ServerConfig {
             // Same scalar rule throughout: a project value (including an explicit 0/false)
@@ -835,6 +875,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_loop_and_typed_model_stages_parse_without_a_common_envelope() {
+        let config = toml::from_str::<Config>(
+            r#"
+[agent]
+loop = "loops/support.flux"
+
+[agent.stages.classify]
+prompt = "Classify the support request and return its typed result."
+input_schema = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }
+output_schema = { type = "object", properties = { queue = { type = "string" }, urgent = { type = "boolean" } }, required = ["queue", "urgent"], additionalProperties = false }
+tools = ["search"]
+model = "google/gemini-2.5-flash"
+max_tokens = 768
+effort = "low"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.agent.loop_spec.as_deref(),
+            Some("loops/support.flux")
+        );
+        let stage = &config.agent.stages["classify"];
+        assert_eq!(stage.input_schema["required"][0], "text");
+        assert_eq!(stage.output_schema["required"][0], "queue");
+        assert_eq!(stage.tools, vec!["search"]);
+        assert_eq!(stage.max_tokens, 768);
+        assert_eq!(stage.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
     fn cross_plugin_credential_grant_is_deny_by_default_and_matches_wildcard() {
         // No config → no grant.
         assert!(!Config::default().cross_plugin_credential_granted("sql", "kubernetes"));
@@ -1018,44 +1089,6 @@ actions = ["workspace.read"]
             2,
             "user + project policy grants must concatenate, not replace"
         );
-    }
-
-    #[test]
-    fn limits_readonly_ladder_parses_and_project_overrides_user() {
-        let dir = temp_dir();
-        write_project(
-            &dir,
-            r#"
-[limits]
-readonly_rounds_escalate = 12
-readonly_rounds_stop = 20
-"#,
-        );
-        let cfg = load(&dir).unwrap();
-        assert_eq!(cfg.limits.readonly_rounds_escalate, Some(12));
-        assert_eq!(cfg.limits.readonly_rounds_stop, Some(20));
-        std::fs::remove_dir_all(&dir).ok();
-
-        // Scalar precedence (same rule as turn_token_budget): the project's value — including an
-        // explicit 0 = "rung disabled" — wins; an unset project field falls back to the user's.
-        let user = Config {
-            limits: Limits {
-                readonly_rounds_escalate: Some(8),
-                readonly_rounds_stop: Some(15),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let project = Config {
-            limits: Limits {
-                readonly_rounds_stop: Some(0),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let merged = merge(user, project);
-        assert_eq!(merged.limits.readonly_rounds_escalate, Some(8));
-        assert_eq!(merged.limits.readonly_rounds_stop, Some(0));
     }
 
     #[test]

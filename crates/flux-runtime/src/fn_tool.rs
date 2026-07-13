@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_core::Result;
-use flux_spec::ToolSpec;
+use flux_spec::{StagingDisposition, ToolSpec};
 
 use crate::{Tool, ToolContext, ToolResult};
 
@@ -49,6 +49,7 @@ pub struct FnTool {
     spec: ToolSpec,
     handler: Arc<dyn Fn(Value) -> HandlerFuture + Send + Sync>,
     subjects: Option<SubjectsFn>,
+    staging: StagingDisposition,
 }
 
 impl FnTool {
@@ -64,6 +65,7 @@ impl FnTool {
             spec,
             handler: Arc::new(move |params| Box::pin(handler(params)) as HandlerFuture),
             subjects: None,
+            staging: StagingDisposition::Infer,
         }
     }
 
@@ -73,6 +75,14 @@ impl FnTool {
         S: Fn(&Value) -> Vec<String> + Send + Sync + 'static,
     {
         self.subjects = Some(Arc::new(subjects));
+        self
+    }
+
+    /// Declare how the adaptive loop may stage this closure-backed operation. The runtime still
+    /// applies the conservative effect/risk/idempotency checks, so `Gather` cannot make a mutating
+    /// operation execute during exploration.
+    pub fn with_staging_disposition(mut self, staging: StagingDisposition) -> Self {
+        self.staging = staging;
         self
     }
 }
@@ -88,6 +98,10 @@ impl Tool for FnTool {
             Some(f) => f(params),
             None => Vec::new(),
         }
+    }
+
+    fn staging_disposition(&self) -> StagingDisposition {
+        self.staging
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {

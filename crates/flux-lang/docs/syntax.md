@@ -67,8 +67,8 @@ accept today; everything unmarked is implemented.
 
 Flux-Lang exists at two levels:
 
-- **Wire / storage format** — JSON (`DraftAst` via serde). Used by `emit_plan`, stored
-  in `.flux/flows/`, passed between agent turns. Not meant to be hand-written.
+- **Programmatic / storage format** — JSON (`DraftAst` via serde). Used by SDK/runtime layers,
+  authored-flow persistence, replay, and host-derived execution records. It is not model output.
 - **Text format** — `.flux` files. The human-writable, version-controllable surface.
   This document specifies the text format.
 
@@ -552,18 +552,18 @@ indent under the header, their bodies one indent further.
 ### match
 
 Multi-way exhaustive branch on a **bound** value (a `$var` or literal — to branch on an op result or a
-field, bind it first: `$k = $plan.kind`). Each `case <value>` runs when `subject == value` (JSON equality);
+field, bind it first: `$k = $request.kind`). Each `case <value>` runs when `subject == value` (JSON equality);
 an optional `default` runs when none match.
 
 ```flux
-$kind = $plan.kind
+$kind = $request.kind
 match $kind
   case "chat"
-    $answer = $plan.text
+    $answer = $request.text
   case "error"
-    $answer = $plan.text
+    $answer = $request.text
   default
-    $ran = run_plan($plan)
+    $answer = handle_request($request)
 ```
 
 ### route
@@ -1314,8 +1314,8 @@ text and emits the resulting `DraftAst` as JSON.
 
 | Property | Text (`.flux`) | JSON (wire) |
 |---|---|---|
-| Who writes it | humans, editors | the LLM / `emit_plan` |
-| Where it lives | `examples/`, user repos | `.flux/flows/`, session storage |
+| Who writes it | humans, editors | SDKs, tooling, runtime hosts |
+| Where it lives | `examples/`, user repos | API values, authored-flow/session storage |
 | Round-trips | via `parse` + `format` | via `serde_json` |
 | Comments | yes (`#`) | no |
 | Multi-line strings | yes — verbatim `"""…"""` (L-39), auto-emitted for any newline-bearing string | escaped `\n` in JSON string (the wire format has no triple-quote form) |

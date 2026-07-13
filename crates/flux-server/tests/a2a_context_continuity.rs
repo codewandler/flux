@@ -23,6 +23,21 @@ impl flux_provider::Provider for MemoryProbeProvider {
         &self,
         req: flux_provider::Request,
     ) -> flux_core::Result<flux_provider::ChunkStream> {
+        if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+            return Ok(Box::pin(futures::stream::iter(vec![
+                Ok(flux_core::Chunk::Block(flux_core::ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "report conversation memory",
+                        "capability_families": [],
+                    }),
+                })),
+                Ok(flux_core::Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::ToolUse),
+                }),
+            ])));
+        }
         let users = req
             .messages
             .iter()

@@ -1094,6 +1094,7 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
             binding,
             source,
             as_type,
+            condition,
         } if opt_ident(binding)
             && opt_spellable_type(as_type)
             // The coercion type is spelled in the binding clause (`await $b: T = …`), so an
@@ -1112,6 +1113,10 @@ fn fmt_stmt(node: &Node, level: usize, indent: &str, multiline: bool, out: &mut 
                 out.push_str(" = ");
             }
             out.push_str(&compact_str(source, multiline));
+            if let Some(condition) = condition {
+                out.push_str(" when ");
+                out.push_str(&fmt_expr(condition, multiline));
+            }
             out.push('\n');
         }
         // Every other node kind round-trips through the single-line `@json` escape.

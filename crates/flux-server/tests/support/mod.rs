@@ -17,7 +17,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tower::ServiceExt; // for `oneshot`
 
 use flux_flow::engine::FlowEngine;
@@ -34,8 +34,27 @@ pub fn scratch_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// A provider that answers every call with a single one-word prose turn — the agent loop exits on
-/// prose immediately, so a handler-driven test turn completes fast and deterministically. Mirrors
+fn declares_intent(req: &flux_provider::Request) -> bool {
+    req.tools.iter().any(|tool| tool.name == "declare_intent")
+}
+
+fn intent_chunks() -> Vec<flux_core::Chunk> {
+    vec![
+        flux_core::Chunk::Block(flux_core::ContentBlock::ToolUse {
+            id: "intent".into(),
+            name: "declare_intent".into(),
+            input: json!({
+                "intent": "answer the current message",
+                "capability_families": [],
+            }),
+        }),
+        flux_core::Chunk::Done {
+            stop_reason: Some(flux_core::StopReason::ToolUse),
+        },
+    ]
+}
+
+/// A provider that declares a typed intent, then answers with a one-word prose turn. Mirrors
 /// `flux_server`'s own inline `ProseProvider` fixtures.
 pub struct ProseProvider;
 
@@ -46,14 +65,19 @@ impl flux_provider::Provider for ProseProvider {
     }
     async fn stream(
         &self,
-        _req: flux_provider::Request,
+        req: flux_provider::Request,
     ) -> flux_core::Result<flux_provider::ChunkStream> {
-        Ok(Box::pin(futures::stream::iter(vec![
-            Ok(flux_core::Chunk::TextDelta("ok".into())),
-            Ok(flux_core::Chunk::Done {
-                stop_reason: Some(flux_core::StopReason::EndTurn),
-            }),
-        ])))
+        let chunks = if declares_intent(&req) {
+            intent_chunks()
+        } else {
+            vec![
+                flux_core::Chunk::TextDelta("ok".into()),
+                flux_core::Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::EndTurn),
+                },
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
     }
 }
 
@@ -68,15 +92,20 @@ impl flux_provider::Provider for MultiDeltaProvider {
     }
     async fn stream(
         &self,
-        _req: flux_provider::Request,
+        req: flux_provider::Request,
     ) -> flux_core::Result<flux_provider::ChunkStream> {
-        Ok(Box::pin(futures::stream::iter(vec![
-            Ok(flux_core::Chunk::TextDelta("hello ".into())),
-            Ok(flux_core::Chunk::TextDelta("world".into())),
-            Ok(flux_core::Chunk::Done {
-                stop_reason: Some(flux_core::StopReason::EndTurn),
-            }),
-        ])))
+        let chunks = if declares_intent(&req) {
+            intent_chunks()
+        } else {
+            vec![
+                flux_core::Chunk::TextDelta("hello ".into()),
+                flux_core::Chunk::TextDelta("world".into()),
+                flux_core::Chunk::Done {
+                    stop_reason: Some(flux_core::StopReason::EndTurn),
+                },
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
     }
 }
 
@@ -93,10 +122,7 @@ pub fn test_engine(provider: Arc<dyn flux_provider::Provider>) -> Arc<FlowEngine
     flux_tools::register_evidence(&mut registry);
     let executor = flux_runtime::Executor::new(
         registry,
-        flux_runtime::PermissionManager::from_rules(
-            &["plan".into(), "run_plan".into(), "observe".into()],
-            &[],
-        ),
+        flux_runtime::PermissionManager::from_rules(&[], &[]),
         Arc::new(flux_runtime::AllowApprover),
         flux_runtime::ToolContext::new(system),
     );

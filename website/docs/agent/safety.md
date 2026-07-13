@@ -5,7 +5,7 @@ description: "The safety chain for every operation, including authorization, per
 
 # Safety & approvals
 
-flux is built so every model-emitted operation, built-in tool, sub-agent operation, app operation,
+flux is built so every model-stage operation, built-in tool, sub-agent operation, app operation,
 and plugin **host-capability request** traverses one mandatory chain before flux performs real IO.
 This page explains that chain, what prompts, and how approval decisions interact with policy.
 
@@ -17,7 +17,7 @@ See [Plugin trust & signing](../security/plugin-trust.md) and
 
 ## The one envelope
 
-Every operation — from a one-shot prompt, a `/run`, a normal turn, a plugin op, or a sub-agent —
+Every operation—from an exploration read, an approved action batch, an authored flow, a plugin op, or a sub-agent—
 lowers onto the same chain before it touches the outside world:
 
 ```text
@@ -48,10 +48,11 @@ pre-tool hooks
 - **Reads** (`read`, `glob`, `grep`, `search`) are pre-allowed — they run without prompting.
 - **Writes and commands** prompt for approval unless you pass `--yes` or have an allow-rule in your
   config.
-- **Destructive operations** (`rm -rf`, `git push --force`, `mkfs`, …) **always re-fire the approval
-  gate** — even inside a plan you already approved: a destructive step that wasn't visible in the
-  approved plan re-fires the gate when it's dispatched, so it can never slip through unapproved. What
-  the gate *does* then depends on the approver in force: the interactive approver prompts you, a
+- **Destructive operations** (`rm -rf`, `git push --force`, `mkfs`, …) force the approval gate. In an
+  adaptive turn they are included in the aggregate action-batch risk before a one-shot receipt is
+  issued; execution still rechecks authorization and the exact approved scope. An undisclosed or
+  changed action has no matching receipt and cannot run. What the gate does depends on the approver:
+  the interactive approver prompts you, a
   sub-agent's approver denies outright, and `--yes` (a headless allow-all approver) approves it
   automatically. So `--yes` does **not** exempt destructive ops from the gate — it answers the gate
   "yes" for them too, along with everything else still admitted by the current capability scope. An
@@ -77,26 +78,26 @@ still prompt. See the [CLI reference](./cli.md) for the flags and
 
 Provider keys, program-declared `secret "NAME"` values, and host-materialized plugin credentials
 are registered with a redactor and scrubbed from **all** model-visible tool output and logs, on both
-success and error. The model plans against secret *names*, never their values. See
+success and error. Model stages operate on secret *references*, never their values. See
 [Credentials & secrets](../security/credentials.md) for how references, resolution, and the redactor
 implement this.
 
 ## Sub-agents inherit the policy
 
 A delegated sub-agent runs under the same envelope as its parent and **cannot** approve destructive
-operations on its own — its emitted *plans* are intent-checked too, so a destructive step buried in
-a sub-agent's plan is denied, not just a direct call. Capability scope only ever narrows on descent:
+operations on its own—its proposed actions use the same batch and intent checks, so a destructive
+step is denied, not just a direct call. Capability scope only ever narrows on descent:
 a role declared with `tools: []` gets **zero** tools.
 
 ## The invariant
 
-> No model-emitted operation, built-in tool, sub-agent operation, app operation, or plugin host
+> No model-stage operation, built-in tool, sub-agent operation, app operation, or plugin host
 > callback reaches real IO without traversing this envelope. Trusted native plugin code remains
 > outside that guarantee: it is not OS-sandboxed by default, though opt-in OS-level sandboxing
 > (`[sandbox]`) closes that gap — see [OS process sandboxing](../security/os-sandbox.md).
 
 This is enforced by construction, not by convention — see [Concepts](../concepts.md) for how it fits
-the plan-first model, and the [source on GitHub](https://github.com/codewandler/flux) for the
+the typed-stage/authored-flow model, and the [source on GitHub](https://github.com/codewandler/flux) for the
 runtime that enforces it.
 
 ## Related docs

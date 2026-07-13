@@ -1,5 +1,5 @@
 //! The pure operation contracts: the typed [`OpSpec`] (which lowers to a [`flux_spec::ToolSpec`]),
-//! the [`OpSignature`] the compiler and analyzer reason over, and the abstract [`OpCatalog`] the
+//! the [`OpSignature`] the analyzer and model-stage catalog reason over, and the abstract [`OpCatalog`] the
 //! analyzer validates against.
 //!
 //! None of this depends on a concrete tool registry. The runtime adapter that presents the real
@@ -15,7 +15,7 @@ use crate::program::CompositeOpDecl;
 
 /// A single named input parameter of an [`OpSpec`]: a `name`, its [`TypeRef`], and whether it may be
 /// omitted. Naming the param here — rather than leaving `inputs` positional — is what lets
-/// [`OpSpec::lower`] project a faithful JSON Schema whose `properties`/`required` the planner catalog
+/// [`OpSpec::lower`] project a faithful JSON Schema whose `properties`/`required` the operation catalog
 /// and [`schema_params`] read back to recover the op's parameter *set* (required vs optional).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Param {
@@ -61,7 +61,7 @@ impl OpSpec {
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: self.input_schema(),
-            output_schema: None,
+            output_schema: (self.output != TypeRef::Any).then(|| type_ref_to_schema(&self.output)),
             effects,
             risk: self.risk,
             idempotency: self.idempotency,
@@ -137,7 +137,7 @@ fn type_ref_to_schema(ty: &TypeRef) -> serde_json::Value {
 /// order is not. `required` follows the schema's `required` array order; `optional` is the
 /// `properties` keys not in `required`, sorted for stable display. Neither order is used for
 /// positional binding — calls name their args via a single object (see `map_args_to_input`);
-/// `param_signature` renders the same names for the planner catalog.
+/// `param_signature` renders the same names for operation-catalog displays.
 pub fn schema_params(schema: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let required: Vec<String> = schema
         .get("required")
@@ -178,11 +178,16 @@ fn schema_prop_type(prop: &serde_json::Value) -> TypeRef {
                 .unwrap_or(TypeRef::Any);
             TypeRef::List(Box::new(item))
         }
+        Some("object") => prop
+            .get("x-flux-type")
+            .and_then(|value| value.as_str())
+            .map(|name| TypeRef::Named(name.to_string()))
+            .unwrap_or(TypeRef::Any),
         _ => TypeRef::Any,
     }
 }
 
-/// The compiler/analyzer's view of an available operation, derived from a registered [`ToolSpec`].
+/// The analyzer/model-stage view of an available operation, derived from a registered [`ToolSpec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpSignature {
     pub name: String,
@@ -203,6 +208,11 @@ pub struct OpSignature {
     /// argument type-checking. Empty when the schema is untyped (a param absent here is `Any`).
     #[serde(default)]
     pub param_types: std::collections::BTreeMap<String, TypeRef>,
+    /// The operation's declared result type. Bare host tools without an output schema remain
+    /// [`TypeRef::Any`]; authored and schema-backed operations preserve their result type so a
+    /// following stage can consume it without an explicit bind annotation.
+    #[serde(default = "any_type")]
+    pub output: TypeRef,
     /// The op's declared SEMANTIC effects (`Money`/`Delete`/`SendExternal`/…), carried alongside the
     /// lowered host [`effects`](Self::effects) instead of being erased by [`OpSpec::lower`] (D-138).
     /// `OpSignature::from_spec` cannot recover these from a bare [`ToolSpec`] — a `ToolSpec` has no
@@ -241,6 +251,11 @@ impl OpSignature {
             required_params,
             optional_params,
             param_types,
+            output: spec
+                .output_schema
+                .as_ref()
+                .map(schema_prop_type)
+                .unwrap_or(TypeRef::Any),
             // A bare `ToolSpec` carries no semantic-effect tier (see the field doc); a caller that
             // has a richer source (an `OpSpec`, or a `flux_runtime::Tool`'s declared semantic-effect
             // tags) sets `semantic_effects` afterward. See `OpSpec::to_signature` for the OpSpec case.
@@ -248,7 +263,7 @@ impl OpSignature {
         }
     }
 
-    /// A compact parameter signature for the planner catalog, e.g. `{path, content}` or `path`
+    /// A compact parameter signature for operation-catalog displays, e.g. `{path, content}` or `path`
     /// (empty when the op takes no declared params). Multi-param ops are shown with braces to signal
     /// the named-object call form; a sole required param is shown bare (the single-value sugar).
     pub fn param_signature(&self) -> String {
@@ -264,6 +279,10 @@ impl OpSignature {
         all.extend(opt.iter().cloned());
         format!("{{{}}}", all.join(", "))
     }
+}
+
+fn any_type() -> TypeRef {
+    TypeRef::Any
 }
 
 /// The abstract operation catalog the analyzer validates against. Decouples analysis from the
@@ -379,6 +398,21 @@ mod tests {
         // And the planner-catalog signature renders names, not a generic object.
         let sig = OpSignature::from_spec(&tool);
         assert_eq!(sig.param_signature(), "{query, limit}");
+    }
+
+    #[test]
+    fn opspec_lowers_and_recovers_its_typed_output() {
+        let tool = kb_search().lower();
+
+        assert_eq!(tool.output_schema, Some(json!({ "$ref": "#/$defs/List" })));
+        assert_eq!(
+            OpSignature::from_spec(&tool).output,
+            TypeRef::Named("List".into())
+        );
+        assert_eq!(
+            kb_search().to_signature().output,
+            TypeRef::Named("List".into())
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use flux_core::{render_knowledge_blocks, ContextBlock, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
+pub use flux_flow::engine::{AgentLoopSpec, BuiltinAgentLoop};
 use flux_flow::state::FlowStore;
 use flux_provider::{Effort, Provider};
 use flux_runtime::{Approver, Executor, PermissionManager, ToolContext, ToolRegistry};
@@ -145,6 +146,8 @@ pub struct AgentSpec {
     pub thinking: bool,
     /// Provider-mapped reasoning effort applied to every model call this agent owns.
     pub effort: Option<Effort>,
+    /// The explicit Flux-Lang outer loop. Defaults to the shipped adaptive preset.
+    pub agent_loop: AgentLoopSpec,
     /// Evidence-gated tool groups (empty disables gating — every op advertised).
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Session-ambient group-surfacing signals (D-115): host-known facts the per-turn workspace
@@ -176,6 +179,7 @@ impl Default for AgentSpec {
             max_iterations: 25,
             thinking: false,
             effort: None,
+            agent_loop: AgentLoopSpec::default(),
             groups: Vec::new(),
             ambient_signals: Vec::new(),
             compact_threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
@@ -241,7 +245,7 @@ impl AgentSpec {
     }
 
     /// Build the standard agent executor for this spec (select the `tools` subset, apply
-    /// `permissions`, register the reflexive ops) and assemble the engine. The simple path for
+    /// `permissions`, register the authored-loop ops) and assemble the engine. The simple path for
     /// surfaces that don't need custom hooks/policy/identity (e.g. the SDK). For full control over
     /// the executor, build it yourself and call [`AgentSpec::into_engine`].
     pub fn assemble(
@@ -273,7 +277,7 @@ impl AgentSpec {
         flow: FlowStore,
     ) -> Result<FlowEngine> {
         let system_prompt = self.effective_system_prompt();
-        FlowEngine::assemble(
+        FlowEngine::assemble_with_loop(
             provider,
             executor,
             events,
@@ -286,6 +290,7 @@ impl AgentSpec {
             self.compact_threshold_chars,
             self.groups,
             self.cwd,
+            self.agent_loop,
         )
         .map(|engine| {
             engine
@@ -295,8 +300,8 @@ impl AgentSpec {
     }
 }
 
-/// Register the machinery/root ops the flux-lang agent loop (`agent-loop.flux`) calls: the reflexive
-/// `plan`/`run_plan` plus model-facing `op.register` (`register_reflect`) and the evidence
+/// Register the typed adaptive stages the Flux-Lang agent loop (`agent-loop.flux`) calls, plus
+/// model-facing `op.register` (`register_reflect`) and the evidence
 /// `observe`/`evidence`/`metrics` (`register_evidence`). Call on the registry before building the [`Executor`] — and crucially
 /// **after** any [`subset`](flux_runtime::ToolRegistry::subset), so a tool-restricted agent (a role
 /// with `tools: [read, grep]`) still has the loop machinery (these ops are the engine's own control
@@ -422,6 +427,19 @@ mod tests {
         assert!(p.contains("Mon–Fri 09:00–18:00 CET."));
         // order preserved
         assert!(p.find("hours").unwrap() < p.find("refund").unwrap());
+    }
+
+    /// A-73: adaptive is the explicit default and callers may supply an authored Flux loop.
+    #[test]
+    fn agent_loop_defaults_to_adaptive_and_accepts_authored_flux() {
+        assert_eq!(AgentSpec::default().agent_loop, AgentLoopSpec::default());
+        assert_eq!(AgentSpec::new("mock").agent_loop, AgentLoopSpec::default());
+        let authored = AgentLoopSpec::parse("flow custom -> string\n  return \"ok\"").unwrap();
+        let spec = AgentSpec {
+            agent_loop: authored.clone(),
+            ..AgentSpec::new("mock")
+        };
+        assert_eq!(spec.agent_loop, authored);
     }
 
     /// L-02: `with_default_skills` discovers from `flux_skill::default_skill_dirs(cwd)` — a skill

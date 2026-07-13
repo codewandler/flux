@@ -1,4 +1,4 @@
-//! Render a `flow.plan` observation (the planner's compiled DAG) as a styled ratatui block — the
+//! Render a `flow.plan` observation (a durable authored or host-built execution DAG) as a styled ratatui block — the
 //! same tree the CLI prints, brought to the TUI. We prefer the observation's `plan_ast` so the tree
 //! is syntax-highlighted via [`flux_flow::render::render_styled`] + our ANSI palette; if only the
 //! pre-rendered `plan` string is present we show that plain.

@@ -777,11 +777,13 @@ design: [strict-review-flows.md](designs/strict-review-flows.md). Built in four 
     `expr` extended with comparison/boolean/string ops, `now`/`cwd`/`sys_info`, `len`/`first`/`last`/
     `filter`, and the `go`/`node`/`python`/`make` toolchain ops. See
     [archive/designs/bash-replacement.md](archive/designs/bash-replacement.md).
-  - **The flux-lang agent loop is now observable.** The self-hosted loop (`agent-loop.flux`) shipped
-    transparent (zero surface change); these make it visible: `flux run --show-loop` reveals the
-    `plan → run_plan → observe` machinery live, the REPL `/evidence` prints the audit trail, and
-    `flux loop show`/`eject` reads or scaffolds the loop (`.flux/agent-loop.flux` override). See
-    [agent-loop.md](agent-loop.md).
+  - **The Flux-Lang agent loop is authored, adaptive, and observable.** The shipped
+    `agent-loop.flux` owns `detect_intent → explore → approve_batch → execute_batch →
+    present_results`; models use native operation schemas and never emit executable Flux.
+    `flux run --show-loop` reveals those stages, the REPL `/evidence` prints the audit trail, and
+    `flux loop show`/`eject` displays or scaffolds an explicit loop. A local file is selected only
+    when requested with `--loop`/config; there is no magic override. See
+    [agent-loop.md](agent-loop.md) and [adaptive-outer-loops.md](designs/adaptive-outer-loops.md).
 - **SDK + crates.io** (tier 2) — **P7 landed the bulk:** a **Rust eDSL** (`flux_lang::dsl`, re-exported
   as `flux_sdk::dsl`) whose builder primitives compile to the Flux-Lang AST — loops
   (`each`/`repeat`/`loop_for`/`race`) and control-flow (`match`/`route`/`fallback`/`timeout`/`budget`)

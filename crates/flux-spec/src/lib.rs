@@ -20,7 +20,7 @@ pub fn tool_input_schema<T: schemars::JsonSchema + 'static>() -> serde_json::Val
     // A tool's input schema is a compile-time constant for its `T`, but `schema_for!` is a
     // non-trivial reflective build (a recursive type like the plan AST expands to dozens of
     // subschemas). Memoize it so the reflection runs once per type instead of on every call — this
-    // matters on the planner hot path, where the op catalog re-derives every tool's spec and each op
+    // matters on the model-stage hot path, where the op catalog re-derives every tool's spec and each op
     // resolution rebuilds a signature. NOTE: a `static` inside a generic fn is SHARED across all
     // monomorphizations (not one-per-`T`), so the cache must be keyed by `TypeId::of::<T>()` — a bare
     // `OnceLock<Value>` here would return the first-built type's schema for every tool.
@@ -43,6 +43,23 @@ pub fn tool_input_schema<T: schemars::JsonSchema + 'static>() -> serde_json::Val
         obj.remove("description");
     }
     cache.lock().unwrap().insert(key, schema.clone());
+    schema
+}
+
+/// Generate an operation output schema while retaining its analyzer-visible type identity.
+///
+/// Provider JSON Schema has no standard keyword for the Rust/schema name once the root `title` is
+/// removed. Flux stores that non-authority metadata under `x-flux-type`; providers ignore the
+/// extension, while the Flux-Lang catalog can recover a named result type for typed stage
+/// composition. Primitive and list schemas keep their structural type regardless of this marker.
+pub fn tool_output_schema<T: schemars::JsonSchema + 'static>() -> serde_json::Value {
+    let mut schema = tool_input_schema::<T>();
+    if let Some(object) = schema.as_object_mut() {
+        object.insert(
+            "x-flux-type".into(),
+            serde_json::Value::String(T::schema_name().into_owned()),
+        );
+    }
     schema
 }
 
@@ -76,6 +93,23 @@ pub enum Idempotency {
     Idempotent,
     NonIdempotent,
     Conditional,
+}
+
+/// How an operation participates in an adaptive agent turn before approval.
+///
+/// This is a routing hint, not authority. The runtime still derives concrete intents and refuses
+/// to gather any mutating, destructive, risky, or non-idempotent invocation even when an operation
+/// declares [`Gather`](Self::Gather).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingDisposition {
+    /// Infer from effects, risk, idempotency, and the invocation's concrete intents.
+    #[default]
+    Infer,
+    /// Prefer immediate exploration when the ordinary safety contract also permits it.
+    Gather,
+    /// Capture the invocation into the proposed action batch; never run it during exploration.
+    Capture,
 }
 
 /// A host capability the tool needs access to.
@@ -154,6 +188,12 @@ impl ToolSpec {
 
     pub fn with_access(mut self, access: Vec<AccessKind>) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Declare the operation's result schema for typed Flux-Lang analysis and SDK stages.
+    pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
+        self.output_schema = Some(schema);
         self
     }
 
@@ -309,6 +349,14 @@ mod tests {
             schema["properties"]["path"]["description"],
             "Path to inspect."
         );
+    }
+
+    #[test]
+    fn tool_output_schema_retains_type_identity_without_restoring_root_noise() {
+        let schema = tool_output_schema::<SampleInput>();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["x-flux-type"], "SampleInput");
+        assert!(schema.get("title").is_none());
     }
 
     #[test]

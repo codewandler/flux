@@ -1,9 +1,9 @@
-//! The Flux-Lang **lifecycle surface** — the SDK front door for "the LLM plans, the runtime runs".
+//! The Flux-Lang **lifecycle surface** — the SDK front door for authored deterministic flows.
 //!
 //! Where [`crate::Client`] runs a conversational turn through the self-hosted Flux-Lang
 //! [`FlowEngine`](flux_flow::engine::FlowEngine), [`FlowClient`] exposes one flow's lifecycle
-//! directly: parse or `compile` an instruction into a typed execution graph, `analyze` it against
-//! the op catalog, optionally `optimize` it, and `execute` it through the real safety envelope.
+//! directly: parse an authored flow, `analyze` it against the live operation catalog, optionally
+//! `optimize` it, and `execute` it through the real safety envelope.
 //! None of that machinery is reimplemented here — every method delegates to `flux-flow` (the
 //! engine) and `flux-lang` (the language), so the envelope, store, and analyzer are reused, not
 //! forked.
@@ -11,16 +11,15 @@
 //! The wiring that earns its keep is [`assemble_registry`]: it takes the pure built-ins
 //! (`flux_tools::register_builtins`) **and** the provider-backed [`CognitionPack`] and registers
 //! both into one [`ToolRegistry`]. That is what makes the model-op pack (`ai.extract`, `ai.rank`,
-//! `ai.judge`, `ai.reason`, `synth`, `ai.rewrite`) reachable as named ops a plan can call — the
+//! `ai.judge`, `ai.reason`, `synth`, `ai.rewrite`) reachable as named ops an authored flow can call — the
 //! pack stops being a dead crate the moment a registry is assembled this way.
 //!
-//! To author the plan in Rust instead of compiling it from natural language, build a
-//! [`flux_lang::ast::DraftAst`] with the [`crate::dsl`], then [`FlowClient::analyze`] and
-//! [`FlowClient::execute`] it directly (skipping `compile`). Runnable, no-API-key examples for both
-//! paths: `examples/flow_compile.rs` (NL→AST) and `examples/dsl_loops.rs` (Rust DSL).
+//! Author with native `.flux` text or build a [`flux_lang::ast::DraftAst`] with the [`crate::dsl`],
+//! then [`FlowClient::analyze`] and [`FlowClient::execute`] it. Runnable, no-API-key examples:
+//! `examples/parameterized_flow.rs` (text) and `examples/dsl_loops.rs` (Rust DSL).
 //!
 //! ```ignore
-//! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example flow_compile`.
+//! // Runnable hermetic version: `cargo run -p codewandler-flux-sdk --example parameterized_flow`.
 //! # async fn ex() -> flux_core::Result<()> {
 //! use std::sync::Arc;
 //! use flux_sdk::flow::FlowClient;
@@ -35,8 +34,10 @@
 //! // The cognition ops are advertised alongside the built-ins.
 //! assert!(client.op_names().iter().any(|n| n == "ai.extract"));
 //!
-//! // compile → analyze → execute (or the `run` convenience that chains all three).
-//! let out = client.run("read the README and summarize it").await?;
+//! // parse → analyze → execute.
+//! let flow = client.parse("flow readme -> string\n  $text = read(\"README.md\")\n  return $text\n")?;
+//! client.analyze(&flow).map_err(|d| flux_core::Error::Other(format!("{d:?}")))?;
+//! let out = client.execute(&flow).await?;
 //! println!("{}", out.result);
 //! # Ok(()) }
 //! ```
@@ -47,7 +48,6 @@ use std::sync::Arc;
 use flux_cognition::CognitionPack;
 use flux_core::{Error, Result, Usage};
 use flux_flow::ast::SymbolName;
-use flux_flow::compile::{compile as compile_flow, CompileOptions};
 use flux_flow::registry::{analyze_composites, OpRegistry};
 use flux_flow::runtime::{execute_flow, execute_flow_with_composites, FlowOutcome};
 use flux_flow::state::FlowStore;
@@ -82,7 +82,7 @@ pub use flux_lang::prelude::{
 /// Assemble a [`ToolRegistry`] = the pure built-ins (`flux_tools::register_builtins`) **plus** the
 /// provider-backed [`CognitionPack`]. This single call is the wiring that makes the model-op pack
 /// (`ai.extract`/`rank`/`judge`/`reason`, `synth`, `ai.rewrite`) reachable as named ops: without it
-/// the pack is never installed and the planner can't call it.
+/// the pack is never installed and authored flows cannot call it.
 pub fn assemble_registry(provider: Arc<dyn Provider>, model: impl Into<String>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     flux_tools::register_builtins(&mut registry);
@@ -97,7 +97,6 @@ pub struct FlowClientBuilder {
     model: String,
     envelope: crate::envelope::Envelope,
     seed_prelude: bool,
-    compile_opts: CompileOptions,
     storage: Option<crate::Storage>,
 }
 
@@ -107,9 +106,8 @@ impl Default for FlowClientBuilder {
             model: "unknown".to_string(),
             // Reads pre-allowed; everything else denied unless `auto_approve` (no UI in a library).
             envelope: crate::envelope::Envelope::with_default_allow(&["read", "glob", "grep"]),
-            // Seed the planner catalog `$defs` with the v1-core artifact ontology by default.
+            // Seed the operation catalog `$defs` with the v1-core artifact ontology by default.
             seed_prelude: true,
-            compile_opts: CompileOptions::default(),
             // Unset ⇒ an in-memory flow store, the pre-0.16 behavior.
             storage: None,
         }
@@ -117,7 +115,7 @@ impl Default for FlowClientBuilder {
 }
 
 impl FlowClientBuilder {
-    /// Set the model id the planner + every op call uses.
+    /// Set the model id every model-backed operation uses.
     pub fn model(mut self, m: impl Into<String>) -> Self {
         self.model = m.into();
         self
@@ -146,7 +144,7 @@ impl FlowClientBuilder {
         self.envelope.approver = Some(approver);
         self
     }
-    /// Skip seeding the planner catalog `$defs` with the prelude artifact ontology (default: seed).
+    /// Skip seeding the operation catalog `$defs` with the prelude artifact ontology (default: seed).
     pub fn without_prelude(mut self) -> Self {
         self.seed_prelude = false;
         self
@@ -158,11 +156,6 @@ impl FlowClientBuilder {
     /// Pass one only to pin a posture independent of ambient env.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.envelope.sandbox = Some(sandbox);
-        self
-    }
-    /// Override the compile front-end's attempt/step/token budgets.
-    pub fn compile_options(mut self, opts: CompileOptions) -> Self {
-        self.compile_opts = opts;
         self
     }
     /// Choose where flow state lives ([`crate::Storage::in_memory`] by default).
@@ -195,7 +188,6 @@ impl FlowClientBuilder {
             Value::Object(serde_json::Map::new())
         };
         Ok(FlowClient {
-            provider,
             model: self.model,
             registry,
             system,
@@ -204,7 +196,6 @@ impl FlowClientBuilder {
             deny: self.envelope.deny,
             auto_approve: self.envelope.auto_approve,
             approver: self.envelope.approver,
-            compile_opts: self.compile_opts,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
             spawner: None,
@@ -214,9 +205,8 @@ impl FlowClientBuilder {
 }
 
 /// A Flux-Lang lifecycle façade: holds the provider + model + the assembled registry, and exposes
-/// the `compile → analyze → execute` surface plus a registration surface for extra ops/packs.
+/// the `parse → analyze → execute` surface plus a registration surface for extra ops/packs.
 pub struct FlowClient {
-    provider: Arc<dyn Provider>,
     model: String,
     registry: ToolRegistry,
     system: Arc<System>,
@@ -228,7 +218,6 @@ pub struct FlowClient {
     auto_approve: bool,
     /// Custom per-op approval policy (see [`FlowClientBuilder::approver`]); overrides `auto_approve`.
     approver: Option<Arc<dyn Approver>>,
-    compile_opts: CompileOptions,
     /// The merged `$defs` artifact map, seeded from `prelude_schema()` and extended by
     /// [`register_prelude`](Self::register_prelude); available for catalog enrichment / inspection.
     prelude_defs: Value,
@@ -246,7 +235,7 @@ impl FlowClient {
         FlowClientBuilder::default()
     }
 
-    /// The resolved model id every op + planner call uses.
+    /// The resolved model id every model-backed operation uses.
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -264,7 +253,7 @@ impl FlowClient {
             .op_names()
     }
 
-    /// The merged artifact `$defs` map (the planner catalog `$defs`), for inspection or merging into
+    /// The merged artifact `$defs` map (the operation catalog `$defs`), for inspection or merging into
     /// a downstream schema.
     pub fn prelude_defs(&self) -> &Value {
         &self.prelude_defs
@@ -323,7 +312,7 @@ impl FlowClient {
     }
 
     /// Merge an artifact `$defs` map (e.g. [`flux_lang::prelude::prelude_schema`]) into the stashed
-    /// planner catalog `$defs`. Existing keys are overwritten by `defs`.
+    /// operation catalog `$defs`. Existing keys are overwritten by `defs`.
     pub fn register_prelude(&mut self, defs: Value) -> &mut Self {
         if let (Some(into), Value::Object(from)) = (self.prelude_defs.as_object_mut(), defs) {
             for (k, v) in from {
@@ -339,27 +328,10 @@ impl FlowClient {
         self
     }
 
-    // ----- the lifecycle: compile → analyze → execute -----
-
-    /// Compile a natural-language `text` into a typed [`DraftAst`] via `flux-flow`'s NL→AST front-end
-    /// (prompt-and-parse with a bounded repair loop). `view`, when present, lets the model reference
-    /// existing session symbols instead of re-fetching.
-    pub async fn compile(&self, text: &str, view: Option<&SessionView>) -> Result<DraftAst> {
-        let ops = OpRegistry::new(&self.registry).with_composites(&self.composites);
-        let compiled = compile_flow(
-            self.provider.as_ref(),
-            &self.model,
-            text,
-            &ops,
-            view,
-            self.compile_opts.clone(),
-        )
-        .await?;
-        Ok(compiled.ast)
-    }
+    // ----- the deterministic lifecycle: parse → analyze → execute -----
 
     /// Deterministic text → AST for a stored / already-validated flow — the non-NL partner of
-    /// [`compile`](Self::compile), with **no** provider round-trip. Wraps `flux_lang`'s parser so a
+    /// model-independent parser with **no** provider round-trip. Wraps `flux_lang`'s parser so a
     /// behaviour runner can re-hydrate a stored flow without a model call. Malformed input is a parse
     /// error folded into the SDK's error type (the parser is total — never a panic).
     pub fn parse(&self, text: &str) -> Result<DraftAst> {
@@ -622,17 +594,7 @@ impl FlowClient {
         })
     }
 
-    /// The convenience pipeline: `compile` → `analyze` → `execute`. A failed analysis aborts before
-    /// any side effect (the AST referenced an op the registry doesn't have).
-    pub async fn run(&self, text: &str) -> Result<ExecutionResult> {
-        let ast = self.compile(text, None).await?;
-        if let Err(diags) = self.analyze(&ast) {
-            return Err(Error::Other(format!("analyze: {}", join_diags(&diags))));
-        }
-        self.execute(&ast).await
-    }
-
-    /// The deterministic counterpart of [`run`](Self::run): `parse` → `analyze` → `execute_with`. Runs
+    /// `parse` → `analyze` → `execute_with`. Runs
     /// a **stored** flow per invocation with injected `inputs` and no model round-trip. A failed
     /// analysis aborts before any side effect (the AST referenced an op the registry doesn't have).
     pub async fn run_flow(
@@ -823,8 +785,8 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    /// A hermetic provider that replays canned text, one `stream()` call at a time. Used to exercise
-    /// the compile front-end (which prompt-and-parses) without any network.
+    /// A hermetic provider that replays canned text, one `stream()` call at a time. Most authored
+    /// flow tests never call it; cognition-operation tests use it without network access.
     struct MockProvider {
         replies: Mutex<Vec<String>>,
     }
@@ -1051,7 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_analyze_then_execute_on_a_json_flow() {
-        // A hand-authored DraftAst (no NL compile): read a file we control, then return it. Exercises
+        // A hand-authored DraftAst: read a file we control, then return it. Exercises
         // analyze (catalog resolution) + execute (real dispatch through the envelope).
         let root = temp_root("roundtrip");
         std::fs::write(root.join("note.txt"), "lifecycle surface works").unwrap();
@@ -1563,26 +1525,6 @@ flow main
             join_diags(&seeded_empty),
             "an empty seed set must behave exactly like `analyze`"
         );
-    }
-
-    #[tokio::test]
-    async fn compile_then_execute_round_trips_through_the_mock_provider() {
-        // The mock provider returns a fenced AST; compile parses it; execute runs it. Proves the
-        // full `compile → execute` path is wired without a real model.
-        let root = temp_root("compile");
-        std::fs::write(root.join("doc.md"), "hello compile").unwrap();
-        let ast_json = "```json\n{\"body\":[{\"kind\":\"call\",\"op\":\"read\",\"args\":[{\"kind\":\"lit\",\"value\":\"doc.md\"}]}]}\n```";
-
-        let client = FlowClient::builder()
-            .model("mock")
-            .build(MockProvider::one(ast_json), &root)
-            .unwrap();
-
-        let ast = client.compile("read the doc", None).await.unwrap();
-        client.analyze(&ast).expect("compiled flow analyzes clean");
-        let out = client.execute(&ast).await.unwrap();
-        assert_eq!(out.tool_calls, vec!["read"]);
-        assert!(out.result.contains("hello compile"));
     }
 
     #[test]

@@ -1,18 +1,24 @@
 # Using flux
 
-flux is a coding/ops agent with one core idea: **the LLM is not the runtime.** Instead of the model
-calling tools live, one step at a time, the model is a *compiler front-end* — it turns your request into
-a typed **execution plan** (a small Flux-Lang graph), and a deterministic Rust runtime executes that
-plan through a safety envelope. You always see the plan before it runs, and the same plan can be re-run.
+flux is a coding/ops agent with one core idea: **the LLM is not the runtime.** The model interprets
+intent, explores through the exact native schemas of a narrow capability set, and proposes literal
+operation calls. An authored Flux-Lang outer loop owns order, bounds, questions, approval, and
+execution; the model never emits executable Flux.
 
 This page is the practical guide. For the design, see [`docs/designs/flux-flow.md`](designs/flux-flow.md).
 
 ## The mental model
 
-Every turn, the model does exactly one of two things:
+The default turn has explicit phases:
 
-- **emits a plan** — a graph of operations (`read`, `grep`, `edit`, `repeat`, `when`, …), or
-- **answers in prose** — when no operation is needed.
+1. A typed intent stage chooses the smallest semantic capability families.
+2. The host intersects those signals with registered, wired, permitted operations.
+3. A native exploration stage uses the real operation schemas. Safe reads execute through the
+   envelope and become evidence; effectful calls are captured rather than executed.
+4. The host freezes captured calls into an immutable action batch and asks once for approval.
+5. A matching one-shot receipt lets the runtime execute each action through the usual envelope.
+6. The same native ledger receives the execution report and repairs failed work locally or presents
+   the result.
 
 The built-in file operations are: `read` (one file, a list of files, or a glob pattern — single-file
 reads get a line-numbered view, multi-file reads return `==> path <==` sections; refuses binary and
@@ -25,47 +31,14 @@ changed on disk since you read it, the edit is refused so you re-read first. A g
 exists but is **off by default** (the `shell` tool group): opt in with `enable_shell = true` in
 `.flux/config.toml` or `FLUX_ENABLE_BASH=1` — prefer the dedicated ops.
 
-It has **no live tools.** It can't call `bash` or `read` directly; even reading a file is a node in a
-plan. This is what makes a turn auditable: what you see *is* what runs.
-
-```
-flow
-├─ $readme = read("README.md")
-└─ return $readme
-```
-
-The runtime executes the plan node by node through the safety envelope (permissions, approval, secret
-redaction), stores each result as a named symbol, and feeds it back so the model can plan the next step.
-A later node reuses an earlier result by name — `$readme` to pass the whole value as an argument, or
-`{{readme}}` inside a string to embed it (e.g. in a sub-agent prompt); the runtime substitutes the
-stored value at execution.
-
-A trivial or already-actionable request costs exactly one (or two) model calls, same as always. A
-complex or context-hungry request first gets a bounded, read-only "gather" pass — the model looks
-around before committing to a plan, capped at a few rounds — rather than guessing the whole task in
-one shot. See [`docs/agent-loop.md`](agent-loop.md) for the phased loop that drives this.
-
-## Two modes: normal and plan
-
-| Mode | What a turn does |
-|---|---|
-| **normal** (default) | the model plans → the runtime **shows the plan, then runs it** (risky steps prompt for approval) |
-| **plan** | the model plans (auto-running a bounded read-only look-around first, if it needs one) → the runtime **shows the final plan but does NOT run it**; you review/refine, then approve to run |
-
-Plan mode is for "let me see (and shape) the whole plan before anything happens." Normal mode just does
-the work, gating risky steps as they come.
-
-A complex or context-hungry `flux plan`/`/plan` prompt gets the same bounded, read-only "gather" pass
-normal mode does (see above): the model may look around — read a few files, grep, list a directory —
-before committing to the real plan. Gather is compile-time enforced non-mutating (no write, no
-destructive op), so it runs automatically without a prompt, exactly the trust `run_plan` already
-grants a non-mutating plan. Only the **final** plan — the one that would make the actual change — is
-ever shown-and-not-run; gather never counts as "the plan you're reviewing."
+Operation metadata—not model output—decides whether a call is gather-safe. A mutating, destructive,
+opaque, or non-idempotent operation can never be relabeled as a read. Every call still traverses
+permissions, approval, redaction, and guarded IO. See [`docs/agent-loop.md`](agent-loop.md).
 
 ## One-shot commands
 
 ```bash
-# Normal: plan + run (prompts to approve risky/destructive steps; Ctrl-C interrupts)
+# Run the adaptive loop (prompts once for a proposed effect batch; Ctrl-C interrupts)
 flux run "rename every TODO comment in src/ to FIXME"
 # (every entry point is a subcommand: a bare `flux rename …` is a clap "unrecognized subcommand"
 #  error, so a stray word never starts the agent — use `flux run <prompt>`)
@@ -73,16 +46,12 @@ flux run "rename every TODO comment in src/ to FIXME"
 # Run unattended (auto-approve every step — for headless/trusted use)
 flux run --yes "delete the *.tmp files in build/"
 
-# Plan mode: show the plan, then (on a terminal) ask "run it? [y/N]"
-flux plan "summarize README.md into SUMMARY.txt"
+# Include typed stage and batch machinery in the stream
+flux run --show-loop "summarize README.md into SUMMARY.txt"
 
-# Inspect the plan as data — prints the graph and exits, never runs
-flux plan -o json "print hello world 3 times"
-flux plan -o yaml "..."       # yaml | json | pretty (default)
+# Select an explicit authored outer loop (the default is `adaptive`)
+flux run --loop loops/support.flux "triage this request"
 ```
-
-`flux plan` prints-and-exits whenever output is piped or `-o json|yaml` is given (so it's safe in
-scripts); on an interactive terminal with no `-o`, it shows the plan and offers to run it.
 
 ## Interactive session (REPL)
 
@@ -95,16 +64,11 @@ Inside the REPL:
 
 | Command | Effect |
 |---|---|
-| `/plan` | toggle **plan mode** (the prompt shows `plan ›`); turns show a plan but don't run it |
-| `/run` | execute the plan you just reviewed |
 | `/model <spec>` | switch model (e.g. `/model opus`) |
 | `/tools` | list available operations |
+| `/evidence` | inspect intent, tool, approval, and execution observations |
 | `/sessions`, `/resume <id>`, `/clear` | session management |
 | `/help` | full command list |
-
-A plan-mode session looks like: type a task → see the plan → either `/run` it, or **just keep typing to
-refine it** ("make it also back up the file first") and a new plan appears. `/plan` again returns to
-normal mode.
 
 ## Terminal UI
 
@@ -119,7 +83,7 @@ background. Enter sends; `Ctrl-J`, `Alt-Enter`, or `Shift-Enter` inserts a newli
 inserted atomically. While a turn runs, Enter adds a visible FIFO follow-up instead of replacing the
 previous one; `/queue` opens the editor (`Delete`, `Alt-Up`/`Alt-Down`, Enter to edit).
 
-`/plan`, `/run`, `/model`, `/shell`, `/tools`, `/evidence`, `/compact`, `/new`, and `/clear` mirror
+`/model`, `/shell`, `/tools`, `/evidence`, `/compact`, `/new`, and `/clear` mirror
 the REPL controls. `/sessions` opens a picker, and `/resume <id>` switches directly; either path
 reconstructs messages, plans, tool results, notices, and usage from the durable session log without
 re-running operations. Use PgUp/PgDn or the mouse wheel for scrollback and `Ctrl-End` to follow the
@@ -128,18 +92,15 @@ latest activity. `Ctrl-E` expands thinking/tool details, `Ctrl-C` interrupts a t
 
 ## Approval & safety
 
-Every operation — whether from a one-shot prompt, a `/run`, or a normal turn — goes through the same
-envelope:
+Every operation—whether it is an exploration read, an approved batch action, or an authored-flow
+call—goes through the same envelope:
 
 - **Reads** are pre-allowed; they run without prompting.
 - **Writes / commands** prompt for approval unless you pass `--yes` or have an allow-rule in
   `.flux/config.toml`.
-- **Destructive** operations (`rm -rf`, force-push, `mkfs`, …) escalate to their own confirmation,
-  with two deliberate exceptions: **`--yes` auto-approves everything, destructive steps included**
-  (it installs a headless allow-all approver — that is what unattended means), and a destructive step
-  **already disclosed in the plan preview you approved** does not re-prompt (approving the rendered
-  plan *was* the confirmation; a destructive command assembled at runtime, invisible to the preview,
-  still escalates).
+- **Destructive** operations (`rm -rf`, force-push, `mkfs`, …) are disclosed in the aggregate batch
+  approval. `--yes` auto-approves everything, destructive actions included, because it installs a
+  headless allow-all approver for trusted unattended work.
 - Secrets are redacted from tool output and logs.
 
 Approve a prompt with `y` (once), `a` (always — saved to `.flux/config.toml`), or `N` (deny).
@@ -230,7 +191,7 @@ flux usage                       # aligned token/cost dashboard for flux + detec
                                  #   --since/--until, --no-external, --harness ..., --progress ...,
                                  #   or --json for normalized machine-readable metrics + rows
 flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-execute a recorded run —
-                                 #   plans re-parse from the durable plan_source, op outputs are served
+                                 #   authored or host-derived flows re-parse from durable source, op outputs are served
                                  #   from the recorded cassette: NO model call, NO live IO, side effects
                                  #   never re-fire; transcript renders like the original minus latency.
                                  #   --turn N · --sub-agents (replay the A-08 child streams too) ·
@@ -238,15 +199,15 @@ flux replay <session|last>       # TIME MACHINE (C-43/A-45): hermetically re-exe
                                  #   Capture is on by default (per-op cap FLUX_CASSETTE_MAX_BYTES,
                                  #   1 MiB); disable with FLUX_CASSETTE=0 — then nothing is replayable.
 flux fork <session> --at N       # TIME MACHINE (A-46): branch a recorded run at top-level statement N
-                                 #   of its final plan — the prefix replays from tape (no side effects),
+                                 #   of a recorded authored/host-derived flow — prefix from tape (no side effects),
                                  #   the tail diverges LIVE through the real approval envelope:
                                  #   --inject '<json>'    bind a different value there, run the rest
                                  #   --edit <file.flux>   continue with a corrected plan (unchanged
                                  #                        statements fast-forward, edits run live)
-                                 #   (default) --replan   let the model re-plan from the forked state
+                                 #   (default) --replan   continue adaptively from the forked state
                                  #   The forked session records its own cassette → replayable/diffable.
-flux diff <A> <B>                # TIME MACHINE (C-44): align two recorded runs; shows where the PLAN
-                                 #   changed vs where the same plan hit a DIFFERENT WORLD (op output
+flux diff <A> <B>                # TIME MACHINE (C-44): align two recorded runs; shows where the FLOW
+                                 #   changed vs where the same flow hit a DIFFERENT WORLD (op output
                                  #   differs); --json; exit 1 when the runs diverge (diff-style)
 flux plugin install <name>       # the plugin CLI — verified install from the signed plugin pack (@<version>, --all;
                                  #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill
@@ -256,9 +217,9 @@ flux review --files a.rs b.rs    # run the embedded strict-review protocol over 
                                  #   ReviewReport (self-contained, read-only — posts nowhere, stdout only);
                                  #   --format md|json, --fail-on info|low|medium|high|critical (exit 1
                                  #   at/above that severity), -m <spec> reviewer model, --max-tokens N
-flux loop                        # print the active agent loop (assets/agent-loop.flux); the default
-                                 #   `show` action. `flux loop eject` writes the built-in loop to
-                                 #   .flux/agent-loop.flux so you can customize it (-f/--force overwrites)
+flux loop show                   # print the built-in adaptive loop. `flux loop eject` writes it to
+                                 #   .flux/agent-loop.flux (-f/--force overwrites); the file is inert
+                                 #   until selected via `flux run --loop …` or `[agent] loop = "…"`
 flux endpoint list               # inspect the persisted endpoint store (~/.flux/endpoints.toml);
                                  #   operator-only, reference-only — never prints a secret value. Also:
                                  #   add <id> --url <bare-url> [--product/--protocol/--credential-ref/
@@ -275,32 +236,28 @@ flux completion [shell]          # print a shell completion script to stdout (de
 flux preset list                 # the recipe cookbook — scaffold or run a parameterized flow. `help
                                  #   <name>` shows a preset's keys; `<name> key=value …` scaffolds it
                                  #   (-o pretty|json), add --run [--yes] [-m <spec>] to execute instead
-flux corpus export               # mine ~/.flux/events.db (read-only) for NL→Flux-Lang training data,
-                                 #   emitting corpus-shaped JSONL (one row per accepted plan); --out <file>
 ```
 
 A **multi-agent program** is a **native flux-lang `.flux` file** that declares the whole app as typed
-module declarations — `agent` / `channel` / `datasource` / `trigger` / `journey` — with each module's
+module declarations — `agent_loop` / `agent` / `channel` / `datasource` / `trigger` / `journey` — with each module's
 settings written inline as flux-lang values, and secrets as `secret "ENV_NAME"` *references* (resolved
 from the environment at load; plaintext is never inline). Journey bodies are ordinary flux-lang flows.
 See `crates/flux-app/examples/hello.flux` (minimal) and `crates/flux-app/examples/support-bot.flux`
 (the full agent + Slack channel + datasource surface), and
 [`designs/native-text-modules.md`](designs/native-text-modules.md). To **embed** flux as a library, use
-`flux-sdk`'s `FlowClient` for the Flux-Lang compile→analyze→execute lifecycle (`crates/flux-sdk/src/flow.rs`).
+`flux-sdk`'s `FlowClient` for the Flux-Lang parse/construct → analyze → execute lifecycle (`crates/flux-sdk/src/flow.rs`).
 
-Plans and tool *inputs* always print in full; tool *output* (e.g. a large file read) is previewed by
+Action batches and operation *inputs* print in full; operation *output* (e.g. a large file read) is previewed by
 default and shown in full with `-v`.
 
 ## Tips
 
-- **Use `flux plan` (or the REPL `/plan` toggle) first** when a task is risky or you want to review the
-  approach — then run it once you're happy.
-- **Plan mode auto-runs a bounded read-only gather pass, then shows (and never auto-runs) the final
-  plan:** a self-contained task ("delete the .tmp files", "print 3×") settles on the full plan
-  immediately, same as before — no added latency. A task that needs to look around first ("refactor
-  the biggest file in src/") gets to read/grep/list on its own before proposing the real plan, instead
-  of guessing blind; what runs automatically is always read-only (compile-time enforced), and what
-  changes anything is always the plan you review and approve.
+- Use `--show-loop` when diagnosing latency or capability selection. It reveals intent, exploration,
+  approval, execution, and presentation stages without changing their behavior.
+- Reads needed for evidence may run during exploration; writes and other effects cannot. They are
+  frozen into the batch shown at the approval boundary.
+- Use an authored flow or custom `--loop` when an invariant must hold structurally—for example,
+  “search the handbook before every answer”—rather than depending on prompt compliance.
 - Pass `--yes` only when you trust the task to run unattended: it auto-approves **every** step,
   destructive ones included — there is no re-confirmation under `--yes`. Without it, destructive
   steps get their own prompt.

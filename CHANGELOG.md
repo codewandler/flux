@@ -8,9 +8,29 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A-73: Flux-authored adaptive outer loops are the agent runtime** (Agent + Language pillars;
+  `docs/designs/adaptive-outer-loops.md`). The one loop used by CLI, SDK `Client`, server/A2A, app
+  agents, and sub-agents is now an ordinary validated Flux-Lang program:
+  `detect_intent → explore → ActionBatch → approve_batch → execute_batch → present_results`.
+  Intent and later evidence signals resolve only wired operations inside the live agent capability
+  ceiling; gather-safe native calls execute through `Executor`, while every effectful call is
+  schema-validated and captured inertly. Approval returns a one-shot receipt bound to the exact
+  batch, session, caller, and policy context; changed, stale, reused, or denied receipts fail closed.
+  Execution reports return to the same native provider ledger for local correction, and typed
+  decision requests suspend and resume through the existing durable `await` path. `--show-loop`
+  exposes the otherwise compact intent/exploration progress. The installed-binary support fixture
+  passed 12/12 across Codex gpt-5.5, Gemini 3.5 Flash, DeepSeek V4 Flash Nitro, and GPT-5-mini within
+  fixed call budgets, with no fabricated path and zero legacy planner calls.
+- **Authored outer loops and typed stages are public extension points.** `AgentLoopSpec`, CLI
+  `--loop`, config, roles, app `agent_loop` declarations, and SDK builders select either the shipped
+  adaptive loop or an explicit Flux-Lang file; `.flux/agent-loop.flux` no longer changes behavior
+  implicitly. Config model stages declare independent input/output schemas and a gather-only tool
+  ceiling. SDK `stage_fn<I, O>` derives unrelated typed contracts and registers the closure as an
+  ordinary guarded operation. Registered output schemas now survive into Flux-Lang result-type
+  inference.
 - **A-68: reasoning policy now survives the complete agent call graph** (Agent pillar;
   `docs/designs/agent-reasoning-effort.md`). `AgentSpec` owns typed thinking/effort settings and
-  consistently applies them to planner/repair, completion, compaction, cognition, app agents, and
+  consistently applies them to intent/exploration/presentation, compaction, cognition, app agents, and
   inherited sub-agents; markdown roles may override the parent. `--think` and
   `--effort low|medium|high|xhigh|max` are visible, functional controls rather than compatibility
   no-ops. Capture-provider tests cover every call class and a same-task Codex trace verifies the
@@ -43,6 +63,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **BREAKING (agent architecture and public API): the natural-language-to-Flux compiler is
+  removed.** Models no longer emit a one-shot Flux AST. The adaptive authored loop is now the
+  default and only conversational path; `PlanningMode`, `--staged`, `flux plan`, REPL `/plan` and
+  `/run`, `emit_plan`/`run_plan`, corpus export, emission A/B, and natural-language
+  `FlowClient::compile` are gone. Authored `.flux` parsing, analysis, execution, replay of historical
+  events, and deterministic `FlowClient` APIs remain. Downstream callers selecting loop behavior
+  must use `AgentLoopSpec`; downstream users of the retired corpus API must remove calls to
+  `EventStore::corpus_rows_all` / `flux_events::corpus_rows` and its row/skip types. This is a
+  pre-1.0 minor-version breaking change.
+
 - **BREAKING (agent behavior): A-69 makes skill activation explicit** (Agent pillar;
   `docs/designs/manual-skill-activation.md`). Merely discovering a skill or matching its name,
   description, or triggers no longer mutates a production prompt. The CLI requires repeatable
@@ -57,14 +87,14 @@ All notable changes to this project are documented in this file. The format is b
   guarded process/capability envelope remain unchanged. Three warm 18-plugin mock runs improved
   from 2.222–2.246 seconds to 0.585–0.592 seconds; a blocking-before-first-yield regression test
   guards the concurrency shape the original async-only test missed.
-- **A-67: installed plugin catalogs now surface on turn intent instead of taxing every planner
+- **A-67: installed plugin catalogs now surface on turn intent instead of taxing every model-stage
   request** (Agent pillar; `docs/designs/turn-intent-plugin-surfacing.md`). Visible operations with
   no explicit plugin-authored group are assigned to an implicit `plugin.<name>` group and surface
   when the current request names that integration. Matching is case-insensitive and boundary-aware,
   activation is sticky for the engine session, and the inferred signal is recorded in
   `groups.active`. Explicit groups, pre-authored flows, the guarded execution envelope, and
   `FLUX_SURFACE_ALL` remain unchanged. Live normal-HOME proof with 636 registered operations and the
-  same OpenRouter prompt: planner input fell **41,567 → ~14,100 tokens (−66%)**, and reported cost
+  same OpenRouter prompt: model input fell **41,567 → ~14,100 tokens (−66%)**, and reported cost
   fell **$0.0106 → $0.0025**; naming Slack selectively surfaced `plugin.slack` at 15.3k tokens.
   Failing-first tests: `turn_intent_signals_match_integration_names_without_substring_collisions`,
   `ungrouped_plugin_ops_get_an_implicit_turn_intent_group`, and
@@ -75,16 +105,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
-- **C-56: model-emitted operation arguments carry an actionable structural contract**
-  (`docs/designs/model-call-argument-contract.md`). The merged Flux-Lang schema now documents the
-  one-named-object convention directly on `Call.args`, and positional-call diagnostics show the
-  correct AST envelope plus the live operation's required/optional names and types. The identical
-  Codex prompt improved from 0/4 valid first plans to 3/3 without weakening named-argument analysis.
-- **C-55: gathered read results retain their source path in later model rounds**
-  (`docs/designs/operation-feedback-provenance.md`). Flux-Lang feedback labels now reuse the
-  existing bounded, safe read/grep argument summary, so multiple results arrive as
-  `[read handbook/plans.md]` rather than indistinguishable `[read]` blocks. Canonical values, result
-  bodies, replay, and authorization are unchanged; arbitrary operation inputs are never dumped.
+- **Adaptive file exploration now repairs unknown paths deterministically.** When the request does
+  not contain an exact path, the exploration stage inventories the workspace before reading.
+  Wildcard directory arguments and all-missing `read_many` calls return precise root-inventory
+  guidance instead of inviting repeated guesses.
+
+- **Gathered native-operation results retain bounded source provenance in later model rounds**
+  (`docs/designs/operation-feedback-provenance.md`). Multiple reads no longer arrive as
+  indistinguishable blocks that encourage invented filenames. Canonical values, result bodies,
+  replay, and authorization are unchanged; arbitrary operation inputs are never dumped.
 - **D-167: parallel sandbox tests no longer break process execution during `task install`**
   (`docs/designs/test-environment-isolation.md`). Bubblewrap/PATH discovery tests use an injected
   search path instead of replacing the process-wide `PATH` observed by unrelated `flux-system`
@@ -118,9 +147,6 @@ All notable changes to this project are documented in this file. The format is b
   longer occupies Tokio's uncancellable blocking worker; a detached reader forwards lines without
   holding runtime shutdown. The exact tutorial app is started and sent direct SIGINT by
   `tutorial_app_exits_cleanly_on_direct_sigint`.
-- **Plan-mode docs disclose bounded read-only gathering.** The tutorial and language tooling now
-  distinguish gather operations that may auto-run from the returned plan, which always remains
-  unexecuted; a website contract test guards against the old “nothing runs” claim.
 
 ## [0.19.2] - 2026-07-12
 

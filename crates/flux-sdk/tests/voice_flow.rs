@@ -1,7 +1,7 @@
 //! D-155: `Session::run_voice_flow` — a flow-driven full-duplex voice session. An SDK-level port of
 //! the engine driver's mock-realtime test: an authored two-`await` flow speaks first at
 //! `SessionReady`, each caller turn resumes the suspension, and flow completion hangs up via
-//! `VoiceSink::session_ended`. No planner runs (echo + await only).
+//! `VoiceSink::session_ended`. No adaptive model stage runs (echo + await only).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ impl Provider for NeverProvider {
         "mock"
     }
     async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-        panic!("a deterministic flow-driven voice session must not invoke the planner");
+        panic!("a deterministic flow-driven voice session must not invoke a model stage");
     }
 }
 
@@ -152,6 +152,7 @@ async fn run_voice_flow_speaks_authored_prompts_resumes_and_hangs_up() {
         binding: Some(SymbolName(name.into())),
         source: "user_input".into(),
         as_type: None,
+        condition: None,
     };
     let flow = DraftAst {
         body: vec![

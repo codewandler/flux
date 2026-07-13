@@ -29,15 +29,11 @@ Use `--tasks a,b` to select cases, `--limit N` for a quick subset, `--watch` for
 `--report out.md` for a categorized report. A single model trial is useful for debugging but noisy
 evidence; use at least three trials for a keep/reject comparison.
 
-## Strict review and corpus export
+## Strict review
 
 `flux review --files …` is a separate read-only quality protocol: built-in reviewer roles inspect
 the files and `review.aggregate` produces stable Markdown or JSON. `--fail-on high` makes it useful
 as a gate.
-
-`flux corpus export` mines accepted, canonical Flux-Lang plans from `~/.flux/events.db` and emits
-NL→plan JSONL. It skips ambiguous/pre-format records instead of guessing. Corpus output is an
-advanced training/evaluation input; it is not required for normal agent use.
 
 ## The repository improvement loop
 
@@ -51,4 +47,4 @@ when working on Flux itself.
 
 - [Usage & cost](./cost.md) — interpret model spend alongside scores.
 - [Time Machine](./time-machine.md) — replay and compare individual runs.
-- [CLI](./cli.md) — `flux eval`, `flux review`, and `flux corpus` options.
+- [CLI](./cli.md) — `flux eval` and `flux review` options.

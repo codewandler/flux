@@ -320,6 +320,7 @@ fn gen_node(rng: &mut Rng, depth: usize, seen: &mut BTreeSet<&'static str>) -> N
             binding: opt_sym(rng),
             source: string(rng),
             as_type: opt_any_type(rng),
+            condition: None,
         },
         11 => Node::Retry {
             max: rng.below(4) as u32,

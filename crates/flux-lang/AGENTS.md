@@ -31,8 +31,8 @@ signatures.
 ## Single source of truth — node kinds are generated
 
 The `Node` enum's **doc-comments** in `src/ast.rs` are the canonical one-line node descriptions. Via
-`schema::node_kind_catalog()` they generate: the planner-prompt grammar, the "Node kinds at a glance"
-table in `docs/reference.md`, and the `## Node kinds` table in the explicitly installable
+`schema::node_kind_catalog()` they generate the "Node kinds at a glance" table in
+`docs/reference.md`, and the `## Node kinds` table in the explicitly installable
 `skill/SKILL.md`. **Never hand-edit a generated `<!-- BEGIN/END generated:node-kinds -->` block.** After
 changing a `Node` variant or its doc-comment, regenerate:
 
@@ -81,6 +81,6 @@ and keep it in sync with your change (design + status + plan move together):
 **Local WIP plans** — under `.flux/plans/` (gitignored, author's machine only): `ast-node-expansion.md`
 (superseded), `flow-new-primitives.md`, `flux-flow-implementation.md`.
 
-Near-term roadmap (per the PRD): the text↔AST layer (`parse`/`format`) is **built and round-trips**;
-what remains is a second, token-efficient display mode (for future fine-tuning) and wiring a
-`fluxlang compile` CLI subcommand onto `parse`.
+The text↔AST layer (`parse`/`format`) is built and round-trips, the compact display is available for
+workbench experiments, and `fluxlang compile` maps authored source to JSON AST. The default agent no
+longer consumes either schema as a model-emission contract.

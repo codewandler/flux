@@ -49,8 +49,8 @@ cargo install --force --git https://github.com/codewandler/flux --package flux-c
 
 ## Try it without an API key
 
-`-m mock` is an offline provider that drives the full plan/execute pipeline with canned output. It is
-a zero-config runtime check: flux plans, approves, executes, writes `flux-mock.txt`, and prints
+`-m mock` is an offline provider that drives the full adaptive loop with canned native calls. It is
+a zero-config runtime check: flux detects intent, captures and approves a batch, writes `flux-mock.txt`, and prints
 `Finished.` regardless of the prompt.
 
 Use it to verify wiring. Use a real provider for representative agent behavior.
@@ -65,11 +65,11 @@ Point flux at a provider, then run a turn. The full provider matrix and credenti
 [Providers and models](./agent/providers.md).
 
 ```bash
-# Plan + run. Risky steps prompt for approval; --yes auto-approves.
+# Adaptive turn. Risky action batches prompt for approval; --yes auto-approves.
 flux run "add a test for the parser"
 
-# Preview the plan before anything runs
-flux plan "summarize README.md into SUMMARY.txt"
+# Reveal intent, scoped exploration, and batch machinery
+flux run --show-loop "summarize README.md into SUMMARY.txt"
 
 # Interactive REPL (session auto-saved); /help for slash commands
 flux
@@ -81,13 +81,14 @@ flux tui
 flux auth status
 ```
 
-Every operation crosses the same [safety envelope](./agent/safety.md). Reads are pre-allowed; writes
-and commands prompt; destructive steps always re-fire the approval gate. `--yes` auto-approves every
-step, including destructive ones, so reserve it for trusted automation.
+Every operation crosses the same [safety envelope](./agent/safety.md). Evidence reads are pre-allowed;
+writes and commands are captured into an action batch and prompt; destructive effects remain forced
+through approval. `--yes` auto-approves every action, including destructive ones, so reserve it for
+trusted automation.
 
 ## Run a stored Flux-Lang flow
 
-Flux-Lang text can be parsed and executed without asking a model to compile a new plan. Save this
+Flux-Lang text is authored, parsed, and executed without asking a model to generate the program. Save this
 as `hello.flux`:
 
 ```flux
@@ -139,7 +140,7 @@ repository's internal `docs/` map and `AGENTS.md`.
 ## Related docs
 
 - [Beginner tutorial](./tutorial.md) — build a guarded agent task, reusable flow, and local app.
-- [Concepts](./concepts.md) — the plan-first execution model.
+- [Concepts](./concepts.md) — typed stages, authored flows, and guarded execution.
 - [CLI](./agent/cli.md) — the command surface after the first run.
 - [Safety and approvals](./agent/safety.md) — what prompts and why.
 - [What's new](./whats-new.md) — customer-facing release notes.

@@ -796,7 +796,7 @@ mod tests {
         let inner: ChunkStream = Box::pin(futures::stream::iter(vec![
             Ok(Chunk::ThinkingDelta("considering".into())),
             Ok(Chunk::ToolInputDelta {
-                name: "emit_plan".into(),
+                name: "read".into(),
                 partial_json: "{}".into(),
             }),
             Ok(Chunk::Usage(flux_core::Usage {

@@ -1078,6 +1078,20 @@ impl System {
         Ok(tokio::fs::metadata(&p).await?.len())
     }
 
+    /// Whether a path exists inside the workspace/read roots.
+    ///
+    /// Unlike [`Path::exists`], this preserves IO errors and applies the workspace's lexical and
+    /// symlink confinement before touching metadata. It is intended for guarded create/overwrite
+    /// decisions at product surfaces.
+    pub async fn path_exists(&self, path: &str) -> Result<bool> {
+        let p = self.workspace.resolve_read(path)?;
+        match tokio::fs::metadata(&p).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Whether `path` (resolved within the workspace/read-roots) is a directory — lets a read tool
     /// give actionable guidance ("list it with glob first") instead of failing on the raw `Is a
     /// directory` io error (C-32). Read-only, so it uses the same `resolve_read` jail as
@@ -1793,6 +1807,16 @@ mod tests {
         sys.write_file("a.txt", "hello").await.unwrap();
         assert_eq!(sys.file_size("a.txt").await.unwrap(), 5);
         assert!(sys.file_size("../outside.txt").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn path_exists_is_guarded_and_preserves_missing() {
+        let (dir, sys) = temp_workspace();
+        assert!(!sys.path_exists("missing.txt").await.unwrap());
+        sys.write_file("nested/present.txt", "ok").await.unwrap();
+        assert!(sys.path_exists("nested/present.txt").await.unwrap());
+        assert!(sys.path_exists("../outside.txt").await.is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

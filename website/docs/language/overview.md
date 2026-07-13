@@ -5,13 +5,13 @@ description: What Flux-Lang is, the mental model behind it, and a map of the lan
 
 # Flux-Lang overview
 
-Flux-Lang is the plan language at the center of flux. It is the boundary between model judgment and
-runtime authority: the model may propose a typed plan, but the runtime analyzes, approves, and
-executes it.
+Flux-Lang is the authored workflow language at the center of flux. It places deterministic control
+flow around model judgment and runtime authority: typed stages may interpret or propose, while the
+runtime analyzes the authored program, approves effects, and executes it. Models do not emit Flux.
 
 Start here if you want the mental model before reading syntax or node reference pages.
 
-A plan is a small, readable program over named values:
+A flow is a small, readable program over named values:
 
 ```flux
 flow release-check
@@ -31,7 +31,7 @@ flow release-check
 
 Two operations run concurrently, a guard aborts early if the evidence is missing, a budgeted context
 pack feeds exactly the selected values to one model call, and the flow returns a structured record.
-Every effectful step in this plan — the git call, the test run, the model call — crosses the same
+Every effectful step in this flow—the git call, the test run, the model call—crosses the same
 runtime safety envelope before it touches the world.
 
 ## What Flux-Lang is
@@ -40,15 +40,15 @@ runtime safety envelope before it touches the world.
   inspect it before it runs, diff it, and replay it.
 - **A workflow language for agent work.** Calls, binds, branching, iteration, concurrency, guard
   rails, and context management are first-class nodes — not conventions layered on chat.
-- **A boundary.** The language separates what a model may decide (which declared branch, what to
-  put in a plan) from what the runtime enforces (policy, approval, IO).
+- **A boundary.** The language makes model calls explicit and separates their typed judgment from
+  what the authored flow and runtime enforce (order, bounds, policy, approval, IO).
 
 ## What Flux-Lang is not
 
 - **Not a shell script.** There is no ambient environment to mutate; values live in immutable
   symbols, and data shaping happens in pure nodes rather than shell-outs.
-- **Not a ReAct transcript.** The model does not improvise the next tool call after each result; it
-  emits a whole plan up front, and revision is a new plan.
+- **Not model output.** The conversational agent uses native tool calling inside typed stages; an
+  author, SDK, or app supplies the Flux program.
 - **Not a general-purpose language.** Loops are bounded, recursion is rejected, and the analyzer
   refuses plans it cannot reason about. The language is deliberately small.
 
@@ -58,9 +58,8 @@ Every flow has two interchangeable representations:
 
 - **Text** — `.flux` files. Human-writable, comment-friendly, version-controllable. This is what
   you write in an editor and what the docs mostly show.
-- **JSON AST** — the canonical wire and storage format. The planner may emit either JSON AST or
-  native text depending on the configured `emit_plan` surface; sessions store the AST, and SDKs pass
-  it around. Not meant to be hand-written.
+- **JSON AST** — the canonical programmatic and storage format used by SDKs, tooling, replay, and
+  host-derived execution records. Not meant to be hand-written.
 
 The two forms are semantically identical: a `.flux` file parses to exactly the AST the JSON expresses,
 and the formatter turns any AST back into canonical text. The same flow, both ways:
@@ -82,15 +81,15 @@ flow check-readme
 }
 ```
 
-Humans usually write the text form; models may emit either surface, and both are normalized into the
-same AST before analysis and execution. Every node kind has a native text spelling; a one-line
+Humans usually write the text form; SDK builders and host tooling may construct the AST directly.
+Both are normalized into the same AST before analysis and execution. Every node kind has a native text spelling; a one-line
 `@json` escape remains for the rare shapes the text grammar cannot express. The
 [node reference](./node-reference.md) covers every kind in both shapes.
 
-## How a plan runs
+## How a flow runs
 
 A flow moves through a fixed lifecycle: the text is **parsed** (or the JSON deserialized) into the
-AST, the **analyzer** lowers it to a typed form and rejects malformed plans (unbounded loops, unknown
+AST, the **analyzer** lowers it to a typed form and rejects malformed flows (unbounded loops, unknown
 ops, races between parallel branches), the **optimizer** simplifies what it can, and the interpreter
 **executes** the result. Every operation call dispatches through one non-bypassable safety envelope —
 `authorization -> approval -> guarded IO` — while pure nodes (formatting, field access, templates,
@@ -106,7 +105,7 @@ flux flow run hello.flux
 ```
 
 Risky steps prompt for approval exactly as they do in an agent turn. See [Tooling](./tooling.md) for
-`flux plan`, `flux run`, `flux app run`, and the standalone `fluxlang` CLI.
+`flux flow run`, `flux run`, `flux app run`, and the standalone `fluxlang` workbench.
 
 ## Reading path
 
@@ -135,7 +134,7 @@ Risky steps prompt for approval exactly as they do in an agent turn. See [Toolin
 - [Node reference](./node-reference.md) — every node kind with its JSON wire shape and fields.
 - [Types and effects](./types-and-effects.md) — type annotations, effect tags, and the prelude
   artifact types.
-- [Ops](./ops.md) — the registered operations the engine advertises to plans.
+- [Ops](./ops.md) — registered operation contracts used by authored flows and model stages.
 - [Tooling](./tooling.md) — running, previewing, and formatting flows.
 
 **Examples**:
@@ -146,5 +145,5 @@ Risky steps prompt for approval exactly as they do in an agent turn. See [Toolin
 
 - [A ten-minute tour](./tour.md) — learn the language by building one flow.
 - [Flows & syntax](./flows-and-syntax.md) — exact text syntax rules.
-- [Execution model](./execution-model.md) — what happens after a plan is parsed.
+- [Execution model](./execution-model.md) — what happens after a flow is parsed.
 - [Editor setup](./editors.md) — highlighting and LSP support for hand-editing flows.

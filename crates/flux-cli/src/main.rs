@@ -1,8 +1,7 @@
 //! The `flux` binary.
 //!
-//! M0 surface: a one-shot mode that streams a single Anthropic response to stdout. The
-//! interactive REPL and TUI land in M2; this establishes the end-to-end path
-//! (CLI → provider → stream → render).
+//! Product surface for adaptive agent turns, authored Flux-Lang flows and apps, replay, plugins,
+//! authentication, and developer tooling. Every effect enters through the shared guarded runtime.
 
 mod changelog;
 mod plugin_skill;
@@ -24,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::{AgentSpec, DEFAULT_SYSTEM_PROMPT};
+use flux_agent::{AgentLoopSpec, AgentSpec, DEFAULT_SYSTEM_PROMPT};
 use flux_core::{Chunk, ContentBlock, StopReason, Usage};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
@@ -42,16 +41,16 @@ use flux_system::{System, Workspace};
 use reedline::{FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
 use std::borrow::Cow;
 
-/// flux — the LLM plans, the runtime runs.
+/// flux — typed model judgment, deterministic execution.
 #[derive(Parser, Debug)]
 #[command(
     name = "flux",
     version,
-    about = "flux — the LLM plans, the runtime runs",
-    long_about = "flux — the LLM plans, the runtime runs.\n\n\
+    about = "flux — typed model judgment, deterministic execution",
+    long_about = "flux — typed model judgment, deterministic execution.\n\n\
         Run the agent with `flux run <prompt>`; with no arguments, `flux` opens the interactive REPL. \
-        The other entry points are subcommands too: `flux plan <prompt>` reviews a plan before running, \
-        `flux tui` is the chat UI, and `flux app run <program.flux>` runs a multi-agent program \
+        `flux tui` is the chat UI, `flux flow run <flow.flux>` runs an authored flow, and \
+        `flux app run <program.flux>` runs a multi-agent program \
         (add `--serve <addr>` to expose an agent over HTTP/A2A). Run `flux help` for the full list of \
         commands."
 )]
@@ -103,7 +102,7 @@ struct Cli {
     no_sandbox: bool,
 }
 
-/// The flags for running an agent turn — flattened into the agent-path subcommands (`run`, `plan`,
+/// The flags for running an agent turn — flattened into the agent-path subcommands (`run`,
 /// `tui`, `fork`, `app run`), so they live on those commands and stay off every other subcommand's
 /// help. (`--color` is `global` on [`Cli`] instead; it applies to every command. `review` carries
 /// its own smaller [`ReviewFlags`].) `fork` and `app run <program>` reject the session/turn flags
@@ -135,13 +134,19 @@ struct AgentFlags {
     #[arg(long)]
     think: bool,
 
-    /// Reasoning effort for planner, completion, compaction, cognition, and inherited sub-agent calls.
+    /// Reasoning effort for intent, exploration, presentation, compaction, cognition, and inherited
+    /// sub-agent calls.
     #[arg(long, value_enum)]
     effort: Option<EffortArg>,
 
-    /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
-    /// so it is generous by default; a turn truncated here fails loudly rather than silently stopping.
-    /// Zero would fail at the provider, so it is rejected at parse time.
+    /// Agent outer loop: `adaptive` (default) or a Flux-Lang source file. A file is selected only
+    /// when named here; `.flux/agent-loop.flux` has no implicit effect.
+    #[arg(long = "loop", value_name = "ADAPTIVE|FILE")]
+    agent_loop: Option<String>,
+
+    /// Maximum tokens per model-stage call. A truncated intent, exploration, repair, or presentation
+    /// stage fails loudly rather than silently stopping. Zero would fail at the provider, so it is
+    /// rejected at parse time.
     #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
 
@@ -166,20 +171,21 @@ struct AgentFlags {
     #[arg(long)]
     yes: bool,
 
-    /// Show tool output in full (no truncation). Plans and tool inputs are always shown in full; this
-    /// also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
+    /// Show tool output in full (no truncation). Action batches and tool inputs are always shown in
+    /// full; this also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
     #[arg(short = 'v', long)]
     verbose: bool,
 
-    /// Reveal the agent loop: stream the loop-machinery ops (`plan`/`run_plan`/`observe`/…) that are
-    /// filtered from the surface by default, so you can watch each turn iterate. Also enabled by
-    /// `FLUX_SHOW_LOOP`. See `flux loop show` for the loop itself and `/evidence` for the audit trail.
+    /// Reveal the agent loop: stream its typed stages (`detect_intent`/`explore`/batch approval and
+    /// execution/…) that are filtered from the surface by default. Also enabled by
+    /// `FLUX_SHOW_LOOP`. See `flux loop show` for the authored loop and `/evidence` for the audit trail.
     #[arg(long)]
     show_loop: bool,
 
     /// Trace the outer agent loop's structure: one dim line per round (`⟳ round 3/25`) and per
     /// structural node (op calls with bind names, match/when branches taken, return) of the
-    /// agent-loop program. Inner plan execution is not traced. Also enabled by `FLUX_TRACE_LOOP`.
+    /// agent-loop program. Native leaf-operation execution is not traced. Also enabled by
+    /// `FLUX_TRACE_LOOP`.
     #[arg(long)]
     trace_loop: bool,
 
@@ -265,18 +271,6 @@ enum Commands {
         /// (`-m`, `--yes`, …) may appear before or after.
         prompt: Vec<String>,
     },
-    /// Plan mode: compile the prompt to a Flux-Lang plan and show it (without running it by default).
-    /// On a terminal it then asks `run it? [y/N]`; piped or with `-o json|yaml` it prints the plan and
-    /// exits (never runs).
-    Plan {
-        #[command(flatten)]
-        agent: AgentFlags,
-        /// Plan output format when not running it: json, yaml, or pretty (default).
-        #[arg(short = 'o', long, value_enum)]
-        output: Option<OutputFormat>,
-        /// The prompt to compile into a plan.
-        prompt: Vec<String>,
-    },
     /// Launch the ratatui chat TUI (requires a real terminal). Tool calls raise a y/a/N modal; pass
     /// `--yes` to auto-approve all calls without a modal.
     Tui {
@@ -285,7 +279,7 @@ enum Commands {
     },
     /// Fork a recorded session at a decision point (A-46): the prefix replays hermetically from
     /// the cassette (no side effects), then the tail DIVERGES live through the real approval
-    /// envelope — inject a different value, run an edited plan, or let the model re-plan.
+    /// envelope — inject a different value, run an edited authored flow, or re-enter the adaptive agent.
     Fork {
         /// Session id (`s_42`), or `last` for the most recent session.
         session: String,
@@ -295,14 +289,14 @@ enum Commands {
         /// Mode A: inject this JSON value as the fork statement's result, then run the rest live.
         #[arg(long, conflicts_with_all = ["edit", "replan"])]
         inject: Option<String>,
-        /// Mode C: continue with this edited plan file (.flux text or JSON DraftAst) — unchanged
+        /// Mode C: continue with this edited flow file (.flux text or JSON DraftAst) — unchanged
         /// leading statements fast-forward against the replayed prefix, edits run live.
         #[arg(long, conflicts_with_all = ["inject", "replan"])]
         edit: Option<String>,
-        /// Mode B (default): let the model re-plan the tail live from the forked state.
+        /// Mode B (default): re-enter the adaptive agent from the forked state.
         #[arg(long)]
         replan: bool,
-        /// With --replan (mode B, the default): the instruction for the re-planned tail
+        /// With --replan (mode B, the default): the instruction for the adaptive tail
         /// (default: continue the recorded task). Meaningless for --inject/--edit, so those
         /// combinations are rejected.
         #[arg(long, conflicts_with_all = ["inject", "edit"])]
@@ -414,14 +408,14 @@ enum Commands {
     },
     /// Per-model token usage + cost across flux and detected local agent harnesses.
     Usage(usage::UsageArgs),
-    /// Hermetically replay a recorded session (A-45): plans re-parse from the durable
-    /// `plan_source`, op outputs are served from the C-43 cassette — no model call, no live IO,
+    /// Hermetically replay a recorded session (A-45): host-recorded execution flows re-parse from
+    /// durable history, and op outputs come from the C-43 cassette — no model call, no live IO,
     /// side effects never re-fired. Divergence from the recording fails loudly.
     Replay {
         /// Session id (`s_42`), or `last` for the most recent session.
         #[arg(default_value = "last")]
         session: String,
-        /// Replay only this turn's plans (1-based — turn 0 is a usage error, not an alias for
+        /// Replay only this turn's recorded flows (1-based — turn 0 is a usage error, not an alias for
         /// the first turn). Cross-turn symbol references fail honestly.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         turn: Option<u64>,
@@ -433,7 +427,7 @@ enum Commands {
         json: bool,
     },
     /// Diff two recorded runs (C-44): align their executed statements and show exactly where the
-    /// PLAN changed (differing statement content) vs where the same plan hit a DIFFERENT WORLD
+    /// FLOW changed (differing statement content) vs where the same flow hit a DIFFERENT WORLD
     /// (differing recorded op output). Exit code 1 when the runs diverge, `diff`-style.
     Diff {
         /// First session id (`s_42`), or `last`.
@@ -443,11 +437,6 @@ enum Commands {
         /// Emit a machine-readable JSON report.
         #[arg(long)]
         json: bool,
-    },
-    /// Mine `~/.flux/events.db` for flux-native NL→Flux-Lang training data (D-53).
-    Corpus {
-        #[command(subcommand)]
-        action: CorpusAction,
     },
     /// Provider and plugin authentication (status / login / set).
     Auth {
@@ -509,13 +498,12 @@ enum Commands {
 }
 
 impl Commands {
-    /// The flattened [`AgentFlags`] of an agent-path subcommand (`run`/`plan`/`tui`/`fork`/
+    /// The flattened [`AgentFlags`] of an agent-path subcommand (`run`/`tui`/`fork`/
     /// `app run`), if this is one. `main` uses this to export the flags' env signals BEFORE the
     /// tokio runtime exists — `set_var` must not race worker-thread `getenv`s.
     fn agent_flags(&self) -> Option<&AgentFlags> {
         match self {
             Self::Run { agent, .. }
-            | Self::Plan { agent, .. }
             | Self::Tui { agent }
             | Self::Fork { agent, .. }
             | Self::App {
@@ -607,28 +595,13 @@ enum FlowAction {
 /// `flux loop …`
 #[derive(clap::Subcommand, Debug)]
 enum LoopAction {
-    /// Print the active agent loop (the default).
+    /// Print the built-in adaptive agent loop (the default).
     Show,
-    /// Write the built-in loop to `.flux/agent-loop.flux` so it can be edited.
+    /// Write the built-in loop to `.flux/agent-loop.flux` so it can be edited and selected explicitly.
     Eject {
-        /// Overwrite an existing override.
+        /// Overwrite an existing ejected copy.
         #[arg(short, long)]
         force: bool,
-    },
-}
-
-/// `flux corpus …`
-#[derive(clap::Subcommand, Debug)]
-enum CorpusAction {
-    /// Pair every accepted plan's canonical text (`plan_source`, L-38) with the user instruction
-    /// that produced it and emit corpus-shaped JSONL (one row per line):
-    /// `{id, nl_goal, source, provenance: {session, turn}, flux_rev}`. Reads events.db read-only;
-    /// prints a skip-count summary to stderr (precision over recall — an ambiguous or pre-L-38 row
-    /// is dropped and counted, never guessed at).
-    Export {
-        /// Write JSONL to this file instead of stdout.
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -885,6 +858,17 @@ impl From<EffortArg> for Effort {
     }
 }
 
+fn parse_effort(value: &str) -> Result<Effort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok(Effort::Low),
+        "medium" => Ok(Effort::Medium),
+        "high" => Ok(Effort::High),
+        "xhigh" => Ok(Effort::Xhigh),
+        "max" => Ok(Effort::Max),
+        _ => anyhow::bail!("expected low, medium, high, xhigh, or max; got {value:?}"),
+    }
+}
+
 /// `flux render --view` — CLI mirror of [`flux_tools::render::View`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 enum RenderView {
@@ -939,15 +923,6 @@ impl ReviewSeverity {
             _ => Self::Critical,
         }
     }
-}
-
-/// Output format for `flux plan -o …`.
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
-enum OutputFormat {
-    Json,
-    Yaml,
-    #[default]
-    Pretty,
 }
 
 // Codex/Anthropic model resolution is backend knowledge owned by each provider crate
@@ -1434,6 +1409,9 @@ async fn run_fork(
     if flags.continue_ || flags.resume {
         bail!("`flux fork` always forks the given session — `--continue`/`--resume` don't apply");
     }
+    if flags.agent_loop.is_some() {
+        bail!("`--loop` selects complete agent turns and does not apply to `flux fork` tail continuation");
+    }
     let events = Arc::new(open_event_store()?);
     let sid = if session_arg == "last" {
         events
@@ -1454,7 +1432,7 @@ async fn run_fork(
 
     // Mint the fork session, correlated to its source (the A-08 linkage `flux replay
     // --sub-agents` and cost rollups already understand), and seed its conversation with the
-    // parent's messages so a re-planned tail has the recorded context.
+    // parent's messages so an adaptive tail has the recorded context.
     let fork_sid = events
         .create_session_with_context(
             &src_info.model,
@@ -1540,8 +1518,8 @@ async fn run_fork(
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         )
     } else {
-        // Mode B: a live turn on the forked session — the planner sees the copied conversation
-        // plus the replayed prefix's symbols, and plans a fresh tail through the full envelope.
+        // Mode B: a live turn on the forked session — the adaptive loop sees the copied
+        // conversation plus the replayed prefix's symbols and continues through the full envelope.
         let instruction = prompt.unwrap_or_else(|| match &last_input {
             Some(input) => {
                 format!("Continue from the current forked state. The original task was: {input}")
@@ -1708,132 +1686,15 @@ fn run_diff_cmd(a_arg: &str, b_arg: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `flux corpus …` (D-53).
-fn run_corpus(action: CorpusAction) -> Result<()> {
-    match action {
-        CorpusAction::Export { out } => run_corpus_export(out),
-    }
-}
-
-/// The provenance anchor stamped on every exported row (D-53): the exporting binary's OWN
-/// `CARGO_PKG_VERSION`, baked in at compile time — the same figure `flux --version` reports. This is
-/// deliberately NOT a runtime `git describe`: an installed binary has no `.git` directory next to it
-/// (and a caller's cwd is arbitrary), so a runtime git shell-out would be silently wrong or fail far
-/// from where the plan was actually recorded. The crate version is the honest anchor actually
-/// available wherever this binary runs — precise enough to tell flux-model whether a corpus row's
-/// `plan_source` was recorded under a flux-lang grammar old enough to need re-lowering.
-const FLUX_REV: &str = env!("CARGO_PKG_VERSION");
-
-/// `flux corpus export [--out <file>]` — walk `~/.flux/events.db` and emit corpus-shaped JSONL: one
-/// accepted plan's canonical text (`plan_source`, L-38) paired with its originating user instruction,
-/// per line. Read-only; writes rows to stdout (or `--out`) and a skip-count summary to stderr, so the
-/// data stream stays pipeable (`flux corpus export | wc -l`) while the audit trail is still visible.
-fn run_corpus_export(out: Option<std::path::PathBuf>) -> Result<()> {
-    let store = open_event_store()?;
-    let summary = match &out {
-        Some(path) => {
-            let file = std::fs::File::create(path)
-                .with_context(|| format!("create {}", path.display()))?;
-            run_corpus_export_with(&store, FLUX_REV, file)?
-        }
-        None => run_corpus_export_with(&store, FLUX_REV, std::io::stdout())?,
-    };
-    eprintln!(
-        "{} {} row{} exported · skipped {} (no plan_source {} · ambiguous pairing {} · unparseable at HEAD {})",
-        style::bold("corpus export:"),
-        summary.exported,
-        if summary.exported == 1 { "" } else { "s" },
-        summary.no_plan_source + summary.ambiguous_pairing + summary.unparseable_at_head,
-        summary.no_plan_source,
-        summary.ambiguous_pairing,
-        summary.unparseable_at_head,
-    );
-    Ok(())
-}
-
-/// The `flux corpus export` outcome, printed to stderr — every row skipped (not just the exported
-/// count) is visible, so "precision over recall" never reads as a silent undercount.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CorpusExportSummary {
-    exported: u64,
-    no_plan_source: u64,
-    ambiguous_pairing: u64,
-    /// A `plan_source` that failed to re-parse against the flux-lang parser LINKED INTO THIS BINARY
-    /// — a scoped, in-repo stand-in for "lower_ok at current flux HEAD" (the fuller flux-model
-    /// corpus ladder additionally lowers against a live op catalog + prior-turn symbol state, which
-    /// is that repo's concern, not this exporter's). Expected to be 0 in practice: `plan_source` is
-    /// documented as "present means parseable" at write time, so this only ever fires when the
-    /// text grammar changed incompatibly since the plan was recorded.
-    unparseable_at_head: u64,
-}
-
-/// The store-parameterized body of [`run_corpus_export`] (tests pass an in-memory store + an in-memory
-/// writer so they touch neither `HOME`'s real `~/.flux/events.db` nor the filesystem).
-fn run_corpus_export_with(
-    store: &EventStore,
-    flux_rev: &str,
-    mut out: impl Write,
-) -> Result<CorpusExportSummary> {
-    let (rows, skips) = store.corpus_rows_all()?;
-    let mut summary = CorpusExportSummary {
-        no_plan_source: skips.no_plan_source,
-        ambiguous_pairing: skips.ambiguous_pairing,
-        ..Default::default()
-    };
-    // C-22 restated at the export boundary: `row.source` (plan_source) is already redacted with the
-    // LIVE session redactor at record time (`loop_host.rs`'s `attempt.plan_source = redactor.redact(&src)`)
-    // — nothing to redo here. `row.nl_goal` (the raw `TurnStarted.user_input`) is NOT redacted at
-    // record time (only the agent's own outputs are), so it gets an equivalent scrub here: a bare
-    // `Redactor` has no registered secret VALUES for a long-closed session to replay, but its
-    // credential-SHAPED-token pattern match (`sk-…`, `ghp_…`, …) still fires independently of any
-    // registry — the same class of scrub `capture.py` applies to raw corpus text.
-    let redactor = flux_secret::Redactor::new();
-    for row in rows {
-        // Re-parse against the CURRENTLY LINKED flux-lang parser (Acceptance's "lower_ok at current
-        // flux HEAD", scoped to parse validity — see CorpusExportSummary::unparseable_at_head).
-        if flux_lang::parse::parse(&row.source).is_err() {
-            summary.unparseable_at_head += 1;
-            continue;
-        }
-        let line = serde_json::json!({
-            "id": row.id,
-            "nl_goal": redactor.redact(&row.nl_goal),
-            "source": row.source,
-            "provenance": { "session": row.session, "turn": row.turn },
-            "flux_rev": flux_rev,
-        });
-        writeln!(out, "{}", serde_json::to_string(&line)?)?;
-        summary.exported += 1;
-    }
-    Ok(summary)
-}
-
-/// `flux loop [show|eject]` — inspect and customize the flux-lang agent loop that drives every turn.
-///
-/// The loop is real Flux-Lang (`crates/flux-flow/assets/agent-loop.flux`): `plan → match → run_plan → observe`,
-/// repeated until the model answers in prose. `show` prints the active loop (a workspace
-/// `.flux/agent-loop.flux` override if present, else the built-in); `eject` writes the built-in to
-/// `.flux/agent-loop.flux` so it can be edited (the engine honors the override on the next turn).
-fn run_loop_cmd(action: Option<LoopAction>) -> Result<()> {
-    use flux_flow::engine::{agent_loop_source, builtin_agent_loop, load_agent_loop, LoopSource};
+/// `flux loop [show|eject]` — inspect or copy the built-in adaptive Flux-Lang outer loop.
+async fn run_loop_cmd(action: Option<LoopAction>) -> Result<()> {
+    use flux_flow::engine::{agent_loop_source, builtin_agent_loop};
 
     let cwd = std::env::current_dir().context("current dir")?;
     match action.unwrap_or(LoopAction::Show) {
         LoopAction::Show => {
-            let (source, text) = agent_loop_source(&cwd);
-            match &source {
-                LoopSource::Builtin => {
-                    eprintln!("{} built-in (compiled-in default)", style::bold("source:"));
-                }
-                LoopSource::Override(path) => {
-                    eprintln!("{} {}", style::bold("source:"), path.display());
-                    // The engine errors on a bad override rather than silently using the built-in, so
-                    // surface a parse failure here too instead of pretending the override is live.
-                    if let Err(e) = load_agent_loop(&cwd) {
-                        eprintln!("{} {e}", style::red("invalid override:"));
-                    }
-                }
-            }
+            let (_source, text) = agent_loop_source(&cwd);
+            eprintln!("{} built-in adaptive preset", style::bold("source:"));
             eprintln!();
             // The loop text goes to stdout so `flux loop show` is pipeable.
             print!("{text}");
@@ -1843,19 +1704,27 @@ fn run_loop_cmd(action: Option<LoopAction>) -> Result<()> {
             Ok(())
         }
         LoopAction::Eject { force } => {
-            let dir = cwd.join(".flux");
-            let path = dir.join("agent-loop.flux");
-            if path.exists() && !force {
+            let system =
+                System::new(Workspace::new(&cwd).map_err(|error| anyhow::anyhow!("{error}"))?);
+            let relative = ".flux/agent-loop.flux";
+            let path = cwd.join(relative);
+            if system
+                .path_exists(relative)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                && !force
+            {
                 bail!(
                     "{} already exists — edit it directly, or pass --force to overwrite with the built-in",
                     path.display()
                 );
             }
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            std::fs::write(&path, builtin_agent_loop())
-                .with_context(|| format!("write {}", path.display()))?;
+            system
+                .write_file(relative, builtin_agent_loop())
+                .await
+                .map_err(|error| anyhow::anyhow!("write {}: {error}", path.display()))?;
             eprintln!(
-                "{} {} — edit it to customize the loop (the engine uses it on the next turn)",
+                "{} {} — reference this file explicitly from an agent, app, role, or config",
                 style::green("wrote"),
                 path.display()
             );
@@ -2120,6 +1989,7 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
                 model: None,
                 thinking: None,
                 effort: None,
+                agent_loop: None,
                 tools: None, // built-in roles inherit the parent's full toolset
                 prompt: (*prompt).to_string(),
             });
@@ -2152,7 +2022,7 @@ fn session_ambient_signals(endpoints: &flux_capabilities::EndpointRegistry) -> V
 /// Put a plugin's otherwise-ungrouped visible operations behind one turn-intent group. Explicit
 /// manifest membership and per-op group tags remain authoritative; this only changes the legacy
 /// `group = None` case that would otherwise classify hundreds of installed integration ops as core
-/// and inject them into every planner request.
+/// and inject them into every adaptive model-stage request.
 fn implicit_plugin_group(
     manifest: &flux_plugin::PluginManifest,
     specs: &[flux_spec::ToolSpec],
@@ -2250,6 +2120,22 @@ fn workspace_with_flow_roots(cwd: &std::path::Path, create_global: bool) -> Resu
 /// production entry point.
 fn resolved_sandbox() -> flux_system::sandbox::Sandbox {
     flux_system::sandbox::Sandbox::resolve(flux_system::sandbox::SandboxSettings::from_env())
+}
+
+/// Resolve an explicit outer-loop selector. The built-in preset needs no IO; a file is read through
+/// the guarded workspace rather than by the engine probing a magic path behind the caller's back.
+async fn resolve_agent_loop(selection: Option<&str>, system: &System) -> Result<AgentLoopSpec> {
+    let Some(selection) = selection.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(AgentLoopSpec::default());
+    };
+    if selection.eq_ignore_ascii_case("adaptive") {
+        return Ok(AgentLoopSpec::default());
+    }
+    let source = system
+        .read_file(selection)
+        .await
+        .with_context(|| format!("read explicit agent loop `{selection}`"))?;
+    AgentLoopSpec::parse(&source).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 async fn build_agent_with(
@@ -2405,10 +2291,9 @@ async fn build_agent_with(
     // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
     flux_eval::register_eval_ops(&mut registry);
 
-    // Root/reflexive ops: `plan`/`run_plan` are registered so a pre-authored flow (`flux flow run`, and
-    // the agent loop in flux-lang) can call them, but are tagged to the never-surfaced `reflect` group so
-    // they stay OUT of the model-facing catalog in ordinary turns. `op.register` is model-facing and
-    // delegates to the engine-installed composite registrar.
+    // Authored-loop stages are registered for `agent-loop.flux` but tagged to the never-surfaced
+    // `reflect` group, so they stay OUT of native model catalogs. `op.register` remains model-facing
+    // and delegates to the engine-installed composite registrar.
     flux_tools::register_reflect(&mut registry);
 
     // Flow discovery/run: `flow_list` (enumerate .flux/flows + ~/.flux/flows) and `flow_run`
@@ -2641,6 +2526,58 @@ async fn build_agent_with(
         }
     }
 
+    // Config-authored model stages are ordinary typed operations. Register them only after every
+    // built-in/plugin operation is known so name collisions and missing gather-tool wiring fail at
+    // startup instead of silently shadowing a live capability.
+    let mut model_stages = std::collections::BTreeMap::new();
+    for (name, stage) in &cfg.agent.stages {
+        if name.trim().is_empty() || registry.get(name).is_some() {
+            anyhow::bail!(
+                "[agent.stages.{name}] must have a non-empty operation name that does not collide with a registered tool"
+            );
+        }
+        if stage.max_tokens == 0 {
+            anyhow::bail!("[agent.stages.{name}] max_tokens must be greater than zero");
+        }
+        for tool in &stage.tools {
+            let registered = registry.get(tool).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[agent.stages.{name}] tool `{tool}` is not registered and wired on this CLI path"
+                )
+            })?;
+            if !flux_flow::statically_gather_safe(registered.as_ref()) {
+                anyhow::bail!(
+                    "[agent.stages.{name}] tool `{tool}` is not statically gather-safe (it must be low-risk, idempotent, non-mutating, and not capture-only)"
+                );
+            }
+        }
+        let effort = stage
+            .effort
+            .as_deref()
+            .map(parse_effort)
+            .transpose()
+            .with_context(|| format!("[agent.stages.{name}] effort"))?;
+        flux_tools::reflect::register_model_stage(
+            &mut registry,
+            name.clone(),
+            format!("Run the configured `{name}` model stage."),
+            stage.input_schema.clone(),
+            stage.output_schema.clone(),
+        );
+        model_stages.insert(
+            name.clone(),
+            flux_flow::ModelStageDefinition {
+                prompt: stage.prompt.clone(),
+                input_schema: stage.input_schema.clone(),
+                output_schema: stage.output_schema.clone(),
+                model: stage.model.clone(),
+                tools: stage.tools.clone(),
+                max_tokens: stage.max_tokens,
+                effort,
+            },
+        );
+    }
+
     // Read-only tools are pre-allowed by default so the common case needs no config; network/
     // mutating tools still gate. See [`DEFAULT_ALLOW`]. A configured allow-list replaces it entirely.
     let mut allow = cfg.permissions.allow.clone();
@@ -2664,7 +2601,7 @@ async fn build_agent_with(
         hook_vec.push(Arc::new(js_hooks));
     }
 
-    let ctx = ToolContext::new(system)
+    let ctx = ToolContext::new(system.clone())
         .with_spawner(spawner.clone())
         .with_redactor(redactor);
     let executor = Executor::new(registry, perms, approver, ctx)
@@ -2707,8 +2644,8 @@ async fn build_agent_with(
     ));
 
     let flow = open_flow_store(events.clone())?;
-    // Assemble the engine: this installs the reflexive loop host on the executor and loads the flux-lang
-    // `agent-loop.flux` (the turn loop is flux-lang, not Rust).
+    // Assemble the engine: this installs the authored-loop host and loads the selected Flux-Lang
+    // outer loop (the turn loop is Flux-Lang, not Rust).
     let spec = AgentSpec {
         model,
         system_prompt,
@@ -2717,6 +2654,14 @@ async fn build_agent_with(
         max_iterations: 25,
         thinking: flags.think,
         effort: flags.effort.map(Into::into),
+        agent_loop: resolve_agent_loop(
+            flags
+                .agent_loop
+                .as_deref()
+                .or(cfg.agent.loop_spec.as_deref()),
+            system.as_ref(),
+        )
+        .await?,
         groups,
         ambient_signals,
         compact_threshold_chars: compact_threshold(),
@@ -2729,6 +2674,7 @@ async fn build_agent_with(
     let agent = spec
         .into_engine(Arc::from(provider), executor, events, flow)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    agent.loop_host.set_model_stages(model_stages);
     // Per-turn token ceiling (A-10), default OFF. Precedence: --turn-budget > FLUX_TURN_TOKEN_BUDGET
     // > config [limits] turn_token_budget. A malformed env value is a hard error, not a silent
     // fall-through: this is a spend/safety ceiling, and `FLUX_TURN_TOKEN_BUDGET=1_000_000` quietly
@@ -2744,12 +2690,6 @@ async fn build_agent_with(
         .or(env_budget)
         .or(cfg.limits.turn_token_budget);
     agent.loop_host.set_token_budget(turn_budget);
-    // Read-only-round breadth ladder (A-29): config-only overrides of the built-in defaults —
-    // raise (or 0-disable) for legitimately read-heavy workflows.
-    agent.loop_host.set_readonly_ladder(
-        cfg.limits.readonly_rounds_escalate,
-        cfg.limits.readonly_rounds_stop,
-    );
     Ok((agent, session_id, canonical_spec, spawner))
 }
 
@@ -3763,12 +3703,11 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         }
     }
 
-    // Denial re-emission guard (design Part 2 / A-16): a statement policy or the user already
+    // Denied-statement resume guard: a statement policy or the user already
     // refused must never be silently re-dispatched just because it re-appears unchanged in a
-    // corrected re-emission. Checked BEFORE executing anything — this authored path never goes
-    // through `run_plan`, so it must enforce the same invariant itself.
+    // corrected file. Checked BEFORE executing anything.
     if let Some(open) = &open_halt {
-        if flux_flow::runtime::denied_reemission_guard(&ast.body, &open.halt) {
+        if flux_flow::runtime::denied_resume_guard(&ast.body, &open.halt) {
             eprintln!(
                 "{}",
                 style::red(&flux_flow::runtime::render_halt_report(
@@ -3807,14 +3746,13 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         style::dim(&format!(" · {} op(s)", risk.ops.len()))
     );
 
-    // Point the engine's installed loop host at this run's session + sink (a flow may call
-    // `plan`/`run_plan`, which re-enter the planner/interpreter through this same executor). The sink is
-    // shared so the outer flow and any inner `run_plan` stream live onto one surface, sub-steps interleaved.
+    // Point the installed loop host at this run's session + sink. A flow may call `ai_segment` or
+    // `flow_run`; the shared sink keeps nested stage and operation events on one surface.
     let shared: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
         CliSink::new(0).with_cost(model_spec, flux_credentials::load_pricing_table()),
     ));
     // `None` advertised set: this is the pre-authored `flow run` path, which is deliberately
-    // unrestricted by surfacing (the file names its ops explicitly; only model-emitted plans gate).
+    // unrestricted by surfacing because the authored file names its operations explicitly.
     engine.loop_host.set_turn(
         session_id.clone(),
         Some(engine.system_prompt.clone()),
@@ -3825,8 +3763,7 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
     let outcome = if resumable {
-        // L-25: the SAME resumable entry point `run_plan` uses (`docs/designs/multipass-agent-loop.md`
-        // Part 2) — a failing top-level statement reifies onto `outcome.failure` instead of
+        // A failing top-level statement reifies onto `outcome.failure` instead of
         // propagating `Err`; `open_halt`'s ledger (when resuming) fast-forwards the matching prefix.
         flux_flow::runtime::execute_flow_resumable_with_composites(
             engine.flow.as_ref(),
@@ -3835,14 +3772,13 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
             ast,
             &active_composites,
             open_halt.as_ref().map(|o| &o.ledger),
-            None,
             &mut sink,
         )
         .await
     } else {
         // Also the no-composites case (empty slice is equivalent): this entry point self-wires
         // the C-43 cassette scope from the store — plain `execute_flow` deliberately does not
-        // (it is shared with the outer agent loop, whose machinery is never cassetted).
+        // (it is shared with the outer agent loop, whose host stages are never cassetted).
         flux_flow::runtime::execute_flow_with_composites(
             engine.flow.as_ref(),
             engine.executor.as_ref(),
@@ -3880,7 +3816,7 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
         );
     }
     // A deterministic flow bills nothing (usage stays zero → `None`, today's output); a flow that
-    // reached a model op via `plan`/`run_plan` reports its real spend (C-30).
+    // reached a model op via `ai_segment` reports its real spend.
     let u = engine.loop_host.turn_usage();
     shared
         .lock()
@@ -3895,8 +3831,8 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
 /// (newest-first) for the most recent session with an open halt latch whose halted plan's key is
 /// prefixed by this flow's declared name (the same `name#`/`h:` prefix
 /// [`flow_key`](flux_lang::runtime) derives) — an UNNAMED flow can't be disambiguated this way (a
-/// bare `h:<hash>` prefix could match ANY unnamed halted plan, including an ordinary chat turn's
-/// inner `run_plan` halt, since they share the same session store and ledger machinery), so `last`
+/// bare `h:<hash>` prefix could match ANY unnamed halted flow, including a host-derived action flow
+/// from an agent turn, since they share the same session store and ledger machinery), so `last`
 /// is refused for it and the caller is pointed at the explicit session id the halt report printed.
 fn resolve_resume_session(
     events: &EventStore,
@@ -3934,157 +3870,10 @@ fn resolve_resume_session(
     bail!("no halted `flow run` session found for flow `{name}` — nothing to resume");
 }
 
-/// An `AskUser` that prompts on stdin — used by `flux plan` when attached to a terminal.
-struct CliAsk;
-impl flux_flow::compile::AskUser for CliAsk {
-    fn ask(&self, question: &str) -> String {
-        eprint!("\n{} ", style::cyan(&format!("? {question}")));
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        line.trim().to_string()
-    }
-}
-
-/// The stdin `ask_user` seam, offered only when attached to a terminal (otherwise the planner runs
-/// without the clarifying-question tool).
-fn terminal_ask(ask: &CliAsk) -> Option<&dyn flux_flow::compile::AskUser> {
-    std::io::stdin()
-        .is_terminal()
-        .then_some(ask as &dyn flux_flow::compile::AskUser)
-}
-
-/// `flux plan <prompt>` (plan mode, one-shot): compile the prompt into a Flux-Lang plan and show it. On
-/// an interactive terminal it then asks `run it? [y/N]` and executes on yes; piped or with `-o json|yaml`
-/// it just prints the plan and exits (never runs). The same engine drives this and a real turn, so the
-/// plan you see is the plan that runs.
-async fn run_plan(
-    flags: AgentFlags,
-    output: Option<OutputFormat>,
-    prompt_words: Vec<String>,
-) -> Result<()> {
-    let prompt = prompt_words.join(" ");
-    if prompt.trim().is_empty() {
-        bail!(
-            "`flux plan` needs a prompt, e.g. `flux plan \"summarize the README into SUMMARY.txt\"`"
-        );
-    }
-    let (engine, session_id, model_spec, _spawner) = build_agent(&flags).await?;
-    let cli_ask = CliAsk;
-    eprintln!(
-        "{}",
-        style::dim(&format!("plan · {} · agentic", engine.model))
-    );
-
-    // A-42: a live sink so any auto-run gather rounds stream (ops/results, phase-aware spinner)
-    // instead of the prior silence — no cost/turn-end rendering needed here, `compile_once` never
-    // calls `turn_end` on it (this is a compile, not a turn).
-    let mut gather_sink = CliSink::new(0);
-    let compiled = match engine
-        .compile_once(
-            &session_id,
-            &prompt,
-            &mut gather_sink,
-            terminal_ask(&cli_ask),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", flux_flow::engine::planner_error(&e)))?
-    {
-        flux_flow::compile::TurnOutput::Plan(c) => c,
-        flux_flow::compile::TurnOutput::Chat(text) => {
-            // The model answered rather than planning — show the answer, no plan.
-            println!("{text}");
-            return Ok(());
-        }
-    };
-
-    // Non-interactive (`-o json|yaml`, or piped stdout): print the plan and exit — never run.
-    if output.is_some() || !std::io::stdout().is_terminal() {
-        // `--yes` pre-approves a run, but this mode never runs — say so instead of letting the
-        // contradictory combo pass as if it had executed something.
-        if flags.yes {
-            eprintln!(
-                "{}",
-                style::dim("(--yes has no effect here: plan output mode never runs the plan — use `flux run`)")
-            );
-        }
-        let rendered = match output.unwrap_or_default() {
-            OutputFormat::Json => {
-                serde_json::to_string_pretty(&compiled.ast).context("render json")?
-            }
-            OutputFormat::Yaml => serde_norway::to_string(&compiled.ast).context("render yaml")?,
-            OutputFormat::Pretty => flux_flow::render::render_pretty(&compiled.ast),
-        };
-        println!("{rendered}");
-        print_diagnostics(&compiled.diagnostics);
-        return Ok(());
-    }
-
-    // Interactive: show the highlighted plan + a risk badge, then offer to run it.
-    let risk = flux_flow::runtime::plan_risk(&compiled.ast, engine.executor.registry());
-    eprintln!(
-        "\n{}  {}{}",
-        style::bold("plan"),
-        risk_badge(&risk.summary()),
-        style::dim(&format!(" · {} op(s)", risk.ops.len()))
-    );
-    eprintln!(
-        "{}",
-        flux_flow::render::render_styled(&compiled.ast, &style::plan_palette())
-    );
-    if !compiled.diagnostics.is_empty() {
-        print_diagnostics(&compiled.diagnostics);
-        let refusal = if diagnostics_all_unknown_op(&compiled.diagnostics) {
-            "plan references unknown operations — not running"
-        } else {
-            "plan failed validation — not running"
-        };
-        eprintln!("{}", style::yellow(refusal));
-        return Ok(());
-    }
-    if risk.ops.is_empty() {
-        eprintln!("{}", style::dim("empty plan — nothing to run"));
-        return Ok(());
-    }
-    if !(flags.yes || confirm_plan(risk.ops.len())) {
-        eprintln!("{}", style::dim("not run"));
-        return Ok(());
-    }
-
-    // Approved → run it through the same envelope (PlanApprover: approved ops pass without a re-prompt;
-    // destructive ops still escalate to the fallback — per-op confirm, or auto under --yes).
-    let fallback: Arc<dyn Approver> = if flags.yes {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(StdinApprover)
-    };
-    engine
-        .executor
-        .set_approver(Arc::new(flux_flow::runtime::PlanApprover::new(
-            risk.ops.clone(),
-            fallback,
-        )));
-    let mut sink = CliSink::new(0).with_cost(model_spec, flux_credentials::load_pricing_table());
-    let outcome = flux_flow::runtime::execute_flow(
-        &engine.flow,
-        &engine.executor,
-        &session_id,
-        &compiled.ast,
-        &mut sink,
-    )
-    .await
-    .context("execute flow")?;
-    if !outcome.result.trim().is_empty() {
-        println!("{}", outcome.result);
-    }
-    sink.turn_end(None);
-    Ok(())
-}
-
 /// Whether *every* analyzer diagnostic is an unknown-op error (message shape `unknown operation: …`).
 /// Picks an accurate header: a validation failure of another class (bad arg, arity, type/shape,
 /// composability, unbound symbol, …) must not be filed under "references unknown operations" (A-62 /
-/// F-010) — that header misleads both the reader and the planner, which reads diagnostics back to
+/// F-010) — that header misleads both the reader and any model stage that reads diagnostics back to
 /// repair. Empty ⇒ false (no header is printed for an empty set).
 fn diagnostics_all_unknown_op(diags: &[flux_flow::analyze::Diagnostic]) -> bool {
     !diags.is_empty()
@@ -4109,24 +3898,8 @@ fn print_diagnostics(diags: &[flux_flow::analyze::Diagnostic]) {
     }
 }
 
-/// One stdin `y/N` confirmation for a whole compiled plan.
-fn confirm_plan(steps: usize) -> bool {
-    eprint!(
-        "\n{} [y/N]: ",
-        style::yellow(&format!("Run this {steps}-op plan?"))
-    );
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
-}
-
 /// A minimal `reedline` prompt: a single `› ` indicator (no left/right segments).
-struct FluxPrompt {
-    plan_mode: bool,
-}
+struct FluxPrompt;
 
 impl Prompt for FluxPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
@@ -4136,8 +3909,7 @@ impl Prompt for FluxPrompt {
         Cow::Borrowed("")
     }
     fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        // A distinct indicator in plan mode, so it's obvious turns won't execute.
-        Cow::Borrowed(if self.plan_mode { "plan › " } else { "› " })
+        Cow::Borrowed("› ")
     }
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
         Cow::Borrowed("… ")
@@ -4549,12 +4321,8 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
     };
     let mut editor = Reedline::create().with_history(history);
 
-    // Plan mode (`/plan`): turns produce a plan but DON'T execute; `/run` executes the pending plan.
-    let mut plan_mode = false;
-    let mut pending_plan: Option<flux_flow::ast::DraftAst> = None;
-
     loop {
-        let prompt = FluxPrompt { plan_mode };
+        let prompt = FluxPrompt;
         let line = match editor.read_line(&prompt) {
             Ok(Signal::Success(buf)) => buf,
             Ok(Signal::CtrlC) => continue, // clear the current line, reprompt
@@ -4572,8 +4340,6 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                 "help" => {
                     const CMDS: &[(&str, &str)] = &[
                         ("/help", "show this help"),
-                        ("/plan", "toggle plan mode (show plan; /run to execute)"),
-                        ("/run", "execute the pending plan from plan mode"),
                         ("/shell", "toggle the generic bash op (off by default)"),
                         ("/tools", "list available tools"),
                         (
@@ -4607,37 +4373,6 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
                     }
                     eprintln!("  Ctrl-C  interrupt a running turn   Ctrl-D  exit");
                 }
-                "plan" => {
-                    plan_mode = !plan_mode;
-                    pending_plan = None;
-                    eprintln!(
-                        "{}",
-                        style::dim(&format!(
-                            "plan mode {} — {}",
-                            if plan_mode { "on" } else { "off" },
-                            if plan_mode {
-                                "turns show a plan; `/run` to execute, or keep chatting to refine"
-                            } else {
-                                "turns run normally"
-                            }
-                        ))
-                    );
-                }
-                "run" => match pending_plan.take() {
-                    Some(ast) => {
-                        let agent_ref = &agent;
-                        let cost_ref = &cost;
-                        let sid_ref = session_id.as_str();
-                        run_interruptible(move |c| async move {
-                            run_pending_plan(agent_ref, cost_ref, sid_ref, &ast, &c).await;
-                        })
-                        .await;
-                    }
-                    None => eprintln!(
-                        "{}",
-                        style::dim("(no pending plan — use /plan, then describe a task)")
-                    ),
-                },
                 "shell" => {
                     // Toggle the generic `bash` op for the session via the runtime's in-process
                     // override — mid-session `set_var`/`remove_var` would race worker-thread
@@ -4830,38 +4565,6 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
             }
             continue;
         }
-        // Plan mode: compile + show a plan, store it for `/run`, but DON'T execute. Refine by chatting.
-        // Interruptible: the first Ctrl-C drops the in-flight compose and returns to the prompt.
-        if plan_mode {
-            let agent_ref = &agent;
-            let cost_ref = &cost;
-            let sid_ref = session_id.as_str();
-            let mut new_plan: Option<flux_flow::ast::DraftAst> = None;
-            let plan_slot = &mut new_plan;
-            run_interruptible(move |c| async move {
-                let mut sink = cost_ref.sink(agent_ref, 0);
-                match agent_ref.plan_turn(sid_ref, input, &mut sink, &c).await {
-                    Ok(Some(ast)) => {
-                        *plan_slot = Some(ast);
-                        eprintln!(
-                            "{}",
-                            style::dim(
-                                "(plan ready — `/run` to execute, or send a message to refine)"
-                            )
-                        );
-                    }
-                    Ok(None) => {} // prose answer, or the compose was cancelled — nothing to run
-                    Err(e) => eprintln!("{} {e:#}", style::red("error:")),
-                }
-            })
-            .await;
-            // Only replace a prior pending plan when a fresh one was produced (prose/cancel keep it).
-            if let Some(ast) = new_plan {
-                pending_plan = Some(ast);
-            }
-            continue;
-        }
-
         // Normal mode: run the turn interruptibly. The first Ctrl-C cancels it (without killing the
         // REPL); the turn unwinds cleanly and we return to the prompt. (Ctrl-D exits.)
         let agent_ref = &agent;
@@ -4880,31 +4583,6 @@ async fn run_repl(flags: AgentFlags) -> Result<()> {
     }
     persist_new_rules(&initial_rules, &agent.executor.allow_rules());
     Ok(())
-}
-
-/// REPL `/run`: execute a reviewed plan. Typing `/run` after reviewing the plan in `/plan` mode IS the
-/// approval, so the plan runs as a pre-approved unit — its ops don't prompt individually (deny rules
-/// still apply). The scope guard closes when this returns.
-async fn run_pending_plan(
-    agent: &FlowEngine,
-    cost: &TurnCost,
-    session_id: &str,
-    ast: &flux_flow::ast::DraftAst,
-    cancel: &tokio_util::sync::CancellationToken,
-) {
-    let mut sink = cost.sink(agent, 0);
-    match agent
-        .run_reviewed_plan_cancellable(session_id, ast, &mut sink, cancel)
-        .await
-    {
-        Ok(flux_flow::engine::ReviewedPlanOutcome::Completed) => {}
-        Ok(flux_flow::engine::ReviewedPlanOutcome::Cancelled) => {
-            eprintln!("{}", style::dim("(cancelled)"));
-        }
-        Err(error) => {
-            eprintln!("{} {error}", style::red("error:"));
-        }
-    }
 }
 
 /// Run `make(cancel)` to completion, but cancel it on Ctrl-C (the token's clones are linked, so
@@ -5139,13 +4817,17 @@ fn format_evidence(log: &flux_evidence::EvidenceLog) -> String {
     out
 }
 
-/// A compact, readable label for a loop-machinery op (`plan`/`run_plan`/`observe`/…) shown when
+/// A compact, readable label for an authored-loop operation shown when
 /// `--show-loop` reveals the loop. Returns `None` for ordinary ops (which fall through to the normal
 /// label path). These ops carry large inputs, so the label deliberately omits the payload.
 fn loop_machinery_label(name: &str, input: &Value) -> Option<String> {
     let (verb, note) = match name {
-        "plan" => ("plan", "ask the model"),
-        "run_plan" => ("run plan", "execute the emitted graph"),
+        "detect_intent" => ("intent", "classify the request"),
+        "explore" => ("explore", "gather / propose actions"),
+        "approve_batch" => ("approve", "freeze the action batch"),
+        "execute_batch" => ("execute", "run approved actions"),
+        "present_results" => ("present", "render the result"),
+        "ai_segment" => ("AI segment", "bounded model stage"),
         "observe" => {
             let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             return Some(format!("{}  {}", style::cyan("observe"), style::dim(kind)));
@@ -5162,7 +4844,7 @@ fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
     // Column width: wide enough for the longest built-in op name (`web.fetch` = 9).
     const GUTTER: usize = 10;
     const ARG_CAP: usize = 120;
-    // The loop machinery (revealed by `--show-loop`) carries large inputs — a plan AST, a transcript.
+    // The loop machinery (revealed by `--show-loop`) may carry large typed state values.
     // Give those a compact, readable label so the stream reads as loop iterations, not a payload dump.
     if let Some(label) = loop_machinery_label(name, input) {
         return label;
@@ -5309,10 +4991,9 @@ struct CliSink {
     /// annotation. `None` when the sink wasn't given a spec (sub-paths that don't show cost).
     model_spec: Option<String>,
     pricing: Option<flux_core::PricingTable>,
-    /// The phase of the most recent `loop.phase` observation this turn (design Part 1 / A-15):
-    /// `orient`/`gather`/`execute`, or `None` for a phase-less caller (the `/plan` REPL path,
-    /// which doesn't emit `loop.phase` — A-18 brings gather there later). Drives the spinner label
-    /// via `phase_spinner_label`.
+    /// The phase of the most recent `loop.phase` observation this turn. Current adaptive stages use
+    /// `intent`/`explore`; historical sessions may still project `orient`/`gather`/`execute`.
+    /// Drives the spinner label via `phase_spinner_label`.
     phase: Option<String>,
     /// How many `execute`-phase `loop.phase` observations have landed this turn — the first is the
     /// turn's actual execution planning, every one after it means the prior round didn't finish
@@ -5447,38 +5128,22 @@ impl AgentSink for CliSink {
         std::io::stderr().flush().ok();
     }
     fn planning(&mut self, active: bool) {
-        // Fill the otherwise-silent compile wait with a spinner; the compiled plan tree (or the
-        // compact gather one-liner) replaces it (via the `flow.plan` observation) once the planner
-        // is done. The label is phase-aware (A-15): "orienting…"/"gathering…"/"planning…"/
-        // "revising…" — see `phase_spinner_label`.
+        // Fill an otherwise-silent provider wait with a phase-aware spinner. The intent/exploration
+        // observation replaces it once the typed model stage completes.
         if active {
+            self.turn_start.get_or_insert_with(std::time::Instant::now);
             self.commit();
+            let label = phase_spinner_label(self.phase.as_deref(), self.execute_rounds);
             if self.use_spinner() {
-                self.start_spinner(style::dim(&phase_spinner_label(
-                    self.phase.as_deref(),
-                    self.execute_rounds,
-                )));
+                self.start_spinner(style::dim(&label));
+            } else if matches!(self.phase.as_deref(), Some("intent" | "explore")) {
+                // Redirected runs have no animated line to rewrite. Preserve one stable
+                // phase marker per provider consultation so logs and CI output do not reproduce
+                // the otherwise-silent wait that A-72 closes for interactive terminals.
+                eprintln!("{}", style::dim(&label));
             }
         } else {
             self.stop_spinner();
-        }
-    }
-    /// L-23: a plan-skeleton headline for one top-level statement, the instant its `emit_plan`
-    /// JSON arguments finish streaming — while composing a large plan takes a while, the running
-    /// spinner already started by `planning(true)` shows the tree taking shape node by node
-    /// instead of sitting on a bare "planning…" until the whole call completes. The eventual
-    /// `flow.plan` observation (`render_plan`) replaces this with the full, authoritative tree.
-    fn plan_delta(&mut self, headline: &str) {
-        let label = style::dim(&format!(
-            "{} · {headline}",
-            phase_spinner_label(self.phase.as_deref(), self.execute_rounds)
-        ));
-        if let Some((state, _)) = &self.spinner {
-            state.lock().unwrap().label = label;
-        } else if self.stderr_tty {
-            // No animated spinner (styling disabled / non-interactive stderr) — still show
-            // progress as plain dim lines rather than going silent.
-            eprintln!("{}", style::dim(&format!("· {headline}")));
         }
     }
     fn tool_call(&mut self, name: &str, input: &Value) {
@@ -5569,6 +5234,10 @@ impl AgentSink for CliSink {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
         } else if o.kind == "loop.phase" {
             self.record_phase(o);
+        } else if o.kind == flux_evidence::KIND_TURN_INTENT
+            && o.data.get("intent").and_then(|v| v.as_str()).is_some()
+        {
+            self.render_intent(o);
         } else if o.kind == "loop.round" {
             // A-39 (`--trace-loop`/`FLUX_TRACE_LOOP`): one dim line per outer-loop round.
             let round = o.data.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -5768,20 +5437,14 @@ impl CliSink {
         eprintln!("{rendered}");
     }
 
-    /// Render a `flow.halt` observation (A-17): a red one-liner marking exactly where a plan halted,
-    /// printed the moment the halt happens — before the next `plan()` round's spinner (which then
-    /// reads "revising…", see `phase_spinner_label`) — so the failure is legible in real time, not
-    /// only inside the fed-back transcript text.
+    /// Render a `flow.halt` observation: a red one-liner marking exactly where guarded execution
+    /// halted before the execution report returns to the native stage for correction.
     fn render_halt(&self, o: &flux_evidence::Observation) {
         eprintln!("{}", style::red(&halt_line(&o.data)));
     }
 
-    /// Track a `loop.phase` observation (design Part 1 / A-15, emitted at every `plan()` entry):
-    /// updates the spinner label state and whether the round's `flow.plan` (rendered a moment
-    /// later, from a separate `run_plan` reflexive call) is a compact gather round or the full
-    /// execution plan. `gather`/`execute` are unambiguous; `orient` resets to "not gathering yet" —
-    /// a `flow.brief` right after (only ever paired with a `gather: true` plan) flips it back on
-    /// when orient itself emitted the first gather round.
+    /// Track a `loop.phase` observation so the spinner names the current typed stage. Historical
+    /// gather/execute values remain readable when old sessions are projected.
     fn record_phase(&mut self, o: &flux_evidence::Observation) {
         let phase = o
             .data
@@ -5795,10 +5458,26 @@ impl CliSink {
                 self.gather_mode = false;
             }
             "gather" => self.gather_mode = true,
-            "orient" => self.gather_mode = false,
+            "orient" | "intent" | "explore" => self.gather_mode = false,
             _ => {}
         }
         self.phase = Some(phase);
+    }
+
+    /// Render A-72's accepted staged intent from the already-durable `turn.intent` observation.
+    /// Keyword-derived turn signals use the same observation kind but carry only `signal`, so the
+    /// caller filters those out. Normal output stays compact; `-v` adds the exact selected ops.
+    fn render_intent(&self, o: &flux_evidence::Observation) {
+        for (index, line) in intent_lines(&o.data, self.verbose, self.width)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                eprintln!("{}", style::cyan(&line));
+            } else {
+                eprintln!("{}", style::dim(&line));
+            }
+        }
     }
 
     /// Render a `flow.brief` observation the moment the grounding artifact is accepted (design
@@ -5826,10 +5505,12 @@ impl CliSink {
 /// the execute phase has already produced a round THIS turn — a plain counter over the
 /// `loop.phase` observations already reaching the sink, not a new flux-flow signal. The halt-aware
 /// "✗ step N/M — revising…" line is a separate, real-time render (`render_halt`/`halt_line`, A-17)
-/// fired the moment a plan halts, distinct from this spinner label. A phase-less caller (the
-/// `/plan` REPL path, which doesn't emit `loop.phase`) falls back to today's "composing plan…".
+/// fired the moment an execution flow halts, distinct from this spinner label. A phase-less caller
+/// falls back to "working…".
 fn phase_spinner_label(phase: Option<&str>, execute_rounds: usize) -> String {
     match phase {
+        Some("intent") => "routing intent…".to_string(),
+        Some("explore") => "exploring…".to_string(),
         Some("orient") => "orienting…".to_string(),
         Some("gather") => "gathering…".to_string(),
         Some("execute") => {
@@ -5839,8 +5520,58 @@ fn phase_spinner_label(phase: Option<&str>, execute_rounds: usize) -> String {
                 "planning…".to_string()
             }
         }
-        _ => "composing plan…".to_string(),
+        _ => "working…".to_string(),
     }
+}
+
+/// Format the accepted staged intent as bounded, stable plain lines. The intent is model-authored,
+/// so whitespace is collapsed before display; families and operation names are host-validated.
+fn intent_lines(data: &Value, verbose: bool, width: usize) -> Vec<String> {
+    let raw_intent = data
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let sanitized: String = raw_intent
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let intent = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let intent_cap = width.saturating_sub(12).clamp(24, 160);
+    let families = data
+        .get("families")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let operations = data
+        .get("operations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let capabilities = if families.is_empty() {
+        "none".to_string()
+    } else {
+        families.join(", ")
+    };
+    let plural = if operations.len() == 1 {
+        "operation"
+    } else {
+        "operations"
+    };
+    let mut lines = vec![
+        format!("◆ intent: {}", truncate(&intent, intent_cap)),
+        format!(
+            "  capabilities: {capabilities} · {} {plural}",
+            operations.len()
+        ),
+    ];
+    if verbose && !operations.is_empty() {
+        lines.push(format!("  operations: {}", operations.join(", ")));
+    }
+    lines
 }
 
 /// Format a `flow.brief` observation's `data` as plain lines (no color, so it's directly testable):
@@ -5860,8 +5591,7 @@ fn brief_lines(data: &Value) -> Vec<String> {
 /// Format a `flow.halt` observation's `data` (A-17) as a plain line: `✗ step N/M <op> failed —
 /// revising…` — or, when the op isn't directly derivable from the failing statement (a composite/
 /// control-flow node), `✗ step N/M failed — revising…`. Emitted once per mid-plan halt, right where
-/// the rest of the feedback contract is built (`EngineLoopHost::run_plan`'s halt arm) — a real-time
-/// cue distinct from the per-tool ✓/✗ markers the dispatcher already prints as ops run.
+/// the action execution report is built — a real-time cue distinct from the per-tool ✓/✗ markers.
 fn halt_line(data: &Value) -> String {
     let step = data.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
     let of = data.get("of").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -6057,12 +5787,10 @@ impl AgentSink for GoalSink {
     }
 }
 
-/// A built-in offline provider (`-m mock`): the first call emits a one-shot `emit_plan` plan that
-/// writes `flux-mock.txt` (or runs `FLUX_MOCK_BASH` / calls `FLUX_MOCK_TOOL`); the engine runs it,
-/// feeds the results back, and loops, so the second call answers in prose and the turn ends (the
-/// standard loop-to-prose). Because the engine is pure-DAG (the model's only tool is `emit_plan`), the
-/// mock must emit a *plan*, not a raw tool call. Lets the Flux-Lang engine be exercised end-to-end with
-/// no network — used by the eval harness's offline slice and smoke tests.
+/// A built-in offline provider (`-m mock`) that speaks the same adaptive native-tool protocol as a
+/// live model: declare intent, capture one literal operation, finalize its action batch, then answer
+/// from the guarded execution report. This keeps the offline gate on the product-default loop rather
+/// than preserving a second mock-only agent-loop path.
 #[derive(Default)]
 struct MockCliProvider {
     calls: AtomicUsize,
@@ -6074,7 +5802,7 @@ impl Provider for MockCliProvider {
         "mock"
     }
 
-    async fn stream(&self, _req: Request) -> flux_core::Result<ChunkStream> {
+    async fn stream(&self, req: Request) -> flux_core::Result<ChunkStream> {
         let n = self.calls.fetch_add(1, Ordering::Relaxed);
 
         // Test hook: `FLUX_MOCK_HANG=1` streams one delta then never completes (only cancellation
@@ -6085,7 +5813,7 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(s));
         }
 
-        // Test hook for direct model-backed cognition ops (not the planner loop): return a canned
+        // Test hook for direct model-backed cognition ops (not the adaptive outer loop): return a canned
         // text completion. L-79 uses this to exercise `ai.extract` input mapping through the real
         // binary without provider credentials or a network stub.
         if let Ok(text) = std::env::var("FLUX_MOCK_RESPONSE") {
@@ -6098,14 +5826,133 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
-        // Second call: the plan (emitted on the first call with no `complete`) has run and its results
-        // were fed back, so the engine loops here — answer in prose, which ends the turn. The usage
-        // chunk mimics a cached re-send (most of the prompt read from cache) so the offline path
-        // exercises the turn-end token annotation (context / output / cache + hit-rate).
+        let target = std::env::var("FLUX_MOCK_TOOL")
+            .ok()
+            .or_else(|| std::env::var("FLUX_MOCK_BASH").ok().map(|_| "bash".into()))
+            .unwrap_or_else(|| "write".into());
+
+        // Intent routing sees only the family index. Select the one whose stable index line names
+        // the target operation; this works for grouped/plugin tools too without hard-coding their
+        // family names into the mock.
+        if req.tools.len() == 1 && req.tools[0].name == "declare_intent" {
+            let family = req
+                .system_segments
+                .iter()
+                .flat_map(|segment| segment.text.lines())
+                .filter_map(|line| {
+                    let line = line.strip_prefix("- ")?;
+                    let (family, details) = line.split_once(" (")?;
+                    let examples = details.split_once("e.g. ")?.1.split_once("):")?.0;
+                    let contains_target = family == target
+                        || examples
+                            .split(',')
+                            .any(|operation| operation.trim() == target);
+                    contains_target.then(|| family.to_string())
+                })
+                .next()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent1".into(),
+                    name: "declare_intent".into(),
+                    input: serde_json::json!({
+                        "intent": "complete the offline mock turn",
+                        "capability_families": family
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
+
+        if req.tools.iter().any(|tool| tool.name == "finalize_plan") {
+            // Tool-result text is deliberately not part of `Message::text()`. Serialize the mock
+            // ledger so this offline provider observes the same structured result blocks a real
+            // wire codec sends back to the model.
+            let transcript = serde_json::to_string(&req.messages).unwrap_or_default();
+
+            // The finalize call's matching tool result carries the actual ExecutionReport. Only now
+            // may the model claim completion.
+            if transcript.contains("Execution report (actual guarded results)") {
+                let chunks = vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "Finished.".into(),
+                    }),
+                    Chunk::Usage(Usage {
+                        input_tokens: 180,
+                        output_tokens: 12,
+                        cache_read_input_tokens: 1_240,
+                        ..Default::default()
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ];
+                return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            }
+
+            // Once the operation was captured, freeze the host-built batch.
+            if transcript.contains("captured as proposed action") {
+                let chunks = vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "finalize1".into(),
+                        name: "finalize_plan".into(),
+                        input: serde_json::json!({
+                            "instructions": "Report the actual guarded operation result."
+                        }),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ];
+                return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            }
+
+            let input = if target == "write" && std::env::var("FLUX_MOCK_TOOL").is_err() {
+                serde_json::json!({
+                    "path": "flux-mock.txt",
+                    "content": "created by flux mock\n"
+                })
+            } else if target == "bash" {
+                serde_json::json!({
+                    "command": std::env::var("FLUX_MOCK_BASH").unwrap_or_default()
+                })
+            } else {
+                std::env::var("FLUX_MOCK_TOOL_INPUT")
+                    .ok()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_else(|| serde_json::json!({}))
+            };
+            let native = req
+                .tools
+                .iter()
+                .find(|tool| {
+                    tool.name == target || tool.description.contains(&format!("`{target}`"))
+                })
+                .map(|tool| tool.name.clone());
+            if let Some(native) = native {
+                let chunks = vec![
+                    Chunk::Block(ContentBlock::ToolUse {
+                        id: "action1".into(),
+                        name: native,
+                        input,
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                ];
+                return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            }
+        }
+
+        // A target that cannot be surfaced ends honestly in prose instead of inventing an operation.
         if n > 0 {
             let chunks = vec![
                 Chunk::Block(ContentBlock::Text {
-                    text: "Finished.".into(),
+                    text: format!("The mock target `{target}` is not available in this agent."),
                 }),
                 Chunk::Usage(Usage {
                     input_tokens: 180,
@@ -6120,61 +5967,7 @@ impl Provider for MockCliProvider {
             return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
         }
 
-        // Build a one-shot Flux-Lang plan (the engine is pure-DAG, so the model emits `emit_plan`).
-        // `FLUX_MOCK_TOOL` calls any tool (input = `FLUX_MOCK_TOOL_INPUT`, passed as a lone object so
-        // it maps straight to the tool's named input); `FLUX_MOCK_BASH` runs a `bash` command; the
-        // default writes `flux-mock.txt`. No `complete` ⇒ the engine loops, and the second call (above)
-        // ends the turn in prose.
-        let ast: serde_json::Value = if let Ok(tool) = std::env::var("FLUX_MOCK_TOOL") {
-            let input: serde_json::Value = std::env::var("FLUX_MOCK_TOOL_INPUT")
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            serde_json::json!({
-                "body": [{
-                    "kind": "call", "op": tool,
-                    "args": [{ "kind": "lit", "value": input }]
-                }]
-            })
-        } else if let Ok(cmd) = std::env::var("FLUX_MOCK_BASH") {
-            serde_json::json!({
-                "body": [{
-                    "kind": "call", "op": "bash",
-                    "args": [{ "kind": "lit", "value": cmd }]
-                }]
-            })
-        } else {
-            // `write` takes its parameters as a single named object (positional args are rejected
-            // by plan validation for multi-param ops) — pass one `lit` object, not two positionals.
-            serde_json::json!({
-                "body": [{
-                    "kind": "call", "op": "write",
-                    "args": [
-                        { "kind": "lit", "value": {
-                            "path": "flux-mock.txt",
-                            "content": "created by flux mock\n"
-                        } }
-                    ]
-                }]
-            })
-        };
-
-        let chunks = vec![
-            Chunk::Block(ContentBlock::ToolUse {
-                id: "plan1".into(),
-                name: "emit_plan".into(),
-                input: serde_json::json!({ "ast": ast }),
-            }),
-            Chunk::Usage(Usage {
-                input_tokens: 1_240,
-                output_tokens: 48,
-                ..Default::default()
-            }),
-            Chunk::Done {
-                stop_reason: Some(StopReason::ToolUse),
-            },
-        ];
-        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        unreachable!("the first mock provider call is always intent detection")
     }
 }
 
@@ -6685,11 +6478,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
                 run_prompt(agent, prompt).await
             }
-            Some(Commands::Plan {
-                agent,
-                output,
-                prompt,
-            }) => run_plan(agent, output, prompt).await,
             Some(Commands::Tui { agent }) => run_tui(agent).await,
             Some(Commands::Fork {
                 session,
@@ -6759,7 +6547,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 format,
                 fail_on,
             }) => run_review(&flags, files, format, fail_on).await,
-            Some(Commands::Loop { action }) => run_loop_cmd(action),
+            Some(Commands::Loop { action }) => run_loop_cmd(action).await,
             Some(Commands::Sessions { prune }) => run_sessions(prune),
             Some(Commands::Usage(args)) => run_usage(args),
             Some(Commands::Replay {
@@ -6769,7 +6557,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 json,
             }) => run_replay(&session, turn.map(|t| t as usize), sub_agents, json).await,
             Some(Commands::Diff { a, b, json }) => run_diff_cmd(&a, &b, json),
-            Some(Commands::Corpus { action }) => run_corpus(action),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
@@ -6959,7 +6746,7 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
 
     // Program mode runs the program's OWN agents: the built-in coding agent's session/turn flags
     // have nothing to attach to, so reject them instead of accepting-and-ignoring (they all work
-    // on `flux run`/`flux plan`/`flux tui` and on `app run --serve` without a program).
+    // on `flux run`/`flux tui` and on `app run --serve` without a program).
     if flags.continue_ || flags.resume {
         bail!("`flux app run <program>` starts the program fresh — `--continue`/`--resume` don't apply");
     }
@@ -6973,6 +6760,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     }
     if flags.turn_budget.is_some() {
         bail!("`--turn-budget` only applies to the built-in coding agent, not `flux app run <program>`");
+    }
+    if flags.agent_loop.is_some() {
+        bail!("`--loop` only applies to the built-in coding agent, not `flux app run <program>`");
     }
 
     let auto_approve = flags.yes;
@@ -9474,10 +9264,10 @@ mod tests {
         credential_location, endpoint_ref_from_parts, format_evidence, implicit_plugin_group,
         loop_machinery_label, merge_static_endpoints, new_render_suffix, parse_labels,
         plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
-        resolve_plugin_operation_name, run_corpus_export_with, run_endpoint_in, run_plugin_in,
-        run_usage_with, should_fail, tool_preview, truncate, url_has_userinfo, usage_annotation,
-        write_generated_skill, EndpointAction, EventStore, EventStoreCrossPluginAudit,
-        EventStoreEgressAudit, Liveness, PluginAction, RedactorSecretSink, ReviewSeverity,
+        resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
+        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill,
+        EndpointAction, EventStore, EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness,
+        PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use serde_json::json;
@@ -9491,6 +9281,8 @@ mod tests {
             .to_string();
         assert!(help.contains("--think"), "{help}");
         assert!(help.contains("--effort"), "{help}");
+        assert!(help.contains("--loop"), "{help}");
+        assert!(help.contains("adaptive"), "{help}");
         assert!(help.contains("low"), "{help}");
         assert!(help.contains("high"), "{help}");
     }
@@ -10516,7 +10308,7 @@ mod tests {
     fn diagnostics_header_matches_the_failure_class() {
         // A-62 / F-010: the "references unknown operations" header/refusal must appear ONLY when every
         // diagnostic is genuinely an unknown-op error — a non-unknown-op failure under that header
-        // misleads both the reader and the repair-reading planner.
+        // misleads both the reader and a repair-reading model stage.
         use flux_flow::analyze::Diagnostic;
         let unknown = vec![Diagnostic::new("unknown operation: `foo`")];
         assert!(super::diagnostics_all_unknown_op(&unknown));
@@ -11979,98 +11771,6 @@ mod tests {
         assert!(opus.cost.unwrap().usd > 0.0);
     }
 
-    /// D-53's failing-first test: `flux corpus export` over a seeded events.db with two accepted
-    /// plans — one carrying `plan_source` (L-38), one in the pre-L-38 shape (no `plan_source`) —
-    /// exports exactly the ONE qualifying row, paired with its OWN turn's user instruction, in the
-    /// documented JSONL shape, and counts (never silently drops) the row it skipped.
-    #[test]
-    fn flux_corpus_export_pairs_accepted_plan_with_its_turn_and_skips_pre_l38_row() {
-        let store = EventStore::in_memory().unwrap();
-        let session = store.create_session("m").unwrap();
-
-        // Pre-L-38 accepted plan: no plan_source recorded — must be skipped and counted, not paired.
-        let t1 = store
-            .begin_turn(&session, "old-style request", "m")
-            .unwrap();
-        store
-            .record_plan_attempt(
-                &session,
-                t1,
-                flux_events::PlanAttempt {
-                    step: 0,
-                    outcome: "accepted".into(),
-                    plan_text: Some("$x = read(\"a\")".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        store
-            .end_turn(&session, t1, "accepted", 1, "done", None)
-            .unwrap();
-
-        // A real L-38 accepted plan: must export, paired with THIS turn's own user_input. The
-        // instruction carries a credential-shaped token (raw `user_input` is NOT redacted at
-        // record time — only the agent's own outputs are) to exercise the export-time nl_goal scrub.
-        let t2 = store
-            .begin_turn(
-                &session,
-                "summarize the README using key AKIAABCDEFGHIJKLMNOP",
-                "m",
-            )
-            .unwrap();
-        store
-            .record_plan_attempt(
-                &session,
-                t2,
-                flux_events::PlanAttempt {
-                    step: 0,
-                    outcome: "accepted".into(),
-                    phase: Some("execute".into()),
-                    plan_source: Some("flow\n  $x = read(\"README.md\")".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        store
-            .end_turn(&session, t2, "accepted", 1, "done", None)
-            .unwrap();
-
-        // Cross-check against the underlying projection (already unit-tested in flux-events) so this
-        // test's expectations about *which* row qualifies don't drift from it.
-        let (expected_rows, _) = store.corpus_rows_all().unwrap();
-        assert_eq!(
-            expected_rows.len(),
-            1,
-            "one row qualifies before export-time re-parsing: {expected_rows:?}"
-        );
-
-        let mut buf: Vec<u8> = Vec::new();
-        let summary = run_corpus_export_with(&store, "test-rev", &mut buf).unwrap();
-
-        assert_eq!(summary.exported, 1, "{summary:?}");
-        assert_eq!(
-            summary.no_plan_source, 1,
-            "the pre-L-38 row is counted, not silently dropped"
-        );
-        assert_eq!(summary.ambiguous_pairing, 0);
-        assert_eq!(summary.unparseable_at_head, 0);
-
-        let text = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 1, "exactly one exported JSONL row: {text:?}");
-
-        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(row["id"], expected_rows[0].id);
-        assert_eq!(
-            row["nl_goal"], "summarize the README using key [redacted]",
-            "the credential-shaped token is scrubbed from the raw user_input at export time"
-        );
-        assert_eq!(row["source"], "flow\n  $x = read(\"README.md\")");
-        assert_eq!(row["provenance"]["session"], session);
-        assert_eq!(row["provenance"]["turn"], t2);
-        assert_eq!(row["flux_rev"], "test-rev");
-    }
-
     /// A `CliSink` with an attached model spec + pricing table prices a turn's usage through the
     /// cost model end-to-end (the wiring that makes C-05's `cost()` live, not dead code). The codex
     /// path resolves on `gpt-5.5` and is labelled subscription spend (C-03 model resolution + C-05).
@@ -12203,11 +11903,8 @@ mod tests {
     }
 
     /// A-15 named acceptance (`phase_observations_emitted_per_pass`'s surface half): each
-    /// `loop.phase` observation updates the phase-labeled spinner — "orienting…"/"gathering…" for
-    /// the collect passes, "planning…" for the execute phase's first round this turn, and
-    /// "revising…" once the execute phase has already produced a round (no `--show-loop` needed —
-    /// this is the spinner, not the machinery). A phase-less turn (no `loop.phase` observed at
-    /// all, e.g. the `/plan` REPL path) keeps today's "composing plan…".
+    /// `loop.phase` observation updates the phase-labeled spinner. Historical phase names remain
+    /// supported, and a phase-less turn uses a neutral fallback.
     #[test]
     fn loop_phase_observations_drive_the_phase_labeled_spinner() {
         use flux_evidence::{Observation, Phase};
@@ -12215,8 +11912,8 @@ mod tests {
         let mut sink = super::CliSink::new(0);
         assert_eq!(
             super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
-            "composing plan…",
-            "no loop.phase observed yet -> byte-compatible fallback"
+            "working…",
+            "no loop.phase observed yet -> neutral fallback"
         );
 
         sink.observation(&Observation::new(
@@ -12244,6 +11941,26 @@ mod tests {
         sink.observation(&Observation::new(
             "loop.phase",
             Phase::Turn,
+            serde_json::json!({ "phase": "intent" }),
+        ));
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "routing intent…"
+        );
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
+            serde_json::json!({ "phase": "explore" }),
+        ));
+        assert_eq!(
+            super::phase_spinner_label(sink.phase.as_deref(), sink.execute_rounds),
+            "exploring…"
+        );
+
+        sink.observation(&Observation::new(
+            "loop.phase",
+            Phase::Turn,
             serde_json::json!({ "phase": "execute" }),
         ));
         assert_eq!(
@@ -12263,6 +11980,52 @@ mod tests {
             "revising…",
             "a second execute-phase round this turn means the prior one didn't finish"
         );
+    }
+
+    #[test]
+    fn staged_intent_summary_is_concise_and_verbose_is_explicit() {
+        let data = serde_json::json!({
+            "intent": "  answer   the account and incident questions\nfrom evidence  ",
+            "families": ["workspace.read"],
+            "operations": ["glob", "read", "grep"]
+        });
+        assert_eq!(
+            super::intent_lines(&data, false, 80),
+            vec![
+                "◆ intent: answer the account and incident questions from evidence",
+                "  capabilities: workspace.read · 3 operations",
+            ]
+        );
+        assert_eq!(
+            super::intent_lines(&data, true, 80),
+            vec![
+                "◆ intent: answer the account and incident questions from evidence",
+                "  capabilities: workspace.read · 3 operations",
+                "  operations: glob, read, grep",
+            ]
+        );
+
+        let none = serde_json::json!({
+            "intent": "chat",
+            "families": [],
+            "operations": []
+        });
+        assert_eq!(
+            super::intent_lines(&none, false, 80)[1],
+            "  capabilities: none · 0 operations"
+        );
+    }
+
+    #[test]
+    fn first_planning_consultation_starts_cli_turn_timing_without_reset() {
+        let mut sink = super::CliSink::new(0);
+        assert!(sink.turn_start.is_none());
+        sink.planning(true);
+        let started = sink.turn_start.expect("planning starts the turn clock");
+        sink.planning(false);
+        sink.planning(true);
+        assert_eq!(sink.turn_start, Some(started));
+        sink.planning(false);
     }
 
     /// A-15: a `flow.brief` observation marks gather mode (a brief only ever accompanies a
@@ -12595,7 +12358,6 @@ mod tests {
         let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         for want in [
             "run",
-            "plan",
             "tui",
             "app",
             "eval",
@@ -12755,7 +12517,7 @@ mod tests {
             );
         }
         // The agent-path subcommands carry the full turn-flag set.
-        for agent_cmd in ["run", "plan", "tui"] {
+        for agent_cmd in ["run", "tui"] {
             let longs = longs_of(agent_cmd);
             assert!(
                 has(&longs, "max-tokens") && has(&longs, "continue"),
@@ -13009,12 +12771,12 @@ mod tests {
 
     #[test]
     fn loop_machinery_label_only_relabels_machinery_ops() {
-        assert!(loop_machinery_label("plan", &json!({}))
+        assert!(loop_machinery_label("detect_intent", &json!({}))
             .unwrap()
-            .contains("ask the model"));
-        assert!(loop_machinery_label("run_plan", &json!({}))
+            .contains("classify the request"));
+        assert!(loop_machinery_label("execute_batch", &json!({}))
             .unwrap()
-            .contains("run plan"));
+            .contains("approved actions"));
         // `observe` surfaces its kind; ordinary ops fall through (None) to the normal label path.
         assert!(
             loop_machinery_label("observe", &json!({"kind": "turn.iteration"}))
@@ -13229,7 +12991,7 @@ mod tests {
     /// L-25 — `flux flow run --resume <session|last>`'s own session-resolution logic (the CLI-level
     /// seam, distinct from flux-flow's engine-level fast-forward tests): a literal session id passes
     /// straight through; an unnamed flow can't use `last` (nothing disambiguates it from any other
-    /// unnamed halted plan, including an ordinary chat turn's inner `run_plan` halt — same store,
+    /// unnamed halted flow, including a host-derived action flow from an agent turn — same store,
     /// same ledger machinery); and `last` finds the most recent halted session matching THIS flow's
     /// declared name, skipping a more-recent halted session that belongs to a different flow.
     #[test]

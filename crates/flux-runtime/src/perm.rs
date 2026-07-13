@@ -89,6 +89,14 @@ impl PermissionManager {
         self.allow.iter().map(Pattern::render).collect()
     }
 
+    /// Whether every invocation of `tool` is denied by a bare rule. Subject-scoped denies cannot be
+    /// decided until literal arguments produce permission subjects and therefore do not hide the
+    /// operation catalog-wide.
+    pub fn is_bare_denied(&self, tool: &str) -> bool {
+        let tool = tool.to_lowercase();
+        self.deny.iter().any(|pattern| pattern.is_bare_for(&tool))
+    }
+
     /// Decide whether a tool invocation (with its permission subjects) is allowed, denied, or
     /// must be asked. Deny wins; otherwise all subjects must be covered by an allow rule.
     pub fn check(&self, tool: &str, subjects: &[String]) -> PermDecision {
@@ -189,5 +197,13 @@ mod tests {
         m.add_allow("Read(*)");
         assert_eq!(m.check("read", &["anything".into()]), PermDecision::Allow);
         assert_eq!(m.allow_rules(), vec!["read(*)".to_string()]);
+    }
+
+    #[test]
+    fn only_bare_denies_hide_an_operation_before_arguments_exist() {
+        let manager =
+            PermissionManager::from_rules(&[], &["bash".into(), "read(private/**)".into()]);
+        assert!(manager.is_bare_denied("BASH"));
+        assert!(!manager.is_bare_denied("read"));
     }
 }

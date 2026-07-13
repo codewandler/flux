@@ -1,6 +1,6 @@
 //! Author a Flux-Lang flow in Rust with the embedded DSL, then run it through the `FlowClient`
-//! lifecycle — no model, no API key. The DSL is the third front door (alongside the conversational
-//! `Client` and `FlowClient::compile`'s NL→AST): you build the AST directly, the engine runs it.
+//! lifecycle — no model, no API key. This is the authored-flow front door beside the adaptive
+//! conversational `Client`: you build the AST directly, and the engine runs it.
 //!
 //! Run with: `cargo run -p codewandler-flux-sdk --example dsl_loops`
 //!
@@ -19,8 +19,8 @@ use flux_sdk::dsl::*;
 use flux_sdk::FlowClient;
 use serde_json::json;
 
-/// A provider that is never actually called: this example builds the AST directly (no `compile`) and
-/// only dispatches built-in ops (`read`), so the model is never reached. It exists because
+/// A provider that is never actually called: this example builds the AST directly and only
+/// dispatches built-in ops (`read`), so the model is never reached. It exists because
 /// `FlowClient::build` requires *a* provider.
 struct UnusedProvider;
 

@@ -4,13 +4,13 @@
 //! [`Client`]. You supply a [`Provider`] (from `flux-providers`) and a workspace
 //! root; the SDK wires the rest.
 //!
-//! There are three front doors: [`Client`] (an agentic turn — the model plans, the runtime runs the
-//! flux-lang agent loop — returning a [`TurnOutput`]), [`FlowClient`] (the Flux-Lang
-//! `compile → analyze → execute` lifecycle, NL→AST), and the [`dsl`] (author the AST in Rust).
+//! There are three front doors: [`Client`] (an adaptive agent turn driven by an authored Flux-Lang
+//! outer loop, returning a [`TurnOutput`]), [`FlowClient`] (the authored Flux-Lang
+//! `parse → analyze → execute` lifecycle), and the [`dsl`] (author the AST in Rust).
 //! `Client` assembles [`flux_flow::engine::FlowEngine`]; `FlowClient` delegates directly to the same
-//! `flux-flow` compiler, runtime adapter, store, and safety envelope for one-flow execution. Each
+//! `flux-flow` runtime adapter, store, and safety envelope for one-flow execution. Each
 //! door has a runnable, no-API-key example: `examples/client_basic.rs`,
-//! `examples/flow_compile.rs`, and `examples/dsl_loops.rs` respectively. On top of the DSL,
+//! `examples/parameterized_flow.rs`, and `examples/dsl_loops.rs` respectively. On top of the DSL,
 //! [`recipes`] is a cookbook of reusable, parameterized flow builders (routing, lookup, the loop
 //! family, resilience).
 //!
@@ -54,7 +54,7 @@ pub use flux_provider::Provider;
 
 /// The agent definition ([`ClientBuilder::from_spec`]) plus its permission rules. Re-exported so
 /// the full-control door needs no direct `flux-agent` dependency.
-pub use flux_agent::{AgentSpec, Permissions};
+pub use flux_agent::{AgentLoopSpec, AgentSpec, BuiltinAgentLoop, Permissions};
 
 /// The per-turn token accounting carried on [`TurnOutput`]. Re-exported from `flux-core`.
 pub use flux_core::Usage;
@@ -78,6 +78,41 @@ pub use flux_flow::replay::ReplayReport;
 pub mod tools {
     pub use flux_runtime::{tool_fn, FnTool, Tool, ToolContext, ToolRegistry, ToolResult};
     pub use flux_spec::{Risk, ToolSpec};
+}
+
+/// Build a typed, closure-backed stage operation. `I` and `O` are independent contracts: both JSON
+/// Schemas are derived and registered, the Flux analyzer infers `O` at call sites, and execution
+/// still traverses the ordinary authorization/approval dispatcher. The safe default is a low-risk,
+/// idempotent read stage; use a bespoke [`tools::Tool`] when the stage has effects or permission
+/// subjects that need a stronger contract.
+pub fn stage_fn<I, O, F, Fut, E>(
+    name: impl Into<String>,
+    description: impl Into<String>,
+    handler: F,
+) -> Arc<dyn tools::Tool>
+where
+    I: serde::de::DeserializeOwned + schemars::JsonSchema + Send + 'static,
+    O: serde::Serialize + schemars::JsonSchema + Send + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<O, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let spec = flux_spec::ToolSpec::read_only_typed::<I>(name, description)
+        .with_output_schema(flux_spec::tool_output_schema::<O>());
+    let handler = Arc::new(handler);
+    Arc::new(
+        flux_runtime::FnTool::new(spec, move |value| {
+            let handler = handler.clone();
+            async move {
+                let input = serde_json::from_value::<I>(value)
+                    .map_err(|error| format!("invalid stage input: {error}"))?;
+                let output = handler(input).await.map_err(|error| error.to_string())?;
+                serde_json::to_value(output)
+                    .map_err(|error| format!("stage output did not serialize: {error}"))
+            }
+        })
+        .with_staging_disposition(flux_spec::StagingDisposition::Gather),
+    )
 }
 
 /// **Approval policy.** Implement [`Approver`](approval::Approver) and pass it to a builder's
@@ -213,7 +248,7 @@ pub mod plugins {
 
 /// **Sub-agents.** Attach named roles to a conversational client with
 /// [`ClientBuilder::with_sub_agents`] (or to a flow client with
-/// [`FlowClient::with_sub_agents`](flow::FlowClient::with_sub_agents)); a turn whose plan calls
+/// [`FlowClient::with_sub_agents`](flow::FlowClient::with_sub_agents)); a turn whose native stage calls
 /// `task(role, …)` then delegates to a role's child agent through the same
 /// authorization → approval → guarded-IO envelope. [`SubAgents`](subagents::SubAgents) is the bundle
 /// (roles + the child tool surface + a [`ProviderFactory`](subagents::ProviderFactory) + limits),
@@ -231,7 +266,7 @@ pub mod subagents {
 /// taking a direct `flux-system` dependency.
 pub use flux_system::sandbox::{Sandbox, SandboxSettings};
 
-/// The Rust **embedded DSL** for authoring flows — builder primitives that compile to the Flux-Lang
+/// The Rust **embedded DSL** for authoring flows — builder primitives that construct the Flux-Lang
 /// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
 /// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
 /// from `flux-lang` so consumers can stay inside `flux_sdk`. See `examples/dsl_loops.rs`.
@@ -239,6 +274,7 @@ pub use flux_lang::dsl;
 
 pub mod recipes;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -343,6 +379,11 @@ impl ClientBuilder {
     /// Cap the agent loop's tool-calling iterations per turn.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.spec.max_iterations = n;
+        self
+    }
+    /// Select the Flux-Lang outer control program for conversational turns.
+    pub fn agent_loop(mut self, agent_loop: AgentLoopSpec) -> Self {
+        self.spec.agent_loop = agent_loop;
         self
     }
     /// Add a permission allow rule (e.g. `"write"`, `"Bash(git:*)"`).
@@ -548,7 +589,7 @@ impl ClientBuilder {
         let (events, flow) = self.storage.unwrap_or_default().resolve()?;
 
         // The agent's definition; `assemble` selects the tool subset, applies the permissions,
-        // registers the reflexive ops, and ties the engine⇄loop-host cycle. Builder rules are
+        // registers the authored-loop stages, and ties the engine⇄loop-host cycle. Builder rules are
         // additive to the spec's own (`from_spec` starts from a bare envelope). Skills are explicit:
         // an empty set stays empty and no default directory is scanned or activated.
         let mut spec = self.spec;
@@ -604,7 +645,7 @@ pub struct Client {
     // The default session's id, created lazily on first use (see `default_id`). Kept behind a
     // std mutex so two concurrent first-uses can't each mint (and leak) a session.
     default_session: std::sync::Mutex<Option<String>>,
-    // One engine runs one turn at a time (the planner loop is armed per turn); every Session
+    // One engine runs one turn at a time (the authored outer loop is armed per turn); every Session
     // created by this client shares this guard so concurrent sends serialize instead of racing.
     turn_guard: Arc<tokio::sync::Mutex<()>>,
 }
@@ -701,6 +742,39 @@ mod tests {
     use flux_provider::{ChunkStream, Request};
     use std::sync::Mutex;
 
+    fn request_has_tool(request: &Request, name: &str) -> bool {
+        request.tools.iter().any(|tool| tool.name == name)
+    }
+
+    fn intent_chunks(intent: &str, families: &[&str]) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "intent".into(),
+                name: "declare_intent".into(),
+                input: serde_json::json!({
+                    "intent": intent,
+                    "capability_families": families,
+                }),
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
+    fn native_call(id: &str, name: &str, input: serde_json::Value) -> Vec<Chunk> {
+        vec![
+            Chunk::Block(ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::ToolUse),
+            },
+        ]
+    }
+
     struct OneShotMock {
         chunks: Mutex<Option<Vec<Chunk>>>,
     }
@@ -709,8 +783,12 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            let chunks = self.chunks.lock().unwrap().take().unwrap_or_default();
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("answer the user", &[])
+            } else {
+                self.chunks.lock().unwrap().take().unwrap_or_default()
+            };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -719,8 +797,8 @@ mod tests {
     async fn client_runs_a_text_turn() {
         let dir = std::env::temp_dir().join(format!("flux-sdk-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // The model answers in prose (no `emit_plan`) → the flux-lang loop takes the `chat` path:
-        // it returns that text as the turn's answer and runs no ops.
+        // The model first emits the required intent signal, then answers in prose without calling
+        // an operation.
         let provider = Box::new(OneShotMock {
             chunks: Mutex::new(Some(vec![
                 Chunk::TextDelta("hello from sdk".into()),
@@ -745,7 +823,7 @@ mod tests {
         let out = client.run("hi").await.unwrap();
         assert_eq!(out.text, "hello from sdk");
         assert!(out.tool_calls.is_empty());
-        // Token usage now rides back out through the unified flux-lang loop: the planner call's
+        // Token usage rides back out through the unified Flux-authored loop: every model stage's
         // `Usage` is accumulated by the loop host and handed to `turn_end` at turn completion.
         let usage = out
             .usage
@@ -776,16 +854,17 @@ mod tests {
                 sys.push_str(s);
             }
             self.systems.lock().unwrap().push(sys);
-            Ok(Box::pin(futures::stream::iter(
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("answer the user", &[])
+            } else {
                 vec![
                     Chunk::Block(ContentBlock::Text { text: "ok".into() }),
                     Chunk::Done {
                         stop_reason: Some(StopReason::EndTurn),
                     },
                 ]
-                .into_iter()
-                .map(Ok),
-            )))
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
@@ -839,10 +918,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Two-call mock: the planner emits a one-op plan (call 0), the engine runs it (which also calls
-    /// the loop-machinery `observe`), then the model answers in prose (call 1). Proves the SDK drives
-    /// the *full* flux-lang loop end-to-end — `plan`/`run_plan`/`observe` are all registered (the
-    /// `register_agent_ops` path) and a real op dispatches and surfaces to the sink.
+    /// Adaptive mock: declare a write intent, call the provider-native `write` schema, then answer
+    /// from the execution report. Proves the SDK drives the full authored outer loop and a real op
+    /// dispatches through the envelope and surfaces to the sink.
     struct PlanThenProseMock {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -851,30 +929,34 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            if request_has_tool(&req, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("write a file", &["workspace.write"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
             let n = self
                 .calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let chunks = if n == 0 {
-                // A one-op plan with no `complete` ⇒ the engine runs it and loops back to plan again.
-                let ast = serde_json::json!({
-                    "body": [{
-                        "kind": "call", "op": "write",
-                        "args": [
-                            { "kind": "lit", "value": { "path": "sdk-plan.txt", "content": "from the sdk plan\n" } }
-                        ]
-                    }]
-                });
-                vec![
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "p1".into(),
-                        name: "emit_plan".into(),
-                        input: serde_json::json!({ "ast": ast }),
+                native_call(
+                    "write-1",
+                    "write",
+                    serde_json::json!({
+                        "path": "sdk-plan.txt",
+                        "content": "from the sdk action batch\n"
                     }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
+                )
+            } else if n == 1 {
+                native_call(
+                    "finalize-1",
+                    "finalize_plan",
+                    serde_json::json!({
+                        "instructions": "Report whether the file was written."
+                    }),
+                )
             } else {
                 vec![
                     Chunk::Block(ContentBlock::Text {
@@ -899,8 +981,10 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            Ok(Box::pin(futures::stream::iter(
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("answer the user", &[])
+            } else {
                 vec![
                     Chunk::TextDelta(self.text.into()),
                     Chunk::Block(ContentBlock::Text {
@@ -910,9 +994,8 @@ mod tests {
                         stop_reason: Some(StopReason::EndTurn),
                     },
                 ]
-                .into_iter()
-                .map(Ok),
-            )))
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
@@ -954,7 +1037,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A mock whose first call plans a single named op with a literal arg, then answers in prose.
+    /// A mock that routes to one named provider-native op, then answers from its result.
     struct PlanOpMock {
         op: &'static str,
         calls: std::sync::atomic::AtomicUsize,
@@ -964,27 +1047,24 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            if request_has_tool(&req, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("call the requested operation", &["core"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
             let n = self
                 .calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let chunks = if n == 0 {
-                let ast = serde_json::json!({
-                    "body": [{
-                        "kind": "call", "op": self.op,
-                        "args": [ { "kind": "lit", "value": { "name": "flux" } } ]
-                    }]
-                });
-                vec![
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "p1".into(),
-                        name: "emit_plan".into(),
-                        input: serde_json::json!({ "ast": ast }),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
+                let input = if self.op == "park" {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"name": "flux"})
+                };
+                native_call("op-1", self.op, input)
             } else {
                 vec![
                     Chunk::Block(ContentBlock::Text {
@@ -1176,8 +1256,10 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            Ok(Box::pin(futures::stream::iter(
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("answer the user", &[])
+            } else {
                 vec![
                     Chunk::TextDelta("first ".into()),
                     Chunk::TextDelta("second".into()),
@@ -1188,9 +1270,8 @@ mod tests {
                         stop_reason: Some(StopReason::EndTurn),
                     },
                 ]
-                .into_iter()
-                .map(Ok),
-            )))
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
@@ -1305,23 +1386,24 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
             let start = std::time::Instant::now();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             self.calls
                 .lock()
                 .unwrap()
                 .push((start, std::time::Instant::now()));
-            Ok(Box::pin(futures::stream::iter(
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("answer the user", &[])
+            } else {
                 vec![
                     Chunk::Block(ContentBlock::Text { text: "ok".into() }),
                     Chunk::Done {
                         stop_reason: Some(StopReason::EndTurn),
                     },
                 ]
-                .into_iter()
-                .map(Ok),
-            )))
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
@@ -1349,16 +1431,16 @@ mod tests {
 
         let mut intervals = calls.lock().unwrap().clone();
         intervals.sort_by_key(|(s, _)| *s);
-        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals.len(), 4, "two adaptive stages per chat turn");
         assert!(
-            intervals[1].0 >= intervals[0].1,
+            intervals.windows(2).all(|pair| pair[1].0 >= pair[0].1),
             "provider calls overlapped: the turn guard failed to serialize the turns"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn client_runs_a_plan_then_answers() {
+    async fn client_runs_an_action_batch_then_answers() {
         let dir = std::env::temp_dir().join(format!("flux-sdk-plan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let provider = Box::new(PlanThenProseMock {
@@ -1366,15 +1448,15 @@ mod tests {
         });
         let client = Client::builder()
             .model("mock")
-            .auto_approve(true) // no human in the loop: the plan's `write` is allowed
+            .auto_approve(true) // no human in the loop: the action batch's `write` is allowed
             .build(provider, &dir)
             .unwrap();
         let out = client.run("write a file").await.unwrap();
         assert_eq!(out.text, "Wrote the file.");
-        // The real op surfaced to the sink; loop machinery (plan/run_plan/observe) is filtered out.
+        // The real op surfaced to the sink; adaptive loop machinery is filtered out.
         assert_eq!(out.tool_calls, vec!["write"]);
-        // The plan actually executed through the guarded envelope.
-        assert!(dir.join("sdk-plan.txt").exists(), "the plan's write ran");
+        // The action actually executed through the guarded envelope.
+        assert!(dir.join("sdk-plan.txt").exists(), "the batch's write ran");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1507,7 +1589,7 @@ mod tests {
     }
 
     /// A never-planning mock: the deterministic flow skeleton (echo prompts + `await`) invokes no
-    /// planner, so a call here is a bug. Panics if the model is ever hit.
+    /// model stage, so a call here is a bug. Panics if the model is ever hit.
     struct NeverMock;
     #[async_trait]
     impl Provider for NeverMock {
@@ -1515,7 +1597,7 @@ mod tests {
             "mock"
         }
         async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            panic!("a flow-driven session must not invoke the planner");
+            panic!("a flow-driven session must not invoke a model stage");
         }
     }
 
@@ -1564,6 +1646,7 @@ mod tests {
             binding: Some(SymbolName(name.into())),
             source: "user_input".into(),
             as_type: None,
+            condition: None,
         };
         flux_lang::ast::DraftAst {
             body: vec![
@@ -1687,8 +1770,10 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            Ok(Box::pin(futures::stream::iter(
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("complete the delegated task", &[])
+            } else {
                 vec![
                     Chunk::Block(ContentBlock::Text {
                         text: "did the subtask".into(),
@@ -1698,14 +1783,13 @@ mod tests {
                         stop_reason: Some(StopReason::EndTurn),
                     },
                 ]
-                .into_iter()
-                .map(Ok),
-            )))
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
-    /// The parent planner: round 0 emits a one-op plan calling `task(worker, …)`; round 1 answers in
-    /// prose. Neither call bills usage, so the turn's total isolates the sub-agent's contribution.
+    /// The parent adaptive loop routes to `task(worker, …)`, then answers from the result. Parent
+    /// calls bill no usage, so the turn's total isolates the sub-agent's contribution.
     struct DelegatingMock {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -1714,25 +1798,31 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            if request_has_tool(&req, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("delegate the task", &["process"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
             let n = self
                 .calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let chunks = if n == 0 {
-                let ast = serde_json::json!({ "body": [{
-                    "kind": "call", "op": "task",
-                    "args": [{ "kind": "lit", "value": { "role": "worker", "task": "do it" } }]
-                }] });
-                vec![
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "p".into(),
-                        name: "emit_plan".into(),
-                        input: serde_json::json!({ "ast": ast }),
+                native_call(
+                    "task-1",
+                    "task",
+                    serde_json::json!({"role": "worker", "task": "do it"}),
+                )
+            } else if n == 1 {
+                native_call(
+                    "finalize-1",
+                    "finalize_plan",
+                    serde_json::json!({
+                        "instructions": "Report the delegated task's actual result."
                     }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
+                )
             } else {
                 vec![
                     Chunk::Block(ContentBlock::Text {
@@ -1748,7 +1838,7 @@ mod tests {
     }
 
     /// D-148: `ClientBuilder::with_sub_agents` puts the `task` tool + spawner on the conversational
-    /// door. A turn whose plan calls `task(role, …)` runs the child through the parent's envelope,
+    /// door. A turn whose native action calls `task(role, …)` runs the child through the parent's envelope,
     /// and the child's usage observation lands in the session's run trace (folded into the turn's
     /// recorded usage). The `subagents` re-export module names every bundle type.
     #[tokio::test]
@@ -1789,12 +1879,12 @@ mod tests {
         let out = client.run("delegate this").await.unwrap();
         assert!(
             out.tool_calls.contains(&"task".to_string()),
-            "the plan delegated via `task`: {:?}",
+            "the adaptive turn delegated via `task`: {:?}",
             out.tool_calls
         );
 
         // The child's tokens reached the session's run trace: the parent turn's recorded usage folds
-        // in the sub-agent's spend (the parent's own planner calls billed nothing).
+        // in the sub-agent's spend (the parent's own model-stage calls billed nothing).
         let sid = client.session_id().unwrap();
         let events = client.event_store();
         let turns = events.turns(&sid).unwrap();
@@ -1943,8 +2033,10 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
-            Ok(Box::pin(futures::stream::iter(
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("answer the user", &[])
+            } else {
                 vec![
                     Chunk::TextDelta("ok".into()),
                     Chunk::Block(ContentBlock::Text { text: "ok".into() }),
@@ -1953,9 +2045,8 @@ mod tests {
                         stop_reason: Some(StopReason::EndTurn),
                     },
                 ]
-                .into_iter()
-                .map(Ok),
-            )))
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
@@ -2154,8 +2245,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A planner that emits `bind x = read(note.txt); return x` once, then answers in prose — a
-    /// recorded session with a `bind` at the fork point and a cassette-captured `read`.
+    /// An adaptive provider that gathers `read(note.txt)` once, then answers in prose — a recorded
+    /// session with a cassette-captured `read` at the fork point.
     struct BindPlanMock {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -2164,27 +2255,19 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            if request_has_tool(&req, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("read the note", &["workspace.read"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
             let n = self
                 .calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let chunks = if n == 0 {
-                let ast = serde_json::json!({ "body": [
-                    { "kind": "bind", "name": "x",
-                      "value": { "kind": "call", "op": "read",
-                                 "args": [{ "kind": "lit", "value": "note.txt" }] } },
-                    { "kind": "return", "value": { "kind": "var", "name": "x" } }
-                ] });
-                vec![
-                    Chunk::Block(ContentBlock::ToolUse {
-                        id: "p".into(),
-                        name: "emit_plan".into(),
-                        input: serde_json::json!({ "ast": ast }),
-                    }),
-                    Chunk::Done {
-                        stop_reason: Some(StopReason::ToolUse),
-                    },
-                ]
+                native_call("read-1", "read", serde_json::json!({"path": "note.txt"}))
             } else {
                 vec![
                     Chunk::Block(ContentBlock::Text {

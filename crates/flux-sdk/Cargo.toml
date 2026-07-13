@@ -40,6 +40,7 @@ flux-orchestrate.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 # `run_voice_session` takes a cancel token to end a full-duplex voice session.
 tokio-util.workspace = true
 # The client's turn guard (`sync::Mutex`) — one engine runs one turn at a time — and the spawned

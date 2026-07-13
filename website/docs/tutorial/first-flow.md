@@ -5,9 +5,9 @@ description: Turn the handbook task into a parameterized Flux-Lang flow with exp
 
 # Write a reusable flow
 
-An agent request is useful when the route to the result is open-ended. When you already know the
-steps, write them as a Flux-Lang flow. The flow itself is the plan, so flux can parse and execute it
-without asking a planner model to invent the structure again.
+An adaptive request is useful when the route to the result is open-ended. When you already know the
+steps, write them as a Flux-Lang flow. Flux parses and executes that authored structure without
+asking a model to invent it.
 
 ## Create `brief.flux`
 
@@ -64,7 +64,7 @@ The two model uses in this tutorial have different jobs:
 
 | Command | What the model decides | What the runtime controls |
 |---|---|---|
-| `flux run "…"` | The shape of the plan | Validation, approvals, and every effect |
+| `flux run "…"` | Intent, semantic operation choices, and wording | The authored outer loop, schemas, batches, approvals, and every effect |
 | `flux flow run brief.flux` | Only the answer inside `ai.reason` | The authored flow, context budget, dispatch, and every effect |
 
 The reads still cross the safety envelope. Writing them into a flow does not grant extra authority;

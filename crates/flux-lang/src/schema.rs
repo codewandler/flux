@@ -2,7 +2,7 @@
 //!
 //! The AST types in [`crate::ast`] derive [`schemars::JsonSchema`]; this module projects that into
 //! (a) the full JSON Schema of the AST ([`ast_schema`]) and (b) the markdown node-kind catalog
-//! ([`node_kind_catalog`]) that feeds the planner prompt and the generated skill/docs. There is no
+//! ([`node_kind_catalog`]) that feeds the generated skill/docs and tooling. There is no
 //! hand-maintained table and no build-time `syn` parsing: change a `Node` variant or its doc-comment
 //! and every downstream surface updates automatically.
 
@@ -10,7 +10,7 @@ use crate::ast::{DraftAst, Node};
 
 /// The full JSON Schema of the Draft AST, as a `serde_json::Value`. Memoized — the schema is a
 /// compile-time constant, and `schema_for!` over the recursive AST is a non-trivial reflective build
-/// that would otherwise re-run on every planner call.
+/// that would otherwise be rebuilt by every tooling consumer.
 pub fn ast_schema() -> serde_json::Value {
     static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
@@ -19,12 +19,12 @@ pub fn ast_schema() -> serde_json::Value {
     .clone()
 }
 
-/// The **model-facing merged** AST schema (L-71): [`ast_schema`] with the `Node` definition's
+/// The compact merged AST schema (L-71): [`ast_schema`] with the `Node` definition's
 /// 43-variant `oneOf` collapsed into ONE object schema via [`merge_node_schema`]. Same wire format
 /// (the internally-tagged `{"kind": …, …}` objects serde already speaks), a fraction of the tokens
-/// — per-kind field/semantics documentation stays in [`node_kind_catalog`], which the planner
-/// prompt carries anyway. The planner's default emission surface since the measured L-71 cutover
-/// (`docs/designs/flux-lang-emission-ab.md`). Memoized like [`ast_schema`].
+/// — per-kind field/semantics documentation stays in [`node_kind_catalog`]. Retained for language
+/// workbench experiments and external hosts; the agent does not ask a model to emit this schema.
+/// Memoized like [`ast_schema`].
 pub fn model_schema() -> serde_json::Value {
     static CELL: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
@@ -49,7 +49,8 @@ pub fn model_schema() -> serde_json::Value {
 /// Purely a projection of the derived schema — the AST types, serde encoding, and every consumer of
 /// [`ast_schema`] are untouched. A schema without a `oneOf` `Node` definition is left unchanged, so
 /// the merge is idempotent. Works on both the bare [`ast_schema`] and a tool-input schema embedding
-/// it (e.g. `emit_plan`'s), whichever defs key schemars emitted.
+/// it, whichever defs key schemars emitted. This compact form is a language-workbench projection;
+/// the agent runtime does not ask a model to generate it.
 pub fn merge_node_schema(schema: &mut serde_json::Value) {
     let Some(defs_key) = ["$defs", "definitions"]
         .into_iter()
@@ -163,8 +164,7 @@ pub fn merge_node_schema(schema: &mut serde_json::Value) {
 /// for a strict markdown-table renderer, as the website generator does).
 pub fn node_kind_rows() -> Vec<(String, String)> {
     // Memoized: building this runs `schema_for!(Node)` (a full reflective build of the 40+-variant
-    // AST enum) plus a per-variant walk. `node_kind_catalog` feeds the planner prompt on every turn,
-    // so cache the rows and hand back a clone.
+    // AST enum) plus a per-variant walk. Cache the rows for docs, skills, LSP, and CLI consumers.
     static CELL: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
         let schema =
@@ -228,7 +228,7 @@ mod tests {
         let catalog = node_kind_catalog();
         assert!(catalog.starts_with("| kind | description |\n|---|---|\n"));
 
-        // Every kind the planner relies on must have a row.
+        // Every language kind must have a row.
         for kind in [
             "call",
             "bind",

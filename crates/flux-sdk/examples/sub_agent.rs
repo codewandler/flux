@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
         model: None, // inherit the spawner's default model
         thinking: None,
         effort: None,
+        agent_loop: None,
         tools: Some(Vec::new()), // a leaf with no tools — it just investigates and reports
         prompt: "You are a scout. Investigate and report findings tersely.".into(),
     }]);

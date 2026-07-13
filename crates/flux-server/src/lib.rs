@@ -1240,8 +1240,7 @@ mod tests {
         }
     }
 
-    /// A provider that answers every call with a one-word prose turn — the agent loop exits on
-    /// prose, so a handler-driven test turn completes fast and deterministically.
+    /// A provider that declares an intent, then answers with a one-word prose turn.
     struct ProseProvider;
     #[async_trait::async_trait]
     impl flux_provider::Provider for ProseProvider {
@@ -1250,14 +1249,31 @@ mod tests {
         }
         async fn stream(
             &self,
-            _req: flux_provider::Request,
+            req: flux_provider::Request,
         ) -> flux_core::Result<flux_provider::ChunkStream> {
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(flux_core::Chunk::TextDelta("ok".into())),
-                Ok(flux_core::Chunk::Done {
-                    stop_reason: Some(flux_core::StopReason::EndTurn),
-                }),
-            ])))
+            let chunks = if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+                vec![
+                    flux_core::Chunk::Block(flux_core::ContentBlock::ToolUse {
+                        id: "intent".into(),
+                        name: "declare_intent".into(),
+                        input: serde_json::json!({
+                            "intent": "answer the current message",
+                            "capability_families": [],
+                        }),
+                    }),
+                    flux_core::Chunk::Done {
+                        stop_reason: Some(flux_core::StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    flux_core::Chunk::TextDelta("ok".into()),
+                    flux_core::Chunk::Done {
+                        stop_reason: Some(flux_core::StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
         }
     }
 
@@ -1284,10 +1300,7 @@ mod tests {
         flux_tools::register_evidence(&mut registry);
         let executor = flux_runtime::Executor::new(
             registry,
-            flux_runtime::PermissionManager::from_rules(
-                &["plan".into(), "run_plan".into(), "observe".into()],
-                &[],
-            ),
+            flux_runtime::PermissionManager::from_rules(&[], &[]),
             Arc::new(flux_runtime::AllowApprover),
             flux_runtime::ToolContext::new(system),
         );

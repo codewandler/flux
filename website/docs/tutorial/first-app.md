@@ -61,9 +61,11 @@ should report Monday–Friday, 09:00–17:00 Central European Time. Your run may
 It may also skip `search`, claim the handbook lacks a fact that is present, or answer from prior model
 knowledge. Repeat a question if you want to probe that behavior.
 
-That variability is the experiment, not a tutorial failure. `tools [search]` makes `search` available,
-the datasource declaration scopes it, and the description requests it—but the model still decides
-whether to call it. A successful answer does not change that structure.
+That variability is the experiment, not a tutorial failure. The adaptive loop makes schema use much
+more reliable than a generated plan, and `tools [search]` plus the datasource declaration give it a
+narrow live capability. But the description still expresses an application invariant as prompt
+advice: the model decides whether the question needs `search`. A successful answer does not change
+that structure.
 
 ```text
 terminal line
@@ -187,7 +189,7 @@ launch flux. If you edit either handbook file, restart the app to rebuild its in
 
 Starting from basic terminal commands, you have now:
 
-- previewed a model-generated plan before it ran;
+- watched typed intent, native-schema exploration, and action-batch approval;
 - authored a typed, parameterized Flux-Lang flow;
 - observed why a prompt is not a control-flow guarantee;
 - moved mandatory retrieval into a deterministic journey;

@@ -44,6 +44,22 @@ impl Provider for ReviewerMockProvider {
     }
 
     async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "review the assigned files",
+                        "capability_families": [],
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
         // `system_text()` joins the segmented system prompt (A-03) — the role prompt now rides in
         // a segment, so `req.system` alone is empty.
         let system = req.system_text().unwrap_or_default();

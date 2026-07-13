@@ -3,7 +3,7 @@
 //! JSON or natural language.
 //!
 //! The output is an ordinary [`DraftAst`]: feed it to the analyzer ([`crate::analyze`]) and the engine
-//! (`flux-flow` / `flux-sdk`'s `FlowClient`) exactly as you would a model-compiled plan. The DSL is a
+//! (`flux-flow` / `flux-sdk`'s `FlowClient`) exactly as you would parsed authored text. The DSL is a
 //! *construction* convenience only — it does **not** type-check the flow. Semantic validity (bounded
 //! loops, top-level `await`, `match` subjects, `fallback` arity, op resolution) stays the analyzer's
 //! job; build a flow here, then `analyze` it before you `execute`.
@@ -628,6 +628,7 @@ impl Block {
             binding: a.binding,
             source: source.into(),
             as_type: a.as_type,
+            condition: None,
         })
     }
 

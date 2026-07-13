@@ -53,6 +53,22 @@ impl Provider for ReviewerMockProvider {
     }
 
     async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+            let chunks = vec![
+                Chunk::Block(ContentBlock::ToolUse {
+                    id: "intent".into(),
+                    name: "declare_intent".into(),
+                    input: json!({
+                        "intent": "review the assigned files",
+                        "capability_families": [],
+                    }),
+                }),
+                Chunk::Done {
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+            ];
+            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+        }
         let system = req.system_text().unwrap_or_default();
         let text = if system.contains("SECURITY reviewer") {
             json!([
@@ -137,7 +153,7 @@ impl Provider for ReviewerMockProvider {
 }
 
 /// A never-called top-level provider: `run_flow` (`parse` + `analyze` + `execute_with`) never
-/// compiles from natural language, so the client's own provider is never invoked — only the
+/// is fully authored, so the client's own provider is never invoked — only the
 /// sub-agent spawner's `provider_factory` (`ReviewerMockProvider`) is.
 struct UnusedTopLevelProvider;
 

@@ -390,16 +390,16 @@ pub struct Param {
     pub ty: TypeRef,
 }
 
-/// Serde default for [`Node::Jq`]'s `optional` flag: a `jq` deserialized without the field (a
-/// model-emitted `emit_plan`, an older cassette) keeps the lenient "absent means empty" traversal
-/// that real agent turns depend on. Native `$x.field` sugar sets `optional: false` explicitly at
-/// parse time, so only the human-authored surface is strict.
+/// Backward-compatible serde default for [`Node::Jq`]'s `optional` flag. Older JSON ASTs omitted
+/// the field and used lenient "absent means empty" traversal; native `$x.field` text sets
+/// `optional: false` explicitly at parse time.
 fn jq_optional_default() -> bool {
     true
 }
 
-/// A node in the Draft AST the LLM emits. Expressions and statements share one enum; the analyzer
-/// enforces where each may appear.
+/// A node in an authored or host-derived Draft AST. Expressions and statements share one enum; the
+/// analyzer enforces where each may appear. Agent models call native operation schemas and do not
+/// generate this executable representation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Node {
@@ -507,6 +507,10 @@ pub enum Node {
         source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_type: Option<TypeRef>,
+        /// Optional pure condition. A false condition skips this top-level suspension point; this
+        /// keeps decision points authored and durable without nesting `await` inside control flow.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<Box<Node>>,
     },
     /// Retry a body on failure with optional backoff. Fatal errors (policy denial, unknown op) are
     /// never retried. `backoff` may be `"none"` | `"linear"` | `"exponential"`.
@@ -641,18 +645,12 @@ pub enum Node {
     /// `optional` selects the traversal-through-missing-data policy. When `false` — the
     /// default for native `$x.field` sugar — an absent object key, an out-of-range index, or a field
     /// access on a non-object is a loud error, so a typo'd field name fails fast instead of silently
-    /// reading empty. When `true` — native `$x.field?` sugar, and the default for a model- or
-    /// host-emitted `jq` (so real agent turns keep the battle-tested "absent means empty" leniency) —
-    /// such a miss yields `null`. A present-but-`null` field is never an error in either mode.
+    /// reading empty. When `true` — native `$x.field?` sugar, or a legacy JSON AST that omitted the
+    /// flag — such a miss yields `null`. A present-but-`null` field is never an error in either mode.
     Jq {
         path: String,
         input: Box<Node>,
-        // Not advertised to the model (`schemars(skip)`): model-facing JSON schema omits this field,
-        // and the engine normalizes model-ingress plans to lenient access. Strictness is a
-        // human-authored native-`$x.field` concern, set by the parser; the field still (de)serializes
-        // for durable plan_source and human-authored `.flux` round-trips.
         #[serde(default = "jq_optional_default")]
-        #[schemars(skip)]
         optional: bool,
     },
 
@@ -914,42 +912,6 @@ impl DraftAst {
             bind: None,
         }];
         self
-    }
-}
-
-/// Set every `jq` node's `optional` flag to `true` throughout `ast` — the LENIENT "absent means empty"
-/// traversal. Applied to model-emitted plans so both `emit_plan` surfaces share one contract;
-/// human-authored `.flux` text keeps the strict default. Walks the serialized form so it covers a `jq`
-/// nested anywhere without a full node match, and is a no-op on a plan that already used the `?`
-/// opt-out (its `jq` are already `optional: true`).
-pub fn relax_field_access(ast: &mut DraftAst) {
-    // A `DraftAst` always (de)serializes losslessly (it is the `@json` wire form); on the impossible
-    // error path leave the ast untouched rather than panic.
-    let Ok(mut v) = serde_json::to_value(&*ast) else {
-        return;
-    };
-    relax_jq_optional(&mut v);
-    if let Ok(relaxed) = serde_json::from_value(v) {
-        *ast = relaxed;
-    }
-}
-
-fn relax_jq_optional(v: &mut serde_json::Value) {
-    match v {
-        serde_json::Value::Object(map) => {
-            if map.get("kind").and_then(|k| k.as_str()) == Some("jq") {
-                map.insert("optional".to_string(), serde_json::Value::Bool(true));
-            }
-            for child in map.values_mut() {
-                relax_jq_optional(child);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for child in arr.iter_mut() {
-                relax_jq_optional(child);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1247,46 +1209,14 @@ pub enum RunEvent {
 mod tests {
     use super::*;
 
-    /// `relax_field_access` flips every `jq` node to lenient (`optional: true`) — the transform the
-    /// engine applies to model-authored plans so both emit_plan surfaces share one field-access
-    /// contract.
+    /// Authored JSON ASTs can select the same strict/optional behavior as Flux text. Older JSON
+    /// without the field still decodes leniently through `jq_optional_default`.
     #[test]
-    fn relax_field_access_makes_every_jq_lenient() {
-        // A strict field access nested inside a bind (`$x = $obj.field`).
-        let mut ast = DraftAst {
-            body: vec![Node::Bind {
-                name: "x".into(),
-                value: Box::new(Node::Jq {
-                    path: ".field".into(),
-                    input: Box::new(Node::Var { name: "obj".into() }),
-                    optional: false,
-                }),
-                ty: None,
-                effect: None,
-            }],
-            ..Default::default()
-        };
-        relax_field_access(&mut ast);
-        let Node::Bind { value, .. } = &ast.body[0] else {
-            panic!("bind");
-        };
-        assert!(
-            matches!(value.as_ref(), Node::Jq { optional: true, .. }),
-            "relax must set optional=true: {value:?}"
-        );
-    }
-
-    /// The `jq` node's `optional` flag is NOT advertised in the model-facing schema
-    /// (`schemars(skip)`). The engine also normalizes model-ingress plans to lenient access; strictness
-    /// is a human-authored native-`$x.field` parser concern.
-    #[test]
-    fn jq_optional_is_hidden_from_the_model_schema() {
+    fn jq_optional_is_exposed_in_the_authored_ast_schema() {
         let schema = serde_json::to_string(&schemars::schema_for!(Node)).unwrap();
-        // The quoted `"optional"` only appears as a JSON-Schema *property key*; other fields' doc
-        // comments mention the word `optional` unquoted inside their `description` text.
         assert!(
-            !schema.contains("\"optional\""),
-            "the `optional` field must be hidden from the emit_plan Node schema (found it as a property)"
+            schema.contains("\"optional\""),
+            "the authored AST schema must expose jq's optional traversal flag"
         );
     }
 

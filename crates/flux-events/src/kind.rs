@@ -67,7 +67,7 @@ pub enum EventKind {
     /// a phase-aware call. `plan_source` is the accepted plan's CANONICAL parseable Flux-Lang text
     /// (`flux_lang::format::format`, L-38) — machine-minable, round-trips via `parse`; `None` for
     /// non-accepted outcomes, pre-L-38 logs, and oversized plans (never truncated: a present
-    /// `plan_source` always parses). `delta_source` is the raw `emit_plan_delta` tool input
+    /// `plan_source` always parses). `delta_source` is the raw legacy `emit_plan_delta` tool input
     /// (canonical JSON) when this accepted attempt was produced by patching the previous rejected
     /// plan rather than re-emitting it whole (KF3/L-55) — `None` for every ordinary full emission,
     /// so the durable record can reconstruct BOTH the patch that was sent and (via `plan_source`)

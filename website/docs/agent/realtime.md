@@ -100,8 +100,8 @@ executor — the same envelope as a text turn — and barge-in is unchanged.
   voice session, and `.flux` programs cannot declare one.
 - **One provider.** OpenAI Realtime is the only implementation; the seam is provider-shaped so
   others can land, but none have.
-- **In the default mode, the model owns the turn.** There is no plan/DAG indirection per utterance —
-  sub-second turn-taking cannot round-trip a planner. flux's guarantee here is narrower and
+- **In the lower-level model-driven mode, the realtime model owns the turn.** There is no authored
+  outer-loop round-trip per utterance. flux's guarantee here is narrower and
   deliberate: every *effectful action* still crosses the guarded executor envelope, and the audit
   trail still records it. The [flow-driven mode](#flow-driven-voice) inverts this: the flow owns the
   turn, and the model speaks only inside a bounded, tool-scoped segment.

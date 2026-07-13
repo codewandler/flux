@@ -83,17 +83,18 @@ change.
 
 ## P3 — SDK lifecycle surface (`flux-sdk`) — ✅ DONE
 - **Shipped:** `flux-sdk/src/flow.rs` — `assemble_registry(provider, model)` (builtins + `CognitionPack`),
-  `FlowClient` (compile→analyze→execute), `register_op`/`register_pack`/`register_prelude`, artifact
+  `FlowClient` (parse→analyze→optimize→execute), `register_op`/`register_pack`/`register_prelude`, artifact
   re-exports. **Cognition pack wired into the live CLI** (`flux-cli` `build_agent`) — the model ops are
   now advertised on the real path (resolves the Wave-1 dead-crate finding). `optimize` deferred (needs
-  node-id plan lowering). Classic agent-loop client kept as the simple front door.
+  node-id plan lowering). `Client` remains the simple adaptive-agent front door; A-73 deliberately
+  removed natural-language `FlowClient::compile` and added typed `stage_fn<I, O>` operations.
 
 - Keep `ClientBuilder`/`Client` (agent-loop) as the simple front door.
-- Add: `OpRegistry` + `register_op`/`register_pack`/`register_prelude`; re-expose `compile_turn`,
-  `analyze`, `execute` (reuse flux-flow adapters — no new envelope); `optimize` stub.
+- Add: `OpRegistry` + `register_op`/`register_pack`/`register_prelude`; expose parse, `analyze`,
+  `execute` (reuse flux-flow adapters — no new envelope); `optimize` stub.
 - Artifact builders/readers for `Ctx`/`Need`/`Claim`/`Evidence`/`Patch`/`TestResult`; result readers for
   evidence-used / gaps-open / risks.
-- `FlowClient` façade (provider + packs + compile→analyze→execute → structured artifacts).
+- `FlowClient` façade (packs + parse→analyze→execute → structured artifacts).
 - Runnable example + doctest; feeds the roadmap "SDK + crates.io" tier.
 
 ## P4 — richer analyze (typed HIR) — ✅ DONE

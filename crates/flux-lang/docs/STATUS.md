@@ -11,6 +11,10 @@ update it in the same commit as the behaviour it describes.
 > Note: the implementation has intentionally grown **beyond** the PRD's "deliberately small" v1 node set
 > (PRD §4/§8 list ~7 constructs; `ast.rs` ships **43**). That is a superset, not a regression.
 
+> Architecture update (A-73): the PRD is retained as the original source-of-record, but its
+> natural-language compiler requirements are intentionally retired. Models now use typed native
+> stages inside an authored Flux-Lang outer loop; only developers author executable Flux programs.
+
 ## Evolution build status (P0–P6 + flux-app)
 
 The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-evolution.md)) phases, as built:
@@ -33,7 +37,7 @@ The forward design ([`flux-lang-evolution.md`](../../../docs/designs/flux-lang-e
 | **P7** | Tier-2 control-flow (`scope`/`saga`/`once`/`checkpoint`) + `DurableStore` seam (`FlowStore` event-log folds) + dead-step + **CSE** optimizer passes (`Stage::Alias`) | ✅ |
 | **P8a** | bind-grammar ergonomics: `bind` now accepts a `var` (`$b = $a` alias) or `lit` (`$x = 5`/`[1,2,3]`/`{…}`) directly (runtime-only; parser/analyzer already produced these) | ✅ |
 | **P8b** | **value-template construction** — pure `obj`/`list` nodes so a record/list assembles from variables (`return { ok: true, n: $count, intent: $x.intent }`); leaves restricted to pure value nodes | ✅ |
-| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once; the **measured** strict-JSON-vs-native-text emission A/B (native `{k:expr}`/`[expr]` spellings shipped in P8; the strict `emit_plan` schema arm shipped in flux-flow — only the comparison run remains) | ⬜ (optional) |
+| — | `ask` reply-correlation (flux-app MVP); `checkpoint`∘`await` composition; `once` crash-exactly-once | ⬜ (optional) |
 
 Each landed phase shipped behind the full dev loop (build/test/clippy/fmt/codegate) and an adversarial
 review pass (findings fixed before commit).
@@ -66,7 +70,7 @@ review pass (findings fixed before commit).
 | 19, 20.3 | Interpreter (bind/call/when/repeat/return + more) | ✅ | `src/runtime.rs` |
 | 9.2, 20.2 | Immutable value store; outputs stored as values by id | ✅ | `flux-flow/src/state.rs` (`FlowStore`, SQLite) |
 | 9.3 | Symbol table + visibility tiers (visible/hidden/pinned/expired/private) | ✅ | `state.rs`; `Visibility` |
-| 9.3 | Focus aliases ("the draft", "those results") | 🟡 (deferred) | the planner emits explicit `$symbol` names, not NL aliases — no runtime consumer exists, so a resolver would be dead code; revisit when a surface needs NL focus resolution |
+| 9.3 | Focus aliases ("the draft", "those results") | 🟡 (deferred) | authored flows and native stages use explicit values/symbols; no runtime consumer exists, so a resolver would be dead code; revisit when a surface needs NL focus resolution |
 | 9.1 | Thing references + deterministic resolver | ✅ (P6c) | `OpHost::resolve_thing` + `default_resolve_thing` (`host.rs`): self-identifying selectors (`Id`/`Key`, `File` by `Path`, `Url`) resolve deterministically (confidence 1.0, no IO, `ThingResolved` trace); `Node::Thing` binds the resolved value. `Name`/`Query` selectors error pending a host resolver (a `ThingResolver` override is the follow-up) |
 | 14.3, 20.3 | Immutable replayable run trace (`RunEvent`) | ✅ | `RunEvent` in `ast.rs`; appended by `FlowStore` |
 | 20.2 | Old value versions remain addressable (audit/undo) | ✅ | value-id revisions in `state.rs` |
@@ -93,12 +97,12 @@ review pass (findings fixed before commit).
 
 | PRD § | Requirement | Status | Evidence / note |
 |---|---|---|---|
-| 17.1 | `compile_turn(text, view, registry, llm) -> DraftAst` | ✅ | surfaced via `flux-sdk` `FlowClient::compile` (delegates to `flux-flow/src/compile.rs`) |
+| 17.1 | `compile_turn(text, view, registry, llm) -> DraftAst` | retired (A-73) | model-to-Flux compilation was removed; the default agent uses typed intent/exploration stages inside the shipped authored loop |
 | 17.2 | `analyze(ast, session, registry, policy) -> HirFlow` | ✅ | `analyze::lower`: effects + arity + **arg type-checking**; `FlowClient::analyze`/`optimize` |
 | 17.3 | `optimize(hir) -> PhysicalPlan` | ✅ (P5b) | `flux-sdk` `FlowClient::optimize` → `flux_lang::optimize` |
 | 17.4 | `execute(plan, session, runtime) -> ExecutionResult` | ✅ | `FlowClient::execute` over `execute_flow` |
 | 17.5 | `register_op` / `register_pack` / `register_prelude` | ✅ | `flux-sdk` `flow` module |
-| 17 | **`flux-sdk` exposes the lifecycle** (not the agent loop) | ✅ (P3) | `FlowClient` (`flux-sdk/src/flow.rs`): assemble registry (builtins + **cognition pack**) + compile→analyze→execute + artifact helpers; classic loop kept as the simple front door |
+| 17 | **`flux-sdk` exposes deterministic lifecycle + adaptive agent doors** | ✅ (P3, A-73) | `FlowClient` parses/analyzes/optimizes/executes authored Flux; `Client` runs the adaptive authored outer loop; `stage_fn<I, O>` registers typed guarded stages |
 
 ## UI editor model (PRD §16)
 
