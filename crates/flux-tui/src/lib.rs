@@ -242,6 +242,7 @@ struct ToolEntry {
     /// The op input (so a diff/preview can be rendered exactly).
     input: serde_json::Value,
     started: Instant,
+    timing: Option<flux_core::OperationTiming>,
     /// `None` while the op is still running.
     result: Option<ToolOutcome>,
 }
@@ -253,6 +254,7 @@ struct ToolOutcome {
     /// A one-line summary (e.g. `3 matches`) when [`toolview::format_result`] has one.
     summary: Option<String>,
     elapsed: Duration,
+    approval_wait: Option<Duration>,
 }
 
 impl ToolEntry {
@@ -263,6 +265,7 @@ impl ToolEntry {
             call,
             input,
             started: Instant::now(),
+            timing: None,
             result: None,
         }
     }
@@ -283,11 +286,13 @@ impl ToolEntry {
             started: Instant::now()
                 .checked_sub(elapsed)
                 .unwrap_or_else(Instant::now),
+            timing: None,
             result: Some(ToolOutcome {
                 is_error,
                 content,
                 summary,
                 elapsed,
+                approval_wait: None,
             }),
         }
     }
@@ -309,11 +314,13 @@ impl ToolEntry {
             started: Instant::now()
                 .checked_sub(elapsed)
                 .unwrap_or_else(Instant::now),
+            timing: None,
             result: Some(ToolOutcome {
                 is_error,
                 content,
                 summary,
                 elapsed,
+                approval_wait: None,
             }),
         }
     }
@@ -883,9 +890,19 @@ impl ChatState {
         for entry in self.entries.iter_mut().rev() {
             if let Entry::Tool(tool) = entry {
                 if tool.result.is_none() && tool.name == name {
+                    let elapsed = tool
+                        .timing
+                        .and_then(|timing| timing.execution_us)
+                        .map(Duration::from_micros)
+                        .unwrap_or_else(|| tool.started.elapsed());
+                    let approval_wait = tool
+                        .timing
+                        .and_then(|timing| timing.approval_wait_us)
+                        .map(Duration::from_micros);
                     tool.result = Some(ToolOutcome {
                         is_error,
-                        elapsed: tool.started.elapsed(),
+                        elapsed,
+                        approval_wait,
                         summary,
                         content,
                     });
@@ -899,6 +916,17 @@ impl ChatState {
             text: content,
             sev: if is_error { Sev::Err } else { Sev::Info },
         });
+    }
+
+    fn time_tool(&mut self, name: &str, timing: flux_core::OperationTiming) {
+        for entry in self.entries.iter_mut().rev() {
+            if let Entry::Tool(tool) = entry {
+                if tool.result.is_none() && tool.name == name {
+                    tool.timing = Some(timing);
+                    return;
+                }
+            }
+        }
     }
 
     /// Flatten the transcript to styled logical lines at `width`, with a blank line between
@@ -1054,8 +1082,8 @@ impl ChatState {
             // Keep the in-flight badge static: elapsed time already lives in the animated footer,
             // which lets the cached transcript remain untouched across spinner-only frames.
             None => ("◌ running".to_string(), t.warn_style()),
-            Some(o) if o.is_error => (format!("✗ {}", fmt_elapsed(o.elapsed)), t.err_style()),
-            Some(o) => (format!("✓ {}", fmt_elapsed(o.elapsed)), t.ok_style()),
+            Some(o) if o.is_error => (format!("✗ {}", fmt_tool_timing(o)), t.err_style()),
+            Some(o) => (format!("✓ {}", fmt_tool_timing(o)), t.ok_style()),
         };
 
         // Header: `→ verb  arg`, with the arg truncated so the badge sits flush right on one row.
@@ -1643,6 +1671,17 @@ fn fmt_elapsed(d: Duration) -> String {
     }
 }
 
+fn fmt_tool_timing(outcome: &ToolOutcome) -> String {
+    match outcome.approval_wait {
+        Some(wait) => format!(
+            "exec {} + approval {}",
+            fmt_elapsed(outcome.elapsed),
+            fmt_elapsed(wait)
+        ),
+        None => fmt_elapsed(outcome.elapsed),
+    }
+}
+
 /// Max persisted history entries.
 const HISTORY_CAP: usize = 500;
 
@@ -1945,6 +1984,10 @@ enum UiEvent {
         name: String,
         input: serde_json::Value,
     },
+    ToolTiming {
+        name: String,
+        timing: flux_core::OperationTiming,
+    },
     ToolResult {
         name: String,
         content: String,
@@ -2026,6 +2069,12 @@ impl AgentSink for ChannelSink {
             name: name.to_string(),
             content: result.content.clone(),
             is_error: result.is_error,
+        });
+    }
+    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+        self.send(UiEvent::ToolTiming {
+            name: name.to_string(),
+            timing: *timing,
         });
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
@@ -2345,6 +2394,7 @@ async fn event_loop(
                     state.steps += 1;
                     state.push(Entry::Tool(ToolEntry::new(name, input)));
                 }
+                UiEvent::ToolTiming { name, timing } => state.time_tool(&name, timing),
                 UiEvent::ToolResult {
                     name,
                     content,
@@ -3333,6 +3383,31 @@ mod tests {
         assert!(content.contains("$ cargo test"));
         assert!(content.contains("✓")); // done badge
         assert!(content.contains("exit 0 · 1 line")); // bash result collapses to a compact summary
+    }
+
+    #[test]
+    fn tool_card_separates_approval_wait_from_execution() {
+        let mut state = ChatState::new("opus".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "write".into(),
+            serde_json::json!({"path": "README.md"}),
+        )));
+        state.time_tool(
+            "write",
+            flux_core::OperationTiming {
+                total_us: 30_005_000,
+                approval_wait_us: Some(30_000_000),
+                execution_us: Some(5_000),
+            },
+        );
+        state.finish_tool("write", "wrote README.md".into(), false);
+        let Entry::Tool(tool) = &state.entries[0] else {
+            panic!("expected tool entry")
+        };
+        assert_eq!(
+            fmt_tool_timing(tool.result.as_ref().unwrap()),
+            "exec 5ms + approval 30.0s"
+        );
     }
 
     #[test]

@@ -71,7 +71,8 @@ Verified against the tree (full matrix in `STATUS.md`):
   `OpHost`/`ValueStore`/`FlowSink`, the SQLite value/symbol store with visibility tiers
   (`flux-flow/src/state.rs`), the effects→policy bridge (`effects.rs`) on the one envelope, the NL→AST
   compiler (`flux-flow/src/compile.rs`), the ASCII renderer, and the schemars-driven node-kind SSOT
-  (`schema.rs`) that generates the planner prompt + `reference.md` + both skills.
+  (`schema.rs`) that generates the planner prompt + `reference.md` + the explicitly installable
+  language skill + website tables.
 - **Partial / not started:** the **text parser** (`parse.rs`/`format.rs` are only a "Toolchain plan" in
   `syntax.md`), **HIR type/effect checking** (`HirFlow` is a stub; the analyzer does name/grammar/
   bounded-loop only), the **optimizer + `PhysicalPlan` execution** (the `Stage` types exist; nothing
@@ -306,8 +307,9 @@ return do kb.synth $claims               # domain wrapper = synth with citation 
   Race/Repeat/Retry/Return/Seq/Thing/Throttle/Try/Unless/Var/Verify/When`). (`need`/`gaps` are pure ops,
   not nodes.) Each gets a doc-comment;
   the node-kind SSOT (`schema::node_kind_catalog`) then regenerates the planner prompt, the
-  `reference.md` table, and both skills. Regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test
-  skill_in_sync` and `UPDATE=1 cargo test -p codewandler-flux-flow --test skill_docs_in_sync`; keep both green.
+  `reference.md` table, the explicitly installable language skill, and the website. Regenerate with
+  `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `UPDATE=1 cargo test -p
+  codewandler-flux-lang --test website_in_sync`; keep both green.
 - **No new effects, no `Value`/`TypeRef` change.** The `ctx`/`ctx_append` nodes and the `need`/`gaps` ops
   are `Pure`; model ops are `Model`; `query` is `Read`/`Network`. Artifact types are `Named` schemas.
 - **New prelude-type SSOT.** Mirror the node-kind generator with a `prelude_type_catalog()` +

@@ -90,11 +90,39 @@ model's context, the Vault backend, and OAuth login for plugins — see
 Prompt caching is applied automatically for long contexts on providers that support it — no flag
 needed.
 
-:::note
-`--think` / `--effort` flags are hidden and accepted for CLI compatibility, but are currently
-**no-ops** — the raw `-p` prompt path that consumed them was removed in the engine cutover.
-Extended-thinking control for full agent turns is planned.
-:::
+## Reasoning controls
+
+`--think` asks capable models to expose adaptive thinking. `--effort
+low|medium|high|xhigh|max` sets the provider-mapped reasoning effort. They are independent: use one
+or both. The setting follows the whole agent call graph — planner and repair calls, grounded final
+rendering, context compaction, cognition operations, and sub-agents that do not override it.
+
+```bash
+flux run -m codex/gpt-5.5 --effort low "summarize this repository"
+flux run -m anthropic/claude-sonnet-5 --think --effort high "debug this failure"
+```
+
+Provider capability gates still apply. For example, Anthropic models that reject adaptive thinking
+or effort receive neither unsupported field, while OpenAI-family providers map the common effort
+levels to the values their wire accepts. Reasoning output, when the provider returns it, streams on
+the thinking channel; merely opening the TUI or attaching a streaming consumer does not enable it.
+
+## Diagnosing model latency
+
+Set `FLUX_MODEL_TRACE=1` to write one credential-free JSON summary before each native model request
+and one correlated terminal record to stderr. It reports request and cache-segment sizes, selected
+thinking/effort, response-header time, first thinking/tool/text time, retries, usage, and total stream
+time. It applies consistently to planning, repair, final rendering, compaction, cognition calls, and
+sub-agents.
+
+```bash
+FLUX_MODEL_TRACE=1 flux run -m codex/gpt-5.5 --effort low "explain this failure"
+```
+
+`FLUX_MODEL_TRACE=full` additionally prints the exact JSON request body. **That body is sensitive:**
+it can contain your prompts, source documents, tool results, and system instructions. Credential
+headers are never included, but redirect and retain full traces only as carefully as the underlying
+workspace data.
 
 ## Related docs
 

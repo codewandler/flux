@@ -32,13 +32,13 @@ signatures.
 
 The `Node` enum's **doc-comments** in `src/ast.rs` are the canonical one-line node descriptions. Via
 `schema::node_kind_catalog()` they generate: the planner-prompt grammar, the "Node kinds at a glance"
-table in `docs/reference.md`, the `## Node kinds` table in `skill/SKILL.md`, and the same table in the
-engine skill. **Never hand-edit a generated `<!-- BEGIN/END generated:node-kinds -->` block.** After
+table in `docs/reference.md`, and the `## Node kinds` table in the explicitly installable
+`skill/SKILL.md`. **Never hand-edit a generated `<!-- BEGIN/END generated:node-kinds -->` block.** After
 changing a `Node` variant or its doc-comment, regenerate:
 
 ```bash
 UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync          # language skill + docs/reference.md
-UPDATE=1 cargo test -p codewandler-flux-flow --test skill_docs_in_sync     # engine skill
+UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync        # public website tables
 ```
 
 Hand-written prose (the detailed per-node sections in `docs/reference.md`, the examples in `skill.rs`)

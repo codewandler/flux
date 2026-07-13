@@ -13,6 +13,7 @@ mod event;
 mod message;
 pub mod pricing;
 mod stream;
+mod timing;
 
 pub use audio::{AudioEncoding, AudioFormat};
 pub use content::{
@@ -27,3 +28,4 @@ pub use pricing::{
     resolve_role_model, CostSource, Money, PricingTable, RateOverride, Rates,
 };
 pub use stream::{Chunk, StopReason, Usage};
+pub use timing::OperationTiming;

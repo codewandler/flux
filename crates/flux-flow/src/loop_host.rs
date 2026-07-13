@@ -499,7 +499,7 @@ pub struct EngineLoopHost {
     composites: Arc<DynamicComposites>,
     /// Active reentry depth, guarding against runaway `run_plan` recursion.
     depth: AtomicU32,
-    opts: CompileOptions,
+    opts: Mutex<CompileOptions>,
     /// Per-turn session + sink, set by [`set_turn`](Self::set_turn) before each run.
     turn: Mutex<TurnCtx>,
     /// Retry-breaker state, reset per turn — stops a stalled loop from replaying to the cap.
@@ -564,6 +564,15 @@ pub struct EngineLoopHost {
 }
 
 impl EngineLoopHost {
+    /// Update the reasoning policy used by planner and grounded-completion calls. The outer
+    /// [`FlowEngine`](crate::engine::FlowEngine) mirrors the same values for one-shot planning and
+    /// compaction.
+    pub fn set_reasoning(&self, thinking: bool, effort: Option<flux_provider::Effort>) {
+        let mut opts = self.opts.lock().unwrap();
+        opts.thinking = thinking;
+        opts.effort = effort;
+    }
+
     /// Wire the reflexive capability onto `executor`, returning the shared `Arc<Executor>` to drive flows
     /// with **and** the host handle (to [`set_turn`](Self::set_turn) before each run). `store` is shared
     /// with the runs; the initial `session_id`/`sink`/`base_system` seed the first turn.
@@ -593,7 +602,7 @@ impl EngineLoopHost {
                 store,
                 composites,
                 depth: AtomicU32::new(0),
-                opts,
+                opts: Mutex::new(opts),
                 turn: Mutex::new(TurnCtx {
                     session_id,
                     base_system,
@@ -1137,12 +1146,15 @@ impl LoopHost for EngineLoopHost {
         if let Some(directive) = pending {
             let provider = self.provider.lock().unwrap().clone();
             let model = self.model.lock().unwrap().clone();
+            let opts = self.opts.lock().unwrap().clone();
             match render_completion(
                 &*provider,
                 &model,
                 &conversation,
                 &directive,
-                self.opts.max_tokens,
+                opts.max_tokens,
+                opts.thinking,
+                opts.effort,
             )
             .await
             {
@@ -1195,6 +1207,7 @@ impl LoopHost for EngineLoopHost {
         let sink = self.turn.lock().unwrap().sink.clone();
         let _planning = PlanningGuard::start(sink.clone());
         let mut thinking_sink = SharedSink::new(sink);
+        let opts = self.opts.lock().unwrap().clone();
         // A-14: the phase resolved from `input` at entry threads straight into `compile_turn`,
         // selecting that pass's instruction segment (orient's three-way contract, gather's
         // keep-gathering-or-settle contract, or execute's byte-compatible default).
@@ -1207,7 +1220,7 @@ impl LoopHost for EngineLoopHost {
             view_ref,
             None,
             Some(&mut thinking_sink),
-            self.opts.clone(),
+            opts,
             phase,
         )
         .await;
@@ -2014,6 +2027,9 @@ impl AgentSink for SharedSink {
     fn tool_result(&mut self, name: &str, result: &ToolResult) {
         self.0.lock().unwrap().tool_result(name, result);
     }
+    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+        self.0.lock().unwrap().tool_timing(name, timing);
+    }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.0.lock().unwrap().observation(o);
     }
@@ -2033,6 +2049,7 @@ pub enum SinkEvent {
     Planning(bool),
     PlanDelta(String),
     ToolCall(String, Value),
+    ToolTiming(String, flux_core::OperationTiming),
     ToolResult(String, ToolResult),
     Observation(flux_evidence::Observation),
     TurnEnd(Option<flux_core::Usage>),
@@ -2047,6 +2064,7 @@ impl SinkEvent {
             SinkEvent::Planning(a) => sink.planning(a),
             SinkEvent::PlanDelta(h) => sink.plan_delta(&h),
             SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
+            SinkEvent::ToolTiming(n, t) => sink.tool_timing(&n, &t),
             SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
             SinkEvent::Observation(o) => sink.observation(&o),
             SinkEvent::TurnEnd(u) => sink.turn_end(u),
@@ -2087,6 +2105,11 @@ impl AgentSink for ChannelSink {
         let _ = self
             .0
             .send(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    }
+    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+        let _ = self
+            .0
+            .send(SinkEvent::ToolTiming(name.to_string(), *timing));
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         let _ = self.0.send(SinkEvent::Observation(o.clone()));

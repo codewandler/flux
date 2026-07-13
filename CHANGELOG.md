@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A-68: reasoning policy now survives the complete agent call graph** (Agent pillar;
+  `docs/designs/agent-reasoning-effort.md`). `AgentSpec` owns typed thinking/effort settings and
+  consistently applies them to planner/repair, completion, compaction, cognition, app agents, and
+  inherited sub-agents; markdown roles may override the parent. `--think` and
+  `--effort low|medium|high|xhigh|max` are visible, functional controls rather than compatibility
+  no-ops. Capture-provider tests cover every call class and a same-task Codex trace verifies the
+  selected effort reaches the wire.
+- **C-54: credential-free native model lifecycle tracing** (Core pillar;
+  `docs/designs/model-request-lifecycle-trace.md`). `FLUX_MODEL_TRACE=1` emits correlated request
+  shape, cache-segment sizes, reasoning policy, retry/fallback counters, response/first-content
+  milestones, terminal status, and usage. `FLUX_MODEL_TRACE=full` additionally emits the exact,
+  explicitly sensitive JSON body without credential headers. Request errors and dropped streams
+  retain terminal trace records; disabled mode adds no per-chunk wrapper.
 - **A-66: app-declared capability ceilings and executable journey ownership** (Agent + Language
   pillars; `docs/designs/owned-journeys.md`). Native programs can declare a top-level exact-op
   `permissions` ceiling and agent-level `allow`/`deny` narrowing. The runtime subsets the actual
@@ -30,6 +43,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **BREAKING (agent behavior): A-69 makes skill activation explicit** (Agent pillar;
+  `docs/designs/manual-skill-activation.md`). Merely discovering a skill or matching its name,
+  description, or triggers no longer mutates a production prompt. The CLI requires repeatable
+  `--skill <name>`; SDK agents explicitly populate `AgentSpec.skills`. Empty skill sets skip
+  directory discovery entirely. The deprecated 19.4 KB project-default Flux-Lang mirror and its
+  duplicate sync guard were removed; the installable language skill and website/reference SSOT
+  remain. A live same-workspace trace removed an unrelated activation and reduced input by 5,166
+  tokens (18%).
+- **A-70: installed-plugin startup now overlaps real verification/spawn prefixes and manifest
+  handshakes** (Agent pillar; `docs/designs/parallel-plugin-startup.md`). Loads run in bounded Tokio
+  tasks, then sort by plugin name before registration so catalog/cache order and the mandatory
+  guarded process/capability envelope remain unchanged. Three warm 18-plugin mock runs improved
+  from 2.222–2.246 seconds to 0.585–0.592 seconds; a blocking-before-first-yield regression test
+  guards the concurrency shape the original async-only test missed.
 - **A-67: installed plugin catalogs now surface on turn intent instead of taxing every planner
   request** (Agent pillar; `docs/designs/turn-intent-plugin-surfacing.md`). Visible operations with
   no explicit plugin-authored group are assigned to an implicit `plugin.<name>` group and surface
@@ -48,6 +75,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **C-53: approval wait is no longer mislabeled as tool execution latency** (Core pillar;
+  `docs/designs/operation-latency-attribution.md`). The dispatcher emits correlated
+  `approval.requested`/`approved|denied`, `tool.started`/`ended`, and `tool.cache_hit` lifecycle
+  observations without subjects, inputs, or results. CLI/TUI surfaces render execution and approval
+  separately while cassette compatibility remains unchanged. A delayed-approver regression proves
+  an instant tool stays near-instant even when the operator waits.
 - **The beginner tutorial now works as written end-to-end** (Agent + Language pillars;
   `docs/designs/tutorial-e2e-hardening.md`). Runtime `Ctx` values materialize their retained symbol
   values into an exactly character-budgeted, labelled payload, and `ai.reason` sends that payload

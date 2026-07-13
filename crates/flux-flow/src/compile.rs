@@ -24,7 +24,7 @@
 use futures::StreamExt;
 
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, StopReason, Usage};
-use flux_provider::{Provider, Request, SystemSegment, ToolDef};
+use flux_provider::{Effort, Provider, Request, SystemSegment, ToolDef};
 use flux_spec::tool_input_schema;
 use schemars::JsonSchema;
 
@@ -64,6 +64,10 @@ pub struct CompileOptions {
     /// too small a budget truncates large plans mid-tool-call (see the `max_tokens` guard in
     /// [`compile_turn`]).
     pub max_tokens: u32,
+    /// Ask providers/models that support it to emit adaptive thinking.
+    pub thinking: bool,
+    /// Provider-mapped reasoning effort for every compiler/completion request.
+    pub effort: Option<Effort>,
 }
 
 impl Default for CompileOptions {
@@ -72,6 +76,8 @@ impl Default for CompileOptions {
             max_attempts: 2,
             max_steps: 8,
             max_tokens: 16384,
+            thinking: false,
+            effort: None,
         }
     }
 }
@@ -405,8 +411,8 @@ pub async fn compile(
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
-            thinking: false,
-            effort: None,
+            thinking: opts.thinking,
+            effort: opts.effort,
             metadata: serde_json::Map::new(),
         };
         let mut stream = provider.stream(req).await?;
@@ -597,10 +603,8 @@ async fn compile_turn_inner(
     // fresh each step rather than fixed here.
     let base_tools = planner_tools(interactive, arm);
     let mut messages = conversation.to_vec();
-    // Forward thinking-token deltas to the sink while we're in the planning phase, so both surfaces
-    // (CLI: dims them on stderr; TUI: streams them into a dedicated Thinking entry) can show reasoning
-    // live instead of silently waiting behind "composing plan\u2026".
-    let enable_thinking = thinking_sink.is_some();
+    // The sink only observes reasoning; attaching a UI must never change model behavior. The agent's
+    // explicit settings decide whether the provider should request adaptive thinking.
 
     // The most recent rejection fed back to the model (hidden ops, analyzer diagnostics, duplicate
     // emit_plan). When the step budget runs out, the turn is rejected WITH this text (C-17/F2) —
@@ -633,8 +637,8 @@ async fn compile_turn_inner(
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
-            thinking: enable_thinking,
-            effort: None,
+            thinking: opts.thinking,
+            effort: opts.effort,
             metadata: serde_json::Map::new(),
         };
 
@@ -1204,6 +1208,8 @@ pub async fn render_completion(
     conversation: &[Message],
     directive: &Completion,
     max_tokens: u32,
+    thinking: bool,
+    effort: Option<Effort>,
 ) -> Result<(String, Usage)> {
     let primer = directive
         .primer
@@ -1227,8 +1233,8 @@ pub async fn render_completion(
         temperature: None,
         top_p: None,
         stop_sequences: Vec::new(),
-        thinking: false,
-        effort: None,
+        thinking,
+        effort,
         metadata: serde_json::Map::new(),
     };
     let (result, usage) = stream_blocks(provider, req, None).await;
@@ -2579,6 +2585,49 @@ mod tests {
     /// A provider that replays canned chunk sequences, one per `stream()` call.
     struct Mock {
         responses: Mutex<VecDeque<Vec<Chunk>>>,
+    }
+
+    #[tokio::test]
+    async fn planner_request_uses_explicit_reasoning_settings_not_sink_presence() {
+        let provider = request_capturing_mock(vec![
+            tool_call(
+                "emit_plan",
+                json!({"ast":{"body":[{"kind":"call","op":"not_real","args":[]}]}}),
+            ),
+            tool_call("emit_plan", serde_json::from_str(VALID_AST).unwrap()),
+        ]);
+        let reg = full_registry();
+        let ops = OpRegistry::new(&reg);
+        struct Sink;
+        impl crate::AgentSink for Sink {}
+        let mut sink = Sink;
+        let (out, _) = compile_turn(
+            &provider,
+            "mock",
+            &[Message::user_text("say hello")],
+            None,
+            &ops,
+            None,
+            None,
+            Some(&mut sink),
+            CompileOptions {
+                thinking: false,
+                effort: Some(flux_provider::Effort::High),
+                ..Default::default()
+            },
+            Phase::Execute,
+        )
+        .await;
+        assert!(matches!(out.unwrap(), TurnOutput::Plan(_)));
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "initial planner call plus repair");
+        assert!(
+            requests.iter().all(|request| !request.thinking),
+            "a UI sink must not enable thinking"
+        );
+        assert!(requests
+            .iter()
+            .all(|request| request.effort == Some(flux_provider::Effort::High)));
     }
     #[async_trait]
     impl Provider for Mock {

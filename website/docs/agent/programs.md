@@ -31,6 +31,8 @@ trigger that answers each message ([`crates/flux-app/examples/support-bot.flux`]
 ```flux
 agent assistant
   model "claude-sonnet-5"
+  thinking true
+  effort "medium"
   tools [search]
   datasources [docs]
   description "answers support questions from the docs"
@@ -52,6 +54,10 @@ That is the entire application. On each Slack mention the agent reads the messag
 the indexed docs, and its answer is posted back into the thread. The trigger is **agent-bound** (it
 names an `agent`, not a `run` journey), so the model drives the turn. See the [Slack channel setup
 guide](./slack-channel.md) for creating the Slack app and its tokens.
+
+`thinking` and `effort` are agent settings, so they also apply to cognition operations, completion
+rendering, and compaction owned by that agent. Omit them for the default (`thinking false`, no effort
+hint); accepted effort values are `"low"`, `"medium"`, `"high"`, `"xhigh"`, and `"max"`.
 
 For deterministic, fixed-step work a trigger can run a **journey** — a named Flux-Lang flow — instead
 of an agent (`run <journey>` with no trigger-level `agent`). A journey may still declare `agent

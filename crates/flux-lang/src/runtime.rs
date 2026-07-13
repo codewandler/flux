@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use flux_core::{Error, Usage};
+use flux_core::{Error, OperationTiming, Usage};
 use flux_spec::IntentSet;
 
 use crate::ast::{
@@ -48,6 +48,8 @@ pub struct CallOutcome {
     /// [`OpOutcome::denied`]) — surfaced as the fatal [`FlowError::Denied`] instead of the
     /// retryable runtime wrap, so `retry`/`loop`/composites never re-attempt a denial (L-21).
     pub denied: bool,
+    /// Leaf dispatch timing, absent for composite/pure outcomes.
+    pub timing: Option<OperationTiming>,
     /// The canonical value: bound to the symbol, spliced into `{{interpolation}}`, used for control
     /// flow (`when`/`return`). Deterministic execution works with this.
     pub content: String,
@@ -374,6 +376,7 @@ pub async fn execute_call(
 
     let summary_input = input.clone();
     let result = executor.dispatch(op, input).await;
+    let timing = result.timing;
     // The model-facing view (line numbers, diff, guidance); falls back to canonical content.
     let view = result.view().to_string();
 
@@ -389,6 +392,7 @@ pub async fn execute_call(
             value_id: None,
             is_error: true,
             denied: result.denied,
+            timing,
             content: result.content,
             view,
         });
@@ -421,6 +425,7 @@ pub async fn execute_call(
         value_id: Some(value_id),
         is_error: false,
         denied: false,
+        timing,
         content: result.content,
         view,
     })
@@ -470,6 +475,7 @@ async fn execute_composite_call(
                 value_id: None,
                 is_error: true,
                 denied: false,
+                timing: None,
                 content: error.clone(),
                 view: error,
             });
@@ -499,6 +505,7 @@ async fn execute_composite_call(
                 value_id: None,
                 is_error: true,
                 denied: false,
+                timing: None,
                 content: error.clone(),
                 view: error,
             });
@@ -517,6 +524,7 @@ async fn execute_composite_call(
             value_id: None,
             is_error: true,
             denied: false,
+            timing: None,
             content: error.clone(),
             view: error,
         });
@@ -572,6 +580,7 @@ async fn execute_composite_call(
         value_id: Some(value_id),
         is_error: false,
         denied: false,
+        timing: None,
         content,
         view,
     })
@@ -3240,6 +3249,7 @@ async fn run_call(
             view: None,
             is_error: outcome.is_error,
             denied: outcome.denied,
+            timing: outcome.timing,
         },
     );
     Ok(outcome)

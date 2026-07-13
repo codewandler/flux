@@ -312,8 +312,8 @@ impl ClientBuilder {
     /// `read` pre-allow**, so a spec with empty `permissions` and no [`auto_approve`](Self::auto_approve)
     /// denies *every* op (including reads) — grant what the agent needs via the spec's
     /// `permissions`, [`allow`](Self::allow), or `auto_approve`. Builder methods overlay on top. A
-    /// spec with explicit `skills` keeps them; an empty `skills` still gets default-dir discovery at
-    /// [`build`](Self::build).
+    /// `skills` is explicit: an empty list means no skills. Use
+    /// [`AgentSpec::with_default_skills`] deliberately if enabling every discovered skill is desired.
     pub fn from_spec(spec: AgentSpec) -> Self {
         Self {
             spec,
@@ -515,7 +515,9 @@ impl ClientBuilder {
         let mut registry = ToolRegistry::new();
         flux_tools::register_builtins(&mut registry);
         if self.cognition {
-            CognitionPack::new(provider.clone(), self.spec.model.clone()).register(&mut registry);
+            CognitionPack::new(provider.clone(), self.spec.model.clone())
+                .with_reasoning(self.spec.thinking, self.spec.effort)
+                .register(&mut registry);
         }
         // Snapshot the base op names (built-ins + cognition) so consumer-registered ops can be
         // told apart below: a `tools` subset restricts the *base* catalog, but must not silently
@@ -547,10 +549,8 @@ impl ClientBuilder {
 
         // The agent's definition; `assemble` selects the tool subset, applies the permissions,
         // registers the reflexive ops, and ties the engine⇄loop-host cycle. Builder rules are
-        // additive to the spec's own (`from_spec` starts from a bare envelope). Skills come from
-        // the default skill dirs (project `.flux/skills`/`.claude/skills` + the user globals,
-        // L-02) unless the spec already carries an explicit set — discovery is progressive
-        // (metadata now, bodies on activation), so this costs a frontmatter head-read per skill.
+        // additive to the spec's own (`from_spec` starts from a bare envelope). Skills are explicit:
+        // an empty set stays empty and no default directory is scanned or activated.
         let mut spec = self.spec;
         spec.permissions
             .allow
@@ -568,15 +568,16 @@ impl ClientBuilder {
             }
         }
         spec.cwd = root;
-        if spec.skills.is_empty() {
-            spec = spec.with_default_skills();
-        }
         // Thread the sub-agent spawner into the dispatch context when sub-agents are attached, so a
         // `task` call delegates through the same guarded `System`; `None` (the common case) leaves
         // the context exactly as before. Mirrors `FlowClient::build_executor`.
         let mut ctx = ToolContext::new(system.clone());
         if let Some(sub_agents) = self.sub_agents {
-            ctx = ctx.with_spawner(sub_agents.into_spawner(system));
+            ctx = ctx.with_spawner(
+                sub_agents
+                    .with_reasoning(spec.thinking, spec.effort)
+                    .into_spawner(system),
+            );
         }
         let model = spec.model.clone();
         let engine = spec.assemble(provider, registry, approver, ctx, events, flow)?;
@@ -788,11 +789,10 @@ mod tests {
         }
     }
 
-    /// L-02: the SDK populates skills from `flux_skill::default_skill_dirs` (previously only the
-    /// CLI did) — a project skill under `<root>/.flux/skills` whose trigger matches the turn's
-    /// input must be injected into the system prompt.
+    /// A-69: SDK skills are explicit. Merely placing a matching skill under the workspace must not
+    /// alter prompts; a caller can still deliberately populate `AgentSpec.skills`.
     #[tokio::test]
-    async fn sdk_populates_skills_from_default_dirs() {
+    async fn sdk_skills_require_an_explicit_agent_spec() {
         let dir = std::env::temp_dir().join(format!("flux-sdk-skills-{}", std::process::id()));
         let skills = dir.join(".flux").join("skills");
         std::fs::create_dir_all(&skills).unwrap();
@@ -814,8 +814,27 @@ mod tests {
 
         let sys = systems.lock().unwrap().join("\n---\n");
         assert!(
+            !sys.contains("Always greet with ahoy."),
+            "workspace discovery must not activate a skill implicitly; got:\n{sys}"
+        );
+
+        let systems = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(SystemCaptureMock {
+            systems: systems.clone(),
+        });
+        let spec = AgentSpec {
+            cwd: dir.clone(),
+            ..AgentSpec::new("mock")
+        }
+        .with_default_skills();
+        let client = ClientBuilder::from_spec(spec)
+            .build(provider, &dir)
+            .unwrap();
+        client.run("an unrelated turn").await.unwrap();
+        let sys = systems.lock().unwrap().join("\n---\n");
+        assert!(
             sys.contains("<skill name=\"greeting\">") && sys.contains("Always greet with ahoy."),
-            "the matching project skill must be injected into the system prompt; got:\n{sys}"
+            "an explicitly populated AgentSpec injects the skill; got:\n{sys}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

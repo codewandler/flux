@@ -19,12 +19,13 @@ pub mod context;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use flux_core::Result;
+use flux_core::{OperationTiming, Result};
 use flux_evidence::{
     DestructiveEscalation, EvidenceLog, Observation, Phase, Reaction, KIND_DESTRUCTIVE,
 };
@@ -931,6 +932,8 @@ pub struct Executor {
     /// read observes) starts a new generation. Keys embed the generation, so all older entries
     /// become unreachable at once.
     cache_gen: AtomicU64,
+    /// Monotonic correlation id for lifecycle observations emitted by each dispatch.
+    dispatch_seq: AtomicU64,
     /// `FLUX_OP_CACHE=off|0` kill switch (resolved at construction); `with_op_cache` overrides.
     cache_enabled: bool,
 }
@@ -983,6 +986,8 @@ pub struct DispatchOutcome {
     /// denials never matched the old prefix heuristic either, since their wording is `` `{op}`
     /// blocked by hook `` , not `` `{op}` denied by `` ).
     pub denied: bool,
+    /// Monotonic phase attribution measured inside the safety envelope.
+    pub timing: OperationTiming,
 }
 
 impl Drop for CapScopeGuard<'_> {
@@ -997,6 +1002,49 @@ impl Drop for CapScopeGuard<'_> {
 }
 
 impl Executor {
+    fn record_dispatch_event(
+        &self,
+        kind: &str,
+        dispatch: u64,
+        name: &str,
+        started: Instant,
+        extra: serde_json::Value,
+    ) {
+        let mut data = serde_json::Map::from_iter([
+            ("dispatch".to_string(), json!(dispatch)),
+            ("tool".to_string(), json!(name)),
+            (
+                "elapsed_us".to_string(),
+                json!(started.elapsed().as_micros().min(u64::MAX as u128) as u64),
+            ),
+        ]);
+        if let Some(fields) = extra.as_object() {
+            data.extend(fields.clone());
+        }
+        self.ctx.evidence.lock().unwrap().record(Observation::new(
+            kind,
+            Phase::Turn,
+            Value::Object(data),
+        ));
+    }
+
+    fn finish_dispatch(
+        &self,
+        _name: &str,
+        started: Instant,
+        approval_wait: Option<Duration>,
+        execution: Option<Duration>,
+        result: ToolResult,
+        denied: bool,
+    ) -> DispatchOutcome {
+        let timing = OperationTiming::from_durations(started.elapsed(), approval_wait, execution);
+        DispatchOutcome {
+            result,
+            denied,
+            timing,
+        }
+    }
+
     pub fn new(
         registry: ToolRegistry,
         perms: PermissionManager,
@@ -1016,6 +1064,7 @@ impl Executor {
             trust_all: AtomicBool::new(false),
             op_cache: Mutex::new(HashMap::new()),
             cache_gen: AtomicU64::new(0),
+            dispatch_seq: AtomicU64::new(1),
             cache_enabled: std::env::var("FLUX_OP_CACHE")
                 .map(|v| v != "off" && v != "0")
                 .unwrap_or(true),
@@ -1233,11 +1282,18 @@ impl Executor {
     /// Like [`dispatch`](Self::dispatch), but also reports — structurally, not by inference —
     /// whether the envelope itself denied the call. See [`DispatchOutcome`].
     pub async fn dispatch_outcome(&self, name: &str, params: Value) -> DispatchOutcome {
+        let started = Instant::now();
+        let dispatch = self.dispatch_seq.fetch_add(1, Ordering::Relaxed);
+        let mut approval_wait = None;
         let Some(tool) = self.registry.get(name) else {
-            return DispatchOutcome {
-                result: ToolResult::error(format!("unknown tool: {name}")),
-                denied: false,
-            };
+            return self.finish_dispatch(
+                name,
+                started,
+                approval_wait,
+                None,
+                ToolResult::error(format!("unknown tool: {name}")),
+                false,
+            );
         };
 
         // 0. Capability-scope floor — checked FIRST, before pre-tool hooks or the policy/permission
@@ -1255,12 +1311,16 @@ impl Executor {
                     Phase::Turn,
                     json!({ "tool": name, "scope": scope }),
                 ));
-                return DispatchOutcome {
-                    result: ToolResult::error(format!(
+                return self.finish_dispatch(
+                    name,
+                    started,
+                    approval_wait,
+                    None,
+                    ToolResult::error(format!(
                         "`{name}` denied by capability scope (not in the active with_tools allowlist)"
                     )),
-                    denied: true,
-                };
+                    true,
+                );
             }
         }
 
@@ -1273,10 +1333,14 @@ impl Executor {
                 HookOutcome::Deny(reason) => {
                     // Not an authorization refusal — hooks are meant to stay retryable/repairable
                     // (see `DispatchOutcome::denied`'s doc comment).
-                    return DispatchOutcome {
-                        result: ToolResult::error(format!("`{name}` blocked by hook: {reason}")),
-                        denied: false,
-                    };
+                    return self.finish_dispatch(
+                        name,
+                        started,
+                        approval_wait,
+                        None,
+                        ToolResult::error(format!("`{name}` blocked by hook: {reason}")),
+                        false,
+                    );
                 }
             }
         }
@@ -1297,12 +1361,16 @@ impl Executor {
                 match self.ctx.system.path_identity(&subject, access) {
                     Ok(subject) => physical.push(subject),
                     Err(err) => {
-                        return DispatchOutcome {
-                            result: ToolResult::error(format!(
+                        return self.finish_dispatch(
+                            name,
+                            started,
+                            approval_wait,
+                            None,
+                            ToolResult::error(format!(
                                 "`{name}` denied by filesystem path guard: {err}"
                             )),
-                            denied: true,
-                        };
+                            true,
+                        );
                     }
                 }
             }
@@ -1330,13 +1398,17 @@ impl Executor {
                 };
                 match evaluate(policy, &req).decision {
                     Decision::Deny => {
-                        return DispatchOutcome {
-                            result: ToolResult::error(format!(
+                        return self.finish_dispatch(
+                            name,
+                            started,
+                            approval_wait,
+                            None,
+                            ToolResult::error(format!(
                                 "`{name}` denied by policy ({} on {:?})",
                                 action.0, resource.kind
                             )),
-                            denied: true,
-                        };
+                            true,
+                        );
                     }
                     Decision::ApprovalRequired => policy_requires_approval = true,
                     Decision::Allow => {}
@@ -1347,10 +1419,14 @@ impl Executor {
         // 2. Permission rules (coder-style): deny wins; otherwise allow/ask for tool + subjects.
         let perm = self.perms.lock().unwrap().check(name, &subjects);
         if perm == PermDecision::Deny {
-            return DispatchOutcome {
-                result: ToolResult::error(format!("`{name}` denied by permission rules")),
-                denied: true,
-            };
+            return self.finish_dispatch(
+                name,
+                started,
+                approval_wait,
+                None,
+                ToolResult::error(format!("`{name}` denied by permission rules")),
+                true,
+            );
         }
 
         // 3. Evidence + reactions: record this call (and a destructive marker when matched), then
@@ -1402,16 +1478,44 @@ impl Executor {
         let approval_sensitive = force_approval || perm != PermDecision::Allow;
         if (!self.in_approved_scope() || undisclosed_destructive) && approval_sensitive {
             let approver = self.approver.lock().unwrap().clone();
-            match approver.request(name, &subjects, &intents).await {
-                ApprovalChoice::Allow => {}
+            self.record_dispatch_event("approval.requested", dispatch, name, started, json!({}));
+            let approval_started = Instant::now();
+            let choice = approver.request(name, &subjects, &intents).await;
+            approval_wait = Some(approval_started.elapsed());
+            match choice {
+                ApprovalChoice::Allow => self.record_dispatch_event(
+                    "approval.approved",
+                    dispatch,
+                    name,
+                    started,
+                    json!({ "choice": "allow" }),
+                ),
                 ApprovalChoice::AllowAlways(rule) => {
+                    self.record_dispatch_event(
+                        "approval.approved",
+                        dispatch,
+                        name,
+                        started,
+                        json!({ "choice": "always" }),
+                    );
                     self.perms.lock().unwrap().add_allow(&rule);
                 }
                 ApprovalChoice::Deny => {
-                    return DispatchOutcome {
-                        result: ToolResult::error(format!("`{name}` denied by user")),
-                        denied: true,
-                    };
+                    self.record_dispatch_event(
+                        "approval.denied",
+                        dispatch,
+                        name,
+                        started,
+                        json!({}),
+                    );
+                    return self.finish_dispatch(
+                        name,
+                        started,
+                        approval_wait,
+                        None,
+                        ToolResult::error(format!("`{name}` denied by user")),
+                        true,
+                    );
                 }
             }
         }
@@ -1455,10 +1559,8 @@ impl Executor {
                     Phase::Turn,
                     json!({ "tool": name }),
                 ));
-                return DispatchOutcome {
-                    result: hit,
-                    denied: false,
-                };
+                self.record_dispatch_event("tool.cache_hit", dispatch, name, started, json!({}));
+                return self.finish_dispatch(name, started, approval_wait, None, hit, false);
             }
         }
 
@@ -1474,6 +1576,8 @@ impl Executor {
 
         // 5. System boundary: the only place real IO happens. Redact secrets from the result —
         //    both the success content and any error — before it reaches the model or the logs.
+        self.record_dispatch_event("tool.started", dispatch, name, started, json!({}));
+        let execution_started = Instant::now();
         let result = match tool.execute(&self.ctx, params).await {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
@@ -1483,6 +1587,17 @@ impl Executor {
             }
             Err(e) => ToolResult::error(self.ctx.redactor.redact(&e.to_string())),
         };
+        let execution = Some(execution_started.elapsed());
+        self.record_dispatch_event(
+            "tool.ended",
+            dispatch,
+            name,
+            started,
+            json!({
+                "status": if result.is_error { "error" } else { "ok" },
+                "execution_us": execution.map(|d| d.as_micros().min(u64::MAX as u128) as u64),
+            }),
+        );
         // 6. Record a `tool_error` observation on a failed call (an op that ran and errored), so
         //    `metrics()`/`evidence` give a model-in-the-loop the failure signal to retry/stop on. The
         //    matching `tool_call` was already recorded above, so the shared log carries both.
@@ -1512,10 +1627,7 @@ impl Executor {
         }
         // The op ran (successfully or not) — never a `denied` outcome, no matter what its own
         // content says (L-32).
-        DispatchOutcome {
-            result,
-            denied: false,
-        }
+        self.finish_dispatch(name, started, approval_wait, execution, result, false)
     }
 }
 
@@ -1527,6 +1639,77 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct DelayedAllowApprover;
+
+    #[async_trait]
+    impl Approver for DelayedAllowApprover {
+        async fn request(&self, _t: &str, _s: &[String], _i: &IntentSet) -> ApprovalChoice {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            ApprovalChoice::Allow
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_attributes_approval_wait_separately_from_execution() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::new(),
+            Arc::new(DelayedAllowApprover),
+            test_ctx(),
+        );
+        let outcome = executor
+            .dispatch_outcome("echo", json!({"text": "hi"}))
+            .await;
+        assert!(!outcome.result.is_error);
+        assert!(
+            outcome.timing.approval_wait_us.unwrap_or_default() >= 20_000,
+            "approval delay was not attributed: {:?}",
+            outcome.timing
+        );
+        assert!(
+            outcome.timing.execution_us.unwrap_or(u64::MAX) < 20_000,
+            "instant tool was mislabeled as slow: {:?}",
+            outcome.timing
+        );
+        let evidence = executor.evidence();
+        let lifecycle: Vec<&Observation> = evidence
+            .all()
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.kind.as_str(),
+                    "approval.requested"
+                        | "approval.approved"
+                        | "approval.denied"
+                        | "tool.started"
+                        | "tool.ended"
+                )
+            })
+            .collect();
+        let kinds: Vec<&str> = lifecycle.iter().map(|o| o.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "approval.requested",
+                "approval.approved",
+                "tool.started",
+                "tool.ended"
+            ]
+        );
+        assert!(
+            lifecycle
+                .windows(2)
+                .all(|pair| pair[0].data["elapsed_us"].as_u64()
+                    <= pair[1].data["elapsed_us"].as_u64()),
+            "lifecycle elapsed times must be monotonic: {lifecycle:?}"
+        );
+        assert!(lifecycle
+            .iter()
+            .all(|o| o.data["dispatch"] == lifecycle[0].data["dispatch"]));
+    }
 
     fn test_ctx() -> ToolContext {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);

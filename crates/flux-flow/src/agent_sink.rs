@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use flux_core::Usage;
+use flux_core::{OperationTiming, Usage};
 use flux_runtime::ToolResult;
 
 /// Receives streaming output and tool activity from a turn (the CLI/TUI/SDK implements this).
@@ -25,6 +25,8 @@ pub trait AgentSink: Send {
     /// authoritative. Default no-op so existing sinks stay source-compatible.
     fn plan_delta(&mut self, _headline: &str) {}
     fn tool_call(&mut self, _name: &str, _input: &Value) {}
+    /// Safety-envelope timing for the immediately following tool result.
+    fn tool_timing(&mut self, _name: &str, _timing: &OperationTiming) {}
     fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
     /// An audit observation made during dispatch (e.g. a destructive-command marker).
     fn observation(&mut self, _o: &flux_evidence::Observation) {}

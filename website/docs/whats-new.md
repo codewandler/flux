@@ -14,6 +14,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Reasoning effort is now a real per-agent control.** Use `--think` and/or
+  `--effort low|medium|high|xhigh|max`; the choice follows planning, final answers, compaction,
+  cognition operations, and sub-agents unless a role deliberately overrides it.
+- **Model calls can explain their request shape and latency.** Set `FLUX_MODEL_TRACE=1` for safe
+  request-size, cache, retry, first-response, usage, and total-time records. A `full` mode can print
+  the exact request body for sensitive local debugging.
 - **Apps can declare their own hard capability boundary.** Put exact operation names in a top-level
   `permissions` block, then optionally narrow them per agent. An app or agent deny cannot be undone
   by local auto-approval or `--yes`.
@@ -23,6 +29,10 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **Plugin-heavy commands start much faster.** Installed integrations now verify, start, and exchange
+  manifests concurrently with bounded fan-out while preserving stable operation ordering and the
+  same safety checks. An 18-plugin local setup improved from about 2.23 seconds to 0.59 seconds for
+  a warm offline plan.
 - **Installed integrations no longer make unrelated agent turns carry their entire tool catalog.**
   Flux keeps plugin operations out of the planner prompt until your request names that integration,
   then makes only that integration available for the session. On a plugin-heavy installation this
@@ -34,6 +44,9 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Action needed
 
+- **Skills are now manual-only.** Installing a skill or mentioning one of its trigger words no longer
+  changes an agent prompt. Pass repeatable `--skill <name>` in the CLI, or explicitly add skills to
+  an embedded agent specification. This avoids accidental early activation and hidden context cost.
 - **Rust code constructing Flux-Lang programs directly may need one small update.** `Program` and
   `AgentDecl` have a new optional permissions field; exhaustive struct literals should set it to
   `None` or finish with `..Default::default()`. Existing `.flux` files and serialized programs remain
@@ -41,6 +54,9 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Fixed
 
+- **Approval time is reported separately from tool execution.** A command that waits for your answer
+  no longer appears to have spent those seconds reading a file, writing output, or calling a model;
+  CLI and TUI timing show both phases explicitly.
 - **The beginner tutorial now completes reliably.** Context packs pass the selected handbook text
   into AI reasoning instead of only its variable names, GPT-5 requests use the token-limit field its
   API accepts, and the tutorial explains the model-call approval and plan mode's bounded read-only

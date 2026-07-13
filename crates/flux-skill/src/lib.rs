@@ -3,9 +3,9 @@
 //! A skill is a `.md` file (or a directory containing `SKILL.md`) with YAML frontmatter. flux reads
 //! **multiple formats**:
 //!
-//! - **flux-native** — carries explicit `triggers` (substrings that gate activation).
+//! - **flux-native** — carries optional `triggers` (routing hints retained for compatibility).
 //! - **Agent Skills** (agentskills.io) / **Claude** — `name` + `description`, optional `license`,
-//!   `compatibility`, `metadata`, `allowed-tools`; **no `triggers`** (activation is description-led).
+//!   `compatibility`, `metadata`, `allowed-tools`; **no `triggers`**.
 //!
 //! ```text
 //! ---
@@ -16,10 +16,10 @@
 //! <markdown body>
 //! ```
 //!
-//! Parsing is lenient (driven by [`flux_markdown`]); when a skill has no `triggers` we fall back to
-//! keywords from its `name`/`description` so foreign skills still activate. Per turn, [`active_for`]
-//! selects, ranks, and caps the skills whose activation matches the input — the runtime injects their
-//! bodies. Field validation ([`validate`]) is a separate, non-fatal helper for tooling.
+//! Parsing is lenient (driven by [`flux_markdown`]). The compatibility helper [`active_for`] can
+//! rank candidates from triggers or `name`/`description` keywords, but the production agent does not
+//! call it: callers explicitly select skills by name and populate `AgentSpec.skills`. Field
+//! validation ([`validate`]) is a separate, non-fatal helper for tooling.
 //!
 //! Discovery is **progressive** (L-02): [`discover`]/[`discover_merged`] read only each file's
 //! frontmatter head (Level-1 metadata — `name`, `description`, `triggers`), and a skill's
@@ -223,8 +223,7 @@ impl<'de> Deserialize<'de> for SkillBody {
     }
 }
 
-/// How many skills (and how much body) one turn may activate — a guard against prompt bloat now that
-/// whole global skill dirs (`~/.claude/skills`, `~/.agents/skills`) are in scope.
+/// Limits for the optional compatibility matcher [`active_for`].
 #[derive(Debug, Clone, Copy)]
 pub struct ActivationLimits {
     pub max_skills: usize,

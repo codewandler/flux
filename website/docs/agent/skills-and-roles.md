@@ -7,7 +7,7 @@ description: "Teach an agent project knowledge with progressively loaded skills 
 
 Skills and roles change different parts of an agent:
 
-- A **skill** is contextual knowledge injected when its name, description, or triggers match a turn.
+- A **skill** is contextual knowledge you explicitly enable for an agent.
 - A **role** defines a sub-agent persona, optional model override, and tool allow-list used by `task`.
 
 Neither grants new host capabilities. Skill prose can guide a plan; role tools can only narrow the
@@ -15,8 +15,8 @@ parent's available operation set.
 
 ## Skills
 
-A skill may be a Markdown file or a directory containing `SKILL.md`. Flux-native skills can declare
-explicit triggers; Agent Skills/Claude-compatible files can use `name` and `description` only:
+A skill may be a Markdown file or a directory containing `SKILL.md`. Flux-native and Agent
+Skills/Claude-compatible metadata is accepted:
 
 ```markdown
 ---
@@ -28,8 +28,17 @@ triggers: [rust, cargo, clippy]
 Use `cargo fmt --all` and keep clippy clean with warnings denied.
 ```
 
-Discovery reads frontmatter first and loads a body only when that skill activates. At most four
-skills and 24,000 body bytes are injected by default.
+Discovery reads frontmatter only. Skills are inactive by default: user-message keywords, names,
+descriptions, and `triggers` do not alter the prompt. Enable one or more by name:
+
+```bash
+flux run --skill rust-style "fix the parser"
+flux run --skill rust-style --skill release-checks "prepare the release"
+```
+
+An unknown name fails before a model call. Once enabled, the skill body is loaded progressively and
+injected on every turn of that agent. `triggers` remain compatible metadata for tooling and a future
+evaluated router; they are not an automatic activation mechanism.
 
 Default precedence, highest first:
 
@@ -40,11 +49,13 @@ Default precedence, highest first:
 5. `~/.claude/skills`.
 
 Repeatable `--skill-dir` entries precede all defaults. `[skills] dirs` comes next, with project
-entries before user entries. Earlier directories win when two skills share a name.
+entries before user entries. Earlier directories win when two skills share a name. These options
+change discovery only; use `--skill` to activate a discovered name.
 
 `flux skill [cli|lang|plugin|ops]` prints a generated skill; add `--install` for project
-`.flux/skills`, or `--install --global` for `~/.claude/skills`. `flux plugin skill` generates the
-operation reference for installed plugins.
+`.flux/skills`, or `--install --global` for `~/.claude/skills`. Installation does not activate it;
+pass `--skill <name>` when you want it. `flux plugin skill` generates the operation reference for
+installed plugins.
 
 ## Sub-agent roles
 
@@ -55,6 +66,8 @@ reuse. The filename stem is the default role name:
 ---
 description: Read-only repository reconnaissance
 model: haiku
+thinking: true
+effort: low
 tools: [read, glob, grep, git_status, git_diff]
 ---
 
@@ -63,6 +76,8 @@ Inspect the requested area quickly. Do not modify files. Return evidence with pa
 
 - Omit `model` to inherit the parent's model. A role's `model` resolves against the parent's
   provider aliases.
+- Omit `thinking` and `effort` to inherit the parent's reasoning policy. Set them explicitly to
+  override it for that role (`effort`: `low`, `medium`, `high`, `xhigh`, or `max`).
 - Omit `tools` to inherit the tools available to the parent.
 - Use `tools: []` to grant no operations.
 - A listed tool is still subject to policy, approval, and the parent capability floor.

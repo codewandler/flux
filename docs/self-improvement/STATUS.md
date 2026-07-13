@@ -1,6 +1,6 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-07-13 (targeted planner-catalog hardening). Substantive autonomous-loop state is
+_Last updated: 2026-07-13 (targeted prompt/startup hardening). Substantive autonomous-loop state is
 frozen at round 3, 2026-07-06 — the initiative remains ON HOLD._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
@@ -29,6 +29,17 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   file write without emitting a plan, while GPT-5-mini was correct but spent 46.2s planning. Model
   latency is not a substitute for the structural catalog fix. The autonomous improvement initiative
   remains on hold; this was a user-scoped, live before/after hardening task.
+
+- **2026-07-13 follow-on trace + startup hardening (also outside the paused loop):** a credential-free
+  native model trace exposed another 5.1k input tokens from false-positive skill activation and about
+  2.5s outside the provider. Skills are now manual-only (`--skill` / explicit `AgentSpec.skills`),
+  reducing the same-workspace probe 28,449 → 23,283 input tokens. The no-plugin-HOME control then
+  isolated installed-plugin startup: the first `buffer_unordered` fix was illusory because plugin
+  futures did synchronous verification/spawn work before yielding. Bounded Tokio tasks reduced three
+  warm 18-plugin mock runs from 2.222–2.246s to 0.585–0.592s, and the live non-provider gap to ~0.75s.
+  A same-task Codex low/high effort pair proved the newly wired AgentSpec effort reaches the wire;
+  both trivial answers were correct with zero reasoning tokens, so it is propagation evidence, not
+  an effort-quality/default claim. The autonomous initiative remains on hold.
 
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →

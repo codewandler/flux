@@ -313,6 +313,7 @@ impl ReplayTape {
                 consumed[i] = true;
                 return Some(OpOutcome {
                     denied: cell.denied,
+                    timing: None,
                     content: cell.content.clone(),
                     view: cell.view.clone(),
                     is_error: cell.is_error,

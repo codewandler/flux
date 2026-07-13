@@ -11,6 +11,7 @@ mod skill_cmd;
 mod style;
 mod usage;
 
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
@@ -130,14 +131,12 @@ struct AgentFlags {
     #[arg(short = 'm', long)]
     model: Option<String>,
 
-    /// (Hidden) Adaptive thinking — accepted for CLI compatibility; currently a no-op (the raw
-    /// `-p` path that consumed it was removed with the engine cutover).
-    #[arg(long, hide = true)]
+    /// Ask capable providers/models to expose adaptive thinking for every call owned by this agent.
+    #[arg(long)]
     think: bool,
 
-    /// (Hidden) Reasoning effort — accepted for CLI compatibility; currently a no-op (the raw
-    /// `-p` path that consumed it was removed with the engine cutover).
-    #[arg(long, value_enum, hide = true)]
+    /// Reasoning effort for planner, completion, compaction, cognition, and inherited sub-agent calls.
+    #[arg(long, value_enum)]
     effort: Option<EffortArg>,
 
     /// Maximum tokens to generate. The planner must fit the entire `emit_plan` graph in this budget,
@@ -189,6 +188,11 @@ struct AgentFlags {
     /// dirs win a skill-name clash.
     #[arg(long = "skill-dir", value_name = "DIR")]
     skill_dirs: Vec<std::path::PathBuf>,
+
+    /// Explicitly enable a discovered skill by name. Repeatable. Skills are never activated from
+    /// prompt keywords automatically; `--skill-dir` and config directories only affect discovery.
+    #[arg(long = "skill", value_name = "NAME")]
+    skills: Vec<String>,
 
     /// Continue the most recent session instead of starting a new one.
     #[arg(short = 'c', long)]
@@ -1144,21 +1148,82 @@ fn compact_threshold() -> usize {
 /// Discover skills from the project's `.flux/skills` and `.claude/skills` plus the user/global dirs
 /// (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`), with custom dirs layered above the
 /// well-known set: `--skill-dir` flags first, then `[skills] dirs` from the layered config (project
-/// before user) — earlier dirs win a name clash (L-02). Activation (triggers or a description
-/// fallback) gates which bodies are injected per turn; discovery reads metadata only.
+/// before user) — earlier dirs win a name clash (L-02). Discovery reads metadata only. `enabled`
+/// is the explicit `--skill NAME` allowlist; prompt text never activates a skill automatically.
 fn load_skills(
     cwd: &std::path::Path,
     cfg: &flux_config::Config,
     cli_dirs: &[std::path::PathBuf],
-) -> Vec<flux_skill::Skill> {
+    enabled: &[String],
+) -> Result<Vec<flux_skill::Skill>> {
+    // Manual-only means more than "discover everything, then select nothing": an ordinary turn
+    // must not pay to walk every project and global skill directory. Discovery is only useful once
+    // the caller has explicitly named at least one skill.
+    if enabled.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut extra: Vec<std::path::PathBuf> = cli_dirs.to_vec();
     extra.extend(cfg.skill_dir_paths());
-    flux_skill::discover_merged(&flux_skill::skill_dirs(cwd, &extra))
+    let discovered = flux_skill::discover_merged(&flux_skill::skill_dirs(cwd, &extra));
+    let mut selected = Vec::new();
+    for name in enabled {
+        let skill = discovered
+            .iter()
+            .find(|skill| skill.name == *name)
+            .ok_or_else(|| {
+                let mut available: Vec<&str> =
+                    discovered.iter().map(|skill| skill.name.as_str()).collect();
+                available.sort_unstable();
+                anyhow::anyhow!(
+                    "unknown skill `{name}` (discovered: {})",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )
+            })?;
+        if !selected
+            .iter()
+            .any(|selected: &flux_skill::Skill| selected.name == skill.name)
+        {
+            selected.push(skill.clone());
+        }
+    }
+    Ok(selected)
 }
 
 /// The plugin descriptor directory `~/.flux/plugins` (None if `HOME` is unset).
 fn plugins_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".flux").join("plugins"))
+}
+
+const PLUGIN_LOAD_CONCURRENCY: usize = 16;
+
+async fn collect_bounded<F, T>(futures: Vec<F>, limit: usize) -> Result<Vec<T>>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permits = Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
+    let tasks = futures.into_iter().map(|future| {
+        let permits = permits.clone();
+        tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await.map_err(|error| {
+                anyhow::anyhow!("plugin-load concurrency limiter closed: {error}")
+            })?;
+            Ok::<T, anyhow::Error>(future.await)
+        })
+    });
+    let joined: Vec<_> = futures::stream::iter(tasks)
+        .buffer_unordered(limit.max(1))
+        .collect()
+        .await;
+    let mut values = Vec::with_capacity(joined.len());
+    for result in joined {
+        values.push(result.context("plugin-load task failed")??);
+    }
+    Ok(values)
 }
 
 /// A coarse "… ago" string from a millisecond epoch timestamp (for session listings).
@@ -2053,6 +2118,8 @@ fn load_roles(cwd: &std::path::Path) -> RoleRegistry {
                 name: (*name).to_string(),
                 description: (*desc).to_string(),
                 model: None,
+                thinking: None,
+                effort: None,
                 tools: None, // built-in roles inherit the parent's full toolset
                 prompt: (*prompt).to_string(),
             });
@@ -2283,6 +2350,7 @@ async fn build_agent_with(
     // the shared event store by default (A-08) — each child gets its own correlated session stream.
     let spawner: Arc<dyn flux_runtime::Spawner> =
         SubAgents::new(roles, child_base, factory, model.clone(), flags.max_tokens)
+            .with_reasoning(flags.think, flags.effort.map(Into::into))
             .with_authorization_cell(policy.clone(), identity.clone())
             .with_audit(events.clone())
             .into_spawner(system.clone());
@@ -2329,6 +2397,7 @@ async fn build_agent_with(
         };
     if let Some(cog_provider) = cog_provider {
         flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.clone())
+            .with_reasoning(flags.think, flags.effort.map(Into::into))
             .register(&mut registry);
     }
 
@@ -2485,44 +2554,61 @@ async fn build_agent_with(
         );
         let (plugins, stale) = split_stale_plugins(flux_plugin::discover(&dir));
         warn_stale_plugins(&stale);
-        for p in plugins {
-            // Build host capabilities from the plugin's own manifest declaration, so each plugin
-            // gets only the process/secret/http access it asked for (and nothing by default).
-            let system = system.clone();
-            let cfg_for_caps = cfg.clone();
-            let caps_system = system.clone();
-            let audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
-                store: events.clone(),
-                stream: session_id.clone(),
-            });
-            let broker_for_caps = broker.clone();
-            let resolver_for_caps = broker.clone() as Arc<dyn flux_plugin::ReferenceResolver>;
-            let secret_sink = Arc::new(RedactorSecretSink {
-                redactor: redactor.clone(),
-            }) as Arc<dyn flux_plugin::SecretSink>;
-            let make_caps = move |m: &flux_plugin::PluginManifest| {
-                let plugin_private_hosts = effective_plugin_private_hosts(&cfg_for_caps, &m.name);
-                // Inject the broker as the resolver (ref-based IO + the `credential` capability) and the
-                // redactor-backed secret sink BEFORE wrapping with the broker host-caps.
-                let inner = Arc::new(
-                    flux_plugin::SystemHostCaps::new(caps_system)
-                        .with_manifest(m)
-                        .with_private_net_grants(plugin_private_hosts)
-                        .with_grant_source(private_net_grant_source_for(&m.name))
-                        .with_egress_audit(audit)
-                        .with_resolver(resolver_for_caps)
-                        .with_secret_sink(secret_sink),
-                ) as Arc<dyn flux_plugin::HostCapabilities>;
-                // Wrap with the endpoint broker so this plugin's `endpoint.discover` calls fan out
-                // (deny-by-default, gated by the manifest's `discover` capability).
-                Arc::new(flux_capabilities::EndpointBrokerHostCaps::new(
-                    inner,
-                    broker_for_caps,
-                    m.name.clone(),
-                    m.capabilities.discover,
-                )) as Arc<dyn flux_plugin::HostCapabilities>
-            };
-            match flux_plugin::load_plugin_tools(&system, &p.name, &p.descriptor, make_caps).await {
+        let loads: Vec<_> = plugins
+            .into_iter()
+            .map(|p| {
+                // Build host capabilities from the plugin's own manifest declaration, so each plugin
+                // gets only the process/secret/http access it asked for (and nothing by default).
+                let system = system.clone();
+                let cfg_for_caps = cfg.clone();
+                let caps_system = system.clone();
+                let audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
+                    store: events.clone(),
+                    stream: session_id.clone(),
+                });
+                let broker_for_caps = broker.clone();
+                let resolver_for_caps = broker.clone() as Arc<dyn flux_plugin::ReferenceResolver>;
+                let secret_sink = Arc::new(RedactorSecretSink {
+                    redactor: redactor.clone(),
+                }) as Arc<dyn flux_plugin::SecretSink>;
+                let make_caps = move |m: &flux_plugin::PluginManifest| {
+                    let plugin_private_hosts =
+                        effective_plugin_private_hosts(&cfg_for_caps, &m.name);
+                    // Inject the broker as the resolver (ref-based IO + the `credential` capability) and the
+                    // redactor-backed secret sink BEFORE wrapping with the broker host-caps.
+                    let inner = Arc::new(
+                        flux_plugin::SystemHostCaps::new(caps_system)
+                            .with_manifest(m)
+                            .with_private_net_grants(plugin_private_hosts)
+                            .with_grant_source(private_net_grant_source_for(&m.name))
+                            .with_egress_audit(audit)
+                            .with_resolver(resolver_for_caps)
+                            .with_secret_sink(secret_sink),
+                    ) as Arc<dyn flux_plugin::HostCapabilities>;
+                    // Wrap with the endpoint broker so this plugin's `endpoint.discover` calls fan out
+                    // (deny-by-default, gated by the manifest's `discover` capability).
+                    Arc::new(flux_capabilities::EndpointBrokerHostCaps::new(
+                        inner,
+                        broker_for_caps,
+                        m.name.clone(),
+                        m.capabilities.discover,
+                    )) as Arc<dyn flux_plugin::HostCapabilities>
+                };
+                async move {
+                    let name = p.name.clone();
+                    let loaded =
+                        flux_plugin::load_plugin_tools(&system, &p.name, &p.descriptor, make_caps)
+                            .await;
+                    (name, loaded)
+                }
+            })
+            .collect();
+        let mut loaded_plugins = collect_bounded(loads, PLUGIN_LOAD_CONCURRENCY).await?;
+        // Completion order is nondeterministic; registration order stays name-stable so prompt
+        // catalogs and group merges remain cache-stable across invocations.
+        loaded_plugins.sort_by(|a, b| a.0.cmp(&b.0));
+        for (plugin_name, loaded) in loaded_plugins {
+            match loaded {
                 Ok(lp) => {
                     // Register this plugin as a discovery provider so the broker can fan a query back
                     // to it (matched by its manifest's `discovers` products).
@@ -2548,7 +2634,7 @@ async fn build_agent_with(
                 Err(e) => {
                     eprintln!(
                         "{}",
-                        style::dim(&format!("(plugin `{}` failed to load: {e})", p.name))
+                        style::dim(&format!("(plugin `{plugin_name}` failed to load: {e})"))
                     )
                 }
             }
@@ -2626,9 +2712,11 @@ async fn build_agent_with(
     let spec = AgentSpec {
         model,
         system_prompt,
-        skills: load_skills(&cwd, &cfg, &flags.skill_dirs),
+        skills: load_skills(&cwd, &cfg, &flags.skill_dirs, &flags.skills)?,
         max_tokens: flags.max_tokens,
         max_iterations: 25,
+        thinking: flags.think,
+        effort: flags.effort.map(Into::into),
         groups,
         ambient_signals,
         compact_threshold_chars: compact_threshold(),
@@ -5182,6 +5270,18 @@ fn risk_badge(summary: &str) -> String {
     }
 }
 
+fn format_operation_timing(timing: flux_core::OperationTiming) -> String {
+    let fmt = |micros| style::fmt_elapsed(std::time::Duration::from_micros(micros));
+    match (timing.execution_us, timing.approval_wait_us) {
+        (Some(execution), Some(approval)) => {
+            format!("exec {} + approval {}", fmt(execution), fmt(approval))
+        }
+        (Some(execution), None) => format!("exec {}", fmt(execution)),
+        (None, Some(approval)) => format!("approval {}", fmt(approval)),
+        (None, None) => format!("dispatch {}", fmt(timing.total_us)),
+    }
+}
+
 /// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr,
 /// in the "Refined" style: a syntax-highlighted plan, colored `→`/`✓`/`✗` markers, a live spinner while
 /// each op runs, and a completion rule with timing. All color is tty/`NO_COLOR`/`--color`-aware.
@@ -5195,6 +5295,8 @@ struct CliSink {
     turn_start: Option<std::time::Instant>,
     /// The current op's `(label, start)`, set on `tool_call` and finalized on `tool_result`.
     pending: Option<(String, std::time::Instant)>,
+    /// Dispatcher-attributed phases for the pending op, delivered immediately before its result.
+    pending_timing: Option<flux_core::OperationTiming>,
     spinner: Option<(
         Arc<std::sync::Mutex<SpinnerState>>,
         tokio::task::JoinHandle<()>,
@@ -5245,6 +5347,7 @@ impl CliSink {
             steps: 0,
             turn_start: None,
             pending: None,
+            pending_timing: None,
             spinner: None,
             iter: 0,
             max_iter,
@@ -5398,6 +5501,10 @@ impl AgentSink for CliSink {
             eprintln!("\n{} {label}", style::blue("→"));
         }
         self.pending = Some((label, std::time::Instant::now()));
+        self.pending_timing = None;
+    }
+    fn tool_timing(&mut self, _name: &str, timing: &flux_core::OperationTiming) {
+        self.pending_timing = Some(*timing);
     }
     fn tool_result(&mut self, name: &str, result: &ToolResult) {
         let (label, start) = self
@@ -5408,7 +5515,12 @@ impl AgentSink for CliSink {
         if self.stop_spinner() {
             eprintln!("\n{} {label}", style::blue("→"));
         }
-        let elapsed = style::dim(&format!("· {}", style::fmt_elapsed(start.elapsed())));
+        let elapsed = self
+            .pending_timing
+            .take()
+            .map(format_operation_timing)
+            .unwrap_or_else(|| style::fmt_elapsed(start.elapsed()));
+        let elapsed = style::dim(&format!("· {elapsed}"));
         let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
             .unwrap_or_else(|| result_summary_for(&result.content, name, self.verbose));
         let mark = if result.is_error {
@@ -6854,9 +6966,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     if flags.dev {
         bail!("`--dev` only applies to the built-in coding agent, not `flux app run <program>`");
     }
-    if !flags.skill_dirs.is_empty() {
+    if !flags.skill_dirs.is_empty() || !flags.skills.is_empty() {
         bail!(
-            "`--skill-dir` only applies to the built-in coding agent, not `flux app run <program>`"
+            "`--skill`/`--skill-dir` only apply to the built-in coding agent, not `flux app run <program>`"
         );
     }
     if flags.turn_budget.is_some() {
@@ -9370,6 +9482,29 @@ mod tests {
     use flux_flow::AgentSink;
     use serde_json::json;
 
+    #[test]
+    fn reasoning_controls_are_visible_in_agent_help() {
+        use clap::CommandFactory;
+
+        let help = super::AgentFlagsOnly::command()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--think"), "{help}");
+        assert!(help.contains("--effort"), "{help}");
+        assert!(help.contains("low"), "{help}");
+        assert!(help.contains("high"), "{help}");
+    }
+
+    #[test]
+    fn operation_timing_names_approval_and_execution_separately() {
+        let rendered = super::format_operation_timing(flux_core::OperationTiming {
+            total_us: 30_005_000,
+            approval_wait_us: Some(30_000_000),
+            execution_us: Some(5_000),
+        });
+        assert_eq!(rendered, "exec 5ms + approval 30.0s");
+    }
+
     /// C-11: every subcommand builds providers through the ONE factory (`build_provider` /
     /// `provider_for`), and the factory owns the aws chain — with static env creds present the
     /// chain no-ops (no network) and the `aws` provider constructs from any (sync) caller, which
@@ -10432,7 +10567,8 @@ mod tests {
         };
 
         // Config layer beats the well-known default...
-        let skills = super::load_skills(&root, &cfg, &[]);
+        let enabled = vec!["l02-cli-layering".to_string()];
+        let skills = super::load_skills(&root, &cfg, &[], &enabled).unwrap();
         let s = skills
             .iter()
             .find(|s| s.name == "l02-cli-layering")
@@ -10440,13 +10576,85 @@ mod tests {
         assert_eq!(s.body, "from config");
 
         // ...and a CLI --skill-dir beats the config layer.
-        let skills = super::load_skills(&root, &cfg, &[root.join("cli-skills")]);
+        let skills = super::load_skills(&root, &cfg, &[root.join("cli-skills")], &enabled).unwrap();
         let s = skills
             .iter()
             .find(|s| s.name == "l02-cli-layering")
             .unwrap();
         assert_eq!(s.body, "from cli");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn skills_are_disabled_until_named_explicitly() {
+        let root =
+            std::env::temp_dir().join(format!("flux-cli-manual-skills-{}", std::process::id()));
+        let dir = root.join(".flux/skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("automatic.md"),
+            "---\nname: automatic\ntriggers: [hello]\n---\nlarge body",
+        )
+        .unwrap();
+        let cfg = flux_config::Config::default();
+        assert!(
+            super::load_skills(&root, &cfg, &[], &[])
+                .unwrap()
+                .is_empty(),
+            "discovery and prompt triggers must not enable a skill"
+        );
+        let enabled = super::load_skills(&root, &cfg, &[], &["automatic".to_string()]).unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "automatic");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unknown_explicit_skill_fails_before_agent_construction() {
+        let root =
+            std::env::temp_dir().join(format!("flux-cli-unknown-skill-{}", std::process::id()));
+        let error = super::load_skills(
+            &root,
+            &flux_config::Config::default(),
+            &[],
+            &["missing".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("unknown skill `missing` (discovered:"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_collector_polls_plugin_loads_concurrently() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let futures = (0..4)
+            .map(|value| {
+                let active = active.clone();
+                let maximum = maximum.clone();
+                async move {
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    // Deliberately block before this future can yield. `buffer_unordered` alone does
+                    // not provide concurrency for this shape; each plugin loader performs a small
+                    // synchronous verify/spawn prefix with the same property.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    value
+                }
+            })
+            .collect();
+        let mut values = super::collect_bounded(futures, 4).await.unwrap();
+        values.sort_unstable();
+        assert_eq!(values, [0, 1, 2, 3]);
+        assert!(
+            maximum.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "plugin handshakes were polled sequentially"
+        );
     }
 
     /// C-08: `flux auth login codex` drives a full PKCE flow — authorize URL with challenge+state,

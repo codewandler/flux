@@ -6,7 +6,10 @@
 //! swap providers/models at will.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -375,6 +378,243 @@ fn transport_fallback_note(err: &Error) -> Option<String> {
     on.then(|| format!("flux: stream transport fell back to HTTP: {err}"))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelTraceMode {
+    Summary,
+    Full,
+}
+
+fn model_trace_mode() -> Option<ModelTraceMode> {
+    match std::env::var("FLUX_MODEL_TRACE")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "summary" | "true" | "on" => Some(ModelTraceMode::Summary),
+        "full" => Some(ModelTraceMode::Full),
+        _ => None,
+    }
+}
+
+static MODEL_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+type ModelTraceSink = Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static MODEL_TRACE_SINK: std::cell::RefCell<Option<ModelTraceSink>> = const { std::cell::RefCell::new(None) };
+}
+
+fn emit_model_trace(value: serde_json::Value) {
+    #[cfg(test)]
+    {
+        let delivered = MODEL_TRACE_SINK.with(|slot| {
+            if let Some(sink) = slot.borrow().as_ref() {
+                sink(&value);
+                true
+            } else {
+                false
+            }
+        });
+        if delivered {
+            return;
+        }
+    }
+    eprintln!("flux: model_trace {value}");
+}
+
+struct ModelTrace {
+    id: u64,
+    provider: String,
+    model: String,
+    started: Instant,
+    body_built_us: u64,
+    response_us: u64,
+    first_chunk_us: Option<u64>,
+    first_thinking_us: Option<u64>,
+    first_tool_us: Option<u64>,
+    first_text_us: Option<u64>,
+    usage_us: Option<u64>,
+    done_us: Option<u64>,
+    chunks: u64,
+    usage: Option<flux_core::Usage>,
+    http_attempts: u32,
+    oauth_refreshes: u32,
+    transport_fallback: bool,
+    terminal: Option<&'static str>,
+    emitted: bool,
+}
+
+impl ModelTrace {
+    fn elapsed_us(&self) -> u64 {
+        self.started.elapsed().as_micros().min(u64::MAX as u128) as u64
+    }
+
+    fn observe(&mut self, item: &Result<Chunk>) {
+        let now = self.elapsed_us();
+        self.first_chunk_us.get_or_insert(now);
+        self.chunks += 1;
+        match item {
+            Ok(Chunk::ThinkingDelta(_)) => {
+                self.first_thinking_us.get_or_insert(now);
+            }
+            Ok(Chunk::ToolInputDelta { .. })
+            | Ok(Chunk::Block(flux_core::ContentBlock::ToolUse { .. })) => {
+                self.first_tool_us.get_or_insert(now);
+            }
+            Ok(Chunk::TextDelta(_)) | Ok(Chunk::Block(flux_core::ContentBlock::Text { .. })) => {
+                self.first_text_us.get_or_insert(now);
+            }
+            Ok(Chunk::Usage(usage)) => {
+                self.usage_us = Some(now);
+                self.usage = Some(usage.clone());
+            }
+            Ok(Chunk::Done { .. }) => {
+                self.done_us = Some(now);
+            }
+            Err(_) => self.terminal = Some("stream_error"),
+            _ => {}
+        }
+    }
+
+    fn emit(&mut self, terminal: &'static str) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let terminal = self.terminal.unwrap_or(terminal);
+        emit_model_trace(serde_json::json!({
+            "event": "stream.end",
+            "id": self.id,
+            "provider": self.provider,
+            "model": self.model,
+            "terminal": terminal,
+            "body_built_us": self.body_built_us,
+            "response_us": self.response_us,
+            "first_chunk_us": self.first_chunk_us,
+            "first_thinking_us": self.first_thinking_us,
+            "first_tool_us": self.first_tool_us,
+            "first_text_us": self.first_text_us,
+            "usage_us": self.usage_us,
+            "done_us": self.done_us,
+            "total_us": self.elapsed_us(),
+            "chunks": self.chunks,
+            "usage": self.usage,
+            "http_attempts": self.http_attempts,
+            "oauth_refreshes": self.oauth_refreshes,
+            "transport_fallback": self.transport_fallback,
+        }));
+    }
+}
+
+impl Drop for ModelTrace {
+    fn drop(&mut self) {
+        self.emit("request_error");
+    }
+}
+
+struct ModelTraceStream {
+    inner: ChunkStream,
+    trace: ModelTrace,
+}
+
+impl Stream for ModelTraceStream {
+    type Item = Result<Chunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                self.trace.observe(&item);
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => {
+                self.trace.emit("eof");
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ModelTraceStream {
+    fn drop(&mut self) {
+        self.trace.emit("dropped");
+    }
+}
+
+fn begin_model_trace(
+    mode: ModelTraceMode,
+    provider: &str,
+    req: &Request,
+    body: &serde_json::Value,
+    started: Instant,
+) -> ModelTrace {
+    let id = MODEL_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+    let body_built_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let segments: Vec<serde_json::Value> = req
+        .system_segments
+        .iter()
+        .map(|segment| serde_json::json!({ "bytes": segment.text.len(), "cache": segment.cache }))
+        .collect();
+    emit_model_trace(serde_json::json!({
+        "event": "request",
+        "id": id,
+        "provider": provider,
+        "model": req.model,
+        "thinking": req.thinking,
+        "effort": req.effort.map(Effort::as_str),
+        "max_tokens": req.max_tokens,
+        "system_bytes": req.system_text().map(|s| s.len()).unwrap_or_default(),
+        "system_segments": segments,
+        "messages": req.messages.len(),
+        "message_bytes": serde_json::to_vec(&req.messages).map(|v| v.len()).unwrap_or_default(),
+        "tools": req.tools.len(),
+        "tool_names": req.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+        "body_bytes": serde_json::to_vec(body).map(|v| v.len()).unwrap_or_default(),
+        "body_built_us": body_built_us,
+    }));
+    if mode == ModelTraceMode::Full {
+        emit_model_trace(serde_json::json!({
+            "event": "request.body",
+            "id": id,
+            "sensitive": true,
+            "body": body,
+        }));
+    }
+    ModelTrace {
+        id,
+        provider: provider.to_string(),
+        model: req.model.clone(),
+        started,
+        body_built_us,
+        response_us: 0,
+        first_chunk_us: None,
+        first_thinking_us: None,
+        first_tool_us: None,
+        first_text_us: None,
+        usage_us: None,
+        done_us: None,
+        chunks: 0,
+        usage: None,
+        http_attempts: 0,
+        oauth_refreshes: 0,
+        transport_fallback: false,
+        terminal: None,
+        emitted: false,
+    }
+}
+
+fn finish_model_trace_stream(stream: ChunkStream, trace: Option<ModelTrace>) -> ChunkStream {
+    match trace {
+        Some(trace) => Box::pin(ModelTraceStream {
+            inner: stream,
+            trace,
+        }),
+        None => stream,
+    }
+}
+
 #[async_trait]
 impl Provider for NativeProvider {
     fn name(&self) -> &str {
@@ -382,6 +622,7 @@ impl Provider for NativeProvider {
     }
 
     async fn stream(&self, mut req: Request) -> Result<ChunkStream> {
+        let trace_started = Instant::now();
         if let Some(prefix) = self.cred.system_prefix() {
             if !req.system_segments.is_empty() {
                 // The transport-required prefix is constant per credential → its own cached
@@ -402,6 +643,8 @@ impl Provider for NativeProvider {
         }
 
         let body = self.codec.build_body(&req)?;
+        let mut model_trace = model_trace_mode()
+            .map(|mode| begin_model_trace(mode, &self.name, &req, &body, trace_started));
         let wire_headers = self.codec.wire_headers();
         let span =
             tracing::info_span!("provider.stream", provider = %self.name, model = %req.model);
@@ -412,8 +655,19 @@ impl Provider for NativeProvider {
         // connection — falls back transparently to the generic HTTP+SSE path below.
         if let Some(transport) = &self.transport {
             match transport.connect(&body).await {
-                Ok(bytes) => return Ok(self.codec.map_stream(bytes)),
+                Ok(bytes) => {
+                    if let Some(trace) = model_trace.as_mut() {
+                        trace.response_us = trace.elapsed_us();
+                    }
+                    return Ok(finish_model_trace_stream(
+                        self.codec.map_stream(bytes),
+                        model_trace,
+                    ));
+                }
                 Err(e) => {
+                    if let Some(trace) = model_trace.as_mut() {
+                        trace.transport_fallback = true;
+                    }
                     tracing::warn!(error = %e, "stream transport failed; falling back to HTTP");
                     // C-19: the warning above is invisible from the CLI (no tracing subscriber
                     // is installed), so a broken WS leg would silently complete over HTTP. With
@@ -432,6 +686,9 @@ impl Provider for NativeProvider {
         // A 401 forces exactly one OAuth token refresh + retry; a second 401 surfaces the error.
         let mut forced_refresh = false;
         let resp = loop {
+            if let Some(trace) = model_trace.as_mut() {
+                trace.http_attempts += 1;
+            }
             let mut rb = self
                 .http
                 .post(self.cred.endpoint())
@@ -455,6 +712,9 @@ impl Provider for NativeProvider {
                     if status.as_u16() == 401 && !forced_refresh {
                         if let Some(ts) = self.cred.token_source() {
                             tracing::warn!("401 unauthorized; forcing one OAuth refresh and retry");
+                            if let Some(trace) = model_trace.as_mut() {
+                                trace.oauth_refreshes += 1;
+                            }
                             ts.refresh().await?;
                             forced_refresh = true;
                             continue;
@@ -500,7 +760,13 @@ impl Provider for NativeProvider {
             resp.bytes_stream()
                 .map(|r| r.map_err(|e| Error::Provider(format!("stream: {e}")))),
         );
-        Ok(self.codec.map_stream(bytes))
+        if let Some(trace) = model_trace.as_mut() {
+            trace.response_us = trace.elapsed_us();
+        }
+        Ok(finish_model_trace_stream(
+            self.codec.map_stream(bytes),
+            model_trace,
+        ))
     }
 }
 
@@ -509,6 +775,102 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn model_trace_records_request_shape_and_stream_milestones() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = records.clone();
+        MODEL_TRACE_SINK.with(|slot| {
+            *slot.borrow_mut() = Some(Arc::new(move |value| {
+                captured.lock().unwrap().push(value.clone());
+            }));
+        });
+
+        let req = Request::new("model", "hello")
+            .with_thinking(true)
+            .with_effort(Effort::High);
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let started = Instant::now();
+        let mut trace = begin_model_trace(ModelTraceMode::Summary, "test", &req, &body, started);
+        trace.response_us = trace.elapsed_us();
+        let inner: ChunkStream = Box::pin(futures::stream::iter(vec![
+            Ok(Chunk::ThinkingDelta("considering".into())),
+            Ok(Chunk::ToolInputDelta {
+                name: "emit_plan".into(),
+                partial_json: "{}".into(),
+            }),
+            Ok(Chunk::Usage(flux_core::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                reasoning_tokens: 1,
+                ..Default::default()
+            })),
+            Ok(Chunk::Done { stop_reason: None }),
+        ]));
+        let mut stream = finish_model_trace_stream(inner, Some(trace));
+        while stream.next().await.is_some() {}
+        drop(stream);
+        MODEL_TRACE_SINK.with(|slot| *slot.borrow_mut() = None);
+
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2, "request + terminal stream record");
+        assert_eq!(records[0]["event"], "request");
+        assert_eq!(records[0]["effort"], "high");
+        assert_eq!(records[0]["thinking"], true);
+        assert_eq!(records[1]["event"], "stream.end");
+        assert_eq!(records[1]["terminal"], "eof");
+        assert!(records[1]["first_thinking_us"].is_number());
+        assert!(records[1]["first_tool_us"].is_number());
+        assert_eq!(records[1]["usage"]["reasoning_tokens"], 1);
+    }
+
+    #[test]
+    fn full_model_trace_marks_the_exact_body_sensitive() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = records.clone();
+        MODEL_TRACE_SINK.with(|slot| {
+            *slot.borrow_mut() = Some(Arc::new(move |value| {
+                captured.lock().unwrap().push(value.clone());
+            }));
+        });
+        let req = Request::new("model", "private prompt");
+        let body = serde_json::json!({"input": "private prompt"});
+        let mut trace =
+            begin_model_trace(ModelTraceMode::Full, "test", &req, &body, Instant::now());
+        trace.emit("test_complete");
+        MODEL_TRACE_SINK.with(|slot| *slot.borrow_mut() = None);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1]["event"], "request.body");
+        assert_eq!(records[1]["sensitive"], true);
+        assert_eq!(records[1]["body"], body);
+    }
+
+    #[test]
+    fn dropping_a_trace_before_a_stream_exists_records_request_error() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = records.clone();
+        MODEL_TRACE_SINK.with(|slot| {
+            *slot.borrow_mut() = Some(Arc::new(move |value| {
+                captured.lock().unwrap().push(value.clone());
+            }));
+        });
+        let req = Request::new("model", "hello");
+        let trace = begin_model_trace(
+            ModelTraceMode::Summary,
+            "test",
+            &req,
+            &serde_json::json!({"input": "hello"}),
+            Instant::now(),
+        );
+        drop(trace);
+        MODEL_TRACE_SINK.with(|slot| *slot.borrow_mut() = None);
+
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["event"], "stream.end");
+        assert_eq!(records[1]["terminal"], "request_error");
+    }
 
     #[test]
     fn retryable_statuses() {

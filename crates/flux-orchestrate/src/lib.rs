@@ -20,7 +20,7 @@ use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
-use flux_provider::Provider;
+use flux_provider::{Effort, Provider};
 use flux_runtime::{
     ApprovalChoice, Approver, Executor, IdentityCell, PermissionManager, SpawnOutcome,
     SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
@@ -112,6 +112,8 @@ pub struct LocalSpawner {
     base_registry: ToolRegistry,
     system: Arc<System>,
     default_model: String,
+    default_thinking: bool,
+    default_effort: Option<Effort>,
     limits: SpawnLimits,
     /// Approver the sub-agent's tool calls dispatch through. `None` → the default [`SubAgentApprover`]
     /// (auto-approve non-destructive, deny destructive). A multi-tenant consumer injects an approver
@@ -147,6 +149,8 @@ impl LocalSpawner {
             base_registry,
             system,
             default_model: default_model.into(),
+            default_thinking: false,
+            default_effort: None,
             limits: SpawnLimits::new(max_tokens),
             approver: None,
             auth: None,
@@ -187,6 +191,13 @@ impl LocalSpawner {
         self
     }
 
+    /// Set the reasoning policy inherited by roles that do not override it in frontmatter.
+    pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
+        self.default_thinking = thinking;
+        self.default_effort = effort;
+        self
+    }
+
     /// Inject the approver a sub-agent's tool calls dispatch through (default: [`SubAgentApprover`]).
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = Some(approver);
@@ -221,6 +232,8 @@ impl LocalSpawner {
             base_registry,
             system: self.system.clone(),
             default_model: self.default_model.clone(),
+            default_thinking: self.default_thinking,
+            default_effort: self.default_effort,
             limits: self.limits.clone(),
             approver: self.approver.clone(),
             auth: self.auth.clone(),
@@ -329,6 +342,8 @@ impl Spawner for LocalSpawner {
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
         let mut spec = role.to_spec(&self.default_model);
+        spec.thinking = role.thinking.unwrap_or(self.default_thinking);
+        spec.effort = role.effort.or(self.default_effort);
         // A-41: a role's `model:` override speaks the same provider-prefixed spec form `-m` accepts
         // (e.g. `openrouter/deepseek/deepseek-v4-flash`), but sub-agents always run on the PARENT's
         // provider — there is no per-sub-agent provider factory. Resolve it here, fast, at
@@ -430,6 +445,8 @@ pub struct SubAgents {
     pub child_base: ToolRegistry,
     pub provider_factory: ProviderFactory,
     pub default_model: String,
+    pub default_thinking: bool,
+    pub default_effort: Option<Effort>,
     pub limits: SpawnLimits,
     pub approver: Option<Arc<dyn Approver>>,
     pub auth: Option<(AuthorizationPolicy, IdentityCell)>,
@@ -454,6 +471,8 @@ impl SubAgents {
             child_base,
             provider_factory,
             default_model: default_model.into(),
+            default_thinking: false,
+            default_effort: None,
             limits: SpawnLimits::new(max_tokens),
             approver: None,
             auth: None,
@@ -492,6 +511,13 @@ impl SubAgents {
         self
     }
 
+    /// Set the reasoning policy inherited by roles that do not override it in frontmatter.
+    pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
+        self.default_thinking = thinking;
+        self.default_effort = effort;
+        self
+    }
+
     /// Inject the approver a sub-agent's tool calls dispatch through.
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = Some(approver);
@@ -523,6 +549,7 @@ impl SubAgents {
             self.default_model,
             limits.max_tokens,
         )
+        .with_reasoning(self.default_thinking, self.default_effort)
         .with_limits(limits)
         .with_max_depth(self.max_depth);
         if let Some(approver) = self.approver {
@@ -946,6 +973,7 @@ mod tests {
     struct ModelCapturingProvider {
         provider_name: &'static str,
         seen_model: std::sync::Mutex<Option<String>>,
+        seen_reasoning: std::sync::Mutex<Option<(bool, Option<Effort>)>>,
     }
 
     #[async_trait]
@@ -955,6 +983,7 @@ mod tests {
         }
         async fn stream(&self, req: Request) -> Result<ChunkStream> {
             *self.seen_model.lock().unwrap() = Some(req.model.clone());
+            *self.seen_reasoning.lock().unwrap() = Some((req.thinking, req.effort));
             let chunks = vec![
                 Chunk::Block(ContentBlock::Text { text: "ok".into() }),
                 Chunk::Done {
@@ -978,6 +1007,7 @@ mod tests {
         let provider = Arc::new(ModelCapturingProvider {
             provider_name: "openrouter",
             seen_model: std::sync::Mutex::new(None),
+            seen_reasoning: std::sync::Mutex::new(None),
         });
         let provider_for_factory = provider.clone();
         let spawner = LocalSpawner::new(
@@ -990,7 +1020,8 @@ mod tests {
             temp_system(),
             "mock",
             1024,
-        );
+        )
+        .with_reasoning(true, Some(Effort::High));
         let out = spawner
             .spawn(
                 SpawnRequest::new("scout", "look around"),
@@ -1003,6 +1034,48 @@ mod tests {
             provider.seen_model.lock().unwrap().as_deref(),
             Some("deepseek/deepseek-v4-flash"),
             "the parent's own provider prefix must be stripped before hitting the wire"
+        );
+        assert_eq!(
+            *provider.seen_reasoning.lock().unwrap(),
+            Some((true, Some(Effort::High))),
+            "a role without reasoning keys inherits the parent policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_reasoning_settings_override_parent_policy() {
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\nthinking: false\neffort: low\n---\nYou are a scout.",
+            "scout",
+        ));
+        let provider = Arc::new(ModelCapturingProvider {
+            provider_name: "openrouter",
+            seen_model: std::sync::Mutex::new(None),
+            seen_reasoning: std::sync::Mutex::new(None),
+        });
+        let provider_for_factory = provider.clone();
+        let spawner = LocalSpawner::new(
+            Arc::new(move || {
+                Ok(Box::new(NameForwarding(provider_for_factory.clone())) as Box<dyn Provider>)
+            }),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_reasoning(true, Some(Effort::High));
+        spawner
+            .spawn(
+                SpawnRequest::new("scout", "look around"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *provider.seen_reasoning.lock().unwrap(),
+            Some((false, Some(Effort::Low)))
         );
     }
 
@@ -1032,6 +1105,7 @@ mod tests {
         let provider = Arc::new(ModelCapturingProvider {
             provider_name: "openrouter",
             seen_model: std::sync::Mutex::new(None),
+            seen_reasoning: std::sync::Mutex::new(None),
         });
         let spawner = LocalSpawner::new(
             Arc::new(move || Ok(Box::new(NameForwarding(provider.clone())) as Box<dyn Provider>)),
@@ -2460,6 +2534,8 @@ mod tests {
             name: "scout".into(),
             description: "recon".into(),
             model: None,
+            thinking: None,
+            effort: None,
             tools: Some(Vec::new()),
             prompt: "You are a scout.".into(),
         }]);

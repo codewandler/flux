@@ -132,7 +132,9 @@ access. Every admitted private request is audited.
 
 `[skills] dirs` adds skill directories above the well-known project/global set. Relative paths are
 resolved from the workspace; `~/` expands to the home directory. Earlier directories win a name
-collision. CLI `--skill-dir` entries have the highest precedence. See [Skills & roles](../agent/skills-and-roles.md).
+collision. CLI `--skill-dir` entries have the highest precedence. Directories only affect discovery;
+skills remain inactive until selected with `--skill <name>` or an explicit `AgentSpec`. See
+[Skills & roles](../agent/skills-and-roles.md).
 
 `[workspace] add_dirs` grants extra **read-only** roots outside the workspace; writes remain confined
 to the workspace. It mirrors repeatable `--add-dir`. `allow_all = true` mirrors

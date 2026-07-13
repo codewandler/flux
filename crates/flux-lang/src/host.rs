@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 
+use flux_core::OperationTiming;
 use flux_spec::IntentSet;
 
 use crate::ast::{ResolvedThing, Selector, ThingId, ThingRef};
@@ -27,6 +28,9 @@ pub struct OpOutcome {
     /// re-attempt it (L-21). Only the host can set this — it is the layer that shaped the denial —
     /// so the interpreter never guesses from message prose.
     pub denied: bool,
+    /// Host-measured safety-envelope phase timing. `None` for pure/composite/replayed outcomes that
+    /// did not traverse a live leaf-tool dispatch in this process.
+    pub timing: Option<OperationTiming>,
 }
 
 impl OpOutcome {
@@ -37,6 +41,7 @@ impl OpOutcome {
             view: None,
             is_error: false,
             denied: false,
+            timing: None,
         }
     }
 
@@ -47,6 +52,7 @@ impl OpOutcome {
             view: None,
             is_error: true,
             denied: false,
+            timing: None,
         }
     }
 
@@ -59,6 +65,7 @@ impl OpOutcome {
             view: None,
             is_error: true,
             denied: true,
+            timing: None,
         }
     }
 

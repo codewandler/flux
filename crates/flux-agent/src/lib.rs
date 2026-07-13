@@ -13,7 +13,7 @@ use flux_core::{render_knowledge_blocks, ContextBlock, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_flow::state::FlowStore;
-use flux_provider::Provider;
+use flux_provider::{Effort, Provider};
 use flux_runtime::{Approver, Executor, PermissionManager, ToolContext, ToolRegistry};
 
 pub mod role;
@@ -132,8 +132,8 @@ pub struct AgentSpec {
     pub model: String,
     /// The agent's persona / system prompt (defaults to [`DEFAULT_SYSTEM_PROMPT`]).
     pub system_prompt: String,
-    /// Skills whose triggers, when matched against a turn's input, inject their body into that
-    /// turn's system prompt.
+    /// Skills explicitly enabled for this agent. Each body is injected on every turn; metadata
+    /// triggers are discovery hints only and never activate a skill implicitly.
     pub skills: Vec<flux_skill::Skill>,
     /// Tool selection: a subset of the provided registry's ops by name. `None` = every available op.
     pub tools: Option<Vec<String>>,
@@ -141,6 +141,10 @@ pub struct AgentSpec {
     pub permissions: Permissions,
     pub max_tokens: u32,
     pub max_iterations: usize,
+    /// Ask capable providers/models to expose adaptive thinking for this agent's calls.
+    pub thinking: bool,
+    /// Provider-mapped reasoning effort applied to every model call this agent owns.
+    pub effort: Option<Effort>,
     /// Evidence-gated tool groups (empty disables gating — every op advertised).
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Session-ambient group-surfacing signals (D-115): host-known facts the per-turn workspace
@@ -170,6 +174,8 @@ impl Default for AgentSpec {
             permissions: Permissions::default(),
             max_tokens: 4096,
             max_iterations: 25,
+            thinking: false,
+            effort: None,
             groups: Vec::new(),
             ambient_signals: Vec::new(),
             compact_threshold_chars: DEFAULT_COMPACT_THRESHOLD_CHARS,
@@ -189,10 +195,11 @@ impl AgentSpec {
         }
     }
 
-    /// Populate `skills` from the default skill directories rooted at this spec's `cwd`
+    /// Explicitly enable every skill from the default skill directories rooted at this spec's `cwd`
     /// ([`flux_skill::default_skill_dirs`]: project `.flux/skills` + `.claude/skills`, then the
     /// user-global dirs; project wins name clashes). Discovery is progressive — only Level-1
-    /// metadata is read here; bodies load on activation (L-02). Set `cwd` first.
+    /// metadata is read here; bodies load when the engine injects the explicitly enabled skills.
+    /// Set `cwd` first. Most callers should select named skills instead of enabling the whole set.
     pub fn with_default_skills(mut self) -> Self {
         self.skills = flux_skill::discover_merged(&flux_skill::default_skill_dirs(&self.cwd));
         self
@@ -280,7 +287,11 @@ impl AgentSpec {
             self.groups,
             self.cwd,
         )
-        .map(|engine| engine.with_ambient_signals(self.ambient_signals))
+        .map(|engine| {
+            engine
+                .with_reasoning(self.thinking, self.effort)
+                .with_ambient_signals(self.ambient_signals)
+        })
     }
 }
 
@@ -389,6 +400,8 @@ mod tests {
         assert_eq!(spec.system_prompt, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(spec.max_iterations, 25);
         assert!(spec.tools.is_none());
+        assert!(!spec.thinking);
+        assert_eq!(spec.effort, None);
         // A-19: no injected context → the effective prompt is byte-identical (cache-stable).
         assert_eq!(spec.effective_system_prompt(), DEFAULT_SYSTEM_PROMPT);
         assert!(spec.context.is_empty());

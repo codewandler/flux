@@ -31,7 +31,7 @@ use flux_lang::ast::{Node, SymbolName, Value as FluxValue, Visibility};
 use flux_lang::program::{AgentDecl, PermissionDecl, Program};
 use flux_lang::runtime::FlowOutcome;
 use flux_orchestrate::{SubAgents, TaskTool};
-use flux_provider::Provider;
+use flux_provider::{Effort, Provider};
 use flux_runtime::{
     AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
     ToolRegistry, ToolResult,
@@ -586,12 +586,15 @@ fn rebind_cognition(
     provider: Arc<dyn Provider>,
     model: &str,
     persona: &str,
+    thinking: bool,
+    effort: Option<Effort>,
 ) {
     for name in flux_cognition::CognitionPack::names() {
         registry.remove(name);
     }
     flux_cognition::CognitionPack::new(provider, model)
         .with_system_prefix(persona)
+        .with_reasoning(thinking, effort)
         .register(registry);
 }
 
@@ -617,6 +620,8 @@ async fn resolve_agent_runtime_profile(
             provider,
             &spec.model,
             &spec.effective_system_prompt(),
+            spec.thinking,
+            spec.effort,
         );
     }
 
@@ -1520,6 +1525,26 @@ async fn agent_spec_from_decl(
     cwd: PathBuf,
     system: &System,
 ) -> Result<AgentSpec> {
+    let thinking = match decl.settings.get("thinking") {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            Error::Other(format!(
+                "agent `{}`: settings.thinking must be a boolean",
+                decl.name
+            ))
+        })?,
+        None => false,
+    };
+    let effort = match decl.settings.get("effort") {
+        Some(value) => Some(
+            serde_json::from_value::<Effort>(value.clone()).map_err(|_| {
+                Error::Other(format!(
+                    "agent `{}`: settings.effort must be low, medium, high, xhigh, or max",
+                    decl.name
+                ))
+            })?,
+        ),
+        None => None,
+    };
     let mut parts: Vec<String> = Vec::new();
     if let Some(base) = decl.description.clone().or_else(|| {
         decl.settings
@@ -1594,6 +1619,8 @@ async fn agent_spec_from_decl(
         cwd,
         context,
         compact_threshold_chars: compact_threshold_for_decl(decl),
+        thinking,
+        effort,
         ..AgentSpec::default()
     })
 }
@@ -2344,6 +2371,34 @@ journey pong
             .await
             .unwrap();
         assert_eq!(spec.compact_threshold_chars, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_spec_parses_reasoning_settings() {
+        let system = System::new(Workspace::new(".").unwrap());
+        let decl = AgentDecl {
+            name: "reasoner".into(),
+            model: None,
+            tools: vec![],
+            datasources: vec![],
+            description: None,
+            permissions: None,
+            settings: json!({ "thinking": true, "effort": "high" }),
+        };
+        let spec = agent_spec_from_decl(&decl, "m", PathBuf::from("."), &system)
+            .await
+            .unwrap();
+        assert!(spec.thinking);
+        assert_eq!(spec.effort, Some(Effort::High));
+
+        let bad = AgentDecl {
+            settings: json!({ "effort": "maximum-ish" }),
+            ..decl
+        };
+        let error = agent_spec_from_decl(&bad, "m", PathBuf::from("."), &system)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("settings.effort"));
     }
 
     #[tokio::test]

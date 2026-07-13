@@ -46,7 +46,9 @@ async fn main() -> Result<()> {
     let roles = RoleRegistry::from_roles([Role {
         name: "scout".into(),
         description: "read-only reconnaissance".into(),
-        model: None,             // inherit the spawner's default model
+        model: None, // inherit the spawner's default model
+        thinking: None,
+        effort: None,
         tools: Some(Vec::new()), // a leaf with no tools — it just investigates and reports
         prompt: "You are a scout. Investigate and report findings tersely.".into(),
     }]);

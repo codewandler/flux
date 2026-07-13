@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use flux_provider::Effort;
 use serde::{Deserialize, Serialize};
 
 use crate::AgentSpec;
@@ -18,6 +19,12 @@ pub struct Role {
     /// Model override; `None` inherits the parent's model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Adaptive-thinking override; `None` inherits the parent's setting for spawned roles.
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    /// Reasoning-effort override; `None` inherits the parent's setting for spawned roles.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Tool allowlist. `None` (no `tools` key) inherits all tools available to the parent;
     /// `Some([])` (an explicit empty list) grants none.
     #[serde(default)]
@@ -38,6 +45,8 @@ impl Role {
                 .unwrap_or_else(|| default_model.to_string()),
             system_prompt: self.prompt.clone(),
             tools: self.tools.clone(),
+            thinking: self.thinking.unwrap_or(false),
+            effort: self.effort,
             ..AgentSpec::default()
         }
     }
@@ -51,6 +60,8 @@ struct RoleFrontmatter {
     name: String,
     description: String,
     model: Option<String>,
+    thinking: Option<bool>,
+    effort: Option<Effort>,
     tools: Option<Vec<String>>,
 }
 
@@ -71,6 +82,8 @@ pub fn parse_role(content: &str, name_fallback: &str) -> Role {
         description: meta.description,
         // an empty `model:` (null/blank) inherits the parent's model
         model: meta.model.filter(|m| !m.is_empty()),
+        thinking: meta.thinking,
+        effort: meta.effort,
         tools: meta.tools,
         prompt: body.trim().to_string(),
     }
@@ -144,12 +157,14 @@ mod tests {
     #[test]
     fn parses_role_frontmatter() {
         let r = parse_role(
-            "---\ndescription: fast recon\nmodel: haiku\ntools: [read, grep, ls]\n---\nYou are a scout.",
+            "---\ndescription: fast recon\nmodel: haiku\nthinking: true\neffort: high\ntools: [read, grep, ls]\n---\nYou are a scout.",
             "scout",
         );
         assert_eq!(r.name, "scout");
         assert_eq!(r.description, "fast recon");
         assert_eq!(r.model.as_deref(), Some("haiku"));
+        assert_eq!(r.thinking, Some(true));
+        assert_eq!(r.effort, Some(flux_provider::Effort::High));
         assert_eq!(
             r.tools.as_deref(),
             Some(&["read".into(), "grep".into(), "ls".into()][..])
@@ -188,6 +203,17 @@ mod tests {
 
         let r2 = parse_role("---\nmodel: haiku\n---\nx", "s");
         assert_eq!(r2.to_spec("default-model").model, "haiku"); // role overrides
+    }
+
+    #[test]
+    fn to_spec_carries_explicit_reasoning_settings() {
+        let r = parse_role(
+            "---\nthinking: true\neffort: xhigh\n---\nInvestigate deeply.",
+            "investigator",
+        );
+        let spec = r.to_spec("parent-model");
+        assert!(spec.thinking);
+        assert_eq!(spec.effort, Some(flux_provider::Effort::Xhigh));
     }
 
     #[test]

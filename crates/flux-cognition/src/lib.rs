@@ -30,7 +30,7 @@ use flux_core::{Chunk, Error, Result, Usage};
 use flux_evidence::{Observation, Phase};
 use flux_lang::ast::{FlowEffect, TypeRef};
 use flux_lang::opspec::{OpSpec, Param};
-use flux_provider::{Provider, Request};
+use flux_provider::{Effort, Provider, Request};
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Idempotency, Risk, ToolSpec};
 
@@ -255,6 +255,8 @@ struct CognitionOp {
     provider: Arc<dyn Provider>,
     model: String,
     system_prefix: Option<String>,
+    thinking: bool,
+    effort: Option<Effort>,
 }
 
 #[async_trait]
@@ -278,7 +280,15 @@ impl Tool for CognitionOp {
             ),
             _ => self.kind.system().to_string(),
         };
-        let (out, usage) = run_model(self.provider.as_ref(), &self.model, &system, &prompt).await?;
+        let (out, usage) = run_model(
+            self.provider.as_ref(),
+            &self.model,
+            &system,
+            &prompt,
+            self.thinking,
+            self.effort,
+        )
+        .await?;
         // A cognition op is a real model call, but its token spend can't ride back through
         // `ToolResult` (a plain string). Record it on the shared evidence log — the same side-channel
         // `subagent.usage` uses — so a `FlowClient` run can sum what its cognition ops cost
@@ -305,6 +315,8 @@ pub struct CognitionPack {
     provider: Arc<dyn Provider>,
     model: String,
     system_prefix: Option<String>,
+    thinking: bool,
+    effort: Option<Effort>,
 }
 
 impl CognitionPack {
@@ -314,6 +326,8 @@ impl CognitionPack {
             provider,
             model: model.into(),
             system_prefix: None,
+            thinking: false,
+            effort: None,
         }
     }
 
@@ -321,6 +335,14 @@ impl CognitionPack {
     /// persona. The operation contract remains last so JSON/text shape requirements stay explicit.
     pub fn with_system_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.system_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Apply the owning agent's adaptive-thinking and reasoning-effort policy to every cognition
+    /// request in this pack.
+    pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
+        self.thinking = thinking;
+        self.effort = effort;
         self
     }
 
@@ -338,6 +360,8 @@ impl CognitionPack {
                 provider: self.provider.clone(),
                 model: self.model.clone(),
                 system_prefix: self.system_prefix.clone(),
+                thinking: self.thinking,
+                effort: self.effort,
             }));
         }
     }
@@ -352,10 +376,17 @@ async fn run_model(
     model: &str,
     system: &str,
     prompt: &str,
+    thinking: bool,
+    effort: Option<Effort>,
 ) -> Result<(String, Usage)> {
     let req = Request::new(model.to_string(), prompt.to_string())
         .with_system(system.to_string())
-        .with_max_tokens(MAX_TOKENS);
+        .with_max_tokens(MAX_TOKENS)
+        .with_thinking(thinking);
+    let req = match effort {
+        Some(effort) => req.with_effort(effort),
+        None => req,
+    };
     let mut stream = provider.stream(req).await?;
     let mut out = String::new();
     let mut usage = Usage::default();
@@ -443,6 +474,39 @@ mod tests {
     /// A hermetic provider that ignores the request and replays a single canned text delta.
     struct MockProvider {
         reply: String,
+    }
+
+    struct RequestCaptureProvider(std::sync::Mutex<Option<Request>>);
+
+    #[async_trait]
+    impl Provider for RequestCaptureProvider {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            *self.0.lock().unwrap() = Some(req);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(Chunk::TextDelta(
+                "[]".into(),
+            ))])))
+        }
+    }
+
+    #[tokio::test]
+    async fn cognition_requests_inherit_agent_reasoning_settings() {
+        let provider = Arc::new(RequestCaptureProvider(std::sync::Mutex::new(None)));
+        let mut reg = ToolRegistry::new();
+        CognitionPack::new(provider.clone(), "test-model")
+            .with_reasoning(true, Some(flux_provider::Effort::Medium))
+            .register(&mut reg);
+        reg.get("ai.extract")
+            .unwrap()
+            .execute(&ctx(), json!({ "from": "x" }))
+            .await
+            .unwrap();
+        let req = provider.0.lock().unwrap().clone().unwrap();
+        assert!(req.thinking);
+        assert_eq!(req.effort, Some(flux_provider::Effort::Medium));
     }
 
     #[async_trait]

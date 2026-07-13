@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::AgentSink;
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, Usage};
 use flux_events::EventStore;
-use flux_provider::{Provider, Request};
+use flux_provider::{Effort, Provider, Request};
 use flux_runtime::Executor;
 
 use crate::ast::DraftAst;
@@ -60,8 +60,12 @@ pub struct FlowEngine {
     pub system_prompt: String,
     pub max_tokens: u32,
     pub max_iterations: usize,
-    /// Skills whose triggers, when matched against a turn's input, inject their body into that turn's
-    /// system prompt (and record a `skill.activated` observation).
+    /// Adaptive-thinking request policy for every model call made by this agent.
+    pub thinking: bool,
+    /// Provider-mapped reasoning effort for every model call made by this agent.
+    pub effort: Option<Effort>,
+    /// Skills explicitly enabled for this agent. Their bodies are injected into each turn's system
+    /// prompt; discovery metadata/triggers never activate a skill implicitly.
     pub skills: Vec<flux_skill::Skill>,
     /// When the persisted session exceeds this many (serialized) chars, older turns are summarized
     /// into one synthetic message before the next request. `0` disables compaction.
@@ -166,6 +170,8 @@ impl FlowEngine {
             system_prompt,
             max_tokens,
             max_iterations,
+            thinking: false,
+            effort: None,
             skills,
             compact_threshold_chars,
             groups,
@@ -182,6 +188,15 @@ impl FlowEngine {
     /// sticky-monotonic, so values computed once at startup are enough.
     pub fn with_ambient_signals(mut self, signals: Vec<String>) -> Self {
         self.ambient_signals = signals;
+        self
+    }
+
+    /// Apply one reasoning policy to the full agent call graph: reflexive planner/repair and
+    /// completion calls on the loop host, plus outer one-shot planning and compaction calls.
+    pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
+        self.thinking = thinking;
+        self.effort = effort;
+        self.loop_host.set_reasoning(thinking, effort);
         self
     }
 
@@ -504,6 +519,8 @@ impl FlowEngine {
         );
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
+            thinking: self.thinking,
+            effort: self.effort,
             ..CompileOptions::default()
         };
         // A-42: drive `compile_with_gather` over an owned, channel-backed sink and drain the
@@ -755,6 +772,8 @@ impl FlowEngine {
         let advertised = self.surfaced_for_turn(user_input, sink);
         let opts = CompileOptions {
             max_tokens: self.max_tokens,
+            thinking: self.thinking,
+            effort: self.effort,
             ..CompileOptions::default()
         };
         let conversation = self.events.conversation(session_id)?;
@@ -923,15 +942,11 @@ impl FlowEngine {
         sink.observation(&obs);
     }
 
-    /// The agent identity + project context + any skills whose triggers match this turn — the base the
-    /// planner prompt is appended to (shared by `run_turn` and `plan_turn`).
-    fn base_system_with_skills(&self, user_input: &str, sink: &mut dyn AgentSink) -> String {
+    /// The agent identity + project context + explicitly enabled skills — the base the planner prompt
+    /// is appended to (shared by `run_turn` and `plan_turn`).
+    fn base_system_with_skills(&self, _user_input: &str, sink: &mut dyn AgentSink) -> String {
         let mut base_system = self.system_prompt.clone();
-        for skill in flux_skill::active_for(
-            &self.skills,
-            user_input,
-            flux_skill::ActivationLimits::default(),
-        ) {
+        for skill in &self.skills {
             base_system.push_str(&format!(
                 "\n\n<skill name=\"{}\">\n{}\n</skill>",
                 skill.name, skill.body
@@ -1462,7 +1477,13 @@ impl FlowEngine {
             "Summarize the earlier conversation into a compact set of durable facts, decisions, and \
              open threads. Preserve file paths, names, and numbers. Be terse.\n\n{transcript}"
         );
-        let req = Request::new(self.model.clone(), prompt).with_max_tokens(1024);
+        let req = Request::new(self.model.clone(), prompt)
+            .with_max_tokens(1024)
+            .with_thinking(self.thinking);
+        let req = match self.effort {
+            Some(effort) => req.with_effort(effort),
+            None => req,
+        };
         let mut usage = Usage::default();
         let mut stream = match self.provider.stream(req).await {
             Ok(stream) => stream,
@@ -1753,7 +1774,9 @@ pub fn trace_loop() -> bool {
 fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink, reveal: bool) {
     use crate::loop_host::SinkEvent;
     let machinery = match &ev {
-        SinkEvent::ToolCall(name, _) | SinkEvent::ToolResult(name, _) => is_loop_machinery_op(name),
+        SinkEvent::ToolCall(name, _)
+        | SinkEvent::ToolTiming(name, _)
+        | SinkEvent::ToolResult(name, _) => is_loop_machinery_op(name),
         _ => false,
     };
     if reveal || !machinery {
@@ -3053,7 +3076,8 @@ mod tests {
             ])),
             requests: requests.clone(),
         });
-        let engine = engine_with_provider(provider, store.clone());
+        let engine =
+            engine_with_provider(provider, store.clone()).with_reasoning(true, Some(Effort::High));
         let mut sink = CollectSink::default();
         engine.run_turn(&sid, "echo hi", &mut sink).await.unwrap();
 
@@ -3072,6 +3096,8 @@ mod tests {
             reqs[1].tools.is_empty(),
             "call 2 offers NO tools — it cannot recurse into planning"
         );
+        assert!(reqs.iter().all(|req| req.thinking));
+        assert!(reqs.iter().all(|req| req.effort == Some(Effort::High)));
         let sys2 = format!(
             "{}{}",
             reqs[1].system.as_deref().unwrap_or_default(),
@@ -3308,8 +3334,13 @@ mod tests {
         let store = Arc::new(EventStore::in_memory().unwrap());
         let sid = store.create_session("mock").unwrap();
         // The only model call `maybe_compact` makes is the summary render.
-        let responses = VecDeque::from(vec![prose("SUMMARY: the earlier turns.")]);
-        let mut engine = engine_with(responses, store.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(CaptureProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("SUMMARY: the earlier turns.")])),
+            requests: requests.clone(),
+        });
+        let mut engine = engine_with_provider(provider, store.clone())
+            .with_reasoning(true, Some(Effort::Medium));
         engine.compact_threshold_chars = 50; // tiny, so a handful of messages exceed it
 
         // Seed a persistent-session conversation that exceeds the threshold.
@@ -3335,6 +3366,10 @@ mod tests {
             after < before,
             "compaction bounded the conversation: {before} -> {after}"
         );
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].thinking);
+        assert_eq!(reqs[0].effort, Some(Effort::Medium));
     }
 
     fn seed_provider_valid_history(store: &EventStore, sid: &str) {

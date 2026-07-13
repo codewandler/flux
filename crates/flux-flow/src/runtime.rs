@@ -448,6 +448,7 @@ impl OpHost for ExecutorHost<'_> {
                     Some(out) => out,
                     None => OpOutcome {
                         denied: false,
+                        timing: None,
                         content: format!(
                             "replay diverged: {}",
                             tape.diverged()
@@ -486,6 +487,7 @@ impl OpHost for ExecutorHost<'_> {
                     let view = reuse_note(op, symbol.as_deref());
                     let out = OpOutcome {
                         denied: false,
+                        timing: None,
                         content,
                         view: Some(view),
                         is_error: false,
@@ -506,6 +508,7 @@ impl OpHost for ExecutorHost<'_> {
         let outcome = self.executor.dispatch_outcome(op, input).await;
         let out = OpOutcome {
             denied: outcome.denied,
+            timing: Some(outcome.timing),
             content: outcome.result.content,
             view: outcome.result.view,
             is_error: outcome.result.is_error,
@@ -611,6 +614,9 @@ impl FlowSink for SinkBridge<'_> {
         self.inner.tool_call(name, input);
     }
     fn tool_result(&mut self, name: &str, result: &OpOutcome) {
+        if let Some(timing) = result.timing.as_ref() {
+            self.inner.tool_timing(name, timing);
+        }
         self.inner.tool_result(
             name,
             &ToolResult {
@@ -1600,6 +1606,7 @@ mod tests {
     struct CollectSink {
         calls: Vec<String>,
         observations: Vec<String>,
+        timings: Vec<(String, flux_core::OperationTiming)>,
     }
     impl AgentSink for CollectSink {
         fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
@@ -1607,6 +1614,9 @@ mod tests {
         }
         fn observation(&mut self, o: &flux_evidence::Observation) {
             self.observations.push(o.kind.clone());
+        }
+        fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+            self.timings.push((name.to_string(), *timing));
         }
     }
 
@@ -1653,6 +1663,12 @@ mod tests {
         assert_eq!(outcome.steps, 2, "both echo ops dispatched");
         assert_eq!(outcome.result, "hi");
         assert_eq!(sink.calls, vec!["echo", "echo"]);
+        assert_eq!(sink.timings.len(), 2, "each live dispatch exposes timing");
+        assert!(sink.timings[0].1.execution_us.is_some());
+        assert_eq!(
+            sink.timings[1].1.execution_us, None,
+            "the second identical read was a cache hit, not a fresh execution"
+        );
         // $b holds the value $a flowed into it (symbols carried the value, not the prose).
         let vid = store
             .resolve("sess", &SymbolName("b".into()))
