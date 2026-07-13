@@ -660,6 +660,33 @@ fn describe_params(sig: &OpSignature) -> String {
     }
 }
 
+/// Build the repair diagnostic for a positional call to a named-argument operation. The model is
+/// constructing AST JSON, so show the AST envelope it must emit (not merely the eventual tool-input
+/// object) and derive the accepted names/types from the live operation signature.
+fn named_object_args_diag(op: &str, sig: &OpSignature, supplied: usize) -> String {
+    let example_names: Vec<&str> = if sig.required_params.is_empty() {
+        sig.optional_params
+            .first()
+            .map(String::as_str)
+            .into_iter()
+            .collect()
+    } else {
+        sig.required_params.iter().map(String::as_str).collect()
+    };
+    let fields = example_names
+        .into_iter()
+        .map(|name| format!(r#""{name}":{{"kind":"lit","value":…}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "op `{op}` requires a single object argument naming its parameters, but received {supplied} \
+         positional argument(s). Set `args` to exactly one AST object node, for example \
+         `args: [{{\"kind\":\"obj\",\"fields\":{{{fields}}}}}]`, and move each value under its \
+         intended parameter name. `{op}` accepts: {}",
+        describe_params(sig)
+    )
+}
+
 /// Ordered type-check walk: track each symbol's type (a `bind`/`memo`'s `ty` annotation, else `Any`)
 /// and check every `call`'s args. Control bodies are checked with a cloned scope (a branch-local bind
 /// doesn't leak out — conservative). Threads the same `label[i]` node path [`analyze_flow`]'s
@@ -1427,26 +1454,14 @@ fn check_node(node: &Node, ops: &dyn OpCatalog, bound: &HashSet<String>, d: &mut
                         || matches!(args.as_slice(), [Node::Obj { .. }]);
                     let max = sig.required_params.len() + sig.optional_params.len();
                     if !lone_object && max > 0 && args.len() >= 2 {
-                        d.add(format!(
-                            "op `{op}`: pass a single object argument naming its parameters \
-                             (e.g. `{{\"{}\": …}}`) instead of {n} positional arguments",
-                            sig.required_params
-                                .first()
-                                .or(sig.optional_params.first())
-                                .cloned()
-                                .unwrap_or_default(),
-                            n = args.len()
-                        ));
+                        d.add(named_object_args_diag(op, &sig, args.len()));
                     }
                     // A single bare value against a multi-param op is ambiguous without names —
                     // BUT a single required param (plus optionals) is the common ergonomic sugar
                     // (`read("x")`, `grep("TODO")`), so allow it.
                     let single_required = sig.required_params.len() == 1;
                     if !lone_object && max > 1 && args.len() == 1 && !single_required {
-                        d.add(format!(
-                            "op `{op}` takes {max} parameters; pass a single object argument naming \
-                             each (e.g. `{{…}}`) instead of one bare value"
-                        ));
+                        d.add(named_object_args_diag(op, &sig, 1));
                     }
                     // Too few: a call with NO args can never bind a required param (zero args cannot
                     // be the lone whole-input object). Surface it at compile time so the planner
@@ -2254,8 +2269,14 @@ mod tests {
         let err = lower(&positional, &ops, &HashSet::new()).unwrap_err();
         assert!(
             err.iter()
-                .any(|d| d.message.contains("single object argument")),
-            "expected a named-object-argument diagnostic, got: {:?}",
+                .any(|d| d.message.contains("args: [{\"kind\":\"obj\"")),
+            "expected the concrete AST repair shape, got: {:?}",
+            err.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("path (required), content (required)")),
+            "expected the operation's accepted parameter set, got: {:?}",
             err.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
 
@@ -2271,8 +2292,9 @@ mod tests {
         };
         let err = lower(&bare, &ops, &HashSet::new()).unwrap_err();
         assert!(
-            err.iter()
-                .any(|d| d.message.contains("single object argument naming each")),
+            err.iter().any(|d| d
+                .message
+                .contains("single object argument naming its parameters")),
             "expected a single-bare-vs-multi-param diagnostic, got: {:?}",
             err.iter().map(|d| &d.message).collect::<Vec<_>>()
         );

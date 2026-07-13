@@ -337,6 +337,20 @@ mod tests {
         assert_eq!(kinds, catalog, "kind enum = every variant, in order");
     }
 
+    /// C-56: the generic merged schema cannot specialize args per operation, but it must put the
+    /// named-object convention on the exact field the model fills instead of relying on remote
+    /// system-prompt prose alone.
+    #[test]
+    fn model_schema_call_args_describes_named_object_convention() {
+        let merged = model_schema();
+        let description = defs(&merged)["Node"]["properties"]["args"]["description"]
+            .as_str()
+            .expect("call args carries model-facing guidance");
+        assert!(description.contains("exactly one"));
+        assert!(description.contains("named object"));
+        assert!(description.contains("kind\":\"obj"));
+    }
+
     /// Every property of every `oneOf` variant survives the merge — the union is complete, so no
     /// field a kind needs is hidden from the model.
     #[test]

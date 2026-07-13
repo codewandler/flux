@@ -75,6 +75,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **C-56: model-emitted operation arguments carry an actionable structural contract**
+  (`docs/designs/model-call-argument-contract.md`). The merged Flux-Lang schema now documents the
+  one-named-object convention directly on `Call.args`, and positional-call diagnostics show the
+  correct AST envelope plus the live operation's required/optional names and types. The identical
+  Codex prompt improved from 0/4 valid first plans to 3/3 without weakening named-argument analysis.
 - **C-55: gathered read results retain their source path in later model rounds**
   (`docs/designs/operation-feedback-provenance.md`). Flux-Lang feedback labels now reuse the
   existing bounded, safe read/grep argument summary, so multiple results arrive as

@@ -406,6 +406,11 @@ pub enum Node {
     /// Invoke a registered operation with argument expressions.
     Call {
         op: String,
+        /// Call argument expressions. For an operation with multiple declared parameters, this
+        /// array contains exactly one named object: prefer an `obj` node shaped like
+        /// `{"kind":"obj","fields":{"parameter": <value node>}}`; an object-valued `lit` is
+        /// also accepted. Never put multiple positional value nodes in this array. An operation
+        /// with exactly one required parameter may use one bare value node as shorthand.
         #[serde(default)]
         args: Vec<Node>,
     },

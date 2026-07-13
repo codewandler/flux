@@ -57,6 +57,9 @@
 
 ### Fixed
 
+- **Plans no longer commonly waste a model call repairing operation arguments.** The plan schema now
+  explains the named-input shape exactly where an operation call is constructed, and any remaining
+  error shows the valid plan shape and that operation's accepted parameters.
 - **Answers grounded in several files can cite the right source reliably.** Read and search results
   keep a concise source label when they are fed into the next planning step, instead of arriving as
   indistinguishable blocks that invite the model to guess filenames.

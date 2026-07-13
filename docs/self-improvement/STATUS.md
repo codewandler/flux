@@ -53,9 +53,14 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   computed the support fixture correctly, but low/medium invented source filenames because gathered
   values reached the next model call as anonymous `[read]` blocks. The runtime now retains bounded,
   allow-listed read/grep provenance in feedback; two fresh runs cited every real source correctly.
-  The trace also isolated the next latency defect: four consecutive matched runs emitted the same
-  invalid positional `grep` arguments, and the repair call alone cost 6–10 seconds plus roughly 17k
-  input tokens each time. This remains targeted harness hardening outside the paused autonomous loop.
+  The trace also isolated a latency defect: four consecutive matched runs emitted the same invalid
+  positional `grep` arguments, and the repair call alone cost 6–10 seconds plus roughly 17k input
+  tokens each time. `Call.args` had no schema description; its named-object rule lived only in remote
+  prose, and the error illustrated the wrong abstraction level. Putting the contract on the field
+  and emitting the exact AST repair shape changed matched first-plan validity from 0/4 to 3/3. Two
+  low-effort runs finished correctly in 13.2/14.4s; a medium run used the saved call for useful
+  retrieval and took 26.6s, so broader latency remains open. This remains targeted harness hardening
+  outside the paused autonomous loop.
 
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →
