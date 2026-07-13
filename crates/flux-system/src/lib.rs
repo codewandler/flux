@@ -1752,7 +1752,12 @@ mod tests {
 
     fn temp_workspace() -> (PathBuf, System) {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("flux-sys-test-{}-{n}", std::process::id()));
+        // Sandbox tests deliberately exercise TMPDIR parsing. Read it under their shared env lock
+        // so an unrelated process test never builds its fixture under a transient test value.
+        let dir = {
+            let _env = sandbox::EnvGuard::new(&[]);
+            std::env::temp_dir().join(format!("flux-sys-test-{}-{n}", std::process::id()))
+        };
         std::fs::create_dir_all(&dir).unwrap();
         let ws = Workspace::new(&dir).unwrap();
         (dir, System::new(ws))
@@ -2148,12 +2153,12 @@ mod tests {
     /// just the first.
     #[tokio::test]
     async fn flux_sandboxed_marker_survives_env_clear_like_other_safe_env_entries() {
+        let (dir, sys) = temp_workspace();
         // FIX G: take the SAME lock the `sandbox::tests` use so a concurrent test mutating
         // FLUX_SANDBOXED can't race the marker this test depends on. The guard is a struct wrapping
         // the lock (not a raw `MutexGuard`), so holding it across the `.await` is sound and does not
         // trip `clippy::await_holding_lock`; it restores FLUX_SANDBOXED on drop.
         let _env = sandbox::EnvGuard::new(&["FLUX_SANDBOXED"]);
-        let (dir, sys) = temp_workspace();
         std::env::set_var("FLUX_SANDBOXED", "1");
         let out = sys
             .run(&["env".to_string()], Duration::from_secs(10))

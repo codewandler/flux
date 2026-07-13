@@ -373,10 +373,17 @@ fn discover_backend() -> Backend {
 
 /// First match for `name` on `PATH`, returned as-is (not yet canonicalized — callers that need the
 /// absolute-path invariant canonicalize themselves). Mirrors `flux-web::browser::which_on_path`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn which_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    which_on_path_in(name, &path)
+}
+
+/// [`which_on_path`] with an injected PATH value. Keeping the split/lookup seam pure lets parallel
+/// tests cover discovery without replacing the process environment seen by unrelated child spawns.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn which_on_path_in(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .map(|dir| dir.join(name))
         .find(|cand| cand.is_file())
 }
@@ -386,7 +393,16 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// otherwise-functional bubblewrap installs on non-FHS systems such as NixOS and Guix.
 #[cfg(target_os = "linux")]
 fn discover_probe_executable(name: &str) -> std::result::Result<PathBuf, String> {
-    which_on_path(name)
+    let path = std::env::var_os("PATH");
+    discover_probe_executable_in(name, path.as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn discover_probe_executable_in(
+    name: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<PathBuf, String> {
+    path.and_then(|path| which_on_path_in(name, path))
         .and_then(|path| path.canonicalize().ok())
         .ok_or_else(|| format!("probe command `{name}` not found on the caller's PATH"))
 }
@@ -396,11 +412,21 @@ fn discover_probe_executable(name: &str) -> std::result::Result<PathBuf, String>
 /// `PATH` swap (or a spawn whose `PATH` was cleared) could redirect.
 #[cfg(target_os = "linux")]
 fn discover_bwrap() -> std::result::Result<PathBuf, String> {
-    if let Some(p) = std::env::var_os("FLUX_BWRAP_BIN").filter(|p| !p.is_empty()) {
-        return std::fs::canonicalize(&p)
+    let override_bin = std::env::var_os("FLUX_BWRAP_BIN");
+    let path = std::env::var_os("PATH");
+    discover_bwrap_in(override_bin.as_deref(), path.as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn discover_bwrap_in(
+    override_bin: Option<&std::ffi::OsStr>,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<PathBuf, String> {
+    if let Some(p) = override_bin.filter(|p| !p.is_empty()) {
+        return std::fs::canonicalize(p)
             .map_err(|e| format!("FLUX_BWRAP_BIN={p:?} is not a usable bwrap binary: {e}"));
     }
-    which_on_path("bwrap")
+    path.and_then(|path| which_on_path_in("bwrap", path))
         .and_then(|p| std::fs::canonicalize(&p).ok())
         .ok_or_else(|| {
             "bubblewrap (bwrap) not found on PATH — install it or set FLUX_BWRAP_BIN".to_string()
@@ -1790,11 +1816,8 @@ mod tests {
         let dir = temp_dir("bwrap-path");
         write_script(&dir.join("bwrap"), "#!/bin/sh\nexit 0\n");
 
-        let _g = EnvGuard::new(&["FLUX_BWRAP_BIN", "PATH"]);
-        std::env::remove_var("FLUX_BWRAP_BIN");
-        std::env::set_var("PATH", &dir);
-
-        let found = discover_bwrap().expect("fake bwrap discoverable on PATH");
+        let found = discover_bwrap_in(None, Some(dir.as_os_str()))
+            .expect("fake bwrap discoverable on injected PATH");
         assert!(found.is_absolute(), "must be absolute: {found:?}");
         assert_ne!(found, PathBuf::from("bwrap"), "must never be the bare name");
     }
@@ -1806,10 +1829,7 @@ mod tests {
         let custom = dir.join("custom-bwrap");
         write_script(&custom, "#!/bin/sh\nexit 0\n");
 
-        let _g = EnvGuard::new(&["FLUX_BWRAP_BIN"]);
-        std::env::set_var("FLUX_BWRAP_BIN", &custom);
-
-        let found = discover_bwrap().unwrap();
+        let found = discover_bwrap_in(Some(custom.as_os_str()), None).unwrap();
         assert_eq!(found, custom.canonicalize().unwrap());
         assert!(found.is_absolute());
     }
@@ -1818,11 +1838,7 @@ mod tests {
     #[test]
     fn discover_bwrap_missing_names_flux_bwrap_bin_in_the_reason() {
         let dir = temp_dir("bwrap-empty-path");
-        let _g = EnvGuard::new(&["FLUX_BWRAP_BIN", "PATH"]);
-        std::env::remove_var("FLUX_BWRAP_BIN");
-        std::env::set_var("PATH", &dir);
-
-        let err = discover_bwrap().unwrap_err();
+        let err = discover_bwrap_in(None, Some(dir.as_os_str())).unwrap_err();
         assert!(err.contains("not found on PATH"), "{err}");
         assert!(err.contains("FLUX_BWRAP_BIN"), "{err}");
     }
@@ -1837,16 +1853,27 @@ mod tests {
         );
         write_script(&dir.join("true"), "#!/bin/sh\nexit 0\n");
 
-        let _g = EnvGuard::new(&["FLUX_SANDBOXED", "FLUX_BWRAP_BIN", "PATH"]);
-        std::env::remove_var("FLUX_SANDBOXED");
-        std::env::remove_var("FLUX_BWRAP_BIN");
-        std::env::set_var("PATH", &dir);
-        let sandbox = Sandbox::resolve(SandboxSettings {
-            mode: SandboxMode::On,
-            network: true,
-            extra_writable: Vec::new(),
-        });
-        assert!(sandbox.is_active(), "reason: {:?}", sandbox.reason());
+        let path = dir.as_os_str();
+        let bwrap = discover_bwrap_in(None, Some(path)).unwrap();
+        let command = discover_probe_executable_in("true", Some(path)).unwrap();
+        assert!(
+            command.is_absolute(),
+            "probe command must be pinned: {command:?}"
+        );
+        assert_eq!(
+            run_probe(&bwrap, &bwrap_probe_argv(&command), Duration::from_secs(2)),
+            ProbeOutcome::Ok
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn injected_discovery_never_mutates_the_process_path() {
+        let original = std::env::var_os("PATH");
+        let dir = temp_dir("bwrap-pure-path");
+        write_script(&dir.join("bwrap"), "#!/bin/sh\nexit 0\n");
+        let _ = discover_bwrap_in(None, Some(dir.as_os_str())).unwrap();
+        assert_eq!(std::env::var_os("PATH"), original);
     }
 
     // -- preflight probe classification (D-131) -------------------------------------------------

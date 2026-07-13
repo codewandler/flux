@@ -75,6 +75,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **D-167: parallel sandbox tests no longer break process execution during `task install`**
+  (`docs/designs/test-environment-isolation.md`). Bubblewrap/PATH discovery tests use an injected
+  search path instead of replacing the process-wide `PATH` observed by unrelated `flux-system`
+  tests. Temporary-workspace construction also reads `TMPDIR` under the shared environment guard.
+  This removes the flake where `sh`, `printf`, `env`, and `sleep` simultaneously became unavailable
+  and thirteen process tests failed as a cluster.
 - **C-53: approval wait is no longer mislabeled as tool execution latency** (Core pillar;
   `docs/designs/operation-latency-attribution.md`). The dispatcher emits correlated
   `approval.requested`/`approved|denied`, `tool.started`/`ended`, and `tool.cache_hit` lifecycle

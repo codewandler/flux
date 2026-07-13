@@ -41,6 +41,14 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   both trivial answers were correct with zero reasoning tokens, so it is propagation evidence, not
   an effort-quality/default claim. The autonomous initiative remains on hold.
 
+- **2026-07-13 install-gate flake found by the operator:** `task install` failed 13 `flux-system`
+  process tests as one cluster. Sandbox discovery tests temporarily replaced process-wide `PATH`;
+  their mutex serialized only other mutators, so unrelated parallel tests intermittently lost
+  `sh`, `printf`, `env`, and `sleep`. Discovery tests now inject PATH into pure helpers and never
+  mutate the process value; temporary workspace creation reads TMPDIR under the existing guard.
+  Verification: 20 consecutive 64-thread `flux-system` runs passed, followed by the exact
+  `task install` (workspace library tests plus replacement of both `flux` and `flux-lsp`).
+
 - **The loop works end-to-end.** Every stage fires on real Docker / terminal-bench: baseline eval →
   reviewer → aggregate → planner → `git_snapshot` → worker → `guard_protected` → `gate_check` →
   candidate eval → `score_compare` → keep+tag **or** revert → `improve_log`.
