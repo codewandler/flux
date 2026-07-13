@@ -12,6 +12,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Fixed
+
+- **The bundled plugin pack builds against the new adaptive agent operation metadata.** Plugin
+  authors can also set the same typed exploration-versus-action hint in custom integrations.
+
 ## [0.20.0] - 2026-07-13
 
 ### New

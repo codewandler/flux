@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The nested plugin SDK now carries adaptive-loop staging metadata in every operation helper.**
+  `read_op`, `write_op`, and `internal_op` default to conservative inference and re-export the typed
+  disposition for plugin authors, restoring the plugin workspace build under the 0.20 API.
+
 ## [0.20.0] - 2026-07-13
 
 ### Added

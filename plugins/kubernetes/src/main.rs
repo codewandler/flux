@@ -493,6 +493,7 @@ fn op_spec_typed<T: JsonSchema + 'static>(
         effects,
         risk: Some(risk),
         idempotency: Some(idempotency),
+        staging: StagingDisposition::Infer,
         group: None,
         secret_purposes: Vec::new(),
         internal: false,

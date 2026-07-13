@@ -38,7 +38,7 @@ pub use flux_plugin::{
     OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
     ToolGroup, VALIDATE_OP,
 };
-pub use flux_spec::{Effect, Idempotency, Risk};
+pub use flux_spec::{Effect, Idempotency, Risk, StagingDisposition};
 
 /// Re-export `schemars` so a plugin crate can `#[derive(host_kit::schemars::JsonSchema)]`
 /// (or `Deserialize`) on its op-input structs without adding its own `schemars` dependency —
@@ -1064,6 +1064,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
         effects: vec![Effect::Read],
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
+        staging: StagingDisposition::Infer,
         secret_purposes: Vec::new(),
         group: None,
         internal: false,
@@ -1081,6 +1082,7 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         effects: vec![Effect::Write, Effect::Network],
         risk: Some(Risk::Medium),
         idempotency: Some(Idempotency::NonIdempotent),
+        staging: StagingDisposition::Infer,
         secret_purposes: Vec::new(),
         group: None,
         internal: false,
@@ -1128,6 +1130,7 @@ pub fn internal_op(name: &str, description: &str, input_schema: Value) -> Operat
         effects: Vec::new(),
         risk: Some(Risk::Low),
         idempotency: Some(Idempotency::Idempotent),
+        staging: StagingDisposition::Infer,
         secret_purposes: Vec::new(),
         group: None,
         internal: true,
@@ -1918,6 +1921,18 @@ mod tests {
         assert_eq!(up.status, 200);
         // the mock echoes the canned JSON as the text body, whose bytes we get back
         assert_eq!(up.bytes, b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn operation_helpers_default_to_conservative_staging_inference() {
+        let schema = json!({"type": "object"});
+        let ops = [
+            read_op("acme.read", "read", schema.clone()),
+            write_op("acme.write", "write", schema.clone()),
+            internal_op("acme.internal", "internal", schema),
+        ];
+
+        assert!(ops.iter().all(|op| op.staging == StagingDisposition::Infer));
     }
 
     /// C-09a: `internal_op`/`internal_op_typed` build an op with `internal: true`, and the host's
