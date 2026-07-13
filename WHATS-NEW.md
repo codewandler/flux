@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-07-13
+
 ### Fixed
 
 - **Requests for live facts reliably select an evidence operation.** Capability summaries no longer
