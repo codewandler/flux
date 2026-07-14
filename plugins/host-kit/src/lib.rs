@@ -10,22 +10,38 @@
 //!
 //! ```ignore
 //! use host_kit::*;
-//! fn main() {
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Deserialize, Serialize, schemars::JsonSchema)]
+//! #[serde(deny_unknown_fields)]
+//! struct PingInput {}
+//!
+//! #[derive(Serialize, schemars::JsonSchema)]
+//! struct PingOutput {
+//!     status: serde_json::Value,
+//! }
+//!
+//! fn main() -> Result<(), String> {
 //!     PluginBuilder::new("acme", "0.1.0")
 //!         .capabilities(Caps { http: true, secrets: vec!["ACME_TOKEN".into()], ..Caps::default() })
 //!         .auth(AuthMethod { purpose: "api_token".into(), env: vec!["ACME_TOKEN".into()], ..Default::default() })
 //!         .endpoint(EndpointSpec { name: "acme.endpoint".into(), env: vec!["ACME_URL".into()], ..Default::default() })
-//!         .operation(op("acme.ping", "Ping the API", schema), |_in, host| {
-//!             let v = host.get_json_ref("acme.endpoint", "/ping", Some("api_token"))?;
-//!             Ok(v)
-//!         })
-//!         .serve();
+//!         .operation_typed::<PingInput, PingOutput>(
+//!             read_op_typed::<PingInput>("acme.ping", "Ping the API"),
+//!             |_in, host| {
+//!                 let status = host.get_json_ref("acme.endpoint", "/ping", Some("api_token"))?;
+//!                 Ok(PingOutput { status })
+//!             },
+//!         )
+//!         .try_serve()
 //! }
 //! ```
 
 use std::collections::HashMap;
 
 use base64::Engine as _;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 pub mod preflight;
@@ -56,6 +72,11 @@ pub use schemars;
 /// Prefer the [`read_op_typed`] / [`write_op_typed`] helpers, which call this for you.
 pub fn op_input_schema<T: schemars::JsonSchema + 'static>() -> Value {
     flux_spec::tool_input_schema::<T>()
+}
+
+/// Derive the successful-result JSON Schema for a typed plugin operation.
+pub fn op_output_schema<T: schemars::JsonSchema + 'static>() -> Value {
+    flux_spec::tool_output_schema::<T>()
 }
 
 /// A typed view over the host-capability channel, handed to each op handler.
@@ -129,6 +150,18 @@ impl HttpResponse {
 }
 
 impl Host<'_> {
+    /// Check whether a declared auth purpose can be resolved without returning its secret value to
+    /// the plugin. Use this to select an optional authenticated backend before an `http.do` call;
+    /// the eventual request should still pass `auth_purpose` for host-side injection.
+    pub fn auth_available(&mut self, purpose: &str) -> Result<bool, String> {
+        let v = self
+            .inner
+            .host_call("auth.available", json!({ "purpose": purpose }))?;
+        v.get("available")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "auth.available: host returned no boolean".into())
+    }
+
     /// Resolve a secret by purpose (an auth-method name declared in the manifest).
     pub fn secret(&mut self, purpose: &str) -> Result<String, String> {
         let v = self
@@ -817,8 +850,18 @@ impl std::io::Write for ConnStream<'_, '_> {
     }
 }
 
-/// A handler closure for one operation: `(input, host) -> result`.
-type OpFn = Box<dyn Fn(Value, &mut Host) -> Result<Value, String> + Send + Sync>;
+struct PreparedInput {
+    normalized: Value,
+    typed: Box<dyn std::any::Any + Send>,
+}
+
+type PrepareFn = Box<dyn Fn(Value) -> Result<PreparedInput, String> + Send + Sync>;
+type OpFn = Box<dyn Fn(PreparedInput, &mut Host) -> Result<Value, String> + Send + Sync>;
+
+struct OpHandler {
+    prepare: PrepareFn,
+    call: OpFn,
+}
 
 /// A custom preflight rule for one operation: `input -> problems` (empty = valid). Runs alongside
 /// the generic [`schema_preflight`] in both the `--dry-run` path (via [`VALIDATE_OP`]) and runtime
@@ -828,8 +871,9 @@ type PreflightFn = Box<dyn Fn(&Value) -> Vec<String> + Send + Sync>;
 /// Collects a manifest + op handlers, then [`serve`](Plugin::serve)s them over the plugin protocol.
 pub struct PluginBuilder {
     manifest: PluginManifest,
-    ops: HashMap<String, OpFn>,
+    ops: HashMap<String, OpHandler>,
     preflights: HashMap<String, PreflightFn>,
+    registration_errors: Vec<String>,
 }
 
 impl PluginBuilder {
@@ -843,7 +887,30 @@ impl PluginBuilder {
             },
             ops: HashMap::new(),
             preflights: HashMap::new(),
+            registration_errors: Vec::new(),
         }
+    }
+
+    fn operation_collision(&self, spec: &OperationSpec) -> Option<String> {
+        let public_name = spec.projected_name(&self.manifest.name);
+        self.manifest.operations.iter().find_map(|existing| {
+            if existing.name == spec.name {
+                let identical = serde_json::to_value(existing).ok()
+                    == serde_json::to_value(spec).ok();
+                let shape = if identical { "identical" } else { "conflicting" };
+                return Some(format!(
+                    "duplicate plugin operation `{}` ({shape} declaration; first effects/risk: {:?}/{:?}, second: {:?}/{:?})",
+                    spec.name, existing.effects, existing.risk, spec.effects, spec.risk
+                ));
+            }
+            let existing_public = existing.projected_name(&self.manifest.name);
+            (existing_public == public_name).then(|| {
+                format!(
+                    "plugin operations `{}` and `{}` both project as public operation `{public_name}`",
+                    existing.name, spec.name
+                )
+            })
+        })
     }
 
     /// Declare the host capabilities this plugin needs (process/secret/http).
@@ -892,13 +959,114 @@ impl PluginBuilder {
         self
     }
 
-    /// Register an operation: its spec (projected to a tool) + the handler closure.
+    /// Deprecated value-only registration spelling.
+    ///
+    /// Use [`operation_typed`](Self::operation_typed) for closed contracts. Use
+    /// [`operation_flexible`](Self::operation_flexible) only when an operation deliberately accepts
+    /// or returns an open `serde_json::Value` payload.
+    #[deprecated(
+        since = "0.24.0",
+        note = "use operation_typed for closed contracts; use operation_flexible only for intentionally open Value payloads"
+    )]
     pub fn operation(
+        self,
+        spec: OperationSpec,
+        handler: impl Fn(Value, &mut Host) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.operation_flexible(spec, handler)
+    }
+
+    /// Explicit compatibility adapter for open/flex payloads whose executable contract is
+    /// intentionally `serde_json::Value`.
+    ///
+    /// Closed-shape operations should use [`operation_typed`](Self::operation_typed). This adapter
+    /// is for transitional handlers and vendor payload pass-through where a stable Rust output type
+    /// would erase meaningful vendor fields.
+    pub fn operation_flexible(
         mut self,
         spec: OperationSpec,
         handler: impl Fn(Value, &mut Host) -> Result<Value, String> + Send + Sync + 'static,
     ) -> Self {
-        self.ops.insert(spec.name.clone(), Box::new(handler));
+        if let Some(error) = self.operation_collision(&spec) {
+            self.registration_errors.push(error);
+            return self;
+        }
+        self.ops.insert(
+            spec.name.clone(),
+            OpHandler {
+                prepare: Box::new(|input| {
+                    Ok(PreparedInput {
+                        normalized: input.clone(),
+                        typed: Box::new(input),
+                    })
+                }),
+                call: Box::new(move |prepared, host| {
+                    let input = prepared.typed.downcast::<Value>().map_err(|_| {
+                        "host-kit internal error: flexible input type mismatch".to_string()
+                    })?;
+                    handler(*input, host)
+                }),
+            },
+        );
+        self.manifest.operations.push(spec);
+        self
+    }
+
+    /// Register an operation through the default typed path: its Rust input/output types are the
+    /// executable and catalog contract. Input is deserialized exactly once with a field path on
+    /// error, normalized by serializing that typed value, and then used for schema/custom preflight
+    /// and the typed handler. The successful output is serialized once and its schema is projected
+    /// into the manifest.
+    pub fn operation_typed<I, O>(
+        mut self,
+        mut spec: OperationSpec,
+        handler: impl Fn(I, &mut Host) -> Result<O, String> + Send + Sync + 'static,
+    ) -> Self
+    where
+        I: DeserializeOwned + Serialize + schemars::JsonSchema + Send + 'static,
+        O: Serialize + schemars::JsonSchema + 'static,
+    {
+        spec.input_schema = op_input_schema::<I>();
+        spec.output_schema = Some(op_output_schema::<O>());
+        if let Some(error) = self.operation_collision(&spec) {
+            self.registration_errors.push(error);
+            return self;
+        }
+        let operation = spec.name.clone();
+        self.ops.insert(
+            operation.clone(),
+            OpHandler {
+                prepare: Box::new(move |input| {
+                    let typed: I = serde_path_to_error::deserialize(input).map_err(|error| {
+                        let path = error.path().to_string();
+                        let location = if path.is_empty() {
+                            "<input>".to_string()
+                        } else {
+                            path
+                        };
+                        format!(
+                            "invalid typed input for `{operation}` at `{location}`: {}",
+                            error.inner()
+                        )
+                    })?;
+                    let normalized = serde_json::to_value(&typed).map_err(|error| {
+                        format!("normalize typed input for `{operation}`: {error}")
+                    })?;
+                    Ok(PreparedInput {
+                        normalized,
+                        typed: Box::new(typed),
+                    })
+                }),
+                call: Box::new(move |prepared, host| {
+                    let input = prepared.typed.downcast::<I>().map_err(|_| {
+                        "host-kit internal error: typed input type mismatch".to_string()
+                    })?;
+                    let output = handler(*input, host)?;
+                    serde_json::to_value(output)
+                        .map_err(|error| format!("serialize typed operation result: {error}"))
+                }),
+            },
+        );
         self.manifest.operations.push(spec);
         self
     }
@@ -914,7 +1082,15 @@ impl PluginBuilder {
         op: impl Into<String>,
         rule: impl Fn(&Value) -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
-        self.preflights.insert(op.into(), Box::new(rule));
+        let op = op.into();
+        match self.preflights.entry(op) {
+            std::collections::hash_map::Entry::Occupied(entry) => self.registration_errors.push(
+                format!("duplicate preflight rule for operation `{}`", entry.key()),
+            ),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Box::new(rule));
+            }
+        }
         self
     }
 
@@ -934,17 +1110,18 @@ impl PluginBuilder {
         self
     }
 
-    /// Finish building (without serving) — used by tests to call ops against a mock host.
+    /// Finish building without serving, rejecting every manifest/handler identity mismatch.
     ///
-    /// Panics if a [`preflight`](Self::preflight) rule names an unregistered op (a developer
-    /// error any test constructing the plugin catches). Auto-registers the [`VALIDATE_OP`]
-    /// internal op unless the plugin declared its own.
-    pub fn build(self) -> Plugin {
+    /// This is the production assembly path. It reports duplicate raw names, duplicate projected
+    /// public names, conflicting handler metadata, missing handlers, and invalid preflight targets
+    /// before a subprocess can publish its manifest.
+    pub fn try_build(self) -> Result<Plugin, String> {
+        let plugin_name = self.manifest.name.clone();
+        let mut problems = self.registration_errors;
         for op in self.preflights.keys() {
-            assert!(
-                self.ops.contains_key(op),
-                "preflight rule for unregistered op `{op}`"
-            );
+            if !self.ops.contains_key(op) {
+                problems.push(format!("preflight rule for unregistered operation `{op}`"));
+            }
         }
         let mut manifest = self.manifest;
         if !manifest.operations.iter().any(|o| o.name == VALIDATE_OP) {
@@ -963,45 +1140,142 @@ impl PluginBuilder {
                 }),
             ));
         }
-        Plugin {
+
+        if let Err(error) = flux_plugin::validate_manifest_operations(&manifest) {
+            problems.push(error);
+        }
+        for operation in &manifest.operations {
+            let auto_validate =
+                operation.name == VALIDATE_OP && !self.ops.contains_key(VALIDATE_OP);
+            if !auto_validate && !self.ops.contains_key(&operation.name) {
+                problems.push(format!(
+                    "manifest operation `{}` has no registered handler",
+                    operation.name
+                ));
+            }
+        }
+        for operation in self.ops.keys() {
+            if !manifest
+                .operations
+                .iter()
+                .any(|spec| spec.name == *operation)
+            {
+                problems.push(format!(
+                    "handler operation `{operation}` has no manifest declaration"
+                ));
+            }
+        }
+        if !problems.is_empty() {
+            problems.sort();
+            problems.dedup();
+            return Err(format!(
+                "plugin `{plugin_name}` assembly failed:\n  - {}",
+                problems.join("\n  - ")
+            ));
+        }
+
+        Ok(Plugin {
             manifest,
             ops: self.ops,
             preflights: self.preflights,
-        }
+        })
     }
 
-    /// Build and run the stdio serve loop (call from `main`).
+    /// Compatibility wrapper for callers that cannot yet return a build error.
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`try_build`](Self::try_build); panicking hides the plugin and operation source from a
+    /// host that could otherwise render an actionable startup error.
+    pub fn build(self) -> Plugin {
+        self.try_build()
+            .unwrap_or_else(|error| panic!("plugin assembly failed: {error}"))
+    }
+
+    /// Fallibly build and run the stdio serve loop (call from `main`).
+    pub fn try_serve(self) -> Result<(), String> {
+        let plugin = self.try_build()?;
+        flux_plugin::serve(plugin);
+        Ok(())
+    }
+
+    /// Compatibility wrapper that panics on an invalid plugin declaration.
+    ///
+    /// # Deprecated
+    ///
+    /// Plugin binaries should return [`try_serve`](Self::try_serve) from `main`.
+    #[deprecated(note = "use PluginBuilder::try_serve and return its error from main")]
     pub fn serve(self) {
-        flux_plugin::serve(self.build());
+        self.try_serve()
+            .unwrap_or_else(|error| panic!("plugin assembly failed: {error}"));
     }
 }
 
 /// A built plugin: a [`PluginHandler`] dispatching to the registered op closures.
 pub struct Plugin {
     manifest: PluginManifest,
-    ops: HashMap<String, OpFn>,
+    ops: HashMap<String, OpHandler>,
     preflights: HashMap<String, PreflightFn>,
 }
 
 impl Plugin {
+    /// Resolve a public model-facing compatibility name back to the stable subprocess handler
+    /// identity. Exact raw names win so existing `flux plugin call` invocations remain valid.
+    fn raw_operation_name<'a>(&'a self, operation: &str) -> Option<&'a str> {
+        self.ops
+            .get_key_value(operation)
+            .map(|(name, _)| name.as_str())
+            .or_else(|| {
+                self.manifest
+                    .operations
+                    .iter()
+                    .find(|spec| {
+                        spec.projected_name(&self.manifest.name) == operation
+                            && self.ops.contains_key(&spec.name)
+                    })
+                    .map(|spec| spec.name.as_str())
+            })
+    }
+
     /// The combined preflight verdict for one op input (D-88): the generic [`schema_preflight`]
     /// against the op's declared `input_schema`, plus any custom
     /// [`preflight`](PluginBuilder::preflight) rule. This is what runtime dispatch enforces and
     /// what [`VALIDATE_OP`] answers — the single source of the dry-run/runtime verdict.
     pub fn validate_input(&self, operation: &str, input: &Value) -> preflight::PreflightReport {
+        let Some(raw_operation) = self.raw_operation_name(operation) else {
+            return preflight::PreflightReport::default();
+        };
+        self.prepare_input(raw_operation, input.clone()).0
+    }
+
+    fn prepare_input(
+        &self,
+        raw_operation: &str,
+        input: Value,
+    ) -> (preflight::PreflightReport, Option<PreparedInput>) {
         let mut report = preflight::PreflightReport::default();
+        let Some(handler) = self.ops.get(raw_operation) else {
+            return (report, None);
+        };
+        let prepared = match (handler.prepare)(input) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                report.problems.push(error);
+                return (report, None);
+            }
+        };
         if let Some(spec) = self
             .manifest
             .operations
             .iter()
-            .find(|o| o.name == operation)
+            .find(|o| o.name == raw_operation)
         {
-            report = schema_preflight(&spec.input_schema, input);
+            report = schema_preflight(&spec.input_schema, &prepared.normalized);
         }
-        if let Some(rule) = self.preflights.get(operation) {
-            report.problems.extend(rule(input));
+        if let Some(rule) = self.preflights.get(raw_operation) {
+            report.problems.extend(rule(&prepared.normalized));
         }
-        report
+        (report, Some(prepared))
     }
 }
 
@@ -1023,11 +1297,11 @@ impl PluginHandler for Plugin {
                 .get("operation")
                 .and_then(|v| v.as_str())
                 .ok_or("plugin.validate: `operation` (string) required")?;
-            if !self.ops.contains_key(target) {
-                return Err(format!("unknown operation: {target}"));
-            }
+            let raw_target = self
+                .raw_operation_name(target)
+                .ok_or_else(|| format!("unknown operation: {target}"))?;
             let op_input = input.get("input").cloned().unwrap_or_else(|| json!({}));
-            let report = self.validate_input(target, &op_input);
+            let report = self.validate_input(raw_target, &op_input);
             return Ok(json!({
                 "operation": target,
                 "valid": report.problems.is_empty(),
@@ -1035,13 +1309,13 @@ impl PluginHandler for Plugin {
                 "warnings": report.warnings,
             }));
         }
-        let op = self
-            .ops
-            .get(operation)
+        let raw_operation = self
+            .raw_operation_name(operation)
             .ok_or_else(|| format!("unknown operation: {operation}"))?;
         // Runtime dispatch runs the same preflight the dry-run path sees, so the two verdicts
         // can never disagree (D-88). Warnings stay advisory — only problems block dispatch.
-        let problems = self.validate_input(operation, &input).problems;
+        let (report, prepared) = self.prepare_input(raw_operation, input);
+        let problems = report.problems;
         if !problems.is_empty() {
             return Err(format!(
                 "invalid input for `{operation}` ({} problem(s)):\n  - {}",
@@ -1049,14 +1323,20 @@ impl PluginHandler for Plugin {
                 problems.join("\n  - ")
             ));
         }
+        let prepared = prepared.ok_or_else(|| format!("unknown operation: {operation}"))?;
+        let op = self
+            .ops
+            .get(raw_operation)
+            .ok_or_else(|| format!("unknown operation: {operation}"))?;
         let mut h = Host { inner: host };
-        op(input, &mut h)
+        (op.call)(prepared, &mut h)
     }
 }
 
 /// A simple read-only operation spec helper (Effect::Read, low risk, idempotent).
 pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
+        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema,
@@ -1076,6 +1356,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
 /// A write/mutating operation spec helper (Effect::Write, medium risk, non-idempotent).
 pub fn write_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
+        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema,
@@ -1095,11 +1376,11 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
 /// A **typed** read-only op: `input_schema` is derived from `T` via `schemars`
 /// ([`op_input_schema`]) instead of a hand-written `json!({...})` object.
 ///
-/// `T` should be a `#[derive(Deserialize, schemars::JsonSchema)]` struct whose fields encode
-/// the op's params (use `Option<T>` for optional fields so `required` is a set, per L-09).
-/// Add `#[schemars(allow_unknown_fields)]` when the handler ignores unknown keys (the common
-/// case for flex-extractors) so the derived schema doesn't forbid extras the runtime accepts.
-/// Effects/risk/idempotency match [`read_op`] (Read, Low, Idempotent).
+/// For the default [`PluginBuilder::operation_typed`] path, `T` should derive
+/// `Deserialize + Serialize + schemars::JsonSchema`; its fields are the executable input contract.
+/// Use `Option<T>` for optional fields and serde aliases/defaults for accepted compatibility
+/// spellings. Prefer `#[serde(deny_unknown_fields)]` on closed contracts. Effects/risk/idempotency
+/// match [`read_op`] (Read, Low, Idempotent).
 pub fn read_op_typed<T: schemars::JsonSchema + 'static>(
     name: &str,
     description: &str,
@@ -1125,6 +1406,7 @@ pub fn write_op_typed<T: schemars::JsonSchema + 'static>(
 /// [`flux_plugin::PluginTool::new`] applies to an undeclared op) — override via the returned spec.
 pub fn internal_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
+        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema,
@@ -1147,16 +1429,25 @@ pub fn grouped(mut op: OperationSpec, group: &str) -> OperationSpec {
     op
 }
 
+/// Expose an operation under a stable model-facing compatibility name while retaining its raw
+/// subprocess/CLI dispatch identity.
+pub fn exposed_as(mut op: OperationSpec, public_name: &str) -> OperationSpec {
+    op.public_name = Some(public_name.into());
+    op
+}
+
 /// Override an operation's risk classification.
 pub fn risked(mut op: OperationSpec, risk: Risk) -> OperationSpec {
     op.risk = Some(risk);
     op
 }
 
-/// Attach the JSON Schema describing an operation's successful result — the machine-readable return
-/// contract projected unchanged onto the runtime `ToolSpec` and used by generated references (D-164).
-/// Composes with the `read_op`/`write_op` presets in the fluent `.operation(...)` call, e.g.
-/// `.operation(with_output_schema(read_op("tickets.list", "...", json!({...})), json!({...})), handler)`.
+/// Attach a manually authored JSON Schema describing an operation's successful result.
+///
+/// This is the compatibility path for [`PluginBuilder::operation_flexible`], where no closed Rust
+/// output type exists. [`PluginBuilder::operation_typed`] derives the successful-result schema from
+/// its output type and does not need this combinator. The schema is projected unchanged onto the
+/// runtime `ToolSpec` and used by generated references (D-164).
 pub fn with_output_schema(mut op: OperationSpec, output_schema: Value) -> OperationSpec {
     op.output_schema = Some(output_schema);
     op
@@ -1376,6 +1667,10 @@ impl GuestHost for MockHost {
             .borrow_mut()
             .push((command.to_string(), payload.clone()));
         match command {
+            "auth.available" => {
+                let purpose = payload.get("purpose").and_then(Value::as_str).unwrap_or("");
+                Ok(json!({ "available": self.secrets.contains_key(purpose) }))
+            }
             "secret" => {
                 let p = payload
                     .get("purpose")
@@ -1641,6 +1936,211 @@ impl GuestHost for MockHost {
 mod tests {
     use super::*;
 
+    #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct TypedProfile {
+        count: u32,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct TypedSearchInput {
+        #[serde(alias = "q")]
+        query: String,
+        profile: TypedProfile,
+    }
+
+    #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+    struct TypedSearchOutput {
+        summary: String,
+        count: u32,
+    }
+
+    #[test]
+    fn typed_operation_owns_schema_normalization_dispatch_and_output() {
+        let plugin = PluginBuilder::new("acme", "0.1.0")
+            .operation_typed::<TypedSearchInput, TypedSearchOutput>(
+                read_op("acme.search", "typed search", json!({"type": "null"})),
+                |input, _host| {
+                    Ok(TypedSearchOutput {
+                        summary: input.query,
+                        count: input.profile.count,
+                    })
+                },
+            )
+            // The alias `q` is normalized to canonical `query` before this shared dry/live rule.
+            .preflight("acme.search", |input| {
+                if input.get("query").and_then(Value::as_str) == Some("ok") {
+                    Vec::new()
+                } else {
+                    vec!["normalized `query` must be `ok`".into()]
+                }
+            })
+            .build();
+
+        let spec = plugin
+            .manifest()
+            .operations
+            .into_iter()
+            .find(|operation| operation.name == "acme.search")
+            .unwrap();
+        assert!(spec.input_schema["properties"].get("query").is_some());
+        let output_schema = spec.output_schema.as_ref().unwrap();
+        assert_eq!(output_schema["x-flux-type"], "TypedSearchOutput");
+        assert!(output_schema["properties"].get("summary").is_some());
+
+        let input = json!({"q": "ok", "profile": {"count": 3}});
+        assert!(plugin
+            .validate_input("acme.search", &input)
+            .problems
+            .is_empty());
+        let mut host = MockHost::default();
+        let output = plugin.call("acme.search", input, &mut host).unwrap();
+        assert_eq!(output, json!({"summary": "ok", "count": 3}));
+    }
+
+    #[test]
+    fn typed_drift_errors_are_path_aware_and_identical_in_dry_and_live_paths() {
+        let plugin = PluginBuilder::new("acme", "0.1.0")
+            .operation_typed::<TypedSearchInput, TypedSearchOutput>(
+                read_op("acme.search", "typed search", json!({})),
+                |input, _host| {
+                    Ok(TypedSearchOutput {
+                        summary: input.query,
+                        count: input.profile.count,
+                    })
+                },
+            )
+            .build();
+        let bad = json!({"query": "ok", "profile": {"count": "three"}});
+        let dry = plugin.validate_input("acme.search", &bad);
+        assert_eq!(dry.problems.len(), 1, "{dry:?}");
+        assert!(dry.problems[0].contains("profile.count"), "{dry:?}");
+
+        let mut host = MockHost::default();
+        let live = plugin.call("acme.search", bad, &mut host).unwrap_err();
+        assert!(live.contains(&dry.problems[0]), "dry={dry:?}; live={live}");
+    }
+
+    #[test]
+    fn flexible_operation_is_an_explicit_open_payload_escape_hatch() {
+        let plugin = PluginBuilder::new("acme", "0.1.0")
+            .operation_flexible(
+                read_op("acme.flex", "open", json!({"type": "object"})),
+                |input, _host| Ok(input),
+            )
+            .build();
+        let input = json!({"vendor_extension": {"anything": true}});
+        let mut host = MockHost::default();
+        assert_eq!(
+            plugin.call("acme.flex", input.clone(), &mut host).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn public_operation_name_dispatches_and_validates_the_raw_handler() {
+        let plugin = PluginBuilder::new("websearch", "0.1.0")
+            .operation_flexible(
+                exposed_as(
+                    read_op(
+                        "websearch.search",
+                        "search",
+                        json!({
+                            "type": "object",
+                            "properties": { "query": { "type": "string" } },
+                            "required": ["query"]
+                        }),
+                    ),
+                    "web.search",
+                ),
+                |input, _host| Ok(json!({ "query": input["query"] })),
+            )
+            .build();
+        let mut host = MockHost::default();
+
+        let result = plugin
+            .call("web.search", json!({ "query": "flux" }), &mut host)
+            .unwrap();
+        assert_eq!(result, json!({ "query": "flux" }));
+        let validation = plugin
+            .call(
+                VALIDATE_OP,
+                json!({ "operation": "web.search", "input": {} }),
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(validation["valid"], false);
+        assert!(!validation["problems"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_handlers_with_conflicting_metadata() {
+        let error = PluginBuilder::new("acme", "0.1.0")
+            .operation_flexible(
+                read_op("acme.thing", "read a thing", json!({"type": "object"})),
+                |_input, _host| Ok(json!({"handler": "read"})),
+            )
+            .operation_flexible(
+                write_op("acme.thing", "replace a thing", json!({"type": "object"})),
+                |_input, _host| Ok(json!({"handler": "write"})),
+            )
+            .try_build()
+            .err()
+            .expect("duplicate handler must fail plugin assembly");
+        assert!(error.contains("duplicate plugin operation `acme.thing`"));
+        assert!(error.contains("conflicting declaration"));
+        assert!(error.contains("Read"), "{error}");
+        assert!(error.contains("Write"), "{error}");
+    }
+
+    #[test]
+    fn builder_rejects_distinct_handlers_projecting_the_same_public_name() {
+        let error = PluginBuilder::new("acme", "0.1.0")
+            .operation_flexible(
+                exposed_as(
+                    read_op("acme.first", "first", json!({"type": "object"})),
+                    "shared.lookup",
+                ),
+                |_input, _host| Ok(json!({"handler": "first"})),
+            )
+            .operation_flexible(
+                exposed_as(
+                    read_op("acme.second", "second", json!({"type": "object"})),
+                    "shared.lookup",
+                ),
+                |_input, _host| Ok(json!({"handler": "second"})),
+            )
+            .try_build()
+            .err()
+            .expect("duplicate public operation must fail plugin assembly");
+        assert!(error.contains("acme.first"), "{error}");
+        assert!(error.contains("acme.second"), "{error}");
+        assert!(error.contains("shared.lookup"), "{error}");
+    }
+
+    #[test]
+    fn builder_rejects_manifest_handler_identity_drift() {
+        let error = PluginBuilder::new("acme", "0.1.0")
+            .operation_flexible(
+                read_op("acme.thing", "read a thing", json!({"type": "object"})),
+                |_input, _host| Ok(json!({"handler": "thing"})),
+            )
+            .map_operations(|operation| operation.name = "acme.renamed".into())
+            .try_build()
+            .err()
+            .expect("manifest and handler identities must stay paired");
+
+        assert!(
+            error.contains("manifest operation `acme.renamed` has no registered handler"),
+            "{error}"
+        );
+        assert!(
+            error.contains("handler operation `acme.thing` has no manifest declaration"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn builder_dispatches_ops_and_host_calls_work() {
         let plugin = PluginBuilder::new("acme", "0.1.0")
@@ -1662,7 +2162,7 @@ mod tests {
                 http_hosts: vec!["acme.example.com".into()],
                 ..Default::default()
             })
-            .operation(
+            .operation_flexible(
                 read_op("acme.thing", "fetch a thing", json!({"type": "object"})),
                 |_input, host| {
                     // Ref-based IO: the endpoint is addressed by name; the host resolves the URL
@@ -1710,14 +2210,14 @@ mod tests {
     fn output_schema_via_combinator_and_map_operations() {
         let out = json!({ "type": "object", "properties": { "id": { "type": "string" } } });
         let plugin = PluginBuilder::new("acme", "0.1.0")
-            .operation(
+            .operation_flexible(
                 with_output_schema(
                     read_op("acme.get", "get a thing", json!({ "type": "object" })),
                     out.clone(),
                 ),
                 |_input, _host| Ok(json!({ "id": "1" })),
             )
-            .operation(
+            .operation_flexible(
                 read_op("acme.list", "list things", json!({ "type": "object" })),
                 |_input, _host| Ok(json!([])),
             )
@@ -1954,11 +2454,11 @@ mod tests {
 
         // A manifest carrying one public + one internal op projects only the public one.
         let manifest = PluginBuilder::new("aws-bedrock", "0.1.0")
-            .operation(
+            .operation_flexible(
                 read_op("aws-bedrock.chat", "run a turn", json!({})),
                 |_, _| Ok(json!({"ok": true})),
             )
-            .operation(
+            .operation_flexible(
                 internal_op("aws-bedrock.auth", "resolve creds", json!({})),
                 |_, _| Ok(json!({"access_key": "AKID"})),
             )
@@ -1980,7 +2480,7 @@ mod tests {
     #[test]
     fn validate_op_is_auto_registered_and_internal() {
         let plugin = PluginBuilder::new("acme", "0.1.0")
-            .operation(read_op("acme.ping", "ping", json!({})), |_, _| {
+            .operation_flexible(read_op("acme.ping", "ping", json!({})), |_, _| {
                 Ok(json!({"ok": true}))
             })
             .build();
@@ -2011,7 +2511,7 @@ mod tests {
             "additionalProperties": false,
         });
         let plugin = PluginBuilder::new("acme", "0.1.0")
-            .operation(read_op("acme.thing", "fetch", schema), |_, _| {
+            .operation_flexible(read_op("acme.thing", "fetch", schema), |_, _| {
                 Ok(json!({"fetched": true}))
             })
             // A custom rule the schema can't express: `name` may not be "root".

@@ -32,14 +32,19 @@ pub(crate) fn register(
     bus: Bus,
     channels: Arc<Vec<ChannelDecl>>,
     host: Weak<dyn JourneyHost>,
-) {
-    registry.register(Arc::new(EmitOp { bus: bus.clone() }));
-    registry.register(Arc::new(SendOp {
-        bus: bus.clone(),
-        channels: channels.clone(),
-    }));
-    registry.register(Arc::new(AskOp { bus, channels }));
-    registry.register(Arc::new(SpawnOp { host }));
+) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-app orchestration pack",
+        vec![
+            Arc::new(EmitOp { bus: bus.clone() }) as Arc<dyn Tool>,
+            Arc::new(SendOp {
+                bus: bus.clone(),
+                channels: channels.clone(),
+            }),
+            Arc::new(AskOp { bus, channels }),
+            Arc::new(SpawnOp { host }),
+        ],
+    )
 }
 
 /// A spec for an in-process orchestration verb. The op itself does no host IO (so it declares no host

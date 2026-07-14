@@ -37,7 +37,8 @@ pub mod util;
 
 use std::sync::Arc;
 
-use flux_runtime::ToolRegistry;
+use flux_core::Result;
+use flux_runtime::{Tool, ToolRegistry};
 
 /// Register the eval / self-improvement ops onto a tool registry (mirrors
 /// [`flux_tools::register_builtins`](https://docs.rs/flux-tools)).
@@ -45,31 +46,37 @@ use flux_runtime::ToolRegistry;
 /// Wire this on the **top-level** registry only — these ops orchestrate eval runs and (later) mutate
 /// git, so they belong to the outer flow, never to a worker sub-agent's scoped toolset.
 pub fn register_eval_ops(registry: &mut ToolRegistry) {
+    try_register_eval_ops(registry).expect("flux-eval operation pack registration failed");
+}
+
+/// Fallibly register the eval/self-improvement pack with one auditable source label.
+pub fn try_register_eval_ops(registry: &mut ToolRegistry) -> Result<()> {
     // Eval substrate.
-    registry.register(Arc::new(ops::EvalRunTool));
-    registry.register(Arc::new(ops::EvalSessionsTool));
-    registry.register(Arc::new(ops::SessionsDigestTool));
-    registry.register(Arc::new(ops::PainpointsCollectTool));
-    registry.register(Arc::new(ops::EvalReportMdTool));
-    registry.register(Arc::new(ops::ImproveLogTool));
-    registry.register(Arc::new(ops::EvalAdoptTool));
-    registry.register(Arc::new(ops::EvalScalarTool));
-    registry.register(Arc::new(ops::ScoreCompareTool));
-    registry.register(Arc::new(ops::ScoreCompareMultiTool));
-    registry.register(Arc::new(ops::GradeTool));
-    // Aggregate → candidates + loop control.
-    registry.register(Arc::new(aggregate::ImprovementsAggregateTool));
-    registry.register(Arc::new(aggregate::CandidatesEmptyTool));
-    registry.register(Arc::new(aggregate::CandidatesAdvanceTool));
-    registry.register(Arc::new(ops::ChangeImplementTool));
-    // Keep/commit/revert loop. `git_commit`/`git_stage` are built-ins (flux-tools); we add only what
-    // they lack: a HEAD+clean snapshot, tagging, and a hard-reset revert.
-    registry.register(Arc::new(gate::GateCheckTool));
-    registry.register(Arc::new(git::GitSnapshotTool));
-    registry.register(Arc::new(git::GitTagTool));
-    registry.register(Arc::new(git::GitRevertTool));
-    // Integrity: restore grader/harness/CI after the worker runs (anti-gaming).
-    registry.register(Arc::new(git::GuardProtectedTool));
+    registry.try_register_all_from(
+        "flux-eval self-improvement pack",
+        vec![
+            Arc::new(ops::EvalRunTool) as Arc<dyn Tool>,
+            Arc::new(ops::EvalSessionsTool),
+            Arc::new(ops::SessionsDigestTool),
+            Arc::new(ops::PainpointsCollectTool),
+            Arc::new(ops::EvalReportMdTool),
+            Arc::new(ops::ImproveLogTool),
+            Arc::new(ops::EvalAdoptTool),
+            Arc::new(ops::EvalScalarTool),
+            Arc::new(ops::ScoreCompareTool),
+            Arc::new(ops::ScoreCompareMultiTool),
+            Arc::new(ops::GradeTool),
+            Arc::new(aggregate::ImprovementsAggregateTool),
+            Arc::new(aggregate::CandidatesEmptyTool),
+            Arc::new(aggregate::CandidatesAdvanceTool),
+            Arc::new(ops::ChangeImplementTool),
+            Arc::new(gate::GateCheckTool),
+            Arc::new(git::GitSnapshotTool),
+            Arc::new(git::GitTagTool),
+            Arc::new(git::GitRevertTool),
+            Arc::new(git::GuardProtectedTool),
+        ],
+    )
 }
 
 /// The evidence-gated [`ToolGroup`](flux_evidence::ToolGroup) bundling every eval / self-improvement
@@ -78,7 +85,7 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
 /// back from [`register_eval_ops`] so the group can never drift from the registered ops.
 pub fn eval_group() -> flux_evidence::ToolGroup {
     let mut reg = ToolRegistry::new();
-    register_eval_ops(&mut reg);
+    try_register_eval_ops(&mut reg).expect("eval group catalog registration failed");
     flux_evidence::ToolGroup {
         name: "eval".into(),
         description: "Evaluation & self-improvement operations (improve-tbench.flux).".into(),

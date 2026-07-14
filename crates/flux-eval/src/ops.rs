@@ -637,6 +637,7 @@ impl Tool for GradeTool {
         )
         // A `command` criterion shells out to a checker, so be honest about the process effect.
         .with_effects(vec![Effect::Read, Effect::Process])
+        .with_access(vec![AccessKind::Filesystem, AccessKind::Process])
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {

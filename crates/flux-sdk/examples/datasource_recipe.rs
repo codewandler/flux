@@ -5,7 +5,7 @@
 //! the wrong contract (see the "Out of scope" note in `docs/designs/sdk-surface.md`). Until then,
 //! the recipe below is the supported way to give an embedded agent retrieval ops: add a direct
 //! `flux-capabilities` dependency, build a backend, and register its ops through the existing
-//! [`FlowClient::register_pack`] (or [`ClientBuilder::register_pack`]) seam. The registered
+//! [`FlowClient::try_register_pack`] (or [`ClientBuilder::try_register_pack`]) seam. The registered
 //! `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops dispatch through the same
 //! authorization → approval → guarded-IO envelope as every built-in.
 //!
@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flux_capabilities::{
-    ingest_markdown, register_datasource_ops, DatasourceBackend, MemoryBackend,
+    ingest_markdown, try_register_datasource_ops, DatasourceBackend, MemoryBackend,
 };
 use flux_core::{Chunk, Result};
 use flux_provider::{ChunkStream, Provider, Request};
@@ -46,12 +46,14 @@ async fn main() -> Result<()> {
     )];
     ingest_markdown(&*backend, "local", &docs)?;
 
-    // 2. Register the retrieval ops against the backend via `register_pack` — the same seam any
+    // 2. Register the retrieval ops against the backend via `try_register_pack` — the same seam any
     //    op-pack uses. `move` hands the shared backend into the installer.
     let mut client = FlowClient::builder()
         .auto_approve(true)
         .build(Arc::new(NoopProvider), ".")?;
-    client.register_pack(move |registry| register_datasource_ops(registry, backend.clone()));
+    client.try_register_pack(move |registry| {
+        try_register_datasource_ops(registry, backend.clone())
+    })?;
 
     // 3. The retrieval ops are now part of the agent's catalog, gated by the safety envelope.
     let ops = client.op_names();
