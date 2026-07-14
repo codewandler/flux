@@ -27,16 +27,42 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use flux_core::{Chunk, Error, Result, Usage};
-use flux_evidence::{Observation, Phase};
+use flux_evidence::{EvidenceLog, Observation, Phase};
 use flux_lang::ast::{FlowEffect, TypeRef};
 use flux_lang::opspec::{OpSpec, Param};
 use flux_provider::{Effort, Provider, Request};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Idempotency, Risk, ToolSpec};
 
 /// Token budget for a single cognition completion. Generous enough for a synthesized answer or an
 /// extracted array, bounded so a runaway generation can't burn the whole context.
 const MAX_TOKENS: u32 = 4096;
+
+/// Evidence kind emitted once for every cognition call that reports billable usage.
+pub const USAGE_OBSERVATION_KIND: &str = "cognition.usage";
+
+/// Sum the independent cognition calls recorded in an evidence log.
+///
+/// Direct SDK/App flow runners do not install a turn-owning [`LoopHost`], so their structured
+/// result reads this side channel after execution. Each cognition op owns a fresh prompt; every
+/// usage field therefore adds via [`Usage::sum_independent`] rather than the adaptive agent loop's
+/// context-snapshot semantics.
+pub fn recorded_usage(evidence: &EvidenceLog) -> Option<Usage> {
+    let mut total = Usage::default();
+    let mut any = false;
+    for observation in evidence.by_kind(USAGE_OBSERVATION_KIND) {
+        let Some(usage) = observation
+            .data
+            .get("usage")
+            .and_then(|value| serde_json::from_value::<Usage>(value.clone()).ok())
+        else {
+            continue;
+        };
+        total.sum_independent(&usage);
+        any = true;
+    }
+    any.then_some(total)
+}
 
 /// The six cognition ops. One enum keeps the [`Tool`] implementation DRY while still registering a
 /// distinct, independently-dispatchable op per variant (each variant owns the same provider/model).
@@ -280,37 +306,120 @@ impl Tool for CognitionOp {
             ),
             _ => self.kind.system().to_string(),
         };
-        let (out, usage) = run_model(
+        // A retained engine context also retains its loop-host capability between turns. Publish
+        // into turn accounting only while a lexical/stored session is active; direct executor
+        // dispatches outside a turn still keep the evidence observation without contaminating the
+        // host's last or next turn total.
+        let turn_loop_host = ctx.session_id().and(ctx.loop_host.clone());
+        let mut usage_observation = UsageObservationGuard::new(
+            ctx.evidence.clone(),
+            turn_loop_host,
+            self.kind.name(),
+            self.provider.name().to_string(),
+            self.model.clone(),
+        );
+        let (result, usage) = run_model(
             self.provider.as_ref(),
             &self.model,
             &system,
             &prompt,
             self.thinking,
             self.effort,
+            &mut usage_observation,
         )
-        .await?;
-        // A cognition op is a real model call, but its token spend can't ride back through
-        // `ToolResult` (a plain string). Record it on the shared evidence log — the same side-channel
-        // `subagent.usage` uses — so a `FlowClient` run can sum what its cognition ops cost
-        // (`ExecutionResult.usage`, D-150). A call the provider reported no usage for (e.g. the `mock`
-        // provider) records nothing, so a free run stays `usage: None`.
-        if usage.total() > 0 {
-            ctx.evidence.lock().unwrap().record(Observation::new(
-                "cognition.usage",
-                Phase::Turn,
-                serde_json::json!({
-                    "op": self.kind.opspec().name,
-                    "model": self.model,
-                    "usage": usage,
-                }),
-            ));
-        }
+        .await;
+        // Usage is independent from the provider result: a declared stream failure after a usage
+        // frame still cost tokens. Record before propagating the untouched error. The guard's Drop
+        // path performs the same one-shot recording if cancellation drops this future mid-stream.
+        usage_observation.finish(usage);
+        let out = result?;
         Ok(ToolResult::ok(out))
     }
 }
 
+/// One cognition call's usage observation. Normal completion calls [`Self::finish`]; dropping an
+/// in-flight operation (turn cancellation, timeout/race loser, or task abort) records the latest
+/// usage snapshot already observed by the stream collector. `recorded` makes the two paths mutually
+/// exclusive, so successful and failed calls cannot be double-counted.
+struct UsageObservationGuard {
+    evidence: Arc<std::sync::Mutex<EvidenceLog>>,
+    loop_host: Option<Arc<dyn LoopHost>>,
+    op: &'static str,
+    provider: String,
+    model: String,
+    usage: Usage,
+    recorded: bool,
+}
+
+impl UsageObservationGuard {
+    fn new(
+        evidence: Arc<std::sync::Mutex<EvidenceLog>>,
+        loop_host: Option<Arc<dyn LoopHost>>,
+        op: &'static str,
+        provider: String,
+        model: String,
+    ) -> Self {
+        Self {
+            evidence,
+            loop_host,
+            op,
+            provider,
+            model,
+            usage: Usage::default(),
+            recorded: false,
+        }
+    }
+
+    /// Provider usage chunks are cumulative within one call, so the last observed snapshot wins.
+    fn observe(&mut self, usage: &Usage) {
+        self.usage = usage.clone();
+    }
+
+    fn finish(&mut self, usage: Usage) {
+        self.observe(&usage);
+        self.record();
+    }
+
+    fn record(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        // Preserve the established D-150 behavior: a provider that reports no billable tokens
+        // produces no observation, so downstream execution totals remain `None` rather than zero.
+        if self.usage.total() == 0 {
+            return;
+        }
+        let usage = self.usage.clone();
+        let observation = Observation::new(
+            USAGE_OBSERVATION_KIND,
+            Phase::Turn,
+            serde_json::json!({
+                "op": self.op,
+                "provider": &self.provider,
+                "model": &self.model,
+                "usage": &usage,
+            }),
+        );
+        // Drop must never panic while another failure is unwinding. A poisoned evidence lock is
+        // already unusable; leave the original provider/cancellation terminal state untouched.
+        if let Ok(mut evidence) = self.evidence.lock() {
+            evidence.record(observation);
+        }
+        if let Some(loop_host) = &self.loop_host {
+            loop_host.record_model_usage(&self.provider, &self.model, usage);
+        }
+    }
+}
+
+impl Drop for UsageObservationGuard {
+    fn drop(&mut self) {
+        self.record();
+    }
+}
+
 /// A provider-injected pack of model-backed cognition ops. Construct it with the provider/model the
-/// host has configured, then [`register`](Self::register) every op into a [`ToolRegistry`].
+/// host has configured, then [`try_register`](Self::try_register) every op into a [`ToolRegistry`].
 pub struct CognitionPack {
     provider: Arc<dyn Provider>,
     model: String,
@@ -353,24 +462,74 @@ impl CognitionPack {
 
     /// Register every cognition op (`ai.extract`, `ai.rank`, `ai.judge`, `ai.reason`, `synth`,
     /// `ai.rewrite`) into `registry`. Each op shares this pack's provider and model.
-    pub fn register(&self, registry: &mut ToolRegistry) {
-        for kind in OpKind::ALL {
-            registry.register(Arc::new(CognitionOp {
+    pub fn try_register(&self, registry: &mut ToolRegistry) -> Result<()> {
+        self.try_register_from("flux-cognition model operation pack", registry)
+    }
+
+    /// Register this pack with an explicit assembly-source label.
+    pub fn try_register_from(
+        &self,
+        source: impl Into<String>,
+        registry: &mut ToolRegistry,
+    ) -> Result<()> {
+        let tools = OpKind::ALL.into_iter().map(|kind| {
+            Arc::new(CognitionOp {
                 kind,
                 provider: self.provider.clone(),
                 model: self.model.clone(),
                 system_prefix: self.system_prefix.clone(),
                 thinking: self.thinking,
                 effort: self.effort,
-            }));
+            }) as Arc<dyn Tool>
+        });
+        registry.try_register_all_from(source, tools)
+    }
+
+    /// Intentionally replace this pack's canonical operation family.
+    ///
+    /// App uses this when a declared agent overrides the host model/persona. The operation names
+    /// are fixed by [`OpKind`], and the source label makes the otherwise-dangerous replacement
+    /// visible in registry diagnostics.
+    pub fn replace_from(
+        &self,
+        source: impl Into<String>,
+        registry: &mut ToolRegistry,
+    ) -> Result<()> {
+        let source = source.into();
+        let mut assembled = registry.clone();
+        for kind in OpKind::ALL {
+            assembled.replace_from(
+                source.clone(),
+                Arc::new(CognitionOp {
+                    kind,
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    system_prefix: self.system_prefix.clone(),
+                    thinking: self.thinking,
+                    effort: self.effort,
+                }),
+            )?;
         }
+        *registry = assembled;
+        Ok(())
+    }
+
+    /// Compatibility wrapper for callers that cannot yet propagate registry assembly errors.
+    ///
+    /// # Deprecated
+    ///
+    /// Production assembly should call [`try_register`](Self::try_register).
+    pub fn register(&self, registry: &mut ToolRegistry) {
+        self.try_register(registry)
+            .expect("flux-cognition pack registration failed");
     }
 }
 
 /// One single-shot text completion: stream and collect every [`Chunk::TextDelta`] plus the call's
-/// [`Usage`] (mirrors the `run_model` helper in `flux-flow`'s compiler). Provider usage chunks are
-/// cumulative within one call, so the last one wins; a provider that reports none yields a zero
-/// `Usage` (the caller records no observation for it).
+/// [`Usage`] (mirrors `flux-flow`'s result-plus-usage stream collector). Usage stays outside the
+/// call's [`Result`]: provider usage chunks are cumulative within one call, so the last one wins;
+/// a provider that reports none yields a zero `Usage`. `usage_observation` is updated as chunks are
+/// consumed so dropping this future can retain only the usage observed before cancellation.
 async fn run_model(
     provider: &dyn Provider,
     model: &str,
@@ -378,7 +537,8 @@ async fn run_model(
     prompt: &str,
     thinking: bool,
     effort: Option<Effort>,
-) -> Result<(String, Usage)> {
+    usage_observation: &mut UsageObservationGuard,
+) -> (Result<String>, Usage) {
     let req = Request::new(model.to_string(), prompt.to_string())
         .with_system(system.to_string())
         .with_max_tokens(MAX_TOKENS)
@@ -387,17 +547,24 @@ async fn run_model(
         Some(effort) => req.with_effort(effort),
         None => req,
     };
-    let mut stream = provider.stream(req).await?;
+    let mut stream = match provider.stream(req).await {
+        Ok(stream) => stream,
+        Err(error) => return (Err(error), Usage::default()),
+    };
     let mut out = String::new();
     let mut usage = Usage::default();
     while let Some(chunk) = stream.next().await {
-        match chunk? {
-            Chunk::TextDelta(t) => out.push_str(&t),
-            Chunk::Usage(u) => usage = u,
-            _ => {}
+        match chunk {
+            Ok(Chunk::TextDelta(t)) => out.push_str(&t),
+            Ok(Chunk::Usage(u)) => {
+                usage = u;
+                usage_observation.observe(&usage);
+            }
+            Ok(_) => {}
+            Err(error) => return (Err(error), usage),
         }
     }
-    Ok((out, usage))
+    (Ok(out), usage)
 }
 
 /// A required, non-optional param.
@@ -745,6 +912,78 @@ mod tests {
         }
     }
 
+    /// A declared provider failure can arrive after the provider has already reported billable
+    /// usage for the call. The error itself must remain the call's result; usage is an independent
+    /// accounting outcome.
+    struct UsageThenErrorProvider(Usage);
+
+    #[async_trait]
+    impl Provider for UsageThenErrorProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(Chunk::Usage(self.0.clone())),
+                Err(Error::Provider("declared stream failure".into())),
+            ])))
+        }
+    }
+
+    /// A stream that reports one usage snapshot, then remains pending until its owning cognition
+    /// future is cancelled/dropped. `pending` fires only after the usage chunk was consumed.
+    struct UsageThenPendingStream {
+        usage: Option<Usage>,
+        pending: Arc<tokio::sync::Notify>,
+    }
+
+    impl futures::Stream for UsageThenPendingStream {
+        type Item = Result<Chunk>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if let Some(usage) = self.usage.take() {
+                return std::task::Poll::Ready(Some(Ok(Chunk::Usage(usage))));
+            }
+            self.pending.notify_one();
+            std::task::Poll::Pending
+        }
+    }
+
+    struct UsageThenPendingProvider {
+        usage: Usage,
+        pending: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for UsageThenPendingProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(UsageThenPendingStream {
+                usage: Some(self.usage.clone()),
+                pending: self.pending.clone(),
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct UsageLoopHost(std::sync::Mutex<Vec<(String, String, Usage)>>);
+
+    impl LoopHost for UsageLoopHost {
+        fn record_model_usage(&self, provider: &str, model: &str, usage: Usage) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((provider.to_string(), model.to_string(), usage));
+        }
+    }
+
     /// D-150: a cognition op's model call was billing tokens that got dropped on the floor. It now
     /// records a `cognition.usage` observation (op + model + the call's `Usage`) on the shared
     /// evidence log — the side-channel a `FlowClient` run reads to sum `ExecutionResult.usage`.
@@ -757,7 +996,10 @@ mod tests {
         };
         let mut reg = ToolRegistry::new();
         CognitionPack::new(Arc::new(UsageProvider(usage)), "test-model").register(&mut reg);
-        let ctx = ctx();
+        let host = Arc::new(UsageLoopHost::default());
+        let mut ctx = ctx();
+        ctx.set_session("test-session");
+        ctx.loop_host = Some(host.clone());
         reg.get("ai.extract")
             .unwrap()
             .execute(&ctx, json!({ "from": "x", "ask": "y" }))
@@ -772,6 +1014,118 @@ mod tests {
         let u: Usage = serde_json::from_value(recorded[0].data["usage"].clone()).unwrap();
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 20);
+        assert_eq!(
+            host.0.lock().unwrap().len(),
+            1,
+            "normal completion publishes turn usage once"
+        );
+    }
+
+    /// C-66: usage observed before a declared provider error is still billable. It must be recorded
+    /// exactly once without wrapping or replacing the provider's original error.
+    #[tokio::test]
+    async fn cognition_op_retains_usage_before_declared_provider_error() {
+        let usage = Usage {
+            input_tokens: 73,
+            output_tokens: 11,
+            ..Default::default()
+        };
+        let mut reg = ToolRegistry::new();
+        CognitionPack::new(
+            Arc::new(UsageThenErrorProvider(usage.clone())),
+            "test-model",
+        )
+        .register(&mut reg);
+        let host = Arc::new(UsageLoopHost::default());
+        let mut ctx = ctx();
+        ctx.set_session("test-session");
+        ctx.loop_host = Some(host.clone());
+
+        let error = reg
+            .get("ai.extract")
+            .unwrap()
+            .execute(&ctx, json!({ "from": "x" }))
+            .await
+            .expect_err("the declared provider failure remains terminal");
+        match error {
+            Error::Provider(message) => assert_eq!(message, "declared stream failure"),
+            other => panic!("expected the original provider error, got {other:?}"),
+        }
+
+        let recorded: Vec<_> = ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .by_kind("cognition.usage")
+            .cloned()
+            .collect();
+        assert_eq!(recorded.len(), 1, "failed call usage is recorded once");
+        let recorded_usage: Usage =
+            serde_json::from_value(recorded[0].data["usage"].clone()).unwrap();
+        assert_eq!(recorded_usage, usage);
+        assert_eq!(
+            host.0.lock().unwrap().as_slice(),
+            &[("mock".into(), "test-model".into(), usage)],
+            "turn accounting sees the failed call exactly once"
+        );
+    }
+
+    /// C-66: cancelling the task drops the in-flight cognition future. Drop-time accounting keeps
+    /// the last usage snapshot that was actually observed, while Tokio still reports cancellation
+    /// as the terminal state (rather than a fabricated provider success/error).
+    #[tokio::test]
+    async fn cognition_op_retains_observed_usage_when_cancelled_and_dropped() {
+        let usage = Usage {
+            input_tokens: 41,
+            output_tokens: 3,
+            ..Default::default()
+        };
+        let pending = Arc::new(tokio::sync::Notify::new());
+        let mut reg = ToolRegistry::new();
+        CognitionPack::new(
+            Arc::new(UsageThenPendingProvider {
+                usage: usage.clone(),
+                pending: pending.clone(),
+            }),
+            "test-model",
+        )
+        .register(&mut reg);
+        let tool = reg.get("ai.extract").unwrap();
+        let host = Arc::new(UsageLoopHost::default());
+        let mut ctx = ctx();
+        ctx.set_session("test-session");
+        ctx.loop_host = Some(host.clone());
+        let run_ctx = ctx.clone();
+        let task =
+            tokio::spawn(async move { tool.execute(&run_ctx, json!({ "from": "x" })).await });
+
+        pending.notified().await;
+        task.abort();
+        let terminal = task.await.expect_err("aborting drops the cognition future");
+        assert!(
+            terminal.is_cancelled(),
+            "cancellation remains the terminal state: {terminal}"
+        );
+
+        let recorded: Vec<_> = ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .by_kind("cognition.usage")
+            .cloned()
+            .collect();
+        assert_eq!(recorded.len(), 1, "drop records observed usage once");
+        let recorded_usage: Usage =
+            serde_json::from_value(recorded[0].data["usage"].clone()).unwrap();
+        assert_eq!(
+            recorded_usage, usage,
+            "only the observed snapshot is billed"
+        );
+        assert_eq!(
+            host.0.lock().unwrap().as_slice(),
+            &[("mock".into(), "test-model".into(), usage)],
+            "drop publishes the observed call to turn accounting once"
+        );
     }
 
     /// A free call (the `mock` provider reports no usage) records nothing — so a free run stays
@@ -779,7 +1133,10 @@ mod tests {
     #[tokio::test]
     async fn cognition_op_records_nothing_when_the_call_is_free() {
         let (_pack, reg) = pack("[]"); // MockProvider bills no usage
-        let ctx = ctx();
+        let host = Arc::new(UsageLoopHost::default());
+        let mut ctx = ctx();
+        ctx.set_session("test-session");
+        ctx.loop_host = Some(host.clone());
         reg.get("ai.extract")
             .unwrap()
             .execute(&ctx, json!({ "from": "x" }))
@@ -793,6 +1150,10 @@ mod tests {
                 .count(),
             0,
             "a call the provider billed nothing for records no usage observation"
+        );
+        assert!(
+            host.0.lock().unwrap().is_empty(),
+            "zero usage must not create a turn-accounting call"
         );
     }
 }

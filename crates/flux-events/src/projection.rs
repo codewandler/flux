@@ -342,14 +342,7 @@ pub struct ModelCost {
 /// and never re-derives a row's [`ModelCost::cost`] from this aggregate (see its doc comment for
 /// why that would silently under-report a mixed tabled/reported row).
 fn sum_usage(acc: &mut Usage, call: &Usage) {
-    acc.input_tokens += call.input_tokens;
-    acc.output_tokens += call.output_tokens;
-    acc.cache_creation_input_tokens += call.cache_creation_input_tokens;
-    acc.cache_read_input_tokens += call.cache_read_input_tokens;
-    acc.reasoning_tokens += call.reasoning_tokens;
-    if let Some(c) = call.reported_cost_usd {
-        *acc.reported_cost_usd.get_or_insert(0.0) += c;
-    }
+    acc.sum_independent(call);
 }
 
 /// Per-model running fold for [`cost_summary`]/[`EventStore::cost_summary_all`](crate::EventStore::cost_summary_all):

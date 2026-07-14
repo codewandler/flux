@@ -198,6 +198,23 @@ impl EngineLoopHost {
         ));
     }
 
+    /// Record a model call whose prompt is independent from the adaptive conversation. Cognition
+    /// ops each build a fresh single-shot request, so their input/cache counters add rather than
+    /// replacing the previous stage call's context snapshot.
+    fn record_independent_call(&self, provider: &str, model: &str, usage: Usage) {
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sum_independent(&usage);
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                flux_core::canonical_model_spec(Some(provider), model),
+                usage,
+            ));
+    }
+
     fn record_stage_usages(&self, provider: &str, model: &str, usages: Vec<Usage>) {
         for usage in usages {
             self.record_external_call(provider, model, usage);
@@ -481,6 +498,10 @@ fn validate_live_batch(
 
 #[async_trait]
 impl LoopHost for EngineLoopHost {
+    fn record_model_usage(&self, provider: &str, model: &str, usage: Usage) {
+        self.record_independent_call(provider, model, usage);
+    }
+
     async fn detect_intent(&self) -> Result<Value> {
         let (context, provider, _) = self.adaptive_context()?;
         let run = crate::staged::detect_intent_stage(context).await;

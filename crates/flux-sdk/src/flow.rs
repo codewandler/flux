@@ -45,11 +45,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use flux_cognition::CognitionPack;
+use flux_cognition::{recorded_usage, CognitionPack};
 use flux_core::{Error, Result, Usage};
 use flux_flow::ast::SymbolName;
 use flux_flow::registry::{analyze_composites, OpRegistry};
-use flux_flow::runtime::{execute_flow, execute_flow_with_composites, FlowOutcome};
+use flux_flow::runtime::{
+    execute_flow, execute_flow_with_composites, execute_plan, execute_plan_with_composites,
+    FlowOutcome,
+};
 use flux_flow::state::FlowStore;
 use flux_flow::{tool_defs_from_registry, AgentSink, VoiceSessionDriver, VoiceSink};
 use flux_lang::analyze::analyze_flow;
@@ -57,10 +60,13 @@ use flux_lang::prelude;
 use flux_lang::program::{CompositeOpDecl, Module};
 use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::{Provider, RealtimeConfig, RealtimeProvider};
+#[cfg(test)]
+use flux_runtime::ToolContext;
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
-    ToolRegistry,
+    AllowApprover, Approver, DenyApprover, ExecutionAuthorization, ExecutionEnvironment, Executor,
+    PermissionManager, Spawner, Tool, ToolRegistry,
 };
+use flux_secret::Redactor;
 use flux_system::sandbox::Sandbox;
 use flux_system::{System, Workspace};
 use serde::de::DeserializeOwned;
@@ -83,11 +89,23 @@ pub use flux_lang::prelude::{
 /// provider-backed [`CognitionPack`]. This single call is the wiring that makes the model-op pack
 /// (`ai.extract`/`rank`/`judge`/`reason`, `synth`, `ai.rewrite`) reachable as named ops: without it
 /// the pack is never installed and authored flows cannot call it.
-pub fn assemble_registry(provider: Arc<dyn Provider>, model: impl Into<String>) -> ToolRegistry {
+pub fn try_assemble_registry(
+    provider: Arc<dyn Provider>,
+    model: impl Into<String>,
+) -> Result<ToolRegistry> {
     let mut registry = ToolRegistry::new();
-    flux_tools::register_builtins(&mut registry);
-    CognitionPack::new(provider, model).register(&mut registry);
-    registry
+    flux_tools::try_register_builtins(&mut registry)?;
+    CognitionPack::new(provider, model).try_register(&mut registry)?;
+    Ok(registry)
+}
+
+/// Compatibility wrapper for callers that cannot yet propagate registry assembly errors.
+///
+/// # Deprecated
+///
+/// Use [`try_assemble_registry`]; it preserves both registration sources in duplicate diagnostics.
+pub fn assemble_registry(provider: Arc<dyn Provider>, model: impl Into<String>) -> ToolRegistry {
+    try_assemble_registry(provider, model).expect("FlowClient registry assembly failed")
 }
 
 /// Builder for a [`FlowClient`]. Shares the envelope knobs (permission rules, approval policy,
@@ -144,6 +162,22 @@ impl FlowClientBuilder {
         self.envelope.approver = Some(approver);
         self
     }
+    /// Install the mandatory authorization policy and resolved caller identity. It remains the
+    /// floor even when every approval prompt is auto-approved.
+    pub fn with_authorization(
+        mut self,
+        policy: flux_policy::AuthorizationPolicy,
+        caller: flux_policy::Caller,
+        trust: flux_policy::Trust,
+    ) -> Self {
+        self.envelope.authorization = ExecutionAuthorization::new(policy, caller, trust);
+        self
+    }
+    /// Install the shared secret redactor used by every per-run executor.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.envelope.redactor = redactor;
+        self
+    }
     /// Skip seeding the operation catalog `$defs` with the prelude artifact ontology (default: seed).
     pub fn without_prelude(mut self) -> Self {
         self.seed_prelude = false;
@@ -180,7 +214,7 @@ impl FlowClientBuilder {
         // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
         let sandbox = self.envelope.resolve_sandbox();
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
-        let registry = assemble_registry(provider.clone(), self.model.clone());
+        let registry = try_assemble_registry(provider.clone(), self.model.clone())?;
         let store = Arc::new(self.storage.unwrap_or_default().into_flow_store()?);
         let prelude_defs = if self.seed_prelude {
             prelude::prelude_schema()
@@ -196,6 +230,8 @@ impl FlowClientBuilder {
             deny: self.envelope.deny,
             auto_approve: self.envelope.auto_approve,
             approver: self.envelope.approver,
+            authorization: self.envelope.authorization,
+            redactor: self.envelope.redactor,
             prelude_defs,
             session_id: "flux-sdk".to_string(),
             spawner: None,
@@ -218,6 +254,10 @@ pub struct FlowClient {
     auto_approve: bool,
     /// Custom per-op approval policy (see [`FlowClientBuilder::approver`]); overrides `auto_approve`.
     approver: Option<Arc<dyn Approver>>,
+    /// Mandatory policy and identity profile cloned into every per-run executor.
+    authorization: ExecutionAuthorization,
+    /// Shared secret scrubber installed on every per-run execution environment.
+    redactor: Redactor,
     /// The merged `$defs` artifact map, seeded from `prelude_schema()` and extended by
     /// [`register_prelude`](Self::register_prelude); available for catalog enrichment / inspection.
     prelude_defs: Value,
@@ -263,15 +303,37 @@ impl FlowClient {
 
     /// Register a single extra op (any [`Tool`]) into the assembled registry.
     pub fn register_op(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
-        self.registry.register(tool);
-        self
+        self.try_register_op(tool)
+            .expect("FlowClient custom operation registration failed")
+    }
+
+    /// Fallible counterpart to [`register_op`](Self::register_op). New integrations should use
+    /// this form so a collision with a built-in or another custom pack is returned to the caller
+    /// with both registration sources instead of becoming a startup panic.
+    pub fn try_register_op(&mut self, tool: Arc<dyn Tool>) -> Result<&mut Self> {
+        self.registry
+            .try_register_from("sdk FlowClient custom operation", tool)?;
+        Ok(self)
     }
 
     /// Register a *pack* — any `FnOnce(&mut ToolRegistry)`, e.g. another
     /// `CognitionPack::register`-style installer or `flux_tools::register_dev_builtins`.
     pub fn register_pack<F: FnOnce(&mut ToolRegistry)>(&mut self, pack: F) -> &mut Self {
-        pack(&mut self.registry);
-        self
+        self.try_register_pack(|registry| {
+            pack(registry);
+            Ok(())
+        })
+        .expect("FlowClient custom pack registration failed")
+    }
+
+    /// Fallible pack-registration seam. Pack installers should use source-labelled `try_*`
+    /// registry methods so collisions identify both independently assembled contributors.
+    pub fn try_register_pack<F>(&mut self, pack: F) -> Result<&mut Self>
+    where
+        F: FnOnce(&mut ToolRegistry) -> Result<()>,
+    {
+        pack(&mut self.registry)?;
+        Ok(self)
     }
 
     /// Load an installed subprocess plugin (feature `plugins`) and register its operations as
@@ -287,7 +349,8 @@ impl FlowClient {
     ) -> Result<&mut Self> {
         let tools = crate::plugins::load_tools(&self.system, name, descriptor).await?;
         for tool in tools {
-            self.registry.register(tool);
+            self.registry
+                .try_register_from(format!("plugin:{name}"), tool)?;
         }
         Ok(self)
     }
@@ -304,13 +367,26 @@ impl FlowClient {
     /// session lineage and reporter; streamed execution pins the snapshot before `tokio::spawn`.
     /// A generous **default `wall_clock` (10 min)** remains the safety backstop in both cases; a
     /// consumer with longer-running work overrides it via [`SubAgents::with_limits`].
-    pub fn with_sub_agents(&mut self, mut sub_agents: SubAgents) -> &mut Self {
+    pub fn with_sub_agents(&mut self, sub_agents: SubAgents) -> &mut Self {
+        self.try_with_sub_agents(sub_agents)
+            .expect("FlowClient sub-agent operation registration failed")
+    }
+
+    /// Fallible counterpart to [`with_sub_agents`](Self::with_sub_agents).
+    pub fn try_with_sub_agents(&mut self, mut sub_agents: SubAgents) -> Result<&mut Self> {
         if sub_agents.limits.wall_clock.is_none() {
             sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
         }
-        self.registry.register(Arc::new(TaskTool));
+        sub_agents = sub_agents.with_authorization_cell(
+            self.authorization.policy().clone(),
+            self.authorization.identity(),
+        );
+        self.registry.try_register_from(
+            "sdk FlowClient sub-agent task operation",
+            Arc::new(TaskTool),
+        )?;
         self.spawner = Some(sub_agents.into_spawner(self.system.clone()));
-        self
+        Ok(self)
     }
 
     /// Attach named sub-agents with an explicit adaptive intent/explore policy for every child.
@@ -320,17 +396,34 @@ impl FlowClient {
     /// callers retain [`flux_agent::AdaptiveLoopPolicy::default`].
     pub fn with_sub_agents_policy(
         &mut self,
-        mut sub_agents: SubAgents,
+        sub_agents: SubAgents,
         adaptive_policy: flux_agent::AdaptiveLoopPolicy,
     ) -> &mut Self {
+        self.try_with_sub_agents_policy(sub_agents, adaptive_policy)
+            .expect("FlowClient sub-agent operation registration failed")
+    }
+
+    /// Fallible counterpart to [`with_sub_agents_policy`](Self::with_sub_agents_policy).
+    pub fn try_with_sub_agents_policy(
+        &mut self,
+        mut sub_agents: SubAgents,
+        adaptive_policy: flux_agent::AdaptiveLoopPolicy,
+    ) -> Result<&mut Self> {
         if sub_agents.limits.wall_clock.is_none() {
             sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
         }
-        self.registry.register(Arc::new(TaskTool));
+        sub_agents = sub_agents.with_authorization_cell(
+            self.authorization.policy().clone(),
+            self.authorization.identity(),
+        );
+        self.registry.try_register_from(
+            "sdk FlowClient sub-agent task operation",
+            Arc::new(TaskTool),
+        )?;
         self.spawner = Some(
             sub_agents.into_spawner_with_adaptive_policy(self.system.clone(), adaptive_policy),
         );
-        self
+        Ok(self)
     }
 
     /// Merge an artifact `$defs` map (e.g. [`flux_lang::prelude::prelude_schema`]) into the stashed
@@ -401,23 +494,16 @@ impl FlowClient {
     pub async fn execute(&self, ast: &DraftAst) -> Result<ExecutionResult> {
         let executor = self.build_executor();
         let mut sink = ExecSink::default();
-        // `execute_flow` returns `flux_flow::Result` (a `FlowError`); fold it into the SDK's
-        // `flux_core::Error` so the surface speaks one error type.
-        let outcome = if self.composites.is_empty() {
-            execute_flow(&self.store, &executor, &self.session_id, ast, &mut sink).await
-        } else {
-            execute_flow_with_composites(
-                &self.store,
-                &executor,
-                &self.session_id,
-                ast,
-                &self.composites,
-                &mut sink,
-            )
-            .await
-        }
-        .map_err(|e| Error::Other(e.to_string()))?;
-        finish_outcome(outcome, sink, cognition_usage(&executor))
+        let outcome = execute_kernel(
+            &self.store,
+            &executor,
+            &self.session_id,
+            ExecutionProgram::Flow(ast),
+            &self.composites,
+            &mut sink,
+        )
+        .await?;
+        finish_outcome(outcome, sink, recorded_usage(&executor.evidence()))
     }
 
     /// Execute `ast` with `inputs` seeded as flow variables (`$name`) **before** the run — the
@@ -449,21 +535,16 @@ impl FlowClient {
         }
         let executor = self.build_executor();
         let mut sink = ExecSink::default();
-        let outcome = if self.composites.is_empty() {
-            execute_flow(&store, &executor, &self.session_id, ast, &mut sink).await
-        } else {
-            execute_flow_with_composites(
-                &store,
-                &executor,
-                &self.session_id,
-                ast,
-                &self.composites,
-                &mut sink,
-            )
-            .await
-        }
-        .map_err(|e| Error::Other(e.to_string()))?;
-        finish_outcome(outcome, sink, cognition_usage(&executor))
+        let outcome = execute_kernel(
+            &store,
+            &executor,
+            &self.session_id,
+            ExecutionProgram::Flow(ast),
+            &self.composites,
+            &mut sink,
+        )
+        .await?;
+        finish_outcome(outcome, sink, recorded_usage(&executor.evidence()))
     }
 
     /// Execute `ast` while **streaming** every dispatch to your own [`AgentSink`] as it happens — each
@@ -480,26 +561,21 @@ impl FlowClient {
             consumer: sink,
             collect: Collector::default(),
         };
-        let outcome = if self.composites.is_empty() {
-            execute_flow(&self.store, &executor, &self.session_id, ast, &mut tee).await
-        } else {
-            execute_flow_with_composites(
-                &self.store,
-                &executor,
-                &self.session_id,
-                ast,
-                &self.composites,
-                &mut tee,
-            )
-            .await
-        }
-        .map_err(|e| Error::Other(e.to_string()))?;
+        let outcome = execute_kernel(
+            &self.store,
+            &executor,
+            &self.session_id,
+            ExecutionProgram::Flow(ast),
+            &self.composites,
+            &mut tee,
+        )
+        .await?;
         // The tee's collector holds the op names (as `TurnOutput.tool_calls`) for the result.
         let names = std::mem::take(&mut tee.collect.0.tool_calls);
         finish_outcome(
             outcome,
             ExecSink { tool_calls: names },
-            cognition_usage(&executor),
+            recorded_usage(&executor.evidence()),
         )
     }
 
@@ -521,25 +597,20 @@ impl FlowClient {
                 tx,
                 collect: Collector::default(),
             };
-            let outcome = if composites.is_empty() {
-                execute_flow(&store, &executor, &session_id, &ast, &mut sink).await
-            } else {
-                execute_flow_with_composites(
-                    &store,
-                    &executor,
-                    &session_id,
-                    &ast,
-                    &composites,
-                    &mut sink,
-                )
-                .await
-            }
-            .map_err(|e| Error::Other(e.to_string()))?;
+            let outcome = execute_kernel(
+                &store,
+                &executor,
+                &session_id,
+                ExecutionProgram::Flow(&ast),
+                &composites,
+                &mut sink,
+            )
+            .await?;
             let names = std::mem::take(&mut sink.collect.0.tool_calls);
             finish_outcome(
                 outcome,
                 ExecSink { tool_calls: names },
-                cognition_usage(&executor),
+                recorded_usage(&executor.evidence()),
             )
         });
         FlowStream {
@@ -584,35 +655,24 @@ impl FlowClient {
             .map_err(|d| Error::Other(format!("analyze: {}", join_diags(&d))))?;
         let executor = self.build_executor();
         let mut sink = ExecSink::default();
-        let outcome = if self.composites.is_empty() {
-            flux_flow::runtime::execute_plan(
-                &self.store,
-                &executor,
-                &self.session_id,
-                &ast.body,
-                &plan,
-                &mut sink,
-            )
-            .await
-        } else {
-            flux_flow::runtime::execute_plan_with_composites(
-                &self.store,
-                &executor,
-                &self.session_id,
-                &ast.body,
-                &plan,
-                &self.composites,
-                &mut sink,
-            )
-            .await
-        }
-        .map_err(|e| Error::Other(e.to_string()))?;
+        let outcome = execute_kernel(
+            &self.store,
+            &executor,
+            &self.session_id,
+            ExecutionProgram::Plan {
+                body: &ast.body,
+                plan: &plan,
+            },
+            &self.composites,
+            &mut sink,
+        )
+        .await?;
         Ok(ExecutionResult {
             result: outcome.result,
             transcript: outcome.transcript,
             steps: outcome.steps,
             tool_calls: sink.tool_calls,
-            usage: cognition_usage(&executor),
+            usage: recorded_usage(&executor.evidence()),
         })
     }
 
@@ -670,21 +730,66 @@ impl FlowClient {
             None if self.auto_approve => Arc::new(AllowApprover),
             None => Arc::new(DenyApprover),
         };
-        // Thread the sub-agent spawner into the per-run context when one is attached, so a `task` call
-        // can delegate. `None` (the common case) leaves the context exactly as before.
-        let mut ctx = ToolContext::new(self.system.clone());
+        let mut environment = ExecutionEnvironment::new(
+            self.system.clone(),
+            self.registry.clone(),
+            perms,
+            approver,
+            self.authorization.clone(),
+        )
+        .with_redactor(self.redactor.clone());
+        // Thread the sub-agent spawner into the per-run context when one is attached, so a `task`
+        // call can delegate. `None` (the common case) leaves the context exactly as before.
         if let Some(spawner) = &self.spawner {
-            ctx = ctx.with_spawner(spawner.clone());
+            environment = environment.with_spawner(spawner.clone());
         }
         // A guarded adapter may build this one-shot client while its parent runtime-turn context is
         // available only through a lexical task-local. Pin the COMPLETE snapshot (cancellation,
         // parent session and child reporter) onto this fresh per-run context before
         // `execute_streamed` moves it into `tokio::spawn`; Tokio task-locals do not propagate to a
         // new task. Outside a parent turn the snapshot is empty, preserving one-shot behavior.
-        let turn = ctx.runtime_turn_context();
-        ctx.set_runtime_turn_context(turn);
-        Executor::new(self.registry.clone(), perms, approver, ctx)
+        environment.inherit_runtime_turn().into_executor()
     }
+}
+
+/// The two interpreter entry shapes accepted by the SDK execution kernel. Keeping the shape here,
+/// rather than branching in every public method, makes plain/composite dispatch selection one
+/// auditable decision for direct, seeded, sink-backed, streamed, and optimized runs.
+enum ExecutionProgram<'a> {
+    Flow(&'a DraftAst),
+    Plan {
+        body: &'a [flux_flow::ast::Node],
+        plan: &'a flux_flow::ast::PhysicalPlan,
+    },
+}
+
+/// Run one flow or physical plan through the matching plain/composite interpreter adapter and fold
+/// the engine error into the SDK's single error type. Result collection stays with each public
+/// surface because streamed and consumer-sink runs own different collectors.
+async fn execute_kernel(
+    store: &FlowStore,
+    executor: &Executor,
+    session_id: &str,
+    program: ExecutionProgram<'_>,
+    composites: &[CompositeOpDecl],
+    sink: &mut dyn AgentSink,
+) -> Result<FlowOutcome> {
+    let outcome = match (program, composites.is_empty()) {
+        (ExecutionProgram::Flow(ast), true) => {
+            execute_flow(store, executor, session_id, ast, sink).await
+        }
+        (ExecutionProgram::Flow(ast), false) => {
+            execute_flow_with_composites(store, executor, session_id, ast, composites, sink).await
+        }
+        (ExecutionProgram::Plan { body, plan }, true) => {
+            execute_plan(store, executor, session_id, body, plan, sink).await
+        }
+        (ExecutionProgram::Plan { body, plan }, false) => {
+            execute_plan_with_composites(store, executor, session_id, body, plan, composites, sink)
+                .await
+        }
+    };
+    outcome.map_err(|e| Error::Other(e.to_string()))
 }
 
 /// The outcome of [`FlowClient::execute`]: the rendered result, the model-facing transcript (every
@@ -752,7 +857,7 @@ fn join_diags(diags: &[Diagnostic]) -> String {
 /// flow (its prefix's side effects fired, the remainder never will) is reported rather than silently
 /// returned — durable cross-turn `await` flows belong on the resumable session door. Shared by
 /// [`FlowClient::execute`] and [`FlowClient::execute_with`] so the two can't drift. `usage` is the
-/// run's summed cognition spend (see [`cognition_usage`]).
+/// run's summed cognition spend (see [`recorded_usage`]).
 fn finish_outcome(
     outcome: FlowOutcome,
     sink: ExecSink,
@@ -773,36 +878,6 @@ fn finish_outcome(
         tool_calls: sink.tool_calls,
         usage,
     })
-}
-
-/// Sum the token spend of the cognition ops dispatched during a run. Each `CognitionOp` records a
-/// `cognition.usage` observation on the shared evidence log (D-150); this reads them back off the
-/// executor's log and **sums every field** — cognition calls are independent single-shot completions
-/// (distinct prompts), not a re-sent conversation, so `Usage::accumulate`'s input-last-wins would
-/// undercount. `None` when no cognition op billed anything (a pure-ops flow, or a free provider).
-fn cognition_usage(executor: &Executor) -> Option<Usage> {
-    let mut total = Usage::default();
-    let mut any = false;
-    for obs in executor.evidence().by_kind("cognition.usage") {
-        if let Some(u) = obs
-            .data
-            .get("usage")
-            .and_then(|v| serde_json::from_value::<Usage>(v.clone()).ok())
-        {
-            total.input_tokens += u.input_tokens;
-            total.output_tokens += u.output_tokens;
-            total.cache_creation_input_tokens += u.cache_creation_input_tokens;
-            total.cache_read_input_tokens += u.cache_read_input_tokens;
-            total.reasoning_tokens += u.reasoning_tokens;
-            total.audio_input_tokens += u.audio_input_tokens;
-            total.audio_output_tokens += u.audio_output_tokens;
-            if let Some(c) = u.reported_cost_usd {
-                *total.reported_cost_usd.get_or_insert(0.0) += c;
-            }
-            any = true;
-        }
-    }
-    any.then_some(total)
 }
 
 #[cfg(test)]
@@ -1255,6 +1330,42 @@ mod tests {
         );
     }
 
+    /// C-60: authored-flow auto-approval cannot widen the explicitly installed policy floor.
+    #[tokio::test]
+    async fn flow_client_auto_approval_cannot_widen_authorization() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_hits = hits.clone();
+        let (caller, trust) = flux_policy::local_identity("flow-sdk-test");
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .with_authorization(flux_policy::AuthorizationPolicy::default(), caller, trust)
+            .build(MockProvider::one("noop"), temp_root("policy-floor"))
+            .unwrap();
+        client.register_op(flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "policy_probe",
+                "must not run",
+                json!({"type": "object"}),
+            )
+            .with_access(vec![flux_spec::AccessKind::Filesystem]),
+            move |_input| {
+                let hits = tool_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!("ran"))
+                }
+            },
+        ));
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [{"kind": "call", "op": "policy_probe", "args": []}]
+        }))
+        .unwrap();
+
+        let result = client.execute(&ast).await;
+        assert!(result.is_err(), "policy denial must halt the flow");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// D-67: a seeded object must marshal into an op **exactly** like a literal-bound one. The
     /// interpreter canonicalizes every `lit` bind to the JSON-as-string `Value::String` (the shape
     /// op results take), so a lone `$input` argument reaches arg marshaling as a *string* and
@@ -1417,6 +1528,120 @@ flow main
             view.symbols.iter().all(|s| s.name.0 != "local"),
             "composite local must not leak into caller view: {:?}",
             view.symbols
+        );
+    }
+
+    async fn execution_variants(client: &FlowClient, ast: &DraftAst) -> Vec<ExecutionResult> {
+        let direct = client.execute(ast).await.unwrap();
+        let seeded = client
+            .execute_with(ast, serde_json::Map::new())
+            .await
+            .unwrap();
+        let mut consumer = ExecSink::default();
+        let sink_backed = client.execute_with_sink(ast, &mut consumer).await.unwrap();
+        let streamed = client.execute_streamed(ast).finish().await.unwrap();
+        let optimized = client.execute_optimized(ast).await.unwrap();
+        vec![direct, seeded, sink_backed, streamed, optimized]
+    }
+
+    fn assert_execution_variant_parity(
+        results: &[ExecutionResult],
+        marker: &str,
+        expected_calls: &[&str],
+    ) {
+        assert_eq!(results.len(), 5, "all public execution variants ran");
+        let baseline = &results[0];
+        assert!(
+            baseline.result.contains(marker),
+            "baseline result must contain {marker:?}: {}",
+            baseline.result
+        );
+        assert_eq!(
+            baseline.tool_calls,
+            expected_calls
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
+        );
+        for (index, result) in results.iter().enumerate().skip(1) {
+            assert_eq!(
+                result.result, baseline.result,
+                "result drift at variant {index}"
+            );
+            assert_eq!(
+                result.transcript, baseline.transcript,
+                "transcript drift at variant {index}"
+            );
+            assert_eq!(
+                result.steps, baseline.steps,
+                "step drift at variant {index}"
+            );
+            assert_eq!(
+                result.tool_calls, baseline.tool_calls,
+                "tool-call drift at variant {index}"
+            );
+            assert_eq!(
+                result.usage, baseline.usage,
+                "usage drift at variant {index}"
+            );
+        }
+    }
+
+    /// C-71: every public one-shot path delegates the same plain/composite selection to the SDK
+    /// kernel. Pin both sides so a future execution surface cannot quietly choose a different
+    /// interpreter adapter or fold a different result shape.
+    #[tokio::test]
+    async fn execution_kernel_preserves_plain_and_composite_result_parity() {
+        let mut plain = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("kernel-plain"))
+            .unwrap();
+        plain.register_op(Arc::new(EchoArgsTool));
+        let plain_ast: DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "return",
+                "value": {
+                    "kind": "call",
+                    "op": "echo_args",
+                    "args": [{ "kind": "lit", "value": "KERNEL-PLAIN" }]
+                }
+            }]
+        }))
+        .unwrap();
+        let plain_results = execution_variants(&plain, &plain_ast).await;
+        assert_execution_variant_parity(&plain_results, "KERNEL-PLAIN", &["echo_args"]);
+
+        let mut composite = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("kernel-composite"))
+            .unwrap();
+        composite.register_op(Arc::new(EchoArgsTool));
+        let module = composite
+            .parse_module(
+                r#"
+op shout(value: String) -> String
+  description "kernel parity composite"
+  risk "low"
+  idempotency "idempotent"
+  effects [read]
+  expose true
+
+  return echo_args($value)
+
+flow main
+  return shout("KERNEL-COMPOSITE")
+"#,
+            )
+            .unwrap();
+        let Module::Program(program) = module else {
+            panic!("op declaration makes this a program");
+        };
+        composite.register_composites(program.ops);
+        let composite_results = execution_variants(&composite, &program.flows[0]).await;
+        assert_execution_variant_parity(
+            &composite_results,
+            "KERNEL-COMPOSITE",
+            &["shout", "echo_args"],
         );
     }
 
@@ -1588,6 +1813,22 @@ flow main
         assert!(client.prelude_defs().as_object().unwrap().is_empty());
         client.register_prelude(prelude::prelude_schema());
         assert!(client.prelude_defs().get("Answer").is_some());
+    }
+
+    #[test]
+    fn fallible_flow_registration_rejects_duplicate_custom_operations() {
+        let mut client = FlowClient::builder()
+            .build(MockProvider::one("noop"), temp_root("duplicate-register"))
+            .unwrap();
+        client.try_register_op(Arc::new(LookupTool)).unwrap();
+        let error = client
+            .try_register_op(Arc::new(LookupTool))
+            .err()
+            .expect("duplicate operation must fail flow client registration")
+            .to_string();
+
+        assert!(error.contains("duplicate operation `lookup`"));
+        assert!(error.contains("sdk FlowClient custom operation"));
     }
 
     /// A provider that bills a fixed [`Usage`] on every call — so a cognition op's model call has

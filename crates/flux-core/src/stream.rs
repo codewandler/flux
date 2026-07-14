@@ -91,6 +91,24 @@ impl Usage {
             *self.reported_cost_usd.get_or_insert(0.0) += c;
         }
     }
+
+    /// Add an independent model call field-by-field into this total.
+    ///
+    /// Unlike [`Self::accumulate`], this sums the input/cache side as well as generated output:
+    /// cognition operations, sub-agents, and separate journey calls each own a distinct prompt, so
+    /// none is a re-sent snapshot that should replace an earlier call's context occupancy.
+    pub fn sum_independent(&mut self, call: &Usage) {
+        self.input_tokens += call.input_tokens;
+        self.output_tokens += call.output_tokens;
+        self.cache_creation_input_tokens += call.cache_creation_input_tokens;
+        self.cache_read_input_tokens += call.cache_read_input_tokens;
+        self.reasoning_tokens += call.reasoning_tokens;
+        self.audio_input_tokens += call.audio_input_tokens;
+        self.audio_output_tokens += call.audio_output_tokens;
+        if let Some(cost) = call.reported_cost_usd {
+            *self.reported_cost_usd.get_or_insert(0.0) += cost;
+        }
+    }
 }
 
 /// Why the model stopped generating.
@@ -182,6 +200,39 @@ mod tests {
         assert_eq!(acc.output_tokens, 55);
         assert_eq!(acc.reasoning_tokens, 23);
         assert_eq!(acc.input_tokens, 150);
+    }
+
+    #[test]
+    fn usage_sum_independent_adds_every_counter_and_reported_cost() {
+        let mut total = Usage {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 2,
+            reasoning_tokens: 1,
+            audio_input_tokens: 2,
+            audio_output_tokens: 1,
+            reported_cost_usd: Some(0.25),
+        };
+        total.sum_independent(&Usage {
+            input_tokens: 20,
+            output_tokens: 8,
+            cache_creation_input_tokens: 6,
+            cache_read_input_tokens: 4,
+            reasoning_tokens: 2,
+            audio_input_tokens: 4,
+            audio_output_tokens: 2,
+            reported_cost_usd: Some(0.5),
+        });
+
+        assert_eq!(total.input_tokens, 30);
+        assert_eq!(total.output_tokens, 12);
+        assert_eq!(total.cache_creation_input_tokens, 9);
+        assert_eq!(total.cache_read_input_tokens, 6);
+        assert_eq!(total.reasoning_tokens, 3);
+        assert_eq!(total.audio_input_tokens, 6);
+        assert_eq!(total.audio_output_tokens, 3);
+        assert_eq!(total.reported_cost_usd, Some(0.75));
     }
 
     /// C-34: `reported_cost_usd` sums across calls like `output_tokens`/`reasoning_tokens` — a
