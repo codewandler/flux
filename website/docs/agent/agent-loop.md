@@ -111,13 +111,13 @@ adds provider transport milestones. Exact request bodies appear only with the ex
 
 ## Bound or tune the built-in stages
 
-One logical adaptive turn has a 12-call default ceiling spanning intent repair, exploration, and
+One logical adaptive turn has a 50-call default ceiling spanning intent repair, exploration, and
 every decision resume. Exceeding it fails clearly instead of returning an ungrounded answer. Use
 `--max-model-calls` for a one-off override, or configure the stages:
 
 ```toml
 [agent.adaptive]
-max_model_calls = 10
+max_model_calls = 50
 
 [agent.adaptive.intent]
 model = "codex/gpt-5.5"
@@ -134,6 +134,18 @@ max_calls = 8
 Missing values inherit the agent. Stage models must use the agent's existing provider; a matching
 provider prefix is stripped, while a cross-provider override fails before any request. SDK callers
 set the same policy through `AgentSpec` or the client builder.
+
+The authored decision/batch repeat has a separate 50-iteration default. It counts outer control-flow
+iterations, not provider calls. Override it with `--max-iterations`, `[agent] max_iterations`,
+`AgentSpec::max_iterations`, or the SDK builder's `max_iterations` method:
+
+```toml
+[agent]
+max_iterations = 50
+```
+
+An authored `ai_segment` owns a third, local bound: its required `max_rounds` is honored exactly and
+is not clamped to either normal-turn default. All three controls must be positive.
 
 ## Select or author a loop
 
@@ -154,6 +166,7 @@ runtime behavior. Project config can select it explicitly:
 ```toml
 [agent]
 loop = "loops/support.flux"
+max_iterations = 50
 ```
 
 Apps may define and select a loop in the same source file:

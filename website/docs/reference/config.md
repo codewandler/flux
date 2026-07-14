@@ -86,13 +86,21 @@ actions   = ["workspace.write"]
 `[agent] loop` is `"adaptive"` (the default) or a workspace-relative Flux-Lang file. Selection is
 explicit: `.flux/agent-loop.flux` has no effect merely because it exists.
 
-The shipped adaptive loop defaults to at most 12 provider calls across intent repair, exploration,
-and durable decision resumes. Its two built-in stages inherit the agent model, effort, and token
-limit unless overridden:
+The shipped adaptive loop defaults to at most 50 provider calls across intent repair, exploration,
+and durable decision resumes. The separate authored decision/batch repeat also defaults to 50
+iterations and can be configured alongside the loop selector:
+
+```toml
+[agent]
+loop = "adaptive"
+max_iterations = 50
+```
+
+Its two built-in stages inherit the agent model, effort, and token limit unless overridden:
 
 ```toml
 [agent.adaptive]
-max_model_calls = 10
+max_model_calls = 50
 
 [agent.adaptive.intent]
 model = "codex/gpt-5.5" # optional; must use the agent's provider
@@ -108,7 +116,9 @@ max_calls = 8
 
 All ceilings must be greater than zero. A matching provider prefix is accepted and stripped; a
 different provider fails during startup rather than opening another credential path. The CLI
-`--max-model-calls` flag overrides the configured total for one invocation.
+`--max-model-calls` overrides the configured provider-call total for one invocation;
+`--max-iterations` independently overrides the outer repeat. An authored `ai_segment.max_rounds`
+is its own exact local provider-call ceiling and is not clamped to either default.
 
 Config may register model-backed stages as ordinary typed guarded operations. Input and output have
 independent JSON Schemas; there is no common stage envelope:

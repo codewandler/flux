@@ -23,7 +23,7 @@ flow agent-loop -> string
   # Explore/decide/execute/revise is bounded. Every decision uses the same durable await, including
   # decisions discovered after an execution report. Each batch gets a separate aggregate approval
   # and a one-shot receipt; reports return to the same native ledger, so completed work is not rerun.
-  repeat 25
+  repeat 50
     until $done
     $kind = $step.kind
     match $kind

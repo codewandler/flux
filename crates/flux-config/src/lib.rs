@@ -148,6 +148,9 @@ pub struct AgentConfig {
     /// `adaptive` or a workspace-relative Flux-Lang source file. Absent selects `adaptive`.
     #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_spec: Option<String>,
+    /// Maximum decision/batch iterations in the authored outer loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<usize>,
     /// Named model stages registered as typed guarded operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stages: BTreeMap<String, ModelStageConfig>,
@@ -158,7 +161,10 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     fn is_default(&self) -> bool {
-        self.loop_spec.is_none() && self.stages.is_empty() && self.adaptive.is_default()
+        self.loop_spec.is_none()
+            && self.max_iterations.is_none()
+            && self.stages.is_empty()
+            && self.adaptive.is_default()
     }
 }
 
@@ -590,6 +596,7 @@ fn merge(user: Config, project: Config) -> Config {
         },
         agent: AgentConfig {
             loop_spec: project.agent.loop_spec.or(user.agent.loop_spec),
+            max_iterations: project.agent.max_iterations.or(user.agent.max_iterations),
             stages: {
                 let mut stages = user.agent.stages;
                 stages.extend(project.agent.stages);
@@ -955,6 +962,7 @@ mod tests {
             r#"
 [agent]
 loop = "loops/support.flux"
+max_iterations = 37
 
 [agent.adaptive]
 max_model_calls = 9
@@ -984,6 +992,7 @@ effort = "low"
             config.agent.loop_spec.as_deref(),
             Some("loops/support.flux")
         );
+        assert_eq!(config.agent.max_iterations, Some(37));
         assert_eq!(config.agent.adaptive.max_model_calls, Some(9));
         assert_eq!(
             config.agent.adaptive.intent.model.as_deref(),
@@ -1004,17 +1013,20 @@ effort = "low"
     #[test]
     fn adaptive_policy_merges_project_fields_without_dropping_user_defaults() {
         let mut user = Config::default();
+        user.agent.max_iterations = Some(41);
         user.agent.adaptive.max_model_calls = Some(11);
         user.agent.adaptive.intent.model = Some("fast-router".into());
         user.agent.adaptive.intent.max_tokens = Some(512);
         user.agent.adaptive.explore.effort = Some("medium".into());
 
         let mut project = Config::default();
+        project.agent.max_iterations = Some(37);
         project.agent.adaptive.max_model_calls = Some(8);
         project.agent.adaptive.intent.max_tokens = Some(768);
         project.agent.adaptive.explore.max_calls = Some(6);
 
         let merged = merge(user, project);
+        assert_eq!(merged.agent.max_iterations, Some(37));
         assert_eq!(merged.agent.adaptive.max_model_calls, Some(8));
         assert_eq!(
             merged.agent.adaptive.intent.model.as_deref(),

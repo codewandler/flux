@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 
 use flux_core::{Error, Message, Result, Usage};
 use flux_provider::{Effort, Provider};
-use flux_runtime::{CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, ToolResult};
+use flux_runtime::{
+    CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SpawnActivity,
+    SpawnActivitySink, ToolResult,
+};
 
 use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
 use crate::model::StageOptions;
@@ -152,6 +155,13 @@ impl EngineLoopHost {
         advertised: Option<HashSet<String>>,
         audit: Option<(Arc<flux_events::EventStore>, i64)>,
     ) {
+        // Snapshot this turn's owned channel into the L2 spawner reporter. A `task` call copies the
+        // Arc into its SpawnRequest, so later turns cannot retarget an already-running child.
+        if let Some(executor) = self.executor.upgrade() {
+            executor
+                .context()
+                .set_spawn_activity_sink(Arc::new(AgentSinkSpawnActivitySink(sink.clone())));
+        }
         self.conversation_cache
             .lock()
             .unwrap()
@@ -252,7 +262,6 @@ impl EngineLoopHost {
                 authored_ceiling: None,
                 groups,
                 opts: options,
-                max_native_rounds: 12,
                 remaining_token_budget,
                 adaptive_policy,
             },
@@ -336,13 +345,13 @@ impl EngineLoopHost {
         context.advertised = tools;
         context.authored_ceiling = Some(context.advertised.clone());
         context.conversation = vec![Message::user_text(goal)];
-        context.max_native_rounds = max_rounds.min(12);
+        context.adaptive_policy.max_model_calls = max_rounds;
+        context.adaptive_policy.explore.max_calls = None;
         let intent = crate::staged::scoped_segment_state(&context, goal)?;
         let mut next = json!({ "state": intent["state"].clone() });
         let mut remaining = max_rounds;
 
         while remaining > 0 {
-            context.max_native_rounds = remaining.min(12);
             let run = crate::staged::explore_stage(context.clone(), next).await;
             let spent = run.usages.len().max(1);
             remaining = remaining.saturating_sub(spent);
@@ -1055,5 +1064,18 @@ impl AgentSink for ChannelSink {
 
     fn turn_end(&mut self, usage: Option<Usage>) {
         let _ = self.0.send(SinkEvent::TurnEnd(usage));
+    }
+}
+
+/// L3 adapter from the owned parent [`AgentSink`] channel to the L2 spawner callback. Emission is
+/// synchronous and send-only (the wrapped [`ChannelSink`] just enqueues), so no lock crosses await.
+struct AgentSinkSpawnActivitySink(Arc<Mutex<dyn AgentSink>>);
+
+impl SpawnActivitySink for AgentSinkSpawnActivitySink {
+    fn emit(&self, activity: SpawnActivity) {
+        self.0
+            .lock()
+            .unwrap()
+            .observation(&activity.to_observation());
     }
 }

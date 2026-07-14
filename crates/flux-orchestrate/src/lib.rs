@@ -4,7 +4,9 @@
 //! A role is `.flux/agents/<name>.md` with frontmatter (`description`/`model`/`tools`) and a body
 //! used as the sub-agent's system prompt. [`LocalSpawner`] runs a role as an isolated sub-agent
 //! (fresh in-memory session, scoped toolset, auto-approved within its sandboxed tools) and returns
-//! its final text. Plan-and-dispatch builds on this (follow-up).
+//! its final text. When [`SpawnRequest::activity`] is present, it additionally reports correlated
+//! planning/tool/observation activity while keeping child thinking, prose, and result content private.
+//! Plan-and-dispatch builds on this (follow-up).
 
 // Agent roles + definitions live in the Agent-pillar crate (`flux-agent`); re-exported here so
 // `flux_orchestrate::{Role, RoleRegistry, parse_role}` keep resolving for consumers.
@@ -22,8 +24,9 @@ use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
-    ApprovalChoice, Approver, Executor, IdentityCell, PermissionManager, SpawnOutcome,
-    SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
+    ApprovalChoice, Approver, Executor, IdentityCell, PermissionManager, SpawnActivity,
+    SpawnActivityEvent, SpawnActivitySink, SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext,
+    ToolRegistry, ToolResult,
 };
 use flux_spec::{tool_input_schema, Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -75,6 +78,10 @@ impl Approver for SubAgentApprover {
 
 /// Produces a fresh provider per sub-agent (sub-agents can't share one `Box<dyn Provider>`).
 pub type ProviderFactory = Arc<dyn Fn() -> Result<Box<dyn Provider>> + Send + Sync>;
+
+/// Process-local correlation for live child activity. Ephemeral child stores each begin at `s_1`,
+/// so a session id alone cannot distinguish concurrent storeless spawns of the same role.
+static NEXT_SPAWN_ACTIVITY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Per-sub-agent resource limits. Defaults preserve the historical behaviour: 30 iterations (a
 /// planner that grounds a task in files or a worker that reads/edits/then runs the dev-gate needs
@@ -250,7 +257,9 @@ impl Spawner for LocalSpawner {
     /// is intersected into the role's own `tools` so a `task` invoked from inside a capability
     /// scope can never hand the child a broader tool set than the block that spawned it
     /// (capabilities only ever narrow on descent: role ∩ block scope). `request.parent_session`
-    /// is recorded as the child session's `correlation_id` (A-08).
+    /// is recorded as the child session's `correlation_id` (A-08). When `request.activity` is set,
+    /// the private child collector also emits correlated live lifecycle events; it still returns the
+    /// child's final prose only through [`SpawnOutcome`].
     async fn spawn(
         &self,
         request: SpawnRequest,
@@ -327,6 +336,7 @@ impl Spawner for LocalSpawner {
             .approver
             .clone()
             .unwrap_or_else(|| Arc::new(SubAgentApprover));
+        let activity_redactor = ctx.redactor.clone();
         let mut executor = Executor::new(registry, PermissionManager::new(), approver, ctx);
         if let Some((policy, cell)) = &self.auth {
             // Snapshot the *current* identity at spawn time: under a per-request surface the cell
@@ -389,7 +399,16 @@ impl Spawner for LocalSpawner {
         // included) without awaiting the child — so under `with_audit` a parent Ctrl-C can leave the
         // child's turn unterminated in the shared store. See docs/designs/sub-agent-hardening.md.
         let run_cancel = cancel.child_token();
-        let mut sink = TextCollector::default();
+        let spawn_id = NEXT_SPAWN_ACTIVITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut sink = TextCollector::new(
+            request.activity.clone(),
+            spawn_id,
+            role_name.to_string(),
+            session_id.clone(),
+            request.parent_session.clone(),
+            child_depth,
+            activity_redactor,
+        );
         match self.limits.wall_clock {
             Some(dur) => {
                 let run = engine.run_turn_cancellable(&session_id, task, &mut sink, &run_cancel);
@@ -422,12 +441,21 @@ impl Spawner for LocalSpawner {
         // the parent's model. `None` when the child billed nothing (e.g. `mock`, or no usage reported).
         let usage = engine.loop_host.turn_usage();
         let usage = (usage.total() > 0).then_some(usage);
+        let cancelled = sink.cancelled;
+        sink.finish(cancelled, usage.clone());
+        if cancelled {
+            return Err(Error::Other(format!(
+                "sub-agent '{role_name}' was cancelled"
+            )));
+        }
+        let text = std::mem::take(&mut sink.text);
+        let tool_calls = sink.tool_calls;
         Ok(SpawnOutcome {
-            text: sink.text,
+            text,
             model,
             usage,
             session_id,
-            tool_calls: sink.tool_calls,
+            tool_calls,
         })
     }
 }
@@ -565,20 +593,192 @@ impl SubAgents {
     }
 }
 
-#[derive(Default)]
 struct TextCollector {
     text: String,
     /// How many tool calls the child streamed — the cheap trace count `subagent.trace` reports.
     tool_calls: usize,
+    activity: Option<Arc<dyn SpawnActivitySink>>,
+    spawn_id: u64,
+    role: String,
+    child_session_id: String,
+    parent_session: Option<String>,
+    depth: usize,
+    redactor: flux_secret::Redactor,
+    next_call_id: u64,
+    pending: std::collections::HashMap<String, Vec<u64>>,
+    terminal_usage: Option<Usage>,
+    cancelled: bool,
+    terminal_emitted: bool,
 }
+
+impl TextCollector {
+    fn new(
+        activity: Option<Arc<dyn SpawnActivitySink>>,
+        spawn_id: u64,
+        role: String,
+        child_session_id: String,
+        parent_session: Option<String>,
+        depth: usize,
+        redactor: flux_secret::Redactor,
+    ) -> Self {
+        Self {
+            text: String::new(),
+            tool_calls: 0,
+            activity,
+            spawn_id,
+            role,
+            child_session_id,
+            parent_session,
+            depth,
+            redactor,
+            next_call_id: 0,
+            pending: std::collections::HashMap::new(),
+            terminal_usage: None,
+            cancelled: false,
+            terminal_emitted: false,
+        }
+    }
+
+    fn emit(&self, event: SpawnActivityEvent) {
+        if let Some(activity) = &self.activity {
+            activity.emit(SpawnActivity {
+                spawn_id: self.spawn_id,
+                role: self.role.clone(),
+                child_session_id: self.child_session_id.clone(),
+                parent_session: self.parent_session.clone(),
+                depth: self.depth,
+                event,
+            });
+        }
+    }
+
+    fn active_call(&self, name: &str) -> Option<u64> {
+        self.pending
+            .get(name)
+            .and_then(|calls| calls.last())
+            .copied()
+    }
+
+    /// Emit exactly one terminal event at the spawner boundary. `AgentSink::turn_end` alone is
+    /// insufficient: a timed-out child can finalize its engine turn and still make `spawn` fail.
+    fn finish(&mut self, is_error: bool, usage: Option<Usage>) {
+        if self.terminal_emitted {
+            return;
+        }
+        self.terminal_emitted = true;
+        self.emit(SpawnActivityEvent::Finished { usage, is_error });
+    }
+}
+
+impl Drop for TextCollector {
+    fn drop(&mut self) {
+        if !self.terminal_emitted {
+            // Covers engine errors, wall-clock returns, and cancellation dropping the in-flight
+            // spawner future. Drop is synchronous, so the parent sees a terminal failure even when
+            // no async cleanup path can be awaited.
+            self.finish(true, self.terminal_usage.clone());
+        }
+    }
+}
+
 impl AgentSink for TextCollector {
     fn text_delta(&mut self, t: &str) {
         self.text.push_str(t);
     }
-    fn tool_call(&mut self, _name: &str, _input: &serde_json::Value) {
-        self.tool_calls += 1;
+
+    // Intentionally do not forward `thinking_delta`: child reasoning is private even when the
+    // parent surface elects to show delegated activity.
+
+    fn planning(&mut self, active: bool) {
+        self.emit(SpawnActivityEvent::Planning { active });
     }
-    fn turn_end(&mut self, _u: Option<Usage>) {}
+
+    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+        self.tool_calls += 1;
+        if self.activity.is_none() {
+            return;
+        }
+        self.next_call_id += 1;
+        let call_id = self.next_call_id;
+        self.pending
+            .entry(name.to_string())
+            .or_default()
+            .push(call_id);
+        let mut input = input.clone();
+        redact_spawn_json(&self.redactor, &mut input);
+        self.emit(SpawnActivityEvent::ToolCall {
+            call_id,
+            name: name.to_string(),
+            input,
+        });
+    }
+
+    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+        if let Some(call_id) = self.active_call(name) {
+            self.emit(SpawnActivityEvent::ToolTiming {
+                call_id,
+                name: name.to_string(),
+                timing: *timing,
+            });
+        }
+    }
+
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        let Some(call_id) = self.pending.get_mut(name).and_then(Vec::pop) else {
+            return;
+        };
+        // Result content and error text stay inside the child/model transcript. Only the outcome
+        // bit crosses the live reporter contract.
+        self.emit(SpawnActivityEvent::ToolResult {
+            call_id,
+            name: name.to_string(),
+            is_error: result.is_error,
+        });
+    }
+
+    fn observation(&mut self, observation: &flux_evidence::Observation) {
+        if let Some(activity) = SpawnActivity::from_observation(observation) {
+            // A nested child already carries its originating role/session/depth/call id. Relay it
+            // unchanged so an intermediate collector cannot collapse or misattribute the scope.
+            if let Some(parent) = &self.activity {
+                parent.emit(activity);
+            }
+            return;
+        }
+        if observation.kind == "turn.cancelled" {
+            self.cancelled = true;
+        }
+        let mut observation = observation.clone();
+        redact_spawn_json(&self.redactor, &mut observation.data);
+        self.emit(SpawnActivityEvent::Observation { observation });
+    }
+
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        // Cache engine usage, but defer the terminal event until `LocalSpawner::spawn` knows
+        // whether the overall operation succeeded (a timeout may occur after engine finalization).
+        self.terminal_usage = usage;
+    }
+}
+
+fn redact_spawn_json(redactor: &flux_secret::Redactor, value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = redactor.redact(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_spawn_json(redactor, item);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            // JSON keys can contain credentials too (for example a model-generated header map).
+            // Rebuild the map so both keys and values cross the live reporter scrubbed.
+            let original = std::mem::take(fields);
+            for (key, mut value) in original {
+                redact_spawn_json(redactor, &mut value);
+                fields.insert(redactor.redact(&key), value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A simplified plan-and-dispatch: spawn the `planner` role to produce a plan for `goal`, then
@@ -822,6 +1022,7 @@ impl Tool for TaskTool {
             task: args.task.clone(),
             cap_scope: ctx.active_cap_scope(),
             parent_session: ctx.session_id(),
+            activity: ctx.spawn_activity_sink(),
         };
         match spawner.spawn(request, &cancel).await {
             Ok(outcome) => {
@@ -921,6 +1122,34 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn child_activity_redaction_scrubs_json_keys_and_values() {
+        const SECRET: &str = "SECRET-MAP-KEY-4711";
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret(SECRET);
+        let mut value = json!({
+            SECRET: SECRET,
+            "nested": [{ SECRET: format!("prefix-{SECRET}-suffix") }],
+        });
+
+        redact_spawn_json(&redactor, &mut value);
+
+        let encoded = value.to_string();
+        assert!(
+            !encoded.contains(SECRET),
+            "secret crossed activity: {encoded}"
+        );
+        assert!(encoded.contains("[redacted]"));
+        assert!(
+            value.get("[redacted]").is_some(),
+            "top-level key was not scrubbed"
+        );
+        assert!(
+            value["nested"][0].get("[redacted]").is_some(),
+            "nested key was not scrubbed"
+        );
+    }
+
     /// Mock provider: returns a fixed text reply (one canned turn).
     struct MockProvider;
     #[async_trait]
@@ -998,6 +1227,415 @@ mod tests {
             .spawn(SpawnRequest::new("nope", "x"), &cancel)
             .await
             .is_err());
+    }
+
+    /// A-79 failing-first: the child status/read lifecycle must reach the reporter WHILE the read
+    /// is still blocked, with stable role/session/call correlation. The final prose remains the
+    /// private SpawnOutcome instead of becoming an activity event.
+    #[tokio::test]
+    async fn spawn_streams_correlated_child_activity_before_the_child_finishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StatusTool;
+        #[async_trait]
+        impl Tool for StatusTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only("ui.status", "show progress", json!({"type": "object"}))
+                    .with_group("core")
+            }
+            async fn execute(&self, _ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok("status shown to the user"))
+            }
+        }
+
+        struct BlockingRead {
+            entered: tokio::sync::mpsc::UnboundedSender<()>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl Tool for BlockingRead {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only("account.read", "read config", json!({"type": "object"}))
+                    .with_group("core")
+            }
+            async fn execute(&self, _ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                let _ = self.entered.send(());
+                self.release.notified().await;
+                Ok(ToolResult::ok("PRIVATE-RESULT"))
+            }
+        }
+
+        struct ActivityProvider {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ActivityProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("inspect the account", &["core"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
+                let chunks = match self.calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => {
+                        let status = request
+                            .tools
+                            .iter()
+                            .find(|tool| {
+                                tool.name == "ui.status" || tool.name.starts_with("ui_status__")
+                            })
+                            .expect("ui.status is advertised")
+                            .name
+                            .clone();
+                        let mut chunks = native_call(
+                            "status-1",
+                            &status,
+                            json!({"message": "Checking account configuration"}),
+                        );
+                        chunks.insert(0, Chunk::ThinkingDelta("PRIVATE-REASONING".into()));
+                        chunks
+                    }
+                    1 => {
+                        let read = request
+                            .tools
+                            .iter()
+                            .find(|tool| {
+                                tool.name == "account.read"
+                                    || tool.name.starts_with("account_read__")
+                            })
+                            .expect("account.read is advertised")
+                            .name
+                            .clone();
+                        native_call("read-1", &read, json!({"query": "PRIVATE-QUERY"}))
+                    }
+                    _ => prose_chunks("child finished"),
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        #[derive(Default)]
+        struct CaptureActivity(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for CaptureActivity {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut child_tools = ToolRegistry::new();
+        child_tools.register(Arc::new(StatusTool));
+        child_tools.register(Arc::new(BlockingRead {
+            entered: entered_tx,
+            release: release.clone(),
+        }));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ui.status, account.read]\n---\nYou inspect account configuration.",
+            "config-admin",
+        ));
+        let spawner = Arc::new(LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(ActivityProvider {
+                    calls: AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            child_tools,
+            temp_system(),
+            "mock",
+            1024,
+        ));
+        let activity = Arc::new(CaptureActivity::default());
+        let mut request = SpawnRequest::new("config-admin", "inspect it");
+        request.parent_session = Some("parent-1".into());
+        request.activity = Some(activity.clone());
+        let run = tokio::spawn(async move {
+            spawner
+                .spawn(request, &CancellationToken::new())
+                .await
+                .unwrap()
+        });
+
+        if entered_rx.recv().await.is_none() {
+            let ended = run.await;
+            panic!("the child ended before its read began: {ended:?}");
+        }
+        let while_blocked = activity.0.lock().unwrap().clone();
+        release.notify_one();
+        let outcome = run.await.unwrap();
+
+        assert!(
+            while_blocked
+                .iter()
+                .any(|a| matches!(&a.event, SpawnActivityEvent::Planning { active: true })),
+            "child planning must reach the parent before the child finishes: {while_blocked:?}"
+        );
+        assert!(
+            while_blocked.iter().any(|a| matches!(
+                &a.event,
+                SpawnActivityEvent::ToolCall { name, .. } if name == "ui.status"
+            )),
+            "the status call must reach the parent before the child finishes: {while_blocked:?}"
+        );
+        assert!(
+            while_blocked.iter().any(|a| matches!(
+                &a.event,
+                SpawnActivityEvent::ToolCall { name, .. } if name == "account.read"
+            )),
+            "the blocked read must already be visible: {while_blocked:?}"
+        );
+
+        let all = activity.0.lock().unwrap().clone();
+        assert!(!all.is_empty());
+        let spawn_id = all[0].spawn_id;
+        assert!(spawn_id > 0 && all.iter().all(|a| a.spawn_id == spawn_id));
+        assert!(all.iter().all(|a| {
+            a.role == "config-admin"
+                && !a.child_session_id.is_empty()
+                && a.parent_session.as_deref() == Some("parent-1")
+        }));
+        let read_call = all.iter().find_map(|a| match &a.event {
+            SpawnActivityEvent::ToolCall { call_id, name, .. } if name == "account.read" => {
+                Some(*call_id)
+            }
+            _ => None,
+        });
+        assert!(all.iter().any(|a| matches!(
+            &a.event,
+            SpawnActivityEvent::ToolResult { call_id, name, is_error: false }
+                if name == "account.read" && Some(*call_id) == read_call
+        )));
+        let terminals: Vec<_> = all
+            .iter()
+            .filter_map(|activity| match &activity.event {
+                SpawnActivityEvent::Finished { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            terminals,
+            vec![false],
+            "one honest success terminal: {all:?}"
+        );
+        assert_eq!(outcome.text, "child finished");
+        assert!(
+            !format!("{all:?}").contains("PRIVATE-RESULT")
+                && !format!("{all:?}").contains("PRIVATE-REASONING"),
+            "result content and reasoning must remain private: {all:?}"
+        );
+    }
+
+    /// A storeless LocalSpawner creates a fresh in-memory event store per child, so both sessions
+    /// may be named `s_1`. The process-local spawn id must still disambiguate concurrent children
+    /// of the same role (the correlation key customer surfaces use for paired activity).
+    #[tokio::test]
+    async fn concurrent_storeless_children_get_distinct_activity_ids() {
+        #[derive(Default)]
+        struct Capture(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for Capture {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nYou are a worker.", "worker"));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        let activity = Arc::new(Capture::default());
+        let request = |task: &str| {
+            let mut request = SpawnRequest::new("worker", task);
+            request.parent_session = Some("parent".into());
+            request.activity = Some(activity.clone());
+            request
+        };
+
+        let left_cancel = CancellationToken::new();
+        let right_cancel = CancellationToken::new();
+        let (left, right) = tokio::join!(
+            spawner.spawn(request("left"), &left_cancel),
+            spawner.spawn(request("right"), &right_cancel),
+        );
+        assert_eq!(left.unwrap().text, "scouted: 3 files");
+        assert_eq!(right.unwrap().text, "scouted: 3 files");
+
+        let finished: Vec<_> = activity
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|activity| matches!(activity.event, SpawnActivityEvent::Finished { .. }))
+            .map(|activity| {
+                (
+                    activity.spawn_id,
+                    activity.role.clone(),
+                    activity.child_session_id.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(finished.len(), 2, "one completion per child: {finished:?}");
+        assert_ne!(finished[0].0, finished[1].0, "spawn ids must be unique");
+        assert!(finished.iter().all(|(_, role, _)| role == "worker"));
+    }
+
+    /// A-79 propagation seam: a real parent FlowEngine must derive the L2 reporter from its owned
+    /// turn channel and TaskTool must snapshot it into SpawnRequest. This complements the LocalSpawner
+    /// forwarding test above; together they pin the full parent-engine → task → child callback path.
+    #[tokio::test]
+    async fn parent_engine_derives_the_spawn_activity_reporter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ReportingSpawner;
+        #[async_trait]
+        impl Spawner for ReportingSpawner {
+            async fn spawn(
+                &self,
+                request: SpawnRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<SpawnOutcome> {
+                let reporter = request
+                    .activity
+                    .expect("TaskTool snapshots the active parent reporter");
+                for event in [
+                    SpawnActivityEvent::ToolCall {
+                        call_id: 7,
+                        name: "account.read".into(),
+                        input: json!({"query": "private"}),
+                    },
+                    SpawnActivityEvent::ToolResult {
+                        call_id: 7,
+                        name: "account.read".into(),
+                        is_error: false,
+                    },
+                ] {
+                    reporter.emit(SpawnActivity {
+                        spawn_id: 7,
+                        role: request.role.clone(),
+                        child_session_id: "child-7".into(),
+                        parent_session: request.parent_session.clone(),
+                        depth: 1,
+                        event,
+                    });
+                }
+                Ok(SpawnOutcome {
+                    text: "child answer".into(),
+                    model: "mock".into(),
+                    session_id: "child-7".into(),
+                    tool_calls: 1,
+                    ..Default::default()
+                })
+            }
+        }
+
+        struct ParentProvider {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ParentProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("delegate the read", &["process"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
+                let chunks = match self.calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => native_call(
+                        "task-1",
+                        "task",
+                        json!({"role": "config-admin", "task": "inspect it"}),
+                    ),
+                    1 => native_call(
+                        "finalize-1",
+                        "finalize_plan",
+                        json!({"instructions": "Report the delegated result."}),
+                    ),
+                    _ => prose_chunks("parent answer"),
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        #[derive(Default)]
+        struct ParentSink {
+            children: Vec<SpawnActivity>,
+            turn_ends: usize,
+        }
+        impl AgentSink for ParentSink {
+            fn observation(&mut self, observation: &flux_evidence::Observation) {
+                if let Some(activity) = SpawnActivity::from_observation(observation) {
+                    self.children.push(activity);
+                }
+            }
+            fn turn_end(&mut self, _usage: Option<Usage>) {
+                self.turn_ends += 1;
+            }
+        }
+
+        let system = temp_system();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TaskTool));
+        register_agent_ops(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["task".into()], &[]),
+            Arc::new(flux_runtime::AllowApprover),
+            ToolContext::new(system).with_spawner(Arc::new(ReportingSpawner)),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = flux_flow::engine::FlowEngine::assemble(
+            Arc::new(ParentProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            executor,
+            events.clone(),
+            flow,
+            "mock".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            std::env::temp_dir().join(format!("flux-orch-parent-activity-{}", std::process::id())),
+        )
+        .unwrap();
+        let session = events.create_session("mock").unwrap();
+        let mut sink = ParentSink::default();
+
+        engine
+            .run_turn(&session, "delegate this", &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(sink.children.len(), 2, "both child lifecycle events cross");
+        assert!(sink.children.iter().all(|a| {
+            a.role == "config-admin"
+                && a.child_session_id == "child-7"
+                && a.parent_session.as_deref() == Some(session.as_str())
+        }));
+        assert_eq!(
+            sink.turn_ends, 1,
+            "child completion cannot end the parent turn"
+        );
     }
 
     /// A mock provider that names a real provider (not `"mock"`) and records the `model` string it
@@ -1999,6 +2637,14 @@ mod tests {
     /// a typed timeout error, instead of letting a stuck sub-agent run forever.
     #[tokio::test]
     async fn wall_clock_deadline_aborts_a_hung_sub_agent() {
+        #[derive(Default)]
+        struct Capture(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for Capture {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
         let mut roles = RoleRegistry::default();
         roles.insert(parse_role("---\ntools: []\n---\nYou stall.", "sloth"));
         let spawner = LocalSpawner::new(
@@ -2016,12 +2662,12 @@ mod tests {
         });
 
         // The 5s guard fails the test (rather than hanging CI) if the deadline doesn't fire.
+        let activity = Arc::new(Capture::default());
+        let mut request = SpawnRequest::new("sloth", "spin forever");
+        request.activity = Some(activity.clone());
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            spawner.spawn(
-                SpawnRequest::new("sloth", "spin forever"),
-                &CancellationToken::new(),
-            ),
+            spawner.spawn(request, &CancellationToken::new()),
         )
         .await
         .expect("spawn should return by its wall-clock deadline, not hang");
@@ -2029,6 +2675,21 @@ mod tests {
         assert!(
             err.to_string().contains("wall-clock"),
             "expected a wall-clock timeout error, got: {err}"
+        );
+        let terminals: Vec<_> = activity
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|activity| match &activity.event {
+                SpawnActivityEvent::Finished { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            terminals,
+            vec![true],
+            "a timeout must emit exactly one failure terminal"
         );
     }
 
@@ -2560,6 +3221,7 @@ mod tests {
                     task: "go".into(),
                     cap_scope: Some(vec!["task".into(), "read".into()]),
                     parent_session: None,
+                    activity: None,
                 },
                 &CancellationToken::new(),
             )

@@ -1,6 +1,6 @@
 # Self-improvement: status & journey
 
-_Last updated: 2026-07-13 (targeted prompt/startup hardening). Substantive autonomous-loop state is
+_Last updated: 2026-07-14 (targeted adaptive-budget and latency hardening). Substantive autonomous-loop state is
 frozen at round 3, 2026-07-06 — the initiative remains ON HOLD._
 
 This is the honest, dated record of where the self-improvement loop stands and how it got here —
@@ -102,6 +102,24 @@ defensible. For how the loop works, see [DESIGN.md](DESIGN.md).
   `task install` and the complete root/plugin gates pass. The live support matrix still requires a
   fresh three-trial run before making a new cross-model quality claim; its report now includes
   per-stage call counts and latency.
+
+- **2026-07-14 adaptive-budget coherence (A-77, outside the paused autonomous loop):** the public
+  logical provider-call ceiling no longer collides with a hidden 12-round native clamp. Normal turns
+  now default to 50 model calls, authored `ai_segment.max_rounds` is honored exactly, and the
+  separate Flux decision/batch loop defaults to 50 iterations. CLI, project/user config, AgentSpec,
+  and SDK controls remain distinct; 50/51-boundary and early-invalid-value tests pin the behavior.
+  Capability visibility, authorization, approval, dispatch, and guarded IO are unchanged. The full
+  workspace gate and exact `task install` passed, including all 110 `flux-system` tests.
+
+- **2026-07-14 paired intent-latency evaluation (A-78, outside the paused autonomous loop):** a
+  redacted CLI evaluator ran 36 screening turns and 120 alternating-order confirmation turns across
+  Codex gpt-5.5, GPT-5-mini, DeepSeek V4 Flash Nitro, and Gemini 3.5 Flash. A 512-token intent cap
+  was rejected: per-model intent medians changed by +1.7%, -9.5%, -15.3%, and -6.8%, none meeting
+  the 20% keep threshold; GPT-5-mini fell from 15/15 to 11/15 and several end-to-end medians
+  regressed. Shipped intent defaults remain unchanged. Slack was selected by every model and no
+  write executed, but Gemini failed before approval because its endpoint rejected surfaced array
+  schemas without `items`; A-81 tracks this separate provider-portability defect. The autonomous
+  improvement initiative remains on hold.
 
 - **2026-07-13 post-cutover semantic-expansion hardening (A-74, outside the paused autonomous
   loop):** live session `s_1162` selected Slack correctly, then needed a second family to retrieve a

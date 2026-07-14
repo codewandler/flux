@@ -59,9 +59,11 @@ normal model router. The routing index changes visibility only and never grants 
 ### 4. One logical-run model-call budget
 
 The durable adaptive state carries cumulative intent and exploration call counts. The default total
-ceiling is 12, checked before every provider request and serialized across `await`/resume and process
+ceiling is 50, checked before every provider request and serialized across `await`/resume and process
 restart. Exhaustion returns a precise error naming used/allowed calls; it never silently falls back
 to an ungrounded answer. `AgentSpec`, config, and `--max-model-calls` can lower or raise the bound.
+The former independent 12-round native clamp was removed by A-77, so this visible logical budget is
+the single normal-turn provider-call ceiling.
 
 `AgentStagePolicy` optionally overrides model, effort, output-token cap, and stage-call cap for the
 intent or exploration phase. Missing values inherit the agent. A model override must resolve on the

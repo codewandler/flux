@@ -915,6 +915,7 @@ dependencies = [
  "codewandler-flux-policy",
  "codewandler-flux-provider",
  "codewandler-flux-runtime",
+ "codewandler-flux-secret",
  "codewandler-flux-spec",
  "codewandler-flux-system",
  "futures",

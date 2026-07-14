@@ -6,6 +6,44 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-78: a redacted adaptive-latency evaluator now applies a paired cross-model keep gate.** It
+  measures startup, stage duration/TTFT, provider calls and repairs, usage/cache, request sizes,
+  approval wait, and execution without retaining full provider bodies or private reasoning. A live
+  120-turn confirmation rejected a 512-token intent cap: no model reached the required 20% intent
+  improvement, GPT-5-mini correctness regressed, and several end-to-end medians worsened. Intent
+  defaults therefore remain unchanged. The same matrix identified Gemini-native operation-schema
+  portability as a separate A-81 follow-up.
+- **A-79: spawned sub-agents can report correlated live activity to their parent turn.** Planning,
+  redactor-scrubbed observations, tool calls, timings, status-only outcomes, and completion carry
+  role/session/spawn/call identity through the existing sink observation seam. Child thinking,
+  prose, and tool-result content stay private. Redaction covers JSON keys and values; terminal status
+  is emitted exactly once from the spawner boundary. Reporter inheritance crosses guarded adapters,
+  including a streamed nested one-shot runtime, while remaining lexically scoped per concurrent turn.
+
+### Changed
+
+- **A-77: adaptive cognition and authored-loop budgets now default to 50 through distinct public
+  controls.** The durable logical provider-call ceiling is owned by `AdaptiveLoopPolicy`,
+  `[agent.adaptive] max_model_calls`, and `--max-model-calls`; the outer Flux decision/batch repeat
+  is owned by `AgentSpec.max_iterations`, `[agent] max_iterations`, the SDK builder, and
+  `--max-iterations`. CLI values override project config, which overrides user config, then the
+  default. Per-stage `max_calls` can still narrow intent or exploration, and zero/overflow values
+  fail before model or flow execution.
+- **BREAKING (Rust API):** `flux_config::AgentConfig` gains `max_iterations`. Downstream exhaustive
+  struct literals must provide the field or use `..Default::default()`.
+- **BREAKING (Rust API):** `flux_runtime::SpawnRequest` gains an optional `activity` reporter.
+  Callers using exhaustive struct literals must provide `activity: None`; `SpawnRequest::new` and
+  update syntax with `..SpawnRequest::new(...)` remain source-compatible.
+
+### Fixed
+
+- **A-77: the hidden 12-round native-stage clamp no longer overrides visible or authored budgets.**
+  A normal adaptive run configured for 50 calls may issue one intent plus 49 exploration requests
+  and refuses a 51st request. `ai_segment({max_rounds: 50})` now honors all 50 authored rounds
+  instead of stopping at 12. Capability ceilings, approval, dispatch, and guarded IO are unchanged.
+
 ## [0.21.0] - 2026-07-13
 
 ### Added

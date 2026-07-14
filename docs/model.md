@@ -67,7 +67,9 @@ model = "anthropic/claude-sonnet-5"
 
 ### Notes
 
-- `--think` / `--effort` exist as hidden flags but are not yet wired into the engine — currently no-ops.
+- `--think` and `--effort low|medium|high|xhigh|max` are public agent controls. They apply to intent,
+  exploration, presentation, compaction, cognition, and inherited sub-agent calls when supported by
+  the selected provider/model.
 - Prompt caching is applied automatically for long context windows.
 - Streaming is fully supported; token deltas are shown in the TUI and REPL.
 

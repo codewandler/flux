@@ -10,7 +10,6 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::AgentSink;
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, Usage};
 use flux_events::EventStore;
 use flux_provider::{Effort, Provider, Request};
@@ -24,7 +23,11 @@ use crate::runtime::{
     execute_flow_traced, execute_flow_with_composites, resume_flow_with_composites,
 };
 use crate::state::FlowStore;
+use crate::AgentSink;
 use flux_lang::runtime::FlowOutcome;
+
+/// Default bound for the authored decision/batch repeat in the shipped agent loop.
+pub const DEFAULT_AGENT_LOOP_ITERATIONS: usize = 50;
 
 /// A shipped agent-loop preset. Presets are ordinary Flux-Lang programs selected explicitly by an
 /// agent definition; the host does not probe the workspace for an implicit override.
@@ -1899,6 +1902,61 @@ mod tests {
         ] {
             assert!(source.contains(stage), "missing adaptive stage `{stage}`");
         }
+        assert!(
+            source.contains(&format!("repeat {DEFAULT_AGENT_LOOP_ITERATIONS}")),
+            "the inspectable built-in source must show the default outer-loop bound \
+             ({DEFAULT_AGENT_LOOP_ITERATIONS}); regenerate assets/agent-loop.flux if this fails"
+        );
+    }
+
+    #[test]
+    fn outer_loop_iteration_bounds_reject_zero_and_overflow_before_execution() {
+        let zero = load_agent_loop_with_iterations(AgentLoopSpec::default(), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(zero.contains("must be greater than zero"), "{zero}");
+
+        if usize::BITS > u32::BITS {
+            let overflow =
+                load_agent_loop_with_iterations(AgentLoopSpec::default(), (u32::MAX as usize) + 1)
+                    .unwrap_err()
+                    .to_string();
+            assert!(overflow.contains("exceeds Flux-Lang's u32 repeat bound"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_segment_honors_an_authored_50_round_budget() {
+        let mut responses = (0..49)
+            .map(|round| {
+                native_call(
+                    &format!("echo-{round}"),
+                    "echo",
+                    json!({"text": format!("evidence-{round}")}),
+                )
+            })
+            .collect::<Vec<_>>();
+        responses.push(prose("All 49 observations were gathered."));
+        let loop_spec = AgentLoopSpec::Flux(
+            flux_lang::parse::parse(
+                r#"flow segment_test -> string
+  $segment = ai_segment({ goal: "Gather every observation", tools: ["echo"], max_rounds: 50 })
+  return $segment.result
+"#,
+            )
+            .expect("test loop parses"),
+        );
+        let (engine, events, requests) = scripted_engine(responses, loop_spec);
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "Run the segment", &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(sink.text, "All 49 observations were gathered.");
+        assert_eq!(requests.lock().unwrap().len(), 50);
     }
 
     #[tokio::test]

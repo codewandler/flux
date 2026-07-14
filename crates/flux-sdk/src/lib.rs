@@ -378,12 +378,14 @@ impl ClientBuilder {
         self.spec.max_tokens = n;
         self
     }
-    /// Cap the agent loop's tool-calling iterations per turn.
+    /// Cap the authored outer loop's decision/batch iterations per turn (default: 50). This is
+    /// separate from the adaptive policy's provider-call budget.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.spec.max_iterations = n;
         self
     }
-    /// Configure intent/exploration model policy and the shared logical-run call ceiling.
+    /// Configure intent/exploration model policy and the shared logical-run provider-call ceiling
+    /// (default: 50).
     pub fn adaptive_policy(mut self, policy: AdaptiveLoopPolicy) -> Self {
         self.spec.adaptive_policy = policy;
         self

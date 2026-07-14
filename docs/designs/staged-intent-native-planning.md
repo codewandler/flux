@@ -170,7 +170,11 @@ operation before validation or dispatch.
 It also receives one host tool, `finalize_plan({instructions, primer?})`. There is no `emit_plan`
 tool in this stage.
 
-The host runs a bounded twelve-round native tool loop. Live GPT-5-mini evidence showed that eight
+> Budget update (2026-07-14): A-77 supersedes this original fixed twelve-round choice. The shipped
+> loop now uses the visible logical model-call budget (default 50), and authored
+> `ai_segment.max_rounds` is honored exactly. The rationale below records the initial A-71 design.
+
+The host originally ran a bounded twelve-round native tool loop. Live GPT-5-mini evidence showed that eight
 could stop a still-progressing multi-source investigation one read before the governing policy;
 successful turns still finish early, while twelve keeps the hard no-runaway bound:
 

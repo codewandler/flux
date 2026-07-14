@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.19.2 (2026-07-12)**: public + installable at
+Status as of **0.21.0 (2026-07-13)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green

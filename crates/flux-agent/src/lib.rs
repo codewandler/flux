@@ -179,7 +179,7 @@ impl Default for AgentSpec {
             tools: None,
             permissions: Permissions::default(),
             max_tokens: 4096,
-            max_iterations: 25,
+            max_iterations: flux_flow::DEFAULT_AGENT_LOOP_ITERATIONS,
             thinking: false,
             effort: None,
             agent_loop: AgentLoopSpec::default(),
@@ -442,7 +442,7 @@ mod tests {
         let spec = AgentSpec::new("mock");
         assert_eq!(spec.model, "mock");
         assert_eq!(spec.system_prompt, DEFAULT_SYSTEM_PROMPT);
-        assert_eq!(spec.max_iterations, 25);
+        assert_eq!(spec.max_iterations, 50);
         assert!(spec.tools.is_none());
         assert!(!spec.thinking);
         assert_eq!(spec.effort, None);

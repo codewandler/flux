@@ -52,6 +52,7 @@ and [Safety & approvals](./safety.md).
 flux run -m openrouter/google/gemini-2.5-flash --effort low "summarize the docs"
 flux run --show-loop "update the changelog"
 flux run --max-model-calls 8 "answer with live evidence"
+flux run --max-iterations 20 "handle a multi-batch task"
 flux run --trace-loop "update the changelog"
 flux run --loop loops/support.flux "triage this request"
 ```
@@ -63,7 +64,9 @@ flux run --loop loops/support.flux "triage this request"
 - `--loop adaptive|FILE` explicitly selects the outer loop. `.flux/agent-loop.flux` is never magic.
 - `--turn-budget` bounds cumulative model usage for the turn.
 - `--max-model-calls` bounds provider consultations across intent, exploration, repairs, and
-  decision resumes for one logical adaptive turn (default: 12).
+  decision resumes for one logical adaptive turn (default: 50).
+- `--max-iterations` separately bounds decision/batch iterations in the authored outer loop
+  (default: 50).
 - `--skill NAME` explicitly enables a discovered skill. Skills do not activate from prompt keywords.
 
 ## Saved flow inputs

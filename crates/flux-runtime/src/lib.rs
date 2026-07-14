@@ -37,6 +37,17 @@ use flux_secret::Redactor;
 use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, StagingDisposition, ToolSpec};
 use flux_system::{PathAccess, System};
 
+tokio::task_local! {
+    /// The parent turn's child-activity reporter while one guarded tool future is executing.
+    /// Nested runtimes assembled by adapter tools inherit this into their own `ToolContext`; the
+    /// task-local scope prevents concurrent turns from retargeting one another.
+    static ACTIVE_SPAWN_ACTIVITY_SINK: Arc<dyn SpawnActivitySink>;
+}
+
+fn inherited_spawn_activity_sink() -> Option<Arc<dyn SpawnActivitySink>> {
+    ACTIVE_SPAWN_ACTIVITY_SINK.try_with(Arc::clone).ok()
+}
+
 /// The result of executing a tool.
 ///
 /// A result has **two faces**. `content` is the *canonical* value: it is what gets bound to a session
@@ -108,18 +119,115 @@ pub struct SpawnOutcome {
     pub tool_calls: usize,
 }
 
+/// One live, correlated event from a spawned sub-agent. Every event carries the child identity so
+/// a host can safely keep same-named operations from concurrent/nested children separate. The
+/// event stream deliberately has no child text or thinking variants: final prose stays in
+/// [`SpawnOutcome::text`] and private reasoning stays private.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnActivity {
+    /// Process-local unique id for this spawn. Unlike an ephemeral event store's session id
+    /// (`s_1` in every fresh store), this remains distinct across concurrent storeless children.
+    pub spawn_id: u64,
+    pub role: String,
+    pub child_session_id: String,
+    pub parent_session: Option<String>,
+    pub depth: usize,
+    pub event: SpawnActivityEvent,
+}
+
+/// The activity a spawned child may report to its parent. Tool result *content* is intentionally
+/// absent; a customer-facing surface must still default-deny the tool input and observation data
+/// carried by this trusted host-side contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpawnActivityEvent {
+    Planning {
+        active: bool,
+    },
+    ToolCall {
+        call_id: u64,
+        name: String,
+        input: Value,
+    },
+    ToolTiming {
+        call_id: u64,
+        name: String,
+        timing: OperationTiming,
+    },
+    ToolResult {
+        call_id: u64,
+        name: String,
+        is_error: bool,
+    },
+    Observation {
+        observation: Observation,
+    },
+    Finished {
+        usage: Option<flux_core::Usage>,
+        /// Whether the child failed, timed out, or was cancelled. No error text crosses this
+        /// boundary; the parent receives only the terminal outcome bit.
+        is_error: bool,
+    },
+}
+
+/// Observation kind used to bridge typed child activity through the existing L3 `AgentSink`
+/// extension point. The observation is live-only; hosts must treat its data as internal and
+/// project it default-deny before exposing it to a customer.
+pub const KIND_SUBAGENT_ACTIVITY: &str = "subagent.activity";
+
+impl SpawnActivity {
+    /// Encode this typed event as the observation shape existing `AgentSink` implementations can
+    /// consume without adding an unscoped child callback to every surface.
+    pub fn to_observation(&self) -> Observation {
+        Observation::new(
+            KIND_SUBAGENT_ACTIVITY,
+            Phase::ToolFollowup,
+            serde_json::to_value(self).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Decode a live child-activity observation; unrelated/malformed observations return `None`.
+    pub fn from_observation(observation: &Observation) -> Option<Self> {
+        (observation.kind == KIND_SUBAGENT_ACTIVITY)
+            .then(|| serde_json::from_value(observation.data.clone()).ok())
+            .flatten()
+    }
+}
+
+/// Synchronous, send-only reporter for [`SpawnActivity`]. Defined in L2 so [`Spawner`] can accept
+/// it without depending on the L3 agent-loop [`AgentSink`](https://docs.rs/codewandler-flux-flow).
+/// Implementations must not hold a lock across an await; the engine adapter only enqueues events.
+pub trait SpawnActivitySink: Send + Sync {
+    fn emit(&self, activity: SpawnActivity);
+}
+
 /// One sub-agent spawn, fully described. `cap_scope` is the caller's active `with_tools`
 /// allowlist, if any — the spawner intersects it into the role's own `tools`, so a `task` invoked
 /// from inside a capability scope can never hand the child a broader tool set than the block that
 /// spawned it (capabilities only narrow on descent). `parent_session`, when known, is recorded as
 /// the child session's `correlation_id` so a shared audit store correlates child streams to the
 /// turn that spawned them (A-08).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SpawnRequest {
     pub role: String,
     pub task: String,
     pub cap_scope: Option<Vec<String>>,
     pub parent_session: Option<String>,
+    /// Live reporter snapshotted from the parent turn. `None` preserves the storeless/one-shot
+    /// behavior: the child still returns its final [`SpawnOutcome`], but emits no live activity.
+    pub activity: Option<Arc<dyn SpawnActivitySink>>,
+}
+
+impl std::fmt::Debug for SpawnRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnRequest")
+            .field("role", &self.role)
+            .field("task", &self.task)
+            .field("cap_scope", &self.cap_scope)
+            .field("parent_session", &self.parent_session)
+            .field("activity", &self.activity.is_some())
+            .finish()
+    }
 }
 
 impl SpawnRequest {
@@ -130,6 +238,7 @@ impl SpawnRequest {
             task: task.into(),
             cap_scope: None,
             parent_session: None,
+            activity: None,
         }
     }
 }
@@ -291,6 +400,11 @@ pub struct ToolContext {
     /// one-active-turn-per-engine lifecycle as `cancel`). A spawning tool (`task`) reads it to
     /// correlate the child's audit stream to the parent turn (A-08).
     session: Arc<Mutex<Option<String>>>,
+    /// Live child-activity reporter for the active turn. Like `cancel`/`session`, this is a
+    /// snapshotted, interior-mutable one-active-turn slot installed by the engine. `TaskTool`
+    /// copies the current `Arc` into each [`SpawnRequest`], so a later turn cannot retarget an
+    /// already-running child.
+    spawn_activity: Arc<Mutex<Option<Arc<dyn SpawnActivitySink>>>>,
     /// The **capability-scope stack**: each entry is the effective tool-name allowlist of one active
     /// `with_tools` block, narrow-only (an entry is always the intersection of its own declared set
     /// with the one below it — see [`Executor::push_cap_scope`]). Empty stack = no scope active = every
@@ -313,6 +427,7 @@ impl ToolContext {
             evidence: Arc::new(Mutex::new(EvidenceLog::new())),
             cancel: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
+            spawn_activity: Arc::new(Mutex::new(None)),
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -346,6 +461,22 @@ impl ToolContext {
     /// The current turn's session id, if a driver installed one.
     pub fn session_id(&self) -> Option<String> {
         self.session.lock().unwrap().clone()
+    }
+
+    /// Install the active turn's live child-activity reporter.
+    pub fn set_spawn_activity_sink(&self, sink: Arc<dyn SpawnActivitySink>) {
+        *self.spawn_activity.lock().unwrap() = Some(sink);
+    }
+
+    /// Snapshot the current turn's child-activity reporter for a [`SpawnRequest`]. Adapter tools
+    /// that open a nested runtime inherit the reporter only while their guarded future is active;
+    /// a context retained past that lexical scope does not keep an obsolete parent callback.
+    pub fn spawn_activity_sink(&self) -> Option<Arc<dyn SpawnActivitySink>> {
+        self.spawn_activity
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(inherited_spawn_activity_sink)
     }
 
     /// Record that `path` was read at `mtime` (called by `read`/`read_many`).
@@ -1685,7 +1816,15 @@ impl Executor {
         //    both the success content and any error — before it reaches the model or the logs.
         self.record_dispatch_event("tool.started", dispatch, name, started, json!({}));
         let execution_started = Instant::now();
-        let result = match tool.execute(&self.ctx, params).await {
+        // Keep the reporter live only for this guarded tool future. A nested runtime assembled by an
+        // adapter tool receives it through `ToolContext::new`; task-local scoping keeps concurrent
+        // turns isolated and avoids a process-global callback.
+        let execution = tool.execute(&self.ctx, params);
+        let executed = match self.ctx.spawn_activity_sink() {
+            Some(activity) => ACTIVE_SPAWN_ACTIVITY_SINK.scope(activity, execution).await,
+            None => execution.await,
+        };
+        let result = match executed {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
                 r.content = self.ctx.redactor.redact(&r.content);
@@ -1845,6 +1984,72 @@ mod tests {
                 params["text"].as_str().unwrap_or("").to_string(),
             ))
         }
+    }
+
+    struct NoopSpawnActivitySink;
+
+    impl SpawnActivitySink for NoopSpawnActivitySink {
+        fn emit(&self, _activity: SpawnActivity) {}
+    }
+
+    /// A nested runtime (for example a one-shot `FlowClient` opened by an adapter tool) constructs
+    /// its own context inside the outer tool future. It must inherit the active turn's child reporter
+    /// or a sub-agent spawned by that nested runtime becomes invisible to the parent channel.
+    struct NestedContextProbe {
+        captured: Arc<Mutex<Option<ToolContext>>>,
+    }
+
+    #[async_trait]
+    impl Tool for NestedContextProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "nested_context_probe",
+                "probe nested context inheritance",
+                json!({"type": "object"}),
+            )
+        }
+
+        async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+            let nested = ToolContext::new(ctx.system.clone());
+            let inherited = nested.spawn_activity_sink().is_some();
+            *self.captured.lock().unwrap() = Some(nested);
+            Ok(ToolResult::ok(if inherited {
+                "inherited"
+            } else {
+                "missing"
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_tool_context_inherits_the_active_spawn_reporter() {
+        let captured = Arc::new(Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(NestedContextProbe {
+            captured: captured.clone(),
+        }));
+        let ctx = test_ctx();
+        ctx.set_spawn_activity_sink(Arc::new(NoopSpawnActivitySink));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["nested_context_probe".to_string()], &[]),
+            Arc::new(AllowApprover),
+            ctx,
+        );
+
+        let result = executor.dispatch("nested_context_probe", json!({})).await;
+
+        assert_eq!(result.content, "inherited");
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .spawn_activity_sink()
+                .is_none(),
+            "a nested context retained after the adapter returns must not keep the old turn sink"
+        );
     }
 
     /// Minimal guarded filesystem reader used to prove that permission subjects name the physical

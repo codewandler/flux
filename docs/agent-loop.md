@@ -111,13 +111,13 @@ observations for the current session.
 
 ## Bound or tune the built-in stages
 
-One logical adaptive turn has a 12-call default ceiling across intent repair, exploration, and every
+One logical adaptive turn has a 50-call default ceiling across intent repair, exploration, and every
 decision resume. Exhaustion fails honestly instead of producing an ungrounded answer. Override the
 total from the CLI with `--max-model-calls`, or set independent same-provider stage policy in config:
 
 ```toml
 [agent.adaptive]
-max_model_calls = 10
+max_model_calls = 50
 
 [agent.adaptive.intent]
 model = "codex/gpt-5.5"
@@ -134,6 +134,18 @@ max_calls = 8
 Missing stage values inherit the agent. A provider prefix must match the agent's provider and is
 stripped before the request; a cross-provider override fails at startup. Embedded callers use
 `AgentSpec::adaptive_policy` or the SDK builder's `adaptive_policy` method.
+
+The authored decision/batch repeat has a separate 50-iteration default. It counts outer control-flow
+iterations, not provider calls. Override it with `--max-iterations`, `[agent] max_iterations`,
+`AgentSpec::max_iterations`, or the SDK builder's `max_iterations` method:
+
+```toml
+[agent]
+max_iterations = 50
+```
+
+An authored `ai_segment` owns a third, local bound: its required `max_rounds` value is honored as
+written and is not reduced to either normal-turn default. All three controls must be positive.
 
 ## Select or author a loop
 
@@ -154,6 +166,7 @@ Project config uses the same selector:
 ```toml
 [agent]
 loop = "loops/support.flux"
+max_iterations = 50
 ```
 
 Roles may carry `agent_loop` source in frontmatter. `AgentSpec::agent_loop` and the SDK builder use

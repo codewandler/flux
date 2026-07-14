@@ -157,6 +157,12 @@ struct AgentFlags {
     #[arg(long, value_parser = parse_positive_usize)]
     max_model_calls: Option<usize>,
 
+    /// Maximum decision/batch iterations in the authored outer loop. This is separate from model
+    /// calls: one iteration may execute a batch, ask a question, or continue from a report.
+    /// Overrides `[agent] max_iterations`.
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_iterations: Option<usize>,
+
     /// Per-turn token budget (all tiers, summed across the turn's model calls): once crossed, the
     /// turn ends honestly with a budget-exceeded answer instead of consulting the model again.
     /// Overrides `FLUX_TURN_TOKEN_BUDGET` and `[limits] turn_token_budget` in .flux/config.toml.
@@ -189,7 +195,7 @@ struct AgentFlags {
     #[arg(long)]
     show_loop: bool,
 
-    /// Trace the outer agent loop's structure: one dim line per round (`⟳ round 3/25`) and per
+    /// Trace the outer agent loop's structure: one dim line per round (`⟳ round 3/50`) and per
     /// structural node (op calls with bind names, match/when branches taken, return) of the
     /// agent-loop program. Native leaf-operation execution is not traced. Also enabled by
     /// `FLUX_TRACE_LOOP`.
@@ -925,6 +931,20 @@ fn adaptive_loop_policy(
         intent: adaptive_stage_policy("intent", &config.adaptive.intent)?,
         explore: adaptive_stage_policy("explore", &config.adaptive.explore)?,
     })
+}
+
+fn agent_max_iterations(flags: &AgentFlags, config: &flux_config::AgentConfig) -> Result<usize> {
+    // Resolve under CLI > config > default precedence first, then reject a zero that actually takes
+    // effect. A valid `--max-iterations` (already `parse_positive_usize`-checked) must override a
+    // bad `[agent] max_iterations = 0`, not be defeated by it.
+    let resolved = flags
+        .max_iterations
+        .or(config.max_iterations)
+        .unwrap_or(flux_flow::DEFAULT_AGENT_LOOP_ITERATIONS);
+    if resolved == 0 {
+        bail!("[agent] max_iterations must be greater than zero");
+    }
+    Ok(resolved)
 }
 
 /// `flux render --view` — CLI mirror of [`flux_tools::render::View`].
@@ -2736,7 +2756,7 @@ async fn build_agent_with(
         system_prompt,
         skills: load_skills(&cwd, &cfg, &flags.skill_dirs, &flags.skills)?,
         max_tokens: flags.max_tokens,
-        max_iterations: 25,
+        max_iterations: agent_max_iterations(flags, &cfg.agent)?,
         thinking: flags.think,
         effort: flags.effort.map(Into::into),
         agent_loop: resolve_agent_loop(
@@ -6897,6 +6917,9 @@ async fn run_app(path: Option<&str>, flags: &AgentFlags, serve: Option<String>) 
     if flags.max_model_calls.is_some() {
         bail!("`--max-model-calls` only applies to the built-in coding agent, not `flux app run <program>`");
     }
+    if flags.max_iterations.is_some() {
+        bail!("`--max-iterations` only applies to the built-in coding agent, not `flux app run <program>`");
+    }
     if flags.agent_loop.is_some() {
         bail!("`--loop` only applies to the built-in coding agent, not `flux app run <program>`");
     }
@@ -9438,6 +9461,7 @@ mod tests {
         assert!(help.contains("low"), "{help}");
         assert!(help.contains("high"), "{help}");
         assert!(help.contains("--max-model-calls"), "{help}");
+        assert!(help.contains("--max-iterations"), "{help}");
     }
 
     #[tokio::test]
@@ -9476,6 +9500,38 @@ mod tests {
             error.contains("[agent.adaptive.explore] max_calls must be greater than zero"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn outer_loop_iterations_follow_cli_then_config_then_default_precedence() {
+        use clap::Parser;
+
+        let default_flags = super::AgentFlags::from_model_yes(Some("mock"), true);
+        let mut config = flux_config::AgentConfig {
+            max_iterations: Some(37),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::agent_max_iterations(&default_flags, &config).unwrap(),
+            37
+        );
+
+        let cli_flags = super::AgentFlagsOnly::parse_from(["flux", "--max-iterations", "41"]).agent;
+        assert_eq!(
+            super::agent_max_iterations(&cli_flags, &config).unwrap(),
+            41
+        );
+
+        config.max_iterations = None;
+        assert_eq!(
+            super::agent_max_iterations(&default_flags, &config).unwrap(),
+            flux_flow::DEFAULT_AGENT_LOOP_ITERATIONS
+        );
+        config.max_iterations = Some(0);
+        assert!(super::agent_max_iterations(&default_flags, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("[agent] max_iterations must be greater than zero"));
     }
 
     #[test]
@@ -12784,6 +12840,7 @@ mod tests {
         err(&["flux", "replay", "--turn", "0"]);
         err(&["flux", "run", "--max-tokens", "0", "hi"]);
         err(&["flux", "run", "--max-model-calls", "0", "hi"]);
+        err(&["flux", "run", "--max-iterations", "0", "hi"]);
         err(&["flux", "run", "--turn-budget", "0", "hi"]);
         err(&["flux", "eval", "not-an-adapter"]);
         err(&["flux", "eval", "synthetic", "--trials", "0"]);

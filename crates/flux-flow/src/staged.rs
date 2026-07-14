@@ -28,10 +28,14 @@ const SIGNAL_CAPABILITIES: &str = "signal_capabilities";
 const RETURN_STAGE_RESULT: &str = "return_stage_result";
 const MAX_INTENT_ATTEMPTS: usize = 2;
 const MAX_FAMILIES: usize = 4;
-const MAX_NATIVE_ROUNDS: usize = 12;
 const MAX_NATIVE_TOOLS: usize = 64;
 const MAX_NATIVE_SCHEMA_CHARS: usize = 128_000;
-pub const DEFAULT_ADAPTIVE_MODEL_CALLS: usize = 12;
+/// Per-invocation provider-round cap for an authored `[agent.stages]` model stage. Named stages are
+/// a separate mechanism from the adaptive intent/explore loop, so their repair-round ceiling is a
+/// fixed, self-contained bound rather than the user-tunable adaptive model-call budget (a tight or
+/// generous `[agent.adaptive] max_model_calls` must not silently retarget an unrelated named stage).
+const MODEL_STAGE_MAX_ROUNDS: usize = 50;
+pub const DEFAULT_ADAPTIVE_MODEL_CALLS: usize = 50;
 
 const INTENT_SYSTEM: &str = "You are Flux's intent router. Understand the user's request and call \
 declare_intent exactly once. Select only the smallest capability families needed. This is routing, \
@@ -85,8 +89,6 @@ pub(crate) struct StagedContext {
     pub authored_ceiling: Option<HashSet<String>>,
     pub groups: Vec<ToolGroup>,
     pub opts: StageOptions,
-    /// Maximum provider rounds one invocation of a native stage may consume.
-    pub max_native_rounds: usize,
     /// Remaining billed-token budget when this stage call began.
     pub remaining_token_budget: Option<u64>,
     /// Logical-run and per-stage cognition policy. Counts live in [`AdaptiveState`] so an `await`
@@ -668,7 +670,14 @@ async fn run_model_stage_inner(
     let mut last_error = String::new();
 
     observe(ctx, "stage.started", json!({ "stage": name }));
-    let round_limit = native_round_limit(ctx);
+    // The advertised tool set is loop-invariant, so build it once and clone per repair round instead
+    // of re-running every `tool_def` conversion each round.
+    let stage_tools: Vec<ToolDef> = by_native
+        .values()
+        .map(tool_def)
+        .chain(std::iter::once(return_tool))
+        .collect();
+    let round_limit = MODEL_STAGE_MAX_ROUNDS;
     for round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
         let mut req = base_request(
@@ -695,11 +704,7 @@ async fn run_model_stage_inner(
                 cache: true,
             });
         }
-        req.tools = by_native
-            .values()
-            .map(tool_def)
-            .chain(std::iter::once(return_tool.clone()))
-            .collect();
+        req.tools = stage_tools.clone();
         let stage_label = format!("stage.{name}");
         correlate_request(ctx, &mut req, &stage_label, round);
         let request_model = req.model.clone();
@@ -1053,12 +1058,15 @@ async fn adaptive_explore(
     // The `ai_segment` entry point seeds exploration without going through `detect_intent_inner`, so
     // re-assert the control-tool reservation here to cover every path into the exploration stage.
     ensure_control_names_free(ctx)?;
-    let round_limit = native_round_limit(ctx);
+    let round_limit = model_call_limit(ctx);
+    // `specs`/`families` derive only from the immutable `ctx` (registry snapshot, groups, advertised).
+    // A capability signal mutates `state`, never these, so the full family ceiling is loop-invariant:
+    // compute it once instead of rebuilding a sorted spec clone + family map on every round.
+    let specs = live_visible_specs(ctx);
+    let families = build_families(&specs, &ctx.groups, &ctx.advertised);
     for _round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
         ensure_model_call_budget(ctx, state.intent_calls, state.explore_calls, "explore")?;
-        let specs = live_visible_specs(ctx);
-        let families = build_families(&specs, &ctx.groups, &ctx.advertised);
         let selected = selected_specs_for_state(&state, &families, ctx)?;
         let mut selected_by_native = BTreeMap::<String, ToolSpec>::new();
         for spec in &selected {
@@ -2190,8 +2198,12 @@ fn ensure_stage_budget(ctx: &StagedContext, usages: &[Usage]) -> Result<()> {
     }
 }
 
-fn native_round_limit(ctx: &StagedContext) -> usize {
-    ctx.max_native_rounds.clamp(1, MAX_NATIVE_ROUNDS)
+/// The adaptive loop's shared logical model-call budget, used by `adaptive_explore` as a round safety
+/// bound above [`ensure_model_call_budget`] (which is the real, resume-aware ceiling). Named
+/// `[agent.stages]` stages use their own [`MODEL_STAGE_MAX_ROUNDS`] instead, so this stays scoped to
+/// the adaptive intent/explore run.
+fn model_call_limit(ctx: &StagedContext) -> usize {
+    ctx.adaptive_policy.max_model_calls
 }
 
 fn intent_segments(ctx: &StagedContext, index: String) -> Vec<SystemSegment> {
@@ -2803,7 +2815,6 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            max_native_rounds: MAX_NATIVE_ROUNDS,
             remaining_token_budget: None,
             adaptive_policy: AdaptiveLoopPolicy::default(),
         };
@@ -2839,6 +2850,12 @@ mod tests {
             usages: intent.usages,
             model: exploration.model,
         }
+    }
+
+    #[test]
+    fn adaptive_model_call_default_is_50() {
+        assert_eq!(DEFAULT_ADAPTIVE_MODEL_CALLS, 50);
+        assert_eq!(AdaptiveLoopPolicy::default().max_model_calls, 50);
     }
 
     fn spec(
@@ -3777,7 +3794,6 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            max_native_rounds: MAX_NATIVE_ROUNDS,
             remaining_token_budget: None,
             adaptive_policy: AdaptiveLoopPolicy::default(),
         };
@@ -3996,7 +4012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_round_exhaustion_fails_honestly_without_execution() {
+    async fn logical_call_budget_allows_50_calls_and_refuses_the_51st_request() {
         let mut responses = vec![native_call(
             "intent",
             DECLARE_INTENT,
@@ -4005,7 +4021,7 @@ mod tests {
                 "capability_families": ["workspace.write"]
             }),
         )];
-        responses.extend((0..MAX_NATIVE_ROUNDS).map(|round| {
+        responses.extend((0..50).map(|round| {
             native_call(
                 &format!("write-{round}"),
                 "change",
@@ -4014,18 +4030,22 @@ mod tests {
         }));
         let TestHarness {
             context: mut ctx,
+            requests,
             write_calls,
             ..
         } = staged_context(responses);
-        // This fixture isolates the separate per-invocation native-round guard. The normal logical
-        // turn budget is intentionally lower/equal and is covered by its own resume test.
-        ctx.adaptive_policy.max_model_calls = MAX_NATIVE_ROUNDS + 2;
+        ctx.adaptive_policy.max_model_calls = 50;
 
         let error = run(ctx).await.result.unwrap_err().to_string();
 
         assert!(
-            error.contains(&format!("exhausted {MAX_NATIVE_ROUNDS} native rounds")),
+            error.contains("adaptive model-call budget exhausted before `explore` (50/50"),
             "{error}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            50,
+            "one intent plus 49 exploration calls are allowed; no 51st request is sent"
         );
         assert_eq!(write_calls.load(Ordering::SeqCst), 0);
     }

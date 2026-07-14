@@ -12,6 +12,26 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **Long delegated work can report what each specialist is doing.** Embedded chat surfaces can show
+  a child agent's planning, safe progress notes, operation lifecycle, and success/failure as it
+  happens, with stable child/call correlation. Private reasoning, child prose, operation arguments,
+  and result content remain outside that live feed unless the embedding host explicitly projects a
+  safe label.
+- **Long evidence-gathering turns have room to finish, with visible controls.** Adaptive turns now
+  allow up to 50 model calls by default, and the separate decision/batch loop allows 50 iterations.
+  Use `--max-model-calls` and `--max-iterations` (or project config) to tune them independently.
+  An authored `ai_segment` now receives exactly the `max_rounds` budget written in the flow instead
+  of being silently reduced to 12.
+
+### Action needed
+
+- **Rust callers constructing `AgentConfig` with every field must add `max_iterations`.** Using the
+  type's default keeps the new 50-iteration outer-loop behavior.
+- **Rust callers constructing `SpawnRequest` with every field must add `activity: None`** or switch
+  to `SpawnRequest::new`. Hosts that want live child progress can supply the optional reporter.
+
 ## [0.21.0] - 2026-07-13
 
 ### New

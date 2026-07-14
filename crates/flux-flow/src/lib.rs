@@ -38,6 +38,7 @@ pub mod state;
 pub mod voice;
 
 pub use agent_sink::AgentSink;
+pub use engine::DEFAULT_AGENT_LOOP_ITERATIONS;
 pub use voice::{
     tool_defs_from_registry, TranscriptAccumulator, UsageRecording, VoiceSessionDriver, VoiceSink,
     VoiceTurnHandler,

@@ -654,6 +654,13 @@ impl FlowClient {
         if let Some(spawner) = &self.spawner {
             ctx = ctx.with_spawner(spawner.clone());
         }
+        // A guarded adapter may build this one-shot client while its parent reporter is available
+        // only through the runtime's lexical task-local. Pin that snapshot onto the fresh context
+        // before `execute_streamed` moves the executor into `tokio::spawn` (task-locals themselves
+        // do not propagate to a new task).
+        if let Some(activity) = ctx.spawn_activity_sink() {
+            ctx.set_spawn_activity_sink(activity);
+        }
         Executor::new(self.registry.clone(), perms, approver, ctx)
     }
 }
@@ -1661,6 +1668,78 @@ flow main
             "body": [ { "kind": "call", "op": "slow", "args": [] } ]
         }))
         .unwrap()
+    }
+
+    struct NoopSpawnActivity;
+    impl flux_runtime::SpawnActivitySink for NoopSpawnActivity {
+        fn emit(&self, _activity: flux_runtime::SpawnActivity) {}
+    }
+
+    struct ReporterProbe;
+    #[async_trait]
+    impl Tool for ReporterProbe {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "reporter_probe",
+                "report whether child activity is attached",
+                json!({"type": "object"}),
+            )
+        }
+        async fn execute(&self, ctx: &ToolContext, _params: Value) -> CoreResult<ToolResult> {
+            Ok(ToolResult::ok(if ctx.spawn_activity_sink().is_some() {
+                "inherited"
+            } else {
+                "missing"
+            }))
+        }
+    }
+
+    struct StreamedNestedAdapter;
+    #[async_trait]
+    impl Tool for StreamedNestedAdapter {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "streamed_nested_adapter",
+                "open a streamed nested runtime",
+                json!({"type": "object"}),
+            )
+        }
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> CoreResult<ToolResult> {
+            let mut client = FlowClient::builder().auto_approve(true).build(
+                MockProvider::one("noop"),
+                temp_root("nested-stream-reporter"),
+            )?;
+            client.register_op(Arc::new(ReporterProbe));
+            let ast: DraftAst = serde_json::from_value(json!({
+                "body": [{ "kind": "call", "op": "reporter_probe", "args": [] }]
+            }))
+            .unwrap();
+            let stream = client.execute_streamed(&ast);
+            let outcome = stream.finish().await?;
+            Ok(ToolResult::ok(outcome.result))
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_nested_runtime_pins_the_lexical_spawn_reporter() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StreamedNestedAdapter));
+        let ctx = ToolContext::new(Arc::new(System::new(
+            Workspace::new(temp_root("outer-stream-reporter")).unwrap(),
+        )));
+        ctx.set_spawn_activity_sink(Arc::new(NoopSpawnActivity));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["streamed_nested_adapter".into()], &[]),
+            Arc::new(AllowApprover),
+            ctx,
+        );
+
+        let result = executor
+            .dispatch("streamed_nested_adapter", json!({}))
+            .await;
+
+        assert_eq!(result.content, "inherited");
     }
 
     /// D-158: `execute_with_sink` streams each dispatched op's `tool_call` AND `tool_result` to a
