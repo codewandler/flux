@@ -247,14 +247,14 @@ async fn contextid_continuity_is_realm_keyed() {
     assert_eq!(accounts, ["acct:acme", "acct:globex"]);
 }
 
-/// The envelope identity follows the request principal: after alice's turn the executor's
-/// identity cell holds alice, after bob's it holds bob — never the build-time service identity.
-/// (The policy-evaluation consequence of the swap is unit-proven in flux-runtime.)
+/// The envelope identity follows the request principal without retargeting the shared executor.
+/// Each turn's durable audit row carries its lexical caller while the assembly-time fallback stays
+/// unchanged.
 #[tokio::test]
 async fn turns_run_under_the_request_principal() {
     let (app, engine) = principal_app();
 
-    let (status, _) = post_json_auth(
+    let (status, alice) = post_json_auth(
         app.clone(),
         "/a2a",
         send_params("hi", None),
@@ -262,9 +262,18 @@ async fn turns_run_under_the_request_principal() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(engine.executor.identity().get().0.principal.id, "alice");
+    let alice_session = alice["result"]["id"].as_str().unwrap();
+    let alice_callers: Vec<_> = engine
+        .events
+        .observations(alice_session)
+        .unwrap()
+        .into_iter()
+        .filter(|observation| observation.kind == "turn.identity")
+        .filter_map(|observation| observation.data["caller"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(alice_callers, ["alice"]);
 
-    let (status, _) = post_json_auth(
+    let (status, bob) = post_json_auth(
         app.clone(),
         "/a2a",
         send_params("hi", None),
@@ -272,7 +281,21 @@ async fn turns_run_under_the_request_principal() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(engine.executor.identity().get().0.principal.id, "bob");
+    let bob_session = bob["result"]["id"].as_str().unwrap();
+    let bob_callers: Vec<_> = engine
+        .events
+        .observations(bob_session)
+        .unwrap()
+        .into_iter()
+        .filter(|observation| observation.kind == "turn.identity")
+        .filter_map(|observation| observation.data["caller"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(bob_callers, ["bob"]);
+    assert_eq!(
+        engine.executor.identity().get().0.principal.id,
+        "local",
+        "request identities must never mutate the executor fallback"
+    );
 }
 
 /// A principal without an account claim gets a principal-derived realm (`user:<id>`), not a

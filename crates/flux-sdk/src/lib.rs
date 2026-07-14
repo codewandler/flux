@@ -52,6 +52,8 @@ pub use tokio_util::sync::CancellationToken;
 /// real one.
 pub use flux_provider::Provider;
 
+#[allow(deprecated)]
+pub use flux_agent::AgentExecutorConfig;
 /// The agent definition ([`ClientBuilder::from_spec`]) plus its permission rules. Re-exported so
 /// the full-control door needs no direct `flux-agent` dependency.
 pub use flux_agent::{
@@ -124,6 +126,18 @@ where
 pub mod approval {
     pub use flux_runtime::{ApprovalChoice, Approver, RiskApprover};
     pub use flux_spec::IntentSet;
+}
+
+/// **Authorization floor.** Every SDK executor carries an [`ExecutionAuthorization`] profile.
+/// Builders use [`ExecutionAuthorization::local`] by default; embedding services should install a
+/// resolved policy and identity with `with_authorization(...)`.
+pub mod authorization {
+    pub use flux_policy::{
+        default_local_grants, local_identity, AuthorizationPolicy, Caller, Trust,
+    };
+    pub use flux_runtime::{
+        ExecutionAuthorization, ExecutionEnvironment, IdentityCell, TurnIdentity,
+    };
 }
 
 /// **Session observability.** The projection types [`Session`] readers return —
@@ -256,10 +270,12 @@ pub mod plugins {
 /// (roles + the child tool surface + a [`ProviderFactory`](subagents::ProviderFactory) + limits),
 /// [`SpawnLimits`](subagents::SpawnLimits) bounds each child (tokens, wall-clock, …), and
 /// [`Role`](subagents::Role)/[`RoleRegistry`](subagents::RoleRegistry) name the roles a `task` may
-/// target ([`parse_role`](subagents::parse_role) builds a `Role` from a markdown definition).
+/// target ([`try_parse_role`](subagents::try_parse_role) builds a `Role` from a markdown
+/// definition while rejecting malformed capability metadata).
 pub mod subagents {
+    #[allow(deprecated)]
     pub use flux_orchestrate::{
-        parse_role, ProviderFactory, Role, RoleRegistry, SpawnLimits, SubAgents,
+        parse_role, try_parse_role, ProviderFactory, Role, RoleRegistry, SpawnLimits, SubAgents,
     };
 }
 
@@ -287,7 +303,10 @@ use flux_core::Result;
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
 use flux_orchestrate::{SubAgents, TaskTool};
-use flux_runtime::{Approver, Tool, ToolContext, ToolRegistry};
+#[cfg(test)]
+use flux_runtime::ToolContext;
+use flux_runtime::{Approver, ExecutionEnvironment, PermissionManager, Tool, ToolRegistry};
+use flux_secret::Redactor;
 use flux_system::{System, Workspace};
 
 /// The result of one turn — a [`Client::run`], a [`Session::send`], or a
@@ -312,7 +331,7 @@ pub struct TurnOutput {
 }
 
 /// A deferred registry installer (the `register_*` pack convention), applied at `build`.
-type RegistryPack = Box<dyn FnOnce(&mut ToolRegistry)>;
+type RegistryPack = Box<dyn FnOnce(&mut ToolRegistry) -> Result<()>>;
 
 /// Builder for a [`Client`]. Internally an [`AgentSpec`] plus the shared envelope knobs, so every
 /// agent-definition field has exactly one home and [`from_spec`](Self::from_spec) is the
@@ -322,7 +341,7 @@ pub struct ClientBuilder {
     envelope: envelope::Envelope,
     storage: Option<Storage>,
     cognition: bool,
-    ops: Vec<Arc<dyn Tool>>,
+    ops: Vec<(String, Arc<dyn Tool>)>,
     packs: Vec<RegistryPack>,
     sub_agents: Option<SubAgents>,
     sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
@@ -353,7 +372,7 @@ impl ClientBuilder {
     /// denies *every* op (including reads) — grant what the agent needs via the spec's
     /// `permissions`, [`allow`](Self::allow), or `auto_approve`. Builder methods overlay on top. A
     /// `skills` is explicit: an empty list means no skills. Use
-    /// [`AgentSpec::with_default_skills`] deliberately if enabling every discovered skill is desired.
+    /// [`AgentSpec::try_with_default_skills`] deliberately if enabling every discovered skill is desired.
     pub fn from_spec(spec: AgentSpec) -> Self {
         Self {
             spec,
@@ -423,16 +442,53 @@ impl ClientBuilder {
         self.envelope.approver = Some(approver);
         self
     }
+    /// Install the mandatory authorization policy and resolved caller identity. This floor is
+    /// evaluated before permission rules or approval, so `auto_approve(true)` cannot widen it.
+    pub fn with_authorization(
+        mut self,
+        policy: flux_policy::AuthorizationPolicy,
+        caller: flux_policy::Caller,
+        trust: flux_policy::Trust,
+    ) -> Self {
+        self.envelope.authorization =
+            flux_runtime::ExecutionAuthorization::new(policy, caller, trust);
+        self
+    }
+    /// Install the shared secret redactor on the assembled agent executor.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.envelope.redactor = redactor;
+        self
+    }
     /// Register a custom op (any [`Tool`], e.g. one built with `flux_runtime::tool_fn`) alongside
     /// the built-ins. Registered ops dispatch through the same authorization → approval → guarded
     /// IO envelope as every other op — registration grants existence, not permission.
     pub fn register_op(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.ops.push(tool);
+        self.ops
+            .push(("sdk ClientBuilder::register_op".into(), tool));
+        self
+    }
+
+    /// Register a custom operation with an auditable owner label. Prefer this when composing
+    /// independently developed packs so duplicate-name errors identify both contributors.
+    pub fn register_op_from(mut self, source: impl Into<String>, tool: Arc<dyn Tool>) -> Self {
+        self.ops.push((source.into(), tool));
         self
     }
     /// Register a whole pack of ops via a closure over the registry (the `register_*` convention
     /// used across flux). Same envelope rules as [`register_op`](Self::register_op).
     pub fn register_pack<F: FnOnce(&mut ToolRegistry) + 'static>(mut self, pack: F) -> Self {
+        self.packs.push(Box::new(move |registry| {
+            pack(registry);
+            Ok(())
+        }));
+        self
+    }
+    /// Register a fallible operation pack. This is the preferred composition seam: installers use
+    /// source-labelled registry methods and `build` returns any duplicate instead of panicking.
+    pub fn try_register_pack<F>(mut self, pack: F) -> Self
+    where
+        F: FnOnce(&mut ToolRegistry) -> Result<()> + 'static,
+    {
         self.packs.push(Box::new(pack));
         self
     }
@@ -447,7 +503,25 @@ impl ClientBuilder {
     /// ```
     #[cfg(feature = "plugins")]
     pub fn with_plugin_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
-        self.ops.extend(tools);
+        self.ops.extend(tools.into_iter().map(|tool| {
+            (
+                "sdk ClientBuilder::with_plugin_tools (plugin source unspecified)".into(),
+                tool,
+            )
+        }));
+        self
+    }
+
+    /// Attach one named plugin's tools with source-aware collision diagnostics.
+    #[cfg(feature = "plugins")]
+    pub fn with_plugin_tools_from(
+        mut self,
+        plugin: impl Into<String>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
+        let source = format!("plugin:{}", plugin.into());
+        self.ops
+            .extend(tools.into_iter().map(|tool| (source.clone(), tool)));
         self
     }
     /// Attach named sub-agents to the conversational client: at [`build`](Self::build) the `task`
@@ -588,11 +662,11 @@ impl ClientBuilder {
         let sandbox = self.envelope.resolve_sandbox();
         let system = Arc::new(System::new(Workspace::new(root.clone())?).with_sandbox(sandbox));
         let mut registry = ToolRegistry::new();
-        flux_tools::register_builtins(&mut registry);
+        flux_tools::try_register_builtins(&mut registry)?;
         if self.cognition {
             CognitionPack::new(provider.clone(), self.spec.model.clone())
                 .with_reasoning(self.spec.thinking, self.spec.effort)
-                .register(&mut registry);
+                .try_register_from("sdk ClientBuilder cognition pack", &mut registry)?;
         }
         // Snapshot the base op names (built-ins + cognition) so consumer-registered ops can be
         // told apart below: a `tools` subset restricts the *base* catalog, but must not silently
@@ -600,18 +674,21 @@ impl ClientBuilder {
         let base_names: std::collections::HashSet<String> = registry.names().into_iter().collect();
         // Consumer ops/packs join the same registry the envelope gates — registration grants
         // existence, not permission (the safety envelope still gates every dispatch).
-        for tool in self.ops {
-            registry.register(tool);
+        for (source, tool) in self.ops {
+            registry.try_register_from(source, tool)?;
         }
         for pack in self.packs {
-            pack(&mut registry);
+            pack(&mut registry)?;
         }
         // Sub-agents: register the `task` tool BEFORE the custom-name snapshot so it rides the same
         // re-admit into a `tools` subset every consumer-registered op does (a consumer that scoped
         // the catalog AND asked for sub-agents still keeps `task`). The spawner is attached to the
         // dispatch context below.
         if self.sub_agents.is_some() {
-            registry.register(Arc::new(TaskTool));
+            registry.try_register_from(
+                "sdk ClientBuilder sub-agent task operation",
+                Arc::new(TaskTool),
+            )?;
         }
         let custom_names: Vec<String> = registry
             .names()
@@ -643,22 +720,32 @@ impl ClientBuilder {
             }
         }
         spec.cwd = root;
-        // Thread the sub-agent spawner into the dispatch context when sub-agents are attached, so a
-        // `task` call delegates through the same guarded `System`; `None` (the common case) leaves
+        let authorization = self.envelope.authorization.clone();
+        let mut environment = ExecutionEnvironment::new(
+            system.clone(),
+            registry,
+            PermissionManager::new(),
+            approver,
+            authorization.clone(),
+        )
+        .with_redactor(self.envelope.redactor.clone());
+        // Thread the sub-agent spawner into the shared environment when sub-agents are attached, so
+        // a `task` call delegates through the same guarded `System`; `None` (the common case) leaves
         // the context exactly as before. Mirrors `FlowClient::build_executor`.
-        let mut ctx = ToolContext::new(system.clone());
         if let Some(sub_agents) = self.sub_agents {
-            let sub_agents = sub_agents.with_reasoning(spec.thinking, spec.effort);
+            let sub_agents = sub_agents
+                .with_reasoning(spec.thinking, spec.effort)
+                .with_authorization_cell(authorization.policy().clone(), authorization.identity());
             let spawner = match self.sub_agent_adaptive_policy {
                 Some(policy) => {
                     sub_agents.into_spawner_with_adaptive_policy(system.clone(), policy)
                 }
                 None => sub_agents.into_spawner(system.clone()),
             };
-            ctx = ctx.with_spawner(spawner);
+            environment = environment.with_spawner(spawner);
         }
         let model = spec.model.clone();
-        let engine = spec.assemble(provider, registry, approver, ctx, events, flow)?;
+        let engine = spec.assemble_in(provider, environment, events, flow)?;
         Ok(Client {
             engine: Arc::new(engine),
             model,
@@ -682,8 +769,9 @@ pub struct Client {
     // The default session's id, created lazily on first use (see `default_id`). Kept behind a
     // std mutex so two concurrent first-uses can't each mint (and leak) a session.
     default_session: std::sync::Mutex<Option<String>>,
-    // One engine runs one turn at a time (the authored outer loop is armed per turn); every Session
-    // created by this client shares this guard so concurrent sends serialize instead of racing.
+    // FlowEngine owns its single-active-turn invariant. Every Session also shares this broader SDK
+    // operation guard so turns remain ordered with replay/fork/divergence paths that intentionally
+    // execute against the same stores or executor outside FlowEngine's public turn lifecycle.
     turn_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -757,7 +845,8 @@ impl Client {
     }
 
     /// The assembled engine — the documented advanced escape hatch. Everything reachable from
-    /// here still dispatches through the same authorization → approval → guarded-IO envelope.
+    /// here still dispatches through the same authorization → approval → guarded-IO envelope, and
+    /// public turn entries retain the engine's mandatory single-active-turn guarantee.
     pub fn engine(&self) -> &Arc<FlowEngine> {
         &self.engine
     }
@@ -778,6 +867,10 @@ mod tests {
     use flux_core::{Chunk, ContentBlock, StopReason, Usage};
     use flux_provider::{ChunkStream, Request};
     use std::sync::Mutex;
+
+    fn parse_role(content: &str, name_fallback: &str) -> crate::subagents::Role {
+        crate::subagents::try_parse_role(content, name_fallback).unwrap()
+    }
 
     fn request_has_tool(request: &Request, name: &str) -> bool {
         request.tools.iter().any(|tool| tool.name == name)
@@ -942,7 +1035,8 @@ mod tests {
             cwd: dir.clone(),
             ..AgentSpec::new("mock")
         }
-        .with_default_skills();
+        .try_with_default_skills()
+        .unwrap();
         let client = ClientBuilder::from_spec(spec)
             .build(provider, &dir)
             .unwrap();
@@ -1140,6 +1234,27 @@ mod tests {
         )
     }
 
+    fn guarded_read_tool(hits: Arc<std::sync::atomic::AtomicUsize>) -> Arc<dyn flux_runtime::Tool> {
+        flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "guarded_read",
+                "A filesystem-scoped read used to exercise authorization",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } }
+                }),
+            )
+            .with_access(vec![flux_spec::AccessKind::Filesystem]),
+            move |_input| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(serde_json::json!("ran"))
+                }
+            },
+        )
+    }
+
     /// D-143: a `tool_fn` registered on the builder is callable by a planned turn — and it runs
     /// through the envelope, not around it (`auto_approve` is what permits it here).
     #[tokio::test]
@@ -1162,6 +1277,44 @@ mod tests {
         let out = client.run("greet flux").await.unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(out.tool_calls, vec!["greet"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-60: blanket approval is subordinate to the SDK client's mandatory policy floor.
+    #[tokio::test]
+    async fn client_auto_approval_cannot_widen_authorization() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-sdk-policy-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut policy = flux_policy::default_local_grants();
+        policy.grants.retain(|grant| {
+            !grant
+                .actions
+                .iter()
+                .any(|action| action.0 == "workspace.read")
+        });
+        let (caller, trust) = flux_policy::local_identity("sdk-test");
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .with_authorization(policy, caller, trust)
+            .register_op(guarded_read_tool(hits.clone()))
+            .build(
+                Box::new(PlanOpMock {
+                    op: "guarded_read",
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+
+        let _ = client.run("greet flux").await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "auto approval must not execute a policy-denied operation"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1669,6 +1822,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_builder_reports_source_aware_custom_operation_collisions() {
+        let error = Client::builder()
+            .register_op_from("custom-pack:alpha", Arc::new(EchoTool))
+            .register_op_from("custom-pack:beta", Arc::new(EchoTool))
+            .build(Box::new(NeverMock), ".")
+            .err()
+            .expect("duplicate operation must fail client assembly")
+            .to_string();
+
+        assert!(error.contains("duplicate operation `echo`"));
+        assert!(error.contains("custom-pack:alpha"));
+        assert!(error.contains("custom-pack:beta"));
+    }
+
+    #[test]
+    fn client_builder_rejects_custom_operation_shadowing_a_builtin() {
+        let shadow = flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "read",
+                "shadow the workspace reader",
+                serde_json::json!({"type": "object"}),
+            ),
+            |_params| async { Ok(serde_json::Value::Null) },
+        );
+        let error = Client::builder()
+            .register_op_from("custom-pack:shadow", shadow)
+            .build(Box::new(NeverMock), ".")
+            .err()
+            .expect("custom operation must not replace a built-in")
+            .to_string();
+
+        assert!(error.contains("duplicate operation `read`"), "{error}");
+        assert!(error.contains("custom-pack:shadow"), "{error}");
+        assert!(error.contains("flux-tools core coding pack"), "{error}");
+    }
+
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn client_builder_rejects_two_installed_plugins_with_the_same_public_operation() {
+        let error = Client::builder()
+            .with_plugin_tools_from(
+                "alpha (/plugins/alpha.toml)",
+                vec![Arc::new(EchoTool) as Arc<dyn Tool>],
+            )
+            .with_plugin_tools_from(
+                "beta (/plugins/beta.toml)",
+                vec![Arc::new(EchoTool) as Arc<dyn Tool>],
+            )
+            .build(Box::new(NeverMock), ".")
+            .err()
+            .expect("installed plugin public-name collision must fail assembly")
+            .to_string();
+
+        assert!(error.contains("duplicate operation `echo`"), "{error}");
+        assert!(
+            error.contains("plugin:alpha (/plugins/alpha.toml)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("plugin:beta (/plugins/beta.toml)"),
+            "{error}"
+        );
+    }
+
     /// A two-`await` interview flow: prompt, park, prompt, park, done. `echo` emits each authored
     /// prompt; `await` parks for the reply.
     fn interview_flow() -> flux_lang::ast::DraftAst {
@@ -1880,7 +2098,7 @@ mod tests {
     /// recorded usage). The `subagents` re-export module names every bundle type.
     #[tokio::test]
     async fn with_sub_agents_runs_a_delegated_task_and_records_child_usage() {
-        use crate::subagents::{parse_role, RoleRegistry, SubAgents};
+        use crate::subagents::{RoleRegistry, SubAgents};
 
         let dir = std::env::temp_dir().join(format!("flux-sdk-subagents-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1974,7 +2192,7 @@ mod tests {
     /// legacy default `into_spawner` path.
     #[tokio::test]
     async fn with_sub_agents_policy_reaches_conversational_children() {
-        use crate::subagents::{parse_role, RoleRegistry, SubAgents};
+        use crate::subagents::{RoleRegistry, SubAgents};
 
         let dir =
             std::env::temp_dir().join(format!("flux-sdk-subagent-policy-{}", std::process::id()));
@@ -2093,7 +2311,7 @@ mod tests {
             _ctx: &ToolContext,
             _params: serde_json::Value,
         ) -> Result<flux_runtime::ToolResult> {
-            use crate::subagents::{parse_role, RoleRegistry, SpawnLimits, SubAgents};
+            use crate::subagents::{RoleRegistry, SpawnLimits, SubAgents};
 
             let mut roles = RoleRegistry::default();
             roles.insert(parse_role(

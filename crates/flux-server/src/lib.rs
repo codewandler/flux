@@ -34,8 +34,11 @@ use flux_auth::request::{AuthContext, AuthError, RequestAuthenticator};
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
+use flux_runtime::TurnIdentity;
 
 type Shared = Arc<FlowEngine>;
+/// Higher-level A2A task/session ordering. `FlowEngine` independently serializes turns and owns
+/// their lexical caller identity; this gate exists only for mint/TTL/registry transition ordering.
 pub(crate) type TurnGate = Arc<tokio::sync::Mutex<()>>;
 
 // ── Auth modes (D-69) ─────────────────────────────────────────────────────────
@@ -58,7 +61,7 @@ pub enum ServerAuth {
     /// Per-request bearer → principal resolution: every request is authenticated by the injected
     /// [`RequestAuthenticator`], sessions are tagged with and scoped to the caller's realm, and
     /// every turn runs under the request principal's `(Caller, Trust)` — never the service
-    /// identity (see [`enter_turn`]).
+    /// identity (see [`server_turn_context`]).
     Principal(PrincipalAuth),
 }
 
@@ -239,59 +242,66 @@ fn realm_of(ctx: &AuthContext) -> String {
     }
 }
 
-/// Principal-mode turn entry: swaps the engine's executor identity to the request principal and
-/// returns the caller's realm. The `_gate` witness makes this uncallable without holding the
-/// single-turn gate — the identity cell must never be swapped while another request's turn is
-/// draining — and a turn's realm is obtainable *only* from this function, so realm-scoped minting
-/// structurally cannot happen without the identity swap (the D-69 type-coupling: principal mode
-/// cannot ship with turns running under the service identity).
-///
-/// Non-principal modes return `Ok(None)` and touch nothing (byte-for-byte pre-D-69 behavior).
-/// In principal mode a missing [`AuthContext`] is a constant 401 — unreachable behind
-/// [`require_auth`], but fail-closed rather than fail-open if a future route forgets the layer.
-pub(crate) fn enter_turn(
+/// Immutable request-owned inputs for one server-driven engine turn.
+#[derive(Clone)]
+pub(crate) struct ServerTurnContext {
+    pub(crate) realm: Option<String>,
+    pub(crate) identity: Option<TurnIdentity>,
+}
+
+/// Resolve realm and caller identity together without mutating the shared executor. The resulting
+/// identity is moved into `FlowEngine` only after its engine-owned turn gate is acquired.
+pub(crate) fn server_turn_context(
     auth: &ServerAuth,
-    engine: &FlowEngine,
     ctx: Option<&AuthContext>,
-    _gate: &tokio::sync::MutexGuard<'_, ()>,
-) -> Result<Option<String>, Box<Response>> {
+) -> Result<ServerTurnContext, Box<Response>> {
     match auth {
-        ServerAuth::Open | ServerAuth::SharedSecret { .. } => Ok(None),
+        ServerAuth::Open | ServerAuth::SharedSecret { .. } => Ok(ServerTurnContext {
+            realm: None,
+            identity: None,
+        }),
         ServerAuth::Principal(_) => {
             let ctx = ctx.ok_or_else(|| Box::new(unauthorized()))?;
-            engine
-                .executor
-                .set_identity(ctx.caller.clone(), ctx.trust.clone());
-            Ok(Some(realm_of(ctx)))
+            Ok(ServerTurnContext {
+                realm: Some(realm_of(ctx)),
+                identity: Some(TurnIdentity::new(ctx.caller.clone(), ctx.trust.clone())),
+            })
         }
     }
 }
 
-/// The caller's realm **without** the identity swap — for A2A operations that never run a turn
-/// (`tasks/get`, `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/*`) and for
-/// the non-blocking mint (A-54), where the task id must be answered before the single-turn gate
-/// can be acquired.
-///
-/// This is a deliberate, narrow relaxation of the D-69 type-coupling ([`enter_turn`] binds
-/// realm-derivation to the gate-held identity swap): the coupling's invariant is that **no turn
-/// runs under the service identity**, and it still holds — a non-blocking send's background task
-/// calls [`enter_turn`] under the gate before any model work; the read-only task operations run
-/// no turn at all. What this function must never be used for is minting-then-running inside one
-/// gate hold — that path keeps using [`enter_turn`]'s realm.
-///
-/// Same fail-closed posture: principal mode without an [`AuthContext`] is an error (unreachable
-/// behind [`require_auth`]).
+/// Drive a server request through the engine's mandatory turn gate with the request's immutable
+/// identity. Open/shared-secret modes retain the executor's assembled default identity.
+pub(crate) async fn run_server_turn(
+    engine: &FlowEngine,
+    turn: &ServerTurnContext,
+    session_id: &str,
+    input: &str,
+    sink: &mut dyn AgentSink,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> flux_core::Result<()> {
+    match &turn.identity {
+        Some(identity) => {
+            engine
+                .run_turn_cancellable_as(session_id, input, sink, cancel, identity.clone())
+                .await
+        }
+        None => {
+            engine
+                .run_turn_cancellable(session_id, input, sink, cancel)
+                .await
+        }
+    }
+}
+
+/// Resolve only the caller realm for A2A operations that do not run an engine turn.
 pub(crate) fn caller_realm(
     auth: &ServerAuth,
     ctx: Option<&AuthContext>,
 ) -> Result<Option<String>, ()> {
-    match auth {
-        ServerAuth::Open | ServerAuth::SharedSecret { .. } => Ok(None),
-        ServerAuth::Principal(_) => match ctx {
-            Some(ctx) => Ok(Some(realm_of(ctx))),
-            None => Err(()),
-        },
-    }
+    server_turn_context(auth, ctx)
+        .map(|turn| turn.realm)
+        .map_err(|_| ())
 }
 
 /// The A2A session TTL in seconds (C-18): A2A-minted sessions whose last activity is older than
@@ -542,7 +552,7 @@ pub fn router(engine: Arc<FlowEngine>, auth: ServerAuth, card: CardInfo) -> Rout
 fn a2a_ttl_from_config() -> A2aTtl {
     let ttl = std::env::current_dir()
         .ok()
-        .and_then(|cwd| match flux_config::load(&cwd) {
+        .and_then(|cwd| match flux_runtime::metadata::load_config(&cwd) {
             Ok(cfg) => Some(cfg.a2a_session_ttl_secs()),
             Err(e) => {
                 eprintln!("(ignoring malformed flux config for the A2A session TTL: {e})");
@@ -629,14 +639,11 @@ pub trait AgentResolver: Send + Sync {
 /// card. (Each agent owns its own `FlowEngine` — and thus its own event store — so A2A session
 /// TTL, `contextId` continuity, and per-principal realm scoping are already isolated per agent.)
 ///
-/// **Principal-mode contract:** the mount swaps *this engine's executor identity* to the request
-/// principal each turn ([`enter_turn`]). For a sub-agent (`task`) spawned within that turn to run
-/// under the same principal — rather than a stale build-time identity — the engine must have been
-/// built with its **executor's identity cell shared into the spawner** (i.e. one
-/// `Executor::identity()` cell fed to both the executor and `SubAgents::with_authorization_cell`,
-/// as the CLI wires it). Building the engine's spawner with a fresh unshared cell
-/// (`SubAgents::with_authorization`) instead would leave sub-agents authorized as the service
-/// identity. There is no runtime check for this — it is the engine builder's responsibility.
+/// **Principal-mode contract:** the mount passes an immutable [`TurnIdentity`] into this engine's
+/// gate-held turn entry. The same lexical runtime context is propagated across the supervised
+/// `task` boundary, so a spawned sub-agent snapshots the request principal rather than the
+/// assembly-time fallback identity. Engine/spawner assembly may still share one immutable
+/// `IdentityCell` as their non-principal default; request handling never retargets it.
 #[derive(Clone)]
 pub struct ResolvedAgent {
     pub engine: Arc<FlowEngine>,
@@ -939,18 +946,22 @@ struct MessageRequest {
 async fn post_message(
     State(agent): State<Shared>,
     State(auth): State<Arc<ServerAuth>>,
-    State(turn_gate): State<TurnGate>,
     ctx: Option<Extension<AuthContext>>,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, Response> {
     let mut sink = Collect::default();
-    let _turn = turn_gate.lock().await;
-    enter_turn(&auth, &agent, ctx.as_ref().map(|e| &e.0), &_turn).map_err(|e| *e)?;
-    agent
-        .run_turn(&id, &req.input, &mut sink)
-        .await
-        .map_err(|e| err500(e).into_response())?;
+    let turn = server_turn_context(&auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
+    run_server_turn(
+        &agent,
+        &turn,
+        &id,
+        &req.input,
+        &mut sink,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .map_err(|e| err500(e).into_response())?;
     Ok(Json(json!({
         "text": sink.text,
         "tool_calls": sink.tools,
@@ -1039,29 +1050,26 @@ struct StreamQuery {
 async fn stream_message(
     State(agent): State<Shared>,
     State(auth): State<Arc<ServerAuth>>,
-    State(turn_gate): State<TurnGate>,
     ctx: Option<Extension<AuthContext>>,
     Path(id): Path<String>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
-    // Fail closed BEFORE the SSE response is established: principal mode with no resolved
-    // principal is a 401, not a stream (unreachable behind `require_auth`).
-    if matches!(auth.as_ref(), ServerAuth::Principal(_)) && ctx.is_none() {
-        return Err(unauthorized());
-    }
-    let ctx = ctx.map(|e| e.0);
+    // Resolve before establishing SSE so principal mode without a context is a normal 401.
+    let turn = server_turn_context(&auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let agent = agent.clone();
     tokio::spawn(async move {
         let mut sink = SseSink { tx: tx.clone() };
-        let _turn = turn_gate.lock().await;
-        // Identity swap inside the gate (the SSE response is already up, so a — pre-checked,
-        // unreachable — failure surfaces as an error frame rather than an HTTP status).
-        if enter_turn(&auth, &agent, ctx.as_ref(), &_turn).is_err() {
-            let _ = tx.send(Event::default().event("error").data(UNAUTHORIZED_BODY));
-            return;
-        }
-        if let Err(e) = agent.run_turn(&id, &q.input, &mut sink).await {
+        if let Err(e) = run_server_turn(
+            &agent,
+            &turn,
+            &id,
+            &q.input,
+            &mut sink,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        {
             let _ = tx.send(Event::default().event("error").data(e.to_string()));
         }
         let _ = tx.send(Event::default().event("done").data("end"));
@@ -1093,7 +1101,6 @@ impl AgentSink for SseSink {
 async fn webhook(
     State(agent): State<Shared>,
     State(auth): State<Arc<ServerAuth>>,
-    State(turn_gate): State<TurnGate>,
     ctx: Option<Extension<AuthContext>>,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<Value>, Response> {
@@ -1101,12 +1108,17 @@ async fn webhook(
     // every other mint — an untagged session would be unreachable to its own creator.
     let session_id = mint_session(&agent, &auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
     let mut sink = Collect::default();
-    let _turn = turn_gate.lock().await;
-    enter_turn(&auth, &agent, ctx.as_ref().map(|e| &e.0), &_turn).map_err(|e| *e)?;
-    agent
-        .run_turn(&session_id, &req.input, &mut sink)
-        .await
-        .map_err(|e| err500(e).into_response())?;
+    let turn = server_turn_context(&auth, ctx.as_ref().map(|e| &e.0)).map_err(|e| *e)?;
+    run_server_turn(
+        &agent,
+        &turn,
+        &session_id,
+        &req.input,
+        &mut sink,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .map_err(|e| err500(e).into_response())?;
     Ok(Json(json!({
         "session_id": session_id,
         "text": sink.text,

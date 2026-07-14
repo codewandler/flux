@@ -1,7 +1,7 @@
 //! The resumable session handle.
 //!
 //! A [`Session`] is a cheap, cloneable handle to one conversation on a [`Client`](crate::Client)'s
-//! engine: `{engine, session_id}` plus the client's turn guard. Sessions are how an embedder
+//! engine: `{engine, session_id}` plus the client's operation guard. Sessions are how an embedder
 //! resumes work across process restarts (pair with
 //! [`Storage::dir`](crate::Storage::dir)) and where the streaming, flow-driven, and
 //! observability front doors live.
@@ -32,9 +32,9 @@ use crate::TurnOutput;
 /// [`Client::open_session`](crate::Client::open_session), or
 /// [`Client::latest_session`](crate::Client::latest_session). Clones share the same session.
 ///
-/// One engine runs one turn at a time (the authored outer loop is stateful per turn), so concurrent
-/// `send`s — on one session or across sessions of the same client — serialize on the client's
-/// internal turn guard rather than interleaving.
+/// [`FlowEngine`] itself serializes its public turn entries, including calls made through the
+/// advanced engine escape hatch. The SDK's broader operation guard also orders those turns against
+/// replay, fork, and divergence operations that share the client's executor and stores.
 #[derive(Clone)]
 pub struct Session {
     pub(crate) engine: Arc<FlowEngine>,
@@ -211,6 +211,7 @@ impl Session {
         sink: &mut dyn VoiceSink,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        let _operation = self.turn_guard.lock().await;
         // Flow-driven: the flow owns tools (the model is STT/TTS only), so no tool defs are declared.
         let conn = provider.connect(config).await?;
         let handler = EngineVoiceHandler::new(self.engine.clone(), self.id.clone(), flow);
@@ -237,6 +238,7 @@ impl Session {
         turn: Option<usize>,
         sink: &mut dyn AgentSink,
     ) -> Result<ReplayReport> {
+        let _operation = self.turn_guard.lock().await;
         flux_flow::replay::replay_session(
             &self.engine.events,
             &self.engine.executor,

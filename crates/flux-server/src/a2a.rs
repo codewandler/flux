@@ -33,7 +33,7 @@
 //! than the configured TTL (`[server] a2a_session_ttl_secs`, default 1h, `0` = never) — see
 //! [`create_a2a_session`]. Only A2A-tagged sessions are ever eligible.
 //!
-//! Minting happens *after* the single-turn `turn_gate` is acquired, never before (C-29): a
+//! Minting happens *after* the A2A ordering `turn_gate` is acquired, never before (C-29): a
 //! session minted while still queued behind another in-flight turn would sit with a frozen
 //! `updated_at` until its own `run_turn` starts, so a concurrent request's mint-time sweep could
 //! prune it out from under the queue — no error results (there is no FK from `events` back to
@@ -53,6 +53,10 @@ use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
+
+mod task_run;
+
+use task_run::{TaskRun, TerminalPrecedence};
 
 use flux_a2a::{error, server};
 use flux_a2a::{AgentCard, Message, Task, TaskState, TaskStatus};
@@ -766,12 +770,12 @@ async fn send_blocking(
     input: String,
 ) -> Json<Value> {
     let requested_context = server::extract_context_id(&params);
-    // Acquire the gate BEFORE minting (C-29) — the identity swap + realm derivation happen
-    // through `enter_turn` under the same gate hold: the realm used for continuity keying is
-    // obtainable only from the function that also sets the executor identity (D-69 coupling).
+    // Acquire the gate BEFORE minting (C-29). Identity is request-owned and will be installed by
+    // the engine only after its own turn gate is acquired; this outer gate orders A2A mint/TTL and
+    // registry transitions around the run.
     let _turn = turn_gate.lock().await;
-    let realm = match crate::enter_turn(&auth, &engine, ctx.as_ref(), &_turn) {
-        Ok(r) => r,
+    let turn = match crate::server_turn_context(&auth, ctx.as_ref()) {
+        Ok(turn) => turn,
         // Constant text: unreachable behind `require_auth`, fail-closed if a mount forgets it.
         Err(_) => return rpc_err(id, -32603, crate::UNAUTHORIZED_BODY),
     };
@@ -781,7 +785,7 @@ async fn send_blocking(
         &engine,
         ttl,
         requested_context.as_deref(),
-        realm.as_deref(),
+        turn.realm.as_deref(),
         TaskState::Working,
         CancellationToken::new(),
     ) {
@@ -789,44 +793,35 @@ async fn send_blocking(
         Err(e) => return mint_err(id, e),
     };
     let mut sink = Collect::default();
-    let result = engine
-        .run_turn_cancellable(&task.session_id, &input, &mut sink, &task.cancel)
-        .await;
+    let result = crate::run_server_turn(
+        &engine,
+        &turn,
+        &task.session_id,
+        &input,
+        &mut sink,
+        &task.cancel,
+    )
+    .await;
+    let run = TaskRun::new(&registry, &scope, &task);
+    let terminal = run.classify(
+        result,
+        Some(Message::agent_text(sink.text)),
+        TerminalPrecedence::Failure,
+    );
     // Publish the terminal transition for any resubscriber/webhook, then release the entry
     // BEFORE the gate drops (a queued follow-up on this context must not collide with it).
-    if let Err(e) = result {
-        publish_transition(
-            &registry,
-            &scope,
-            &task.session_id,
-            &task.context_id,
-            TaskState::Failed,
-            Some(Message::agent_text(e.to_string())),
-            true,
-        );
-        registry.finish(&scope, &task.session_id);
-        return rpc_err(id, -32603, format!("Agent error: {e}"));
+    run.finish(&terminal);
+    if let Some(error) = terminal.error {
+        return rpc_err(id, -32603, format!("Agent error: {error}"));
     }
-    // A cancel that landed mid-run (A-55) surfaces as a canceled task, not a completed one.
-    let (state, message) = if task.cancel.is_cancelled() {
-        (TaskState::Canceled, None)
-    } else {
-        (TaskState::Completed, Some(Message::agent_text(sink.text)))
-    };
-    publish_transition(
-        &registry,
-        &scope,
-        &task.session_id,
-        &task.context_id,
-        state,
-        None,
-        true,
-    );
-    registry.finish(&scope, &task.session_id);
     // A-52: return the conversation so far as `Task.history`, capped to the client's
     // `historyLength` when set.
     let history = a2a_history(&engine, &task.session_id, server::history_length(&params));
-    let status = TaskStatus::new(state, message, Some(server::now_rfc3339()));
+    let status = TaskStatus::new(
+        terminal.state,
+        terminal.response_message,
+        Some(server::now_rfc3339()),
+    );
     let mut out = Task::new(task.session_id, Some(task.context_id), status);
     out.history = history;
     match serde_json::to_value(&out) {
@@ -837,9 +832,8 @@ async fn send_blocking(
 
 /// The non-blocking path (A-54): answer `submitted` + the task id immediately and drive the turn
 /// on a background task. The client advances via `tasks/get` (poll) or `tasks/resubscribe`
-/// (stream). Realm comes from [`crate::caller_realm`] — the D-69 identity swap is deferred to the
-/// background task's gate-held [`crate::enter_turn`], so no turn ever runs under the service
-/// identity.
+/// (stream). Realm and identity are resolved from the same authenticated request; the background
+/// task passes the immutable identity into the engine-owned turn gate.
 #[allow(clippy::too_many_arguments)]
 async fn send_nonblocking(
     engine: Shared,
@@ -889,10 +883,9 @@ async fn send_nonblocking(
     response
 }
 
-/// Drive one non-blocking send to its terminal state: queue on the single-turn gate, swap the
-/// executor identity ([`crate::enter_turn`] — the D-69 swap deferred from mint), advance
-/// `submitted → working`, run the cancellable turn, publish the terminal transition, and release
-/// the registry entry (before the gate, so a queued follow-up never collides with it).
+/// Drive one non-blocking send to its terminal state: queue on the A2A ordering gate, advance
+/// `submitted → working`, run under the engine-owned identity/turn gate, publish the terminal
+/// transition, and release the registry entry before a queued follow-up can collide with it.
 #[allow(clippy::too_many_arguments)]
 async fn run_background(
     engine: Shared,
@@ -906,32 +899,27 @@ async fn run_background(
 ) {
     let _turn = turn_gate.lock().await;
     // Fail-closed belt+braces: `caller_realm` already vetted the context at mint.
-    if crate::enter_turn(&auth, &engine, ctx.as_ref(), &_turn).is_err() {
-        publish_transition(
-            &registry,
-            &scope,
-            &task.session_id,
-            &task.context_id,
-            TaskState::Failed,
-            Some(Message::agent_text(crate::UNAUTHORIZED_BODY)),
-            true,
-        );
-        registry.finish(&scope, &task.session_id);
-        return;
-    }
+    let turn = match crate::server_turn_context(&auth, ctx.as_ref()) {
+        Ok(turn) => turn,
+        Err(_) => {
+            publish_transition(
+                &registry,
+                &scope,
+                &task.session_id,
+                &task.context_id,
+                TaskState::Failed,
+                Some(Message::agent_text(crate::UNAUTHORIZED_BODY)),
+                true,
+            );
+            registry.finish(&scope, &task.session_id);
+            return;
+        }
+    };
+    let run = TaskRun::new(&registry, &scope, &task);
     // A cancel can land while the task is still queued (A-55): keep the registry state
     // `canceled` — the engine's first cancellation check ends the run immediately either way.
     if !task.cancel.is_cancelled() {
-        registry.set_state(&scope, &task.session_id, TaskState::Working);
-        publish_transition(
-            &registry,
-            &scope,
-            &task.session_id,
-            &task.context_id,
-            TaskState::Working,
-            None,
-            false,
-        );
+        run.start_working();
     }
     let mut sink = BroadcastSink {
         registry: registry.clone(),
@@ -939,29 +927,19 @@ async fn run_background(
         task_id: task.session_id.clone(),
         context_id: task.context_id.clone(),
     };
-    let result = engine
-        .run_turn_cancellable(&task.session_id, &input, &mut sink, &task.cancel)
-        .await;
+    let result = crate::run_server_turn(
+        &engine,
+        &turn,
+        &task.session_id,
+        &input,
+        &mut sink,
+        &task.cancel,
+    )
+    .await;
     // The final frame carries no message on success — the deltas already broadcast are
     // authoritative, and the answer is durable in the task projection (`tasks/get`).
-    let (state, message) = if task.cancel.is_cancelled() {
-        (TaskState::Canceled, None)
-    } else {
-        match result {
-            Ok(()) => (TaskState::Completed, None),
-            Err(e) => (TaskState::Failed, Some(Message::agent_text(e.to_string()))),
-        }
-    };
-    publish_transition(
-        &registry,
-        &scope,
-        &task.session_id,
-        &task.context_id,
-        state,
-        message,
-        true,
-    );
-    registry.finish(&scope, &task.session_id);
+    let terminal = run.classify(result, None, TerminalPrecedence::Cancellation);
+    run.finish(&terminal);
 }
 
 /// Streams a background run's text deltas as `working` frames to any live subscriber (A-56).
@@ -1142,7 +1120,7 @@ fn project_stored_task(
 // ── tasks/get · tasks/cancel · tasks/resubscribe (A-54/A-55/A-56) ────────────
 
 /// Validate a `tasks/*` request: the task id from `params.id` plus the caller's realm (no
-/// identity swap — these operations never run a turn).
+/// turn identity — these operations never run a turn).
 fn task_request(
     auth: &crate::ServerAuth,
     ctx: &Option<flux_auth::request::AuthContext>,
@@ -1592,9 +1570,9 @@ async fn subscribe(
         // which is why the mint and the initial "working" frame both live inside the gate below
         // rather than before `tokio::spawn`.
         let _turn = turn_gate.lock().await;
-        // Identity swap + realm under the gate (pre-checked above; error frame is belt+braces).
-        let realm = match crate::enter_turn(&auth, &engine_clone, ctx.as_ref(), &_turn) {
-            Ok(r) => r,
+        // Resolve the immutable request identity and realm under the A2A ordering gate.
+        let turn = match crate::server_turn_context(&auth, ctx.as_ref()) {
+            Ok(turn) => turn,
             Err(_) => {
                 let _ = tx.send(
                     Event::default().data(
@@ -1617,7 +1595,7 @@ async fn subscribe(
             &engine_clone,
             ttl,
             requested_context.as_deref(),
-            realm.as_deref(),
+            turn.realm.as_deref(),
             TaskState::Working,
             cancel_task.clone(),
         ) {
@@ -1648,6 +1626,7 @@ async fn subscribe(
         let session_id = task.session_id.clone();
         let context_id = task.context_id.clone();
         let task_id = session_id.clone();
+        let run = TaskRun::new(&registry, &scope, &task);
 
         // Initial "working" update so the caller knows the task started (the transition also
         // reaches resubscribers/webhooks).
@@ -1659,15 +1638,7 @@ async fn subscribe(
             None,
             false,
         ));
-        publish_transition(
-            &registry,
-            &scope,
-            &task_id,
-            &context_id,
-            TaskState::Working,
-            None,
-            false,
-        );
+        run.start_working();
         let mut sink = StreamSink {
             tx: tx.clone(),
             id: id.clone(),
@@ -1677,20 +1648,19 @@ async fn subscribe(
             registry: registry.clone(),
             scope: scope.clone(),
         };
-        let result = engine_clone
-            .run_turn_cancellable(&session_id, &input, &mut sink, &cancel_task)
-            .await;
+        let result = crate::run_server_turn(
+            &engine_clone,
+            &turn,
+            &session_id,
+            &input,
+            &mut sink,
+            &cancel_task,
+        )
+        .await;
         // The terminal state: a disconnect-cancelled run is `canceled`, otherwise the run's own
         // outcome. The final event carries no message on success — the deltas already streamed
         // are authoritative; on failure it carries the error text.
-        let (state, message) = if cancel_task.is_cancelled() {
-            (TaskState::Canceled, None)
-        } else {
-            match result {
-                Ok(()) => (TaskState::Completed, None),
-                Err(e) => (TaskState::Failed, Some(Message::agent_text(e.to_string()))),
-            }
-        };
+        let terminal = run.classify(result, None, TerminalPrecedence::Cancellation);
         // If the client disconnected mid-stream, skip its final event — nobody is listening —
         // but the transition still reaches resubscribers and webhooks.
         if !cancel_task.is_cancelled() {
@@ -1698,22 +1668,14 @@ async fn subscribe(
                 &id,
                 &task_id,
                 &context_id,
-                state,
-                message.clone(),
+                terminal.state,
+                terminal.response_message.clone(),
                 true,
             ));
         }
-        publish_transition(
-            &registry,
-            &scope,
-            &task_id,
-            &context_id,
-            state,
-            message,
-            true,
-        );
-        // Release the entry before the gate drops (a queued follow-up must not collide with it).
-        registry.finish(&scope, &task_id);
+        // Publish for resubscribers/webhooks and release before the gate drops (a queued follow-up
+        // must not collide with it).
+        run.finish(&terminal);
         // `tx` (and sink.tx clone) drop here → channel closes → stream ends.
     });
 
@@ -2103,7 +2065,7 @@ mod tests {
     }
 
     /// C-29 failing-first test: `send`/`subscribe` used to mint a session (running the lazy TTL
-    /// sweep) *before* acquiring the single-turn `turn_gate`, and a session's `updated_at` is
+    /// sweep) *before* acquiring the A2A ordering `turn_gate`, and a session's `updated_at` is
     /// frozen at mint until its own `run_turn` first records something. So a session minted just
     /// ahead of a long turn already holding the gate could sit queued long enough to look expired
     /// to a *different*, concurrent request's mint-time sweep — which prunes it out from under the
@@ -2121,7 +2083,7 @@ mod tests {
         let ttl = A2aTtl(1); // 1s — small enough to cross for real within the test.
         let turn_gate: TurnGate = Arc::new(tokio::sync::Mutex::new(()));
 
-        // Simulate a long turn already in flight: something else holds the single-turn gate.
+        // Simulate a long A2A turn already in flight: something else holds the ordering gate.
         let held = turn_gate.clone().lock_owned().await;
 
         // Fire request X through the real `send` handler — a BLOCKING send (the path whose C-29

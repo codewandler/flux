@@ -72,6 +72,10 @@ identity.
   (`set_identity_swaps_the_policy_subject_between_turns`) and the server identity swap in
   `tests/principal_auth.rs` (8 new integration tests). `docs/a2a.md` security notes rewritten.
   Full workspace gate green.
+- 2026-07-14 — A-87 supersedes that historical mutable-identity implementation: the server now
+  constructs an immutable `TurnIdentity` and passes it through the engine-owned `run_turn*_as`
+  entry points; mutable `IdentityCell` retargeting, `enter_turn`, and the old swap test no longer
+  exist.
 - 2026-07-07 pre-release review hardening: realm keys namespaced `acct:`/`user:` (disjoint, closes
   the account-value/principal-realm collision) with a regression test; realm-scoped `/usage` now
   goes through the store's `cost_summary_for_account` (shared canonical fold, no key-split/unpriced

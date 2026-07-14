@@ -113,6 +113,63 @@ let client = Client::builder()
     .build(provider, ".")?;
 ```
 
+## Authorization and approval
+
+Every `Client` and `FlowClient` has a mandatory authorization profile. The default is the documented
+local single-user profile (`ExecutionAuthorization::local()`), which carries both the local grants
+and a resolved local identity. A service that authenticates multiple callers should install its
+resolved policy, caller, and trust explicitly:
+
+```rust,ignore
+use flux_sdk::{authorization::{AuthorizationPolicy, Caller, Trust}, Client};
+
+# fn ex(
+#     provider: Box<dyn flux_provider::Provider>,
+#     policy: AuthorizationPolicy,
+#     caller: Caller,
+#     trust: Trust,
+# ) -> flux_core::Result<()> {
+let client = Client::builder()
+    .with_authorization(policy, caller, trust)
+    .auto_approve(true)
+    .build(provider, ".")?;
+# Ok(()) }
+```
+
+Authorization is evaluated before permission rules and approval. Consequently, `auto_approve(true)`
+can skip an approval prompt but cannot grant an action denied by the policy. The same profile is
+carried into direct-flow, streamed, voice, and sub-agent execution paths.
+
+Long-lived services that reuse one engine across authenticated principals must not retarget its
+executor. Freeze the request identity and pass it with the turn instead:
+
+```rust,ignore
+use flux_sdk::authorization::TurnIdentity;
+
+let identity = TurnIdentity::new(caller, trust);
+client
+    .engine()
+    .run_turn_as(session_id, input, sink, identity)
+    .await?;
+```
+
+`run_turn_as` (and its cancellable/authored-flow counterparts) installs the identity only after the
+engine acquires its single-active-turn gate. Policy checks, approval receipts, audit rows, and
+spawned specialists therefore share one immutable request identity.
+
+## Operation registration collisions
+
+Operation names are unique identities. Client construction returns an error when a custom operation
+or plugin collides with a built-in, another plugin, or an earlier custom operation; the diagnostic
+names both registration sources. `FlowClient::try_register_op` is the fallible direct-registration
+API for integrations. The older `FlowClient::register_op` convenience method remains source
+compatible but panics on an invalid or duplicate declaration, so new production code should use the
+fallible form. Pack installers should likewise expose a fallible function and use
+`ClientBuilder::try_register_pack` or `FlowClient::try_register_pack`; the legacy `register_pack`
+wrappers remain source-compatible but cannot propagate a collision. Runtime owners that
+intentionally replace a control-plane operation must use the separately named
+`ToolRegistry::replace_from`; ordinary registration never overwrites implicitly.
+
 ## Direct-flow lifecycle and lower-level crates
 
 `FlowClient` is the recommended AI-application API when the application owns a flow. It exposes

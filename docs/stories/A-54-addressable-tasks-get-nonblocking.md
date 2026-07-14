@@ -59,6 +59,9 @@ builds on.
   `task_surface_is_realm_scoped_with_constant_not_found`. NOT a breaking signature change in the
   end (registry is internal state) — but the non-blocking DEFAULT is a wire-behavior change →
   minor bump.
+- 2026-07-14 — A-87 supersedes the mutable identity wording above: A2A turns now pass an immutable
+  `TurnIdentity` through the engine-owned `run_turn*_as` entry points after acquiring the turn gate;
+  there is no `enter_turn` identity swap.
 
 ## Notes
 - `input-required`/`auth-required` (resume-on-`taskId` via the suspend/resume seam) rides this story's
