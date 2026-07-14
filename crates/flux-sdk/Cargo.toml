@@ -29,6 +29,11 @@ flux-policy.workspace = true
 flux-secret.workspace = true
 flux-system.workspace = true
 flux-tools.workspace = true
+# First-class live systems-of-record registration. `flux-capabilities` owns the guarded async
+# backend/operation seam; the pure row/page/filter types stay in their L0 contract crate and are
+# re-exported by `flux_sdk::datasource` so embedders need no transitive dependency imports.
+flux-capabilities.workspace = true
+flux-datasource.workspace = true
 flux-events.workspace = true
 flux-agent.workspace = true
 # Flux-Lang lifecycle surface: the L0 language (artifact prelude), the L3 engine (compile/analyze/
@@ -89,9 +94,3 @@ plugins = ["dep:flux-plugin"]
 name = "flux_sdk_plugin_fixture"
 path = "fixtures/plugin_fixture.rs"
 required-features = ["plugins"]
-
-[dev-dependencies]
-# L5 web + datasource/RAG capabilities — a dev-only dependency for the `datasource_recipe` example
-# (D-159): it shows how an EMBEDDER attaches datasources today via `register_pack`, so `flux-sdk`
-# itself stays free of the dependency until the first-class seam lands (D-62).
-flux-capabilities.workspace = true

@@ -115,7 +115,6 @@ Registering a `LiveDatasource` under a domain name yields exactly two ops, built
 ```rust
 pub fn try_register_live_datasource(
     registry: &mut ToolRegistry,
-    groups: &mut Vec<ToolGroup>,
     domain: &str,
     backend: Arc<dyn LiveDatasource>,
 ) -> Result<LiveDatasourceSurface>;
@@ -274,8 +273,8 @@ Accepted implementation stories — each remains independently testable and comm
 2. **D-169 — the `LiveDatasource` trait** ✅ — `async list`/`get` + `schema()` and closed
    `LiveAccess` declarations in `flux-capabilities/src/datasource/live.rs`, using the existing
    async/runtime dependencies.
-3. **D-170 — the generic two-op projection** — `try_register_live_datasource(registry, groups,
-   domain, backend)`
+3. **D-170 — the generic two-op projection** — `try_register_live_datasource(registry, domain,
+   backend)`
    emitting `<domain>.list` + `<domain>.get` with schema-generated input schemas and compact row +
    `next:` rendering.
 4. **D-171 — validation, clamping & cursor plumbing** — filter-key/type validation (unknown-key + enum

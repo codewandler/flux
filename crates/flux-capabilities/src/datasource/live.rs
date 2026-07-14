@@ -13,8 +13,9 @@ use flux_datasource::live::{
     FilterKey, FilterType, FilterValue, Filters, LiveEntity, LiveSchema, Page, PageRequest,
     Reference, Row,
 };
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
-use flux_spec::{AccessKind, ToolSpec};
+use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
+use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_spec::{AccessKind, Effect, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -79,30 +80,44 @@ pub trait LiveDatasource: Send + Sync {
     async fn get(&self, ctx: &ToolContext, entity: &str, id: &str) -> Result<Option<Row>>;
 }
 
+/// Evidence-gated catalog metadata returned with one registered live datasource.
+///
+/// Hosts install [`group`](Self::group) beside the generated tools and add
+/// [`ambient_signal`](Self::ambient_signal) whenever the configured backend is present. Keeping
+/// those values together prevents a registration from accidentally advertising tools without the
+/// evidence that makes the integration available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveDatasourceSurface {
+    /// Per-domain group containing exactly the generated list/get operations.
+    pub group: ToolGroup,
+    /// Ambient project signal emitted because this datasource is configured.
+    pub ambient_signal: String,
+}
+
 /// Build the uniform `<domain>.list` and `<domain>.get` operations for one live backend.
 ///
-/// The backend contract is snapshotted and validated once so the schemas advertised at
-/// registration are the same entity/filter vocabulary used to route calls. Runtime enforcement of
-/// filter contracts and page bounds is the next projection phase; this layer performs only the
-/// structural conversion needed by the typed backend.
+/// The backend contract is snapshotted and validated once so the schemas and external authority
+/// advertised at registration are the same entity/filter/resource vocabulary used to route calls.
 pub fn live_datasource_tools(
     domain: &str,
     backend: Arc<dyn LiveDatasource>,
 ) -> Result<Vec<Arc<dyn Tool>>> {
     let schema = backend.schema();
-    validate_live_contract(domain, &schema, &backend.access())?;
+    let access = backend.access();
+    validate_live_contract(domain, &schema, &access)?;
 
     let projection = Arc::new(LiveProjection {
         domain: domain.to_string(),
         schema,
+        access,
         backend,
     });
     let list = LiveListOp {
-        spec: list_spec(&projection.domain, &projection.schema),
+        spec: list_spec(&projection.domain, &projection.schema, &projection.access),
         projection: projection.clone(),
     };
     let get = LiveGetOp {
-        spec: get_spec(&projection.domain, &projection.schema),
+        spec: get_spec(&projection.domain, &projection.schema, &projection.access),
         projection,
     };
     Ok(vec![Arc::new(list), Arc::new(get)])
@@ -116,9 +131,10 @@ pub fn try_register_live_datasource(
     registry: &mut ToolRegistry,
     domain: &str,
     backend: Arc<dyn LiveDatasource>,
-) -> Result<()> {
+) -> Result<LiveDatasourceSurface> {
     let tools = live_datasource_tools(domain, backend)?;
-    registry.try_register_all_from(live_source(domain), tools)
+    registry.try_register_all_from(live_source(domain), tools)?;
+    Ok(live_surface(domain))
 }
 
 fn live_source(domain: &str) -> String {
@@ -128,7 +144,13 @@ fn live_source(domain: &str) -> String {
 struct LiveProjection {
     domain: String,
     schema: LiveSchema,
+    access: Vec<LiveAccess>,
     backend: Arc<dyn LiveDatasource>,
+}
+
+struct LiveInvocationContract {
+    permission_subject: String,
+    requirements: Vec<AuthorityRequirement>,
 }
 
 impl LiveProjection {
@@ -143,6 +165,26 @@ impl LiveProjection {
                     self.domain
                 ))
             })
+    }
+
+    fn invocation_contract(&self, params: &Value) -> LiveInvocationContract {
+        let entity = params
+            .get("entity")
+            .and_then(Value::as_str)
+            .filter(|entity| !entity.is_empty())
+            .unwrap_or("*");
+        let permission_subject = format!("{}/{entity}", self.domain);
+        let mut requirements = vec![AuthorityRequirement::datasource_read(
+            permission_subject.clone(),
+        )];
+        requirements.extend(self.access.iter().map(|access| match access {
+            LiveAccess::Network { subject } => AuthorityRequirement::network_fetch(subject),
+            LiveAccess::Connection { subject } => AuthorityRequirement::connection_dial(subject),
+        }));
+        LiveInvocationContract {
+            permission_subject,
+            requirements,
+        }
     }
 }
 
@@ -176,6 +218,22 @@ impl Tool for LiveListOp {
         self.spec.clone()
     }
 
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        vec![
+            self.projection
+                .invocation_contract(params)
+                .permission_subject,
+        ]
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        Ok(self.projection.invocation_contract(params).requirements)
+    }
+
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let operation = &self.spec.name;
         let input: LiveListInput = parse(operation, params)?;
@@ -203,6 +261,22 @@ struct LiveGetOp {
 impl Tool for LiveGetOp {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        vec![
+            self.projection
+                .invocation_contract(params)
+                .permission_subject,
+        ]
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        Ok(self.projection.invocation_contract(params).requirements)
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -357,40 +431,83 @@ fn render_full_row(entity: &str, row: &Row) -> String {
     output
 }
 
-fn list_spec(domain: &str, schema: &LiveSchema) -> ToolSpec {
+fn list_spec(domain: &str, schema: &LiveSchema, access: &[LiveAccess]) -> ToolSpec {
     let variants = schema
         .entities
         .iter()
         .map(list_entity_schema)
         .collect::<Vec<_>>();
-    ToolSpec::read_only(
-        format!("{domain}.list"),
-        format!("List one page from the `{domain}` live datasource."),
-        json!({"type": "object", "oneOf": variants}),
+    live_spec(
+        ToolSpec::read_only(
+            format!("{domain}.list"),
+            format!("List one page from the `{domain}` live datasource."),
+            json!({"type": "object", "oneOf": variants}),
+        ),
+        domain,
+        access,
     )
-    .with_access(vec![AccessKind::Datasource])
 }
 
-fn get_spec(domain: &str, schema: &LiveSchema) -> ToolSpec {
+fn get_spec(domain: &str, schema: &LiveSchema, access: &[LiveAccess]) -> ToolSpec {
     let entities = schema
         .entities
         .iter()
         .map(|entity| entity.entity.clone())
         .collect::<Vec<_>>();
-    ToolSpec::read_only(
-        format!("{domain}.get"),
-        format!("Fetch one full row from the `{domain}` live datasource."),
-        json!({
-            "type": "object",
-            "properties": {
-                "entity": {"type": "string", "enum": entities},
-                "id": {"type": "string", "description": "Stable row id resolved by the backend"}
-            },
-            "required": ["entity", "id"],
-            "additionalProperties": false
-        }),
+    live_spec(
+        ToolSpec::read_only(
+            format!("{domain}.get"),
+            format!("Fetch one full row from the `{domain}` live datasource."),
+            json!({
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string", "enum": entities},
+                    "id": {"type": "string", "description": "Stable row id resolved by the backend"}
+                },
+                "required": ["entity", "id"],
+                "additionalProperties": false
+            }),
+        ),
+        domain,
+        access,
     )
-    .with_access(vec![AccessKind::Datasource])
+}
+
+fn live_spec(spec: ToolSpec, domain: &str, access: &[LiveAccess]) -> ToolSpec {
+    let mut access_kinds = vec![AccessKind::Datasource];
+    for kind in access.iter().map(|access| match access {
+        LiveAccess::Network { .. } => AccessKind::Network,
+        LiveAccess::Connection { .. } => AccessKind::Connection,
+    }) {
+        if !access_kinds.contains(&kind) {
+            access_kinds.push(kind);
+        }
+    }
+    let effects = if access.is_empty() {
+        vec![Effect::Read]
+    } else {
+        vec![Effect::Read, Effect::Network]
+    };
+    spec.with_effects(effects)
+        .with_access(access_kinds)
+        .with_group(domain)
+}
+
+fn live_surface(domain: &str) -> LiveDatasourceSurface {
+    let list = format!("{domain}.list");
+    let get = format!("{domain}.get");
+    LiveDatasourceSurface {
+        group: ToolGroup {
+            name: domain.to_string(),
+            description: format!("Live datasource operations for `{domain}`."),
+            tools: vec![list, get],
+            surface_when: vec![SignalMatch {
+                kind: KIND_SIGNAL.to_string(),
+                signal: Some(domain.to_string()),
+            }],
+        },
+        ambient_signal: domain.to_string(),
+    }
 }
 
 fn list_entity_schema(entity: &LiveEntity) -> Value {

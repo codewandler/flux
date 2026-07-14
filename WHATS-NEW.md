@@ -23,6 +23,9 @@
 
 ### Improved
 
+- **Embedded agents can attach a live system of record with one fallible builder call.** Its
+  operations appear only when that configured domain is surfaced, and both plan preview and
+  execution require the exact datasource and external resources declared by the backend.
 - **Live datasource queries now validate each entity's declared filters before contacting the
   backend.** Page sizes use safe backend defaults and ceilings, while continuation cursors remain
   opaque and unchanged.

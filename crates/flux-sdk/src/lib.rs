@@ -84,6 +84,19 @@ pub mod tools {
     pub use flux_spec::{Risk, ToolSpec};
 }
 
+/// **Live systems of record.** Implement [`LiveDatasource`](datasource::LiveDatasource), then use
+/// [`ClientBuilder::try_with_live_datasource`] to install its generated `<domain>.list` and
+/// `<domain>.get` operations, evidence group, and configured-domain signal as one unit. The row,
+/// filter, paging, and weak-reference contracts are re-exported here so an SDK embedder does not
+/// need to name flux's internal capability crates.
+pub mod datasource {
+    pub use flux_capabilities::{LiveAccess, LiveDatasource, LiveDatasourceSurface};
+    pub use flux_datasource::live::{
+        FilterKey, FilterType, FilterValue, Filters, LiveEntity, LiveSchema, Page, PageRequest,
+        Reference, Row,
+    };
+}
+
 /// Build a typed, closure-backed stage operation. `I` and `O` are independent contracts: both JSON
 /// Schemas are derived and registered, the Flux analyzer infers `O` at call sites, and execution
 /// still traverses the ordinary authorization/approval dispatcher. The safe default is a low-risk,
@@ -343,6 +356,7 @@ pub struct ClientBuilder {
     cognition: bool,
     ops: Vec<(String, Arc<dyn Tool>)>,
     packs: Vec<RegistryPack>,
+    live_surfaces: Vec<flux_capabilities::LiveDatasourceSurface>,
     sub_agents: Option<SubAgents>,
     sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
 }
@@ -358,6 +372,7 @@ impl Default for ClientBuilder {
             cognition: false,
             ops: Vec::new(),
             packs: Vec::new(),
+            live_surfaces: Vec::new(),
             // Unset ⇒ no `task` tool, no spawner (children off by default).
             sub_agents: None,
             sub_agent_adaptive_policy: None,
@@ -381,6 +396,7 @@ impl ClientBuilder {
             cognition: false,
             ops: Vec::new(),
             packs: Vec::new(),
+            live_surfaces: Vec::new(),
             sub_agents: None,
             sub_agent_adaptive_policy: None,
         }
@@ -491,6 +507,29 @@ impl ClientBuilder {
     {
         self.packs.push(Box::new(pack));
         self
+    }
+
+    /// Install one async live system of record as a generated `<domain>.list` / `<domain>.get`
+    /// pair. Static backend metadata is validated immediately; operation collisions remain
+    /// source-labelled build errors when this prepared registry is composed with built-ins and
+    /// other consumer packs.
+    ///
+    /// The returned builder retains the domain's evidence group and ambient configured signal
+    /// separately from [`groups`](Self::groups) and [`ambient_signals`](Self::ambient_signals), so
+    /// calling those setters before or after this method cannot tear apart the all-in-one surface.
+    pub fn try_with_live_datasource(
+        mut self,
+        domain: impl Into<String>,
+        backend: Arc<dyn flux_capabilities::LiveDatasource>,
+    ) -> Result<Self> {
+        let domain = domain.into();
+        let mut prepared = ToolRegistry::new();
+        let surface =
+            flux_capabilities::try_register_live_datasource(&mut prepared, &domain, backend)?;
+        self.packs
+            .push(Box::new(move |registry| registry.try_extend(prepared)));
+        self.live_surfaces.push(surface);
+        Ok(self)
     }
     /// Attach a subprocess plugin's operations (feature `plugins`) as policy-gated tools. Load them
     /// first with [`plugins::load_tools`] over a guarded [`System`] — plugin ops carry their own host
@@ -704,6 +743,25 @@ impl ClientBuilder {
         // additive to the spec's own (`from_spec` starts from a bare envelope). Skills are explicit:
         // an empty set stays empty and no default directory is scanned or activated.
         let mut spec = self.spec;
+        for surface in self.live_surfaces {
+            if let Some(existing) = spec
+                .groups
+                .iter()
+                .find(|group| group.name == surface.group.name)
+            {
+                if existing != &surface.group {
+                    return Err(flux_core::Error::Other(format!(
+                        "live datasource group `{}` conflicts with an existing group declaration",
+                        surface.group.name
+                    )));
+                }
+            } else {
+                spec.groups.push(surface.group);
+            }
+            if !spec.ambient_signals.contains(&surface.ambient_signal) {
+                spec.ambient_signals.push(surface.ambient_signal);
+            }
+        }
         spec.permissions
             .allow
             .extend(self.envelope.allow.iter().cloned());

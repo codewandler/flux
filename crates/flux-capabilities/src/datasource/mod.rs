@@ -33,7 +33,7 @@ pub use ingest::{
 };
 pub use live::{
     live_datasource_tools, try_register_live_datasource, validate_live_contract, LiveAccess,
-    LiveDatasource,
+    LiveDatasource, LiveDatasourceSurface,
 };
 pub use memory::MemoryBackend;
 pub use ops::{datasource_tools, register_datasource_ops, try_register_datasource_ops};

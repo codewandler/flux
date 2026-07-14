@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-172: live datasource discovery and authority now travel as one SDK surface.** Registration
+  returns a signal-gated per-domain group; specs and plan/dispatch authorization share exact
+  datasource, network, and connection resources without treating IDs, filters, or cursors as
+  grants. `ClientBuilder::try_with_live_datasource` installs the tools, group, and signal together.
 - **D-171: live datasource queries are normalized and rejected before backend IO.** Entity-specific
   required filters, keys, scalar types, and enum values now fail with input paths; omitted limits
   use the declared default, oversized limits clamp to the backend ceiling, zero is rejected, and
