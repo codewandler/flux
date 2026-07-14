@@ -20,12 +20,12 @@ the *surfaces* (CLI/TUI/server/SDK).
 
 | Layer | Crates | Role |
 |---|---|---|
-| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-audio` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, datasource record/retrieval contract, PCM16 audio sample math (codecs/resampling/framing), the Flux-Lang language + reference interpreter (effects injected via traits) |
+| **L0 contracts** (pure) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-audio` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, indexed-record and live row/filter/page datasource contracts, PCM16 audio sample math (codecs/resampling/framing), the Flux-Lang language + reference interpreter (effects injected via traits) |
 | **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` `flux-a2a` `flux-pg` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`, `bedrock`, `codex`, plus `realtime/`) + credential store + the A2A agent-protocol client/wire types + `flux-pg` (the Postgres driver-owner: the sole `sqlx` dep, a pool, and a panic-safe sync↔async bridge) |
 | **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store (embedded SQLite by default; opt-in Postgres) |
 | **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
 | **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
-| **L5 capabilities** | `flux-capabilities` `flux-auth` `flux-web` | datasource/RAG tools; native web request/read/browse under the `web` egress scope (`flux-web`); caller identity (separate) |
+| **L5 capabilities** | `flux-capabilities` `flux-auth` `flux-web` | indexed datasource/RAG tools plus async live-system projections; native web request/read/browse under the `web` egress scope (`flux-web`); caller identity (separate) |
 | **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` `flux-lsp` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack), the Flux-Lang language server |
 
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
@@ -33,7 +33,7 @@ envelope" structurally hard. Notable rules that fall out:
 - **`flux-runtime` (L2) does not depend on `flux-auth` (L5).** Surfaces resolve identity
   (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)`, pair it with the policy in an atomic
   `ExecutionAuthorization`, and pass that through `ExecutionEnvironment`.
-- `flux-evidence`, `flux-skill`, `flux-config`, and `flux-lang` are L0 leaves on purpose, so
+- `flux-evidence`, `flux-skill`, `flux-config`, `flux-datasource`, and `flux-lang` are L0 leaves on purpose, so
   runtime/agent crates may depend on them without a layering violation. `flux-lang` is the language
   **and its reference interpreter** — it uses async but takes all effects (op dispatch, value store,
   observation sink) as injected traits, so it has no L1+ flux dependency. The L3 `flux-flow` engine
@@ -58,7 +58,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-config` | L0 | `.flux/config.toml` loading + precedence | — |
 | `flux-skill` | L0 | multi-format skill defs + discovery/merge + activation (triggers or name/description fallback) | — |
 | `flux-markdown` | L0 | frontmatter parse/validate (`serde_norway`) + feature-gated render wrappers over `codewandler/markdown` | — |
-| `flux-datasource` | L0 | datasource records / entity declarations + retrieval (search/get/list/relation) types — the contract between the knowledge index and integration plugins | — |
+| `flux-datasource` | L0 | pure indexed-record/retrieval contracts plus live rows, typed filters, cursor pages, entity schemas, and weak references | — |
 | `flux-audio` | L0 | PCM16 LE/BE codecs, stateless + streaming resampling (phase carried across packets), `Framer` re-chunking — the sample-math layer for realtime-voice consumers | — |
 | `flux-provider` | L1 | the `Provider` abstraction (published) | — |
 | `flux-providers` | L1 | concrete clients (anthropic / openai / openrouter / ollama / bedrock / codex, + the `realtime` full-duplex module) | — |
@@ -100,7 +100,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-channels` | L6 | event-trigger channels: cron / webhook / Slack adapters that wake a `flux-app` program's journeys | — |
 | `flux-lsp` | L6 | Flux-Lang language server (`flux-lsp` binary): CST-driven diagnostics, completion, hover, formatting; wired into Helix config-only | — |
 | `flux-plugin` | L4 | subprocess plugins (NDJSON, capability-gated) + the JS pre-tool `hooks` module | absorbed `flux-hooks` (P2 ✅) |
-| `flux-capabilities` | L5 | `datasource` (keyword index + search; RAG deferred) module | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
+| `flux-capabilities` | L5 | `datasource`: indexed knowledge backends/retrieval packs plus async live-system `list`/`get` projection | merged `flux-browser` (P3 ✅); depends on the standalone L0 `flux-datasource` contract crate |
 | `flux-web` | L5 | native web capabilities: `http.request`, `web.fetch` (HTML→readable markdown via `condense`), and the non-visual CDP browser ops — all under the family-wide `[private_net] web` egress scope (SSRF guard on every call) | new 2026-07-09 (D-98, D-120…D-124); `web.fetch` moved here from `flux-capabilities` |
 | `flux-auth` | L5 | caller identity (`LocalIdentity`; OIDC seam) | kept standalone — identity ≠ tool capability |
 
@@ -172,6 +172,27 @@ surfaced as events.
   approval rather than silently authorized workspace-wide.
 - Sub-agents inherit the policy and refuse destructive ops; a role's `tools: []` grants *zero* tools.
 
+## Datasources: indexed snapshots vs live systems
+
+The datasource stack has two explicit shapes that share pure L0 contracts but not a leaky
+supertrait:
+
+- **Indexed knowledge** uses `flux_capabilities::DatasourceBackend`. A host ingests records into a
+  memory, SQLite, Postgres, or semantic index, then registers the generic
+  `search`/`get`/`list`/`relation`/`batch_get`/`sources` operation pack. SDK consumers compose this
+  pack through `try_register_pack`; the backend owns a local snapshot and index-oriented paging.
+- **Live systems of record** use the async `LiveDatasource` contract. `flux-capabilities` snapshots
+  its entity/filter/cursor-page schema and external `LiveAccess`, then generates only
+  `<domain>.list` and `<domain>.get`. The SDK conversational builder exposes this as
+  `try_with_live_datasource`, carrying the tools, per-domain evidence group, and configured signal
+  together.
+
+Both generated live operations traverse `Executor::dispatch`. Their stable permission subject is
+`<domain>/<entity>`; their typed authority contract adds exact `datasource.read` plus every declared
+network or connection resource. Whole-plan preview and dispatch consume that same contract, while
+filters, cursors, row IDs, weak references, credentials, and live handles never become grants. A
+backend still performs real IO through the guarded host surfaces it receives or is configured with.
+
 ## Providers: wire codec × credential
 
 A "provider" conflates two orthogonal axes, modeled separately and composed by `NativeProvider`:
@@ -241,8 +262,9 @@ provider is a small composition, never a fork of the loop. Streaming is a
 
 ## Surfaces
 
-- **`flux-sdk`** — high-level `Client` (run/stream, sessions) **and `FlowClient`**, the Flux-Lang
-  lifecycle surface (compile→analyze→execute, `optimize`/`execute_optimized`, register op-packs/prelude).
+- **`flux-sdk`** — high-level `Client` (run/stream, sessions, first-class async live datasources) **and
+  `FlowClient`**, the Flux-Lang lifecycle surface (compile→analyze→execute,
+  `optimize`/`execute_optimized`, register indexed-datasource and other op-packs/prelude).
 - **`flux-app`** — the L6 runtime host that runs a multi-agent `.flux` **Program** (event bus, triggers,
   journeys; orchestration ops `emit`/`send`/`ask`/`spawn`), driven by `flux run app.flux`,
   deny-destructive by default.

@@ -128,10 +128,30 @@ build one `Client` per agent.
 pass-throughs the CLI uses: `approver(Arc<dyn Approver>)`, `register_op`, `register_pack`,
 `tools(subset)`, `with_cognition`, `with_sub_agents(SubAgents)`, `groups`, `ambient_signals`,
 `compact_threshold_chars`, `context_budget`, `from_spec(AgentSpec)` (full-control escape hatch),
-and `storage(Storage)` (also on `FlowClientBuilder`). Shared builder state is factored into a
-private `envelope.rs` so the two builders cannot drift. `FlowClient` additionally gains
+`storage(Storage)` (also on `FlowClientBuilder`), and the fallible
+`try_with_live_datasource(domain, backend)` integration seam. Shared builder state is factored into
+a private `envelope.rs` so the two builders cannot drift. `FlowClient` additionally gains
 `execute_with_sink`/`execute_streamed` (wave 4) and `ExecutionResult.usage` (wave 2 — requires
 `flux-cognition` to surface per-call usage it drops today).
+
+## Datasource split
+
+The SDK preserves two contracts instead of forcing one abstraction over unlike storage models:
+
+- Indexed knowledge is still an operation pack. A host builds a
+  `flux_capabilities::DatasourceBackend`, ingests records, and uses
+  `try_register_pack(|registry| try_register_datasource_ops(registry, backend))`. That contract owns
+  a local snapshot and exposes search plus record-oriented retrieval.
+- An async system of record is first-class on the conversational builder. A host implements the
+  SDK-re-exported `LiveDatasource` and calls `try_with_live_datasource`; the builder atomically
+  retains its generated `<domain>.list` / `<domain>.get` tools, per-domain `ToolGroup`, and ambient
+  configured signal. Later `groups` or `ambient_signals` setters cannot tear that surface apart.
+
+The live projection snapshots entity/filter/page metadata and declared network/connection access at
+registration. Its one invocation contract supplies both whole-plan preview and dispatch with exact
+`datasource.read(<domain>/<entity>)` plus backend resource requirements. Payload filters, cursors,
+IDs, and weak references are not authority subjects. The lower-level registration function remains
+available to non-SDK hosts; the SDK convenience adds composition, not a second dispatch path.
 
 ## Re-export rule
 
@@ -141,9 +161,11 @@ tool_fn, ToolSpec, Risk), `flux_sdk::approval` (Approver, ApprovalChoice, RiskAp
 IntentSet), `flux_sdk::subagents` (SubAgents, SpawnLimits, Role, RoleRegistry, ProviderFactory,
 SubAgentApprover), `flux_sdk::voice` (VoiceSink, VoiceReply, RealtimeProvider, RealtimeConfig),
 `flux_sdk::observe` (Message, TurnSummary, RunEvent, ModelCost, EfficiencySummary, RunDiff,
-Observation), plus root-level `Provider`, `AgentSink`, `AgentSpec`, `Permissions`, `Usage`,
-`PricingTable`, `ContextBlock`, `CancellationToken`, `EventStore`, `ToolGroup`. `flux-spec` and
-`tokio` become real (non-dev) dependencies.
+Observation), and `flux_sdk::datasource` (LiveDatasource, LiveAccess, LiveDatasourceSurface, plus
+the row/filter/page/reference contracts). Root-level exports include `Provider`, `AgentSink`,
+`AgentSpec`, `Permissions`, `Usage`, `PricingTable`, `ContextBlock`, `CancellationToken`,
+`EventStore`, and `ToolGroup`. `flux-spec`, `flux-datasource`, `flux-capabilities`, and `tokio` are
+real (non-dev) dependencies.
 
 ## Feature-gated batteries (decision: opt-in features, default = none)
 
@@ -168,19 +190,19 @@ requires optional deps to be published; every closure member already is — only
 ## Safety audit
 
 No new dispatch path anywhere in this design. Every new door — streamed turns, flow turns, voice
-flow turns, plugin tools, forks — funnels into the one shared `Executor`
+flow turns, plugin tools, live datasource tools, forks — funnels into the one shared `Executor`
 (authorization → approval → guarded IO). Registered custom tools land in the same registry the
 envelope gates; an injected `Approver` tightens, never bypasses (deny rules still take
-precedence). Replay's scope guarantees nothing executes during replay. The layering map holds:
-SDK is L6; `flux-providers`/`flux-credentials` L1, `flux-plugin` L4.
+precedence). Live datasource plan preview and dispatch consume the same exact typed requirements;
+the backend must still perform real IO through guarded host surfaces. Replay's scope guarantees
+nothing executes during replay. The layering map holds: SDK is L6; `flux-datasource` L0,
+`flux-providers`/`flux-credentials` L1, `flux-plugin` L4, and `flux-capabilities` L5.
 
 ## Out of scope
 
 - **A2A serving** (`flux-server` routers) — embedding ≠ serving; L6 peer product.
 - **A2A client** — expressible as a registered `Tool`; revisit on demand.
 - **`flux-app` / `flux-channels`** — the whole-`.flux`-program hosts are peer products.
-- **First-class datasource API** — blocked on the D-62 async paged seam; until then the
-  `register_pack(|r| register_datasource_ops(r, backend))` recipe is documented (wave 4).
 - **Raw loop-host internals** — `Client::engine()` is the documented advanced escape hatch.
 - **Postgres convenience constructors** — reachable via `Storage::custom`.
 
@@ -195,7 +217,7 @@ SDK is L6; `flux-providers`/`flux-credentials` L1, `flux-plugin` L4.
 - **Wave 3 — providers, plugins, voice (D-152…D-155):** `flux_providers::spec` extraction;
   `providers` feature; `plugins` feature; `Session::run_voice_flow`.
 - **Wave 4 — time machine + flow streaming (D-156…D-159):** `Session::replay`; `Session::fork`
-  + diff; `FlowClient::execute_with_sink`/`execute_streamed`; datasource recipe doc.
+  + diff; `FlowClient::execute_with_sink`/`execute_streamed`; indexed-datasource recipe doc.
 
 Each story is independently shippable with a failing-first test; acceptance lives in the story
 files. Website docs gain `sdk/sessions.md`, `sdk/streaming.md` (wave 1), `sdk/durable-flows.md`

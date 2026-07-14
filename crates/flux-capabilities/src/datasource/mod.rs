@@ -1,12 +1,19 @@
-//! `datasource` — the knowledge layer (story D-07).
+//! `datasource` — indexed knowledge and live systems of record.
 //!
-//! A pluggable [`DatasourceBackend`] over [`flux_datasource`] records, plus the retrieval ops the agent
-//! calls ([`register_datasource_ops`]). Two backends implement the trait: [`MemoryBackend`] (the default
-//! — an in-memory keyword index) and (later) a persistent SQLite-FTS5 store. The record/retrieval *types*
-//! live in the L0 `flux-datasource` crate so plugins (`flux-plugin`) can emit records into the same shape.
+//! [`DatasourceBackend`] is the index-shaped contract: hosts ingest [`flux_datasource`] records into
+//! memory, SQLite, Postgres, or a semantic index and attach the generic
+//! `search`/`get`/`list`/`relation`/`batch_get`/`sources` pack with
+//! [`try_register_datasource_ops`]. This remains the right shape for local, indexed knowledge.
 //!
-//! v1 ranks by keyword/term-frequency; the [`Embedder`] seam is defined but **no semantic backend is
-//! wired** (deferred).
+//! [`LiveDatasource`] is the async system-of-record contract. [`try_register_live_datasource`]
+//! snapshots its entity/filter/page schema and declared [`LiveAccess`], then installs generated
+//! `<domain>.list` / `<domain>.get` operations plus their evidence surface. Each invocation carries
+//! stable `<domain>/<entity>` permission subjects and exact datasource plus network/connection
+//! authority through the ordinary runtime envelope.
+//!
+//! The record/retrieval contracts and pure live row, filter, page, and weak-reference types live in
+//! the L0 `flux-datasource` crate. Real IO remains host-owned and guarded; neither contract gives the
+//! model a credential, connection, or live handle.
 
 mod host_caps;
 mod ingest;

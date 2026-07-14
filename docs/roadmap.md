@@ -80,7 +80,18 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.19.2** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+
+### Async live systems-of-record datasources — ✅ **DONE 2026-07-15 (unreleased; D-62, D-168…D-173)**
+
+Added a first-class seam for remote systems of record without turning the synchronous indexed
+knowledge store into an async integration abstraction. A pure L0 contract describes entities,
+typed filters, compact rows, opaque cursors, and weak references; guarded async backends project a
+consistent per-domain `list`/`get` pair with validation before backend entry. Configured-domain
+evidence controls discovery, while planning and dispatch share exact datasource, network, and
+connection authority. The SDK installs the complete surface with one fallible builder call, and a
+hermetic support-system example proves paging, multiple entities, get/not-found, catalog surfacing,
+and denial before IO. Design: [designs/async-live-datasource-seam.md](designs/async-live-datasource-seam.md).
 
 ### flux-sdk surface — a standard agent SDK (epic) — ✅ **SHIPPED 2026-07-12 (v0.16.0–v0.17.0; D-142…D-159)**
 
@@ -194,9 +205,10 @@ and the whole endpoint + saved-flows cluster has effectively zero website docume
 ([D-117](stories/D-117-endpoints-flows-website-docs.md)). Done looks like the original scenario
 running without a kubeconfig: one command wires a Postgres endpoint, the agent discovers the ops
 unaided, enumerates its sources, and queries through the endpoint — all documented publicly.
-Explicit non-goal: live SQL databases as first-class *knowledge* datasources — that stays
-[D-62](stories/D-62-async-live-datasource-seam.md) (design-first, backlog). Design:
-[designs/datasource-discoverability.md](designs/datasource-discoverability.md).
+Live systems of record remain separate from this indexed-knowledge surface. Their shipped seam
+([D-62](stories/D-62-async-live-datasource-seam.md)) exposes generated per-domain `list`/`get`
+operations with backend-owned paging and exact authority instead of pretending a remote database
+is a local knowledge index. Design: [designs/datasource-discoverability.md](designs/datasource-discoverability.md).
 
 ### v0.6.0 beta hardening (epic) — ✅ **done 2026-07-08 (external beta test)**
 

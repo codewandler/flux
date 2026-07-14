@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-173: the live-datasource seam now ships with an executable adoption proof.** A hermetic
+  support backend exercises multiple entities, typed filters, backend-owned cursor paging,
+  get/not-found, catalog surfacing, exact datasource authority, and policy denial before backend
+  entry; the SDK and agent guides now distinguish live systems of record from indexed knowledge.
 - **D-172: live datasource discovery and authority now travel as one SDK surface.** Registration
   returns a signal-gated per-domain group; specs and plan/dispatch authorization share exact
   datasource, network, and connection resources without treating IDs, filters, or cursors as

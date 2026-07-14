@@ -1,13 +1,15 @@
 //! **Attaching a knowledge datasource to an embedded agent** (D-159).
 //!
-//! There is no first-class `with_datasource(...)` on the SDK builders yet — deliberately: the
-//! first-class surface waits on the async paged live-backend seam (story D-62) so we don't freeze
-//! the wrong contract (see the "Out of scope" note in `docs/designs/sdk-surface.md`). Until then,
-//! the recipe below is the supported way to give an embedded agent retrieval ops: add a direct
-//! `flux-capabilities` dependency, build a backend, and register its ops through the existing
-//! [`FlowClient::try_register_pack`] (or [`ClientBuilder::try_register_pack`]) seam. The registered
-//! `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops dispatch through the same
+//! This example covers **indexed knowledge**: ingest records into a local index-shaped
+//! [`DatasourceBackend`], then attach its generic retrieval operations through
+//! [`FlowClient::try_register_pack`] (or `ClientBuilder::try_register_pack`). The registered
+//! `search`/`get`/`list`/`relation`/`batch_get`/`sources` operations dispatch through the same
 //! authorization → approval → guarded-IO envelope as every built-in.
+//!
+//! Async systems of record use a different, first-class shape: implement
+//! `flux_sdk::datasource::LiveDatasource` and call `ClientBuilder::try_with_live_datasource` to
+//! install generated `<domain>.list` / `<domain>.get` operations with their evidence surface and
+//! exact datasource plus backend authority. See the hermetic `live_datasource` example.
 //!
 //! Run with: `cargo run -p codewandler-flux-sdk --example datasource_recipe`
 

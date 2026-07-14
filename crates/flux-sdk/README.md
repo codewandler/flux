@@ -37,12 +37,13 @@ cargo run -p codewandler-flux-sdk --example client_basic   # the self-hosted Flu
 cargo run -p codewandler-flux-sdk --example parameterized_flow # parse authored Flux → execute
 ```
 
-Two **domain** examples show the DSL on real tasks, with the model/datasource adapters mocked (registered
-stub ops) so they run with no API key:
+Additional hermetic examples cover domain flows and both datasource shapes, with no API key:
 
 ```sh
 cargo run -p codewandler-flux-sdk --example intent_routing # classify an utterance, then `route` to a handler
 cargo run -p codewandler-flux-sdk --example faq_lookup     # KB lookup + `fallback` escalation → a typed `Answer`
+cargo run -p codewandler-flux-sdk --example datasource_recipe # ingest and query an indexed knowledge backend
+cargo run -p codewandler-flux-sdk --example live_datasource # attach an async live system of record
 ```
 
 ## Quick start — the Rust DSL
@@ -112,6 +113,26 @@ let client = Client::builder()
     ))
     .build(provider, ".")?;
 ```
+
+## Datasources: indexed knowledge and live systems
+
+Flux keeps two datasource shapes separate because they own different data and paging semantics:
+
+- **Indexed knowledge** implements `flux_capabilities::DatasourceBackend`. Records are ingested into
+  a local memory, SQLite, Postgres, or semantic index, then the generic
+  `search`/`get`/`list`/`relation`/`batch_get`/`sources` pack is attached with
+  `ClientBuilder::try_register_pack` or `FlowClient::try_register_pack`. See
+  `examples/datasource_recipe.rs`.
+- **Live systems of record** implement the SDK-re-exported `flux_sdk::datasource::LiveDatasource`.
+  The conversational builder's fallible `try_with_live_datasource(domain, backend)` installs the
+  generated `<domain>.list` and `<domain>.get` operations together with their evidence group and
+  configured-domain signal. See `examples/live_datasource.rs`.
+
+A live backend declares its entity/filter/page schema and any `LiveAccess::Network` or
+`LiveAccess::Connection` resources. Registration snapshots that contract. Plan preview and dispatch
+then derive the same exact requirements: `datasource.read` on `<domain>/<entity>` plus each declared
+backend resource. Filters, cursors, row IDs, and weak references never become authority grants, and
+real backend IO still uses the guarded host surfaces supplied through `ToolContext`.
 
 ## Authorization and approval
 

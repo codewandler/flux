@@ -16,9 +16,8 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   `web.fetch`/`web.search` dot-rename; D-160…D-166), **plugin operation output schemas** (D-164), a
   **runnable Slack support-bot** example (D-165), and a public beginner tutorial. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Focus:** the architecture-review epic and v0.25.0 release are complete. The next wave starts
-  with the accepted async live-datasource design (D-62) and its dependency-ordered implementation
-  stories D-168…D-173; release promotion and typed GitLab/Slack handler work run independently.
+- **Focus:** the async live-datasource epic and its independent release-promotion and typed
+  GitLab/Slack handler batch are complete; take the highest-priority story from Ready next.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
@@ -37,9 +36,6 @@ _None._
 ## Backlog
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
-
-### Async live datasource seam
-- [D-173 — Prove and document live-datasource adoption](D-173-live-datasource-adoption-proof.md) · Agent · D-62 phase 6; depends on D-172
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
@@ -370,6 +366,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-170 — Project live datasources into list and get operations](D-170-live-datasource-operations.md) · Agent · atomic generated list/get tools with guarded async routing and consistent row/cursor rendering
 - [D-171 — Enforce live-datasource filters limits and cursors](D-171-live-datasource-validation.md) · Agent · path-aware typed filter validation, bounded limits, deterministic normalization, and byte-exact opaque cursors before backend entry
 - [D-172 — Wire live datasources through surfacing and typed authority](D-172-live-datasource-safety-surfacing.md) · Agent · configured-domain evidence gating and exact datasource/network/connection authority now compose through one fallible SDK builder seam
+- [D-173 — Prove and document live-datasource adoption](D-173-live-datasource-adoption-proof.md) · Agent · executable multi-entity reference backend and public live-vs-indexed adoption guide prove the guarded SDK seam end to end
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this

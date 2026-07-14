@@ -1,124 +1,194 @@
 ---
 title: Datasources
-description: "The agent's indexed knowledge layer: records, how knowledge gets in, and the retrieval operations that read it."
+description: "The agent's governed data layer: indexed knowledge and async live systems of record."
 ---
 
 # Datasources
 
-A **datasource** is the agent's knowledge layer: an indexed store of **records** the agent can
-search and read, instead of re-reading raw files or being handed a giant prompt. If
-[operations](../language/ops.md) are what the agent can *do*, a datasource is what the agent can
-*look up*.
+A **datasource** is a governed data boundary the agent reaches through
+[operations](../language/ops.md). Flux supports two complementary forms:
+
+| | Indexed knowledge | Live system of record |
+|---|---|---|
+| Data lives | In a flux-owned index of records | In an external API, database, or in-process backend |
+| Best for | Searchable docs and contributed knowledge | Current tickets, customers, inventory, and similar domain data |
+| Read shape | Search, address lookup, relations, offset paging | Typed entity filters, cursor paging, stable-id lookup |
+| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` |
+
+The split is intentional. A stable local snapshot benefits from indexing and ranked search; a
+changing system of record needs async calls and backend-owned continuation cursors. Neither form is
+a side channel: both are projected into the ordinary operation catalog and cross authorization →
+approval → guarded IO.
 
 ## Datasources vs. operations
 
-The two concepts sit at different layers, and the relationship is deliberately simple:
+- An **operation** is the universal callable unit—the verbs of the system. Every tool, plugin
+  operation, toolchain command, cognition op, and datasource read uses the same catalog and safety
+  envelope.
+- A **datasource** defines the data and access contract. An indexed datasource owns records; a live
+  datasource owns an entity/filter/page schema and a host-side backend.
+- The agent reaches either form **through operations**. Indexed retrieval uses the six common ops;
+  registering a live domain named `support` generates `support.list` and `support.get`.
 
-- An **operation** is the universal callable unit — the verbs of the system. Every tool, plugin
-  operation, toolchain command, and cognition op is an operation in one catalog, and every call
-  crosses the same [safety envelope](./safety.md) (authorization → approval → guarded IO).
-- A **datasource** is one specific capability: a queryable index of knowledge records. It is a
-  *noun* — it does nothing on its own.
-- The agent reaches a datasource **through operations**. Retrieval is exposed as ordinary read-only
-  ops (`sources`, `search`, `get`, `list`, `relation`, `batch_get`) registered in the same catalog as every
-  other operation. There is no side door: reading knowledge is a governed call like any other.
-
-So "datasource vs. operation" is not a choice between alternatives — a datasource is *served by*
-operations. Plugins illustrate both sides at once: a plugin projects new operations (verbs) into
-the catalog **and** can contribute records (knowledge) into the datasource.
+Plugins can participate on both sides: they may project callable operations and contribute records
+to an index. A host can separately implement a `LiveDatasource` for on-demand reads from a system
+of record.
 
 :::note Datasources are not endpoints
-A datasource is indexed knowledge. An [endpoint](./endpoints.md) is a weak reference to a live
-service passed to an operation such as `sql.query`. Registering a database endpoint does not turn
-its rows into datasource records; that live, paged bridge is a separate capability.
+An [endpoint](./endpoints.md) is a weak description of a service connection consumed by an
+operation such as `sql.query`. A live datasource is a typed domain projection over a host-owned
+backend. That backend may declare an exact network or connection target, but registering an endpoint
+alone does not create indexed records or a `<domain>.list`/`<domain>.get` surface.
 :::
 
-## Records
+## Indexed knowledge
 
-A datasource holds records, not files. Each record is addressed by `(source, entity, id)`:
+Indexed datasources hold records that flux can rank, search, and traverse without repeatedly
+reading the original files or putting an entire corpus into the prompt.
 
-- **`source`** — where it came from: `local` for workspace docs, a declared datasource name, or an
+### Records
+
+Each record is addressed by `(source, entity, id)`:
+
+- **`source`**—where it came from: `local` for workspace docs, a declared datasource name, or an
   integration such as `gitlab`.
-- **`entity`** — the record's type, e.g. `file.document`, `openapi.operation`,
+- **`entity`**—the record type, for example `file.document`, `openapi.operation`, or
   `gitlab.merge_request`.
-- **`id`** — stable within its `(source, entity)`.
+- **`id`**—stable within its `(source, entity)`.
 
-A record carries a short `title`, the indexed `body` text, freeform `meta` (url, path,
-`updated_at`, …), and typed `links` to other records — so retrieval can follow relations
-("the merge requests linked from this issue") instead of only matching keywords.
+A record carries a short `title`, indexed `body`, free-form `meta` (URL, path, `updated_at`, …), and
+typed `links` to other records. Retrieval can therefore follow relations—such as merge requests
+linked from an issue—in addition to matching keywords.
 
-## How knowledge gets in
+### How knowledge gets in
 
 Three routes feed the index:
 
-1. **Workspace auto-index.** The CLI agent walks the workspace at startup and indexes
-   documentation files (`.md`, `.txt`, `.rst`, `.adoc`, `.mdx`; capped in count and size) under
-   the `local` source as `file.document` records. Ambient project knowledge is searchable with no
-   setup.
-2. **Program declarations.** A [multi-agent program](./programs.md) declares its knowledge
-   explicitly. Declared datasources are ingested when the program loads:
+1. **Workspace auto-index.** The CLI agent walks the workspace at startup and indexes documentation
+   files (`.md`, `.txt`, `.rst`, `.adoc`, `.mdx`; capped in count and size) under the `local` source
+   as `file.document` records.
+2. **Program declarations.** A [multi-agent program](./programs.md) declares knowledge explicitly:
 
    ```flux
    datasource docs
-     kind "markdown"     // a directory of docs — or "openapi" for an API spec file
+     kind "markdown"     // a directory of docs—or "openapi" for an API spec file
      path "./docs"
    ```
 
-   A relative `path` resolves against the **program file's own directory**, not the directory you
-   launched from — so `flux app run /any/where/app.flux` finds the `./docs` shipped beside `app.flux`
-   from any working directory. An absolute path is used as-is.
+   A relative path resolves against the program file's own directory, not the directory from which
+   `flux app run` was launched. An absolute path is used as-is.
+3. **Plugin records.** A [plugin](../plugins/authoring.md) declares datasources in its manifest and
+   emits records through the gated `datasource.*` host capability. Integration records become
+   searchable beside local docs without the plugin touching index files directly.
 
-3. **Plugin records.** A [plugin](../plugins/authoring.md) declares datasources in its manifest
-   and emits records through the gated `datasource.*` host capability — integration records
-   (issues, merge requests, …) become searchable knowledge alongside local docs, without the
-   plugin ever touching the index files directly.
+### Reading the index
 
-## Reading it: the retrieval operations
-
-Retrieval is six read-only operations — low risk, never pausing for approval:
+The indexed contract exposes six read operations:
 
 | op | arguments | description |
 |---|---|---|
-| `sources` | *(none)* | Enumerate the sources in the index: per source, its entity types and record count |
-| `search` | `query[, source, entity, limit]` | Keyword search over the whole index, ranked |
-| `get` | `source, entity, id` | Fetch one record in full by its address |
-| `list` | `source[, entity, offset, limit]` | Enumerate a source's records, paged |
-| `relation` | `source, entity, id[, rel]` | Follow a record's typed links to the linked records |
-| `batch_get` | `source, entity, ids` | Fetch several records of one entity in one call |
+| `sources` | *(none)* | Enumerate sources, their entity types, and record counts |
+| `search` | `query[, source, entity, limit]` | Ranked keyword search over the index |
+| `get` | `source, entity, id` | Fetch one full record by address |
+| `list` | `source[, entity, offset, limit]` | Enumerate records from a stable snapshot |
+| `relation` | `source, entity, id[, rel]` | Follow a record's typed links |
+| `batch_get` | `source, entity, ids` | Fetch several records of one entity |
 
-`search`/`get`/`list`/`relation`/`batch_get` all take a `source` argument — so how does the agent
-learn which sources exist in the first place? It calls `sources`: no arguments, and the answer is
-every source key currently in the index (`local`, any program-declared name, any contributing
-plugin), each with the entity types it holds and how many records. Run it first, then `search`/
-`list` with a source you now know is real.
-
-These appear in the same [operation catalog](../language/ops.md) as everything else, so a
-Flux-Lang plan can mix retrieval with any other work:
+Call `sources` first when the available sources are unknown; it returns every real source key and
+the entities it contains. A Flux-Lang plan can then mix retrieval with other operations:
 
 ```flux
 $hits = search({ query: "rate limiting", source: "docs" })
 $answer = ai.reason({ ask: "how do we rate-limit?", ctx: $hits })
 ```
 
-## Backends and ranking
+These operations are declared read-only and low risk, but the active authorization policy remains
+the floor for every dispatch.
 
-Where the index lives is pluggable, with identical retrieval semantics:
+### Backends and ranking
 
-- **In-memory** (the default) — built fresh per run; what the auto-index and program declarations
-  use.
-- **SQLite** — a persistent per-scope index file; keyword search via FTS5, ranked by BM25.
-- **Postgres** — for embedders, behind the `postgres` feature: one shared table, namespaced per
-  scope, with full-text search. See [storage](../reference/storage.md#datasource-records).
+The index location is pluggable while retrieval semantics stay the same:
 
-Ranking is keyword/relevance-based by default. Built with the `embeddings` feature (and an
-embeddings API key), a semantic layer wraps the keyword backend and embeds records as they are
-indexed.
+- **In-memory** (the default)—built fresh per run; used by auto-indexing and program declarations.
+- **SQLite**—a persistent per-scope index with FTS5 and BM25 keyword ranking.
+- **Postgres**—for embedders, behind the `postgres` feature: a shared table namespaced per scope,
+  with full-text search. See [storage](../reference/storage.md#datasource-records).
+
+Ranking is keyword/relevance-based by default. With the `embeddings` feature and an embeddings API
+key, a semantic layer wraps the keyword backend and embeds records during ingestion.
+
+## Live systems of record
+
+A live datasource leaves data in its source system and implements one async `LiveDatasource`
+backend. The host declares its domain schema—entities, filters, default/max page sizes—and flux
+generates exactly two operations:
+
+- **`<domain>.list { entity, page?, limit?, filters? }`** returns compact rows and an optional
+  `next` cursor.
+- **`<domain>.get { entity, id }`** returns a full row or `not found`.
+
+For a domain registered as `support`, the catalog contains `support.list` and `support.get`.
+
+### Validation and paging
+
+Flux validates the static schema when the backend is registered. Before a list call reaches the
+backend, the generated operation:
+
+- rejects unknown entities and filter names;
+- enforces required filters and their declared string, integer, boolean, or enum types;
+- rejects invalid enum values;
+- applies the entity's default limit and clamps requests to its maximum.
+
+The cursor is deliberately opaque. Flux validates that `page` has the declared string shape and
+passes it through unchanged; the backend that minted it validates its own cursor format and state.
+It returns another cursor only when more data exists. Cursors must not contain credentials,
+sessions, or connection handles because they can appear in model-visible results and event history.
+
+### Weak rows, exact authority
+
+A live `Row` is plain projection data: stable `id`, `title`, `summary`, and optionally a weak
+`Reference`. A reference is either another `(entity, id)` locator or a non-secret navigation URL.
+It is never a token, credential, presigned secret URL, database handle, session, or live connection.
+`<domain>.get` re-enters the host-owned backend by id, where authentication and connection state are
+resolved again outside the model.
+
+Every invocation requires `datasource.read` for the exact `<domain>/<entity>` resource. The backend
+also declares its concrete external access:
+
+- a network subject adds exact `network.fetch` authority;
+- a connection target adds exact `connection.dial` authority;
+- an in-process backend declares neither.
+
+Filter values, cursors, and ids do not become permission subjects. Planning and dispatch consume
+the same typed requirements, and denial happens before the backend executes. The backend must still
+perform real IO through flux's guarded host facilities.
+
+### Honest catalog surfacing
+
+Live operations are evidence-gated per domain. SDK registration with
+`ClientBuilder::try_with_live_datasource` installs the two operations, their domain group, and a
+configured-domain ambient signal together. The model therefore sees `support.list` and
+`support.get` only when a support backend is actually present. `FLUX_SURFACE_ALL` can reveal the
+catalog for debugging, but it never grants authority or bypasses dispatch.
+
+The hermetic SDK example implements tickets and customers with typed filters, backend-owned
+cursors, get/not-found behavior, and real executor dispatch:
+
+- [`examples/live_datasource.rs`](https://github.com/codewandler/flux/blob/main/crates/flux-sdk/examples/live_datasource.rs)
+- [`examples/support/live_datasource.rs`](https://github.com/codewandler/flux/blob/main/crates/flux-sdk/examples/support/live_datasource.rs)
+
+```bash
+cargo run -p codewandler-flux-sdk --example live_datasource
+```
+
+For embedding code and the indexed `try_register_pack` recipe, see
+[SDK datasources](../sdk/datasources.md).
 
 ## Related docs
 
-- [Operations](../language/ops.md) — the full catalog the retrieval ops live in.
-- [Endpoints](./endpoints.md) — discover and consume live service connections as weak references.
-- [Multi-agent programs](./programs.md) — declaring `datasource` modules in a program file.
-- [Plugin authoring](../plugins/authoring.md) — contributing records from an integration.
-- [Storage](../reference/storage.md#datasource-records) — where datasource records persist.
-- [Concepts](../concepts.md) — the mental model behind ops, symbols, and the safety envelope.
+- [Operations](../language/ops.md)—the catalog both datasource forms use.
+- [Endpoints](./endpoints.md)—discover and consume live service connections as weak references.
+- [Multi-agent programs](./programs.md)—declare indexed knowledge in a program file.
+- [Plugin authoring](../plugins/authoring.md)—contribute records from an integration.
+- [Storage](../reference/storage.md#datasource-records)—persist indexed records.
+- [Concepts](../concepts.md)—the mental model behind operations, symbols, and the safety envelope.

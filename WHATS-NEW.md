@@ -23,6 +23,9 @@
 
 ### Improved
 
+- **The Rust SDK now includes a runnable live-system reference integration.** It demonstrates
+  multiple entities, typed filters, opaque paging cursors, record lookup, conditional operation
+  discovery, and authorization denial before a backend is contacted.
 - **Embedded agents can attach a live system of record with one fallible builder call.** Its
   operations appear only when that configured domain is surfaced, and both plan preview and
   execution require the exact datasource and external resources declared by the backend.

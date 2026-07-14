@@ -12,6 +12,33 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Live systems of record can expose a consistent `<domain>.list` and `<domain>.get` operation
+  pair.** Flux generates each entity's visible filter schema and renders rows and continuation
+  cursors consistently, while the backend retains ownership of its async fetches.
+
+### Improved
+
+- **The Rust SDK now includes a runnable live-system reference integration.** It demonstrates
+  multiple entities, typed filters, opaque paging cursors, record lookup, conditional operation
+  discovery, and authorization denial before a backend is contacted.
+- **Embedded agents can attach a live system of record with one fallible builder call.** Its
+  operations appear only when that configured domain is surfaced, and both plan preview and
+  execution require the exact datasource and external resources declared by the backend.
+- **Live datasource queries now validate each entity's declared filters before contacting the
+  backend.** Page sizes use safe backend defaults and ceilings, while continuation cursors remain
+  opaque and unchanged.
+- **Prepared release binaries can now be promoted by a matching version tag without rebuilding all
+  five platforms.** Promotion is tied to the exact source commit and retains the existing public
+  asset verification; missing candidates fall back visibly to the full build.
+- **Slack channel, user, history, and thread reads now validate their complete input before making
+  a request and advertise their stable result envelope.** Slack's evolving object fields, cursors,
+  and response metadata remain available unchanged.
+- **GitLab project, merge-request, and issue reads now validate their complete input before making
+  a request and advertise their stable result fields.** Existing raw GitLab results, including new
+  vendor fields and explicit nulls, remain unchanged.
+
 ### Fixed
 
 - **Rust SDK installation no longer stops at the runtime configuration dependency.** The config
