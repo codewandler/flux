@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-14
+
 ### New
 
 - **Install a plugin straight from a git repo.** `flux plugin install --git <url> --tag <v>` clones

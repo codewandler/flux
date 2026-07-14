@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-14
+
 ### Added
 
 - **A-82: spawned agents accept an explicit adaptive cognition policy.** Additive
