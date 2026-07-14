@@ -36,6 +36,8 @@ deny-by-default:
    `PluginManifest.endpoints` (the base URLs the host resolves from env) plus a new opt-in flag.
 2. **Per-endpoint/host** — "this plugin may reach *these* declared hosts privately" (a subset of its endpoints),
    for when a plugin legitimately talks to both public and internal backends.
+   > **Status (D-95):** parsed but **not yet enforced** — see *Enforcement status* below. Scope at the
+   > plugin level today.
 
 A request to a private address is permitted **iff** the calling plugin declared that host (or declared
 private-net broadly) **and** the operator granted it. `web_fetch` is its own scope — a plugin's allowance never
@@ -93,6 +95,42 @@ reachable.
 The legacy `allow_private_net` scalar remains as a compatibility read. It maps only to
 `private_net.web_fetch = true`; it never widens plugin egress. The plugin path requires
 `[private_net.plugins]` grants, intersected with each plugin's manifest declarations.
+
+## Enforcement status & scoped-egress recipe (D-95)
+
+**What is enforced today.** Private-net grants are resolved **per plugin** from `[private_net.plugins]`
+(intersected with each plugin's manifest-declared `private_hosts`) and applied **uniformly on every
+plugin-invocation path** — agent turns, `flux app run`, and direct `flux plugin call` (all three route
+through `effective_plugin_private_hosts` in `crates/flux-cli/src/main.rs`). There is **no
+direct-call-specific gap**: `flux plugin call` honours `[private_net.plugins]` exactly like the agent and
+app paths.
+
+**Per-endpoint granularity is parsed but not yet enforced.** `[private_net.endpoints]` deserializes and
+`flux_config::Config::endpoint_private_hosts` exists, but **no production path consumes it** — the plugin
+host applies one flat, session-wide allow-set per plugin, with no per-endpoint context at the guard site.
+So today, scope a private host at the **plugin** level (`[private_net.plugins]`); an
+`[private_net.endpoints]` entry is currently inert on every path (not just direct-call). Wiring true
+per-endpoint scoping requires threading endpoint identity down to the per-request guard and is tracked as
+follow-up — and must not widen the flat grant in the meantime.
+
+### Testing a private GitLab safely (GL-002)
+
+To exercise a plugin against a private/internal GitLab **without disabling the SSRF guard globally**:
+
+1. Point the plugin at the internal host — the gitlab plugin resolves its base URL from `GITLAB_URL`, and
+   the host it resolves to must appear in the plugin's manifest-declared `private_hosts`.
+2. Grant **just that plugin, just that host** in `~/.flux/config.toml`:
+   ```toml
+   [private_net.plugins]
+   gitlab = ["gitlab.internal.example"]   # this plugin, this declared host only
+   ```
+3. Run the call (e.g. `flux plugin call gitlab gitlab.test`). The guard admits only
+   `gitlab.internal.example` at a private address for the `gitlab` plugin; every other host and every
+   other plugin stays refused, and each admission audits as
+   `PrivateNetAdmit { caller, host, grant_source = "config:plugin/gitlab" }`.
+
+Prefer this scoped grant over the process-wide `flux --allow-private-net` flag (which opens `*` for the
+whole run) for anything recurring. Never disable the guard globally just to reach one internal host.
 
 ## Audit
 

@@ -274,8 +274,9 @@ account-scoped; that is called out as an explicit integration obligation, not le
 - `flux-orchestrate` (L3) may depend on `flux-runtime`/`flux-events`/`flux-agent` (L2/L3) — all the new
   types live within layer. `flux-sdk` (L6) consuming `flux-orchestrate` is a downward dep. The
   `flux-codegate` layering lint must stay green.
-- The `ToolContext.cancel` field is the only L2 change; it is additive (`Option`) and threaded by the
-  engine only. No tool is forced to use it.
+- `ToolContext` keeps additive stored fallbacks for compatibility, while A-80's
+  `RuntimeTurnContext` is the concurrency-safe L2 drive boundary for cancel/session/reporter. No tool is
+  forced to consume any of them.
 - **No bypass.** Every new path still dispatches through `Executor::dispatch`. Sub-agents gain *limits and
   audit*, never a way around the envelope.
 - **Valid session shape** on every new termination path (timeout, budget-exhausted, cancel) — covered by
@@ -325,14 +326,13 @@ multi-tenant surface wires real cancellation.
   the parent sink closes, but that does not finalize the durable child conversation. Harmless for the CLI
   default (throwaway child store). *Fix when needed:* a short grace window in the engine's cancel branch
   that awaits in-flight spawning tools before dropping. Noted in the `spawn` code comment.
-- **The per-turn cancel slot assumes one active turn per engine.** `ToolContext::set_cancel` writes into a
-  single interior-mutable slot on the engine's shared context — the **same** one-active-turn-per-engine
-  assumption `loop_host.set_turn` already relies on. A surface that drives two turns concurrently on one
-  engine (e.g. a served agent via `tokio::spawn`) would clobber the slot; once real cancellation is wired
-  there, cancelling tenant B could stop tenant A's sub-agent. Benign today (serve uses non-cancellable
-  `run_turn` with fresh never-cancelled tokens). *Fix when needed:* one engine per concurrent turn
-  (per-tenant engines), or move per-turn state onto a per-turn handle. The SDK path is already safe
-  (`FlowClient::build_executor` mints a fresh context per run). Documented on `ToolContext::cancel`.
+The former shared `ToolContext` cancel/session/reporter-slot limitation was closed by
+[A-80](../stories/A-80-propagate-nested-runtime-turn-context.md): live drives now use a future-local
+`RuntimeTurnContext`, and only a fresh nested one-shot context pins a snapshot before crossing
+`tokio::spawn`. An explicitly empty scope is authoritative, so a retained fallback slot cannot leak into
+another turn. `EngineLoopHost` still assumes one active adaptive turn for its own model-stage accounting;
+SDK sessions serialize that higher-level host state independently of the runtime-turn propagation fixed
+here.
 
 ## Open questions
 

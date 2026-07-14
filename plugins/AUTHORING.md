@@ -41,16 +41,38 @@ callbacks so the manifest gates below actually apply.
 
 ## Lifecycle: install → configure → call
 
-1. **Install** — register the binary as a descriptor at `~/.flux/plugins/<name>.toml`. Users install
-   from the signed pack release: `flux plugin install <name>[@<version>]` (or `--all`) verifies the
-   minisign-signed index + every archive's sha256 and unpacks into the versioned store
-   `~/.flux/plugins/bin/<name>/<version>/`. While authoring, register your local build instead:
+1. **Install** — register the binary as a descriptor at `~/.flux/plugins/<name>.toml`. There are
+   **three install sources**, each with its own trust model; the descriptor's verification label
+   (shown by `flux plugin ls`/`status`) tells them apart:
+
+   | Source | Command | Trust model | `ls` label |
+   | --- | --- | --- | --- |
+   | **signed pack** (D-46..49) | `flux plugin install <name>[@<version>]` / `--all` | minisign-signed index + per-archive sha256 verified before unpack into `~/.flux/plugins/bin/<name>/<version>/`; the sha256 is re-checked at every spawn (`spawn_verified`) — drift is a hard refusal | `verified` (or `hash drift`) |
+   | **local scan** (`--dir`) | `flux plugin install --dir [path]` (default `plugins/target/release`) / `flux plugin add <name> <program>` | none — registers already-built binaries by path; trusted because *you* built them | `unverified (local)` |
+   | **from source** (`--git`, D-87) | `flux plugin install --git <url> [--tag <t> \| --rev <r> \| --branch <b>] [--bin <name>] [--force]` | clone → `cargo build --release --locked` → register; **building unverified source is code execution**, gated behind an explicit confirm that discloses the resolved commit (non-interactively `FLUX_ALLOW_SOURCE_BUILD=1`). Provenance = the git URL + resolved commit, **not** a signed-pack hash | `from-source (unverified)` |
+
    ```
+   # signed pack (no source tree, no toolchain needed):
+   flux plugin install gitlab slack
+
+   # local scan while authoring:
    (cd plugins && cargo build --release)      # → plugins/target/release/flux-plugin-<name>
-   flux plugin install --dir                  # register every built binary (local, unverified; default dir: plugins/target/release)
-   #  …or one at a time:
-   flux plugin add <name> /abs/path/to/flux-plugin-<name>
+   flux plugin install --dir                  # register every built binary (local, unverified)
+   flux plugin add <name> /abs/path/to/flux-plugin-<name>   # …or one at a time
+
+   # from a git URL (e.g. a private GitLab-hosted plugin the pack channel can't serve):
+   flux plugin install --git https://gitlab.example/group/flux-plugin-foo.git --tag v1.0.0
    ```
+   `--git` clones into a cache (`~/.flux/plugins/src/<repo>/`), pins the resolved commit, and copies
+   the built binary into `~/.flux/plugins/bin/<name>/git-<commit>/` so the descriptor's program path
+   is stable; re-installing the same resolved commit is an idempotent no-op, `--force` rebuilds. A
+   repo that is not a flux plugin (no `[[bin]] flux-plugin-*` target) fails with a clear error, not a
+   raw cargo dump. **Cross-cutting caveat:** the cloned plugin's own build-time dependencies must
+   resolve on the installing machine — a private SDK dep must be crates.io-public, reachable as a git
+   dep, or served from a private Cargo registry (GitLab has no native one). All three sources go
+   through the single guarded process path: clone + build run via `flux_system::System` (argv-only,
+   no shell), and the plugin spawns env-cleared.
+
    The descriptor records the program path + args; that exact binary is what flux launches. A plugin
    binary is **trusted, pinned code** — vet it like a dependency before you install it.
 2. **Configure (auth setup)** — a plugin reads no config at runtime. Instead, set the **environment

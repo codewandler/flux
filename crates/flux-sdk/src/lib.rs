@@ -325,6 +325,7 @@ pub struct ClientBuilder {
     ops: Vec<Arc<dyn Tool>>,
     packs: Vec<RegistryPack>,
     sub_agents: Option<SubAgents>,
+    sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
 }
 
 impl Default for ClientBuilder {
@@ -340,6 +341,7 @@ impl Default for ClientBuilder {
             packs: Vec::new(),
             // Unset ⇒ no `task` tool, no spawner (children off by default).
             sub_agents: None,
+            sub_agent_adaptive_policy: None,
         }
     }
 }
@@ -361,6 +363,7 @@ impl ClientBuilder {
             ops: Vec::new(),
             packs: Vec::new(),
             sub_agents: None,
+            sub_agent_adaptive_policy: None,
         }
     }
     /// Set the model id every turn uses.
@@ -457,14 +460,35 @@ impl ClientBuilder {
     ///
     /// A generous default `wall_clock` (10 min) is applied when the bundle sets none, so a hung
     /// child can't run forever; override it (or any limit) via
-    /// [`SubAgents::with_limits`](subagents::SubAgents::with_limits). Unlike the one-shot
-    /// `FlowClient`, a streamed turn's cancel token ([`Session::stream`]`().cancel()`) also reaches
-    /// a running child, since the conversational path installs a cancellation token.
+    /// [`SubAgents::with_limits`](subagents::SubAgents::with_limits). A streamed conversational
+    /// turn's cancel token ([`Session::stream`]`().cancel()`) reaches a running child. A top-level
+    /// one-shot [`FlowClient`] has no cancel or parent lineage; when opened inside a guarded adapter,
+    /// however, it lexically inherits both and pins them before streamed execution crosses
+    /// `tokio::spawn`.
     pub fn with_sub_agents(mut self, mut sub_agents: SubAgents) -> Self {
         if sub_agents.limits.wall_clock.is_none() {
             sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
         }
         self.sub_agents = Some(sub_agents);
+        self.sub_agent_adaptive_policy = None;
+        self
+    }
+    /// Attach named sub-agents with an explicit native intent/explore policy for every child.
+    /// This is the conversational-client sibling of
+    /// [`FlowClient::with_sub_agents_policy`](crate::FlowClient::with_sub_agents_policy). Existing
+    /// [`with_sub_agents`](Self::with_sub_agents) callers retain
+    /// [`AdaptiveLoopPolicy::default`]; this method lets an embedding host independently select
+    /// child stage models/effort and bound output plus model calls.
+    pub fn with_sub_agents_policy(
+        mut self,
+        mut sub_agents: SubAgents,
+        adaptive_policy: AdaptiveLoopPolicy,
+    ) -> Self {
+        if sub_agents.limits.wall_clock.is_none() {
+            sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
+        }
+        self.sub_agents = Some(sub_agents);
+        self.sub_agent_adaptive_policy = Some(adaptive_policy);
         self
     }
     /// Restrict the agent to a subset of the registry's ops by name (`AgentSpec::tools`). Ops
@@ -624,11 +648,14 @@ impl ClientBuilder {
         // the context exactly as before. Mirrors `FlowClient::build_executor`.
         let mut ctx = ToolContext::new(system.clone());
         if let Some(sub_agents) = self.sub_agents {
-            ctx = ctx.with_spawner(
-                sub_agents
-                    .with_reasoning(spec.thinking, spec.effort)
-                    .into_spawner(system),
-            );
+            let sub_agents = sub_agents.with_reasoning(spec.thinking, spec.effort);
+            let spawner = match self.sub_agent_adaptive_policy {
+                Some(policy) => {
+                    sub_agents.into_spawner_with_adaptive_policy(system.clone(), policy)
+                }
+                None => sub_agents.into_spawner(system.clone()),
+            };
+            ctx = ctx.with_spawner(spawner);
         }
         let model = spec.model.clone();
         let engine = spec.assemble(provider, registry, approver, ctx, events, flow)?;
@@ -1911,6 +1938,298 @@ mod tests {
             "the sub-agent's output tokens landed in the session's run trace"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    struct PolicyCaptureWorker {
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    #[async_trait]
+    impl Provider for PolicyCaptureWorker {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            self.requests.lock().unwrap().push(req.clone());
+            let chunks = if request_has_tool(&req, "declare_intent") {
+                intent_chunks("complete the delegated task", &[])
+            } else {
+                vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "policy child done".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// A-82 review regression: the high-level conversational builder is an embedding door too;
+    /// its explicit sibling must reach both child-native stages instead of silently taking the
+    /// legacy default `into_spawner` path.
+    #[tokio::test]
+    async fn with_sub_agents_policy_reaches_conversational_children() {
+        use crate::subagents::{parse_role, RoleRegistry, SubAgents};
+
+        let dir =
+            std::env::temp_dir().join(format!("flux-sdk-subagent-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\n---\nworker prompt", "worker"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let factory: crate::subagents::ProviderFactory = Arc::new({
+            let requests = requests.clone();
+            move || {
+                Ok(Box::new(PolicyCaptureWorker {
+                    requests: requests.clone(),
+                }) as Box<dyn Provider>)
+            }
+        });
+        let sub_agents = SubAgents::new(roles, ToolRegistry::new(), factory, "child-default", 1024);
+        let policy = AdaptiveLoopPolicy {
+            max_model_calls: 2,
+            intent: AgentStagePolicy {
+                model: Some("intent-fast".into()),
+                effort: Some(flux_provider::Effort::Low),
+                max_tokens: Some(111),
+                max_calls: Some(1),
+            },
+            explore: AgentStagePolicy {
+                model: Some("explore-deep".into()),
+                effort: Some(flux_provider::Effort::High),
+                max_tokens: Some(222),
+                max_calls: Some(1),
+            },
+        };
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .with_sub_agents_policy(sub_agents, policy)
+            .build(
+                Box::new(DelegatingMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let out = client.run("delegate this").await.unwrap();
+        assert!(out.tool_calls.contains(&"task".to_string()));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].trace.as_ref().unwrap().stage, "intent");
+        assert_eq!(requests[0].model, "intent-fast");
+        assert_eq!(requests[0].effort, Some(flux_provider::Effort::Low));
+        assert_eq!(requests[0].max_tokens, 111);
+        assert_eq!(requests[1].trace.as_ref().unwrap().stage, "explore");
+        assert_eq!(requests[1].model, "explore-deep");
+        assert_eq!(requests[1].effort, Some(flux_provider::Effort::High));
+        assert_eq!(requests[1].max_tokens, 222);
+        drop(requests);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A-80 regression: a guarded adapter may open a streamed one-shot runtime, which crosses a
+    /// `tokio::spawn` boundary before its `task` op runs. The nested task must still inherit the
+    /// served parent turn's cancellation and session lineage.
+    struct NestedTaskAdapter {
+        audit: Arc<EventStore>,
+        child_entered: tokio::sync::mpsc::UnboundedSender<()>,
+        child_dropped: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    struct DropNotice(tokio::sync::mpsc::UnboundedSender<()>);
+
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    struct HangingWorker {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        dropped: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl Provider for HangingWorker {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            if request_has_tool(&request, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("wait for the parent request", &[])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
+            let _notice = DropNotice(self.dropped.clone());
+            let _ = self.entered.send(());
+            futures::future::pending::<Result<ChunkStream>>().await
+        }
+    }
+
+    #[async_trait]
+    impl Tool for NestedTaskAdapter {
+        fn spec(&self) -> flux_spec::ToolSpec {
+            flux_spec::ToolSpec::read_only(
+                "nested_task_adapter",
+                "delegate through a nested one-shot runtime",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            )
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> Result<flux_runtime::ToolResult> {
+            use crate::subagents::{parse_role, RoleRegistry, SpawnLimits, SubAgents};
+
+            let mut roles = RoleRegistry::default();
+            roles.insert(parse_role(
+                "---\n---\nWait until the parent request is cancelled.",
+                "worker",
+            ));
+            let factory: crate::subagents::ProviderFactory = Arc::new({
+                let entered = self.child_entered.clone();
+                let dropped = self.child_dropped.clone();
+                move || {
+                    Ok(Box::new(HangingWorker {
+                        entered: entered.clone(),
+                        dropped: dropped.clone(),
+                    }) as Box<dyn Provider>)
+                }
+            });
+            let mut limits = SpawnLimits::new(1024);
+            // The assertion below must observe parent cancellation, never this safety backstop.
+            limits.wall_clock = Some(std::time::Duration::from_secs(30));
+            let sub_agents = SubAgents::new(roles, ToolRegistry::new(), factory, "mock", 1024)
+                .with_limits(limits)
+                .with_audit(self.audit.clone());
+
+            let root = std::env::temp_dir().join(format!(
+                "flux-sdk-nested-turn-context-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root)?;
+            let mut nested = FlowClient::builder()
+                .model("mock")
+                .auto_approve(true)
+                .build(Arc::new(ProseMock { text: "unused" }), &root)?;
+            nested.with_sub_agents(sub_agents);
+            let flow: flux_flow::ast::DraftAst = serde_json::from_value(serde_json::json!({
+                "body": [{
+                    "kind": "call",
+                    "op": "task",
+                    "args": [{
+                        "kind": "lit",
+                        "value": { "role": "worker", "task": "wait" }
+                    }]
+                }]
+            }))
+            .map_err(|error| flux_core::Error::Other(error.to_string()))?;
+            let outcome = nested.execute_streamed(&flow).finish().await?;
+            Ok(flux_runtime::ToolResult::ok(outcome.result))
+        }
+    }
+
+    struct NestedAdapterParent {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for NestedAdapterParent {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            if request_has_tool(&request, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("delegate through the adapter", &["core"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
+            let chunks = match self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            {
+                0 => native_call("adapter-1", "nested_task_adapter", serde_json::json!({})),
+                _ => vec![
+                    Chunk::Block(ContentBlock::Text {
+                        text: "unexpected completion".into(),
+                    }),
+                    Chunk::Done {
+                        stop_reason: Some(StopReason::EndTurn),
+                    },
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_streamed_task_inherits_parent_cancel_and_session_lineage() {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-sdk-parent-turn-context-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = Arc::new(EventStore::in_memory().unwrap());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .register_op(Arc::new(NestedTaskAdapter {
+                audit: audit.clone(),
+                child_entered: entered_tx,
+                child_dropped: dropped_tx,
+            }))
+            .build(
+                Box::new(NestedAdapterParent {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                &dir,
+            )
+            .unwrap();
+        let session = client.default_session().unwrap();
+        let parent_session = session.id().to_string();
+        let turn = session.stream("delegate through the adapter");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the nested child must enter its parked provider")
+            .expect("the nested child entry channel closed");
+        turn.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx.recv())
+            .await
+            .expect("parent cancellation must reach the nested child before its 30s deadline")
+            .expect("the nested child drop channel closed");
+        turn.finish().await.unwrap();
+
+        let children = audit.children_of(&parent_session).unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "the child audit stream must be parent-linked"
+        );
+        let child = audit.info(&children[0]).unwrap();
+        assert_eq!(
+            child.context.correlation_id.as_deref(),
+            Some(parent_session.as_str())
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

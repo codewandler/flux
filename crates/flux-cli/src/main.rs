@@ -35,8 +35,8 @@ use flux_orchestrate::{ProviderFactory, Role, RoleRegistry, SubAgents, TaskTool}
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
 use flux_runtime::context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
 use flux_runtime::{
-    AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager, ToolContext,
-    ToolRegistry, ToolResult,
+    scope_runtime_turn, AllowApprover, ApprovalChoice, Approver, Executor, PermissionManager,
+    RuntimeTurnContext, SpawnActivitySink, ToolContext, ToolRegistry, ToolResult,
 };
 use flux_spec::IntentSet;
 use flux_system::{System, Workspace};
@@ -703,10 +703,22 @@ enum PluginAction {
     /// into the versioned store `~/.flux/plugins/bin/<name>/<version>/`. Re-installing a version
     /// already present is an idempotent no-op.
     ///
-    /// `install --dir [path]` is the other mode — the pre-D-47 local scan, registering every
+    /// `install --dir [path]` is the second mode — the pre-D-47 local scan, registering every
     /// `flux-plugin-*` binary already built in a directory (default `plugins/target/release`) with
-    /// no version/hash recorded. The two modes are exclusive; bare `install` with neither plugin
-    /// names/`--all` nor `--dir` is an error naming both.
+    /// no version/hash recorded.
+    ///
+    /// `install --git <url> [--tag <t> | --rev <r> | --branch <b>] [--bin <name>] [--force]` is the
+    /// third source (D-87): clone the repo at the given ref into a cache
+    /// (`~/.flux/plugins/src/<repo>/`), detect a `flux-plugin-*` crate, `cargo build --release
+    /// --locked`, and register the built binary — the source-transparent (`cargo install --git`)
+    /// alternative for a GitLab-hosted or third-party plugin the signed pack channel can't serve.
+    /// Building unverified source is code execution, so the resolved commit is shown and an explicit
+    /// confirm is required before the build (non-interactively: `FLUX_ALLOW_SOURCE_BUILD=1`); the
+    /// descriptor is labelled `from-source (unverified)`. Re-installing the same resolved commit is
+    /// an idempotent no-op; `--force` rebuilds.
+    ///
+    /// The three sources are exclusive; bare `install` with none of names/`--all`, `--dir`, or
+    /// `--git` is an error naming all three.
     Install {
         /// Plugin name(s) to install, each optionally pinned to `@<version>` (remote mode).
         names: Vec<String>,
@@ -726,6 +738,25 @@ enum PluginAction {
             conflicts_with_all = ["names", "all"]
         )]
         dir: Option<String>,
+        /// Build + install from this git URL (source mode, D-87): clone → detect a flux-plugin
+        /// crate → `cargo build --release --locked` → register `from-source (unverified)`.
+        #[arg(long, value_name = "URL", conflicts_with_all = ["names", "all", "dir"])]
+        git: Option<String>,
+        /// With `--git`: check out this tag before building (mutually exclusive with `--rev`/`--branch`).
+        #[arg(long, value_name = "TAG", requires = "git", conflicts_with_all = ["rev", "branch"])]
+        tag: Option<String>,
+        /// With `--git`: check out this exact commit/rev before building.
+        #[arg(long, value_name = "REV", requires = "git", conflicts_with_all = ["tag", "branch"])]
+        rev: Option<String>,
+        /// With `--git`: check out this branch head before building.
+        #[arg(long, value_name = "BRANCH", requires = "git", conflicts_with_all = ["tag", "rev"])]
+        branch: Option<String>,
+        /// With `--git`: the `flux-plugin-*` bin target to build when the repo has several.
+        #[arg(long, value_name = "BIN", requires = "git")]
+        bin: Option<String>,
+        /// With `--git`: rebuild even if the same resolved commit is already installed.
+        #[arg(long, requires = "git")]
+        force: bool,
     },
     /// Remove an installed plugin descriptor: `uninstall <name>`. With `--purge`, also delete
     /// the plugin's versioned-store directory (`~/.flux/plugins/bin/<name>/`) — every downloaded
@@ -3653,6 +3684,18 @@ pub(crate) async fn run_draft_ast_with_composites(
     run_draft_ast_with_composites_resumable(flags, ast, composites, false, None, None).await
 }
 
+/// Build the lexical turn snapshot for the top-level authored-flow CLI path. `EngineLoopHost`
+/// returns the reporter instead of retaining it, so this helper keeps the ownership boundary hard
+/// to accidentally undo at either the direct or resumable call site.
+fn direct_flow_runtime_turn(
+    session_id: &str,
+    activity: Arc<dyn SpawnActivitySink>,
+) -> RuntimeTurnContext {
+    RuntimeTurnContext::new()
+        .with_session(session_id)
+        .with_spawn_activity_sink(activity)
+}
+
 /// [`run_draft_ast_with_composites`] plus L-25's opt-in resumable mode for `flux flow run`.
 /// `resumable` alone reifies a halting top-level statement (a failure, or the L-24 `Awaiting`
 /// reified pause) as a printed, structured halt report + non-zero exit instead of erroring the
@@ -3871,42 +3914,52 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     ));
     // `None` advertised set: this is the pre-authored `flow run` path, which is deliberately
     // unrestricted by surfacing because the authored file names its operations explicitly.
-    engine.loop_host.set_turn(
+    let activity = engine.loop_host.set_turn(
         session_id.clone(),
         Some(engine.system_prompt.clone()),
         shared.clone(),
         None,
         None,
     );
+    // `set_turn` deliberately returns (rather than retains) the live child reporter. Scope that
+    // reporter together with this authored run's session so `task(...)` reached through either the
+    // direct or resumable interpreter inherits the same A-80 turn context. The executor is reused
+    // by the CLI, so pinning this on its long-lived ToolContext would leak an obsolete reporter into
+    // a later run.
+    let runtime_turn = direct_flow_runtime_turn(&session_id, activity);
 
     let mut sink = flux_flow::loop_host::SharedSink::new(shared.clone());
-    let outcome = if resumable {
-        // A failing top-level statement reifies onto `outcome.failure` instead of
-        // propagating `Err`; `open_halt`'s ledger (when resuming) fast-forwards the matching prefix.
-        flux_flow::runtime::execute_flow_resumable_with_composites(
-            engine.flow.as_ref(),
-            engine.executor.as_ref(),
-            &session_id,
-            ast,
-            &active_composites,
-            open_halt.as_ref().map(|o| &o.ledger),
-            &mut sink,
-        )
-        .await
-    } else {
-        // Also the no-composites case (empty slice is equivalent): this entry point self-wires
-        // the C-43 cassette scope from the store — plain `execute_flow` deliberately does not
-        // (it is shared with the outer agent loop, whose host stages are never cassetted).
-        flux_flow::runtime::execute_flow_with_composites(
-            engine.flow.as_ref(),
-            engine.executor.as_ref(),
-            &session_id,
-            ast,
-            &active_composites,
-            &mut sink,
-        )
-        .await
-    }
+    let outcome = scope_runtime_turn(runtime_turn, async {
+        if resumable {
+            // A failing top-level statement reifies onto `outcome.failure` instead of
+            // propagating `Err`; `open_halt`'s ledger (when resuming) fast-forwards the matching
+            // prefix.
+            flux_flow::runtime::execute_flow_resumable_with_composites(
+                engine.flow.as_ref(),
+                engine.executor.as_ref(),
+                &session_id,
+                ast,
+                &active_composites,
+                open_halt.as_ref().map(|o| &o.ledger),
+                &mut sink,
+            )
+            .await
+        } else {
+            // Also the no-composites case (empty slice is equivalent): this entry point self-wires
+            // the C-43 cassette scope from the store — plain `execute_flow` deliberately does not
+            // (it is shared with the outer agent loop, whose host stages are never cassetted).
+            flux_flow::runtime::execute_flow_with_composites(
+                engine.flow.as_ref(),
+                engine.executor.as_ref(),
+                &session_id,
+                ast,
+                &active_composites,
+                &mut sink,
+            )
+            .await
+        }
+    })
+    .await
     .context("execute flow")?;
 
     // A reified halt (L-25): print the structured report and exit non-zero instead of the normal
@@ -7655,6 +7708,9 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     flux_plugin::Verification::Verified => style::green("verified"),
                     flux_plugin::Verification::HashDrift { .. } => style::red("hash drift"),
                     flux_plugin::Verification::UnverifiedLocal => style::dim("unverified (local)"),
+                    flux_plugin::Verification::UnverifiedFromSource => {
+                        style::dim("from-source (unverified)")
+                    }
                 };
                 println!(
                     "{:<16} {} {}{pin}{ver}  [{verification}]",
@@ -7829,13 +7885,18 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
                     }
                 }
                 let _ = host.shutdown().await;
+                // Mask any secret-like input fields the op declared (GL-031) before echoing the
+                // preview — the live `input` sent to the plugin above stays raw; only this copy is
+                // printed. A dry-run of a CI-variable write must not leak the `value` to scrollback.
+                let mut echoed_input = input.clone();
+                redact_plugin_echo(&mut echoed_input, &manifest, &resolved_op);
                 let dry = serde_json::json!({
                     "plugin": name,
                     "operation": resolved_op,
                     "valid": problems.is_empty(),
                     "problems": problems,
                     "warnings": warnings,
-                    "input": input,
+                    "input": echoed_input,
                 });
                 println!(
                     "{}",
@@ -7853,8 +7914,11 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             }
             let result = host.call_with_host(&resolved_op, input, &caps).await;
             let _ = host.shutdown().await;
-            let value =
+            let mut value =
                 result.map_err(|e| anyhow::anyhow!("plugin `{name}` op `{resolved_op}`: {e}"))?;
+            // Mask the op's declared secret-like result fields (GL-031) before echoing — a variable
+            // write's response carries the value back and must not leak into scrollback/logs.
+            redact_plugin_echo(&mut value, &manifest, &resolved_op);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
@@ -7869,124 +7933,149 @@ async fn run_plugin_in(dir: &std::path::Path, action: Option<PluginAction>) -> R
             names,
             all,
             dir: local_dir,
-        } => match local_dir {
-            Some(bin_dir) => {
-                if !names.is_empty() || all {
-                    bail!(
-                        "`--dir` (local scan) cannot be combined with plugin names or `--all` \
+            git,
+            tag,
+            rev,
+            branch,
+            bin,
+            force,
+        } => {
+            // The `--git` ref/bin/force flags are `requires = "git"` at the clap layer, but clap
+            // skips that requirement when it would collide with a present conflicting positional
+            // (`install gitlab --tag t`), so guard it at runtime too — a ref/bin/force flag without
+            // `--git` is a misuse, not a silent remote/`--dir` install that ignores it.
+            if git.is_none()
+                && (tag.is_some() || rev.is_some() || branch.is_some() || bin.is_some() || force)
+            {
+                bail!(
+                    "`--tag`/`--rev`/`--branch`/`--bin`/`--force` apply only to a `--git <url>` \
+                     source install"
+                );
+            }
+            if let Some(url) = git {
+                return run_plugin_git_install(dir, &url, tag, rev, branch, bin.as_deref(), force)
+                    .await;
+            }
+            match local_dir {
+                Some(bin_dir) => {
+                    if !names.is_empty() || all {
+                        bail!(
+                            "`--dir` (local scan) cannot be combined with plugin names or `--all` \
                              (remote pack install) — pick one mode"
-                    );
-                }
-                let bin_dir = std::path::PathBuf::from(bin_dir);
-                let binaries = plugin_binaries_in(&bin_dir)
-                    .with_context(|| format!("scan {}", bin_dir.display()))?;
-                let mut installed = 0usize;
-                for (name, program) in &binaries {
-                    flux_plugin::add_descriptor(
-                        dir,
-                        name,
-                        &flux_plugin::PluginDescriptor {
-                            program: program.clone(),
-                            args: Vec::new(),
-                            pinned: None,
-                            ..Default::default()
-                        },
-                    )
-                    .with_context(|| format!("register plugin `{name}`"))?;
-                    println!("installed `{name}` → {program} (local, unverified)");
-                    installed += 1;
-                }
-                if installed == 0 {
-                    eprintln!(
-                        "no `flux-plugin-*` binaries in {} (build them first: \
+                        );
+                    }
+                    let bin_dir = std::path::PathBuf::from(bin_dir);
+                    let binaries = plugin_binaries_in(&bin_dir)
+                        .with_context(|| format!("scan {}", bin_dir.display()))?;
+                    let mut installed = 0usize;
+                    for (name, program) in &binaries {
+                        flux_plugin::add_descriptor(
+                            dir,
+                            name,
+                            &flux_plugin::PluginDescriptor {
+                                program: program.clone(),
+                                args: Vec::new(),
+                                pinned: None,
+                                ..Default::default()
+                            },
+                        )
+                        .with_context(|| format!("register plugin `{name}`"))?;
+                        println!("installed `{name}` → {program} (local, unverified)");
+                        installed += 1;
+                    }
+                    if installed == 0 {
+                        eprintln!(
+                            "no `flux-plugin-*` binaries in {} (build them first: \
                              `cd plugins && cargo build --release`)",
-                        bin_dir.display()
-                    );
-                } else {
-                    // Prune stale local registrations from an EARLIER scan of this same dir whose
-                    // binary is now absent (e.g. a plugin that failed to build in a partial pack
-                    // build) — otherwise its descriptor lingers and every later command prints a
-                    // "failed to load" warning (N-003). Only unverified/local descriptors whose
-                    // recorded program is the `flux-plugin-<name>` binary directly inside THIS dir
-                    // are eligible; verified pack installs (a recorded sha256) and plugins
-                    // registered elsewhere are never touched. Gated on `installed > 0`, so a
-                    // typo'd/empty `--dir` never wipes a whole set of registrations.
-                    let canon_dir = bin_dir.canonicalize().unwrap_or_else(|_| bin_dir.clone());
-                    let present: std::collections::HashSet<&str> =
-                        binaries.iter().map(|(n, _)| n.as_str()).collect();
-                    for d in flux_plugin::discover(dir) {
-                        if present.contains(d.name.as_str()) || d.descriptor.sha256.is_some() {
-                            continue;
+                            bin_dir.display()
+                        );
+                    } else {
+                        // Prune stale local registrations from an EARLIER scan of this same dir whose
+                        // binary is now absent (e.g. a plugin that failed to build in a partial pack
+                        // build) — otherwise its descriptor lingers and every later command prints a
+                        // "failed to load" warning (N-003). Only unverified/local descriptors whose
+                        // recorded program is the `flux-plugin-<name>` binary directly inside THIS dir
+                        // are eligible; verified pack installs (a recorded sha256) and plugins
+                        // registered elsewhere are never touched. Gated on `installed > 0`, so a
+                        // typo'd/empty `--dir` never wipes a whole set of registrations.
+                        let canon_dir = bin_dir.canonicalize().unwrap_or_else(|_| bin_dir.clone());
+                        let present: std::collections::HashSet<&str> =
+                            binaries.iter().map(|(n, _)| n.as_str()).collect();
+                        for d in flux_plugin::discover(dir) {
+                            if present.contains(d.name.as_str()) || d.descriptor.sha256.is_some() {
+                                continue;
+                            }
+                            let prog = std::path::Path::new(&d.descriptor.program);
+                            let owned_here = prog.parent().is_some_and(|p| {
+                                p == canon_dir.as_path() || p == bin_dir.as_path()
+                            });
+                            let fname = prog.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                            let name_matches = fname == format!("flux-plugin-{}", d.name)
+                                || fname == format!("flux-plugin-{}.exe", d.name);
+                            if owned_here
+                                && name_matches
+                                && flux_plugin::remove_descriptor(dir, &d.name).unwrap_or(false)
+                            {
+                                println!(
+                                    "pruned stale `{}` (binary no longer in {})",
+                                    d.name,
+                                    bin_dir.display()
+                                );
+                            }
                         }
-                        let prog = std::path::Path::new(&d.descriptor.program);
-                        let owned_here = prog
-                            .parent()
-                            .is_some_and(|p| p == canon_dir.as_path() || p == bin_dir.as_path());
-                        let fname = prog.file_name().and_then(|f| f.to_str()).unwrap_or("");
-                        let name_matches = fname == format!("flux-plugin-{}", d.name)
-                            || fname == format!("flux-plugin-{}.exe", d.name);
-                        if owned_here
-                            && name_matches
-                            && flux_plugin::remove_descriptor(dir, &d.name).unwrap_or(false)
-                        {
+                    }
+                    Ok(())
+                }
+                None => {
+                    if names.is_empty() && !all {
+                        bail!(
+                            "`flux plugin install` needs plugin name(s), `--all` (remote pack \
+                             install), `--dir [path]` (local scan of a built \
+                             `plugins/target/release`), or `--git <url>` (build from source) — \
+                             bare `install` no longer guesses"
+                        );
+                    }
+                    if flux_plugin::pack::CURRENT_TARGET.is_empty() {
+                        bail!(
+                            "no prebuilt plugin pack for this platform — build from source: \
+                             `git clone https://github.com/{} && cd plugins && cargo build \
+                             --release && flux plugin install --dir plugins/target/release`",
+                            flux_plugin::pack::DEFAULT_REPO
+                        );
+                    }
+                    let store_root = dir.join("bin");
+                    let fetcher = flux_plugin::pack::GithubFetcher::default();
+                    let req = flux_plugin::pack::InstallRequest {
+                        fetcher: &fetcher,
+                        repo: flux_plugin::pack::DEFAULT_REPO,
+                        public_key: flux_plugin::pack::PUBLIC_KEY,
+                        descriptors_dir: dir,
+                        store_root: &store_root,
+                        target: flux_plugin::pack::CURRENT_TARGET,
+                    };
+                    let installed = flux_plugin::pack::install_many(&req, &names, all)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("remote plugin install: {e}"))?;
+                    for p in installed {
+                        if p.already_installed {
                             println!(
-                                "pruned stale `{}` (binary no longer in {})",
-                                d.name,
-                                bin_dir.display()
+                                "`{}` {} already installed (source {}) — no-op",
+                                p.name, p.version, p.source
+                            );
+                        } else {
+                            println!(
+                                "installed `{}` {} → {} (verified, source {})",
+                                p.name,
+                                p.version,
+                                p.program.display(),
+                                p.source
                             );
                         }
                     }
+                    Ok(())
                 }
-                Ok(())
             }
-            None => {
-                if names.is_empty() && !all {
-                    bail!(
-                        "`flux plugin install` needs plugin name(s), `--all` (remote pack \
-                             install), or `--dir [path]` (local scan of a built \
-                             `plugins/target/release`) — bare `install` no longer guesses"
-                    );
-                }
-                if flux_plugin::pack::CURRENT_TARGET.is_empty() {
-                    bail!(
-                        "no prebuilt plugin pack for this platform — build from source: \
-                             `git clone https://github.com/{} && cd plugins && cargo build \
-                             --release && flux plugin install --dir plugins/target/release`",
-                        flux_plugin::pack::DEFAULT_REPO
-                    );
-                }
-                let store_root = dir.join("bin");
-                let fetcher = flux_plugin::pack::GithubFetcher::default();
-                let req = flux_plugin::pack::InstallRequest {
-                    fetcher: &fetcher,
-                    repo: flux_plugin::pack::DEFAULT_REPO,
-                    public_key: flux_plugin::pack::PUBLIC_KEY,
-                    descriptors_dir: dir,
-                    store_root: &store_root,
-                    target: flux_plugin::pack::CURRENT_TARGET,
-                };
-                let installed = flux_plugin::pack::install_many(&req, &names, all)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("remote plugin install: {e}"))?;
-                for p in installed {
-                    if p.already_installed {
-                        println!(
-                            "`{}` {} already installed (source {}) — no-op",
-                            p.name, p.version, p.source
-                        );
-                    } else {
-                        println!(
-                            "installed `{}` {} → {} (verified, source {})",
-                            p.name,
-                            p.version,
-                            p.program.display(),
-                            p.source
-                        );
-                    }
-                }
-                Ok(())
-            }
-        },
+        }
         PluginAction::Skill {
             install,
             global,
@@ -8176,6 +8265,7 @@ fn print_plugin_status_report(r: &PluginStatusReport) {
             short(actual)
         )),
         flux_plugin::Verification::UnverifiedLocal => style::dim("unverified (local)"),
+        flux_plugin::Verification::UnverifiedFromSource => style::dim("from-source (unverified)"),
     };
     println!(
         "{:<16} {} {}{pin}{ver}  [{liveness_label}]  [{verified_label}]",
@@ -8340,6 +8430,22 @@ fn resolve_plugin_operation_name(
         "plugin `{plugin}` has no operation `{requested}` (tried `{qualified}`). Available ops: {}",
         available_plugin_operations(manifest)
     )
+}
+
+/// Mask an op's declared secret-like fields in a value `flux plugin call` is about to echo — the
+/// dry-run input preview or the live result (GL-031 / D-93). Looks the op's
+/// [`redact_fields`](flux_plugin::OperationSpec::redact_fields) up in the manifest and applies the
+/// shared host masking so secret-like values (e.g. a CI/pipeline variable `value`) never reach
+/// terminal scrollback, logs, or saved transcripts. A no-op when the op declares no secret fields.
+fn redact_plugin_echo(value: &mut Value, manifest: &flux_plugin::PluginManifest, op: &str) {
+    if let Some(fields) = manifest
+        .operations
+        .iter()
+        .find(|o| o.name == op)
+        .map(|o| o.redact_fields.as_slice())
+    {
+        flux_plugin::redact_secret_fields(value, fields);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8742,6 +8848,394 @@ fn write_skill_references(dir: &std::path::Path, refs: &[(String, String)]) -> R
         std::fs::write(&f, md).with_context(|| format!("write {}", f.display()))?;
     }
     Ok(())
+}
+
+/// Whether a `--git` source build is pre-approved non-interactively — `FLUX_ALLOW_SOURCE_BUILD`
+/// truthy (mirrors [`private_net_cli_override`]/`FLUX_ALLOW_PRIVATE_NET`). Building unverified
+/// source is code execution, so an SSRF-style env gate is the non-interactive consent channel.
+fn source_build_preapproved() -> bool {
+    flux_system::env_truthy("FLUX_ALLOW_SOURCE_BUILD")
+}
+
+/// The D-87 trust gate: building unverified remote source is arbitrary code execution, so disclose
+/// the resolved commit and require explicit consent BEFORE the build. `FLUX_ALLOW_SOURCE_BUILD=1`
+/// pre-approves non-interactively; otherwise a `[y/N]` confirm (off a terminal without the flag,
+/// [`read_choice`] declines on EOF — fail-safe).
+async fn confirm_source_build(url: &str, ref_desc: &str, commit: &str) -> bool {
+    let short = &commit[..commit.len().min(12)];
+    if source_build_preapproved() {
+        eprintln!(
+            "{}",
+            style::dim(&format!(
+                "building `{url}` ({ref_desc}) at commit {short} — pre-approved (FLUX_ALLOW_SOURCE_BUILD)"
+            ))
+        );
+        return true;
+    }
+    let prompt = format!(
+        "\n{} `{url}` ({ref_desc}) at commit {short}?\n  This BUILDS and installs unverified \
+         source — arbitrary code execution on this machine. [y]es / [N]o: ",
+        style::yellow("build + install"),
+    );
+    matches!(
+        read_choice(prompt, ApprovalChoice::Deny).await,
+        ApprovalChoice::Allow
+    )
+}
+
+/// `flux plugin install --git <url> …` (D-87): the source-build install source. Maps the
+/// `--tag`/`--rev`/`--branch` ref, wires the guarded [`SystemSourceBuilder`] (clone + build through
+/// [`System`], never a raw `Command`) and the trust gate, and delegates the resolve → consent →
+/// build → register orchestration to `flux_plugin::pack::install_from_git`.
+async fn run_plugin_git_install(
+    dir: &std::path::Path,
+    url: &str,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+    requested_bin: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let git_ref = match (tag, rev, branch) {
+        (Some(t), None, None) => flux_plugin::pack::GitRef::Tag(t),
+        (None, Some(r), None) => flux_plugin::pack::GitRef::Rev(r),
+        (None, None, Some(b)) => flux_plugin::pack::GitRef::Branch(b),
+        (None, None, None) => flux_plugin::pack::GitRef::Default,
+        _ => bail!("`--tag`, `--rev`, and `--branch` are mutually exclusive — pick one ref"),
+    };
+    let ref_desc = git_ref.describe();
+    let builder = SystemSourceBuilder;
+    let src_root = dir.join("src");
+    let store_root = dir.join("bin");
+    let req = flux_plugin::pack::GitInstallRequest {
+        builder: &builder,
+        descriptors_dir: dir,
+        src_root: &src_root,
+        store_root: &store_root,
+    };
+    let installed = flux_plugin::pack::install_from_git(
+        &req,
+        url,
+        &git_ref,
+        requested_bin,
+        force,
+        |commit: &str| {
+            let url = url.to_string();
+            let ref_desc = ref_desc.clone();
+            let commit = commit.to_string();
+            async move { Ok(confirm_source_build(&url, &ref_desc, &commit).await) }
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("git plugin install: {e}"))?;
+
+    if installed.already_installed {
+        println!(
+            "`{}` already installed from {} at commit {} — no-op (--force to rebuild)",
+            installed.name, installed.git_url, installed.git_commit
+        );
+    } else {
+        println!(
+            "installed `{}` → {} (from-source, unverified; {} @ {})",
+            installed.name,
+            installed.program.display(),
+            installed.git_url,
+            installed.git_commit
+        );
+    }
+    Ok(())
+}
+
+/// The production [`flux_plugin::pack::SourceBuilder`] (D-87): drives `git` and `cargo` through the
+/// guarded [`System`] — argv-only, cleared + allow-listed env, **never** a shell string and never a
+/// raw `std::process::Command`. `System::build_command` pins a spawn's cwd to the workspace root, so
+/// the clean answer to "the clone lives outside the caller's workspace" is a **second `System`
+/// rooted AT the clone directory** ([`Self::system_at`]) — no cwd override, one guarded process
+/// path. Network steps (`git clone`/`fetch`, cargo's registry fetch + build) use
+/// [`System::run_with_env_exempt`], the trusted-host exemption that skips only the OS child sandbox
+/// while keeping argv-only + env-clear intact.
+struct SystemSourceBuilder;
+
+impl SystemSourceBuilder {
+    /// A `System` rooted at `dir` (which must already exist) so guarded git/cargo steps run with
+    /// their cwd pinned there.
+    fn system_at(dir: &std::path::Path) -> flux_core::Result<System> {
+        System::from_env(dir)
+            .map_err(|e| flux_core::Error::Other(format!("workspace at {}: {e}", dir.display())))
+    }
+
+    /// Run one guarded git/cargo step (network-exempt). A non-zero exit fails with a **trimmed**
+    /// stderr tail — never a raw multi-screen cargo dump.
+    async fn run_step(
+        sys: &System,
+        argv: &[String],
+        timeout: std::time::Duration,
+        ctx: &str,
+    ) -> flux_core::Result<flux_system::ProcessOutput> {
+        let out = sys.run_with_env_exempt(argv, &[], timeout).await?;
+        if out.exit_code != 0 {
+            return Err(flux_core::Error::Other(format!(
+                "{ctx} failed (exit {}): {}",
+                out.exit_code,
+                last_lines(&out.stderr, 12)
+            )));
+        }
+        Ok(out)
+    }
+}
+
+/// Build an owned argv from string slices (the program is `parts[0]`).
+fn to_argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|p| p.to_string()).collect()
+}
+
+/// The last `n` non-blank lines of `text`, joined — trims a cargo/git failure into an actionable
+/// tail instead of dumping the whole build log.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+const GIT_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const CARGO_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const CARGO_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+#[async_trait::async_trait]
+impl flux_plugin::pack::SourceBuilder for SystemSourceBuilder {
+    async fn clone_and_resolve(
+        &self,
+        url: &str,
+        git_ref: &flux_plugin::pack::GitRef,
+        clone_dir: &std::path::Path,
+    ) -> flux_core::Result<String> {
+        use flux_plugin::pack::GitRef;
+        std::fs::create_dir_all(clone_dir).map_err(flux_core::Error::Io)?;
+        let sys = Self::system_at(clone_dir)?;
+
+        let fresh = !clone_dir.join(".git").is_dir();
+        if fresh {
+            Self::run_step(
+                &sys,
+                &to_argv(&["git", "clone", "--quiet", url, "."]),
+                GIT_STEP_TIMEOUT,
+                "git clone",
+            )
+            .await?;
+        } else {
+            Self::run_step(
+                &sys,
+                &to_argv(&[
+                    "git", "fetch", "--quiet", "--tags", "--force", "--prune", "origin",
+                ]),
+                GIT_STEP_TIMEOUT,
+                "git fetch",
+            )
+            .await?;
+        }
+
+        // Detached-head checkouts (tag/rev) shouldn't print git's advice banner into stderr.
+        match git_ref {
+            GitRef::Tag(t) => {
+                Self::run_step(
+                    &sys,
+                    &to_argv(&[
+                        "git",
+                        "-c",
+                        "advice.detachedHead=false",
+                        "checkout",
+                        "--quiet",
+                        t,
+                    ]),
+                    GIT_STEP_TIMEOUT,
+                    &format!("git checkout tag `{t}`"),
+                )
+                .await?;
+            }
+            GitRef::Rev(r) => {
+                Self::run_step(
+                    &sys,
+                    &to_argv(&[
+                        "git",
+                        "-c",
+                        "advice.detachedHead=false",
+                        "checkout",
+                        "--quiet",
+                        r,
+                    ]),
+                    GIT_STEP_TIMEOUT,
+                    &format!("git checkout rev `{r}`"),
+                )
+                .await?;
+            }
+            GitRef::Branch(b) => {
+                // Fetch the branch, then repoint a local branch at the remote head deterministically.
+                Self::run_step(
+                    &sys,
+                    &to_argv(&["git", "fetch", "--quiet", "origin", b]),
+                    GIT_STEP_TIMEOUT,
+                    &format!("git fetch branch `{b}`"),
+                )
+                .await?;
+                Self::run_step(
+                    &sys,
+                    &to_argv(&[
+                        "git",
+                        "checkout",
+                        "--quiet",
+                        "-B",
+                        b,
+                        &format!("origin/{b}"),
+                    ]),
+                    GIT_STEP_TIMEOUT,
+                    &format!("git checkout branch `{b}`"),
+                )
+                .await?;
+            }
+            GitRef::Default => {
+                // A cache hit refreshes the default branch to its remote head; a fresh clone is
+                // already at it. Best-effort (a detached default is rare and left as-is).
+                if !fresh {
+                    let _ = Self::run_step(
+                        &sys,
+                        &to_argv(&["git", "reset", "--hard", "--quiet", "@{upstream}"]),
+                        GIT_STEP_TIMEOUT,
+                        "git reset to upstream",
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let out = Self::run_step(
+            &sys,
+            &to_argv(&["git", "rev-parse", "HEAD"]),
+            GIT_STEP_TIMEOUT,
+            "git rev-parse HEAD",
+        )
+        .await?;
+        let commit = out.stdout.trim().to_string();
+        if commit.is_empty() {
+            return Err(flux_core::Error::Other(
+                "git rev-parse HEAD returned no commit".into(),
+            ));
+        }
+        Ok(commit)
+    }
+
+    async fn build(
+        &self,
+        clone_dir: &std::path::Path,
+        requested_bin: Option<&str>,
+    ) -> flux_core::Result<flux_plugin::pack::BuiltPlugin> {
+        let sys = Self::system_at(clone_dir)?;
+
+        // Detect the flux-plugin bin target WITHOUT building (a clear, actionable error, not a raw
+        // cargo dump). `--no-deps` reads only the workspace manifests → no dependency resolution.
+        let meta = Self::run_step(
+            &sys,
+            &to_argv(&["cargo", "metadata", "--no-deps", "--format-version", "1"]),
+            CARGO_METADATA_TIMEOUT,
+            "cargo metadata",
+        )
+        .await
+        .map_err(|e| {
+            flux_core::Error::Other(format!(
+                "`{}` is not a readable Rust project ({e}) — a flux plugin is a cargo crate with a \
+                 `[[bin]] flux-plugin-<name>` target (see plugins/AUTHORING.md)",
+                clone_dir.display()
+            ))
+        })?;
+        let meta_json: serde_json::Value = serde_json::from_str(&meta.stdout)
+            .map_err(|e| flux_core::Error::Other(format!("parse cargo metadata: {e}")))?;
+
+        let mut bins: Vec<String> = Vec::new();
+        if let Some(pkgs) = meta_json.get("packages").and_then(|p| p.as_array()) {
+            for pkg in pkgs {
+                let Some(targets) = pkg.get("targets").and_then(|t| t.as_array()) else {
+                    continue;
+                };
+                for tgt in targets {
+                    let is_bin = tgt
+                        .get("kind")
+                        .and_then(|k| k.as_array())
+                        .is_some_and(|ks| ks.iter().any(|k| k.as_str() == Some("bin")));
+                    let name = tgt.get("name").and_then(|n| n.as_str());
+                    if let (true, Some(name)) = (is_bin, name) {
+                        if name.starts_with("flux-plugin-") {
+                            bins.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        bins.sort();
+        bins.dedup();
+
+        let bin_name = match requested_bin {
+            Some(req) => {
+                let want_full = if req.starts_with("flux-plugin-") {
+                    req.to_string()
+                } else {
+                    format!("flux-plugin-{req}")
+                };
+                if bins.contains(&want_full) {
+                    want_full
+                } else {
+                    return Err(flux_core::Error::Other(format!(
+                        "`--bin {req}` is not a flux-plugin bin target in this repo (found: {})",
+                        if bins.is_empty() {
+                            "none".to_string()
+                        } else {
+                            bins.join(", ")
+                        }
+                    )));
+                }
+            }
+            None => match bins.as_slice() {
+                [] => {
+                    return Err(flux_core::Error::Other(format!(
+                        "`{}` is not a flux plugin: no `flux-plugin-*` binary target found. A flux \
+                         plugin is a cargo crate declaring a `[[bin]]` named `flux-plugin-<name>` \
+                         (see plugins/AUTHORING.md)",
+                        clone_dir.display()
+                    )))
+                }
+                [only] => only.clone(),
+                many => {
+                    return Err(flux_core::Error::Other(format!(
+                        "this repo has several flux-plugin bin targets ({}) — pick one with \
+                         `--bin <name>`",
+                        many.join(", ")
+                    )))
+                }
+            },
+        };
+
+        Self::run_step(
+            &sys,
+            &to_argv(&[
+                "cargo",
+                "build",
+                "--release",
+                "--locked",
+                "--bin",
+                &bin_name,
+            ]),
+            CARGO_BUILD_TIMEOUT,
+            &format!("cargo build --bin {bin_name}"),
+        )
+        .await?;
+
+        let binary = clone_dir.join("target").join("release").join(&bin_name);
+        if !binary.is_file() {
+            return Err(flux_core::Error::Other(format!(
+                "cargo build reported success but `{}` is missing",
+                binary.display()
+            )));
+        }
+        Ok(flux_plugin::pack::BuiltPlugin { bin_name, binary })
+    }
 }
 
 /// Find every `flux-plugin-<name>` (or, on Windows, `flux-plugin-<name>.exe`) executable in `dir`,
@@ -9432,20 +9926,44 @@ async fn run_prompt(flags: AgentFlags, prompt_words: Vec<String>) -> Result<()> 
 mod tests {
     use super::{
         app_plugin_caps, build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, endpoint_ref_from_parts, format_evidence, implicit_plugin_group,
-        loop_machinery_label, merge_static_endpoints, new_render_suffix, parse_labels,
-        plugin_binaries_in, plugin_status_one, render_endpoint_row, render_review_markdown,
-        resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
-        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill,
-        EndpointAction, EventStore, EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness,
-        PluginAction, RedactorSecretSink, ReviewSeverity,
+        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, format_evidence,
+        implicit_plugin_group, loop_machinery_label, merge_static_endpoints, new_render_suffix,
+        parse_labels, plugin_binaries_in, plugin_status_one, redact_plugin_echo,
+        render_endpoint_row, render_review_markdown, resolve_plugin_operation_name,
+        run_endpoint_in, run_plugin_in, run_usage_with, should_fail, tool_preview, truncate,
+        url_has_userinfo, usage_annotation, write_generated_skill, EndpointAction, EventStore,
+        EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness, PluginAction,
+        RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
+    use flux_runtime::{active_runtime_turn_context, SpawnActivity, SpawnActivitySink};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
     struct CapturingModelProvider(Arc<Mutex<Vec<Request>>>);
+
+    struct IgnoredSpawnActivity;
+
+    impl SpawnActivitySink for IgnoredSpawnActivity {
+        fn emit(&self, _activity: SpawnActivity) {}
+    }
+
+    /// A-80 review regression: `EngineLoopHost::set_turn` no longer stores its reporter. The CLI's
+    /// direct/resumable flow runner must put that returned capability in the lexical turn scope.
+    #[tokio::test]
+    async fn direct_flow_runtime_scope_carries_session_and_child_reporter() {
+        let turn = direct_flow_runtime_turn("s_cli", Arc::new(IgnoredSpawnActivity));
+
+        flux_runtime::scope_runtime_turn(turn, async {
+            let active = active_runtime_turn_context().expect("direct flow turn is scoped");
+            assert_eq!(active.session_id().as_deref(), Some("s_cli"));
+            assert!(active.spawn_activity_sink().is_some());
+        })
+        .await;
+
+        assert!(active_runtime_turn_context().is_none());
+    }
 
     #[async_trait::async_trait]
     impl Provider for CapturingModelProvider {
@@ -10476,6 +10994,102 @@ mod tests {
         ));
     }
 
+    /// D-87: the `--git` source install parses its ref/bin/force flags and enforces the mode
+    /// exclusivity (a third mode beside names/`--all` and `--dir`), and the ref flags are mutually
+    /// exclusive and require `--git`.
+    #[test]
+    fn plugin_install_git_flags_parse_and_conflict() {
+        use super::{Cli, Commands};
+        use clap::Parser;
+        // A well-formed source install parses into the git fields.
+        let cli = Cli::try_parse_from([
+            "flux",
+            "plugin",
+            "install",
+            "--git",
+            "https://gitlab.example/g/flux-plugin-x.git",
+            "--tag",
+            "v1.2.3",
+            "--bin",
+            "flux-plugin-x",
+            "--force",
+        ])
+        .expect("`install --git … --tag … --bin … --force` parses");
+        match cli.command {
+            Some(Commands::Plugin {
+                action:
+                    Some(PluginAction::Install {
+                        git,
+                        tag,
+                        rev,
+                        branch,
+                        bin,
+                        force,
+                        names,
+                        all,
+                        dir,
+                    }),
+            }) => {
+                assert_eq!(
+                    git.as_deref(),
+                    Some("https://gitlab.example/g/flux-plugin-x.git")
+                );
+                assert_eq!(tag.as_deref(), Some("v1.2.3"));
+                assert_eq!(bin.as_deref(), Some("flux-plugin-x"));
+                assert!(force && rev.is_none() && branch.is_none());
+                assert!(names.is_empty() && !all && dir.is_none());
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        // `--git` is exclusive with `--dir` and with plugin names.
+        assert!(Cli::try_parse_from(
+            ["flux", "plugin", "install", "--git", "u", "--dir=some/dir",]
+        )
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["flux", "plugin", "install", "--git", "u", "gitlab"]).is_err()
+        );
+        // Ref flags are mutually exclusive.
+        assert!(Cli::try_parse_from([
+            "flux", "plugin", "install", "--git", "u", "--tag", "t", "--branch", "b",
+        ])
+        .is_err());
+        // A ref flag with no `--git` and no positional errors at the clap layer.
+        assert!(Cli::try_parse_from(["flux", "plugin", "install", "--tag", "t"]).is_err());
+    }
+
+    /// D-87: the `--git` ref/bin/force flags require `--git` even when a positional name is present
+    /// (clap skips its `requires` there because `--git` conflicts with the name) — a runtime guard
+    /// rejects the misuse rather than running a remote/`--dir` install that silently ignores them.
+    #[tokio::test]
+    async fn plugin_install_ref_flags_require_git_at_runtime() {
+        let dir =
+            std::env::temp_dir().join(format!("flux-install-refguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = run_plugin_in(
+            &dir,
+            Some(PluginAction::Install {
+                names: vec!["gitlab".into()],
+                all: false,
+                dir: None,
+                git: None,
+                tag: Some("v1".into()),
+                rev: None,
+                branch: None,
+                bin: None,
+                force: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--git"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// F2: the zero-arg ambient reads (`now`/`cwd`/`home_dir`/`sys_info`) are pre-allowed by the
     /// default permission set, so a `now()` in a stored flow never reaches the approval gate (which
     /// auto-denies on a non-TTY). Workspace reads stay allowed; a mutating op still gates.
@@ -11204,6 +11818,12 @@ mod tests {
             names: vec![],
             all: false,
             dir: Some(d.to_string_lossy().into_owned()),
+            git: None,
+            tag: None,
+            rev: None,
+            branch: None,
+            bin: None,
+            force: false,
         };
         let names = |d: &std::path::Path| {
             let mut v: Vec<String> = flux_plugin::discover(d)
@@ -11521,6 +12141,12 @@ mod tests {
                 names: vec![],
                 all: false,
                 dir: None,
+                git: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+                force: false,
             }),
         )
         .await
@@ -11528,6 +12154,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--all"), "{msg}");
         assert!(msg.contains("--dir"), "{msg}");
+        assert!(
+            msg.contains("--git"),
+            "the error now names the third source: {msg}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -11545,6 +12175,12 @@ mod tests {
                 names: vec!["gitlab".into()],
                 all: false,
                 dir: Some("plugins/target/release".into()),
+                git: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+                force: false,
             }),
         )
         .await
@@ -11557,6 +12193,12 @@ mod tests {
                 names: vec![],
                 all: true,
                 dir: Some("plugins/target/release".into()),
+                git: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+                force: false,
             }),
         )
         .await
@@ -11582,6 +12224,12 @@ mod tests {
                 names: vec![],
                 all: false,
                 dir: Some(bin_dir.to_string_lossy().into_owned()),
+                git: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+                force: false,
             }),
         )
         .await
@@ -11689,6 +12337,42 @@ mod tests {
             resolve_plugin_operation_name("grafana", "grafana.search", &manifest).unwrap(),
             "grafana.search"
         );
+    }
+
+    #[test]
+    fn plugin_call_echo_masks_declared_secret_fields() {
+        // GL-031: a `flux plugin call` echo (dry-run input preview OR live result) must mask the
+        // op's declared secret-like fields so a CI-variable write's `value` never hits scrollback.
+        let manifest = flux_plugin::PluginManifest {
+            name: "gitlab".into(),
+            operations: vec![
+                flux_plugin::OperationSpec {
+                    name: "gitlab.ci.variable.create".into(),
+                    redact_fields: vec!["value".into()],
+                    ..Default::default()
+                },
+                flux_plugin::OperationSpec {
+                    name: "gitlab.project.show".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        // The secret-declaring op masks `value` but leaves `key` intact.
+        let mut echoed = json!({ "project": "grp/app", "key": "TOKEN", "value": "s3cr3t" });
+        redact_plugin_echo(&mut echoed, &manifest, "gitlab.ci.variable.create");
+        assert_eq!(echoed["key"], "TOKEN");
+        assert_eq!(echoed["value"], flux_plugin::REDACTED_MARKER);
+        assert!(
+            !echoed.to_string().contains("s3cr3t"),
+            "secret leaked: {echoed}"
+        );
+
+        // An op that declares no secret fields echoes verbatim.
+        let mut plain = json!({ "project": "grp/app", "value": "not-secret" });
+        redact_plugin_echo(&mut plain, &manifest, "gitlab.project.show");
+        assert_eq!(plain["value"], "not-secret");
     }
 
     #[test]
@@ -12776,6 +13460,9 @@ mod tests {
             "versioned store",
             "--dir",
             "flux-plugin-*",
+            // D-87: the third install source and its from-source trust label.
+            "--git",
+            "from-source",
         ] {
             assert!(
                 install.contains(want),
@@ -13436,6 +14123,36 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    /// D-95: endpoint-level private-net grants (`[private_net.endpoints]`) parse into the config
+    /// (`endpoint_private_hosts` merges them on top of the plugin grant), but the grant the plugin
+    /// host actually enforces is resolved by `effective_plugin_private_hosts`, which consults only the
+    /// plugin-level `[private_net.plugins]` grant. So an endpoint-only grant is INERT on every
+    /// plugin-invocation path (agent / `app run` / direct `flux plugin call`) — there is no
+    /// direct-call-specific gap and no path that honours endpoint grants. This pins that documented
+    /// reality (`docs/designs/scoped-private-net-egress.md` § *Enforcement status*), so wiring true
+    /// per-endpoint scoping later must deliberately update both the enforcement path and the docs.
+    #[test]
+    fn endpoint_private_net_grants_are_inert_on_the_enforced_plugin_path() {
+        let mut cfg = flux_config::Config::default();
+        cfg.private_net.endpoints.insert(
+            "gitlab:api".to_string(),
+            flux_config::PrivateNetGrant::Hosts(vec!["api.internal".to_string()]),
+        );
+
+        // The config layer parses + merges the declared endpoint grant …
+        assert_eq!(
+            cfg.endpoint_private_hosts("gitlab", "api"),
+            vec!["api.internal".to_string()],
+            "endpoint_private_hosts must surface a declared [private_net.endpoints] grant"
+        );
+        // … but the enforced path (used by all three plugin-invocation sites) ignores an
+        // endpoint-only grant: with no plugin-level grant, no private host is admitted.
+        assert!(
+            super::effective_plugin_private_hosts(&cfg, "gitlab").is_empty(),
+            "endpoint-only grants must stay inert until per-endpoint scoping is deliberately wired"
+        );
     }
 
     /// D-96: the ephemeral `--allow-private-net` override widens the *operator* grant to `*` for this

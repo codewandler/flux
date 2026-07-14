@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, Usage};
 use flux_events::EventStore;
 use flux_provider::{Effort, Provider, Request};
-use flux_runtime::Executor;
+use flux_runtime::{scope_runtime_turn, Executor, RuntimeTurnContext};
 
 use crate::ast::DraftAst;
 use crate::composites::DynamicComposites;
@@ -349,18 +349,41 @@ impl FlowEngine {
         // loop host owns it while stages are in flight — draining its events onto the borrowed
         // `sink` live (inner ops stream as they happen; loop-machinery ops are filtered by
         // `drain_event`).
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
         ));
-        self.loop_host.set_turn(
+        let activity = self.loop_host.set_turn(
             session_id.to_string(),
             Some(base_system),
             channel.clone(),
             Some(advertised),
             Some((self.events.clone(), turn_id)),
         );
+        let runtime_turn = RuntimeTurnContext::new()
+            .with_cancel(cancel.clone())
+            .with_session(session_id)
+            .with_spawn_activity_sink(activity);
 
+        // Everything that can enter the guarded runtime runs under one future-local turn snapshot.
+        // It is authoritative even when a field is absent, restores any outer scope on exit, and
+        // never leaves cancellation/session/reporter state pinned to the long-lived executor.
+        scope_runtime_turn(
+            runtime_turn,
+            self.drive_runtime_turn(session_id, sink, cancel, turn_id, channel, rx),
+        )
+        .await
+    }
+
+    async fn drive_runtime_turn(
+        &self,
+        session_id: &str,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        turn_id: i64,
+        channel: Arc<std::sync::Mutex<dyn AgentSink>>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::loop_host::SinkEvent>,
+    ) -> Result<()> {
         // Snapshot per-turn evidence BEFORE compaction: a failed/cancelled compaction is still this
         // turn and must close with correctly scoped telemetry through the same finalization path.
         let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
@@ -390,12 +413,6 @@ impl FlowEngine {
                 .end_turn(session_id, turn_id, "error", 0, &answer, usage.clone());
             return self.finish_turn(session_id, turn_id, sink, &answer, false, usage);
         }
-        // Thread this turn's cancellation into the tool context so a spawning tool (`task`) can hand a
-        // child token to its sub-agent — cancelling the parent turn then cancels the child. The session
-        // id rides along so `task` can correlate the child's audit stream to THIS turn (A-08).
-        self.executor.context().set_cancel(cancel.clone());
-        self.executor.context().set_session(session_id);
-
         // C-43: arm the per-turn cassette recorder — every leaf-op dispatch this turn lands as a
         // redacted `OpRecorded` cell on the session stream, making the turn hermetically
         // replayable (`flux replay`). Off with FLUX_CASSETTE=0; the recorder is telemetry-grade
@@ -772,14 +789,16 @@ impl FlowEngine {
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
         ));
-        self.loop_host.set_turn(
+        let activity = self.loop_host.set_turn(
             session_id.to_string(),
             Some(base_system),
             channel.clone(),
             Some(advertised),
             Some((self.events.clone(), turn_id)),
         );
-        self.executor.context().set_session(session_id);
+        let runtime_turn = RuntimeTurnContext::new()
+            .with_session(session_id)
+            .with_spawn_activity_sink(activity);
 
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
@@ -790,7 +809,7 @@ impl FlowEngine {
         // ops are filtered by `drain_event`). Mirrors `run_turn_cancellable`'s plumbing.
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());
         let reveal = show_loop();
-        let result = {
+        let result = scope_runtime_turn(runtime_turn, async {
             let flow_fut = execute_flow_with_composites(
                 &self.flow,
                 &self.executor,
@@ -810,7 +829,8 @@ impl FlowEngine {
                     }
                 }
             }
-        };
+        })
+        .await;
         let outcome = match result {
             Ok(o) => o,
             Err(e) => {
@@ -921,14 +941,16 @@ impl FlowEngine {
         let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
             crate::loop_host::ChannelSink::new(tx),
         ));
-        self.loop_host.set_turn(
+        let activity = self.loop_host.set_turn(
             session_id.to_string(),
             Some(base_system),
             channel.clone(),
             Some(advertised),
             Some((self.events.clone(), turn_id)),
         );
-        self.executor.context().set_session(session_id);
+        let runtime_turn = RuntimeTurnContext::new()
+            .with_session(session_id)
+            .with_spawn_activity_sink(activity);
 
         self.composites
             .ensure_session_loaded(&self.flow, session_id)?;
@@ -939,7 +961,7 @@ impl FlowEngine {
         // along so a NAMED flow's resumed run derives the same checkpoint `flow_key` (L-21).
         let mut outer = crate::loop_host::SharedSink::new(channel.clone());
         let reveal = show_loop();
-        let result = {
+        let result = scope_runtime_turn(runtime_turn, async {
             let flow_fut = resume_flow_with_composites(
                 &self.flow,
                 &self.executor,
@@ -962,7 +984,8 @@ impl FlowEngine {
                     }
                 }
             }
-        };
+        })
+        .await;
         let outcome = match result {
             Ok(o) => o,
             Err(e) => {
@@ -1334,11 +1357,9 @@ fn load_agent_loop_with_iterations(spec: AgentLoopSpec, max_iterations: usize) -
              {MAX_AGENT_LOOP_ITERATIONS} (the built-in agent loop expands once per iteration)"
         )));
     }
-    let max = u32::try_from(max_iterations).map_err(|_| {
-        flux_core::Error::Other(format!(
-            "max_iterations {max_iterations} exceeds Flux-Lang's u32 repeat bound"
-        ))
-    })?;
+    // Bounded to `MAX_AGENT_LOOP_ITERATIONS` above, so narrowing to Flux-Lang's `u32` repeat bound
+    // is always lossless.
+    let max = max_iterations as u32;
     let builtin = matches!(spec, AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive));
     let mut ast = match spec {
         AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive) => {

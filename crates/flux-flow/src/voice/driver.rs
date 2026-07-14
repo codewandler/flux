@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use flux_core::Usage;
 use flux_events::{EventKind, EventStore, NewEvent};
 use flux_provider::{RealtimeConnection, RealtimeEvent};
-use flux_runtime::{Executor, ToolResult};
+use flux_runtime::{scope_runtime_turn, Executor, RuntimeTurnContext, ToolResult};
 
 use super::sink::VoiceSink;
 use crate::ast::DraftAst;
@@ -112,8 +112,15 @@ impl VoiceSessionDriver {
         sink: &mut dyn VoiceSink,
         cancel: &CancellationToken,
     ) {
-        // In-flight tool dispatches observe a hangup via the shared per-turn cancel token.
-        self.executor.context().set_cancel(cancel.clone());
+        // Each off-loop dispatch gets an owned lexical snapshot before crossing `tokio::spawn`.
+        // Never pin the session cancel onto the reusable executor: a later voice session must not
+        // inherit a prior hangup token. Usage recording supplies lineage when the caller configured
+        // a durable voice stream; otherwise voice keeps its historical no-parent behavior.
+        let runtime_turn = RuntimeTurnContext::new().with_cancel(cancel.clone());
+        let runtime_turn = match &self.usage_recording {
+            Some(recording) => runtime_turn.with_session(&recording.session_id),
+            None => runtime_turn,
+        };
 
         let RealtimeConnection {
             session,
@@ -183,10 +190,14 @@ impl VoiceSessionDriver {
                             let exec = self.executor.clone();
                             let session = session.clone();
                             let done_tx = done_tx.clone();
+                            let runtime_turn = runtime_turn.clone();
                             tokio::spawn(async move {
-                                let result = exec.dispatch(&name, params).await; // full envelope
-                                let _ = session.send_tool_result(&call_id, result.view()).await;
-                                let _ = done_tx.send((name, result)).await;
+                                scope_runtime_turn(runtime_turn, async move {
+                                    let result = exec.dispatch(&name, params).await; // full envelope
+                                    let _ = session.send_tool_result(&call_id, result.view()).await;
+                                    let _ = done_tx.send((name, result)).await;
+                                })
+                                .await;
                             });
                         }
                         RealtimeEvent::Error { message, .. } => sink.error(&message),

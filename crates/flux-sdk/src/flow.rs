@@ -298,16 +298,38 @@ impl FlowClient {
     /// seam — a consumer (e.g. a multi-tenant service) drives sub-agents without re-assembling the
     /// spawner, executor, and context by hand.
     ///
-    /// The one-shot `execute`/`run` path installs **no** cancellation token (`ToolContext::cancel` is
-    /// `None`), so a sub-agent's only lifecycle bound here is its wall-clock deadline. To guarantee a
-    /// hung child can't run forever, this applies a generous **default `wall_clock` (10 min)** when the
-    /// bundle sets none; a consumer with longer-running work overrides it via [`SubAgents::with_limits`].
+    /// A top-level one-shot `execute`/`run` has no cancellation token or parent lineage, so a
+    /// sub-agent's only lifecycle bound there is its wall-clock deadline. When an adapter constructs
+    /// this client inside a live guarded turn, the fresh per-run context inherits that turn's cancel,
+    /// session lineage and reporter; streamed execution pins the snapshot before `tokio::spawn`.
+    /// A generous **default `wall_clock` (10 min)** remains the safety backstop in both cases; a
+    /// consumer with longer-running work overrides it via [`SubAgents::with_limits`].
     pub fn with_sub_agents(&mut self, mut sub_agents: SubAgents) -> &mut Self {
         if sub_agents.limits.wall_clock.is_none() {
             sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
         }
         self.registry.register(Arc::new(TaskTool));
         self.spawner = Some(sub_agents.into_spawner(self.system.clone()));
+        self
+    }
+
+    /// Attach named sub-agents with an explicit adaptive intent/explore policy for every child.
+    /// Stage model, reasoning effort, output-token and call ceilings are resolved on the child's
+    /// provider before its first request. The policy is independent of [`SubAgents::with_limits`],
+    /// which bounds the whole child/outer loop. Existing [`with_sub_agents`](Self::with_sub_agents)
+    /// callers retain [`flux_agent::AdaptiveLoopPolicy::default`].
+    pub fn with_sub_agents_policy(
+        &mut self,
+        mut sub_agents: SubAgents,
+        adaptive_policy: flux_agent::AdaptiveLoopPolicy,
+    ) -> &mut Self {
+        if sub_agents.limits.wall_clock.is_none() {
+            sub_agents.limits.wall_clock = Some(std::time::Duration::from_secs(600));
+        }
+        self.registry.register(Arc::new(TaskTool));
+        self.spawner = Some(
+            sub_agents.into_spawner_with_adaptive_policy(self.system.clone(), adaptive_policy),
+        );
         self
     }
 
@@ -654,13 +676,13 @@ impl FlowClient {
         if let Some(spawner) = &self.spawner {
             ctx = ctx.with_spawner(spawner.clone());
         }
-        // A guarded adapter may build this one-shot client while its parent reporter is available
-        // only through the runtime's lexical task-local. Pin that snapshot onto the fresh context
-        // before `execute_streamed` moves the executor into `tokio::spawn` (task-locals themselves
-        // do not propagate to a new task).
-        if let Some(activity) = ctx.spawn_activity_sink() {
-            ctx.set_spawn_activity_sink(activity);
-        }
+        // A guarded adapter may build this one-shot client while its parent runtime-turn context is
+        // available only through a lexical task-local. Pin the COMPLETE snapshot (cancellation,
+        // parent session and child reporter) onto this fresh per-run context before
+        // `execute_streamed` moves it into `tokio::spawn`; Tokio task-locals do not propagate to a
+        // new task. Outside a parent turn the snapshot is empty, preserving one-shot behavior.
+        let turn = ctx.runtime_turn_context();
+        ctx.set_runtime_turn_context(turn);
         Executor::new(self.registry.clone(), perms, approver, ctx)
     }
 }
@@ -1740,6 +1762,72 @@ flow main
             .await;
 
         assert_eq!(result.content, "inherited");
+    }
+
+    #[derive(Default)]
+    struct OneShotContextSpawner {
+        seen: Mutex<Vec<(Option<String>, bool)>>,
+    }
+
+    #[async_trait]
+    impl Spawner for OneShotContextSpawner {
+        async fn spawn(
+            &self,
+            request: flux_runtime::SpawnRequest,
+            cancel: &CancellationToken,
+        ) -> CoreResult<flux_runtime::SpawnOutcome> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request.parent_session, cancel.is_cancelled()));
+            Ok(flux_runtime::SpawnOutcome {
+                text: "direct child".into(),
+                model: "mock".into(),
+                session_id: "child-direct".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A-80 negative boundary: a top-level one-shot FlowClient has no served-request cancellation
+    /// or parent lineage to inherit. Pinning the complete snapshot before `tokio::spawn` must not
+    /// invent either one.
+    #[tokio::test]
+    async fn direct_one_shot_task_keeps_no_cancel_and_no_parent_behavior() {
+        let spawner = Arc::new(OneShotContextSpawner::default());
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(
+                MockProvider::one("unused"),
+                temp_root("direct-task-context"),
+            )
+            .unwrap();
+        client.registry.register(Arc::new(TaskTool));
+        client.spawner = Some(spawner.clone());
+        assert!(
+            client
+                .build_executor()
+                .context()
+                .runtime_turn_context()
+                .is_empty(),
+            "a direct one-shot executor must start without live turn capabilities"
+        );
+        let ast: DraftAst = serde_json::from_value(json!({
+            "body": [{
+                "kind": "call",
+                "op": "task",
+                "args": [{
+                    "kind": "lit",
+                    "value": { "role": "worker", "task": "do it" }
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let result = client.execute_streamed(&ast).finish().await.unwrap();
+
+        assert_eq!(result.result, "direct child");
+        assert_eq!(spawner.seen.lock().unwrap().as_slice(), &[(None, false)]);
     }
 
     /// D-158: `execute_with_sink` streams each dispatched op's `tool_call` AND `tool_result` to a

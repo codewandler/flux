@@ -46,16 +46,27 @@ positive_integer() {
 }
 
 preflight() {
-  [[ -x "$FLUX_BIN" ]] || die "flux binary is missing: $FLUX_BIN (run cargo build -p flux-cli)"
-  command -v jq >/dev/null || die "jq is required"
+  local command="$1"
   command -v sqlite3 >/dev/null || die "sqlite3 is required"
-  command -v timeout >/dev/null || die "timeout is required"
   positive_integer "$SCREEN_TRIALS" || die "SCREEN_TRIALS must be positive"
   positive_integer "$CONFIRM_TRIALS" || die "CONFIRM_TRIALS must be positive"
   positive_integer "$TIMEOUT_SECS" || die "TIMEOUT_SECS must be positive"
   case "$CONFIRM_ARM" in
     cap512|low512) ;;
     *) die "CONFIRM_ARM must be cap512 or low512, got: $CONFIRM_ARM" ;;
+  esac
+  # MODELS drives both the trial fan-out and the gate's expected matrix. An empty set would leave the
+  # matrix with nothing to require, letting an interrupted or empty result be reported as KEEP.
+  local configured_models=($MODELS)
+  [[ ${#configured_models[@]} -gt 0 ]] || die "MODELS must list at least one model"
+  # jq, timeout, and the flux binary are only exercised by the commands that actually run flux; the
+  # offline report/gate paths depend on sqlite3 alone, so do not couple them to those tools.
+  case "$command" in
+    check|screen|confirm|slack|diagnostic)
+      [[ -x "$FLUX_BIN" ]] || die "flux binary is missing: $FLUX_BIN (run cargo build -p flux-cli)"
+      command -v jq >/dev/null || die "jq is required"
+      command -v timeout >/dev/null || die "timeout is required"
+      ;;
   esac
 }
 
@@ -388,7 +399,7 @@ EOF
 report() {
   build_report_db
   sqlite3 -header -column "$REPORT_DB" \
-    "select phase,arm,model,workload,n,passes,round(total_median) total_med_ms,round(intent_median) intent_med_ms,round(calls_median,1) calls_med,round(repairs_median,1) repairs_med from workload_medians where phase<>'confirm' order by phase,arm,model,workload;"
+    "select phase,arm,model,workload,n,passes,round(total_median) total_med_ms,round(intent_median) intent_med_ms,round(calls_median,1) calls_med,round(repairs_median,1) repairs_med from workload_medians where phase<>'confirm_paired' order by phase,arm,model,workload;"
 }
 
 validate_gate_matrix() {
@@ -504,7 +515,7 @@ EOF
 main() {
   local command="${1:-}"
   [[ -n "$command" ]] || { usage; exit 2; }
-  preflight
+  preflight "$command"
   write_fixture
   case "$command" in
     check)

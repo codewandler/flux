@@ -125,8 +125,10 @@ impl futures::Stream for TurnStream {
 /// [`FlowClient::execute_streamed`](crate::FlowClient::execute_streamed). The flow runs on a spawned
 /// task, so every op's `tool_call` and `tool_result` arrive as they happen; [`finish`](Self::finish)
 /// awaits completion and returns the [`ExecutionResult`](crate::ExecutionResult). Also implements
-/// [`futures::Stream`]. Dropping it detaches the (bounded) execution rather than cancelling it — a
-/// flow run has no cancellation token, unlike a [`TurnStream`].
+/// [`futures::Stream`]. Dropping it detaches the bounded execution rather than creating or firing
+/// its own cancellation token. A top-level one-shot flow therefore runs to its deadline; a flow
+/// opened inside a guarded adapter may still inherit the enclosing turn's token, so cancelling that
+/// parent reaches nested `task` children even after this handle detaches.
 pub struct FlowStream {
     pub(crate) rx: mpsc::UnboundedReceiver<AgentEvent>,
     pub(crate) handle: Option<tokio::task::JoinHandle<Result<crate::ExecutionResult>>>,

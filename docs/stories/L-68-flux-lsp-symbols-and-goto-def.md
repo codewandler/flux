@@ -2,8 +2,8 @@
 id: L-68
 title: flux-lsp document symbols + go-to-definition
 pillar: Language
-status: backlog
-priority:
+status: done
+priority: 7
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
 note: "Navigation — a CST scope model with definition ranges powers documentSymbol + definition."

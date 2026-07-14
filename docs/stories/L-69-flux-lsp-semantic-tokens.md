@@ -2,8 +2,8 @@
 id: L-69
 title: flux-lsp semantic tokens — for clients that render them
 pillar: Language
-status: backlog
-priority:
+status: done
+priority: 8
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
 note: "Semantic tokens from the CST token stream — NOT a Helix path (Helix renders tree-sitter only; highlighting now comes from codewandler/flux-tree-sitter). Value: VS Code/Neovim + semantic distinctions a grammar can't make."

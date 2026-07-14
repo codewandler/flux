@@ -498,6 +498,7 @@ fn op_spec_typed<T: JsonSchema + 'static>(
         secret_purposes: Vec::new(),
         internal: false,
         semantic_effects: Vec::new(),
+        redact_fields: Vec::new(),
     }
 }
 

@@ -20,7 +20,8 @@ set up highlighting, then connect the language server where the editor supports 
 
 ## Install the language server
 
-`flux-lsp` is not yet a released binary — install it from source:
+`flux-lsp` ships as a release binary alongside the `flux` CLI — grab it from the
+[releases page](https://github.com/codewandler/flux/releases), or install from source:
 
 ```bash
 cargo install --git https://github.com/codewandler/flux flux-lsp
@@ -37,10 +38,13 @@ the editor configs below expect it on `$PATH`.
 | **Diagnostics** | live and error-recovering, with real source spans — parse *and* analysis errors as you type |
 | **Completion** | triggers on `$` and `@`; ops, node-kind keywords, prelude types, and in-scope `$vars` |
 | **Hover** | op signatures with effects and risk, node-kind docs, prelude-type docs |
-| **Formatting** | whole-document formatting via the invertible formatter |
+| **Formatting** | whole-document formatting via the invertible formatter; a commented flow is re-indented so comments survive |
+| **Document symbols** | an outline of every `flow`/`op` with its parameters and `$var` binds |
+| **Go-to-definition** | a `$var` use jumps to its binding; an op/flow reference jumps to its declaration |
+| **Semantic tokens** | for clients that render them (VS Code, Neovim over tree-sitter) — including a registry-known op vs an unknown identifier, and a `$var` bind vs a use |
 
-Go-to-definition, document symbols, and semantic tokens are **not implemented yet** — they are
-on the roadmap, so don't be surprised when an editor's "goto definition" reports no result.
+Helix does not apply LSP semantic tokens (as of 25.07); its colour comes from the tree-sitter
+grammar above. The semantic-tokens feature is for editors that render them.
 
 ## Helix
 

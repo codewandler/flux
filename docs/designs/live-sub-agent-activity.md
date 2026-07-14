@@ -33,24 +33,27 @@ internal sink contract: a customer surface must default-deny them and derive fix
 allowlisted labels. The child redactor scrubs registered secrets from both JSON keys and values before
 either reaches the reporter.
 
-`SpawnRequest` carries the optional reporter. `ToolContext` stores an explicitly installed reporter in the
-same per-turn, one-active-turn slot pattern as cancellation and session correlation.
-`EngineLoopHost::set_turn` snapshots the owned channel sink into an L3 adapter implementing the L2
-reporter; `TaskTool` copies that snapshot into the request. The adapter encodes the typed value as the
-reserved `subagent.activity` observation, using `AgentSink`'s existing extension point instead of adding an
+`SpawnRequest` carries the optional reporter. `EngineLoopHost::set_turn` snapshots the owned channel sink
+into an L3 adapter implementing the L2 reporter and returns it to the turn driver; the driver carries it
+lexically with cancellation + session rather than storing it on the long-lived executor. `TaskTool` copies
+the active snapshot into the request. The adapter encodes the typed value as the reserved
+`subagent.activity` observation, using `AgentSink`'s existing extension point instead of adding an
 uncorrelated child callback to that public trait.
 
-Adapter tools sometimes open a second runtime inside their guarded `execute` future. The executor scopes
-that future with a Tokio task-local view of the reporter; a nested `ToolContext::spawn_activity_sink()` can
-therefore snapshot the same reporter while the adapter is active. The scope is concurrency-safe and
-lexical: a nested context retained after the adapter returns cannot keep an obsolete turn callback. This
-is what preserves live reporting through `parent FlowEngine -> adapter tool -> one-shot FlowClient ->
-TaskTool`, not only through a directly registered parent `TaskTool`.
+Adapter tools sometimes open a second runtime inside their guarded `execute` future. A-80 generalized
+the reporter-only task-local into one `RuntimeTurnContext` carrying cancellation, parent session lineage
+and the reporter together. Conversational, authored-flow, app-journey and voice drivers scope the future
+that actually enters guarded execution; an active scope is authoritative even when a field is absent, so
+stale fallback slots cannot reappear. The scope is concurrency-safe and lexical: parallel turns cannot
+exchange tokens/session ids, a nested reporter override restores its outer reporter, and a context
+retained after the adapter returns cannot keep obsolete turn state. This preserves the complete request
+lifecycle through `parent FlowEngine -> adapter tool -> one-shot FlowClient -> TaskTool`, not only through
+a directly registered parent `TaskTool`.
 
-`FlowClient::build_executor` pins that lexical snapshot onto its fresh context before
+`FlowClient::build_executor` pins the complete lexical snapshot onto its fresh per-run context before
 `execute_streamed` moves the executor into a spawned Tokio task; Tokio task-locals themselves do not
-cross that boundary. Shared/cloned context slot restoration belongs to A-80 together with cancellation
-and session lineage; the supported adapter path constructs a fresh one-shot context.
+cross that boundary. A top-level one-shot client captures an explicitly empty snapshot and therefore
+keeps its historical no-cancel/no-parent behavior.
 
 ## Forwarding path
 
@@ -79,20 +82,24 @@ the intermediate collector, preserving the originating role/session/call identit
   drain, so the collector's synchronous drop-time completion reaches the surface before teardown.
 - Every tool still executes through the child's `Executor`; forwarding is observational only.
 - Reporter callbacks are synchronous send-only and hold no lock across an await.
-- Fresh nested-context reporter inheritance exists only while the outer guarded tool future is executing;
-  there is no process-global reporter, and streamed one-shot execution pins only that lexical snapshot.
-- Reporter absence is a strict no-op, preserving every existing CLI/SDK consumer.
-- Cancellation, deadlines, usage roll-up, correlated audit streams and side-channel UI block collectors
-  keep their existing ownership and behavior.
+- Fresh nested runtime-turn inheritance exists only while the outer guarded tool future is executing;
+  there is no process-global turn state, and streamed one-shot execution pins one owned snapshot.
+- Absent cancellation/session/reporter fields are a strict no-op, preserving every top-level one-shot
+  consumer while preventing stale values from a retained context.
+- Deadlines, usage roll-up, correlated audit streams and side-channel UI block collectors keep their
+  existing ownership and behavior; parent cancellation now also crosses a nested streamed adapter.
 
 ## Test boundary
 
 The failing-first regressions cover each boundary: a child status + read is visible while the read remains
 blocked; a real parent engine derives and snapshots its reporter; a guarded adapter's nested context sees
-the reporter only inside the lexical execution scope; a streamed nested runtime pins it across
-`tokio::spawn`; concurrent storeless children have distinct spawn ids; JSON keys and values are scrubbed;
-and a timed-out child emits one failure terminal. A parent-cancellation regression holds a real `task`
-collector pending, cancels the parent, and requires its single failure completion on the borrowed surface.
-Downstream, a projector unit interleaves same-named calls by child identity, while the served-chat
-regression drives the complete nested-`FlowClient` manager route. Existing cancellation, usage and audit
-tests remain the regression net.
+turn state only inside the lexical execution scope; a streamed nested runtime pins cancel + session +
+reporter across `tokio::spawn`; concurrent scopes keep distinct cancel/session values; explicit-empty
+scope suppresses stale fallbacks; nested reporter scope restores its parent; concurrent storeless children
+have distinct spawn ids; JSON keys and values are scrubbed; and a timed-out child emits one failure
+terminal. The A-80 SDK regression parks a real audited child behind `parent FlowEngine -> adapter Tool ->
+nested FlowClient -> TaskTool`, cancels the parent, and requires prompt child cancellation plus the real
+parent `correlation_id`. A direct one-shot negative proves no cancel/parent is invented. Downstream, a
+projector unit interleaves same-named calls by child identity, while the served-chat regression drives the
+complete nested-`FlowClient` manager route. Existing cancellation, usage and audit tests remain the
+regression net.

@@ -574,6 +574,8 @@ async fn install_one(
             sha256: Some(binary_sha256.clone()),
             source: Some(tag.to_string()),
             previous,
+            git_url: None,
+            git_commit: None,
         },
     )?;
 
@@ -659,6 +661,8 @@ pub async fn pin(req: &InstallRequest<'_>, name: &str, version: &str) -> Result<
             sha256: Some(sha256.clone()),
             source: Some(source),
             previous: previous.clone(),
+            git_url: None,
+            git_commit: None,
         },
     )?;
     Ok(PinOutcome {
@@ -738,6 +742,8 @@ pub fn rollback(
                 Some(v) if v != &prev => Some(v.clone()),
                 _ => None,
             },
+            git_url: None,
+            git_commit: None,
         },
     )?;
     Ok(RollbackOutcome {
@@ -761,6 +767,254 @@ pub fn purge_store(store_root: &Path, name: &str) -> Result<bool> {
     } else {
         Ok(false)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The THIRD install source (D-87): `install --git <url>` — clone + build from source.
+//
+// A signed pack cannot serve an out-of-tree plugin (every URL is hardcoded to `github.com/<repo>`,
+// signed by a key only flux maintainers hold). The `--git` source is the `cargo install --git`
+// model: clone a repo at a ref, detect a `flux-plugin-*` crate, `cargo build --release --locked`,
+// register the built binary. Trust is source-transparent, not signed — the descriptor is labelled
+// `from-source (unverified)` ([`crate::Verification::UnverifiedFromSource`]), gated behind explicit
+// consent and a commit disclosure BEFORE any code is built.
+//
+// The heavy real work — `git clone` + `cargo build`, both through the guarded `flux_system::System`
+// (argv-only, no shell) — sits behind the injectable [`SourceBuilder`] seam, exactly as [`Fetcher`]
+// hides the network for the signed pack, so every test here is hermetic (no network, no toolchain).
+// ---------------------------------------------------------------------------
+
+/// A git reference to clone at — the `--tag`/`--rev`/`--branch` flags (mutually exclusive), or the
+/// remote's default branch when none is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRef {
+    /// `--tag <t>`: an annotated/lightweight tag.
+    Tag(String),
+    /// `--rev <r>`: an exact commit sha (or anything `git checkout` resolves).
+    Rev(String),
+    /// `--branch <b>`: a branch head.
+    Branch(String),
+    /// No ref flag: the remote's default branch (`HEAD` after a plain clone).
+    Default,
+}
+
+impl GitRef {
+    /// A human-readable one-liner for messages ("branch `main`", "commit `abc…`", "default branch").
+    pub fn describe(&self) -> String {
+        match self {
+            GitRef::Tag(t) => format!("tag `{t}`"),
+            GitRef::Rev(r) => format!("commit `{r}`"),
+            GitRef::Branch(b) => format!("branch `{b}`"),
+            GitRef::Default => "the default branch".to_string(),
+        }
+    }
+}
+
+/// A built flux-plugin binary handed back by [`SourceBuilder::build`].
+#[derive(Debug, Clone)]
+pub struct BuiltPlugin {
+    /// The cargo bin target that was built (`flux-plugin-<name>`).
+    pub bin_name: String,
+    /// The freshly built release binary on disk (inside the clone's `target/release`).
+    pub binary: PathBuf,
+}
+
+/// The clone-then-build boundary for `--git` source installs — the one seam that touches the
+/// network + the Rust toolchain, injected so unit tests supply a fake "clone + build" without
+/// either (mirrors [`Fetcher`] for the signed pack). The production implementation drives `git`
+/// and `cargo` through the guarded [`flux_system::System`] (argv-only, cleared env) rooted at the
+/// clone directory — never a raw `std::process::Command`, never a shell string.
+#[async_trait::async_trait]
+pub trait SourceBuilder: Send + Sync {
+    /// Clone `url` at `git_ref` into `clone_dir` (creating/updating it in place — the clone is a
+    /// cache reused across installs), check the ref out, and return the **resolved commit sha**
+    /// (`git rev-parse HEAD`). The commit is what the trust gate discloses before any build.
+    async fn clone_and_resolve(
+        &self,
+        url: &str,
+        git_ref: &GitRef,
+        clone_dir: &Path,
+    ) -> Result<String>;
+
+    /// Detect the flux-plugin binary target in an already-checked-out `clone_dir` (a `flux-plugin-*`
+    /// bin; `requested_bin` disambiguates when a repo has several) and `cargo build --release
+    /// --locked` it. A repo that is not a flux plugin is a clean, actionable `Err` — never a raw
+    /// cargo dump.
+    async fn build(&self, clone_dir: &Path, requested_bin: Option<&str>) -> Result<BuiltPlugin>;
+}
+
+/// The static inputs of a `--git` source install — the descriptor store, the clone cache root
+/// (`~/.flux/plugins/src`), the versioned binary store (`~/.flux/plugins/bin`), and the injected
+/// [`SourceBuilder`].
+pub struct GitInstallRequest<'a> {
+    pub builder: &'a dyn SourceBuilder,
+    /// The descriptor store (`~/.flux/plugins`).
+    pub descriptors_dir: &'a Path,
+    /// The clone cache root (`~/.flux/plugins/src`); a repo is cloned into `<src_root>/<repo-slug>`.
+    pub src_root: &'a Path,
+    /// The versioned binary store (`~/.flux/plugins/bin`); the built binary is copied to
+    /// `<store_root>/<name>/git-<short-commit>/flux-plugin-<name>` so the descriptor's `program`
+    /// is a stable path independent of the mutable clone `target/`.
+    pub store_root: &'a Path,
+}
+
+/// The outcome of a [`install_from_git`] call.
+#[derive(Debug, Clone)]
+pub struct GitInstalled {
+    pub name: String,
+    pub git_url: String,
+    pub git_commit: String,
+    pub program: PathBuf,
+    /// `true` when the same git URL was already installed at this exact resolved commit and its
+    /// binary is present — no consent asked, nothing rebuilt (idempotent re-install).
+    pub already_installed: bool,
+}
+
+/// Derive a bare, filesystem-safe clone-cache directory name from a git URL: the last path segment
+/// with any `.git` suffix stripped, and every character outside `[A-Za-z0-9._-]` mapped to `-`.
+/// This is only the *cache* directory (`<src_root>/<slug>`); the **registered plugin name** comes
+/// from the built binary (`flux-plugin-<name>`), so two bins in one repo share the clone but
+/// register under their own names.
+fn repo_slug(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    let last = trimmed
+        .rsplit(['/', ':'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(trimmed);
+    let last = last.strip_suffix(".git").unwrap_or(last);
+    let slug: String = last
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        "plugin-src".to_string()
+    } else {
+        slug
+    }
+}
+
+/// The first 12 hex chars of a commit sha — the versioned-store sub-directory for a from-source
+/// build (`<store_root>/<name>/git-<short>/…`), so builds at different commits sit side by side.
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(12).collect()
+}
+
+/// `flux plugin install --git <url> [--tag|--rev|--branch] [--bin <name>] [--force]` (D-87): the
+/// third install source. Clone → resolve the commit → (idempotency short-circuit) → **consent
+/// gate** → build → register.
+///
+/// Trust: building arbitrary source is code execution, so `consent` is called with the resolved
+/// commit BEFORE anything is built and must return `Ok(true)` to proceed (a non-interactive
+/// consent env flag or an interactive confirm — the CLI owns that). An idempotent no-op (same URL +
+/// commit already installed, binary present, `!force`) skips the gate entirely — re-confirming to
+/// do nothing is noise. The registered descriptor carries `git_url` + `git_commit` and **no**
+/// `sha256`, so [`crate::verify_descriptor`] labels it [`crate::Verification::UnverifiedFromSource`].
+pub async fn install_from_git<F, Fut>(
+    req: &GitInstallRequest<'_>,
+    url: &str,
+    git_ref: &GitRef,
+    requested_bin: Option<&str>,
+    force: bool,
+    consent: F,
+) -> Result<GitInstalled>
+where
+    F: FnOnce(&str) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let clone_dir = req.src_root.join(repo_slug(url));
+    let commit = req
+        .builder
+        .clone_and_resolve(url, git_ref, &clone_dir)
+        .await?;
+
+    // Idempotency (D-87 acceptance): re-installing the same resolved commit is a no-op. Match by
+    // provenance — any installed descriptor from this same `git_url` at this same commit whose
+    // binary is still on disk — so it holds regardless of which name the bin registered under, and
+    // never rebuilds or re-prompts. `--force` skips the short-circuit and rebuilds.
+    if !force {
+        for d in crate::discover(req.descriptors_dir) {
+            if d.descriptor.git_url.as_deref() == Some(url)
+                && d.descriptor.git_commit.as_deref() == Some(commit.as_str())
+                && Path::new(&d.descriptor.program).exists()
+            {
+                return Ok(GitInstalled {
+                    name: d.name,
+                    git_url: url.to_string(),
+                    git_commit: commit,
+                    program: PathBuf::from(d.descriptor.program),
+                    already_installed: true,
+                });
+            }
+        }
+    }
+
+    // Trust gate: disclose the commit and get explicit consent before building unverified source.
+    if !consent(&commit).await? {
+        return Err(Error::Other(format!(
+            "declined: building `{url}` at commit {commit} was not confirmed — nothing built or \
+             registered (re-run and confirm, or set the non-interactive consent flag)"
+        )));
+    }
+
+    let built = req.builder.build(&clone_dir, requested_bin).await?;
+    let name = built
+        .bin_name
+        .strip_prefix("flux-plugin-")
+        .unwrap_or(&built.bin_name)
+        .to_string();
+    crate::invalid_plugin_name(&name).map_err(|_| {
+        Error::Other(format!(
+            "built binary `{}` yields an invalid plugin name `{name}`",
+            built.bin_name
+        ))
+    })?;
+
+    // Cache the built binary in the versioned store so the descriptor's `program` is a stable path
+    // (the clone's `target/release` is overwritten by the next build at a different ref). Keyed by
+    // short commit → builds at different commits sit side by side.
+    let dest_dir = req
+        .store_root
+        .join(&name)
+        .join(format!("git-{}", short_commit(&commit)));
+    std::fs::create_dir_all(&dest_dir).map_err(Error::Io)?;
+    let dest_path = dest_dir.join(&built.bin_name);
+    std::fs::copy(&built.binary, &dest_path).map_err(Error::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(Error::Io)?;
+    }
+
+    // Preserve an operator's `args` across a rebuild of the same plugin name.
+    let prior_args = crate::load_descriptor(req.descriptors_dir, &name)?
+        .map(|d| d.args)
+        .unwrap_or_default();
+    crate::add_descriptor(
+        req.descriptors_dir,
+        &name,
+        &crate::PluginDescriptor {
+            program: dest_path.to_string_lossy().into_owned(),
+            args: prior_args,
+            git_url: Some(url.to_string()),
+            git_commit: Some(commit.clone()),
+            ..Default::default()
+        },
+    )?;
+
+    Ok(GitInstalled {
+        name,
+        git_url: url.to_string(),
+        git_commit: commit,
+        program: dest_path,
+        already_installed: false,
+    })
 }
 
 #[cfg(test)]
@@ -1114,6 +1368,8 @@ mod tests {
                 sha256: Some(sha256_hex(b"alpha-bytes-0.9.0")),
                 source: Some("plugins-v0.9.0".into()),
                 previous: Some("0.8.0".into()),
+                git_url: None,
+                git_commit: None,
             },
         )
         .unwrap();
@@ -1512,6 +1768,257 @@ mod tests {
             tag, "plugins-v0.3.0",
             "an explicit version needs no listing call"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-87 `--git` source install — hermetic (a fake clone+build, no network, no cargo)
+    // -----------------------------------------------------------------------
+
+    /// A fake [`SourceBuilder`]: "clones" by creating the dir + returning a fixed commit, and
+    /// "builds" by writing a stub `flux-plugin-alpha` into `target/release`. Records call counts so
+    /// a test can prove an idempotent re-install rebuilt NOTHING and `--force` rebuilt. Optionally
+    /// fails the build to model a repo that is not a flux plugin.
+    struct FakeSourceBuilder {
+        commit: String,
+        build_error: Option<String>,
+        clone_calls: Mutex<usize>,
+        build_calls: Mutex<usize>,
+    }
+
+    impl FakeSourceBuilder {
+        fn new(commit: &str) -> Self {
+            Self {
+                commit: commit.to_string(),
+                build_error: None,
+                clone_calls: Mutex::new(0),
+                build_calls: Mutex::new(0),
+            }
+        }
+
+        fn failing(commit: &str, err: &str) -> Self {
+            Self {
+                build_error: Some(err.to_string()),
+                ..Self::new(commit)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceBuilder for FakeSourceBuilder {
+        async fn clone_and_resolve(
+            &self,
+            _url: &str,
+            _git_ref: &GitRef,
+            clone_dir: &Path,
+        ) -> Result<String> {
+            *self.clone_calls.lock().unwrap() += 1;
+            std::fs::create_dir_all(clone_dir).map_err(Error::Io)?;
+            Ok(self.commit.clone())
+        }
+
+        async fn build(
+            &self,
+            clone_dir: &Path,
+            _requested_bin: Option<&str>,
+        ) -> Result<BuiltPlugin> {
+            *self.build_calls.lock().unwrap() += 1;
+            if let Some(err) = &self.build_error {
+                return Err(Error::Other(err.clone()));
+            }
+            let rel = clone_dir.join("target").join("release");
+            std::fs::create_dir_all(&rel).map_err(Error::Io)?;
+            let bin = rel.join("flux-plugin-alpha");
+            std::fs::write(&bin, b"pretend-built-plugin-bytes").map_err(Error::Io)?;
+            Ok(BuiltPlugin {
+                bin_name: "flux-plugin-alpha".to_string(),
+                binary: bin,
+            })
+        }
+    }
+
+    fn git_scratch(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("flux-plugin-git-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let descriptors_dir = base.join("plugins");
+        let src_root = base.join("src");
+        let store_root = base.join("bin");
+        std::fs::create_dir_all(&descriptors_dir).unwrap();
+        (descriptors_dir, src_root, store_root)
+    }
+
+    /// D-87 acceptance: a `--git` install registers a descriptor with git provenance and **no**
+    /// signed-pack hash, so `verify_descriptor` labels it `UnverifiedFromSource`; re-installing the
+    /// same resolved commit is an idempotent no-op (nothing rebuilt); `--force` rebuilds.
+    #[tokio::test]
+    async fn git_install_registers_from_source_descriptor_and_is_idempotent() {
+        let (descriptors_dir, src_root, store_root) = git_scratch("happy");
+        let builder = FakeSourceBuilder::new("abc123def4567890commit");
+        let req = GitInstallRequest {
+            builder: &builder,
+            descriptors_dir: &descriptors_dir,
+            src_root: &src_root,
+            store_root: &store_root,
+        };
+        let url = "https://gitlab.example/group/flux-plugin-alpha.git";
+
+        let out = install_from_git(
+            &req,
+            url,
+            &GitRef::Tag("v1".into()),
+            None,
+            false,
+            |_c| async { Ok(true) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.name, "alpha");
+        assert_eq!(out.git_url, url);
+        assert_eq!(out.git_commit, "abc123def4567890commit");
+        assert!(!out.already_installed);
+        assert!(
+            out.program.is_file(),
+            "the built binary was cached in the store"
+        );
+        assert_eq!(*builder.build_calls.lock().unwrap(), 1);
+
+        // The descriptor: git provenance recorded, NO sha256 → UnverifiedFromSource (not a signed
+        // pack, not a `--dir` local scan). This is the label spawn_verified admits (not HashDrift).
+        let desc = crate::load_descriptor(&descriptors_dir, "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(desc.git_url.as_deref(), Some(url));
+        assert_eq!(desc.git_commit.as_deref(), Some("abc123def4567890commit"));
+        assert!(
+            desc.sha256.is_none(),
+            "a from-source install records no signed-pack hash"
+        );
+        assert_eq!(
+            crate::verify_descriptor(&desc),
+            crate::Verification::UnverifiedFromSource
+        );
+
+        // Re-install of the same resolved commit → idempotent no-op, NOTHING rebuilt.
+        let again = install_from_git(
+            &req,
+            url,
+            &GitRef::Tag("v1".into()),
+            None,
+            false,
+            |_c| async {
+                panic!("consent must NOT be asked for an idempotent no-op");
+            },
+        )
+        .await
+        .unwrap();
+        assert!(again.already_installed);
+        assert_eq!(
+            *builder.build_calls.lock().unwrap(),
+            1,
+            "an idempotent re-install rebuilds nothing"
+        );
+
+        // `--force` rebuilds even at the same commit.
+        let forced = install_from_git(
+            &req,
+            url,
+            &GitRef::Tag("v1".into()),
+            None,
+            true,
+            |_c| async { Ok(true) },
+        )
+        .await
+        .unwrap();
+        assert!(!forced.already_installed);
+        assert_eq!(
+            *builder.build_calls.lock().unwrap(),
+            2,
+            "`--force` rebuilds"
+        );
+
+        std::fs::remove_dir_all(descriptors_dir.parent().unwrap()).ok();
+    }
+
+    /// D-87 acceptance: a repo that is not a flux plugin fails with the builder's clear, actionable
+    /// error — and nothing is registered.
+    #[tokio::test]
+    async fn git_install_non_plugin_repo_errors_cleanly() {
+        let (descriptors_dir, src_root, store_root) = git_scratch("non-plugin");
+        let builder = FakeSourceBuilder::failing(
+            "deadbeefcafe",
+            "repo is not a flux plugin: no `flux-plugin-*` binary target found",
+        );
+        let req = GitInstallRequest {
+            builder: &builder,
+            descriptors_dir: &descriptors_dir,
+            src_root: &src_root,
+            store_root: &store_root,
+        };
+        let err = install_from_git(
+            &req,
+            "https://example/repo.git",
+            &GitRef::Default,
+            None,
+            false,
+            |_c| async { Ok(true) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a flux plugin"), "actionable error: {err}");
+        assert!(
+            flux_core::Result::unwrap(crate::load_descriptor(&descriptors_dir, "repo")).is_none()
+        );
+
+        std::fs::remove_dir_all(descriptors_dir.parent().unwrap()).ok();
+    }
+
+    /// D-87 trust gate: a declined consent aborts before any build/registration.
+    #[tokio::test]
+    async fn git_install_declined_consent_aborts_before_build() {
+        let (descriptors_dir, src_root, store_root) = git_scratch("declined");
+        let builder = FakeSourceBuilder::new("c0ffee123456");
+        let req = GitInstallRequest {
+            builder: &builder,
+            descriptors_dir: &descriptors_dir,
+            src_root: &src_root,
+            store_root: &store_root,
+        };
+        let err = install_from_git(
+            &req,
+            "https://example/flux-plugin-alpha.git",
+            &GitRef::Default,
+            None,
+            false,
+            |_c| async { Ok(false) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("declined"), "{err}");
+        assert_eq!(
+            *builder.build_calls.lock().unwrap(),
+            0,
+            "consent declined → nothing built"
+        );
+        assert!(
+            crate::discover(&descriptors_dir).is_empty(),
+            "nothing registered"
+        );
+
+        std::fs::remove_dir_all(descriptors_dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn repo_slug_is_a_bare_safe_dir_name() {
+        assert_eq!(
+            repo_slug("https://gitlab.example/group/flux-plugin-babelforce-manager.git"),
+            "flux-plugin-babelforce-manager"
+        );
+        assert_eq!(repo_slug("git@github.com:codewandler/flux.git"), "flux");
+        assert_eq!(repo_slug("https://example/x/"), "x");
+        // No path separators survive → the cache dir can never escape src_root.
+        assert!(!repo_slug("https://example/a/b/../c").contains('/'));
     }
 
     /// Not a real test — a one-shot operator tool. Run explicitly once:

@@ -20,6 +20,8 @@ use flux_provider::{
     ByteStream, ChunkStream, Credential, Effort, NativeProvider, Request, TokenSource, WireCodec,
 };
 
+use crate::schema::openrouter_tools;
+
 const OPENAI_CHAT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const OLLAMA_CHAT_ENDPOINT: &str = "http://localhost:11434/v1/chat/completions";
@@ -35,6 +37,22 @@ pub struct OpenAiChat;
 impl WireCodec for OpenAiChat {
     fn build_body(&self, req: &Request) -> Result<Value> {
         build_chat_body(req)
+    }
+
+    fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
+        Box::pin(map_chat_stream(bytes))
+    }
+}
+
+/// OpenRouter's Chat Completions codec. It shares the OpenAI wire shape while deriving a
+/// Gemini-compatible view of operation schemas for `google/gemini-*` model ids.
+pub struct OpenRouterChat;
+
+impl WireCodec for OpenRouterChat {
+    fn build_body(&self, req: &Request) -> Result<Value> {
+        let mut projected = req.clone();
+        projected.tools = openrouter_tools(&req.model, &req.tools)?;
+        build_chat_body(&projected)
     }
 
     fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
@@ -717,7 +735,7 @@ pub fn openrouter_api(
     }
     NativeProvider::new(
         "openrouter",
-        Arc::new(OpenAiChat),
+        Arc::new(OpenRouterChat),
         Arc::new(OpenAiCred {
             endpoint: OPENROUTER_ENDPOINT.to_string(),
             secret: Secret::ApiKey(api_key.into()),
@@ -1149,6 +1167,42 @@ mod tests {
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool["tool_call_id"], "tc_1");
         assert_eq!(tool["content"], "file body");
+    }
+
+    #[test]
+    fn openrouter_chat_projects_gemini_schemas_without_affecting_openai_chat() {
+        let mut req = Request::new("google/gemini-3.5-flash", "hi");
+        req.tools.push(flux_provider::ToolDef {
+            name: "records.merge".into(),
+            description: "merge records".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"records": {"type": "array"}},
+                "required": ["records", "label"]
+            }),
+        });
+        let original = req.clone();
+
+        let gemini = OpenRouterChat.build_body(&req).unwrap();
+        let openai = OpenAiChat.build_body(&req).unwrap();
+
+        assert_eq!(
+            gemini["tools"][0]["function"]["parameters"]["properties"]["records"]["items"],
+            json!({})
+        );
+        assert_eq!(
+            gemini["tools"][0]["function"]["parameters"]["properties"]["label"],
+            json!({})
+        );
+        assert!(
+            openai["tools"][0]["function"]["parameters"]["properties"]["records"]
+                .get("items")
+                .is_none()
+        );
+        assert!(openai["tools"][0]["function"]["parameters"]["properties"]
+            .get("label")
+            .is_none());
+        assert_eq!(req.tools, original.tools);
     }
 
     /// OpenAI's GPT-5 Chat Completions models reject the legacy `max_tokens` field and require

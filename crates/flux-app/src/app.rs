@@ -33,8 +33,8 @@ use flux_lang::runtime::FlowOutcome;
 use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, Executor, PermissionManager, Spawner, Tool, ToolContext,
-    ToolRegistry, ToolResult,
+    scope_runtime_turn, AllowApprover, Approver, DenyApprover, Executor, PermissionManager,
+    Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
 };
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
@@ -1102,9 +1102,12 @@ impl Engine {
             self.system.clone(),
             self.redactor.clone(),
         )?;
-        // The journey's session id on the context, so a `task` call inside the journey correlates
-        // its child's audit stream back to this run (A-08).
-        executor.context().set_session(&session_id);
+        // Preserve any outer cancellation/reporter while making this journey the immediate parent
+        // lineage. The snapshot is scoped around the drive below, never retained on the executor.
+        let runtime_turn = executor
+            .context()
+            .runtime_turn_context()
+            .with_session(&session_id);
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
 
@@ -1117,20 +1120,23 @@ impl Engine {
             inner: sink,
             usage: None,
         };
-        let outcome = if self.program.ops.is_empty() {
-            flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, &mut capture)
+        let outcome = scope_runtime_turn(runtime_turn, async {
+            if self.program.ops.is_empty() {
+                flux_flow::runtime::execute_flow(&store, &executor, &session_id, &ast, &mut capture)
+                    .await
+            } else {
+                flux_flow::runtime::execute_flow_with_composites(
+                    &store,
+                    &executor,
+                    &session_id,
+                    &ast,
+                    &self.program.ops,
+                    &mut capture,
+                )
                 .await
-        } else {
-            flux_flow::runtime::execute_flow_with_composites(
-                &store,
-                &executor,
-                &session_id,
-                &ast,
-                &self.program.ops,
-                &mut capture,
-            )
-            .await
-        }
+            }
+        })
+        .await
         .map_err(other)?;
         let usage = capture.usage;
         let model = profile.model;
@@ -1294,7 +1300,10 @@ impl Engine {
             self.system.clone(),
             self.redactor.clone(),
         )?;
-        executor.context().set_session(&session_id);
+        let runtime_turn = executor
+            .context()
+            .runtime_turn_context()
+            .with_session(&session_id);
         analyze_composites(&self.program.ops, &self.registry)
             .map_err(|d| Error::Other(format!("composite ops: {}", join_diags(&d))))?;
 
@@ -1305,31 +1314,34 @@ impl Engine {
             inner: sink,
             usage: None,
         };
-        let outcome = if self.program.ops.is_empty() {
-            flux_flow::runtime::resume_flow(
-                &store,
-                &executor,
-                &session_id,
-                &body,
-                node,
-                input,
-                &mut capture,
-            )
-            .await
-        } else {
-            flux_flow::runtime::resume_flow_with_composites(
-                &store,
-                &executor,
-                &session_id,
-                flow_name.as_deref(),
-                &body,
-                node,
-                input,
-                &self.program.ops,
-                &mut capture,
-            )
-            .await
-        }
+        let outcome = scope_runtime_turn(runtime_turn, async {
+            if self.program.ops.is_empty() {
+                flux_flow::runtime::resume_flow(
+                    &store,
+                    &executor,
+                    &session_id,
+                    &body,
+                    node,
+                    input,
+                    &mut capture,
+                )
+                .await
+            } else {
+                flux_flow::runtime::resume_flow_with_composites(
+                    &store,
+                    &executor,
+                    &session_id,
+                    flow_name.as_deref(),
+                    &body,
+                    node,
+                    input,
+                    &self.program.ops,
+                    &mut capture,
+                )
+                .await
+            }
+        })
+        .await
         .map_err(other)?;
         let usage = capture.usage;
         let model = profile.model;

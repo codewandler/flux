@@ -23,6 +23,8 @@
 
 pub mod messages;
 
+mod schema;
+
 pub mod anthropic;
 pub mod bedrock;
 pub mod codex;
@@ -66,4 +68,232 @@ pub(crate) fn openrouter_reported_cost(
         0.0
     };
     Some(cost + byok_surcharge)
+}
+
+#[cfg(test)]
+mod schema_portability_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use serde_json::{json, Value};
+
+    use flux_core::Result;
+    use flux_provider::{Credential, NativeProvider, Provider, Request, ToolDef, WireCodec};
+
+    use crate::anthropic::AnthropicMessages;
+    use crate::openai::{OpenAiChat, OpenAiResponses, OpenRouterChat};
+    use crate::openrouter::OpenRouterMessages;
+
+    fn adversarial_request(model: &str) -> Request {
+        let mut request = Request::new(model, "Reply OK without calling any tool.");
+        request.max_tokens = 16;
+        request.tools.push(ToolDef {
+            name: "inert_portability_probe".into(),
+            description: "An inert schema probe. Never call it.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rows": {"type": "array"},
+                    "matrix": {"type": "array", "items": {"type": "array"}},
+                    "reference": {"$ref": "#/$defs/Probe"}
+                },
+                "required": ["rows", "matrix", "label", "reference"],
+                "$defs": {
+                    "Probe": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }
+                }
+            }),
+        });
+        request
+    }
+
+    fn assert_unprojected(schema: &Value) {
+        assert!(schema["properties"]["rows"].get("items").is_none());
+        assert!(schema["properties"]["matrix"]["items"]
+            .get("items")
+            .is_none());
+        assert!(schema["properties"].get("label").is_none());
+    }
+
+    fn assert_projected(schema: &Value) {
+        assert_eq!(schema["properties"]["rows"]["items"], json!({}));
+        assert_eq!(schema["properties"]["matrix"]["items"]["items"], json!({}));
+        assert_eq!(schema["properties"]["label"], json!({}));
+    }
+
+    #[test]
+    fn provider_codecs_project_only_openrouter_gemini_tool_schemas() {
+        let request = adversarial_request("google/gemini-3.5-flash");
+        let original = request.tools.clone();
+
+        let anthropic = AnthropicMessages.build_body(&request).unwrap();
+        assert_unprojected(&anthropic["tools"][0]["input_schema"]);
+
+        let openai = OpenAiChat.build_body(&request).unwrap();
+        assert_unprojected(&openai["tools"][0]["function"]["parameters"]);
+
+        let codex = OpenAiResponses { codex: true }
+            .build_body(&request)
+            .unwrap();
+        assert_unprojected(&codex["tools"][0]["parameters"]);
+
+        let openrouter_chat = OpenRouterChat.build_body(&request).unwrap();
+        assert_projected(&openrouter_chat["tools"][0]["function"]["parameters"]);
+
+        let openrouter_messages = OpenRouterMessages.build_body(&request).unwrap();
+        assert_projected(&openrouter_messages["tools"][0]["input_schema"]);
+
+        let non_gemini = adversarial_request("deepseek/deepseek-v4-flash");
+        let openrouter_non_gemini = OpenRouterChat.build_body(&non_gemini).unwrap();
+        assert_unprojected(&openrouter_non_gemini["tools"][0]["function"]["parameters"]);
+        assert_eq!(request.tools, original);
+    }
+
+    struct EndpointCountingCredential {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Credential for EndpointCountingCredential {
+        fn endpoint(&self) -> String {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            "http://127.0.0.1:9/should-not-connect".into()
+        }
+
+        async fn apply(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+            Ok(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_gemini_schema_fails_before_either_transport_reaches_endpoint() {
+        let fixtures = vec![
+            (
+                ToolDef {
+                    name: "rows.replace".into(),
+                    description: "replace".into(),
+                    input_schema: json!({
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }),
+                },
+                "/type",
+            ),
+            (
+                ToolDef {
+                    name: "closed.create".into(),
+                    description: "create".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": ["missing"],
+                        "additionalProperties": false
+                    }),
+                },
+                "/required/0",
+            ),
+            (
+                ToolDef {
+                    name: "patterns.search".into(),
+                    description: "search".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "filters": {
+                                "type": "object",
+                                "patternProperties": {".*": {"type": "string"}}
+                            }
+                        }
+                    }),
+                },
+                "/properties/filters/patternProperties",
+            ),
+            (
+                ToolDef {
+                    name: "unions.put".into(),
+                    description: "put".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": ["string", "number"],
+                                "anyOf": [{"type": "string"}]
+                            }
+                        }
+                    }),
+                },
+                "/properties/value/type",
+            ),
+            (
+                ToolDef {
+                    name: "enums.put".into(),
+                    description: "put".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "enum": ["ok", 1]}
+                        }
+                    }),
+                },
+                "/properties/value/enum/1",
+            ),
+        ];
+
+        for (tool, expected_path) in fixtures {
+            for codec in [
+                Arc::new(OpenRouterChat) as Arc<dyn WireCodec>,
+                Arc::new(OpenRouterMessages) as Arc<dyn WireCodec>,
+            ] {
+                let mut request = Request::new("google/gemini-3.5-flash", "hi");
+                request.tools.push(tool.clone());
+                let endpoint_calls = Arc::new(AtomicUsize::new(0));
+                let provider = NativeProvider::new(
+                    "openrouter-test",
+                    codec,
+                    Arc::new(EndpointCountingCredential {
+                        calls: endpoint_calls.clone(),
+                    }),
+                )
+                .with_max_retries(0);
+
+                let error = match provider.stream(request).await {
+                    Ok(_) => panic!("incompatible schema reached transport"),
+                    Err(error) => error.to_string(),
+                };
+
+                assert!(error.contains(&tool.name), "error was: {error}");
+                assert!(error.contains(expected_path), "error was: {error}");
+                assert_eq!(endpoint_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    /// Credentialed A-81 smoke. The declaration is inert and no Flux operation is registered or
+    /// executed; consuming either stream proves both OpenRouter wire shapes reached Gemini after
+    /// codec projection instead of failing request validation.
+    #[tokio::test]
+    #[ignore = "requires OPENROUTER_API_KEY and makes two low-token Gemini requests"]
+    async fn live_openrouter_gemini_accepts_projected_schema_on_both_wires() -> Result<()> {
+        let key = std::env::var("OPENROUTER_API_KEY")
+            .map_err(|_| flux_core::Error::Auth("OPENROUTER_API_KEY is not set".into()))?;
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(crate::openai::openrouter_api(&key, "", "")),
+            Box::new(crate::openrouter::openrouter_anthropic_api(&key, "", "")),
+        ];
+
+        for provider in providers {
+            let mut stream = provider
+                .stream(adversarial_request("google/gemini-3.5-flash"))
+                .await?;
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+        }
+        Ok(())
+    }
 }

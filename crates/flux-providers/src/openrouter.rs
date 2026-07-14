@@ -19,6 +19,8 @@ use crate::messages::{
 use flux_core::{Error, Result};
 use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
 
+use crate::schema::openrouter_tools;
+
 const OPENROUTER_MESSAGES_ENDPOINT: &str = "https://openrouter.ai/api/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -73,7 +75,9 @@ pub struct OpenRouterMessages;
 
 impl WireCodec for OpenRouterMessages {
     fn build_body(&self, req: &Request) -> Result<Value> {
-        build_messages_body(req, &OpenRouterProfile.quirks_for(&req.model))
+        let mut projected = req.clone();
+        projected.tools = openrouter_tools(&req.model, &req.tools)?;
+        build_messages_body(&projected, &OpenRouterProfile.quirks_for(&projected.model))
     }
 
     fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
@@ -160,6 +164,7 @@ pub fn openrouter_anthropic_from_env() -> Result<NativeProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_provider::ToolDef;
 
     #[test]
     fn profile_is_conservative_and_routes_tool_capable() {
@@ -239,5 +244,56 @@ mod tests {
             extra: vec![("X-Title", "flux".into())],
         };
         assert_eq!(cred.endpoint(), OPENROUTER_MESSAGES_ENDPOINT);
+    }
+
+    #[test]
+    fn gemini_codec_materializes_portable_array_and_required_schemas_without_mutating_request() {
+        let mut req = Request::new("google/gemini-3.5-flash", "hi");
+        req.tools.push(ToolDef {
+            name: "records.merge".into(),
+            description: "Merge structured records".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "records": {"type": "array"},
+                    "batches": {
+                        "type": "array",
+                        "items": {"type": "array"}
+                    }
+                },
+                "required": ["records", "batches", "label"]
+            }),
+        });
+        let original = req.clone();
+
+        let body = OpenRouterMessages.build_body(&req).unwrap();
+        let schema = &body["tools"][0]["input_schema"];
+
+        assert_eq!(schema["properties"]["records"]["items"], json!({}));
+        assert_eq!(schema["properties"]["batches"]["items"]["items"], json!({}));
+        assert_eq!(schema["properties"]["label"], json!({}));
+        assert_eq!(req.tools, original.tools);
+    }
+
+    #[test]
+    fn gemini_codec_rejects_unrepresentable_required_property_with_operation_and_path() {
+        let mut req = Request::new("google/gemini-3.5-flash", "hi");
+        req.tools.push(ToolDef {
+            name: "closed.create".into(),
+            description: "Create a closed record".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": ["missing"],
+                "additionalProperties": false
+            }),
+        });
+        let original = req.clone();
+
+        let error = OpenRouterMessages.build_body(&req).unwrap_err().to_string();
+
+        assert!(error.contains("closed.create"), "error was: {error}");
+        assert!(error.contains("/required/0"), "error was: {error}");
+        assert_eq!(req.tools, original.tools);
     }
 }

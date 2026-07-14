@@ -2,8 +2,8 @@
 id: L-70
 title: Incremental reparse + comment-preserving format + docs/packaging + epic close
 pillar: Language
-status: backlog
-priority:
+status: done
+priority: 9
 epic: flux-lsp
 design: docs/designs/flux-lsp.md
 note: "Epic close — the CST payoffs (incremental reparse, comment-preserving format) + distribution + final gate. Install/Helix docs shipped early in L-73."

@@ -2,8 +2,8 @@
 id: D-93
 title: Plugin security surface — secret-field redaction + minimal gitlab.test identity
 pillar: Core
-status: backlog
-priority:
+status: done
+priority: 1
 epic: gitlab-plugin-hardening
 design: docs/designs/gitlab-plugin-hardening.md
 note: "dry-run echoes secret-like CI/pipeline variable values with no redaction metadata (leak to scrollback/logs/transcripts); gitlab.test returns the full ~50-key user profile (email, 2FA, sign-in times) for an auth smoke check (GL-016/031)"

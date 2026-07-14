@@ -194,6 +194,10 @@ struct ProjectListInput {
     #[schemars(range(min = 1))]
     page: Option<i64>,
     membership: Option<bool>,
+    /// Feed the results into the local search index as `gitlab.project` records (GL-015). Off by
+    /// default so a plain read is a pure read with no datasource side effects; use `index.build`
+    /// (or pass `contribute=true`) to index deliberately.
+    contribute: Option<bool>,
 }
 
 /// `gitlab.project.show`.
@@ -223,6 +227,10 @@ struct MrListInput {
     page: Option<i64>,
     source_branch: Option<String>,
     target_branch: Option<String>,
+    /// Feed the results into the local search index as `gitlab.merge_request` records (GL-015).
+    /// Off by default so a plain read has no datasource side effects; `index.build` indexes
+    /// deliberately.
+    contribute: Option<bool>,
 }
 
 /// `gitlab.mr.show`.
@@ -253,6 +261,9 @@ struct IssueListInput {
     /// 1-based results page (GL-019) — walk a list beyond a capped first page.
     #[schemars(range(min = 1))]
     page: Option<i64>,
+    /// Feed the results into the local search index as `gitlab.issue` records (GL-015). Off by
+    /// default so a plain read has no datasource side effects; `index.build` indexes deliberately.
+    contribute: Option<bool>,
 }
 
 /// `gitlab.pipeline.list`.
@@ -294,17 +305,13 @@ struct IndexBuildInput {
     order_by: Option<String>,
     sort: Option<String>,
     membership: Option<bool>,
-    #[schemars(range(min = 1))]
-    user_limit: Option<i64>,
-    user_search: Option<String>,
-    active_users: Option<bool>,
-    #[schemars(range(min = 1))]
-    group_limit: Option<i64>,
-    group_search: Option<String>,
-    group_order_by: Option<String>,
-    group_sort: Option<String>,
-    active_groups: Option<bool>,
-    all_visible_groups: Option<bool>,
+    /// Preview the crawl breadth WITHOUT indexing (GL-017): returns which datasources would be
+    /// crawled and each one's scope (project vs instance-wide), contributing no records. Run this
+    /// first when calling with no selectors, so a broad instance-wide crawl is never silent.
+    estimate: Option<bool>,
+    /// Scope issue indexing to one project (GL-040), matching `mr_project` for merge requests;
+    /// falls back to `project`. Without it, issues are crawled instance-wide.
+    issue_project: Option<String>,
     #[schemars(range(min = 1))]
     issue_limit: Option<i64>,
     issue_search: Option<String>,
@@ -330,6 +337,21 @@ struct ProjectCreateInput {
     description: Option<String>,
     visibility: Option<Visibility>,
     initialize_with_readme: Option<bool>,
+}
+
+/// `gitlab.project.delete` (GL-001) — a destructive, plugin-native repo-lifecycle counterpart to
+/// `project.create`.
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+struct ProjectDeleteInput {
+    project: String,
+    /// Fat-finger guard: when set it must equal `project` (the path/id you passed) or the delete
+    /// is refused.
+    confirm_path: Option<String>,
+    /// Fat-finger guard: when set it must equal the project's resolved numeric id or the delete is
+    /// refused.
+    #[schemars(range(min = 1))]
+    confirm_project_id: Option<i64>,
 }
 
 /// `gitlab.mr.create`.
@@ -491,6 +513,8 @@ struct BranchDeleteInput {
     branch: Option<String>,
     /// Alias of `branch` (GL-028).
     name: Option<String>,
+    /// Fat-finger guard (GL-005): when set it must equal the branch being deleted.
+    confirm_branch: Option<String>,
 }
 
 /// `gitlab.branch.delete_merged`.
@@ -498,6 +522,9 @@ struct BranchDeleteInput {
 #[allow(dead_code)]
 struct BranchDeleteMergedInput {
     project: String,
+    /// Fat-finger guard (GL-005): when set it must equal `project`. This is a BULK sweep of every
+    /// merged branch, so confirming the project guards against running it against the wrong repo.
+    confirm_project: Option<String>,
 }
 
 /// `gitlab.repository.file.create`.
@@ -545,6 +572,8 @@ struct RepositoryFileDeleteInput {
     author_email: Option<String>,
     author_name: Option<String>,
     last_commit_id: Option<String>,
+    /// Fat-finger guard (GL-005): when set it must equal `file_path`.
+    confirm_file_path: Option<String>,
 }
 
 /// `gitlab.repository.file.show`.
@@ -666,6 +695,8 @@ struct RepositoryTagDeleteInput {
     tag: Option<String>,
     /// Alias of `tag_name` (GL-028).
     name: Option<String>,
+    /// Fat-finger guard (GL-005): when set it must equal the resolved tag name.
+    confirm_tag_name: Option<String>,
 }
 
 /// `gitlab.snippet.create`.
@@ -689,6 +720,9 @@ struct SnippetDeleteInput {
     /// Alias of `snippet_id` (GL-028).
     #[schemars(range(min = 1))]
     id: Option<i64>,
+    /// Fat-finger guard (GL-005): when set it must equal the resolved snippet id.
+    #[schemars(range(min = 1))]
+    confirm_snippet_id: Option<i64>,
 }
 
 /// `gitlab.search.blobs`.
@@ -879,6 +913,8 @@ struct CiVariableDeleteInput {
     project: String,
     key: String,
     environment_scope: Option<String>,
+    /// Fat-finger guard (GL-005): when set it must equal `key`.
+    confirm_key: Option<String>,
 }
 
 /// `gitlab.pipeline.create`.
@@ -1026,6 +1062,8 @@ struct ReleaseDeleteInput {
     tag_name: Option<String>,
     /// Alias of `tag_name` (GL-028).
     tag: Option<String>,
+    /// Fat-finger guard (GL-005): when set it must equal the resolved release tag.
+    confirm_tag_name: Option<String>,
 }
 
 /// `gitlab.release.link.list`.
@@ -1112,7 +1150,10 @@ struct RepositoryChangelogGenerateInput {
 struct RepositoryChangelogAddInput {
     project: String,
     version: String,
-    branch: Option<String>,
+    /// The branch to commit the changelog section onto — REQUIRED (GL-037). Previously optional,
+    /// which let GitLab default it to the repo's default branch: a silent write to `main`. Name
+    /// the target branch explicitly.
+    branch: String,
     file: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -1259,6 +1300,16 @@ struct DeployTokenRevokeInput {
     confirm_token_id: Option<i64>,
 }
 
+/// Mark an op's secret-like fields for host-side masking (GL-031 / D-93): their values are redacted
+/// wherever flux echoes this op's input or result — the `flux plugin call` dry-run input preview,
+/// the live result echo, and the stringified tool result the model sees. Used for the CI/pipeline
+/// variable `value` fields, which are matched by name at any depth (so a pipeline's
+/// `variables[].value` array is masked element-wise too).
+fn redacting(mut op: OperationSpec, fields: &[&str]) -> OperationSpec {
+    op.redact_fields = fields.iter().map(|s| s.to_string()).collect();
+    op
+}
+
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("gitlab", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
@@ -1356,13 +1407,23 @@ fn manifest_builder() -> PluginBuilder {
             ),
             index_build,
         )
-        // ---- project create ----
+        // ---- project create / delete ----
         .operation(
             write_op_typed::<ProjectCreateInput>(
                 "gitlab.project.create",
                 "Create a project, optionally inside a group namespace (resolved by path).",
             ),
             project_create,
+        )
+        .operation(
+            risked(
+                write_op_typed::<ProjectDeleteInput>(
+                    "gitlab.project.delete",
+                    "DELETE a project (destructive, irreversible). Pass confirm_path equal to project (or confirm_project_id equal to its numeric id) to guard against mistakes.",
+                ),
+                Risk::Destructive,
+            ),
+            project_delete,
         )
         // ---- merge request writes ----
         .operation(
@@ -1438,16 +1499,22 @@ fn manifest_builder() -> PluginBuilder {
             branch_create,
         )
         .operation(
-            write_op_typed::<BranchDeleteInput>(
-                "gitlab.branch.delete",
-                "Delete a GitLab repository branch.",
+            risked(
+                write_op_typed::<BranchDeleteInput>(
+                    "gitlab.branch.delete",
+                    "Delete a GitLab repository branch. Pass confirm_branch equal to the branch to guard against mistakes.",
+                ),
+                Risk::High,
             ),
             branch_delete,
         )
         .operation(
-            write_op_typed::<BranchDeleteMergedInput>(
-                "gitlab.branch.delete_merged",
-                "Delete all merged branches in a GitLab project.",
+            risked(
+                write_op_typed::<BranchDeleteMergedInput>(
+                    "gitlab.branch.delete_merged",
+                    "BULK-delete every merged branch in a GitLab project (destructive, sweeps many branches at once). Pass confirm_project equal to project to guard against mistakes.",
+                ),
+                Risk::Destructive,
             ),
             branch_delete_merged,
         )
@@ -1467,9 +1534,12 @@ fn manifest_builder() -> PluginBuilder {
             repo_file_update,
         )
         .operation(
-            write_op_typed::<RepositoryFileDeleteInput>(
-                "gitlab.repository.file.delete",
-                "Delete a file from a GitLab repository.",
+            risked(
+                write_op_typed::<RepositoryFileDeleteInput>(
+                    "gitlab.repository.file.delete",
+                    "Delete a file from a GitLab repository (destructive). Pass confirm_file_path equal to file_path to guard against mistakes.",
+                ),
+                Risk::Destructive,
             ),
             repo_file_delete,
         )
@@ -1525,9 +1595,12 @@ fn manifest_builder() -> PluginBuilder {
             tag_show,
         )
         .operation(
-            write_op_typed::<RepositoryTagDeleteInput>(
-                "gitlab.repository.tag.delete",
-                "Delete a git tag from a project.",
+            risked(
+                write_op_typed::<RepositoryTagDeleteInput>(
+                    "gitlab.repository.tag.delete",
+                    "Delete a git tag from a project (destructive). Pass confirm_tag_name equal to the tag to guard against mistakes.",
+                ),
+                Risk::Destructive,
             ),
             tag_delete,
         )
@@ -1540,9 +1613,12 @@ fn manifest_builder() -> PluginBuilder {
             snippet_create,
         )
         .operation(
-            write_op_typed::<SnippetDeleteInput>(
-                "gitlab.snippet.delete",
-                "Delete a personal GitLab snippet.",
+            risked(
+                write_op_typed::<SnippetDeleteInput>(
+                    "gitlab.snippet.delete",
+                    "Delete a personal GitLab snippet (destructive). Pass confirm_snippet_id equal to the snippet id to guard against mistakes.",
+                ),
+                Risk::Destructive,
             ),
             snippet_delete,
         )
@@ -1613,30 +1689,42 @@ fn manifest_builder() -> PluginBuilder {
         )
         // ---- CI/CD ----
         .operation(
-            write_op_typed::<CiVariableCreateInput>(
-                "gitlab.ci.variable.create",
-                "Create a GitLab project CI/CD variable.",
+            redacting(
+                write_op_typed::<CiVariableCreateInput>(
+                    "gitlab.ci.variable.create",
+                    "Create a GitLab project CI/CD variable.",
+                ),
+                &["value"],
             ),
             ci_variable_create,
         )
         .operation(
-            write_op_typed::<CiVariableUpdateInput>(
-                "gitlab.ci.variable.update",
-                "Update a GitLab project CI/CD variable.",
+            redacting(
+                write_op_typed::<CiVariableUpdateInput>(
+                    "gitlab.ci.variable.update",
+                    "Update a GitLab project CI/CD variable.",
+                ),
+                &["value"],
             ),
             ci_variable_update,
         )
         .operation(
-            write_op_typed::<CiVariableDeleteInput>(
-                "gitlab.ci.variable.delete",
-                "Delete a GitLab project CI/CD variable.",
+            risked(
+                write_op_typed::<CiVariableDeleteInput>(
+                    "gitlab.ci.variable.delete",
+                    "Delete a GitLab project CI/CD variable (destructive). Pass confirm_key equal to key to guard against mistakes.",
+                ),
+                Risk::Destructive,
             ),
             ci_variable_delete,
         )
         .operation(
-            write_op_typed::<PipelineCreateInput>(
-                "gitlab.pipeline.create",
-                "Create a GitLab CI pipeline.",
+            redacting(
+                write_op_typed::<PipelineCreateInput>(
+                    "gitlab.pipeline.create",
+                    "Create a GitLab CI pipeline.",
+                ),
+                &["value"],
             ),
             pipeline_create,
         )
@@ -1705,9 +1793,12 @@ fn manifest_builder() -> PluginBuilder {
             release_update,
         )
         .operation(
-            write_op_typed::<ReleaseDeleteInput>(
-                "gitlab.release.delete",
-                "Delete a GitLab release. The underlying git tag is left in place.",
+            risked(
+                write_op_typed::<ReleaseDeleteInput>(
+                    "gitlab.release.delete",
+                    "Delete a GitLab release (destructive; the underlying git tag is left in place). Pass confirm_tag_name equal to the tag to guard against mistakes.",
+                ),
+                Risk::Destructive,
             ),
             release_delete,
         )
@@ -2257,6 +2348,17 @@ fn pf_index_build(input: &Value) -> Vec<String> {
     index_include(input).err().into_iter().collect()
 }
 
+/// GL-015: whether a plain read/list op should feed its results into the local search index.
+/// Off by default so a pure read has no datasource side effects (no records, no stderr
+/// `(N record(s) contributed)` line — the host prints it only when records are contributed);
+/// `index.build` is the deliberate indexing path.
+fn wants_contribution(input: &Value) -> bool {
+    input
+        .get("contribute")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// `&page=N` when the caller asked for a specific 1-based results page (GL-019), else "".
 fn page_qs(input: &Value) -> String {
     flex_i64(input, &["page"])
@@ -2342,7 +2444,9 @@ fn project_list(input: Value, host: &mut Host) -> Result<Value, String> {
         ),
     ];
     let projects = gl_get(host, &format!("/projects{}", qs(&pairs)))?;
-    contribute_projects(host, &projects);
+    if wants_contribution(&input) {
+        contribute_projects(host, &projects);
+    }
     Ok(projects)
 }
 
@@ -2385,7 +2489,9 @@ fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
         host,
         &format!("/projects/{}/merge_requests{}", enc(&project), qs(&pairs)),
     )?;
-    contribute_list(host, &mrs, "gitlab.merge_request", &project);
+    if wants_contribution(&input) {
+        contribute_list(host, &mrs, "gitlab.merge_request", &project);
+    }
     Ok(mrs)
 }
 
@@ -2427,7 +2533,9 @@ fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
         host,
         &format!("/projects/{}/issues{}", enc(&project), qs(&pairs)),
     )?;
-    contribute_list(host, &issues, "gitlab.issue", &project);
+    if wants_contribution(&input) {
+        contribute_list(host, &issues, "gitlab.issue", &project);
+    }
     Ok(issues)
 }
 
@@ -2467,7 +2575,20 @@ fn pipeline_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn auth_test(_input: Value, host: &mut Host) -> Result<Value, String> {
     let user = gl_get(host, "/user")?;
-    Ok(json!({ "status": "ok", "text": "GitLab auth OK", "user": user }))
+    // GL-016: an auth smoke check needs only enough identity to confirm *which* account the token
+    // authenticates as — id/username/name. The full `GET /user` (~50 keys: email, public/commit
+    // email, two-factor status, last-sign-in timestamps, …) is sensitive and must never be echoed
+    // for a health check, so pin the result to a minimal, documented identity subset.
+    let pick = |key: &str| user.get(key).cloned().unwrap_or(Value::Null);
+    Ok(json!({
+        "status": "ok",
+        "text": "GitLab auth OK",
+        "user": {
+            "id": pick("id"),
+            "username": pick("username"),
+            "name": pick("name"),
+        },
+    }))
 }
 
 /// Which datasource categories the current `index.build` call should populate.
@@ -2543,6 +2664,15 @@ fn page_plan(input: &Value, limit_key: &str, max_per_page: i64) -> (bool, i64) {
 /// `per_page`/`page` unless a datasource-specific limit pins it to a single page.
 fn index_build(input: Value, host: &mut Host) -> Result<Value, String> {
     let include = index_include(&input)?;
+    // GL-017: a dry-run scope estimate — describe the breadth WITHOUT crawling or contributing,
+    // so a no-argument `index.build` is never a silent instance-wide sweep.
+    if input
+        .get("estimate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(index_estimate(&input, &include));
+    }
     let mut total = 0;
     if include.projects {
         total += index_projects(host, &input);
@@ -2554,6 +2684,82 @@ fn index_build(input: Value, host: &mut Host) -> Result<Value, String> {
         total += index_issues(host, &input);
     }
     Ok(json!({ "indexed": total }))
+}
+
+/// GL-017: describe the crawl `index.build` is about to run — which datasources, and each one's
+/// scope (a named project vs the whole instance) — without any HTTP or contribution. The operator
+/// runs this first, sees the breadth, then reruns without `estimate` to actually index.
+fn index_estimate(input: &Value, include: &IndexInclude) -> Value {
+    let mut would_crawl = Vec::new();
+    let mut scopes = Map::new();
+    let mut instance_wide = false;
+    if include.projects {
+        would_crawl.push(json!("projects"));
+        let membership = input
+            .get("membership")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        // Projects are always instance-scoped (there is no project selector to narrow them).
+        instance_wide = true;
+        scopes.insert(
+            "projects".into(),
+            json!(if membership {
+                "instance-wide (projects you are a member of)"
+            } else {
+                "instance-wide (every visible project)"
+            }),
+        );
+    }
+    if include.merge_requests {
+        would_crawl.push(json!("merge_requests"));
+        let project = flex_str(input, "mr_project")
+            .or_else(|| flex_str(input, "project"))
+            .or_else(|| flex_str(input, "project_id"))
+            .or_else(|| flex_str(input, "path"));
+        match project {
+            Some(p) => {
+                scopes.insert("merge_requests".into(), json!(format!("project {p}")));
+            }
+            None => {
+                instance_wide = true;
+                scopes.insert(
+                    "merge_requests".into(),
+                    json!("instance-wide (every visible merge request)"),
+                );
+            }
+        }
+    }
+    if include.issues {
+        would_crawl.push(json!("issues"));
+        let project = flex_str(input, "issue_project")
+            .or_else(|| flex_str(input, "project"))
+            .or_else(|| flex_str(input, "project_id"))
+            .or_else(|| flex_str(input, "path"));
+        match project {
+            Some(p) => {
+                scopes.insert("issues".into(), json!(format!("project {p}")));
+            }
+            None => {
+                instance_wide = true;
+                scopes.insert(
+                    "issues".into(),
+                    json!("instance-wide (every visible issue)"),
+                );
+            }
+        }
+    }
+    let note = if instance_wide {
+        "This crawls instance-wide datasources — potentially every visible project/MR/issue. Scope it with a project (project/mr_project/issue_project) or narrow with index/entities, then rerun without estimate to index."
+    } else {
+        "Rerun without estimate to index the scoped datasources above."
+    };
+    json!({
+        "estimate": true,
+        "would_crawl": would_crawl,
+        "scopes": Value::Object(scopes),
+        "instance_wide": instance_wide,
+        "note": note,
+    })
 }
 
 fn index_projects(host: &mut Host, input: &Value) -> usize {
@@ -2614,6 +2820,12 @@ fn index_merge_requests(host: &mut Host, input: &Value) -> usize {
 }
 
 fn index_issues(host: &mut Host, input: &Value) -> usize {
+    // GL-040: honor a project scope for issues, matching MR indexing — `issue_project` (or the
+    // shared `project`). Without one, issues are crawled instance-wide.
+    let project = flex_str(input, "issue_project")
+        .or_else(|| flex_str(input, "project"))
+        .or_else(|| flex_str(input, "project_id"))
+        .or_else(|| flex_str(input, "path"));
     let state = flex_str(input, "issue_state").unwrap_or_else(|| "all".into());
     let search = flex_str(input, "issue_search").unwrap_or_default();
     let order_by = flex_str(input, "issue_order_by").unwrap_or_else(|| "updated_at".into());
@@ -2628,7 +2840,11 @@ fn index_issues(host: &mut Host, input: &Value) -> usize {
     }
     pairs.push(("order_by", order_by));
     pairs.push(("sort", sort));
-    let base = format!("/issues{}", qs(&pairs));
+    let base = if let Some(project) = project {
+        format!("/projects/{}/issues{}", enc(&project), qs(&pairs))
+    } else {
+        format!("/issues{}", qs(&pairs))
+    };
     page_index(host, &base, per_page, all_pages, |h, page| {
         contribute_refs(h, page, "gitlab.issue")
     })
@@ -2681,31 +2897,84 @@ fn project_create(input: Value, host: &mut Host) -> Result<Value, String> {
         ],
     );
     body.insert("name".into(), json!(name));
-    // Resolve a group namespace path → namespace_id.
+    // Resolve a group namespace path → namespace_id (GL-026/GL-046).
     if let Some(namespace) = flex_str(&input, "namespace") {
-        let groups = gl_get(
-            host,
-            &format!("/groups?search={}&per_page=20", enc(&namespace)),
-        )?;
-        let id = groups.as_array().and_then(|arr| {
-            arr.iter().find_map(|g| {
-                let full = g.get("full_path").and_then(|v| v.as_str()).unwrap_or("");
-                let path = g.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                if full.eq_ignore_ascii_case(&namespace) || path.eq_ignore_ascii_case(&namespace) {
-                    g.get("id").cloned()
-                } else {
-                    None
-                }
-            })
-        });
-        match id {
-            Some(id) => {
-                body.insert("namespace_id".into(), id);
-            }
-            None => return Err(format!("group {namespace:?} not found")),
-        }
+        let id = resolve_namespace_id(host, &namespace)?;
+        body.insert("namespace_id".into(), id);
     }
     gl_post(host, "/projects", &Value::Object(body))
+}
+
+/// Resolve a group `namespace` to its numeric id for `project.create` (GL-026/GL-046).
+///
+/// Robust against the two beta findings: it **paginates** the `/groups` search beyond the first
+/// page (the old code capped at `per_page=20`, so a group past the first 20 hits was invisible),
+/// and it resolves **unambiguously**. An exact `full_path` match wins deterministically; otherwise
+/// a bare basename (`path`) match is used only when it is unique — a basename shared by several
+/// nested groups is an error asking for the full path, never a silent first-wins pick.
+fn resolve_namespace_id(host: &mut Host, namespace: &str) -> Result<Value, String> {
+    let mut exact_full: Option<Value> = None;
+    let mut basename: Vec<(String, Value)> = Vec::new();
+    let mut page = 1;
+    loop {
+        let groups = gl_get(
+            host,
+            &format!("/groups?search={}&per_page=100&page={page}", enc(namespace)),
+        )?;
+        let arr = match groups.as_array() {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => break,
+        };
+        let len = arr.len();
+        for g in &arr {
+            let full = g.get("full_path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = g.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(id) = g.get("id").filter(|v| !v.is_null()).cloned() else {
+                continue;
+            };
+            if full.eq_ignore_ascii_case(namespace) {
+                // First exact full_path match wins deterministically.
+                exact_full.get_or_insert(id);
+            } else if path.eq_ignore_ascii_case(namespace)
+                && !basename.iter().any(|(f, _)| f.eq_ignore_ascii_case(full))
+            {
+                basename.push((full.to_string(), id));
+            }
+        }
+        if len < 100 {
+            break;
+        }
+        page += 1;
+        if page > 50 {
+            break; // safety cap: never loop unboundedly on a pathological search
+        }
+    }
+    if let Some(id) = exact_full {
+        return Ok(id);
+    }
+    match basename.len() {
+        0 => Err(format!("group {namespace:?} not found")),
+        1 => Ok(basename.into_iter().next().unwrap().1),
+        _ => {
+            let names: Vec<String> = basename.into_iter().map(|(f, _)| f).collect();
+            Err(format!(
+                "namespace {namespace:?} is ambiguous — it matches multiple groups: {}. Pass the full group path.",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+fn project_delete(input: Value, host: &mut Host) -> Result<Value, String> {
+    let project = req_project(&input)?;
+    // GL-005: fat-finger guards — a supplied confirm must match, an absent one stays ergonomic.
+    confirm_str(&input, "confirm_path", &project)?;
+    if flex_i64(&input, &["confirm_project_id"]).is_some() {
+        let id = resolve_project_id(host, &project)?;
+        confirm_i64(&input, "confirm_project_id", id)?;
+    }
+    gl_delete(host, &format!("/projects/{}", enc(&project)))?;
+    Ok(json!({ "project": project, "message": "project deleted" }))
 }
 
 fn mr_create(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -2917,6 +3186,7 @@ fn branch_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let branch = flex_str(&input, "branch")
         .or_else(|| flex_str(&input, "name"))
         .ok_or("`branch` (string) required")?;
+    confirm_str(&input, "confirm_branch", &branch)?;
     gl_delete(
         host,
         &format!(
@@ -2930,6 +3200,7 @@ fn branch_delete(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn branch_delete_merged(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
+    confirm_str(&input, "confirm_project", &project)?;
     gl_delete(
         host,
         &format!("/projects/{}/repository/merged_branches", enc(&project)),
@@ -2998,6 +3269,7 @@ fn repo_file_update(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn repo_file_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let (project, file_path) = repo_file_target(&input)?;
+    confirm_str(&input, "confirm_file_path", &file_path)?;
     require_keys(&input, &["branch", "commit_message"])?;
     let body = body_from(
         &input,
@@ -3083,6 +3355,24 @@ fn repo_file_show(input: Value, host: &mut Host) -> Result<Value, String> {
             }
             if truncated {
                 file["truncated"] = json!(true);
+            }
+        }
+    }
+    // GL-006: convenience decoded text for UTF-8 files. GitLab returns file content base64-encoded;
+    // agents and CLI users almost always want the text. Decode the (post-`max_bytes`) base64 into
+    // `decoded_content` when it is valid UTF-8, leaving the raw `content`/`encoding` untouched for
+    // existing consumers. Binary files (and a truncation that split a multi-byte char) simply omit
+    // the field, so nothing breaks.
+    let is_b64 = file.get("encoding").and_then(|v| v.as_str()) == Some("base64");
+    if is_b64 {
+        if let Some(content) = file.get("content").and_then(|v| v.as_str()) {
+            use base64::Engine as _;
+            let engine = base64::engine::general_purpose::STANDARD;
+            let compact: String = content.split_whitespace().collect();
+            if let Ok(decoded) = engine.decode(compact) {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    file["decoded_content"] = json!(text);
+                }
             }
         }
     }
@@ -3261,6 +3551,7 @@ fn tag_show(input: Value, host: &mut Host) -> Result<Value, String> {
 fn tag_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let tag = tag_name(&input)?;
+    confirm_str(&input, "confirm_tag_name", &tag)?;
     gl_delete(
         host,
         &format!("/projects/{}/repository/tags/{}", enc(&project), enc(&tag)),
@@ -3306,6 +3597,7 @@ fn snippet_create(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn snippet_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let id = flex_i64(&input, &["snippet_id", "id"]).ok_or("`snippet_id` (integer) required")?;
+    confirm_i64(&input, "confirm_snippet_id", id)?;
     gl_delete(host, &format!("/snippets/{id}"))?;
     Ok(json!({ "snippet_id": id, "message": "snippet deleted" }))
 }
@@ -3809,6 +4101,7 @@ fn ci_variable_update(input: Value, host: &mut Host) -> Result<Value, String> {
 fn ci_variable_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let key = flex_str(&input, "key").ok_or("`key` (string) required")?;
+    confirm_str(&input, "confirm_key", &key)?;
     gl_delete(
         host,
         &format!(
@@ -4038,6 +4331,7 @@ fn release_update(input: Value, host: &mut Host) -> Result<Value, String> {
 fn release_delete(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let tag = release_tag(&input)?;
+    confirm_str(&input, "confirm_tag_name", &tag)?;
     gl_delete(
         host,
         &format!("/projects/{}/releases/{}", enc(&project), enc(&tag)),
@@ -4140,6 +4434,12 @@ fn changelog_generate(input: Value, host: &mut Host) -> Result<Value, String> {
 fn changelog_add(input: Value, host: &mut Host) -> Result<Value, String> {
     let project = req_project(&input)?;
     let version = flex_str(&input, "version").ok_or("`version` (string) required")?;
+    // GL-037: require an explicit target branch — never let GitLab default this write to the
+    // repo's default branch. (The schema also marks `branch` required, so the shared preflight
+    // rejects a missing/blank branch in both --dry-run and runtime.)
+    let branch = flex_str(&input, "branch").ok_or(
+        "`branch` (string) required — name the branch to commit the changelog onto, rather than silently writing the default branch",
+    )?;
     let mut body = body_from(
         &input,
         &[
@@ -4153,6 +4453,7 @@ fn changelog_add(input: Value, host: &mut Host) -> Result<Value, String> {
             "config_file",
         ],
     );
+    body.insert("branch".into(), json!(branch));
     body.insert("version".into(), json!(version.clone()));
     // The add-changelog endpoint returns no body.
     gl_request(
@@ -5138,7 +5439,9 @@ mod tests {
         );
         let out = run(
             "gitlab.mr.list",
-            json!({ "project": "group/app", "state": "opened" }),
+            // GL-015: contribution is opt-in — a plain read stays pure (see
+            // `reads_are_pure_unless_contribution_is_opted_in`).
+            json!({ "project": "group/app", "state": "opened", "contribute": true }),
             &mut host,
         );
         assert_eq!(out[0]["iid"], 7);
@@ -5176,7 +5479,7 @@ mod tests {
         );
         let out = run(
             "gitlab.issue.list",
-            json!({ "project": "group/app" }),
+            json!({ "project": "group/app", "contribute": true }),
             &mut host,
         );
         assert_eq!(out[0]["iid"], 3);
@@ -5191,6 +5494,81 @@ mod tests {
         let out = run("gitlab.test", json!({}), &mut host);
         assert_eq!(out["status"], "ok");
         assert_eq!(out["user"]["username"], "agent");
+    }
+
+    #[test]
+    fn auth_test_returns_minimal_identity() {
+        // GL-016: `gitlab.test` is an auth smoke check — it must return only a minimal identity
+        // (id/username/name), never the sensitive full `GET /user` profile (email, public/commit
+        // email, two-factor status, sign-in timestamps/IPs).
+        let full_user = json!({
+            "id": 7,
+            "username": "agent",
+            "name": "Agent Smith",
+            "email": "agent@example.com",
+            "commit_email": "commit@example.com",
+            "public_email": "public@example.com",
+            "two_factor_enabled": true,
+            "last_sign_in_at": "2026-07-14T00:00:00Z",
+            "current_sign_in_ip": "10.0.0.1",
+        });
+        let mut host = base().with_http("/api/v4/user", full_user);
+        let out = run("gitlab.test", json!({}), &mut host);
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["user"]["id"], 7);
+        assert_eq!(out["user"]["username"], "agent");
+        assert_eq!(out["user"]["name"], "Agent Smith");
+        // The user object is pinned to EXACTLY the three identity keys.
+        let keys: Vec<&str> = out["user"]
+            .as_object()
+            .expect("user is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys.len(), 3, "user pinned to a minimal key set: {keys:?}");
+        for leaked in [
+            "email",
+            "commit_email",
+            "public_email",
+            "two_factor_enabled",
+            "last_sign_in_at",
+            "current_sign_in_ip",
+        ] {
+            assert!(
+                out["user"].get(leaked).is_none(),
+                "sensitive `{leaked}` must not be echoed by an auth smoke check"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_ops_declare_value_as_secret() {
+        // GL-031: the CI/pipeline variable ops carry the redaction metadata the host masks on, so a
+        // dry-run/echo of a variable write never leaks the `value` to scrollback/logs/transcripts.
+        let m = manifest_builder().build().manifest();
+        for op_name in [
+            "gitlab.ci.variable.create",
+            "gitlab.ci.variable.update",
+            "gitlab.pipeline.create",
+        ] {
+            let op = m
+                .operations
+                .iter()
+                .find(|o| o.name == op_name)
+                .unwrap_or_else(|| panic!("op {op_name} present"));
+            assert_eq!(
+                op.redact_fields,
+                vec!["value".to_string()],
+                "{op_name} must mark `value` secret"
+            );
+        }
+        // `ci.variable.delete` carries no secret value field, so it declares none.
+        let del = m
+            .operations
+            .iter()
+            .find(|o| o.name == "gitlab.ci.variable.delete")
+            .expect("delete op present");
+        assert!(del.redact_fields.is_empty());
     }
 
     #[test]
@@ -6341,7 +6719,7 @@ mod tests {
     #[test]
     fn manifest_declares_ops_auth_and_datasources() {
         let m = manifest_builder().build().manifest();
-        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 79);
+        assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 80);
         assert_eq!(m.auth[0].purpose, "personal_token");
         assert_eq!(m.endpoints[0].name, "gitlab.endpoint");
         assert_eq!(
@@ -6587,6 +6965,349 @@ mod tests {
         );
         assert!(ok.is_ok());
     }
+
+    // ==== D-91: destructive-op risk metadata, confirm fields & project.delete ====
+
+    /// GL-005: the destructive/bulk ops are no longer flat `Medium` — deletes are `Destructive`
+    /// (the bulk merged-branch sweep too), a single branch delete is `High`, and each delete's
+    /// `confirm_*` guard blocks a mismatched confirmation before any HTTP.
+    #[test]
+    fn delete_ops_carry_finer_risk_and_confirm_guards() {
+        let m = manifest_builder().build().manifest();
+        let risk = |name: &str| {
+            m.operations
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("op {name}"))
+                .risk
+        };
+        assert_eq!(risk("gitlab.branch.delete"), Some(Risk::High));
+        assert_eq!(risk("gitlab.branch.delete_merged"), Some(Risk::Destructive));
+        assert_eq!(
+            risk("gitlab.repository.tag.delete"),
+            Some(Risk::Destructive)
+        );
+        assert_eq!(risk("gitlab.release.delete"), Some(Risk::Destructive));
+        assert_eq!(risk("gitlab.ci.variable.delete"), Some(Risk::Destructive));
+        assert_eq!(
+            risk("gitlab.repository.file.delete"),
+            Some(Risk::Destructive)
+        );
+        assert_eq!(risk("gitlab.snippet.delete"), Some(Risk::Destructive));
+        // Ordinary reversible writes stay Medium — the differentiation the finding asked for.
+        assert_eq!(risk("gitlab.mr.update"), Some(Risk::Medium));
+
+        // A mismatched confirm is refused before the mutating call (canned responses present, so
+        // the ONLY failure reason is the guard). Each guard names its own field.
+        let built = manifest_builder().build();
+        let mut host = base()
+            .with_http("/repository/branches/feat", json!({ "ok": true }))
+            .with_http("/repository/tags/v1.0.0", json!({ "ok": true }))
+            .with_http("/releases/v1.0.0", json!({ "ok": true }))
+            .with_http("/variables/KEY", json!({ "ok": true }))
+            .with_http("/snippets/5", json!({ "ok": true }));
+        let mismatches = [
+            (
+                "gitlab.branch.delete",
+                json!({ "project": "group/app", "branch": "feat", "confirm_branch": "nope" }),
+                "confirm_branch",
+            ),
+            (
+                "gitlab.repository.tag.delete",
+                json!({ "project": "group/app", "tag_name": "v1.0.0", "confirm_tag_name": "wrong" }),
+                "confirm_tag_name",
+            ),
+            (
+                "gitlab.release.delete",
+                json!({ "project": "group/app", "tag_name": "v1.0.0", "confirm_tag_name": "wrong" }),
+                "confirm_tag_name",
+            ),
+            (
+                "gitlab.ci.variable.delete",
+                json!({ "project": "group/app", "key": "KEY", "confirm_key": "OTHER" }),
+                "confirm_key",
+            ),
+            (
+                "gitlab.snippet.delete",
+                json!({ "snippet_id": 5, "confirm_snippet_id": 6 }),
+                "confirm_snippet_id",
+            ),
+        ];
+        for (op, input, field) in mismatches {
+            let err = built.call(op, input, &mut host).unwrap_err();
+            assert!(
+                err.contains(field),
+                "{op}: expected {field} guard, got {err}"
+            );
+        }
+        // A matching confirm proceeds.
+        let ok = built.call(
+            "gitlab.repository.tag.delete",
+            json!({ "project": "group/app", "tag_name": "v1.0.0", "confirm_tag_name": "v1.0.0" }),
+            &mut host,
+        );
+        assert_eq!(ok.unwrap()["message"], "tag deleted");
+    }
+
+    /// GL-001: a plugin-native `project.delete` exists, round-trips, and its `confirm_path` guard
+    /// blocks a mismatched confirmation.
+    #[test]
+    fn project_delete_round_trips_with_confirm_guard() {
+        let built = manifest_builder().build();
+        let mut host = base().with_http("/api/v4/projects/group%2Fapp", json!({ "ok": true }));
+        // Mismatched confirm_path → refused before the DELETE.
+        let bad = built.call(
+            "gitlab.project.delete",
+            json!({ "project": "group/app", "confirm_path": "group/other" }),
+            &mut host,
+        );
+        assert!(bad.unwrap_err().contains("confirm_path"));
+        // Matching confirm_path → deletes.
+        let ok = run(
+            "gitlab.project.delete",
+            json!({ "project": "group/app", "confirm_path": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(ok["message"], "project deleted");
+        assert_eq!(ok["project"], "group/app");
+    }
+
+    /// GL-037: `changelog.add` refuses to run without an explicit `branch`, so it can never
+    /// silently commit the generated section to the repo's default branch. (Before, `branch` was
+    /// optional and GitLab defaulted it.)
+    #[test]
+    fn changelog_add_requires_explicit_branch() {
+        // The shared preflight (dry-run AND runtime) rejects the missing required field.
+        let (valid, problems, _) = validate(
+            "gitlab.repository.changelog.add",
+            json!({ "project": "group/app", "version": "1.2.0" }),
+        );
+        assert!(!valid);
+        assert!(
+            problems.iter().any(|p| p.contains("branch")),
+            "{problems:?}"
+        );
+        // Runtime dispatch refuses it too, even past the preflight — belt and suspenders.
+        let mut host = base().with_http(
+            "/api/v4/projects/group%2Fapp/repository/changelog",
+            json!({}),
+        );
+        let err = manifest_builder()
+            .build()
+            .call(
+                "gitlab.repository.changelog.add",
+                json!({ "project": "group/app", "version": "1.2.0" }),
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(err.contains("branch"), "{err}");
+    }
+
+    // ==== D-92: index scoping correctness & scope estimate ====
+
+    /// GL-040: issue indexing honors a project scope (`issue_project`), hitting the project-scoped
+    /// endpoint instead of the instance-wide `/issues?scope=all`. Only the project-scoped response
+    /// is canned, so an instance-wide crawl would index nothing.
+    #[test]
+    fn index_issues_honors_project_scope() {
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/issues",
+            json!([{ "iid": 3, "title": "Bug", "references": { "full": "group/app#3" } }]),
+        );
+        let out = run(
+            "gitlab.index.build",
+            json!({ "entities": ["issues"], "issue_project": "group/app" }),
+            &mut host,
+        );
+        assert_eq!(out["indexed"], 1);
+        assert_eq!(host.contributed.borrow()[0].id, "group/app#3");
+    }
+
+    /// GL-017: `index.build {estimate:true}` reports the crawl breadth (which datasources, each
+    /// one's scope) WITHOUT crawling or contributing a single record — so a no-argument call is
+    /// never a silent instance-wide sweep.
+    #[test]
+    fn index_build_estimate_reports_scope_without_crawling() {
+        // No HTTP is canned: the estimate must not touch the network.
+        let mut host = MockHost::default();
+        let out = run("gitlab.index.build", json!({ "estimate": true }), &mut host);
+        assert_eq!(out["estimate"], true);
+        assert_eq!(out["instance_wide"], true);
+        let crawl = out["would_crawl"].as_array().unwrap();
+        assert!(crawl.iter().any(|v| v == "projects"));
+        assert!(crawl.iter().any(|v| v == "merge_requests"));
+        assert!(crawl.iter().any(|v| v == "issues"));
+        assert!(out["scopes"]["issues"]
+            .as_str()
+            .unwrap()
+            .contains("instance-wide"));
+        assert!(
+            host.contributed.borrow().is_empty(),
+            "estimate must be pure"
+        );
+
+        // A project-scoped estimate reports the narrower scope and is not flagged instance-wide.
+        let mut host2 = MockHost::default();
+        let scoped = run(
+            "gitlab.index.build",
+            json!({ "entities": ["merge_requests"], "mr_project": "group/app", "estimate": true }),
+            &mut host2,
+        );
+        assert_eq!(scoped["instance_wide"], false);
+        assert!(scoped["scopes"]["merge_requests"]
+            .as_str()
+            .unwrap()
+            .contains("group/app"));
+    }
+
+    /// GL-039: the never-implemented `user_*`/`group_*` `index.build` inputs are gone from the
+    /// schema (the surface no longer advertises support that does not exist), while the new
+    /// `issue_project`/`estimate` scoping inputs are present.
+    #[test]
+    fn index_build_schema_drops_unimplemented_user_and_group_inputs() {
+        let m = manifest_builder().build().manifest();
+        let op = m
+            .operations
+            .iter()
+            .find(|o| o.name == "gitlab.index.build")
+            .unwrap();
+        let props = op.input_schema["properties"].as_object().unwrap();
+        for gone in [
+            "user_limit",
+            "user_search",
+            "active_users",
+            "group_limit",
+            "group_search",
+            "group_order_by",
+            "group_sort",
+            "active_groups",
+            "all_visible_groups",
+        ] {
+            assert!(
+                !props.contains_key(gone),
+                "index.build still exposes {gone}"
+            );
+        }
+        assert!(props.contains_key("issue_project"));
+        assert!(props.contains_key("estimate"));
+    }
+
+    /// GL-026: namespace resolution paginates with `per_page=100` (not the old first-20-only
+    /// `per_page=20`). The canned response only matches a `per_page=100` request, so the old
+    /// behavior would fail to resolve.
+    #[test]
+    fn project_create_namespace_resolution_is_paginated() {
+        let mut host = base()
+            .with_http(
+                "/groups?search=team&per_page=100",
+                json!([{ "id": 5, "full_path": "team", "path": "team" }]),
+            )
+            .with_http("/api/v4/projects", json!({ "id": 9, "name": "dummy" }));
+        let out = run(
+            "gitlab.project.create",
+            json!({ "name": "dummy", "namespace": "team" }),
+            &mut host,
+        );
+        assert_eq!(out["id"], 9);
+    }
+
+    /// GL-046: a bare basename that matches multiple nested groups is a hard error asking for the
+    /// full path — not a silent first-wins pick.
+    #[test]
+    fn project_create_rejects_ambiguous_namespace() {
+        let mut host = base().with_http(
+            "/groups?search=team",
+            json!([
+                { "id": 1, "full_path": "alpha/team", "path": "team" },
+                { "id": 2, "full_path": "beta/team", "path": "team" }
+            ]),
+        );
+        let err = manifest_builder()
+            .build()
+            .call(
+                "gitlab.project.create",
+                json!({ "name": "dummy", "namespace": "team" }),
+                &mut host,
+            )
+            .unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(
+            err.contains("alpha/team") && err.contains("beta/team"),
+            "{err}"
+        );
+    }
+
+    /// GL-046: an exact `full_path` match disambiguates deterministically even when a basename is
+    /// shared, so resolution succeeds instead of erroring.
+    #[test]
+    fn project_create_prefers_exact_full_path_over_basename() {
+        let mut host = base()
+            .with_http(
+                "/groups?search=team",
+                json!([
+                    { "id": 1, "full_path": "alpha/team", "path": "team" },
+                    { "id": 2, "full_path": "team", "path": "team" }
+                ]),
+            )
+            .with_http("/api/v4/projects", json!({ "id": 9 }));
+        let out = run(
+            "gitlab.project.create",
+            json!({ "name": "dummy", "namespace": "team" }),
+            &mut host,
+        );
+        assert_eq!(out["id"], 9);
+    }
+
+    // ==== D-94: output ergonomics & pure-read side-effects ====
+
+    /// GL-006: `repository.file.show` adds a `decoded_content` text field for UTF-8 files while
+    /// keeping the raw base64 `content`/`encoding` for existing consumers.
+    #[test]
+    fn repo_file_show_adds_decoded_content_for_utf8_text() {
+        // "Zm9v" is base64 for "foo".
+        let mut host = base().with_http(
+            "/repository/files/src%2Fmain.rs?ref=main",
+            json!({ "file_path": "src/main.rs", "content": "Zm9v", "encoding": "base64" }),
+        );
+        let out = run(
+            "gitlab.repository.file.show",
+            json!({ "project": "group/app", "path": "src/main.rs", "ref": "main" }),
+            &mut host,
+        );
+        assert_eq!(out["decoded_content"], "foo");
+        // Raw fields are untouched.
+        assert_eq!(out["content"], "Zm9v");
+        assert_eq!(out["encoding"], "base64");
+    }
+
+    /// GL-015: a plain read/list is pure by default — no datasource records are contributed (so
+    /// the host prints no `(N record(s) contributed)` stderr line). Contribution is opt-in via
+    /// `contribute:true`, which `index.build` does deliberately.
+    #[test]
+    fn reads_are_pure_unless_contribution_is_opted_in() {
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/merge_requests",
+            json!([{ "iid": 7, "title": "MR", "description": "body" }]),
+        );
+        // Default: pure read, nothing contributed.
+        run(
+            "gitlab.mr.list",
+            json!({ "project": "group/app" }),
+            &mut host,
+        );
+        assert!(
+            host.contributed.borrow().is_empty(),
+            "a plain read must not contribute records"
+        );
+        // Opt-in: records are contributed.
+        run(
+            "gitlab.mr.list",
+            json!({ "project": "group/app", "contribute": true }),
+            &mut host,
+        );
+        assert_eq!(host.contributed.borrow().len(), 1);
+        assert_eq!(host.contributed.borrow()[0].id, "group/app!7");
+    }
 }
 
 // ===========================================================================
@@ -6657,6 +7378,7 @@ mod schema_contract {
                         p("per_page", Kind::Int),
                         p("page", Kind::Int),
                         p("membership", Kind::Bool),
+                        p("contribute", Kind::Bool),
                     ],
                     vec![],
                 ),
@@ -6680,6 +7402,7 @@ mod schema_contract {
                         p("page", Kind::Int),
                         p("source_branch", Kind::Str),
                         p("target_branch", Kind::Str),
+                        p("contribute", Kind::Bool),
                     ],
                     vec!["project"],
                 ),
@@ -6708,6 +7431,7 @@ mod schema_contract {
                         p("limit", Kind::Int),
                         p("per_page", Kind::Int),
                         p("page", Kind::Int),
+                        p("contribute", Kind::Bool),
                     ],
                     vec!["project"],
                 ),
@@ -6743,15 +7467,8 @@ mod schema_contract {
                         p("order_by", Kind::Str),
                         p("sort", Kind::Str),
                         p("membership", Kind::Bool),
-                        p("user_limit", Kind::Int),
-                        p("user_search", Kind::Str),
-                        p("active_users", Kind::Bool),
-                        p("group_limit", Kind::Int),
-                        p("group_search", Kind::Str),
-                        p("group_order_by", Kind::Str),
-                        p("group_sort", Kind::Str),
-                        p("active_groups", Kind::Bool),
-                        p("all_visible_groups", Kind::Bool),
+                        p("estimate", Kind::Bool),
+                        p("issue_project", Kind::Str),
                         p("issue_limit", Kind::Int),
                         p("issue_search", Kind::Str),
                         p("issue_state", Kind::Str),
@@ -6779,6 +7496,17 @@ mod schema_contract {
                         p("initialize_with_readme", Kind::Bool),
                     ],
                     vec!["name"],
+                ),
+            ),
+            (
+                "gitlab.project.delete",
+                c(
+                    vec![
+                        p("project", Kind::Str),
+                        p("confirm_path", Kind::Str),
+                        p("confirm_project_id", Kind::Int),
+                    ],
+                    vec!["project"],
                 ),
             ),
             (
@@ -6942,13 +7670,17 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("branch", Kind::Str),
                         p("name", Kind::Str),
+                        p("confirm_branch", Kind::Str),
                     ],
                     vec!["project"],
                 ),
             ),
             (
                 "gitlab.branch.delete_merged",
-                c(vec![p("project", Kind::Str)], vec!["project"]),
+                c(
+                    vec![p("project", Kind::Str), p("confirm_project", Kind::Str)],
+                    vec!["project"],
+                ),
             ),
             (
                 "gitlab.repository.file.create",
@@ -7011,6 +7743,7 @@ mod schema_contract {
                         p("author_email", Kind::Str),
                         p("author_name", Kind::Str),
                         p("last_commit_id", Kind::Str),
+                        p("confirm_file_path", Kind::Str),
                     ],
                     vec!["project", "file_path", "branch", "commit_message"],
                 ),
@@ -7125,6 +7858,7 @@ mod schema_contract {
                         p("tag_name", Kind::Str),
                         p("tag", Kind::Str),
                         p("name", Kind::Str),
+                        p("confirm_tag_name", Kind::Str),
                     ],
                     vec!["project"],
                 ),
@@ -7143,7 +7877,14 @@ mod schema_contract {
             ),
             (
                 "gitlab.snippet.delete",
-                c(vec![p("snippet_id", Kind::Int), p("id", Kind::Int)], vec![]),
+                c(
+                    vec![
+                        p("snippet_id", Kind::Int),
+                        p("id", Kind::Int),
+                        p("confirm_snippet_id", Kind::Int),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "gitlab.search.blobs",
@@ -7317,6 +8058,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("key", Kind::Str),
                         p("environment_scope", Kind::Str),
+                        p("confirm_key", Kind::Str),
                     ],
                     vec!["project", "key"],
                 ),
@@ -7450,6 +8192,7 @@ mod schema_contract {
                         p("project", Kind::Str),
                         p("tag_name", Kind::Str),
                         p("tag", Kind::Str),
+                        p("confirm_tag_name", Kind::Str),
                     ],
                     vec!["project"],
                 ),
@@ -7541,7 +8284,7 @@ mod schema_contract {
                         p("trailer", Kind::Str),
                         p("config_file", Kind::Str),
                     ],
-                    vec!["project", "version"],
+                    vec!["project", "version", "branch"],
                 ),
             ),
             (

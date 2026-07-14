@@ -15,14 +15,66 @@
 
 ## [Unreleased]
 
+### New
+
+- **Install a plugin straight from a git repo.** `flux plugin install --git <url> --tag <v>` clones
+  and builds a plugin from source — the way to run a private or third-party plugin that the signed
+  pack channel can't serve. It shows the exact commit and asks for confirmation before building
+  anything.
+- **The Flux-Lang editor server now ships as a downloadable binary** (no Rust toolchain needed), and
+  your editor can outline a `.flux` file and jump from a `$variable` or an operation call straight to
+  where it's defined.
+
+### Improved
+
+- **Embedded apps can tune specialist cognition independently from the manager.** A host may select
+  separate intent and exploration models, reasoning effort, output sizes, and call ceilings for
+  delegated work while retaining the existing child defaults when it does not opt in. Spawn
+  iteration, wall-clock, authorization, approval, and guarded-operation limits remain independent.
+- **GitLab: safer destructive operations.** Deleting a branch, tag, release, file, CI/CD variable, or
+  now a whole project is treated as the high-risk action it is, with an optional confirmation field to
+  prevent fat-finger mistakes.
+- **GitLab: scoped, previewable indexing and reliable project creation.** You can scope indexing to
+  one project's issues and preview an estimate before a broad crawl, and creating a project inside a
+  group namespace resolves reliably — refusing to guess when a name is ambiguous.
+- **GitLab: readable files and side-effect-free reads.** Reading a file now hands you the decoded text
+  alongside the raw content, and plain reads and lists no longer write to your index or print stderr
+  chatter unless you ask them to.
+- **The editor server updates large files incrementally and no longer eats your comments when
+  formatting.**
+
 ### Fixed
 
+- **Long adaptive turns keep one stable integration-family limit.** Later evidence may still surface
+  another relevant integration, but repeated expansion cannot grow the active set past four and
+  trigger a delayed oversized-catalog failure.
+- **Gemini models on OpenRouter can use the same operation catalog as other providers.** Flux now
+  translates compatible schema details before the request and stops locally with a precise
+  operation/path error when a constraint cannot be represented. Your complete operation contract
+  still governs validation, approvals, and execution.
+- **Cancelling a served request now stops delegated work even when an integration opens a nested
+  runtime.** The specialist remains linked to the real parent conversation for audit and live
+  activity, while standalone one-shot flows keep their existing independent behavior.
 - **Extreme outer-loop limits fail safely at startup.** `max_iterations` accepts values from 1 to
   1,000; larger CLI, config, SDK, or embedded-agent values are rejected before Flux builds the
   repeated control program.
 - **Cancelling delegated work clears its live activity state.** A specialist that is still running
   when its parent turn is cancelled now reports a correlated failure completion, so chat surfaces
   do not leave that child shown as active.
+- **Plugin calls no longer print secret-like fields.** Previewing or running a GitLab CI/CD variable
+  write now masks the value (shown as `***`), and the GitLab auth check returns just your id, username,
+  and name instead of your full profile.
+
+### Action needed
+
+- **Rust hosts that store `EngineLoopHost::set_turn` as a typed function pointer must accept or
+  explicitly discard its returned activity reporter.** Ordinary calls used as statements keep compiling.
+- **GitLab `changelog.add` now requires an explicit `branch`** — it no longer silently commits to your
+  default branch, so add the branch you intend to write.
+- **GitLab plain reads and lists no longer contribute to the datasource index by default** — pass
+  `contribute: true` on `project.list`/`mr.list`/`issue.list` to restore the previous behavior.
+- **GitLab `index.build` dropped the unimplemented `user_*`/`group_*` inputs** — remove them from any
+  calls that set them (they were never honored).
 
 ## [0.22.0] - 2026-07-14
 

@@ -121,6 +121,17 @@ shared validation layer used by both dry-run and runtime."** That is D-88, the k
 8. **D-95 — Direct-call private-net grant parity + QA egress docs** (Core; extends D-20). Wire
    endpoint-level grants into the direct `flux plugin call` path or document the `[private_net.plugins]`-
    only support (GL-003); add a short "testing a private GitLab safely" scoped-egress note (GL-002).
+   - **Resolved (2026-07-14) by the documentation arm.** GL-003's premise was refined during
+     implementation: endpoint-level grants (`[private_net.endpoints]` / `endpoint_private_hosts`) are
+     parsed but consumed by **no** production path — the drop is *uniform* across the agent, app, and
+     direct-`plugin call` sites, all of which route through `effective_plugin_private_hosts` →
+     `plugin_private_hosts` (plugin-scoped). There is no direct-call-specific gap and no path that
+     "honours" endpoint grants. Full per-endpoint scoping would need endpoint identity threaded to the
+     per-request guard (a change to the private-net safety guard) — out of scope for this hardening story
+     and deferred to a follow-up. D-95 therefore documents the enforced `[private_net.plugins]`-only
+     reality and the scoped-egress recipe in [`scoped-private-net-egress.md`](scoped-private-net-egress.md)
+     (§ *Enforcement status & scoped-egress recipe*), with a characterization test pinning that
+     `[private_net.endpoints]` stays inert until deliberately wired.
 
 ## Out of scope / already handled (do not re-file)
 

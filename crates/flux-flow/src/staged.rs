@@ -1930,7 +1930,9 @@ fn capability_signal_tool(families: &BTreeMap<String, Family>) -> ToolDef {
         .collect::<Vec<_>>();
     ToolDef {
         name: SIGNAL_CAPABILITIES.into(),
-        description: "Signal additional registered capability families justified by facts discovered during exploration. This only changes tool visibility; it neither calls an operation nor grants authority. Call by itself.".into(),
+        description: format!(
+            "Signal additional registered capability families justified by facts discovered during exploration. This only changes tool visibility; it neither calls an operation nor grants authority. The accumulated active set may contain at most {MAX_FAMILIES} families. Call by itself."
+        ),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -1990,6 +1992,12 @@ fn apply_capability_signal(
         if !new_families.iter().any(|seen| seen == family) {
             new_families.push(family.to_string());
         }
+    }
+    if new_families.len() > MAX_FAMILIES {
+        return Err(Error::Other(format!(
+            "`{SIGNAL_CAPABILITIES}` would select {} accumulated families; the maximum is {MAX_FAMILIES}",
+            new_families.len()
+        )));
     }
     let declaration = IntentDeclaration {
         intent: format!("{}; additional signal: {reason}", state.declaration.intent),
@@ -3478,6 +3486,67 @@ mod tests {
         );
     }
 
+    /// A-83 (failing first): later signals may widen visibility, but the durable union must retain
+    /// the same four-family ceiling as the initial declaration. Reject before expanding schemas or
+    /// mutating the resumable state so a fifth small family cannot defer failure to a later round.
+    #[test]
+    fn semantic_capability_signal_rejects_fifth_cumulative_family_before_expansion() {
+        let families = (0..5)
+            .map(|index| {
+                let family_name = format!("plugin.fixture-{index}");
+                let operation = format!("fixture_{index}.inspect");
+                (
+                    family_name.clone(),
+                    Family {
+                        name: family_name,
+                        description: format!("Fixture family {index}"),
+                        specs: vec![spec(&operation, vec![Effect::Read], Vec::new(), None)],
+                        exhaustive_members: false,
+                        routing_signals: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let initial_families = (0..4)
+            .map(|index| format!("plugin.fixture-{index}"))
+            .collect::<Vec<_>>();
+        let initial_selected = (0..4)
+            .map(|index| format!("fixture_{index}.inspect"))
+            .collect::<Vec<_>>();
+        let mut state = AdaptiveState {
+            version: 1,
+            declaration: IntentDeclaration {
+                intent: "inspect four fixture families".into(),
+                families: initial_families.clone(),
+            },
+            selected: initial_selected.clone(),
+            messages: vec![Message::user_text("inspect the fixtures")],
+            proposed: Vec::new(),
+            gathered: Vec::new(),
+            native_step: 0,
+            last_error: String::new(),
+            pending: None,
+            intent_calls: 1,
+            explore_calls: 1,
+        };
+
+        let error = apply_capability_signal(
+            &mut state,
+            &json!({
+                "capability_families": ["plugin.fixture-4"],
+                "reason": "later evidence named one more integration"
+            }),
+            &families,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("5"), "error was: {error}");
+        assert!(error.contains("maximum is 4"), "error was: {error}");
+        assert_eq!(state.declaration.families, initial_families);
+        assert_eq!(state.selected, initial_selected);
+    }
+
     #[tokio::test]
     async fn semantic_capability_signal_can_propose_an_action_beyond_initial_surface() {
         let responses = vec![
@@ -3857,6 +3926,48 @@ mod tests {
             .unwrap();
         assert!(repair.contains("invented"), "repair was: {repair}");
         assert!(repair.contains("unexpected") || repair.contains("additional"));
+    }
+
+    #[test]
+    fn returned_arguments_validate_against_the_original_registered_schema() {
+        let TestHarness { context, .. } = staged_context(Vec::new());
+        let spec = ToolSpec {
+            description: "Inspect a bounded set of records".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "records": {"type": "array", "maxItems": 1}
+                },
+                "required": ["records"],
+                "additionalProperties": false
+            }),
+            ..spec(
+                "inspect",
+                vec![Effect::Read, Effect::Filesystem],
+                vec![AccessKind::Filesystem],
+                None,
+            )
+        };
+        let original = spec.input_schema.clone();
+
+        let errors = validate_call(
+            &spec,
+            &json!({"records": [{"id": 1}, {"id": 2}]}),
+            &context,
+            &HashSet::from(["inspect".into()]),
+        )
+        .unwrap_err();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("more than 1 item")),
+            "errors were: {errors:?}"
+        );
+        assert!(spec.input_schema["properties"]["records"]
+            .get("items")
+            .is_none());
+        assert_eq!(spec.input_schema, original);
     }
 
     #[tokio::test]

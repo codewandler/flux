@@ -2,8 +2,8 @@
 id: D-91
 title: gitlab — destructive-op risk metadata, confirm fields & project.delete
 pillar: Agent
-status: backlog
-priority:
+status: done
+priority: 3
 epic: gitlab-plugin-hardening
 design: docs/designs/gitlab-plugin-hardening.md
 note: "all create/update/delete/merge are flat 'Medium' risk with no confirm field; no plugin-native project.delete (lifecycle tests need raw REST); changelog.add writes to the default branch/file with only project+version (GL-001/005/037)"

@@ -17,6 +17,7 @@ pub use fn_tool::{tool_fn, FnTool};
 pub mod context;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,17 +37,6 @@ use flux_policy::{
 use flux_secret::Redactor;
 use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, StagingDisposition, ToolSpec};
 use flux_system::{PathAccess, System};
-
-tokio::task_local! {
-    /// The parent turn's child-activity reporter while one guarded tool future is executing.
-    /// Nested runtimes assembled by adapter tools inherit this into their own `ToolContext`; the
-    /// task-local scope prevents concurrent turns from retargeting one another.
-    static ACTIVE_SPAWN_ACTIVITY_SINK: Arc<dyn SpawnActivitySink>;
-}
-
-fn inherited_spawn_activity_sink() -> Option<Arc<dyn SpawnActivitySink>> {
-    ACTIVE_SPAWN_ACTIVITY_SINK.try_with(Arc::clone).ok()
-}
 
 /// The result of executing a tool.
 ///
@@ -199,6 +189,98 @@ impl SpawnActivity {
 /// Implementations must not hold a lock across an await; the engine adapter only enqueues events.
 pub trait SpawnActivitySink: Send + Sync {
     fn emit(&self, activity: SpawnActivity);
+}
+
+/// Lexically scoped capabilities belonging to one live runtime turn. A conversational driver
+/// installs this around the future that actually drives the turn; guarded adapter tools and nested
+/// runtimes can then inherit cancellation, parent-session lineage, and child-activity reporting
+/// without reading process-global or long-lived mutable turn slots.
+///
+/// The scope is future-local: concurrent Tokio tasks do not exchange it, a nested scope restores
+/// its parent on exit (including cancellation/drop), and a context retained after the scope ends
+/// cannot observe obsolete turn state. A spawned Tokio task does not inherit task-locals; callers
+/// that deliberately cross that boundary (such as `FlowClient::execute_streamed`) must snapshot and
+/// pin this value onto their fresh [`ToolContext`] before spawning.
+#[derive(Clone, Default)]
+pub struct RuntimeTurnContext {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    session: Option<String>,
+    spawn_activity: Option<Arc<dyn SpawnActivitySink>>,
+}
+
+impl RuntimeTurnContext {
+    /// An explicitly empty turn context. When scoped, its absent fields are authoritative: stale
+    /// fallback slots on a long-lived [`ToolContext`] stay hidden for the scope's lifetime.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Carry the cancellation token of the live parent turn.
+    pub fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Carry the live parent turn's session id for child-stream correlation.
+    pub fn with_session(mut self, session: impl Into<String>) -> Self {
+        self.session = Some(session.into());
+        self
+    }
+
+    /// Carry the live parent turn's child-activity reporter.
+    pub fn with_spawn_activity_sink(mut self, sink: Arc<dyn SpawnActivitySink>) -> Self {
+        self.spawn_activity = Some(sink);
+        self
+    }
+
+    /// The turn's cancellation token, when driven by a cancellable surface.
+    pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancel.clone()
+    }
+
+    /// The turn's session id, when this runtime is part of a parent conversation.
+    pub fn session_id(&self) -> Option<String> {
+        self.session.clone()
+    }
+
+    /// The turn's live child-activity reporter, when one is attached.
+    pub fn spawn_activity_sink(&self) -> Option<Arc<dyn SpawnActivitySink>> {
+        self.spawn_activity.clone()
+    }
+
+    /// Whether this snapshot carries no live turn capabilities.
+    pub fn is_empty(&self) -> bool {
+        self.cancel.is_none() && self.session.is_none() && self.spawn_activity.is_none()
+    }
+}
+
+impl std::fmt::Debug for RuntimeTurnContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeTurnContext")
+            .field("cancel", &self.cancel.is_some())
+            .field("session", &self.session)
+            .field("spawn_activity", &self.spawn_activity.is_some())
+            .finish()
+    }
+}
+
+tokio::task_local! {
+    static ACTIVE_RUNTIME_TURN: RuntimeTurnContext;
+}
+
+/// Snapshot the currently active lexical turn, if a driver installed one. `Some(empty)` is
+/// distinct from `None`: an explicitly empty scope suppresses legacy stored fallback values.
+pub fn active_runtime_turn_context() -> Option<RuntimeTurnContext> {
+    ACTIVE_RUNTIME_TURN.try_with(Clone::clone).ok()
+}
+
+/// Drive `future` inside one lexical runtime-turn scope. Nested scopes restore the previous value
+/// automatically, and concurrent tasks remain isolated by Tokio's task-local semantics.
+pub async fn scope_runtime_turn<F>(turn: RuntimeTurnContext, future: F) -> F::Output
+where
+    F: Future,
+{
+    ACTIVE_RUNTIME_TURN.scope(turn, future).await
 }
 
 /// One sub-agent spawn, fully described. `cap_scope` is the caller's active `with_tools`
@@ -386,24 +468,15 @@ pub struct ToolContext {
     /// ops, and any sibling run that re-enters this same context all write to **one** audit trail.
     /// Lives here (not Executor-private) so the `observe`/`evidence` ops can read and append to it.
     pub evidence: Arc<Mutex<EvidenceLog>>,
-    /// The turn's cancellation token, installed per turn by the engine (interior-mutable so the
-    /// shared, long-lived context can carry a fresh token each turn — same lifecycle, and the same
-    /// **one-active-turn-per-engine** assumption, as `loop_host`'s per-turn `set_turn`). A spawning
-    /// tool (`task`) threads a child of this token into its sub-agent so cancelling the parent turn
-    /// cancels the child; `None` (no cancellable driver, e.g. the one-shot SDK path) means the
-    /// sub-agent simply runs to completion. INVARIANT: a single engine must not drive two turns
-    /// concurrently — running concurrent turns would clobber this slot (and `loop_host`'s). Surfaces
-    /// that fan out concurrently (e.g. a server) must use one engine per concurrent turn; the SDK's
-    /// `FlowClient` is already safe (a fresh `ToolContext` per `execute`).
+    /// Stored cancellation fallback for legacy/direct drivers and for a fresh nested runtime that
+    /// deliberately pins a lexical [`RuntimeTurnContext`] before crossing `tokio::spawn`. Active
+    /// conversational turns use the task-local scope, not this long-lived mutable slot.
     cancel: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
-    /// The current turn's session id, installed per turn by the engine (same interior-mutable,
-    /// one-active-turn-per-engine lifecycle as `cancel`). A spawning tool (`task`) reads it to
-    /// correlate the child's audit stream to the parent turn (A-08).
+    /// Stored session-lineage fallback; see `cancel`. The lexical turn is authoritative even when
+    /// its session is `None`, so an empty direct one-shot scope cannot revive stale lineage here.
     session: Arc<Mutex<Option<String>>>,
-    /// Live child-activity reporter for the active turn. Like `cancel`/`session`, this is a
-    /// snapshotted, interior-mutable one-active-turn slot installed by the engine. `TaskTool`
-    /// copies the current `Arc` into each [`SpawnRequest`], so a later turn cannot retarget an
-    /// already-running child.
+    /// Stored child-activity fallback; see `cancel`. Ordinary engine turns manufacture a fresh
+    /// reporter and carry it only in their lexical [`RuntimeTurnContext`].
     spawn_activity: Arc<Mutex<Option<Arc<dyn SpawnActivitySink>>>>,
     /// The **capability-scope stack**: each entry is the effective tool-name allowlist of one active
     /// `with_tools` block, narrow-only (an entry is always the intersection of its own declared set
@@ -440,43 +513,61 @@ impl ToolContext {
         self.cap_scopes.lock().unwrap().last().cloned()
     }
 
-    /// Install the turn's cancellation token (the engine calls this per turn before running the loop).
-    /// Interior-mutable so a cloned, shared context picks it up.
+    /// Install a stored cancellation fallback. New turn drivers should use
+    /// [`scope_runtime_turn`] with [`RuntimeTurnContext::with_cancel`]; this setter remains for
+    /// compatibility with direct drivers and for pinning a fresh context across a spawned task.
     pub fn set_cancel(&self, token: tokio_util::sync::CancellationToken) {
         *self.cancel.lock().unwrap() = Some(token);
     }
 
-    /// The turn's cancellation token, if a cancellable driver installed one.
+    /// The active lexical turn's cancellation token, falling back to a deliberately stored value
+    /// only when no lexical scope exists.
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
-        self.cancel.lock().unwrap().clone()
+        self.runtime_turn_context().cancel_token()
     }
 
-    /// Install the turn's session id (the engine calls this per turn, like [`set_cancel`]
-    /// (Self::set_cancel)). A spawning tool (`task`) reads it back to correlate the child's audit
-    /// stream to the parent turn (A-08). Same one-active-turn-per-engine lifecycle as `cancel`.
+    /// Install stored session lineage. New turn drivers should scope a [`RuntimeTurnContext`]; this
+    /// setter remains for direct authored-flow compatibility and fresh-context pinning.
     pub fn set_session(&self, session_id: impl Into<String>) {
         *self.session.lock().unwrap() = Some(session_id.into());
     }
 
-    /// The current turn's session id, if a driver installed one.
+    /// The active lexical parent session, falling back to a deliberately stored value only when no
+    /// lexical scope exists.
     pub fn session_id(&self) -> Option<String> {
-        self.session.lock().unwrap().clone()
+        self.runtime_turn_context().session_id()
     }
 
-    /// Install the active turn's live child-activity reporter.
+    /// Install a stored child-activity reporter. Prefer a lexical [`RuntimeTurnContext`] for live
+    /// turn drives; this setter is intended for fresh-context pinning and compatibility.
     pub fn set_spawn_activity_sink(&self, sink: Arc<dyn SpawnActivitySink>) {
         *self.spawn_activity.lock().unwrap() = Some(sink);
     }
 
-    /// Snapshot the current turn's child-activity reporter for a [`SpawnRequest`]. Adapter tools
-    /// that open a nested runtime inherit the reporter only while their guarded future is active;
-    /// a context retained past that lexical scope does not keep an obsolete parent callback.
+    /// Snapshot the current turn's child-activity reporter for a [`SpawnRequest`].
     pub fn spawn_activity_sink(&self) -> Option<Arc<dyn SpawnActivitySink>> {
-        self.spawn_activity
-            .lock()
-            .unwrap()
-            .clone()
-            .or_else(inherited_spawn_activity_sink)
+        self.runtime_turn_context().spawn_activity_sink()
+    }
+
+    /// The complete effective runtime-turn snapshot. An active lexical scope is authoritative,
+    /// including absent fields; only outside such a scope are the stored compatibility values read.
+    /// This distinction prevents a reused context from reviving a prior turn's cancellation or
+    /// session lineage inside an explicitly empty one-shot run.
+    pub fn runtime_turn_context(&self) -> RuntimeTurnContext {
+        active_runtime_turn_context().unwrap_or_else(|| RuntimeTurnContext {
+            cancel: self.cancel.lock().unwrap().clone(),
+            session: self.session.lock().unwrap().clone(),
+            spawn_activity: self.spawn_activity.lock().unwrap().clone(),
+        })
+    }
+
+    /// Replace all stored runtime-turn fallbacks with one snapshot. This is the explicit bridge for
+    /// a **fresh** nested context that is about to cross a spawned-task boundary; long-lived engine
+    /// contexts should scope the turn instead, so retained contexts cannot keep obsolete state.
+    pub fn set_runtime_turn_context(&self, turn: RuntimeTurnContext) {
+        *self.cancel.lock().unwrap() = turn.cancel;
+        *self.session.lock().unwrap() = turn.session;
+        *self.spawn_activity.lock().unwrap() = turn.spawn_activity;
     }
 
     /// Record that `path` was read at `mtime` (called by `read`/`read_many`).
@@ -1816,14 +1907,12 @@ impl Executor {
         //    both the success content and any error — before it reaches the model or the logs.
         self.record_dispatch_event("tool.started", dispatch, name, started, json!({}));
         let execution_started = Instant::now();
-        // Keep the reporter live only for this guarded tool future. A nested runtime assembled by an
-        // adapter tool receives it through `ToolContext::new`; task-local scoping keeps concurrent
-        // turns isolated and avoids a process-global callback.
+        // Keep the complete runtime-turn context live only for this guarded tool future. A nested
+        // runtime assembled by an adapter tool can inherit cancellation, session lineage and the
+        // reporter together; task-local scoping isolates concurrent turns and restores an outer
+        // scope after a nested dispatch.
         let execution = tool.execute(&self.ctx, params);
-        let executed = match self.ctx.spawn_activity_sink() {
-            Some(activity) => ACTIVE_SPAWN_ACTIVITY_SINK.scope(activity, execution).await,
-            None => execution.await,
-        };
+        let executed = scope_runtime_turn(self.ctx.runtime_turn_context(), execution).await;
         let result = match executed {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
@@ -2011,7 +2100,9 @@ mod tests {
 
         async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
             let nested = ToolContext::new(ctx.system.clone());
-            let inherited = nested.spawn_activity_sink().is_some();
+            let inherited = nested.spawn_activity_sink().is_some()
+                && nested.cancel_token().is_some()
+                && nested.session_id().as_deref() == Some("parent-session");
             *self.captured.lock().unwrap() = Some(nested);
             Ok(ToolResult::ok(if inherited {
                 "inherited"
@@ -2029,6 +2120,8 @@ mod tests {
             captured: captured.clone(),
         }));
         let ctx = test_ctx();
+        ctx.set_cancel(tokio_util::sync::CancellationToken::new());
+        ctx.set_session("parent-session");
         ctx.set_spawn_activity_sink(Arc::new(NoopSpawnActivitySink));
         let executor = Executor::new(
             registry,
@@ -2040,16 +2133,94 @@ mod tests {
         let result = executor.dispatch("nested_context_probe", json!({})).await;
 
         assert_eq!(result.content, "inherited");
-        assert!(
-            captured
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .spawn_activity_sink()
-                .is_none(),
-            "a nested context retained after the adapter returns must not keep the old turn sink"
+        let retained = captured.lock().unwrap().as_ref().unwrap().clone();
+        assert!(retained.runtime_turn_context().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_runtime_turn_scopes_do_not_exchange_cancel_or_session() {
+        let ctx = test_ctx();
+        let left_cancel = tokio_util::sync::CancellationToken::new();
+        let right_cancel = tokio_util::sync::CancellationToken::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let left = scope_runtime_turn(
+            RuntimeTurnContext::new()
+                .with_cancel(left_cancel.clone())
+                .with_session("left"),
+            {
+                let ctx = ctx.clone();
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    left_cancel.cancel();
+                    tokio::task::yield_now().await;
+                    assert!(ctx.cancel_token().unwrap().is_cancelled());
+                    assert_eq!(ctx.session_id().as_deref(), Some("left"));
+                }
+            },
         );
+        let right = scope_runtime_turn(
+            RuntimeTurnContext::new()
+                .with_cancel(right_cancel)
+                .with_session("right"),
+            {
+                let ctx = ctx.clone();
+                async move {
+                    barrier.wait().await;
+                    tokio::task::yield_now().await;
+                    assert!(!ctx.cancel_token().unwrap().is_cancelled());
+                    assert_eq!(ctx.session_id().as_deref(), Some("right"));
+                }
+            },
+        );
+
+        tokio::join!(left, right);
+        assert!(ctx.runtime_turn_context().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_runtime_turn_scope_suppresses_and_restores_stored_fallbacks() {
+        let ctx = test_ctx();
+        ctx.set_cancel(tokio_util::sync::CancellationToken::new());
+        ctx.set_session("obsolete");
+        ctx.set_spawn_activity_sink(Arc::new(NoopSpawnActivitySink));
+
+        scope_runtime_turn(RuntimeTurnContext::new(), async {
+            assert!(ctx.runtime_turn_context().is_empty());
+            let retained = ToolContext::new(ctx.system.clone());
+            assert!(retained.runtime_turn_context().is_empty());
+        })
+        .await;
+
+        assert_eq!(ctx.session_id().as_deref(), Some("obsolete"));
+        assert!(ctx.cancel_token().is_some());
+        assert!(ctx.spawn_activity_sink().is_some());
+    }
+
+    #[tokio::test]
+    async fn nested_reporter_scope_on_a_cloned_snapshot_restores_the_outer_reporter() {
+        let outer: Arc<dyn SpawnActivitySink> = Arc::new(NoopSpawnActivitySink);
+        let inner: Arc<dyn SpawnActivitySink> = Arc::new(NoopSpawnActivitySink);
+        let ctx = test_ctx();
+        let cloned = ctx.clone();
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_spawn_activity_sink(outer.clone()),
+            async {
+                assert!(Arc::ptr_eq(&cloned.spawn_activity_sink().unwrap(), &outer));
+                let nested = cloned
+                    .runtime_turn_context()
+                    .with_spawn_activity_sink(inner.clone());
+                scope_runtime_turn(nested, async {
+                    assert!(Arc::ptr_eq(&cloned.spawn_activity_sink().unwrap(), &inner));
+                })
+                .await;
+                assert!(Arc::ptr_eq(&cloned.spawn_activity_sink().unwrap(), &outer));
+            },
+        )
+        .await;
+        assert!(cloned.spawn_activity_sink().is_none());
     }
 
     /// Minimal guarded filesystem reader used to prove that permission subjects name the physical

@@ -2,8 +2,8 @@
 id: D-94
 title: gitlab — output ergonomics (decoded text) & quiet pure reads
 pillar: Agent
-status: backlog
-priority:
+status: done
+priority: 5
 epic: gitlab-plugin-hardening
 design: docs/designs/gitlab-plugin-hardening.md
 note: "file.show returns base64 only (agents want text); plain read/list calls contribute datasource records and print stderr noise, surprising scripts expecting pure reads (GL-006/015)"

@@ -161,6 +161,51 @@ pub struct OperationSpec {
     /// ops unchanged.
     #[serde(default)]
     pub internal: bool,
+    /// **Secret-like fields** (GL-031 / D-93): property NAMES whose values the host must MASK
+    /// wherever it echoes this op's input or result — the `flux plugin call` dry-run input preview,
+    /// the live result echo, the stringified [`Tool::execute`](PluginTool) result the model sees,
+    /// and audit. Declarative: an op marks which of its fields carry secrets (e.g. a CI/pipeline
+    /// variable `value`) and the host applies [`redact_secret_fields`] uniformly — the plugin never
+    /// redacts by hand, and secret values never reach terminal scrollback, logs, or saved
+    /// transcripts. Matched by property name at *any depth*, so a flat `value` field and an array of
+    /// `{key, value}` variable objects are both masked. Empty (the default) means "this op echoes
+    /// nothing secret," matching every existing manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redact_fields: Vec<String>,
+}
+
+/// The marker a secret-like field's value is replaced with when the host echoes it (GL-031).
+pub const REDACTED_MARKER: &str = "***";
+
+/// Mask secret-like fields in a JSON value for host-side echo/audit (GL-031 / D-93). Every object
+/// property whose key matches one of `fields` (by name, at any depth) has its value replaced with
+/// [`REDACTED_MARKER`], recursing through nested objects and arrays. This is the single masking
+/// applied to a plugin op's declared [`OperationSpec::redact_fields`] wherever secret-carrying
+/// input or output is printed: `flux plugin call`'s dry-run input preview and live result echo, and
+/// [`PluginTool::execute`]'s stringified result. Matching by key name (not a fixed JSON pointer)
+/// means an array of `{key, value}` variable objects is masked element-wise. A no-op when `fields`
+/// is empty (the common case), so it is safe to call unconditionally.
+pub fn redact_secret_fields(value: &mut Value, fields: &[String]) {
+    if fields.is_empty() {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if fields.iter().any(|f| f == key) {
+                    *val = Value::String(REDACTED_MARKER.to_string());
+                } else {
+                    redact_secret_fields(val, fields);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_secret_fields(item, fields);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The manifest-declared, deny-by-default operations that are projected as agent tools: every
@@ -2601,6 +2646,9 @@ pub struct PluginTool {
     /// [`ToolSpec`] has no room for them — see [`Tool::semantic_effects`].
     semantic_effects: Vec<String>,
     staging: StagingDisposition,
+    /// The op's declared secret-like field names (GL-031); the op result is passed through
+    /// [`redact_secret_fields`] with these before it is stringified into model-visible output.
+    redact_fields: Vec<String>,
 }
 
 impl PluginTool {
@@ -2620,6 +2668,7 @@ impl PluginTool {
             spec,
             semantic_effects,
             staging: op.staging,
+            redact_fields: op.redact_fields.clone(),
         }
     }
 }
@@ -2693,9 +2742,14 @@ impl Tool for PluginTool {
             .call_with_host(&self.operation, params, self.caps.as_ref())
             .await
         {
-            Ok(v) => Ok(ToolResult::ok(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
-            )),
+            Ok(mut v) => {
+                // Mask the op's declared secret-like fields (GL-031) before the result is
+                // stringified into model-visible output — a no-op unless the op declared any.
+                redact_secret_fields(&mut v, &self.redact_fields);
+                Ok(ToolResult::ok(
+                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+                ))
+            }
             Err(e) => Ok(ToolResult::error(e.to_string())),
         }
     }
@@ -2774,6 +2828,12 @@ pub async fn load_plugin_tools(
 /// all three (the installed version, the sha256 of the installed binary, and the release it came
 /// from, e.g. `plugins-v0.2.0`); a local/dev descriptor (`add`, `install --dir`) carries none of
 /// them and stays valid — `ls`/`status` label it `unverified (local)` rather than `verified`.
+///
+/// `git_url`/`git_commit` are the third install source's provenance (D-87, `install --git`): a
+/// from-source build records the git URL it was cloned from and the resolved commit it was built
+/// at, but no signed-pack `sha256`. Such a descriptor is [`Verification::UnverifiedFromSource`] —
+/// `ls`/`status` label it `from-source (unverified)`, distinct from both a signed pack and a
+/// `--dir` local scan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PluginDescriptor {
     /// The plugin executable (absolute path or a name on `PATH`).
@@ -2798,6 +2858,16 @@ pub struct PluginDescriptor {
     /// versioned store (D-48).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+    /// The git URL a `--git` source install (D-87) was cloned from — the provenance anchor of a
+    /// from-source build (paired with `git_commit`). Present + a **missing** `sha256` is what makes
+    /// a descriptor [`Verification::UnverifiedFromSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_url: Option<String>,
+    /// The resolved commit sha a `--git` source install (D-87) was built at — the second half of
+    /// from-source provenance, shown before the build and recorded so a re-install of the same
+    /// commit is an idempotent no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
 }
 
 /// The outcome of re-hashing a descriptor's binary against its recorded `sha256` (D-48) — the
@@ -2812,14 +2882,27 @@ pub enum Verification {
     /// The descriptor carries no `sha256` (a dev/local `add` or `install --dir`) — spawns as
     /// always, visibly labeled `unverified (local)` in `ls`/`status`.
     UnverifiedLocal,
+    /// The descriptor carries no `sha256` but *does* carry git provenance (`git_url`) — a `--git`
+    /// source build (D-87). Building arbitrary source is code execution, so the install was gated
+    /// behind explicit consent + commit disclosure; the resulting binary is trusted-because-built,
+    /// not signed. Spawns exactly like [`Verification::UnverifiedLocal`] (never a `HashDrift`
+    /// refusal), visibly labeled `from-source (unverified)` in `ls`/`status` — distinct from a
+    /// signed pack and from a `--dir` local scan.
+    UnverifiedFromSource,
 }
 
 /// Re-hash the binary a descriptor points at against its recorded `sha256`. A hashless descriptor
-/// is [`Verification::UnverifiedLocal`]; an unreadable binary under a recorded hash is reported as
-/// drift (the read error stands in for the actual hash) — verification never silently passes.
+/// is [`Verification::UnverifiedFromSource`] when it carries git provenance (a `--git` build, D-87)
+/// and [`Verification::UnverifiedLocal`] otherwise (`add`/`install --dir`); an unreadable binary
+/// under a recorded hash is reported as drift (the read error stands in for the actual hash) —
+/// verification never silently passes.
 pub fn verify_descriptor(d: &PluginDescriptor) -> Verification {
     let Some(expected) = &d.sha256 else {
-        return Verification::UnverifiedLocal;
+        return if d.git_url.is_some() {
+            Verification::UnverifiedFromSource
+        } else {
+            Verification::UnverifiedLocal
+        };
     };
     let actual = match std::fs::read(&d.program) {
         Ok(bytes) => pack::sha256_hex(&bytes),
@@ -5468,6 +5551,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// D-87: a hashless descriptor that carries git provenance (`git_url`) is
+    /// `UnverifiedFromSource`, NOT `UnverifiedLocal` — and, crucially, NOT `HashDrift`, so
+    /// `spawn_verified` (whose only refusal is `HashDrift`) admits a from-source plugin exactly as
+    /// it admits an `--dir` local one. A `git_url` alongside a recorded `sha256` still verifies by
+    /// hash (provenance does not disable integrity enforcement when a hash IS present).
+    #[test]
+    fn verify_descriptor_labels_from_source_and_spawn_verified_admits_it() {
+        let from_source = PluginDescriptor {
+            program: "/opt/flux-plugin-babelforce-manager".into(),
+            git_url: Some("https://gitlab.example/group/flux-plugin-babelforce-manager.git".into()),
+            git_commit: Some("abc123".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            verify_descriptor(&from_source),
+            Verification::UnverifiedFromSource
+        );
+        // The property spawn_verified relies on: a from-source descriptor is never HashDrift, so it
+        // is never a spawn refusal.
+        assert!(
+            !matches!(
+                verify_descriptor(&from_source),
+                Verification::HashDrift { .. }
+            ),
+            "a from-source descriptor must never be a HashDrift refusal"
+        );
+
+        // Provenance without a hash on a plain local descriptor stays UnverifiedLocal.
+        let plain = PluginDescriptor {
+            program: "/opt/flux-plugin-x".into(),
+            ..Default::default()
+        };
+        assert_eq!(verify_descriptor(&plain), Verification::UnverifiedLocal);
+    }
+
     // ===========================================================================
     // D-31: host-terminated PostgreSQL auth handshake (the `pg` module) against a scripted
     // PG-server stub over a real loopback TcpListener. Hermetic — no external postgres.
@@ -6000,5 +6118,42 @@ mod tests {
             diag.lines().last().unwrap().contains("exiting"),
             "loop ends with a termination diagnostic, not silence: {diag}"
         );
+    }
+
+    /// GL-031: a plugin op that declares a secret-like field has that field's value MASKED wherever
+    /// the host echoes it — the stringified result `PluginTool::execute` produces, the dry-run input
+    /// preview, and audit. This test locks the exact masking `execute` applies (it stringifies the
+    /// value through `to_string_pretty` after `redact_secret_fields`), including the nested/array
+    /// case a flat JSON pointer could not reach, and proves non-secret fields survive untouched.
+    #[test]
+    fn redact_secret_fields_masks_declared_fields_at_any_depth() {
+        let fields = vec!["value".to_string()];
+
+        // Flat field (a CI variable write's `value` in dry-run input echo and its response).
+        let mut flat = json!({ "key": "DEPLOY_TOKEN", "value": "s3cr3t-token" });
+        redact_secret_fields(&mut flat, &fields);
+        assert_eq!(flat["key"], "DEPLOY_TOKEN", "non-secret field is untouched");
+        assert_eq!(flat["value"], REDACTED_MARKER);
+
+        // Nested inside an array of `{key, value}` pipeline-variable objects.
+        let mut nested =
+            json!({ "ref": "main", "variables": [{ "key": "K", "value": "hunter2" }] });
+        redact_secret_fields(&mut nested, &fields);
+        assert_eq!(nested["ref"], "main");
+        assert_eq!(nested["variables"][0]["key"], "K");
+        assert_eq!(nested["variables"][0]["value"], REDACTED_MARKER);
+
+        // The stringified form `PluginTool::execute` prints must not contain the raw secret.
+        let rendered = serde_json::to_string_pretty(&nested).unwrap();
+        assert!(
+            !rendered.contains("hunter2"),
+            "raw secret leaked into stringified result: {rendered}"
+        );
+        assert!(rendered.contains(REDACTED_MARKER));
+
+        // No declared fields → the value is returned verbatim (the common case).
+        let mut untouched = json!({ "value": "kept" });
+        redact_secret_fields(&mut untouched, &[]);
+        assert_eq!(untouched["value"], "kept");
     }
 }

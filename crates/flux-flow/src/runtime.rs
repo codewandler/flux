@@ -14,7 +14,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::AgentSink;
-use flux_runtime::{ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult};
+use flux_runtime::{
+    scope_runtime_turn, ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult,
+};
 use flux_spec::{IntentSet, Risk};
 
 use flux_lang::host::{OpHost, OpOutcome};
@@ -303,12 +305,15 @@ pub async fn execute_flow_with_composites(
     composites: &[CompositeOpDecl],
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    // A-59 / F-016: install the run's session on the executor context so a `task(...)` sub-agent
-    // spawned during this flow correlates to the parent (its `SpawnRequest.parent_session` reads
-    // `ctx.session_id()`). The `flux run` agent loop sets this via `FlowEngine::run_turn`; the direct
-    // `flow run` entry point reaches the executor only here, so set it here for parity — without it,
-    // direct-flow-run children record `correlation_id: null` and `replay --sub-agents` can't recurse.
-    executor.context().set_session(session_id);
+    // A-59 / F-016: a direct composite flow supplies its own session lineage; when nested inside a
+    // live turn, preserve that real parent session together with its cancel/reporter. Scope the
+    // result lexically so a reused executor never retains this run after it returns.
+    let runtime_turn = executor.context().runtime_turn_context();
+    let runtime_turn = if runtime_turn.session_id().is_some() {
+        runtime_turn
+    } else {
+        runtime_turn.with_session(session_id)
+    };
     let mut host = ExecutorHost::new_with_composites(executor, composites);
     // C-43: plan execution self-wires the store's active cassette scope (record or replay).
     host.cassette = store.cassette();
@@ -316,7 +321,11 @@ pub async fn execute_flow_with_composites(
         inner: sink,
         trace: false,
     };
-    flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge).await
+    scope_runtime_turn(
+        runtime_turn,
+        flux_lang::runtime::execute_flow(store, &host, session_id, ast, &mut bridge),
+    )
+    .await
 }
 
 /// The **resumable** analog of [`execute_flow_with_composites`] — the shared entry point for
@@ -335,11 +344,14 @@ pub async fn execute_flow_resumable_with_composites(
     ledger: Option<&ResumeLedger>,
     sink: &mut dyn AgentSink,
 ) -> Result<FlowOutcome> {
-    // A-59 / F-016: install the run's session on the executor context so a `task(...)` sub-agent
-    // correlates to the parent (see `execute_flow_with_composites`). In the agent loop `run_turn`
-    // already set the same value, so this is a no-op there; for the direct `flow run --resume(able)`
-    // path it is the fix that stops children from recording `correlation_id: null`.
-    executor.context().set_session(session_id);
+    // Same lexical lineage boundary as `execute_flow_with_composites`: retain an outer cancel,
+    // parent session and reporter; otherwise supply this direct run's session; always restore.
+    let runtime_turn = executor.context().runtime_turn_context();
+    let runtime_turn = if runtime_turn.session_id().is_some() {
+        runtime_turn
+    } else {
+        runtime_turn.with_session(session_id)
+    };
     let mut host = ExecutorHost::new_with_composites(executor, composites);
     // C-43: authored execution self-wires the store's active cassette scope (record or replay).
     // The outer agent-loop path (`execute_flow_traced`) stays unwired because replay drives its
@@ -349,8 +361,18 @@ pub async fn execute_flow_resumable_with_composites(
         inner: sink,
         trace: false,
     };
-    flux_lang::runtime::execute_flow_resumable(store, &host, session_id, ast, &mut bridge, ledger)
-        .await
+    scope_runtime_turn(
+        runtime_turn,
+        flux_lang::runtime::execute_flow_resumable(
+            store,
+            &host,
+            session_id,
+            ast,
+            &mut bridge,
+            ledger,
+        ),
+    )
+    .await
 }
 
 /// A **denied-statement resume guard** for authored `flux flow run --resume`:
@@ -908,7 +930,7 @@ impl Approver for PlanApprover {
 mod tests {
     use super::*;
     use crate::ast::{NodeId, RunEvent, SagaStep, SymbolName, Value, Visibility};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -1318,22 +1340,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_flow_with_composites_sets_the_session_for_subagent_correlation() {
-        // A-59 / F-016: the direct flow-run entry must install the run's session on the executor
-        // context, so a `task(...)` child spawned during the flow correlates to the parent (its
-        // `SpawnRequest.parent_session` reads `ctx.session_id()`). Before the fix this stayed `None`,
-        // so direct-flow-run children recorded `correlation_id: null` and `replay --sub-agents` could
-        // not recurse into them.
+    async fn execute_flow_with_composites_scopes_the_session_for_subagent_correlation() {
+        // A-59 / F-016 + A-80: the direct flow-run entry supplies the run's session while its ops
+        // execute, so `task(...)` can correlate a child, then restores the reusable context.
+        struct SessionProbe(Arc<Mutex<Option<String>>>);
+        #[async_trait]
+        impl Tool for SessionProbe {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(
+                    "session_probe",
+                    "capture session",
+                    json!({"type": "object"}),
+                )
+            }
+
+            async fn execute(
+                &self,
+                ctx: &ToolContext,
+                _params: serde_json::Value,
+            ) -> flux_core::Result<ToolResult> {
+                *self.0.lock().unwrap() = ctx.session_id();
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+
         let store = FlowStore::in_memory().unwrap();
-        let ex = temp_executor(true);
+        let seen = Arc::new(Mutex::new(None));
+        let dir =
+            std::env::temp_dir().join(format!("flux-flow-session-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SessionProbe(seen.clone())));
+        let ex = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["session_probe".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
         assert_eq!(
             ex.context().session_id(),
             None,
             "a fresh executor context has no session"
         );
         let ast = DraftAst {
-            body: vec![Node::Return {
-                value: Box::new(flow_lit(json!("ok"))),
+            body: vec![Node::Call {
+                op: "session_probe".into(),
+                args: Vec::new(),
             }],
             ..Default::default()
         };
@@ -1342,10 +1394,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            ex.context().session_id().as_deref(),
+            seen.lock().unwrap().as_deref(),
             Some("sess-123"),
-            "the run session is installed on the executor context for task() correlation"
+            "ops see the direct run session for task() correlation"
         );
+        assert_eq!(
+            ex.context().session_id(),
+            None,
+            "the direct run must not leave obsolete lineage on a reusable executor"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// A-39: `execute_flow` never emits structural-trace `loop.*` observations (the outer loop opts

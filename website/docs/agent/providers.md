@@ -63,6 +63,13 @@ provider-native calls against the exact live operation schemas. The model never 
 operation inside a Flux AST. Invalid arguments return schema diagnostics in the same native ledger so
 the model can correct the call locally; rounds and token use are bounded.
 
+OpenRouter Gemini models receive a provider-compatible view of each live operation schema on both
+the `openrouter` and `openrouter-anthropic` wires. Legal JSON Schema shorthands such as an untyped
+array or a nullable type are translated without changing the registered contract. If a constraint
+cannot be represented exactly in Gemini's function-schema subset, the request stops locally and the
+error names the operation and schema path—before a billable model call. Returned arguments are still
+validated against the complete original schema before approval or execution.
+
 Use a model with reliable function calling. A model that cannot emit the intent tool, repeatedly
 calls unavailable operations, or does not make progress stops with an explicit error rather than
 gaining a fallback execution path. Smaller models can still be useful for narrow config/SDK stages

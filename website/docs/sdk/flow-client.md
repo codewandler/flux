@@ -69,7 +69,11 @@ methods return `&mut Self`, so a host can assemble its domain before analyzing f
   independent derived input/output schemas; the analyzer infers `O` at its call sites.
 - `register_pack` installs a group of tools into the registry.
 - `with_sub_agents` registers `task` and attaches a `SubAgents` spawner. If the bundle has no
-  wall-clock limit, the SDK supplies a ten-minute default.
+  wall-clock limit, the SDK supplies a ten-minute default. `with_sub_agents_policy` additionally
+  accepts a child `AdaptiveLoopPolicy`, so intent and exploration may use independent same-provider
+  models, reasoning effort, output limits and call ceilings without changing the parent agent. The
+  conversational `ClientBuilder` exposes the same `with_sub_agents_policy` sibling while its existing
+  `with_sub_agents` path keeps the default child policy.
 - `register_composites` installs Flux-Lang `CompositeOpDecl`s so flows can call them like ordinary
   operations. `parse_module` is the deterministic loader for modules that declare these ops.
 - `register_prelude` merges additional artifact `$defs` into the client's definition map for
@@ -78,6 +82,13 @@ methods return `&mut Self`, so a host can assemble its domain before analyzing f
 All registered tools still execute through the same permission, approval, redaction, and guarded-IO
 path. A composite operation is a nested flow; its inner calls do not inherit authority from the
 wrapper.
+
+Child cognition policy and spawn limits are deliberately separate. `AdaptiveLoopPolicy` bounds the
+native intent/explore model calls inside one logical child run. `SpawnLimits` bounds the child's
+authored outer-loop iterations, fallback output-token setting, and whole-run wall clock. Existing
+`with_sub_agents` callers keep the standard adaptive policy; direct spawner hosts can opt in with
+`LocalSpawner::with_adaptive_policy` or
+`SubAgents::into_spawner_with_adaptive_policy`.
 
 ## Parse or construct
 

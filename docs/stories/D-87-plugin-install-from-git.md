@@ -2,7 +2,8 @@
 id: D-87
 title: Install a plugin from source — `flux plugin install --git <url>`
 pillar: Core
-status: backlog
+status: done
+priority: 10
 epic: plugin-install-source
 note: "third install source next to the signed github pack (D-46..49) and `--dir` local scan: clone a git URL, detect a Rust flux-plugin crate, `cargo build --release`, register the binary. Unblocks GitLab-hosted / third-party plugins that the github+minisign pack channel can't serve."
 ---

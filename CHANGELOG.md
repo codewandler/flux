@@ -6,8 +6,82 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-82: spawned agents accept an explicit adaptive cognition policy.** Additive
+  `LocalSpawner::with_adaptive_policy`, `SubAgents::into_spawner_with_adaptive_policy`, and
+  `FlowClient::with_sub_agents_policy` / `ClientBuilder::with_sub_agents_policy` seams carry the
+  logical call ceiling plus independent intent/explore model, effort, output-token, and call limits
+  into every role-derived child and bounded descendant. Existing constructors and attachment methods retain
+  `AdaptiveLoopPolicy::default()`; authorization, approval, cancellation, audit, and guarded IO are
+  unchanged.
+- **D-87: install a plugin straight from a git URL.** `flux plugin install --git <url>
+  [--tag|--rev|--branch] [--bin] [--force]` clones the repo, detects a `flux-plugin-*` crate, and
+  builds it with `cargo build --release --locked` through the guarded `System` (a second `System`
+  rooted at the clone dir; argv-only, env-cleared — no raw `Command`), then registers a from-source
+  descriptor. Building unverified source is code execution, so it is gated behind an explicit consent
+  + resolved-commit disclosure (`FLUX_ALLOW_SOURCE_BUILD=1` pre-approves non-interactively) and
+  labelled `from-source (unverified)`, distinct from the signed pack and `--dir`. Idempotent per
+  resolved commit; `--force` rebuilds.
+- **D-93: declarative plugin secret-field redaction.** New `OperationSpec.redact_fields` +
+  `flux_plugin::redact_secret_fields` mask declared fields (by name, at any depth) in the
+  model-visible `PluginTool` result.
+- **D-91: `gitlab.project.delete` + finer destructive-op metadata.** New plugin-native
+  `gitlab.project.delete`; delete/bulk ops now carry `Destructive`/`High` risk with optional
+  `confirm_*` fat-finger guards.
+- **D-92: `gitlab.index.build {estimate:true}` dry-run scope preview** and project-scoped issue
+  indexing via `issue_project`.
+- **D-94: `gitlab.repository.file.show` returns `decoded_content`** for UTF-8 text files (raw
+  base64/`encoding` preserved; binary and mid-char truncations omit it).
+- **L-68: flux-lsp document symbols + go-to-definition** from a CST scope model over `$var` binds,
+  params, and flow/op declarations (`textDocument/documentSymbol` + `textDocument/definition`).
+- **L-69: flux-lsp full-document semantic tokens** (`textDocument/semanticTokens/full`, for
+  VS Code/Neovim), distinguishing registry-known ops from unknown identifiers and `$var` binds from
+  uses.
+- **L-70: flux-lsp incremental `didChange` sync + comment-preserving formatter**, and `flux-lsp` now
+  ships as a release binary alongside `flux` (`dist = true`).
+
+### Changed
+
+- **BREAKING (Rust API):** `EngineLoopHost::set_turn` now returns the active
+  `Arc<dyn SpawnActivitySink>` so direct/resumable hosts can scope nested runtimes with the complete
+  cancellation, session, and child-activity context. Ordinary statement calls remain valid, but typed
+  function pointers expecting `()` must accept or discard the returned reporter. This requires the next
+  release to use a pre-1.0 minor bump.
+- **BREAKING (gitlab plugin op contract):** `gitlab.changelog.add` now requires an explicit `branch`
+  (it no longer silently commits to the default branch); `gitlab.index.build` drops the
+  never-implemented `user_*`/`group_*` inputs; and plain `gitlab.project.list`/`mr.list`/`issue.list`
+  reads no longer contribute datasource records (or print the `(N record(s) contributed)` stderr line)
+  unless `contribute: true`. `gitlab.project.create` namespace resolution now paginates (`per_page=100`)
+  and rejects an ambiguous group basename instead of first-wins (D-91/D-92/D-94,
+  GL-037/039/015/026/046).
+
 ### Fixed
 
+- **D-93: `flux plugin call` no longer leaks secret-like field values.** Its dry-run input echo and
+  live result echo were fully unredacted (raw values to scrollback/logs/transcripts); declared secret
+  fields (e.g. gitlab CI/CD variable `value`, including nested `variables[].value`) are now masked with
+  `***`. Separately, `gitlab.test` was trimmed from the full ~50-key user profile (email, 2FA, sign-in
+  times/IP) to a minimal `{id, username, name}` identity (GL-031/GL-016).
+- **A-83: adaptive capability signals now enforce the four-family limit across the complete turn.**
+  A later `signal_capabilities` call can still add evidence-driven visibility, but the deduplicated
+  accumulated union is rejected before schema expansion or durable-state mutation when it would
+  exceed four families. Exact 64-operation and 128,000-schema-character budgets remain independent;
+  valid expansion within the family ceiling is unchanged.
+- **A-81: OpenRouter Gemini requests now derive a provider-compatible operation-schema view before
+  transport.** Both Chat and Messages codecs materialize unconstrained array items and missing
+  required properties equivalently, normalize nullable type unions, and reject unsupported
+  assertions locally with the operation plus exact JSON Pointer before a paid request. The original
+  `Request`/`ToolDef` and registered `ToolSpec` remain unchanged; returned arguments still validate
+  against the full host schema before approval or dispatch. Cross-provider fixtures keep
+  Anthropic/OpenAI/Codex/non-Gemini bytes unchanged, and live A-78 support (`s_1439`) plus
+  Bitcoin-to-Slack denial (`s_1440`, zero executed batches) pass on Gemini 3.5 Flash.
+- **A-80: nested one-shot runtimes preserve the live parent turn's cancellation and session
+  lineage.** Runtime turn state is future-local and concurrency-safe across guarded adapters;
+  streamed `FlowClient` execution pins the complete snapshot before `tokio::spawn`, so cancelling a
+  served request reaches a nested `TaskTool` and audited child streams record the real parent
+  `correlation_id`. Direct and resumable `flux flow run` paths scope the returned activity reporter too;
+  empty/direct one-shot runs still invent neither cancellation nor a parent.
 - **Agent-loop assembly now rejects `max_iterations` values above 1,000 before expanding the
   built-in Flux program.** The shared engine boundary protects CLI/config, SDK, embedded-agent, and
   sub-agent callers from input-driven startup memory exhaustion; CLI diagnostics identify whether
@@ -19,6 +93,17 @@ All notable changes to this project are documented in this file. The format is b
 - **The adaptive-latency keep gate now requires an exact confirmation and Slack matrix.** Missing,
   duplicate, header-only, and stale in-scope rows reject with named diagnostics before metric joins
   run, so an interrupted evaluation cannot be reported as `KEEP`.
+
+### Documentation
+
+- **D-95: private-network egress scoping documented and pinned.** `[private_net.plugins]`
+  (plugin-scoped) is the grant enforced uniformly on every plugin-invocation path — agent, `app run`,
+  and direct `flux plugin call` (all route through `effective_plugin_private_hosts`); there is no
+  direct-call-specific gap. `[private_net.endpoints]` parses but is currently inert (no per-endpoint
+  wiring at the guard site). Added a "testing a private GitLab safely" scoped-egress recipe to
+  `docs/designs/scoped-private-net-egress.md` and a characterization test pinning the endpoint-grant
+  inertness so wiring it later must deliberately update both the enforcement path and the docs
+  (GL-002/003).
 
 ## [0.22.0] - 2026-07-14
 

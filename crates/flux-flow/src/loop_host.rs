@@ -147,6 +147,11 @@ impl EngineLoopHost {
     }
 
     /// Point the long-lived host at the active turn and reset every turn-scoped capability.
+    ///
+    /// The returned reporter is the turn-owned capability that must be installed on the lexical
+    /// [`flux_runtime::RuntimeTurnContext`]. It is intentionally not retained on this long-lived
+    /// host/executor: doing so would let parallel or later turns observe the wrong child channel.
+    #[must_use = "install the returned reporter on this turn's RuntimeTurnContext"]
     pub fn set_turn(
         &self,
         session_id: String,
@@ -154,14 +159,12 @@ impl EngineLoopHost {
         sink: Arc<Mutex<dyn AgentSink>>,
         advertised: Option<HashSet<String>>,
         audit: Option<(Arc<flux_events::EventStore>, i64)>,
-    ) {
-        // Snapshot this turn's owned channel into the L2 spawner reporter. A `task` call copies the
-        // Arc into its SpawnRequest, so later turns cannot retarget an already-running child.
-        if let Some(executor) = self.executor.upgrade() {
-            executor
-                .context()
-                .set_spawn_activity_sink(Arc::new(AgentSinkSpawnActivitySink(sink.clone())));
-        }
+    ) -> Arc<dyn SpawnActivitySink> {
+        // The caller carries this reporter in its lexical RuntimeTurnContext. Never store it on the
+        // long-lived executor: a retained context must not keep an obsolete turn channel, and two
+        // independent turn futures must not retarget one another.
+        let reporter: Arc<dyn SpawnActivitySink> =
+            Arc::new(AgentSinkSpawnActivitySink(sink.clone()));
         self.conversation_cache
             .lock()
             .unwrap()
@@ -176,6 +179,7 @@ impl EngineLoopHost {
         *self.usage.lock().unwrap() = Usage::default();
         self.calls.lock().unwrap().clear();
         self.receipts.clear();
+        reporter
     }
 
     pub fn turn_usage(&self) -> Usage {

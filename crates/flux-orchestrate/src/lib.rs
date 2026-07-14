@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::register_agent_ops;
+use flux_agent::{register_agent_ops, AdaptiveLoopPolicy};
 use flux_core::{Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::AgentSink;
@@ -121,6 +121,10 @@ pub struct LocalSpawner {
     default_model: String,
     default_thinking: bool,
     default_effort: Option<Effort>,
+    /// Complete native intent/explore policy assigned to every role-derived child spec. Kept
+    /// separate from `SpawnLimits`: those bound the whole child/outer loop, while this bounds the
+    /// adaptive model stages inside one logical run.
+    adaptive_policy: AdaptiveLoopPolicy,
     limits: SpawnLimits,
     /// Approver the sub-agent's tool calls dispatch through. `None` → the default [`SubAgentApprover`]
     /// (auto-approve non-destructive, deny destructive). A multi-tenant consumer injects an approver
@@ -158,6 +162,7 @@ impl LocalSpawner {
             default_model: default_model.into(),
             default_thinking: false,
             default_effort: None,
+            adaptive_policy: AdaptiveLoopPolicy::default(),
             limits: SpawnLimits::new(max_tokens),
             approver: None,
             auth: None,
@@ -205,6 +210,15 @@ impl LocalSpawner {
         self
     }
 
+    /// Set the complete adaptive intent/explore cognition policy inherited by every spawned role.
+    /// This is independent of [`SpawnLimits`]: it selects stage models/effort and bounds native
+    /// model calls, while spawn limits bound the child's outer iterations, fallback output tokens,
+    /// and wall clock. The default is [`AdaptiveLoopPolicy::default`].
+    pub fn with_adaptive_policy(mut self, policy: AdaptiveLoopPolicy) -> Self {
+        self.adaptive_policy = policy;
+        self
+    }
+
     /// Inject the approver a sub-agent's tool calls dispatch through (default: [`SubAgentApprover`]).
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = Some(approver);
@@ -241,6 +255,7 @@ impl LocalSpawner {
             default_model: self.default_model.clone(),
             default_thinking: self.default_thinking,
             default_effort: self.default_effort,
+            adaptive_policy: self.adaptive_policy.clone(),
             limits: self.limits.clone(),
             approver: self.approver.clone(),
             auth: self.auth.clone(),
@@ -354,6 +369,7 @@ impl Spawner for LocalSpawner {
         let mut spec = role.to_spec(&self.default_model)?;
         spec.thinking = role.thinking.unwrap_or(self.default_thinking);
         spec.effort = role.effort.or(self.default_effort);
+        spec.adaptive_policy = self.adaptive_policy.clone();
         // A-41: a role's `model:` override speaks the same provider-prefixed spec form `-m` accepts
         // (e.g. `openrouter/deepseek/deepseek-v4-flash`), but sub-agents always run on the PARENT's
         // provider — there is no per-sub-agent provider factory. Resolve it here, fast, at
@@ -462,8 +478,10 @@ impl Spawner for LocalSpawner {
 
 /// A reusable bundle for wiring sub-agents into any surface (the CLI, the SDK): the role catalog, the
 /// tool surface children may be granted, how to build a fresh provider per child, and the safety
-/// knobs. [`SubAgents::into_spawner`] is the single construction path — the surface then registers
-/// [`TaskTool`] into its own catalog and installs the returned spawner via `ToolContext::with_spawner`.
+/// knobs. [`SubAgents::into_spawner`] keeps the standard child cognition policy, while
+/// [`SubAgents::into_spawner_with_adaptive_policy`] is the explicit-policy sibling; the surface then
+/// registers [`TaskTool`] into its own catalog and installs the returned spawner via
+/// `ToolContext::with_spawner`.
 pub struct SubAgents {
     /// The named roles a `task` call may target (in-memory or disk-loaded).
     pub roles: RoleRegistry,
@@ -568,6 +586,17 @@ impl SubAgents {
     /// Build the spawner over `system` (the guarded IO surface children share). The caller registers
     /// [`TaskTool`] into its catalog and installs the returned spawner via `ToolContext::with_spawner`.
     pub fn into_spawner(self, system: Arc<System>) -> Arc<dyn Spawner> {
+        self.into_spawner_with_adaptive_policy(system, AdaptiveLoopPolicy::default())
+    }
+
+    /// Build the spawner with an explicit native intent/explore policy for every child. This is an
+    /// additive alternative to [`into_spawner`](Self::into_spawner), whose defaults remain
+    /// unchanged for existing callers. The policy propagates through bounded nested delegation.
+    pub fn into_spawner_with_adaptive_policy(
+        self,
+        system: Arc<System>,
+        adaptive_policy: AdaptiveLoopPolicy,
+    ) -> Arc<dyn Spawner> {
         let limits = self.limits;
         let mut spawner = LocalSpawner::new(
             self.provider_factory,
@@ -578,6 +607,7 @@ impl SubAgents {
             limits.max_tokens,
         )
         .with_reasoning(self.default_thinking, self.default_effort)
+        .with_adaptive_policy(adaptive_policy)
         .with_limits(limits)
         .with_max_depth(self.max_depth);
         if let Some(approver) = self.approver {
@@ -1227,6 +1257,190 @@ mod tests {
             .spawn(SpawnRequest::new("nope", "x"), &cancel)
             .await
             .is_err());
+    }
+
+    /// A-82 failing-first: the reusable `SubAgents` path must put the host's complete adaptive
+    /// policy on the role-derived child `AgentSpec` before engine assembly. Request capture proves
+    /// the stage-local wire settings; two refusal cases prove the stage and logical call ceilings
+    /// stop before an extra provider request rather than merely being stored on the spawner.
+    #[tokio::test]
+    async fn explicit_child_adaptive_policy_reaches_both_native_stages() {
+        #[derive(Default)]
+        struct CaptureProvider {
+            requests: Arc<std::sync::Mutex<Vec<Request>>>,
+            invalid_first_intent: bool,
+        }
+
+        #[async_trait]
+        impl Provider for CaptureProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                let request_index = {
+                    let mut requests = self.requests.lock().unwrap();
+                    let index = requests.len();
+                    requests.push(request.clone());
+                    index
+                };
+                let chunks = if request_has_tool(&request, "declare_intent") {
+                    if self.invalid_first_intent && request_index == 0 {
+                        prose_chunks("I forgot to declare intent")
+                    } else {
+                        intent_chunks("answer the child task", &[])
+                    }
+                } else {
+                    prose_chunks("child done")
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        fn roles() -> RoleRegistry {
+            let mut roles = RoleRegistry::default();
+            roles.insert(parse_role("---\n---\nYou are a worker.", "worker"));
+            roles
+        }
+
+        let policy = flux_agent::AdaptiveLoopPolicy {
+            max_model_calls: 2,
+            intent: flux_agent::AgentStagePolicy {
+                model: Some("intent-fast".into()),
+                effort: Some(Effort::Low),
+                max_tokens: Some(111),
+                max_calls: Some(1),
+            },
+            explore: flux_agent::AgentStagePolicy {
+                model: Some("explore-deep".into()),
+                effort: Some(Effort::High),
+                max_tokens: Some(222),
+                max_calls: Some(1),
+            },
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider_requests = requests.clone();
+        let spawner = SubAgents::new(
+            roles(),
+            ToolRegistry::new(),
+            Arc::new(move || {
+                Ok(Box::new(CaptureProvider {
+                    requests: provider_requests.clone(),
+                    invalid_first_intent: false,
+                }) as Box<dyn Provider>)
+            }),
+            "child-default",
+            4096,
+        )
+        .into_spawner_with_adaptive_policy(temp_system(), policy.clone());
+        let outcome = spawner
+            .spawn(
+                SpawnRequest::new("worker", "do the work"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "child done");
+
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].trace.as_ref().unwrap().stage, "intent");
+            assert_eq!(requests[0].model, "intent-fast");
+            assert_eq!(requests[0].effort, Some(Effort::Low));
+            assert_eq!(requests[0].max_tokens, 111);
+            assert_eq!(requests[1].trace.as_ref().unwrap().stage, "explore");
+            assert_eq!(requests[1].model, "explore-deep");
+            assert_eq!(requests[1].effort, Some(Effort::High));
+            assert_eq!(requests[1].max_tokens, 222);
+        }
+
+        // A per-stage cap of one refuses intent repair before a second wire request.
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider_requests = requests.clone();
+        let spawner = LocalSpawner::new(
+            Arc::new(move || {
+                Ok(Box::new(CaptureProvider {
+                    requests: provider_requests.clone(),
+                    invalid_first_intent: true,
+                }) as Box<dyn Provider>)
+            }),
+            Arc::new(roles()),
+            ToolRegistry::new(),
+            temp_system(),
+            "child-default",
+            4096,
+        )
+        .with_adaptive_policy(policy.clone());
+        let stopped = spawner
+            .spawn(
+                SpawnRequest::new("worker", "do the work"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            stopped.contains("adaptive `intent` model-call cap exhausted"),
+            "{stopped}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        // The logical total spans stages: one allowed intent call means exploration is refused
+        // before the provider sees a second request.
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider_requests = requests.clone();
+        let mut total_capped = policy;
+        total_capped.max_model_calls = 1;
+        let spawner = LocalSpawner::new(
+            Arc::new(move || {
+                Ok(Box::new(CaptureProvider {
+                    requests: provider_requests.clone(),
+                    invalid_first_intent: false,
+                }) as Box<dyn Provider>)
+            }),
+            Arc::new(roles()),
+            ToolRegistry::new(),
+            temp_system(),
+            "child-default",
+            4096,
+        )
+        .with_adaptive_policy(total_capped);
+        let stopped = spawner
+            .spawn(
+                SpawnRequest::new("worker", "do the work"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(stopped.contains("model-call budget exhausted"), "{stopped}");
+        assert!(stopped.contains("1/1"), "{stopped}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sub_agent_adaptive_policy_defaults_and_nested_inheritance_are_stable() {
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        assert_eq!(
+            spawner.adaptive_policy,
+            flux_agent::AdaptiveLoopPolicy::default()
+        );
+
+        let policy = flux_agent::AdaptiveLoopPolicy {
+            max_model_calls: 3,
+            ..flux_agent::AdaptiveLoopPolicy::default()
+        };
+        let spawner = spawner.with_adaptive_policy(policy.clone());
+        let nested = spawner.at_depth(1, ToolRegistry::new());
+        assert_eq!(nested.adaptive_policy, policy);
     }
 
     /// A-79 failing-first: the child status/read lifecycle must reach the reporter WHILE the read

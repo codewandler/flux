@@ -2,8 +2,8 @@
 id: D-92
 title: gitlab — index scoping correctness & scope estimate
 pillar: Agent
-status: backlog
-priority:
+status: done
+priority: 4
 epic: gitlab-plugin-hardening
 design: docs/designs/gitlab-plugin-hardening.md
 note: "index.build {} is a broad instance crawl with no estimate; issue indexing ignores project scope; user/group index inputs are exposed but unimplemented; namespace resolution is 20-page-limited and matches ambiguous basenames (GL-017/026/039/040/046); extends D-38"

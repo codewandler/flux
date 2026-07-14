@@ -2,8 +2,8 @@
 id: D-95
 title: Direct plugin-call private-net grant parity + scoped-egress docs
 pillar: Core
-status: backlog
-priority:
+status: done
+priority: 6
 epic: gitlab-plugin-hardening
 design: docs/designs/gitlab-plugin-hardening.md
 note: "endpoint-level private-net grants parse in config but are ignored by direct `flux plugin call` (only [private_net.plugins] is wired there); document the scoped-egress recipe for testing a private endpoint safely (GL-002/003); extends D-20"
