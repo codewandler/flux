@@ -83,16 +83,46 @@ mod tests {
     fn message_list_reads_history() {
         let mut h = host().with_http(
             "conversations.history",
-            json!({ "ok": true, "messages": [{ "ts": "1.1", "text": "hi" }] }),
+            json!({
+                "ok": true,
+                "messages": [{
+                    "ts": "1.1",
+                    "text": "hi",
+                    "vendor_message_field": { "nested": true }
+                }],
+                "has_more": true,
+                "response_metadata": { "next_cursor": "next-page" },
+                "vendor_envelope_field": [1, 2, 3]
+            }),
         );
         let out = plugin()
             .call(
                 "slack.message.list",
-                json!({ "channel": "C1", "limit": 5 }),
+                json!({
+                    "channel": "C1",
+                    "limit": 5,
+                    "cursor": "cursor 1",
+                    "oldest": "1.0",
+                    "latest": "2.0"
+                }),
                 &mut h,
             )
             .unwrap();
         assert_eq!(out["messages"][0]["text"], "hi");
+        assert_eq!(out["messages"][0]["vendor_message_field"]["nested"], true);
+        assert_eq!(out["response_metadata"]["next_cursor"], "next-page");
+        assert_eq!(out["vendor_envelope_field"], json!([1, 2, 3]));
+        let calls = h.calls.borrow();
+        let (_, request) = calls
+            .iter()
+            .find(|(command, _)| command == "http.do")
+            .expect("history HTTP request recorded");
+        assert_eq!(request["endpoint_ref"], "slack.endpoint");
+        assert_eq!(request["auth_purpose"], "bot_token");
+        assert_eq!(
+            request["path"],
+            "/conversations.history?channel=C1&limit=5&inclusive=true&cursor=cursor%201&oldest=1.0&latest=2.0"
+        );
     }
 
     #[test]
@@ -125,7 +155,14 @@ mod tests {
     fn thread_reads_replies_from_permalink_ref() {
         let mut h = host().with_http(
             "conversations.replies",
-            json!({ "ok": true, "messages": [{ "ts": "1.1" }, { "ts": "1.2" }] }),
+            json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1.1", "vendor_root": "kept" },
+                    { "ts": "1.2", "vendor_reply": { "kind": "future" } }
+                ],
+                "response_metadata": { "next_cursor": "thread-next" }
+            }),
         );
         let out = plugin()
             .call(
@@ -135,6 +172,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(out["messages"][1]["vendor_reply"]["kind"], "future");
+        assert_eq!(out["response_metadata"]["next_cursor"], "thread-next");
+        let calls = h.calls.borrow();
+        let (_, request) = calls
+            .iter()
+            .find(|(command, _)| command == "http.do")
+            .expect("thread HTTP request recorded");
+        assert_eq!(request["auth_purpose"], "bot_token");
+        assert_eq!(
+            request["path"],
+            "/conversations.replies?channel=C0123ABCD&ts=1718031600.123456&limit=100&inclusive=true"
+        );
     }
 
     #[test]
@@ -603,19 +652,40 @@ mod tests {
             "conversations.list",
             json!({
                 "ok": true,
-                "channels": [{ "id": "C1", "name": "dev-team", "topic": { "value": "eng" } }]
+                "channels": [{
+                    "id": "C1",
+                    "name": "dev-team",
+                    "topic": { "value": "eng" },
+                    "vendor_channel_field": { "retained": true }
+                }],
+                "response_metadata": { "next_cursor": "channel-next" },
+                "vendor_envelope_field": "retained"
             }),
         );
         let out = plugin()
             .call("slack.channel.list", json!({}), &mut h)
             .unwrap();
         assert_eq!(out["channels"][0]["id"], "C1");
+        assert_eq!(out["channels"][0]["vendor_channel_field"]["retained"], true);
+        assert_eq!(out["response_metadata"]["next_cursor"], "channel-next");
+        assert_eq!(out["vendor_envelope_field"], "retained");
         let recs = h.contributed.borrow();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].entity, "slack.channel");
         assert_eq!(recs[0].id, "C1");
         assert_eq!(recs[0].title, "dev-team");
         assert_eq!(recs[0].body, "eng");
+        drop(recs);
+        let calls = h.calls.borrow();
+        let (_, request) = calls
+            .iter()
+            .find(|(command, _)| command == "http.do")
+            .expect("channel-list HTTP request recorded");
+        assert_eq!(request["auth_purpose"], "bot_token");
+        assert_eq!(
+            request["path"],
+            "/conversations.list?types=public_channel,private_channel,mpim,im&limit=200"
+        );
     }
 
     #[test]
@@ -834,14 +904,35 @@ mod tests {
     fn user_list_contributes_records() {
         let mut h = host().with_http(
             "users.list",
-            json!({ "ok": true, "members": [{ "id": "U1", "name": "alice", "profile": { "real_name": "Alice A" } }] }),
+            json!({
+                "ok": true,
+                "members": [{
+                    "id": "U1",
+                    "name": "alice",
+                    "profile": { "real_name": "Alice A" },
+                    "vendor_user_field": ["kept"]
+                }],
+                "response_metadata": { "next_cursor": "user-next" },
+                "vendor_envelope_field": { "retained": true }
+            }),
         );
         let out = plugin().call("slack.user.list", json!({}), &mut h).unwrap();
         assert_eq!(out["members"][0]["id"], "U1");
+        assert_eq!(out["members"][0]["vendor_user_field"], json!(["kept"]));
+        assert_eq!(out["response_metadata"]["next_cursor"], "user-next");
+        assert_eq!(out["vendor_envelope_field"]["retained"], true);
         let recs = h.contributed.borrow();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].entity, "slack.user");
         assert_eq!(recs[0].body, "Alice A");
+        drop(recs);
+        let calls = h.calls.borrow();
+        let (_, request) = calls
+            .iter()
+            .find(|(command, _)| command == "http.do")
+            .expect("user-list HTTP request recorded");
+        assert_eq!(request["auth_purpose"], "bot_token");
+        assert_eq!(request["path"], "/users.list?limit=200");
     }
 
     #[test]
@@ -1206,6 +1297,11 @@ mod tests {
         let channels = out["channels"].as_array().unwrap();
         assert_eq!(channels.len(), 1);
         assert!(channels[0]["name"].as_str().unwrap().contains("alpha"));
+        assert_eq!(
+            h.contributed.borrow().len(),
+            3,
+            "datasource contribution uses the unfiltered vendor response"
+        );
     }
 
     #[test]
@@ -1230,6 +1326,11 @@ mod tests {
             .unwrap();
         let members = out["members"].as_array().unwrap();
         assert_eq!(members.len(), 2);
+        assert_eq!(
+            h.contributed.borrow().len(),
+            3,
+            "datasource contribution uses the unfiltered vendor response"
+        );
     }
 
     #[test]
@@ -1320,6 +1421,124 @@ mod tests {
             .datasources
             .iter()
             .all(|d| d.capabilities.iter().any(|c| c == "index")));
+    }
+
+    #[test]
+    fn bounded_read_families_publish_closed_inputs_and_typed_output_envelopes() {
+        let manifest = plugin().manifest();
+        let contract = |operation: &str| {
+            manifest
+                .operations
+                .iter()
+                .find(|spec| spec.name == operation)
+                .unwrap_or_else(|| panic!("missing operation {operation}"))
+        };
+        let channel = contract("slack.channel.list");
+        assert_eq!(channel.input_schema, op_input_schema::<ChannelListInput>());
+        assert_eq!(
+            channel.output_schema.as_ref(),
+            Some(&op_output_schema::<ChannelListOutput>())
+        );
+        let user = contract("slack.user.list");
+        assert_eq!(user.input_schema, op_input_schema::<UserListInput>());
+        assert_eq!(
+            user.output_schema.as_ref(),
+            Some(&op_output_schema::<UserListOutput>())
+        );
+        let messages = contract("slack.message.list");
+        assert_eq!(messages.input_schema, op_input_schema::<MessageListInput>());
+        assert_eq!(
+            messages.output_schema.as_ref(),
+            Some(&op_output_schema::<MessageListOutput>())
+        );
+        let thread = contract("slack.thread");
+        assert_eq!(thread.input_schema, op_input_schema::<ThreadInput>());
+        assert_eq!(
+            thread.output_schema.as_ref(),
+            Some(&op_output_schema::<ThreadOutput>())
+        );
+
+        for (operation, object_schema, stable_field) in [
+            ("slack.channel.list", "SlackChannelSchema", "id"),
+            ("slack.user.list", "SlackUserSchema", "name"),
+            ("slack.message.list", "SlackMessageSchema", "ts"),
+            ("slack.thread", "SlackMessageSchema", "thread_ts"),
+        ] {
+            let output = contract(operation).output_schema.as_ref().unwrap();
+            assert_eq!(
+                output["additionalProperties"], true,
+                "{operation}: top-level Slack metadata remains open"
+            );
+            let vendor_object = &output["$defs"][object_schema];
+            assert_eq!(vendor_object["type"], "object");
+            assert!(
+                vendor_object["properties"][stable_field].is_object(),
+                "{operation}: missing stable `{stable_field}` in {vendor_object}"
+            );
+            assert_eq!(
+                vendor_object["additionalProperties"], true,
+                "{operation}: Slack-owned object extensions remain open"
+            );
+        }
+
+        for (operation, collection) in [
+            ("slack.channel.list", "channels"),
+            ("slack.user.list", "members"),
+            ("slack.message.list", "messages"),
+            ("slack.thread", "messages"),
+        ] {
+            let spec = contract(operation);
+            assert_eq!(
+                spec.input_schema["additionalProperties"],
+                json!(false),
+                "{operation}: typed input must reject contract drift"
+            );
+            let output = spec
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{operation}: missing generated output schema"));
+            assert_eq!(output["type"], "object", "{operation}: output root");
+            assert!(
+                output["properties"].get(collection).is_some(),
+                "{operation}: output must declare `{collection}`"
+            );
+            assert_eq!(
+                output["properties"][collection]["type"], "array",
+                "{operation}: `{collection}` remains an open vendor-object list"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_read_input_drift_fails_before_http_with_field_context() {
+        let mut h = host();
+        let unknown = plugin()
+            .call(
+                "slack.channel.list",
+                json!({ "unexpected_filter": true }),
+                &mut h,
+            )
+            .unwrap_err();
+        assert!(
+            unknown.contains("unexpected_filter") || unknown.contains("unknown field"),
+            "unexpected error: {unknown}"
+        );
+
+        let wrong_type = plugin()
+            .call(
+                "slack.message.list",
+                json!({ "channel": "C1", "limit": "ten" }),
+                &mut h,
+            )
+            .unwrap_err();
+        assert!(
+            wrong_type.contains("limit"),
+            "unexpected error: {wrong_type}"
+        );
+        assert!(
+            h.calls.borrow().is_empty(),
+            "input drift must fail before a host capability call"
+        );
     }
 
     /// C-52: the mark-read op was the only hyphenated op name in the whole plugin pack; every

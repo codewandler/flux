@@ -80,26 +80,38 @@ pub(crate) fn message_send(input: Value, host: &mut Host) -> Result<Value, Strin
     )?)
 }
 
-pub(crate) fn message_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let channel = req_str(&input, "channel")?;
-    let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+pub(crate) fn message_list(
+    input: MessageListInput,
+    host: &mut Host,
+) -> Result<MessageListOutput, String> {
+    let MessageListInput {
+        channel,
+        limit,
+        cursor,
+        oldest,
+        latest,
+        text_format,
+    } = input;
+    if channel.is_empty() {
+        return Err("`channel` (string) required".into());
+    }
+    let limit = limit.unwrap_or(50);
     let mut path = format!(
         "/conversations.history?channel={}&limit={limit}&inclusive=true",
-        urlencode(channel),
+        urlencode(&channel),
     );
-    for key in ["cursor", "oldest", "latest"] {
-        if let Some(val) = opt_str(&input, key) {
-            path.push_str(&format!("&{key}={}", urlencode(val)));
+    for (key, value) in [("cursor", cursor), ("oldest", oldest), ("latest", latest)] {
+        if let Some(val) = value.filter(|value| !value.is_empty()) {
+            path.push_str(&format!("&{key}={}", urlencode(&val)));
         }
     }
-    let format = parse_text_format(opt_str(&input, "text_format").unwrap_or(""));
-    let mut v = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
-    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for message in messages {
-            render_message_text(message, format);
-        }
+    let format = parse_text_format(text_format.as_deref().unwrap_or(""));
+    let value = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
+    let mut output: MessageListOutput = decode_response("slack.message.list", value)?;
+    for message in &mut output.messages {
+        render_message_text(&mut message.0, format);
     }
-    Ok(v)
+    Ok(output)
 }
 
 pub(crate) fn message_edit(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -139,28 +151,28 @@ pub(crate) fn message_delete(input: Value, host: &mut Host) -> Result<Value, Str
     )?)
 }
 
-pub(crate) fn thread(input: Value, host: &mut Host) -> Result<Value, String> {
-    let (channel, ts) = resolve_ref(&input)?;
-    let limit = input.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+pub(crate) fn thread(input: ThreadInput, host: &mut Host) -> Result<ThreadOutput, String> {
+    let (channel, ts) = resolve_ref_parts(
+        input.r#ref.as_deref(),
+        input.channel.as_deref(),
+        input.ts.as_deref(),
+    )?;
+    let limit = input.limit.unwrap_or(100);
     // max_bytes gates per-image downloads in fluxplane; this handler still
     // surfaces the raw message envelope, but records the cap for callers.
-    let _max_bytes = input
-        .get("max_bytes")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(10_485_760);
+    let _max_bytes = input.max_bytes.unwrap_or(10_485_760);
     let path = format!(
         "/conversations.replies?channel={}&ts={}&limit={limit}&inclusive=true",
         urlencode(&channel),
         urlencode(&ts),
     );
-    let format = parse_text_format(opt_str(&input, "text_format").unwrap_or(""));
-    let mut v = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
-    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for message in messages {
-            render_message_text(message, format);
-        }
+    let format = parse_text_format(input.text_format.as_deref().unwrap_or(""));
+    let value = check_ok(sl_get(host, &path, Some("bot_token"))?)?;
+    let mut output: ThreadOutput = decode_response("slack.thread", value)?;
+    for message in &mut output.messages {
+        render_message_text(&mut message.0, format);
     }
-    Ok(v)
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------

@@ -86,13 +86,29 @@ pub(super) fn parse_ref(reference: &str) -> Option<(String, String)> {
 
 /// Resolve `(channel, ts)` from either a `ref` input or explicit `channel`+`ts`.
 pub(super) fn resolve_ref(input: &Value) -> Result<(String, String), String> {
-    if let Some(r) = opt_str(input, "ref") {
+    resolve_ref_parts(
+        opt_str(input, "ref"),
+        opt_str(input, "channel"),
+        opt_str(input, "ts"),
+    )
+}
+
+/// Resolve a message reference from already-deserialized typed input fields.
+pub(super) fn resolve_ref_parts(
+    reference: Option<&str>,
+    channel: Option<&str>,
+    ts: Option<&str>,
+) -> Result<(String, String), String> {
+    if let Some(r) = reference.filter(|value| !value.is_empty()) {
         if let Some(pair) = parse_ref(r) {
             return Ok(pair);
         }
     }
-    let channel = opt_str(input, "channel").map(str::to_string);
-    let ts = opt_str(input, "ts")
+    let channel = channel
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let ts = ts
+        .filter(|value| !value.is_empty())
         .map(normalize_ts)
         .filter(|s| !s.is_empty());
     match (channel, ts) {
@@ -165,7 +181,7 @@ pub(super) fn message_content(input: &Value) -> Result<MessageContent, String> {
 }
 
 /// True if any of a channel's searchable string fields contain `query` (case-insensitive).
-pub(super) fn channel_matches_query(channel: &Value, query: &str) -> bool {
+pub(super) fn channel_matches_query(channel: &serde_json::Map<String, Value>, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -189,7 +205,7 @@ pub(super) fn channel_matches_query(channel: &Value, query: &str) -> bool {
 }
 
 /// True if any of a user's searchable string fields contain `query` (case-insensitive).
-pub(super) fn user_matches_query(user: &Value, query: &str) -> bool {
+pub(super) fn user_matches_query(user: &serde_json::Map<String, Value>, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -303,7 +319,10 @@ pub(super) fn parse_text_format(raw: &str) -> TextFormat {
 /// Apply the requested `text_format` to a raw Slack message object in-place:
 /// `markdown` returns readable Markdown, `mrkdwn` keeps raw mrkdwn, `both`
 /// returns both forms as `text` and `text_mrkdwn`.
-pub(super) fn render_message_text(message: &mut Value, format: TextFormat) {
+pub(super) fn render_message_text(
+    message: &mut serde_json::Map<String, Value>,
+    format: TextFormat,
+) {
     let raw = message
         .get("text")
         .and_then(|v| v.as_str())
@@ -311,17 +330,26 @@ pub(super) fn render_message_text(message: &mut Value, format: TextFormat) {
         .to_string();
     match format {
         TextFormat::Mrkdwn => {
-            message["text_mrkdwn"] = Value::Null;
+            message.insert("text_mrkdwn".into(), Value::Null);
         }
         TextFormat::Both => {
-            message["text"] = json!(mrkdwn_to_markdown(&raw));
-            message["text_mrkdwn"] = json!(raw);
+            message.insert("text".into(), json!(mrkdwn_to_markdown(&raw)));
+            message.insert("text_mrkdwn".into(), json!(raw));
         }
         TextFormat::Markdown => {
-            message["text"] = json!(mrkdwn_to_markdown(&raw));
-            message["text_mrkdwn"] = Value::Null;
+            message.insert("text".into(), json!(mrkdwn_to_markdown(&raw)));
+            message.insert("text_mrkdwn".into(), Value::Null);
         }
     }
+}
+
+/// Decode a checked Slack response into its typed stable envelope while retaining open fields.
+pub(super) fn decode_response<T: serde::de::DeserializeOwned>(
+    operation: &str,
+    value: Value,
+) -> Result<T, String> {
+    serde_json::from_value(value)
+        .map_err(|error| format!("decode `{operation}` response envelope: {error}"))
 }
 
 /// Best-effort Slack mrkdwn → Markdown renderer. Links, mentions, channels, and

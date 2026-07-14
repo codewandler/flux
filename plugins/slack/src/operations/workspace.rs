@@ -31,36 +31,36 @@ pub(crate) fn reaction(input: Value, host: &mut Host, method: &str) -> Result<Va
 // channels
 // ---------------------------------------------------------------------------
 
-pub(crate) fn channel_list(input: Value, host: &mut Host) -> Result<Value, String> {
+pub(crate) fn channel_list(
+    input: ChannelListInput,
+    host: &mut Host,
+) -> Result<ChannelListOutput, String> {
     let v = check_ok(sl_get(
         host,
         "/conversations.list?types=public_channel,private_channel,mpim,im&limit=200",
         Some("bot_token"),
     )?)?;
+    // Index the complete vendor response before applying caller-local presentation filters.
     contribute_channels(host, &v);
-    let query = opt_str(&input, "query")
-        .unwrap_or("")
+    let query = input
+        .query
+        .as_deref()
+        .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let limit = input
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .filter(|n| *n > 0);
-    if query.is_empty() && limit.is_none() {
-        return Ok(v);
+    let limit = input.limit.filter(|n| *n > 0);
+    let mut output: ChannelListOutput = decode_response("slack.channel.list", v)?;
+    if !query.is_empty() {
+        output
+            .channels
+            .retain(|channel| channel_matches_query(&channel.0, &query));
     }
-    let mut v = v;
-    if let Some(channels) = v.get_mut("channels").and_then(|c| c.as_array_mut()) {
-        if !query.is_empty() {
-            channels.retain(|c| channel_matches_query(c, &query));
-        }
-        if let Some(n) = limit {
-            if channels.len() > n as usize {
-                channels.truncate(n as usize);
-            }
+    if let Some(n) = limit {
+        if output.channels.len() > n as usize {
+            output.channels.truncate(n as usize);
         }
     }
-    Ok(v)
+    Ok(output)
 }
 
 pub(crate) fn channel_join(input: Value, host: &mut Host) -> Result<Value, String> {
@@ -170,32 +170,29 @@ pub(crate) fn bookmark_list(input: Value, host: &mut Host) -> Result<Value, Stri
 // users / presence / emoji
 // ---------------------------------------------------------------------------
 
-pub(crate) fn user_list(input: Value, host: &mut Host) -> Result<Value, String> {
+pub(crate) fn user_list(input: UserListInput, host: &mut Host) -> Result<UserListOutput, String> {
     let v = check_ok(sl_get(host, "/users.list?limit=200", Some("bot_token"))?)?;
+    // Index the complete vendor response before applying caller-local presentation filters.
     contribute_users(host, &v);
-    let query = opt_str(&input, "query")
-        .unwrap_or("")
+    let query = input
+        .query
+        .as_deref()
+        .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let limit = input
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .filter(|n| *n > 0);
-    if query.is_empty() && limit.is_none() {
-        return Ok(v);
+    let limit = input.limit.filter(|n| *n > 0);
+    let mut output: UserListOutput = decode_response("slack.user.list", v)?;
+    if !query.is_empty() {
+        output
+            .members
+            .retain(|user| user_matches_query(&user.0, &query));
     }
-    let mut v = v;
-    if let Some(members) = v.get_mut("members").and_then(|m| m.as_array_mut()) {
-        if !query.is_empty() {
-            members.retain(|u| user_matches_query(u, &query));
-        }
-        if let Some(n) = limit {
-            if members.len() > n as usize {
-                members.truncate(n as usize);
-            }
+    if let Some(n) = limit {
+        if output.members.len() > n as usize {
+            output.members.truncate(n as usize);
         }
     }
-    Ok(v)
+    Ok(output)
 }
 
 pub(crate) fn presence_get(input: Value, host: &mut Host) -> Result<Value, String> {

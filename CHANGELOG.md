@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **C-75: Slack's channel, user, history, and thread reads now execute through typed contracts.**
+  Four handlers reject input drift before HTTP, publish generated stable envelopes, and preserve
+  Slack-owned channel, member, message, cursor, metadata, and extension fields without narrowing
+  the vendor payload.
 - **C-74: GitLab's project, merge-request, and issue read families now execute through typed
   contracts.** Six list/show handlers decode aliases and defaults once, publish generated output
   schemas for stable fields, reject wrong top-level result shapes, and preserve unknown vendor

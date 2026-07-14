@@ -1,8 +1,9 @@
 //! Schemars-derived input contracts for the Slack operation catalog.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 // ─── op input schemas (D-36) ───────────────────────────────────────────────
 // Each op's `input_schema` is schemars-derived (`host_kit::read_op_typed::<T>` /
@@ -35,15 +36,15 @@ pub(super) struct MessageSendInput {
 }
 
 /// `slack.message.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct MessageListInput {
-    channel: String,
-    limit: Option<i64>,
-    cursor: Option<String>,
-    oldest: Option<String>,
-    latest: Option<String>,
-    text_format: Option<String>,
+    pub(super) channel: String,
+    pub(super) limit: Option<i64>,
+    pub(super) cursor: Option<String>,
+    pub(super) oldest: Option<String>,
+    pub(super) latest: Option<String>,
+    pub(super) text_format: Option<String>,
 }
 
 /// `slack.message.edit`.
@@ -71,15 +72,15 @@ pub(super) struct MessageDeleteInput {
 }
 
 /// `slack.thread`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ThreadInput {
-    r#ref: Option<String>,
-    channel: Option<String>,
-    ts: Option<String>,
-    limit: Option<i64>,
-    max_bytes: Option<i64>,
-    text_format: Option<String>,
+    pub(super) r#ref: Option<String>,
+    pub(super) channel: Option<String>,
+    pub(super) ts: Option<String>,
+    pub(super) limit: Option<i64>,
+    pub(super) max_bytes: Option<i64>,
+    pub(super) text_format: Option<String>,
 }
 
 /// `slack.search`.
@@ -136,11 +137,11 @@ pub(super) struct ReactionRemoveInput {
 }
 
 /// `slack.channel.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChannelListInput {
-    query: Option<String>,
-    limit: Option<i64>,
+    pub(super) query: Option<String>,
+    pub(super) limit: Option<i64>,
 }
 
 /// `slack.channel.join`.
@@ -254,12 +255,119 @@ pub(super) struct BookmarkListInput {
 }
 
 /// `slack.user.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct UserListInput {
-    query: Option<String>,
-    limit: Option<i64>,
+    pub(super) query: Option<String>,
+    pub(super) limit: Option<i64>,
 }
+
+// C-75 output contracts. Slack extends channel, member, message, and response objects over time.
+// The executable types therefore enforce only the stable envelope/object shape while retaining
+// every vendor-owned field in an open map. The schema projections document common stable fields
+// without narrowing that extension tail.
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct SlackChannelSchema {
+    id: Option<String>,
+    name: Option<String>,
+    is_channel: Option<bool>,
+    is_group: Option<bool>,
+    is_im: Option<bool>,
+    is_mpim: Option<bool>,
+    is_private: Option<bool>,
+    is_archived: Option<bool>,
+    is_member: Option<bool>,
+    topic: Option<Value>,
+    purpose: Option<Value>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub(super) struct SlackChannel(
+    #[schemars(with = "SlackChannelSchema")] pub(super) Map<String, Value>,
+);
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct SlackUserSchema {
+    id: Option<String>,
+    team_id: Option<String>,
+    name: Option<String>,
+    real_name: Option<String>,
+    deleted: Option<bool>,
+    profile: Option<Value>,
+    is_admin: Option<bool>,
+    is_owner: Option<bool>,
+    is_restricted: Option<bool>,
+    is_ultra_restricted: Option<bool>,
+    is_bot: Option<bool>,
+    is_app_user: Option<bool>,
+    updated: Option<i64>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub(super) struct SlackUser(#[schemars(with = "SlackUserSchema")] pub(super) Map<String, Value>);
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct SlackMessageSchema {
+    r#type: Option<String>,
+    subtype: Option<String>,
+    user: Option<String>,
+    bot_id: Option<String>,
+    text: Option<String>,
+    ts: Option<String>,
+    thread_ts: Option<String>,
+    reply_count: Option<i64>,
+    blocks: Option<Vec<Value>>,
+    attachments: Option<Vec<Value>>,
+    files: Option<Vec<Value>>,
+    reactions: Option<Vec<Value>>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub(super) struct SlackMessage(
+    #[schemars(with = "SlackMessageSchema")] pub(super) Map<String, Value>,
+);
+
+/// Stable `conversations.list` response envelope. Unknown Slack response metadata is retained.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub(super) struct ChannelListOutput {
+    pub(super) ok: bool,
+    pub(super) channels: Vec<SlackChannel>,
+    #[serde(flatten)]
+    pub(super) extensions: BTreeMap<String, Value>,
+}
+
+/// Stable `users.list` response envelope. Unknown Slack response metadata is retained.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub(super) struct UserListOutput {
+    pub(super) ok: bool,
+    pub(super) members: Vec<SlackUser>,
+    #[serde(flatten)]
+    pub(super) extensions: BTreeMap<String, Value>,
+}
+
+/// Stable message-read response envelope shared by history and thread replies.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub(super) struct MessageListOutput {
+    pub(super) ok: bool,
+    pub(super) messages: Vec<SlackMessage>,
+    #[serde(flatten)]
+    pub(super) extensions: BTreeMap<String, Value>,
+}
+
+pub(super) type ThreadOutput = MessageListOutput;
 
 /// `slack.presence.get`.
 #[derive(Deserialize, JsonSchema)]

@@ -17,6 +17,9 @@
 
 ### Improved
 
+- **Slack channel, user, history, and thread reads now validate their complete input before making
+  a request and advertise their stable result envelope.** Slack's evolving object fields, cursors,
+  and response metadata remain available unchanged.
 - **GitLab project, merge-request, and issue reads now validate their complete input before making
   a request and advertise their stable result fields.** Existing raw GitLab results, including new
   vendor fields and explicit nulls, remain unchanged.

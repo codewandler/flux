@@ -3,6 +3,10 @@
 use super::*;
 
 pub(super) fn manifest_builder() -> PluginBuilder {
+    // C-75 migrates the bounded channel/user/message read envelopes below. The remaining flexible
+    // registrations intentionally retain open Slack response families (writes, search/mentions,
+    // files, bookmarks, presence, emoji, and index aggregation) until each can be typed without
+    // narrowing vendor-owned payloads; the phased units are recorded in TYPED-MIGRATION.md.
     let builder = PluginBuilder::new("slack", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
             http: true,
@@ -56,7 +60,7 @@ pub(super) fn manifest_builder() -> PluginBuilder {
             ),
             message_send,
         )
-        .operation_flexible(
+        .operation_typed::<MessageListInput, MessageListOutput>(
             read_op_typed::<MessageListInput>(
                 "slack.message.list",
                 "Read recent messages from a channel (conversations.history); paginate with next_cursor.",
@@ -77,7 +81,7 @@ pub(super) fn manifest_builder() -> PluginBuilder {
             ),
             message_delete,
         )
-        .operation_flexible(
+        .operation_typed::<ThreadInput, ThreadOutput>(
             read_op_typed::<ThreadInput>(
                 "slack.thread",
                 "View a Slack thread. Provide `ref` (permalink or channel:ts) OR `channel`+`ts`.",
@@ -123,7 +127,7 @@ pub(super) fn manifest_builder() -> PluginBuilder {
             reaction_remove,
         )
         // -- channels -------------------------------------------------------
-        .operation_flexible(
+        .operation_typed::<ChannelListInput, ChannelListOutput>(
             read_op_typed::<ChannelListInput>(
                 "slack.channel.list",
                 "List public and private channels (plus group/direct conversations) in the workspace.",
@@ -217,7 +221,7 @@ pub(super) fn manifest_builder() -> PluginBuilder {
             bookmark_list,
         )
         // -- users / presence / emoji ---------------------------------------
-        .operation_flexible(
+        .operation_typed::<UserListInput, UserListOutput>(
             read_op_typed::<UserListInput>(
                 "slack.user.list",
                 "List users in the workspace.",

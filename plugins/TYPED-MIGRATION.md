@@ -9,10 +9,10 @@ the compatibility `operation` spelling is deprecated and must not be used by fir
 The first migrations deliberately cover both ends of the spectrum: `websearch` has the empty-input
 `provider.list` operation and the alias-heavy, multi-query `web.search` operation; Jira has the
 stable attachment list/get family while preserving each open Atlassian attachment object verbatim;
-and GitLab has the project/MR/issue list+show read families. These result families have generated
-output schemas. Other operations already derive input schemas (D-36), but their handlers remain on
-the explicit flexible adapter until each vendor result family is typed without erasing
-vendor-specific semantics.
+GitLab has the project/MR/issue list+show read families; and Slack has channel/user lists plus
+message history/thread reads. These result families have generated output schemas. Other operations
+already derive input schemas (D-36), but their handlers remain on the explicit flexible adapter
+until each vendor result family is typed without erasing vendor-specific semantics.
 
 | Plugin | Typed executable handlers | Next migration unit |
 | --- | --- | --- |
@@ -31,7 +31,7 @@ vendor-specific semantics.
 | onepassword | pending | vault/item list+get, preserving secret redaction |
 | opsgenie | pending | alert/schedule list+show |
 | prometheus | pending | labels/series/query result families |
-| slack | pending | channel/user/message list+show |
+| slack | channel/user list and message history/thread, typed open vendor envelopes | search/mentions/unreads, then file/bookmark result families |
 | sql | pending | server info and row-envelope output |
 | vault | pending | mount/list metadata before secret-bearing reads |
 | websearch | **migrated** | `web.search`, `websearch.provider.list`, typed ranked/provider outputs |
@@ -42,6 +42,13 @@ explicit `null` in the result. The remaining GitLab handlers intentionally stay 
 `operation_flexible` for now because pipeline/job responses, diffs, mutation receipts, and binary
 transfers have distinct open shapes and side conditions; each needs a bounded contract batch rather
 than a single lossy catch-all type.
+
+Slack's migrated reads use typed `ok` + collection envelopes and transparent map-backed
+channel/member/message objects. Both object extensions and top-level response metadata remain
+lossless. The other Slack registrations intentionally stay on `operation_flexible`: writes return
+method-specific receipts, search/mentions/unreads synthesize distinct open aggregates, and
+file/bookmark/presence/emoji/index operations have separate vendor or host-owned result shapes that
+need their own bounded migration units.
 
 Migration rules:
 
