@@ -52,6 +52,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The pre-release A2A smoke now explicitly requests blocking delivery.** The `message/send` gate
+  once again waits for and validates the terminal `completed` task state after non-blocking became
+  the protocol default.
 - **A-85: role discovery now fails closed.** Malformed or unknown frontmatter, invalid loop/effort
   values, unreadable files, workspace symlink escapes, and duplicate names produce source-labelled
   errors instead of silently dropping a role or inheriting the parent's tools. Omitting `tools`

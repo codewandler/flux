@@ -206,7 +206,7 @@ else
   # message/send — synchronous (payload shape pinned by crates/flux-server/tests/a2a_message_send.rs).
   send_out="$(curl -sf -X POST "http://$A2A_ADDR/a2a" \
     -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","id":"s1","method":"message/send","params":{"message":{"contextId":"smoke-send","parts":[{"kind":"text","text":"Reply with exactly the token A2A_OK and nothing else."}]}}}' \
+    -d '{"jsonrpc":"2.0","id":"s1","method":"message/send","params":{"message":{"contextId":"smoke-send","parts":[{"kind":"text","text":"Reply with exactly the token A2A_OK and nothing else."}]},"configuration":{"blocking":true}}}' \
     2>/dev/null)"
   printf '  message/send response:\n'
   printf '%s\n' "$send_out" | python3 -m json.tool 2>/dev/null | sed 's/^/    /' || printf '    %s\n' "$send_out"
