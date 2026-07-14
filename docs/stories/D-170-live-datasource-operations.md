@@ -2,7 +2,8 @@
 id: D-170
 title: Project live datasources into list and get operations
 pillar: Agent
-status: backlog
+status: ready
+priority: 4
 epic: async-live-datasource-seam
 design: docs/designs/async-live-datasource-seam.md
 note: "D-62 phase 3; depends on D-169"

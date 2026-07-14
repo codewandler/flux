@@ -271,7 +271,7 @@ Accepted implementation stories — each remains independently testable and comm
 1. **D-168 — L0 live-datasource types** ✅ — add `Row`, `Page<T>`, `PageRequest`, `Filters`, `Reference`,
    `LiveSchema`/`LiveEntity`, `FilterKey`/`FilterType` to `flux-datasource` (pure data, serde),
    with round-trip tests.
-2. **D-169 — the `LiveDatasource` trait** — `async list`/`get` + `schema()` and closed
+2. **D-169 — the `LiveDatasource` trait** ✅ — `async list`/`get` + `schema()` and closed
    `LiveAccess` declarations in `flux-capabilities/src/datasource/live.rs`, using the existing
    async/runtime dependencies.
 3. **D-170 — the generic two-op projection** — `try_register_live_datasource(registry, groups,

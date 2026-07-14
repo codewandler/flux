@@ -10,6 +10,7 @@
 
 mod host_caps;
 mod ingest;
+mod live;
 mod memory;
 mod ops;
 mod semantic;
@@ -30,6 +31,7 @@ pub use host_caps::DatasourceHostCaps;
 pub use ingest::{
     chunk_text, freshness, ingest_markdown, ingest_openapi, ingest_text, reindex, ChunkOptions,
 };
+pub use live::{validate_live_contract, LiveAccess, LiveDatasource};
 pub use memory::MemoryBackend;
 pub use ops::{datasource_tools, register_datasource_ops, try_register_datasource_ops};
 pub use semantic::SemanticIndex;

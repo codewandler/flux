@@ -8,6 +8,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-169: live systems of record have a guarded async backend contract.** Implementations receive
+  the canonical tool context, declare exact network/connection resource families, and fail static
+  validation on malformed domains, entities, filters, page bounds, or authority before surfacing.
 - **D-168: live datasources now have a pure shared contract.** The namespaced L0 vocabulary covers
   deterministic scalar filters, typed entity schemas, cursor pages, compact rows, and tagged weak
   references without adding IO/runtime dependencies or changing the indexed-record wire shape.
