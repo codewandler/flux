@@ -30,7 +30,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-- [D-170 — Project live datasources into list and get operations](D-170-live-datasource-operations.md) · Agent · **P4** · D-62 phase 3; depends on D-169
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
@@ -370,6 +369,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-167 — Isolate sandbox discovery tests from the process PATH](D-167-isolate-sandbox-path-tests.md) · Agent · 2026-07-13 task install: 13 flux-system process tests failed together while PATH-mutating sandbox tests ran in the same parallel test binary.
 - [D-168 — Add pure live-datasource contracts](D-168-live-datasource-contracts.md) · Agent · namespaced deterministic row/page/filter/reference/schema contracts for live systems of record
 - [D-169 — Add the async LiveDatasource trait](D-169-live-datasource-trait.md) · Agent · object-safe guarded list/get contract with fail-fast schema and authority validation
+- [D-170 — Project live datasources into list and get operations](D-170-live-datasource-operations.md) · Agent · atomic generated list/get tools with guarded async routing and consistent row/cursor rendering
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this

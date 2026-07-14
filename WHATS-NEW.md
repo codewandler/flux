@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### New
+
+- **Live systems of record can expose a consistent `<domain>.list` and `<domain>.get` operation
+  pair.** Flux generates each entity's visible filter schema and renders rows and continuation
+  cursors consistently, while the backend retains ownership of its async fetches.
+
 ### Improved
 
 - **Prepared release binaries can now be promoted by a matching version tag without rebuilding all

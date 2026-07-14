@@ -15,10 +15,10 @@ pub mod endpoint;
 
 pub use datasource::{
     chunk_text, datasource_tools, freshness, ingest_markdown, ingest_openapi, ingest_text,
-    records_to_context_blocks, register_datasource_ops, reindex, try_register_datasource_ops,
-    validate_live_contract, ChunkOptions, DatasourceBackend, DatasourceHostCaps, Embedder,
-    EmbeddingUsage, LiveAccess, LiveDatasource, MemoryBackend, MemoryVectorStore, SemanticIndex,
-    SqliteBackend, VectorStore,
+    live_datasource_tools, records_to_context_blocks, register_datasource_ops, reindex,
+    try_register_datasource_ops, try_register_live_datasource, validate_live_contract,
+    ChunkOptions, DatasourceBackend, DatasourceHostCaps, Embedder, EmbeddingUsage, LiveAccess,
+    LiveDatasource, MemoryBackend, MemoryVectorStore, SemanticIndex, SqliteBackend, VectorStore,
 };
 pub use endpoint::{
     endpoint_tools, register_endpoint_ops, try_register_endpoint_ops, CredentialReader,

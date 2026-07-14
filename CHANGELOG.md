@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-170: any live datasource can project one atomic, source-labelled list/get operation pair.**
+  Registration snapshots the validated backend schema, advertises entity-specific filter fields,
+  routes async calls with the guarded tool context, and renders rows, cursors, empty pages, and
+  missing records consistently without a per-integration adapter.
 - **C-73: version tags can promote an exact-SHA release candidate without recompiling it.** A manual
   run builds and retains all five cargo-dist targets with an immutable provenance receipt; the tag
   workflow verifies the version, commit, run, and complete artifact set before publishing, while a

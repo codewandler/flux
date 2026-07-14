@@ -5,11 +5,17 @@
 //! the guarded [`ToolContext`] and declare their exact external resource families up front.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use flux_core::{Error, Result};
-use flux_datasource::live::{Filters, LiveSchema, Page, PageRequest, Row};
-use flux_runtime::ToolContext;
+use flux_datasource::live::{
+    FilterKey, FilterType, Filters, LiveEntity, LiveSchema, Page, PageRequest, Reference, Row,
+};
+use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_spec::{AccessKind, ToolSpec};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
 
 /// External guarded resource used by a live backend in addition to its datasource identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -70,6 +76,291 @@ pub trait LiveDatasource: Send + Sync {
     /// Resolve one row by stable entity/id, re-entering host-owned authentication and connection
     /// state rather than consuming a model-held capability.
     async fn get(&self, ctx: &ToolContext, entity: &str, id: &str) -> Result<Option<Row>>;
+}
+
+/// Build the uniform `<domain>.list` and `<domain>.get` operations for one live backend.
+///
+/// The backend contract is snapshotted and validated once so the schemas advertised at
+/// registration are the same entity/filter vocabulary used to route calls. Runtime enforcement of
+/// filter contracts and page bounds is the next projection phase; this layer performs only the
+/// structural conversion needed by the typed backend.
+pub fn live_datasource_tools(
+    domain: &str,
+    backend: Arc<dyn LiveDatasource>,
+) -> Result<Vec<Arc<dyn Tool>>> {
+    let schema = backend.schema();
+    validate_live_contract(domain, &schema, &backend.access())?;
+
+    let projection = Arc::new(LiveProjection {
+        domain: domain.to_string(),
+        schema,
+        backend,
+    });
+    let list = LiveListOp {
+        spec: list_spec(&projection.domain, &projection.schema),
+        projection: projection.clone(),
+    };
+    let get = LiveGetOp {
+        spec: get_spec(&projection.domain, &projection.schema),
+        projection,
+    };
+    Ok(vec![Arc::new(list), Arc::new(get)])
+}
+
+/// Atomically install exactly the list/get pair for one live datasource domain.
+///
+/// Both tools share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on
+/// a clone, so a collision or invalid declaration leaves the caller's registry unchanged.
+pub fn try_register_live_datasource(
+    registry: &mut ToolRegistry,
+    domain: &str,
+    backend: Arc<dyn LiveDatasource>,
+) -> Result<()> {
+    let tools = live_datasource_tools(domain, backend)?;
+    registry.try_register_all_from(live_source(domain), tools)
+}
+
+fn live_source(domain: &str) -> String {
+    format!("flux-capabilities live datasource `{domain}`")
+}
+
+struct LiveProjection {
+    domain: String,
+    schema: LiveSchema,
+    backend: Arc<dyn LiveDatasource>,
+}
+
+impl LiveProjection {
+    fn entity(&self, operation: &str, entity: &str) -> Result<&LiveEntity> {
+        self.schema
+            .entities
+            .iter()
+            .find(|declared| declared.entity == entity)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "{operation}: unknown entity `{entity}` for live datasource `{}`",
+                    self.domain
+                ))
+            })
+    }
+}
+
+#[derive(Deserialize)]
+struct LiveListInput {
+    entity: String,
+    #[serde(default)]
+    page: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    filters: Filters,
+}
+
+#[derive(Deserialize)]
+struct LiveGetInput {
+    entity: String,
+    id: String,
+}
+
+struct LiveListOp {
+    projection: Arc<LiveProjection>,
+    spec: ToolSpec,
+}
+
+#[async_trait]
+impl Tool for LiveListOp {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let operation = &self.spec.name;
+        let input: LiveListInput = parse(operation, params)?;
+        let entity = self.projection.entity(operation, &input.entity)?;
+        let page = PageRequest {
+            cursor: input.page,
+            limit: input.limit.unwrap_or(entity.default_page),
+        };
+        let result = self
+            .projection
+            .backend
+            .list(ctx, &input.entity, page, &input.filters)
+            .await?;
+        Ok(ToolResult::ok(render_page(&input.entity, &result)))
+    }
+}
+
+struct LiveGetOp {
+    projection: Arc<LiveProjection>,
+    spec: ToolSpec,
+}
+
+#[async_trait]
+impl Tool for LiveGetOp {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let operation = &self.spec.name;
+        let input: LiveGetInput = parse(operation, params)?;
+        self.projection.entity(operation, &input.entity)?;
+        let row = self
+            .projection
+            .backend
+            .get(ctx, &input.entity, &input.id)
+            .await?;
+        Ok(ToolResult::ok(match row {
+            Some(row) => render_full_row(&input.entity, &row),
+            None => "not found".to_string(),
+        }))
+    }
+}
+
+fn parse<T: serde::de::DeserializeOwned>(operation: &str, params: Value) -> Result<T> {
+    serde_json::from_value(params)
+        .map_err(|error| Error::Other(format!("{operation}: bad input: {error}")))
+}
+
+fn render_page(entity: &str, page: &Page<Row>) -> String {
+    let mut output = if page.rows.is_empty() {
+        "no records".to_string()
+    } else {
+        page.rows
+            .iter()
+            .map(|row| render_compact_row(entity, row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if let Some(next) = &page.next {
+        output.push_str("\nnext: ");
+        output.push_str(next);
+    }
+    output
+}
+
+fn render_compact_row(entity: &str, row: &Row) -> String {
+    let mut output = format!("[{entity} {}]", row.id);
+    if !row.title.is_empty() {
+        output.push(' ');
+        output.push_str(&row.title);
+    }
+    if !row.summary.is_empty() {
+        output.push_str(" — ");
+        output.push_str(&row.summary);
+    }
+    output
+}
+
+fn render_full_row(entity: &str, row: &Row) -> String {
+    let mut output = render_compact_row(entity, row);
+    if let Some(reference) = &row.reference {
+        output.push_str("\nreference: ");
+        match reference {
+            Reference::Entity { entity, id } => {
+                output.push_str(entity);
+                output.push('/');
+                output.push_str(id);
+            }
+            Reference::Url { url } => output.push_str(url),
+        }
+    }
+    output
+}
+
+fn list_spec(domain: &str, schema: &LiveSchema) -> ToolSpec {
+    let variants = schema
+        .entities
+        .iter()
+        .map(list_entity_schema)
+        .collect::<Vec<_>>();
+    ToolSpec::read_only(
+        format!("{domain}.list"),
+        format!("List one page from the `{domain}` live datasource."),
+        json!({"type": "object", "oneOf": variants}),
+    )
+    .with_access(vec![AccessKind::Datasource])
+}
+
+fn get_spec(domain: &str, schema: &LiveSchema) -> ToolSpec {
+    let entities = schema
+        .entities
+        .iter()
+        .map(|entity| entity.entity.clone())
+        .collect::<Vec<_>>();
+    ToolSpec::read_only(
+        format!("{domain}.get"),
+        format!("Fetch one full row from the `{domain}` live datasource."),
+        json!({
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "enum": entities},
+                "id": {"type": "string", "description": "Stable row id resolved by the backend"}
+            },
+            "required": ["entity", "id"],
+            "additionalProperties": false
+        }),
+    )
+    .with_access(vec![AccessKind::Datasource])
+}
+
+fn list_entity_schema(entity: &LiveEntity) -> Value {
+    let mut properties = Map::new();
+    let mut required_filters = Vec::new();
+    for filter in &entity.filters {
+        properties.insert(filter.name.clone(), filter_schema(filter));
+        if filter.required {
+            required_filters.push(Value::String(filter.name.clone()));
+        }
+    }
+
+    let mut filters = json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false
+    });
+    if !required_filters.is_empty() {
+        filters["required"] = Value::Array(required_filters);
+    }
+
+    let mut required = vec![json!("entity")];
+    if entity.filters.iter().any(|filter| filter.required) {
+        required.push(json!("filters"));
+    }
+    let mut schema = json!({
+        "title": entity.entity,
+        "type": "object",
+        "properties": {
+            "entity": {"const": entity.entity, "type": "string"},
+            "page": {"type": "string", "description": "Opaque continuation cursor"},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": entity.max_page,
+                "default": entity.default_page
+            },
+            "filters": filters
+        },
+        "required": required,
+        "additionalProperties": false
+    });
+    if let Some(description) = &entity.description {
+        schema["description"] = json!(description);
+    }
+    schema
+}
+
+fn filter_schema(filter: &FilterKey) -> Value {
+    let mut schema = match &filter.ty {
+        FilterType::String => json!({"type": "string"}),
+        FilterType::Int => json!({"type": "integer"}),
+        FilterType::Bool => json!({"type": "boolean"}),
+        FilterType::Enum(values) => json!({"type": "string", "enum": values}),
+    };
+    if let Some(description) = &filter.description {
+        schema["description"] = json!(description);
+    }
+    schema
 }
 
 /// Validate one domain's static contract before any operation is advertised.

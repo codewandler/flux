@@ -2,8 +2,7 @@
 id: D-170
 title: Project live datasources into list and get operations
 pillar: Agent
-status: ready
-priority: 4
+status: done
 epic: async-live-datasource-seam
 design: docs/designs/async-live-datasource-seam.md
 note: "D-62 phase 3; depends on D-169"
@@ -18,16 +17,20 @@ surface so consumers do not hand-build adapters per integration.
 
 ## Acceptance
 
-- [ ] `try_register_live_datasource` atomically installs exactly two source-labelled tools and
+- [x] `try_register_live_datasource` atomically installs exactly two source-labelled tools and
       rejects collisions without partially mutating the registry.
-- [ ] Generated input schemas enumerate the backend's entities and their declared filter fields;
+- [x] Generated input schemas enumerate the backend's entities and their declared filter fields;
       outputs render compact list rows, full get rows, `next:` cursors, empty pages, and not-found
       results consistently.
-- [ ] Calls dispatch to the typed backend with the guarded `ToolContext`; no operation calls
+- [x] Calls dispatch to the typed backend with the guarded `ToolContext`; no operation calls
       `execute` directly outside tests or introduces an IO side path.
-- [ ] Failing-first mock-backend tests cover list/get routing, rendering, collision atomicity, and
+- [x] Failing-first mock-backend tests cover list/get routing, rendering, collision atomicity, and
       backend error propagation.
 
 ## Progress
 
-- Not started; blocked on D-169.
+- Added the generated two-op projection, conservative datasource access declaration, atomic
+  source-labelled registration, and consistent row/page rendering. The integration fixture failed
+  first on the absent registration API, then passed the scoped capabilities tests, clippy, format,
+  and architecture gate. Filter-contract enforcement and exact authority/surfacing remain isolated
+  to D-171 and D-172 respectively.
