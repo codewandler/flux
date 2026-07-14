@@ -21,12 +21,14 @@ flux-system.workspace = true
 flux-cognition.workspace = true
 flux-secret.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }
+tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+flux-policy.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # L6→L6 (flux-sdk), test-only: dev-dependencies don't constrain flux-codegate's layering check.
 # Used by the L-13 same-report test to drive the direct FlowClient path alongside App::deliver.

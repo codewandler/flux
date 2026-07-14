@@ -38,6 +38,7 @@ mod ops;
 mod park;
 pub mod review;
 mod secrets;
+mod supervisor;
 
 pub use app::{App, HostPermissionRules, JourneyRun, RecordingSink};
 pub use bus::{Bus, Event, SentMessage};

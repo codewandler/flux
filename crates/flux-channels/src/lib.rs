@@ -17,10 +17,10 @@
 //! that drives them against a running [`App`](flux_app::App). flux-app is unchanged.
 //!
 //! ## Concurrency
-//! Deliveries are **serialized** ([`AppDeliverer`]): `App::deliver` subscribes to the broadcast bus and
-//! drains the cascade events its journeys emit, so concurrent deliveries would double-process via
-//! broadcast fan-out. Journeys themselves run on independent per-run stores, so this is the only
-//! serialization point; cross-channel parallelism is a follow-up (needs per-delivery bus isolation).
+//! Deliveries are **serialized by the shared [`flux_app::App`]**: `App::deliver` subscribes to the
+//! broadcast bus and drains the cascade events its journeys emit, so concurrent deliveries would
+//! double-process via broadcast fan-out. Owning the coordinator there covers direct calls and every
+//! adapter instance. Cross-channel parallelism needs per-delivery bus isolation.
 
 mod adapters;
 mod channel;

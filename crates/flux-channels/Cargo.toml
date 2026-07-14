@@ -32,5 +32,7 @@ default = ["slack"]
 slack = ["dep:slack-morphism", "slack-morphism/hyper"]
 
 [dev-dependencies]
+flux-runtime.workspace = true
+flux-spec.workspace = true
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }

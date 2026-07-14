@@ -11,14 +11,13 @@
 //! `DraftAst`, with a [`FlowStore`] for state and an [`AgentSink`] for output. Nothing about the
 //! interpreter is reinvented here — the multi-agent layer is pure wiring over the existing engine.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use flux_agent::{AgentSpec, Permissions, DEFAULT_COMPACT_THRESHOLD_CHARS};
 use flux_core::{Error, Result, Usage};
@@ -33,24 +32,20 @@ use flux_lang::runtime::FlowOutcome;
 use flux_orchestrate::{SubAgents, TaskTool};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
-    scope_runtime_turn, AllowApprover, Approver, DenyApprover, Executor, PermissionManager,
-    Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
+    scope_runtime_turn, AllowApprover, Approver, DenyApprover, ExecutionAuthorization,
+    ExecutionEnvironment, Executor, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
 };
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
 
-use crate::bus::{Bus, Event};
+use crate::bus::Bus;
 use crate::ops::{self, JourneyHost};
 use crate::park::{self, ParkedAsk};
+use crate::supervisor::DeliverySupervisor;
 
 /// How deep `spawn`-within-`spawn` may recurse before the engine refuses (cheap guard against a
 /// journey that spawns itself unboundedly).
 const MAX_SPAWN_DEPTH: u32 = 16;
-
-/// The most events a single [`App::deliver`] will process across the initial event and any it cascades
-/// into (via `emit`). Bounds an `emit`-loop in the one-shot path; the long-running [`App::run`] loop is
-/// unbounded by design.
-const MAX_CASCADE: u32 = 256;
 
 /// Legacy grants for a journey in a program which declares no capability policy. Kept byte-for-byte
 /// compatible; a declared policy replaces this implicit set with an explicit app/agent ceiling.
@@ -102,9 +97,9 @@ pub struct JourneyRun {
     pub result: String,
     pub steps: usize,
     /// The turn(s)' accumulated token usage (C-33), when the run drove at least one model call that
-    /// reported it — `None` for a run that dispatched no model turn (a pure-op journey, or a journey
-    /// whose cognition ops don't yet report usage). Summed across every `turn_end` the run's sink saw,
-    /// so a journey/agent turn that makes more than one model call still attributes its full cost.
+    /// reported it — `None` for a run that dispatched no model turn (a pure-op journey). Summed
+    /// across every `turn_end` the run's sink saw plus direct cognition calls in an authored
+    /// journey, so a journey/agent turn with more than one model call attributes its full cost.
     pub usage: Option<Usage>,
     /// The canonical `provider/model` spec of the engine that drove this run (C-33) — an
     /// `agent`-bound trigger's actual engine (`flux_core::canonical_model_spec` over its provider +
@@ -116,6 +111,10 @@ pub struct JourneyRun {
 
 /// The runtime host for a multi-agent [`Program`]. Cheap to clone is *not* a goal — hold one `App` and
 /// drive it; clone the [`Bus`] handle (via [`App::bus`]) if another task needs to emit.
+///
+/// App constructors install the documented local single-user authorization profile. Approval and
+/// source-declared capabilities may narrow that profile; `auto_approve` never widens its policy
+/// floor.
 pub struct App {
     engine: Arc<Engine>,
 }
@@ -306,19 +305,76 @@ impl App {
         events: Arc<EventStore>,
         host_permissions: HostPermissionRules,
     ) -> Self {
-        App {
+        Self::try_with_events_and_permission_rules_inner(
+            program,
+            provider,
+            model.into(),
+            auto_approve,
+            extra_tools,
+            sub_agents,
+            redactor,
+            events,
+            host_permissions,
+        )
+        .expect("flux-app registry assembly failed")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_with_events_and_permission_rules_inner(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: String,
+        auto_approve: bool,
+        extra_tools: Vec<Arc<dyn Tool>>,
+        sub_agents: Option<SubAgents>,
+        redactor: Redactor,
+        events: Arc<EventStore>,
+        host_permissions: HostPermissionRules,
+    ) -> Result<Self> {
+        let environment = compatibility_execution_environment(extra_tools, auto_approve, redactor)?;
+        Ok(App {
+            engine: Engine::new(
+                program,
+                provider,
+                model,
+                environment,
+                sub_agents,
+                events,
+                host_permissions,
+            )?,
+        })
+    }
+
+    /// Build an App from one explicitly rooted guarded execution environment.
+    ///
+    /// This is the preferred surface assembly door. The environment's registry contains
+    /// surface-contributed operations (datasources/endpoints/plugins); App composes its built-ins,
+    /// cognition, and orchestration ops onto that catalog while retaining the same system,
+    /// redactor, approval posture, policy, and identity for both journeys and lazily-created agent
+    /// engines. No process current-directory lookup occurs here or during lazy agent construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_with_execution_environment(
+        program: Program,
+        provider: Option<Arc<dyn Provider>>,
+        model: impl Into<String>,
+        environment: ExecutionEnvironment,
+        sub_agents: Option<SubAgents>,
+        events: Arc<EventStore>,
+        host_permissions: HostPermissionRules,
+    ) -> Result<Self> {
+        let app = App {
             engine: Engine::new(
                 program,
                 provider,
                 model.into(),
-                auto_approve,
-                extra_tools,
+                environment,
                 sub_agents,
-                redactor,
                 events,
                 host_permissions,
-            ),
-        }
+            )?,
+        };
+        app.engine.validate()?;
+        Ok(app)
     }
 
     /// Validating counterpart to [`with_events`](Self::with_events). This is the constructor product
@@ -335,16 +391,17 @@ impl App {
         redactor: Redactor,
         events: Arc<EventStore>,
     ) -> Result<Self> {
-        let app = Self::with_events(
+        let app = Self::try_with_events_and_permission_rules_inner(
             program,
             provider,
-            model,
+            model.into(),
             auto_approve,
             extra_tools,
             sub_agents,
             redactor,
             events,
-        );
+            HostPermissionRules::default(),
+        )?;
         app.engine.validate()?;
         Ok(app)
     }
@@ -363,17 +420,17 @@ impl App {
         events: Arc<EventStore>,
         host_permissions: HostPermissionRules,
     ) -> Result<Self> {
-        let app = Self::with_events_and_permission_rules(
+        let app = Self::try_with_events_and_permission_rules_inner(
             program,
             provider,
-            model,
+            model.into(),
             auto_approve,
             extra_tools,
             sub_agents,
             redactor,
             events,
             host_permissions,
-        );
+        )?;
         app.engine.validate()?;
         Ok(app)
     }
@@ -425,36 +482,25 @@ impl App {
     }
 
     /// Inject one event and run every journey its label triggers **to completion**, returning each
-    /// run's result. Events the journeys `emit` are processed too (bounded by [`MAX_CASCADE`]). This is
-    /// the unit of work tests and the CLI channels drive; [`App::run`] is the long-running form.
+    /// run's result. Events the journeys `emit` are processed too as a bounded cascade tree. This is
+    /// the unit of work tests and the CLI channels drive; [`App::run`] is the long-running form. The
+    /// App's sole delivery supervisor keeps each request and its cascades correlated.
     pub async fn deliver(
         &self,
         label: impl Into<String>,
         payload: Value,
     ) -> Result<Vec<JourneyRun>> {
-        self.engine.deliver(label.into(), payload).await
+        self.engine
+            .delivery
+            .deliver(&self.engine, label.into(), payload)
+            .await
     }
 
-    /// Run as a long-lived supervisor: emit a single `startup` event, then consume the bus forever,
-    /// running each event's triggered journeys. Returns only when the bus closes. Cascaded `emit`s are
-    /// picked up by the same loop, so this is the natural form for a server-style program.
+    /// Run as a long-lived supervisor: emit `startup` once, then route public bus events forever.
+    /// A second concurrent call fails promptly; cancelling the active call releases that lease so a
+    /// surface may resume supervision without creating another event receiver or repeating startup.
     pub async fn run(&self) -> Result<()> {
-        let mut rx = self.engine.bus.subscribe();
-        // Fire startup *after* subscribing so a `{on:"startup"}` trigger is never missed.
-        self.engine.bus.emit("startup", json!({}));
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let mut sink = RecordingSink::default();
-                    self.engine
-                        .run_triggers(&ev.label, &ev.payload, &mut sink)
-                        .await?;
-                }
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => break,
-            }
-        }
-        Ok(())
+        self.engine.delivery.run(&self.engine).await
     }
 
     /// Test-only: how many messages the agent's bound session for `conversation` holds (`0` if none).
@@ -480,19 +526,17 @@ pub(crate) struct Engine {
     pub(crate) program: Program,
     pub(crate) registry: ToolRegistry,
     pub(crate) bus: Bus,
+    /// The sole trigger-routing owner. Public bus receivers are observation-only; direct deliveries
+    /// and the long-running run lease submit roots to this coordinator.
+    delivery: DeliverySupervisor,
     /// Active `spawn` recursion depth (guards against unbounded self-spawn).
     depth: AtomicU32,
     /// Monotonic counter giving each journey run a distinct session id.
     runs: AtomicU64,
-    /// When true, journeys use an allow approver (`--yes`) for calls still present in their effective
-    /// registry; otherwise calls outside the pre-allowed set are denied. Source-declared ceilings
-    /// are enforced by registry narrowing before this approval layer.
-    auto_approve: bool,
-    /// The sub-agent spawner (when [`App::with_sub_agents`] wired one) — installed on every journey
-    /// run's executor so a `task` call (e.g. inside the `strict_review` composite op's reviewer
-    /// fan-out) can delegate. `None` leaves journeys exactly as before (`task` errors with "no
-    /// sub-agent spawner configured").
-    spawner: Option<Arc<dyn Spawner>>,
+    /// Shared mechanical execution template. Per-journey/per-agent capability decisions replace
+    /// only its catalog, permission rules, or approver; guarded system, redactor, spawner, policy,
+    /// and identity remain identical across every derived executor.
+    execution: ExecutionEnvironment,
     /// The model provider (when wired); needed to assemble an agent-target engine lazily. An
     /// `agent`-bound trigger with no provider is a clear error.
     provider: Option<Arc<dyn Provider>>,
@@ -504,14 +548,6 @@ pub(crate) struct Engine {
     agents: Mutex<HashMap<String, Arc<FlowEngine>>>,
     /// `(agent, conversation)` → persistent session id (in-memory; a restart starts threads fresh).
     sessions: Mutex<HashMap<(String, String), String>>,
-    /// The guarded `System` every journey run's executor + (when wired) the sub-agent spawner share —
-    /// built once here rather than a fresh instance per journey run, so a journey and the sub-agents
-    /// it spawns always resolve paths against the identical workspace root.
-    system: Arc<System>,
-    /// The host's shared secret redactor — the one `resolve_secrets` seeded (clones share the value
-    /// store). Installed on every journey-run executor's and agent-target engine's `ToolContext`, so
-    /// program-declared secrets are scrubbed from tool output/logs everywhere.
-    redactor: Redactor,
     /// Local config approval rules. Applied after source capability narrowing; local deny wins.
     host_permissions: HostPermissionRules,
     /// Journeys parked on an `ask`, oldest first, each waiting for the correlated reply (A-11).
@@ -531,6 +567,38 @@ fn guarded_system(workspace: Workspace) -> System {
     System::new(workspace).with_sandbox(flux_system::sandbox::Sandbox::resolve(
         flux_system::sandbox::SandboxSettings::from_env(),
     ))
+}
+
+/// Compatibility assembly for the pre-C-67 App constructors. New surfaces should build an
+/// [`ExecutionEnvironment`] from their already-resolved workspace and call
+/// [`App::try_with_execution_environment`]. The current-directory lookup lives only here, happens
+/// eagerly, and is fallible; lazy agent creation never consults it again. These shims are planned
+/// for removal in the next minor API cleanup once downstream callers migrate.
+fn compatibility_execution_environment(
+    extra_tools: Vec<Arc<dyn Tool>>,
+    auto_approve: bool,
+    redactor: Redactor,
+) -> Result<ExecutionEnvironment> {
+    let cwd = std::env::current_dir().map_err(other)?;
+    let workspace = Workspace::from_env(cwd).map_err(other)?;
+    let system = Arc::new(guarded_system(workspace));
+    let mut registry = ToolRegistry::new();
+    for (index, tool) in extra_tools.into_iter().enumerate() {
+        registry.try_register_from(format!("app extra tool #{}", index + 1), tool)?;
+    }
+    let approver: Arc<dyn Approver> = if auto_approve {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(DenyApprover)
+    };
+    Ok(ExecutionEnvironment::new(
+        system,
+        registry,
+        PermissionManager::new(),
+        approver,
+        ExecutionAuthorization::local(),
+    )
+    .with_redactor(redactor))
 }
 
 fn effective_capabilities(
@@ -588,14 +656,14 @@ fn rebind_cognition(
     persona: &str,
     thinking: bool,
     effort: Option<Effort>,
-) {
-    for name in flux_cognition::CognitionPack::names() {
-        registry.remove(name);
-    }
+) -> Result<()> {
+    // A declared agent intentionally rebinds the canonical cognition family to its own
+    // provider/model/persona. Use the explicit replacement API so this cannot be mistaken for an
+    // ordinary pack collision.
     flux_cognition::CognitionPack::new(provider, model)
         .with_system_prefix(persona)
         .with_reasoning(thinking, effort)
-        .register(registry);
+        .replace_from("flux-app declared-agent cognition rebind", registry)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -609,11 +677,11 @@ async fn resolve_agent_runtime_profile(
     system: Arc<System>,
     host_permissions: &HostPermissionRules,
 ) -> Result<AgentRuntimeProfile> {
-    let root = std::env::current_dir().map_err(other)?;
+    let root = system.workspace().root().to_path_buf();
     let mut spec = agent_spec_from_decl(decl, default_model, root, &system).await?;
     let capabilities =
         effective_capabilities(available, app_permissions, decl.permissions.as_ref());
-    scope_datasource_tools(&mut registry, &decl.datasources);
+    scope_datasource_tools(&mut registry, &decl.datasources)?;
     if let Some(provider) = provider {
         rebind_cognition(
             &mut registry,
@@ -622,7 +690,7 @@ async fn resolve_agent_runtime_profile(
             &spec.effective_system_prompt(),
             spec.thinking,
             spec.effort,
-        );
+        )?;
     }
 
     // For an open-ended agent, `tools` remains the visible catalog. A declared capability layer can
@@ -723,13 +791,11 @@ impl Engine {
         program: Program,
         provider: Option<Arc<dyn Provider>>,
         model: String,
-        auto_approve: bool,
-        extra_tools: Vec<Arc<dyn Tool>>,
+        environment: ExecutionEnvironment,
         sub_agents: Option<SubAgents>,
-        redactor: Redactor,
         events: Arc<EventStore>,
         host_permissions: HostPermissionRules,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
         // `events` backs agent-target session memory (see the field doc): an in-memory store is fine
@@ -737,56 +803,72 @@ impl Engine {
         // now always handed in by the caller (`App::with_sub_agents` passes a fresh in-memory one;
         // `App::with_events` lets a surface share its own, flux D-65) rather than created here, so
         // both constructors share one code path.
-        // A guarded `System` rooted at the cwd, built ONCE and shared by every journey run's executor
-        // and, when `sub_agents` is set, the spawner it builds — so a journey and the sub-agents it
-        // spawns always resolve paths against the identical workspace root (never two independent
-        // `System`s from separate `current_dir()` calls).
-        let system = Arc::new(guarded_system(
-            Workspace::from_env(std::env::current_dir().unwrap_or_else(|_| ".".into()))
-                .expect("flux-app: workspace"),
-        ));
+        // The surface resolves the guarded system exactly once. Lazy journey/agent construction
+        // below derives only from this environment and never re-reads process cwd.
+        let system = environment.system().clone();
+        let contributed_registry = environment.registry().clone();
         // `new_cyclic`: the `spawn` op needs a back-reference to the engine it re-enters, but the
         // engine owns the registry that owns the op — a `Weak` breaks the cycle.
-        Arc::new_cyclic(|weak: &Weak<Engine>| {
+        let registration_error = std::cell::RefCell::new(None);
+        let engine = Arc::new_cyclic(|weak: &Weak<Engine>| {
             let mut registry = ToolRegistry::new();
-            flux_tools::register_builtins(&mut registry);
+            if let Err(error) = flux_tools::try_register_builtins(&mut registry) {
+                registration_error.borrow_mut().get_or_insert(error);
+            }
             if let Some(provider) = provider.clone() {
-                flux_cognition::CognitionPack::new(provider, model.clone()).register(&mut registry);
+                if let Err(error) = flux_cognition::CognitionPack::new(provider, model.clone())
+                    .try_register_from("flux-app cognition pack", &mut registry)
+                {
+                    registration_error.borrow_mut().get_or_insert(error);
+                }
             }
             let host: Weak<dyn JourneyHost> = weak.clone();
-            ops::register(&mut registry, bus.clone(), channels, host);
-            // Extra tools assembled by the surface (datasource retrieval ops + integration plugin
-            // tools) — available to journeys and to the `trigger.agent` target's registry.
-            for tool in extra_tools {
-                registry.register(tool);
+            if let Err(error) = ops::register(&mut registry, bus.clone(), channels, host) {
+                registration_error.borrow_mut().get_or_insert(error);
+            }
+            // Surface-contributed datasource/endpoint/plugin operations retain their source labels
+            // and fail on collisions with App-owned operations.
+            if let Err(error) = registry.try_extend(contributed_registry.clone()) {
+                registration_error.borrow_mut().get_or_insert(error);
             }
             // Sub-agents (L-13): register `task` and build the spawner over the shared `system` — the
             // same `SubAgents::into_spawner` construction path the CLI's `build_agent` and the SDK's
             // `FlowClient::with_sub_agents` use, so a journey delegates through the identical envelope.
             // Children audit into the app's own event store by default (A-08), correlated per spawn.
             let spawner = sub_agents.map(|sa| {
-                registry.register(Arc::new(TaskTool));
+                if let Err(error) =
+                    registry.try_register_from("app sub-agent task operation", Arc::new(TaskTool))
+                {
+                    registration_error.borrow_mut().get_or_insert(error);
+                }
                 sa.with_audit(events.clone()).into_spawner(system.clone())
             });
+            let mut execution = environment.clone().with_registry(registry.clone());
+            if let Some(spawner) = &spawner {
+                execution = execution.with_spawner(spawner.clone());
+            }
             Engine {
                 program,
                 registry,
                 bus,
+                delivery: DeliverySupervisor::new(),
                 depth: AtomicU32::new(0),
                 runs: AtomicU64::new(0),
-                auto_approve,
-                spawner,
+                execution,
                 provider,
                 default_model: model,
                 events,
                 agents: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
-                system,
-                redactor,
                 host_permissions,
                 parks: Mutex::new(Vec::new()),
             }
-        })
+        });
+        if let Some(error) = registration_error.into_inner() {
+            Err(error)
+        } else {
+            Ok(engine)
+        }
     }
 
     fn available_op_names(&self) -> Vec<String> {
@@ -957,7 +1039,7 @@ impl Engine {
     /// [`crate::park`] for the rule) is **consumed** as that journey's reply — it resumes the park
     /// and does not also route through triggers (otherwise the reply line would start a fresh
     /// journey too). Uncorrelated events route normally and leave every park alone.
-    async fn run_triggers(
+    pub(crate) async fn run_triggers(
         &self,
         label: &str,
         payload: &Value,
@@ -979,35 +1061,6 @@ impl Engine {
         Ok(runs)
     }
 
-    /// One-shot delivery: process the initial event, then drain and process any events its journeys
-    /// emitted, repeating until the bus is quiet or [`MAX_CASCADE`] events have been handled.
-    async fn deliver(&self, label: String, payload: Value) -> Result<Vec<JourneyRun>> {
-        // Subscribe first so emits *during* the journeys are captured.
-        let mut rx = self.bus.subscribe();
-        let mut sink = RecordingSink::default();
-        let mut pending: VecDeque<Event> = VecDeque::new();
-        pending.push_back(Event::new(label, payload));
-        let mut results = Vec::new();
-        let mut budget = MAX_CASCADE;
-
-        while let Some(ev) = pending.pop_front() {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            results.extend(self.run_triggers(&ev.label, &ev.payload, &mut sink).await?);
-            // Drain events the journeys just emitted into the work queue.
-            loop {
-                match rx.try_recv() {
-                    Ok(e) => pending.push_back(e),
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
-                    Err(TryRecvError::Lagged(_)) => continue,
-                }
-            }
-        }
-        Ok(results)
-    }
-
     async fn journey_runtime_profile(&self, owner: Option<&str>) -> Result<JourneyRuntimeProfile> {
         let available = self.available_op_names();
         match owner {
@@ -1025,7 +1078,7 @@ impl Engine {
                     self.registry.clone(),
                     &available,
                     &self.default_model,
-                    self.system.clone(),
+                    self.execution.system().clone(),
                     &self.host_permissions,
                 )
                 .await?;
@@ -1097,10 +1150,7 @@ impl Engine {
             profile.registry.clone(),
             &profile.capabilities,
             &self.host_permissions,
-            self.auto_approve,
-            self.spawner.clone(),
-            self.system.clone(),
-            self.redactor.clone(),
+            self.execution.clone(),
         )?;
         // Preserve any outer cancellation/reporter while making this journey the immediate parent
         // lineage. The snapshot is scoped around the drive below, never retained on the executor.
@@ -1138,7 +1188,11 @@ impl Engine {
         })
         .await
         .map_err(other)?;
-        let usage = capture.usage;
+        let mut usage = capture.usage;
+        accumulate_usage(
+            &mut usage,
+            flux_cognition::recorded_usage(&executor.evidence()),
+        );
         let model = profile.model;
 
         if let Some(parked) = self.park_if_asked(
@@ -1295,10 +1349,7 @@ impl Engine {
             profile.registry.clone(),
             &profile.capabilities,
             &self.host_permissions,
-            self.auto_approve,
-            self.spawner.clone(),
-            self.system.clone(),
-            self.redactor.clone(),
+            self.execution.clone(),
         )?;
         let runtime_turn = executor
             .context()
@@ -1343,7 +1394,11 @@ impl Engine {
         })
         .await
         .map_err(other)?;
-        let usage = capture.usage;
+        let mut usage = capture.usage;
+        accumulate_usage(
+            &mut usage,
+            flux_cognition::recorded_usage(&executor.evidence()),
+        );
         let model = profile.model;
 
         if let Some(parked) = self.park_if_asked(
@@ -1403,8 +1458,7 @@ impl Engine {
                 self.registry.clone(),
                 self.events.clone(),
                 &self.default_model,
-                self.redactor.clone(),
-                self.system.clone(),
+                self.execution.clone(),
                 &self.host_permissions,
                 agent_loop,
             )
@@ -1484,34 +1538,15 @@ impl JourneyHost for Engine {
     }
 }
 
-/// Build the execution envelope for a journey: the shared `system` (built once by [`Engine::new`] and
-/// passed in — never a second, independently-`current_dir()`-resolved instance), the shared op
-/// registry, and an approver chosen by `auto_approve`. Every op dispatches through this `Executor`, so
-/// permission rules and effect gating apply exactly as in the interactive engine.
-///
-/// **Safe headless default (`auto_approve = false`):** the orchestration verbs + read-only builtins are
-/// pre-allowed (they run without prompting); anything else (`bash`, `write`, `git_*`, …) falls to a
-/// [`DenyApprover`] and is **denied** — there is no human at a prompt, so destructive ops in an
-/// untrusted program cannot execute. `auto_approve = true` (the CLI's `--yes`) swaps in an
-/// [`AllowApprover`] for trusted, pre-authored programs, but cannot restore an operation removed by
-/// a declared app/agent ceiling.
-///
-/// `spawner`, when [`App::with_sub_agents`] wired one, is installed on the returned executor's
-/// [`ToolContext`] so a `task` call inside the journey (or a composite op it calls) can delegate —
-/// the same seam [`ToolContext::with_spawner`] provides everywhere else.
+/// Apply one journey's source/host permission decisions to the App's shared execution template.
+/// System, redactor, spawner, policy, identity, and approver are inherited unchanged; only the
+/// narrowed registry and rules differ per journey.
 fn build_executor(
     registry: ToolRegistry,
     capabilities: &EffectiveCapabilities,
     host_permissions: &HostPermissionRules,
-    auto_approve: bool,
-    spawner: Option<Arc<dyn Spawner>>,
-    system: Arc<System>,
-    redactor: Redactor,
+    environment: ExecutionEnvironment,
 ) -> Result<Executor> {
-    let mut ctx = ToolContext::new(system).with_redactor(redactor);
-    if let Some(spawner) = spawner {
-        ctx = ctx.with_spawner(spawner);
-    }
     let mut allow: Vec<String> = if capabilities.declared {
         capabilities.grants.clone()
     } else {
@@ -1524,12 +1559,10 @@ fn build_executor(
     let mut deny = capabilities.deny.clone();
     deny.extend(host_permissions.deny.iter().cloned());
     let perms = PermissionManager::from_rules(&allow, &deny);
-    let approver: Arc<dyn Approver> = if auto_approve {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(DenyApprover)
-    };
-    Ok(Executor::new(registry, perms, approver, ctx))
+    Ok(environment
+        .with_registry(registry)
+        .with_permissions(perms)
+        .into_executor())
 }
 
 /// Map a program-level [`AgentDecl`] to an [`AgentSpec`]. Without source-declared permissions its
@@ -1797,15 +1830,21 @@ impl Tool for DatasourceScopedTool {
     }
 }
 
-fn scope_datasource_tools(registry: &mut ToolRegistry, allowed: &[String]) {
+fn scope_datasource_tools(registry: &mut ToolRegistry, allowed: &[String]) -> Result<()> {
+    let mut scoped = registry.clone();
     for name in DATASOURCE_OPS {
-        if let Some(inner) = registry.remove(name) {
-            registry.register(Arc::new(DatasourceScopedTool {
-                inner,
-                allowed: allowed.to_vec(),
-            }));
+        if let Some(inner) = scoped.get(name) {
+            scoped.replace_from(
+                "flux-app declared datasource-scope adapter",
+                Arc::new(DatasourceScopedTool {
+                    inner,
+                    allowed: allowed.to_vec(),
+                }),
+            )?;
         }
     }
+    *registry = scoped;
+    Ok(())
 }
 
 /// Assemble an agent-target [`FlowEngine`] from a declaration: a guarded [`System`] rooted at the cwd, the
@@ -1819,11 +1858,11 @@ async fn build_agent_engine(
     registry: ToolRegistry,
     events: Arc<EventStore>,
     default_model: &str,
-    redactor: Redactor,
-    system: Arc<System>,
+    environment: ExecutionEnvironment,
     host_permissions: &HostPermissionRules,
     agent_loop: Option<flux_lang::ast::DraftAst>,
 ) -> Result<FlowEngine> {
+    let system = environment.system().clone();
     let available = registry.names();
     let mut profile = resolve_agent_runtime_profile(
         decl,
@@ -1839,17 +1878,18 @@ async fn build_agent_engine(
     if let Some(agent_loop) = agent_loop {
         profile.spec.agent_loop = flux_agent::AgentLoopSpec::Flux(agent_loop);
     }
-    let ctx = ToolContext::new(system).with_redactor(redactor);
-    let approver: Arc<dyn Approver> = Arc::new(DenyApprover);
     // Adaptive model stages read the turn's conversation via the FlowStore (`store.conversation()`),
     // which delegates to the FlowStore's *internal* event log. Back it with the SAME `events` store the
     // engine records the user message into — otherwise `in_memory()` mints a fresh, empty EventStore and
     // the stages see no conversation, so the model only ever gets the system prompt (never the user's
     // message). This is what makes an `agent`-bound trigger actually answer the inbound mention.
     let flow = FlowStore::in_memory_with_events(events.clone()).map_err(other)?;
+    let environment = environment
+        .with_registry(profile.registry)
+        .with_approver(Arc::new(DenyApprover));
     profile
         .spec
-        .assemble(provider, profile.registry, approver, ctx, events, flow)
+        .assemble_in(provider, environment, events, flow)
         .map_err(other)
 }
 
@@ -1983,18 +2023,7 @@ impl AgentSink for RecordingSink {
 fn accumulate_usage(acc: &mut Option<Usage>, next: Option<Usage>) {
     let Some(next) = next else { return };
     match acc {
-        Some(acc) => {
-            acc.input_tokens += next.input_tokens;
-            acc.output_tokens += next.output_tokens;
-            acc.cache_creation_input_tokens += next.cache_creation_input_tokens;
-            acc.cache_read_input_tokens += next.cache_read_input_tokens;
-            acc.reasoning_tokens += next.reasoning_tokens;
-            acc.reported_cost_usd = match (acc.reported_cost_usd, next.reported_cost_usd) {
-                (Some(a), Some(b)) => Some(a + b),
-                (Some(a), None) => Some(a),
-                (None, other) => other,
-            };
-        }
+        Some(acc) => acc.sum_independent(&next),
         None => *acc = Some(next),
     }
 }
@@ -2113,6 +2142,192 @@ mod agent_target_tests {
         }
     }
 
+    /// A single-shot cognition provider: unlike the adaptive fixtures above, every request is the
+    /// model-backed journey op itself and returns a fixed structured value plus usage.
+    struct CognitionUsageProvider(Usage);
+
+    #[async_trait]
+    impl Provider for CognitionUsageProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(Chunk::TextDelta("[]".into())),
+                Ok(Chunk::Usage(self.0.clone())),
+                Ok(Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                }),
+            ])))
+        }
+    }
+
+    struct CognitionErrorProvider(Usage);
+
+    #[async_trait]
+    impl Provider for CognitionErrorProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(Chunk::Usage(self.0.clone())),
+                Err(Error::Provider("declared cognition failure".into())),
+            ])))
+        }
+    }
+
+    struct PendingCognitionStream {
+        usage: Option<Usage>,
+        pending: Arc<tokio::sync::Notify>,
+    }
+
+    impl futures::Stream for PendingCognitionStream {
+        type Item = Result<Chunk>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if let Some(usage) = self.usage.take() {
+                return std::task::Poll::Ready(Some(Ok(Chunk::Usage(usage))));
+            }
+            self.pending.notify_one();
+            std::task::Poll::Pending
+        }
+    }
+
+    struct PendingCognitionProvider {
+        usage: Usage,
+        pending: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for PendingCognitionProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, _req: Request) -> Result<ChunkStream> {
+            Ok(Box::pin(PendingCognitionStream {
+                usage: Some(self.usage.clone()),
+                pending: self.pending.clone(),
+            }))
+        }
+    }
+
+    async fn cognition_engine(provider: Arc<dyn Provider>, events: Arc<EventStore>) -> FlowEngine {
+        let decl = AgentDecl {
+            name: "worker".into(),
+            model: Some("test-model".into()),
+            agent_loop: None,
+            tools: vec!["ai.extract".into()],
+            datasources: Vec::new(),
+            description: Some("extract facts".into()),
+            permissions: None,
+            settings: Value::Null,
+        };
+        let environment = ExecutionEnvironment::new(
+            Arc::new(System::new(Workspace::new(".").unwrap())),
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(DenyApprover),
+            ExecutionAuthorization::local(),
+        );
+        build_agent_engine(
+            &decl,
+            None,
+            provider,
+            ToolRegistry::new(),
+            events,
+            "test-model",
+            environment,
+            &HostPermissionRules::default(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Adaptive child provider that selects `ai.extract` once, then finishes from its tool result.
+    /// The actual cognition call is served by [`CognitionUsageProvider`] registered in the child's
+    /// base catalog, keeping planner usage at zero so the child total isolates the nested call.
+    struct CognitionPlanProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for CognitionPlanProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, req: Request) -> Result<ChunkStream> {
+            if req.tools.len() == 1 && req.tools[0].name == "declare_intent" {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(Chunk::Block(ContentBlock::ToolUse {
+                        id: "intent-1".into(),
+                        name: "declare_intent".into(),
+                        input: json!({
+                            "intent": "extract facts",
+                            "capability_families": ["model"]
+                        }),
+                    })),
+                    Ok(Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    }),
+                ])));
+            }
+
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call == 0 {
+                let native_name = req
+                    .tools
+                    .iter()
+                    .find(|tool| tool.description.contains("Flux operation `ai.extract`"))
+                    .map(|tool| tool.name.clone())
+                    .ok_or_else(|| Error::Other("ai.extract was not surfaced to child".into()))?;
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(Chunk::Block(ContentBlock::ToolUse {
+                        id: "extract-1".into(),
+                        name: native_name,
+                        input: json!({ "from": "Alice" }),
+                    })),
+                    Ok(Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    }),
+                ])));
+            }
+
+            if call == 1 {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(Chunk::Block(ContentBlock::ToolUse {
+                        id: "finalize-1".into(),
+                        name: "finalize_plan".into(),
+                        input: json!({ "instructions": "Report the extracted facts." }),
+                    })),
+                    Ok(Chunk::Done {
+                        stop_reason: Some(StopReason::ToolUse),
+                    }),
+                ])));
+            }
+
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(Chunk::TextDelta("child done".into())),
+                Ok(Chunk::Block(ContentBlock::Text {
+                    text: "child done".into(),
+                })),
+                Ok(Chunk::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                }),
+            ])))
+        }
+    }
+
     /// A provider that echoes the latest user message straight back, so a test can observe the exact
     /// turn input the engine fed the model.
     struct EchoProvider;
@@ -2148,6 +2363,21 @@ mod agent_target_tests {
             Module::Program(p) => p,
             Module::Flow(_) => panic!("expected a program, got a bare flow"),
         }
+    }
+
+    #[test]
+    fn validating_app_constructor_returns_extra_tool_collision() {
+        let duplicate = flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only("read", "shadow read", json!({"type": "object"})),
+            |_input| async { Ok(Value::Null) },
+        );
+        let error = App::try_with_tools(Program::default(), None, "mock", false, vec![duplicate])
+            .err()
+            .expect("extra tool must not replace a built-in")
+            .to_string();
+
+        assert!(error.contains("duplicate operation `read`"));
+        assert!(error.contains("app extra tool #1"));
     }
 
     /// An app with one agent reachable via an `agent`-bound `slack` trigger.
@@ -2204,10 +2434,14 @@ trigger t1
             registry,
             &capabilities,
             &HostPermissionRules::default(),
-            false,
-            None,
-            system,
-            redactor,
+            ExecutionEnvironment::new(
+                system,
+                ToolRegistry::new(),
+                PermissionManager::new(),
+                Arc::new(DenyApprover),
+                ExecutionAuthorization::local(),
+            )
+            .with_redactor(redactor),
         )
         .unwrap();
         let r = executor.dispatch("search", json!({})).await;
@@ -2217,6 +2451,51 @@ trigger t1
             "the resolved secret must be scrubbed from tool output: {}",
             r.content
         );
+    }
+
+    /// C-60: `--yes` changes only the approval posture. An explicit authorization denial remains a
+    /// hard floor on the App journey executor and the tool never runs.
+    #[tokio::test]
+    async fn app_auto_approval_cannot_widen_the_authorization_floor() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_hits = hits.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only("search", "probe", json!({"type": "object"}))
+                .with_access(vec![flux_spec::AccessKind::Filesystem]),
+            move |_input| {
+                let hits = tool_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!("ran"))
+                }
+            },
+        ));
+        let capabilities = EffectiveCapabilities {
+            declared: false,
+            allow: Vec::new(),
+            grants: Vec::new(),
+            deny: Vec::new(),
+        };
+        let (caller, trust) = flux_policy::local_identity("app-test");
+        let environment = ExecutionEnvironment::new(
+            Arc::new(System::new(Workspace::new(".").unwrap())),
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(AllowApprover),
+            ExecutionAuthorization::new(flux_policy::AuthorizationPolicy::default(), caller, trust),
+        );
+        let executor = build_executor(
+            registry,
+            &capabilities,
+            &HostPermissionRules::default(),
+            environment,
+        )
+        .unwrap();
+
+        let result = executor.dispatch("search", json!({})).await;
+        assert!(result.is_error && result.content.contains("denied by policy"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// D-65: a surface (e.g. the `flux app run` CLI path) builds its OWN `EventStore` up front so its
@@ -2348,6 +2627,13 @@ journey pong
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoSearch));
         registry.register(Arc::new(EchoSources));
+        let environment = ExecutionEnvironment::new(
+            Arc::new(System::new(Workspace::new(".").unwrap())),
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(DenyApprover),
+            ExecutionAuthorization::local(),
+        );
         let engine = build_agent_engine(
             &decl,
             None,
@@ -2355,8 +2641,7 @@ journey pong
             registry,
             Arc::new(EventStore::in_memory().unwrap()),
             "mock",
-            Redactor::new(),
-            Arc::new(System::new(Workspace::new(".").unwrap())),
+            environment,
             &HostPermissionRules::default(),
             None,
         )
@@ -2570,6 +2855,180 @@ journey pong
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-67: lazy agent construction must derive every workspace-sensitive capability from the
+    /// explicit execution environment, never from a later process cwd. Run the cwd mutation in an
+    /// isolated child test process so this process-global operation cannot race sibling tests.
+    #[tokio::test]
+    async fn execution_environment_retains_root_across_lazy_agent_construction() {
+        const CHILD: &str = "FLUX_C67_CWD_CHILD";
+        if std::env::var(CHILD).ok().as_deref() != Some("1") {
+            let current_exe = std::env::current_exe().expect("current test executable");
+            let cwd = std::env::current_dir().expect("parent test cwd");
+            let process_system = System::new(Workspace::new(cwd).expect("parent workspace"));
+            let output = process_system
+                .run_with_env(
+                    &[
+                        current_exe.display().to_string(),
+                        "execution_environment_retains_root_across_lazy_agent_construction"
+                            .to_string(),
+                        "--nocapture".to_string(),
+                        "--test-threads=1".to_string(),
+                    ],
+                    &[(CHILD.to_string(), "1".to_string())],
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .expect("run isolated cwd regression");
+            assert_eq!(
+                output.exit_code, 0,
+                "isolated cwd regression failed\nstdout:\n{}\nstderr:\n{}",
+                output.stdout, output.stderr
+            );
+            return;
+        }
+
+        let original = std::env::current_dir().expect("child test cwd");
+        let base = std::env::temp_dir().join(format!(
+            "flux-app-c67-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let root = base.join("root");
+        let other = base.join("other");
+        for dir in [&root, &other] {
+            std::fs::create_dir_all(dir.join(".flux/agents")).unwrap();
+            std::fs::create_dir_all(dir.join(".flux/skills")).unwrap();
+        }
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='rooted'\n").unwrap();
+        std::fs::write(other.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("marker.txt"),
+            "FROM-ORIGINAL-ROOT c67-secret-value",
+        )
+        .unwrap();
+        std::fs::write(other.join("marker.txt"), "FROM-LATER-CWD").unwrap();
+        std::fs::write(root.join("persona.md"), "PERSONA-FROM-ORIGINAL-ROOT").unwrap();
+        std::fs::write(other.join("persona.md"), "PERSONA-FROM-LATER-CWD").unwrap();
+        std::fs::write(
+            root.join(".flux/agents/rooted.md"),
+            "---\nname: rooted\ntools: [read]\n---\nROLE-FROM-ORIGINAL-ROOT",
+        )
+        .unwrap();
+        std::fs::write(
+            other.join(".flux/agents/rooted.md"),
+            "---\nname: rooted\ntools: [read]\n---\nROLE-FROM-LATER-CWD",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".flux/skills/c67-rooted.md"),
+            "---\nname: c67-rooted\ndescription: rooted skill\ntriggers: [c67]\n---\nSKILL-FROM-ORIGINAL-ROOT",
+        )
+        .unwrap();
+        std::fs::write(
+            other.join(".flux/skills/c67-rooted.md"),
+            "---\nname: c67-rooted\ndescription: wrong skill\ntriggers: [c67]\n---\nSKILL-FROM-LATER-CWD",
+        )
+        .unwrap();
+
+        let system = Arc::new(System::new(Workspace::new(&root).unwrap()));
+        let redactor = Redactor::new();
+        redactor.add_secret("c67-secret-value");
+        let environment = ExecutionEnvironment::new(
+            system,
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(DenyApprover),
+            ExecutionAuthorization::local(),
+        )
+        .with_redactor(redactor);
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let app = App::try_with_execution_environment(
+            Program {
+                agents: vec![AgentDecl {
+                    name: "assistant".into(),
+                    model: None,
+                    agent_loop: None,
+                    tools: vec!["read".into()],
+                    datasources: Vec::new(),
+                    description: Some("root-stable agent".into()),
+                    permissions: None,
+                    settings: json!({"system_prompt_files": ["persona.md"]}),
+                }],
+                ..Program::default()
+            },
+            Some(Arc::new(ReplyProvider { reply: "ok".into() })),
+            "mock",
+            environment,
+            None,
+            events.clone(),
+            HostPermissionRules::default(),
+        )
+        .unwrap();
+
+        std::env::set_current_dir(&other).unwrap();
+        let engine = app.agent_engine("assistant").await.unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(engine.cwd, canonical_root);
+        assert_eq!(
+            engine.executor.context().system.workspace().root(),
+            canonical_root
+        );
+        assert!(engine.system_prompt.contains("PERSONA-FROM-ORIGINAL-ROOT"));
+        assert!(!engine.system_prompt.contains("PERSONA-FROM-LATER-CWD"));
+
+        let signals = flux_runtime::detect_signals(&engine.cwd);
+        let signals: Vec<&str> = signals
+            .iter()
+            .filter_map(|observation| observation.data["signal"].as_str())
+            .collect();
+        assert!(signals.contains(&"rust"), "signals: {signals:?}");
+        assert!(!signals.contains(&"node"), "signals: {signals:?}");
+
+        let roles = flux_agent::RoleRegistry::try_load_project(
+            engine.executor.context().system.as_ref(),
+            ".flux/agents",
+        )
+        .unwrap();
+        assert_eq!(
+            roles.get("rooted").unwrap().prompt,
+            "ROLE-FROM-ORIGINAL-ROOT"
+        );
+        let skills = AgentSpec {
+            cwd: engine.cwd.clone(),
+            ..AgentSpec::new("mock")
+        }
+        .try_with_default_skills()
+        .unwrap()
+        .skills;
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "c67-rooted")
+            .expect("rooted skill discovered");
+        assert_eq!(skill.body.text(), "SKILL-FROM-ORIGINAL-ROOT");
+
+        let read = engine
+            .executor
+            .dispatch("read", json!({"path": "marker.txt"}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("FROM-ORIGINAL-ROOT"));
+        assert!(!read.content.contains("FROM-LATER-CWD"));
+        assert!(read.content.contains("[redacted]"));
+        assert!(Arc::ptr_eq(&engine.events, &events));
+
+        // The compatibility `try_*` door must also fail cleanly when no current workspace can be
+        // resolved. Its infallible counterpart may panic by contract; this path must not.
+        let removed = base.join("removed-cwd");
+        std::fs::create_dir_all(&removed).unwrap();
+        std::env::set_current_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        let invalid = App::try_new(Program::default(), None, "mock");
+        std::env::set_current_dir(&original).unwrap();
+        assert!(invalid.is_err(), "invalid cwd unexpectedly built an App");
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[tokio::test]
     async fn agent_trigger_runs_a_turn_and_returns_the_reply() {
         let app = app_with_agent("hi back");
@@ -2706,6 +3165,258 @@ journey pong
             "a pure-op journey drives no model call, so there's no usage to report"
         );
         assert_eq!(runs[0].model, "mock");
+    }
+
+    /// C-66: a plain authored journey has no `FlowEngine::turn_end` callback, but cognition calls
+    /// still bill. The journey result must fold the operation's retained evidence into its usage
+    /// exactly once, using independent-call (field-wise sum) semantics.
+    #[tokio::test]
+    async fn journey_run_includes_cognition_usage() {
+        let src = r#"
+trigger t1
+  on "ping"
+  run extract
+
+journey extract
+  flow
+    $claims = ai.extract({ from: "Alice" })
+    return $claims
+"#;
+        let expected = Usage {
+            input_tokens: 73,
+            output_tokens: 11,
+            ..Default::default()
+        };
+        let app = App::with_options(
+            program(src),
+            Some(Arc::new(CognitionUsageProvider(expected.clone()))),
+            "test-model",
+            true,
+        );
+
+        let runs = app.deliver("ping", json!({})).await.expect("deliver");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].result, "[]");
+        assert_eq!(runs[0].usage, Some(expected));
+        assert_eq!(runs[0].model, "test-model");
+    }
+
+    /// C-66: when a cognition op runs inside a real `FlowEngine` turn, its independent provider
+    /// call must enter the same per-call accounting path as adaptive stages. That gives the sink a
+    /// turn total and gives event/cost projections one attributed `CallUsage` row.
+    #[tokio::test]
+    async fn flow_engine_turn_and_cost_projection_include_cognition_usage() {
+        let expected = Usage {
+            input_tokens: 53,
+            output_tokens: 7,
+            ..Default::default()
+        };
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let engine = cognition_engine(
+            Arc::new(CognitionUsageProvider(expected.clone())),
+            events.clone(),
+        )
+        .await;
+        let session = events.create_session("mock/test-model").unwrap();
+        let flow = flux_lang::parse::parse(
+            "flow\n  $claims = ai.extract({ from: \"Alice\" })\n  return $claims",
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+
+        engine
+            .start_flow_turn(&session, &flow, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(sink.usage, Some(expected.clone()));
+        let turns = events.turns(&session).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].calls, 1, "one cognition call is attributed");
+        assert_eq!(turns[0].call_usage, expected);
+        assert_eq!(turns[0].usage, Some(expected.clone()));
+
+        let costs = events
+            .cost_summary(&session, &flux_core::PricingTable::default())
+            .unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].model, "test-model");
+        assert_eq!(costs[0].calls, 1);
+        assert_eq!(costs[0].usage, expected);
+    }
+
+    /// The same durable accounting must survive the cognition provider failing after its usage
+    /// frame. The engine keeps the failed turn/error outcome while emitting exactly one call row.
+    #[tokio::test]
+    async fn failed_cognition_call_reaches_turn_and_cost_projection_once() {
+        let expected = Usage {
+            input_tokens: 61,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let engine = cognition_engine(
+            Arc::new(CognitionErrorProvider(expected.clone())),
+            events.clone(),
+        )
+        .await;
+        let session = events.create_session("test-model").unwrap();
+        let flow = flux_lang::parse::parse(
+            "flow\n  $claims = ai.extract({ from: \"Alice\" })\n  return $claims",
+        )
+        .unwrap();
+        let mut sink = RecordingSink::default();
+
+        engine
+            .start_flow_turn(&session, &flow, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(sink.usage, Some(expected.clone()));
+        let turns = events.turns(&session).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].outcome, "error");
+        assert_eq!(turns[0].calls, 1);
+        assert_eq!(turns[0].call_usage, expected);
+        assert_eq!(turns[0].usage, Some(expected.clone()));
+
+        let costs = events
+            .cost_summary(&session, &flux_core::PricingTable::default())
+            .unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].calls, 1);
+        assert_eq!(costs[0].usage, expected);
+    }
+
+    /// Cancelling a real engine turn drops the pending cognition future before turn finalization.
+    /// The drop guard must publish the already-observed usage first, while the durable terminal
+    /// outcome remains `cancelled` and the call is attributed exactly once.
+    #[tokio::test]
+    async fn cancelled_cognition_call_reaches_cancelled_turn_projection_once() {
+        let expected = Usage {
+            input_tokens: 47,
+            output_tokens: 2,
+            ..Default::default()
+        };
+        let pending = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        flux_cognition::CognitionPack::new(
+            Arc::new(PendingCognitionProvider {
+                usage: expected.clone(),
+                pending: pending.clone(),
+            }),
+            "cognition-model",
+        )
+        .register(&mut registry);
+        flux_agent::register_agent_ops(&mut registry).unwrap();
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["ai.extract".into()], &[]),
+            Arc::new(flux_runtime::AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(".").unwrap()))),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble(
+            Arc::new(CognitionPlanProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            executor,
+            events.clone(),
+            flow,
+            "planner-model".into(),
+            "plan then extract".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let session = events.create_session("planner-model").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut sink = RecordingSink::default();
+        let result = {
+            let turn = engine.run_turn_cancellable(&session, "extract Alice", &mut sink, &cancel);
+            tokio::pin!(turn);
+
+            tokio::select! {
+                _ = pending.notified() => cancel.cancel(),
+                result = &mut turn => panic!("turn ended before cognition became pending: {result:?}"),
+            }
+            turn.await
+        };
+        result.unwrap();
+
+        assert_eq!(sink.usage, Some(expected.clone()));
+        let turns = events.turns(&session).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].outcome, "cancelled");
+        assert_eq!(turns[0].calls, 1);
+        assert_eq!(turns[0].call_usage, expected);
+        assert_eq!(turns[0].usage, Some(expected));
+    }
+
+    /// C-66: a child `FlowEngine` uses the same turn accounting hook, so cognition spend survives
+    /// the `LocalSpawner` boundary in `SpawnOutcome.usage`. `TaskTool`'s typed roll-up then records
+    /// this outcome on the parent without needing to inspect child evidence.
+    #[tokio::test]
+    async fn sub_agent_outcome_includes_child_cognition_usage() {
+        let expected = Usage {
+            input_tokens: 89,
+            output_tokens: 13,
+            ..Default::default()
+        };
+        let mut base = ToolRegistry::new();
+        flux_cognition::CognitionPack::new(
+            Arc::new(CognitionUsageProvider(expected.clone())),
+            "cognition-model",
+        )
+        .register(&mut base);
+        let mut roles = flux_agent::RoleRegistry::default();
+        roles.insert(
+            flux_agent::try_parse_role(
+                "---\ntools: [ai.extract]\n---\nExtract the requested facts.",
+                "worker",
+            )
+            .unwrap(),
+        );
+        let spawner = flux_orchestrate::LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(CognitionPlanProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }) as Box<dyn Provider>)
+            }),
+            Arc::new(roles),
+            base,
+            Arc::new(System::new(Workspace::new(".").unwrap())),
+            "planner-model",
+            1024,
+        );
+
+        let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(".").unwrap())))
+            .with_spawner(Arc::new(spawner));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TaskTool.execute(&ctx, json!({ "role": "worker", "task": "extract Alice" })),
+        )
+        .await
+        .expect("child completed")
+        .expect("child succeeded");
+        assert!(!result.is_error, "{}", result.content);
+
+        let observations: Vec<_> = ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .by_kind("subagent.usage")
+            .cloned()
+            .collect();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].data["model"], "planner-model");
+        let usage: Usage = serde_json::from_value(observations[0].data["usage"].clone()).unwrap();
+        assert_eq!(usage, expected);
     }
 
     #[tokio::test]
