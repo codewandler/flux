@@ -10,7 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flux_core::{Error, Result};
 use flux_datasource::live::{
-    FilterKey, FilterType, Filters, LiveEntity, LiveSchema, Page, PageRequest, Reference, Row,
+    FilterKey, FilterType, FilterValue, Filters, LiveEntity, LiveSchema, Page, PageRequest,
+    Reference, Row,
 };
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, ToolSpec};
@@ -138,7 +139,7 @@ impl LiveProjection {
             .find(|declared| declared.entity == entity)
             .ok_or_else(|| {
                 Error::Other(format!(
-                    "{operation}: unknown entity `{entity}` for live datasource `{}`",
+                    "{operation}.entity: unknown entity `{entity}` for live datasource `{}`",
                     self.domain
                 ))
             })
@@ -146,6 +147,7 @@ impl LiveProjection {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LiveListInput {
     entity: String,
     #[serde(default)]
@@ -153,10 +155,11 @@ struct LiveListInput {
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
-    filters: Filters,
+    filters: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LiveGetInput {
     entity: String,
     id: String,
@@ -177,14 +180,15 @@ impl Tool for LiveListOp {
         let operation = &self.spec.name;
         let input: LiveListInput = parse(operation, params)?;
         let entity = self.projection.entity(operation, &input.entity)?;
+        let filters = normalize_filters(operation, entity, input.filters)?;
         let page = PageRequest {
             cursor: input.page,
-            limit: input.limit.unwrap_or(entity.default_page),
+            limit: normalize_limit(operation, entity, input.limit)?,
         };
         let result = self
             .projection
             .backend
-            .list(ctx, &input.entity, page, &input.filters)
+            .list(ctx, &input.entity, page, &filters)
             .await?;
         Ok(ToolResult::ok(render_page(&input.entity, &result)))
     }
@@ -220,6 +224,91 @@ impl Tool for LiveGetOp {
 fn parse<T: serde::de::DeserializeOwned>(operation: &str, params: Value) -> Result<T> {
     serde_json::from_value(params)
         .map_err(|error| Error::Other(format!("{operation}: bad input: {error}")))
+}
+
+fn normalize_limit(
+    operation: &str,
+    entity: &LiveEntity,
+    requested: Option<usize>,
+) -> Result<usize> {
+    match requested {
+        Some(0) => Err(Error::Other(format!(
+            "{operation}.limit: must be greater than zero"
+        ))),
+        Some(limit) => Ok(limit.min(entity.max_page)),
+        None => Ok(entity.default_page),
+    }
+}
+
+fn normalize_filters(
+    operation: &str,
+    entity: &LiveEntity,
+    supplied: Map<String, Value>,
+) -> Result<Filters> {
+    for name in supplied.keys() {
+        if !entity.filters.iter().any(|filter| filter.name == *name) {
+            return Err(Error::Other(format!(
+                "{operation}.filters.{name}: unknown filter for entity `{}`",
+                entity.entity
+            )));
+        }
+    }
+
+    let mut normalized = Filters::new();
+    for filter in &entity.filters {
+        let Some(value) = supplied.get(&filter.name) else {
+            if filter.required {
+                return Err(Error::Other(format!(
+                    "{operation}.filters.{}: required filter is missing",
+                    filter.name
+                )));
+            }
+            continue;
+        };
+        normalized.insert(
+            filter.name.clone(),
+            normalize_filter_value(operation, filter, value)?,
+        );
+    }
+    Ok(normalized)
+}
+
+fn normalize_filter_value(
+    operation: &str,
+    filter: &FilterKey,
+    value: &Value,
+) -> Result<FilterValue> {
+    let path = format!("{operation}.filters.{}", filter.name);
+    match &filter.ty {
+        FilterType::String => value
+            .as_str()
+            .map(|value| FilterValue::String(value.to_string()))
+            .ok_or_else(|| Error::Other(format!("{path}: expected string"))),
+        FilterType::Int => value
+            .as_i64()
+            .map(FilterValue::Int)
+            .ok_or_else(|| Error::Other(format!("{path}: expected integer"))),
+        FilterType::Bool => value
+            .as_bool()
+            .map(FilterValue::Bool)
+            .ok_or_else(|| Error::Other(format!("{path}: expected boolean"))),
+        FilterType::Enum(values) => {
+            let Some(value) = value.as_str() else {
+                return Err(Error::Other(format!("{path}: expected string")));
+            };
+            if !values.iter().any(|allowed| allowed == value) {
+                let expected = values
+                    .iter()
+                    .map(|allowed| format!("`{allowed}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Other(format!(
+                    "{path}: expected one of {expected}, got `{value}`"
+                )));
+            }
+            Ok(FilterValue::String(value.to_string()))
+        }
+    }
 }
 
 fn render_page(entity: &str, page: &Page<Row>) -> String {

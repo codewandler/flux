@@ -326,7 +326,10 @@ async fn backend_errors_propagate_without_becoming_successful_results() {
     let ctx = ctx();
 
     let list_error = operation(&registry, "tickets.list")
-        .execute(&ctx, json!({"entity": "ticket"}))
+        .execute(
+            &ctx,
+            json!({"entity": "ticket", "filters": {"owner": "ops"}}),
+        )
         .await
         .unwrap_err();
     assert!(list_error.to_string().contains("fixture list failed"));
@@ -336,4 +339,128 @@ async fn backend_errors_propagate_without_becoming_successful_results() {
         .await
         .unwrap_err();
     assert!(get_error.to_string().contains("fixture get failed"));
+}
+
+#[tokio::test]
+async fn invalid_entities_and_filters_fail_with_paths_before_backend_entry() {
+    let backend = Arc::new(MockBackend::default());
+    let mut registry = ToolRegistry::new();
+    try_register_live_datasource(&mut registry, "tickets", backend.clone()).unwrap();
+    let ctx = ctx();
+    let list = operation(&registry, "tickets.list");
+
+    let cases = [
+        (
+            json!({"entity": "unknown"}),
+            "tickets.list.entity: unknown entity `unknown`",
+        ),
+        (
+            json!({"entity": "ticket", "filters": {"owner": "ops", "extra": true}}),
+            "tickets.list.filters.extra: unknown filter for entity `ticket`",
+        ),
+        (
+            json!({"entity": "ticket"}),
+            "tickets.list.filters.owner: required filter is missing",
+        ),
+        (
+            json!({"entity": "ticket", "filters": {"owner": false}}),
+            "tickets.list.filters.owner: expected string",
+        ),
+        (
+            json!({"entity": "ticket", "filters": {"owner": "ops", "priority": "2"}}),
+            "tickets.list.filters.priority: expected integer",
+        ),
+        (
+            json!({"entity": "user", "filters": {"active": "yes"}}),
+            "tickets.list.filters.active: expected boolean",
+        ),
+        (
+            json!({"entity": "ticket", "filters": {"owner": "ops", "state": "pending"}}),
+            "tickets.list.filters.state: expected one of `open`, `closed`",
+        ),
+    ];
+
+    for (params, expected) in cases {
+        let error = list.execute(&ctx, params).await.unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "expected `{expected}` in `{error}`"
+        );
+    }
+
+    let get_error = operation(&registry, "tickets.get")
+        .execute(&ctx, json!({"entity": "unknown", "id": "1"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        get_error.contains("tickets.get.entity: unknown entity `unknown`"),
+        "{get_error}"
+    );
+    assert!(
+        backend.calls().is_empty(),
+        "rejected inputs must not enter the live backend"
+    );
+}
+
+#[tokio::test]
+async fn limits_filters_and_opaque_cursors_are_normalized_before_backend_entry() {
+    let backend = Arc::new(MockBackend::default());
+    let mut registry = ToolRegistry::new();
+    try_register_live_datasource(&mut registry, "tickets", backend.clone()).unwrap();
+    let ctx = ctx();
+    let list = operation(&registry, "tickets.list");
+    let cursor = "v1:α/β?x=1&y=%2F#雪";
+
+    list.execute(
+        &ctx,
+        json!({
+            "entity": "ticket",
+            "page": cursor,
+            "filters": {"state": "open", "owner": "ops", "priority": 3}
+        }),
+    )
+    .await
+    .unwrap();
+    list.execute(&ctx, json!({"entity": "user", "limit": 999}))
+        .await
+        .unwrap();
+
+    let zero_error = list
+        .execute(&ctx, json!({"entity": "user", "limit": 0}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        zero_error.contains("tickets.list.limit: must be greater than zero"),
+        "{zero_error}"
+    );
+
+    assert_eq!(
+        backend.calls(),
+        vec![
+            Call::List {
+                system: Arc::as_ptr(&ctx.system) as usize,
+                entity: "ticket".into(),
+                page: PageRequest {
+                    cursor: Some(cursor.into()),
+                    limit: 20,
+                },
+                filters: vec![
+                    ("owner".into(), FilterValue::String("ops".into())),
+                    ("priority".into(), FilterValue::Int(3)),
+                    ("state".into(), FilterValue::String("open".into())),
+                ],
+            },
+            Call::List {
+                system: Arc::as_ptr(&ctx.system) as usize,
+                entity: "user".into(),
+                page: PageRequest {
+                    cursor: None,
+                    limit: 50,
+                },
+                filters: Vec::new(),
+            },
+        ]
+    );
 }

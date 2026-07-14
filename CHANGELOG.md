@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-171: live datasource queries are normalized and rejected before backend IO.** Entity-specific
+  required filters, keys, scalar types, and enum values now fail with input paths; omitted limits
+  use the declared default, oversized limits clamp to the backend ceiling, zero is rejected, and
+  opaque cursors pass through byte-for-byte.
 - **D-170: any live datasource can project one atomic, source-labelled list/get operation pair.**
   Registration snapshots the validated backend schema, advertises entity-specific filter fields,
   routes async calls with the guarded tool context, and renders rows, cursors, empty pages, and

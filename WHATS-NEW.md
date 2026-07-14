@@ -23,6 +23,9 @@
 
 ### Improved
 
+- **Live datasource queries now validate each entity's declared filters before contacting the
+  backend.** Page sizes use safe backend defaults and ceilings, while continuation cursors remain
+  opaque and unchanged.
 - **Prepared release binaries can now be promoted by a matching version tag without rebuilding all
   five platforms.** Promotion is tied to the exact source commit and retains the existing public
   asset verification; missing candidates fall back visibly to the full build.

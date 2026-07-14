@@ -39,7 +39,6 @@ _None._
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
 
 ### Async live datasource seam
-- [D-171 — Enforce live-datasource filters limits and cursors](D-171-live-datasource-validation.md) · Agent · D-62 phase 4; depends on D-170
 - [D-172 — Wire live datasources through surfacing and typed authority](D-172-live-datasource-safety-surfacing.md) · Agent · D-62 phase 5; depends on D-171
 - [D-173 — Prove and document live-datasource adoption](D-173-live-datasource-adoption-proof.md) · Agent · D-62 phase 6; depends on D-172
 
@@ -370,6 +369,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-168 — Add pure live-datasource contracts](D-168-live-datasource-contracts.md) · Agent · namespaced deterministic row/page/filter/reference/schema contracts for live systems of record
 - [D-169 — Add the async LiveDatasource trait](D-169-live-datasource-trait.md) · Agent · object-safe guarded list/get contract with fail-fast schema and authority validation
 - [D-170 — Project live datasources into list and get operations](D-170-live-datasource-operations.md) · Agent · atomic generated list/get tools with guarded async routing and consistent row/cursor rendering
+- [D-171 — Enforce live-datasource filters limits and cursors](D-171-live-datasource-validation.md) · Agent · path-aware typed filter validation, bounded limits, deterministic normalization, and byte-exact opaque cursors before backend entry
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this
