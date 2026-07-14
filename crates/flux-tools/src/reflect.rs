@@ -19,18 +19,86 @@ use flux_spec::{
 /// Register authored outer-loop ops. Kept **out** of [`register_builtins`](crate::register_builtins) on
 /// purpose: these ops are only meaningful when a model-in-the-loop host is installed. Adaptive
 /// machinery is tagged to the hidden `reflect` group; `op.register` is model-facing.
+pub fn try_register_reflect(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools authored-loop reflect pack",
+        vec![
+            Arc::new(DetectIntentOp) as Arc<dyn Tool>,
+            Arc::new(ExploreOp),
+            Arc::new(ApproveBatchOp),
+            Arc::new(ExecuteBatchOp),
+            Arc::new(PresentResultsOp),
+            Arc::new(AiSegmentOp),
+            Arc::new(RegisterCompositeOp),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_reflect`].
 pub fn register_reflect(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(DetectIntentOp));
-    registry.register(Arc::new(ExploreOp));
-    registry.register(Arc::new(ApproveBatchOp));
-    registry.register(Arc::new(ExecuteBatchOp));
-    registry.register(Arc::new(PresentResultsOp));
-    registry.register(Arc::new(AiSegmentOp));
-    registry.register(Arc::new(RegisterCompositeOp));
+    try_register_reflect(registry).expect("flux-tools reflect pack registration failed");
+}
+
+/// Install the canonical authored-loop control plane after a surface has narrowed/composed its
+/// catalog.
+///
+/// These names are engine-owned. An independently supplied handler with the same name must never
+/// survive agent assembly, while an ordinary duplicate registration must still fail closed. The
+/// source-labelled replacement is therefore deliberate and auditable rather than last-write-wins.
+pub fn install_reflect(registry: &mut ToolRegistry) -> Result<()> {
+    const SOURCE: &str = "flux-agent canonical authored-loop control plane";
+    let mut assembled = registry.clone();
+    for tool in [
+        Arc::new(DetectIntentOp) as Arc<dyn Tool>,
+        Arc::new(ExploreOp),
+        Arc::new(ApproveBatchOp),
+        Arc::new(ExecuteBatchOp),
+        Arc::new(PresentResultsOp),
+        Arc::new(AiSegmentOp),
+        Arc::new(RegisterCompositeOp),
+    ] {
+        assembled.replace_from(SOURCE, tool)?;
+    }
+    *registry = assembled;
+    Ok(())
 }
 
 /// Register one config-defined model stage as an ordinary typed operation. The operation itself is
 /// a thin delegator; the engine host owns the provider call and gather-only tool ceiling.
+pub fn try_register_model_stage(
+    registry: &mut ToolRegistry,
+    name: impl Into<String>,
+    description: impl Into<String>,
+    input_schema: Value,
+    output_schema: Value,
+) -> Result<()> {
+    registry.try_register_from(
+        "configured model stage",
+        Arc::new(ModelStageOp {
+            spec: ToolSpec {
+                name: name.into(),
+                description: description.into(),
+                input_schema,
+                output_schema: Some(output_schema),
+                effects: vec![Effect::Network],
+                risk: Risk::Low,
+                idempotency: Idempotency::NonIdempotent,
+                access: vec![AccessKind::Provider],
+                group: None,
+            },
+        }),
+    )
+}
+
+/// Compatibility wrapper for callers that cannot yet propagate registry assembly failures.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_model_stage`].
 pub fn register_model_stage(
     registry: &mut ToolRegistry,
     name: impl Into<String>,
@@ -38,19 +106,8 @@ pub fn register_model_stage(
     input_schema: Value,
     output_schema: Value,
 ) {
-    registry.register(Arc::new(ModelStageOp {
-        spec: ToolSpec {
-            name: name.into(),
-            description: description.into(),
-            input_schema,
-            output_schema: Some(output_schema),
-            effects: vec![Effect::Network],
-            risk: Risk::Low,
-            idempotency: Idempotency::NonIdempotent,
-            access: vec![AccessKind::Provider],
-            group: None,
-        },
-    }));
+    try_register_model_stage(registry, name, description, input_schema, output_schema)
+        .expect("configured model-stage registration failed");
 }
 
 struct ModelStageOp {

@@ -496,15 +496,30 @@ impl Tool for MakeTool {
 }
 
 /// Register all non-Rust toolchain tools into a registry.
+pub fn try_register_toolchains(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools language toolchains pack",
+        vec![
+            Arc::new(PythonRunTool) as Arc<dyn Tool>,
+            Arc::new(PytestTool),
+            Arc::new(NpmTool),
+            Arc::new(NodeRunTool),
+            Arc::new(GoBuildTool),
+            Arc::new(GoTestTool),
+            Arc::new(GoVetTool),
+            Arc::new(MakeTool),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_toolchains`].
 pub fn register_toolchains(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(PythonRunTool));
-    registry.register(Arc::new(PytestTool));
-    registry.register(Arc::new(NpmTool));
-    registry.register(Arc::new(NodeRunTool));
-    registry.register(Arc::new(GoBuildTool));
-    registry.register(Arc::new(GoTestTool));
-    registry.register(Arc::new(GoVetTool));
-    registry.register(Arc::new(MakeTool));
+    try_register_toolchains(registry)
+        .expect("flux-tools language toolchains pack registration failed");
 }
 
 #[cfg(test)]

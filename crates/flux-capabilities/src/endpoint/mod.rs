@@ -18,7 +18,7 @@ pub use broker::{
     ProviderInvoker, RefreshSummary,
 };
 pub use host_caps::EndpointBrokerHostCaps;
-pub use ops::{endpoint_tools, register_endpoint_ops, ENDPOINT_GROUP};
+pub use ops::{endpoint_tools, register_endpoint_ops, try_register_endpoint_ops, ENDPOINT_GROUP};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

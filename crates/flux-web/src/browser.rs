@@ -22,7 +22,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use flux_core::{Error, Result};
-use flux_runtime::{Tool, ToolContext, ToolResult};
+use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolResult};
 use flux_spec::{
     AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
     IntentSet, IntentTarget, Risk, ToolSpec,
@@ -838,8 +838,12 @@ pub struct BrowserConfig {
     pub grant_source: String,
 }
 
-fn browser_effects() -> Vec<Effect> {
+fn browser_open_effects() -> Vec<Effect> {
     vec![Effect::Process, Effect::Network, Effect::Browser]
+}
+
+fn browser_navigation_effects() -> Vec<Effect> {
+    vec![Effect::Network, Effect::Browser]
 }
 
 /// `browser.open {url?}` — spawn headless Chromium, attach a page, optionally navigate, return the
@@ -864,12 +868,45 @@ impl Tool for BrowserOpenTool {
                 "properties": { "url": {"type": "string", "description": "Optional URL to navigate to on open."} }
             }),
             output_schema: None,
-            effects: browser_effects(),
+            effects: browser_open_effects(),
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Process, AccessKind::Network, AccessKind::Browser],
             group: Some(BROWSER_GROUP.into()),
         }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        params
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|url| vec![url.to_string()])
+            .unwrap_or_default()
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        let process = self
+            .config
+            .bin
+            .as_deref()
+            .map(str::trim)
+            .filter(|bin| !bin.is_empty())
+            .unwrap_or("*");
+        let destination = params
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or("*");
+        Ok(vec![
+            AuthorityRequirement::process_exec(process),
+            AuthorityRequirement::network_fetch(destination),
+            AuthorityRequirement::browser_navigate(destination),
+        ])
     }
 
     fn intents(&self, params: &Value) -> IntentSet {
@@ -919,12 +956,20 @@ impl Tool for BrowserGotoTool {
                 "required": ["session", "url"]
             }),
             output_schema: None,
-            effects: browser_effects(),
+            effects: browser_navigation_effects(),
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Network, AccessKind::Browser],
             group: Some(BROWSER_GROUP.into()),
         }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        params
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|url| vec![url.to_string()])
+            .unwrap_or_default()
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -1010,12 +1055,23 @@ impl Tool for BrowserActTool {
             }),
             output_schema: None,
             // Acting can submit forms and mutate remote state — honest Network + Browser + Medium risk.
-            effects: browser_effects(),
+            effects: browser_navigation_effects(),
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Network, AccessKind::Browser],
             group: Some(BROWSER_GROUP.into()),
         }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        if params.get("action").and_then(Value::as_str) != Some("goto") {
+            return Vec::new();
+        }
+        params
+            .get("value")
+            .and_then(Value::as_str)
+            .map(|url| vec![url.to_string()])
+            .unwrap_or_default()
     }
 
     fn intents(&self, params: &Value) -> IntentSet {
@@ -1322,6 +1378,83 @@ mod tests {
                 .unwrap()
                 .push((caller.into(), host.into(), grant.into()));
         }
+    }
+
+    #[test]
+    fn browser_goto_declares_its_exact_network_destination() {
+        let tool = BrowserGotoTool {
+            registry: Arc::new(SessionRegistry::new()),
+        };
+        let params = json!({
+            "session": "browser-1",
+            "url": "https://example.com/app",
+        });
+        let subjects = tool.permission_subjects(&params);
+
+        assert_eq!(subjects, vec!["https://example.com/app"]);
+        assert_eq!(
+            tool.authority_requirements(&params, &subjects).unwrap(),
+            vec![
+                AuthorityRequirement::network_fetch("https://example.com/app"),
+                AuthorityRequirement::browser_navigate("https://example.com/app"),
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_open_separates_its_process_and_navigation_authority() {
+        let tool = BrowserOpenTool {
+            registry: Arc::new(SessionRegistry::new()),
+            config: BrowserConfig {
+                bin: Some("/usr/bin/chromium".into()),
+                ..Default::default()
+            },
+        };
+        let params = json!({ "url": "https://example.com/start" });
+        let subjects = tool.permission_subjects(&params);
+
+        assert_eq!(subjects, vec!["https://example.com/start"]);
+        assert_eq!(
+            tool.authority_requirements(&params, &subjects).unwrap(),
+            vec![
+                AuthorityRequirement::process_exec("/usr/bin/chromium"),
+                AuthorityRequirement::network_fetch("https://example.com/start"),
+                AuthorityRequirement::browser_navigate("https://example.com/start"),
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_act_goto_declares_its_exact_network_destination() {
+        let tool = BrowserActTool {
+            registry: Arc::new(SessionRegistry::new()),
+        };
+        let params = json!({
+            "session": "browser-1",
+            "action": "goto",
+            "value": "https://example.com/next",
+        });
+        let subjects = tool.permission_subjects(&params);
+
+        assert_eq!(subjects, vec!["https://example.com/next"]);
+        assert_eq!(
+            tool.authority_requirements(&params, &subjects).unwrap(),
+            vec![
+                AuthorityRequirement::network_fetch("https://example.com/next"),
+                AuthorityRequirement::browser_navigate("https://example.com/next"),
+            ]
+        );
+
+        let click = json!({ "session": "browser-1", "action": "click", "ref": "e1" });
+        assert!(tool.permission_subjects(&click).is_empty());
+        assert_eq!(
+            tool.authority_requirements(&click, &[]).unwrap(),
+            vec![
+                AuthorityRequirement::network_fetch("*"),
+                AuthorityRequirement::browser_navigate("*"),
+            ],
+            "an action whose current remote destination is unknown must stay fail-closed"
+        );
     }
 
     #[tokio::test]

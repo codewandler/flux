@@ -547,6 +547,8 @@ pub struct PlanRisk {
     /// its per-op policy to the plan as a unit. Only literal args contribute; a `$symbol` arg is
     /// invisible here, which is why dispatch re-fires the gate for an undisclosed destructive op.
     pub intents: flux_spec::IntentSet,
+    /// Exact invocation requirements derived through the same tool contract dispatch evaluates.
+    pub requirements: Vec<flux_runtime::AuthorityRequirement>,
 }
 
 impl PlanRisk {
@@ -559,6 +561,7 @@ impl PlanRisk {
             destructive: self.destructive,
             mutating: self.mutating,
             intents: self.intents.clone(),
+            requirements: self.requirements.clone(),
         }
     }
 
@@ -601,10 +604,18 @@ pub fn plan_risk(ast: &DraftAst, registry: &ToolRegistry) -> PlanRisk {
         if spec.risk == Risk::Destructive {
             risk.destructive = true;
         }
-        if effects_are_mutating(&spec.effects) {
-            risk.mutating = true;
+        let input = literal_input(args, &spec.input_schema);
+        let subjects = tool.permission_subjects(&input);
+        match tool.authority_requirements(&input, &subjects) {
+            Ok(requirements) => apply_requirements(&mut risk, requirements),
+            Err(_) => {
+                // An invalid authority declaration is refused at dispatch. Preview it as
+                // destructive as well so aggregate approval can never make it look harmless.
+                risk.destructive = true;
+                risk.mutating = true;
+            }
         }
-        let intents = tool.intents(&literal_input(args, &spec.input_schema));
+        let intents = tool.intents(&input);
         if intents.is_destructive() {
             risk.destructive = true;
         }
@@ -642,10 +653,16 @@ fn accumulate_risk(
         if let Some(tool) = registry.get(op) {
             let spec = tool.spec();
             apply_risk(risk, spec.risk);
-            if effects_are_mutating(&spec.effects) {
-                risk.mutating = true;
+            let input = literal_input(args, &spec.input_schema);
+            let subjects = tool.permission_subjects(&input);
+            match tool.authority_requirements(&input, &subjects) {
+                Ok(requirements) => apply_requirements(risk, requirements),
+                Err(_) => {
+                    risk.destructive = true;
+                    risk.mutating = true;
+                }
             }
-            let intents = tool.intents(&literal_input(args, &spec.input_schema));
+            let intents = tool.intents(&input);
             if intents.is_destructive() {
                 risk.destructive = true;
             }
@@ -686,17 +703,18 @@ fn apply_risk(risk: &mut PlanRisk, next: Risk) {
     });
 }
 
-fn effects_are_mutating(effects: &[flux_spec::Effect]) -> bool {
-    effects.iter().any(|effect| {
-        matches!(
-            effect,
-            flux_spec::Effect::Write
-                | flux_spec::Effect::Process
-                | flux_spec::Effect::Network
-                | flux_spec::Effect::Browser
-                | flux_spec::Effect::LocalSystem
-        )
-    })
+fn apply_requirements(risk: &mut PlanRisk, requirements: Vec<flux_runtime::AuthorityRequirement>) {
+    for requirement in requirements {
+        if requirement.is_mutating() {
+            risk.mutating = true;
+        }
+        if requirement.is_destructive() {
+            risk.destructive = true;
+        }
+        if !risk.requirements.contains(&requirement) {
+            risk.requirements.push(requirement);
+        }
+    }
 }
 
 /// Visit every `call` node reachable in `nodes` (recursing through binds, branches, loops, returns,
@@ -1002,7 +1020,15 @@ mod tests {
     impl Tool for EffectOnlyWriteTool {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("effect_write", "write", json!({"type": "object"}))
-                .with_effects(vec![flux_spec::Effect::Write])
+                .with_effects(vec![
+                    flux_spec::Effect::Write,
+                    flux_spec::Effect::Filesystem,
+                ])
+                .with_access(vec![flux_spec::AccessKind::Filesystem])
+        }
+
+        fn permission_subjects(&self, _params: &serde_json::Value) -> Vec<String> {
+            vec!["out.txt".to_string()]
         }
 
         async fn execute(
@@ -2034,6 +2060,12 @@ mod tests {
 
         assert!(risk.mutating);
         assert_eq!(risk.ops, vec!["effect_write"]);
+        assert_eq!(risk.requirements.len(), 1);
+        assert_eq!(risk.requirements[0].action.0, "workspace.write");
+        assert_eq!(
+            risk.requirements[0].resource.path.as_deref(),
+            Some("out.txt")
+        );
     }
 
     #[tokio::test]

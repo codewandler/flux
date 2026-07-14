@@ -133,6 +133,7 @@ impl Tool for BoomTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::read_only("boom", "destructive", json!({"type": "object"}))
             .with_effects(vec![Effect::Process])
+            .with_access(vec![flux_spec::AccessKind::Process])
             .with_risk(Risk::Destructive)
     }
     async fn execute(&self, _ctx: &ToolContext, _params: Value) -> flux_core::Result<ToolResult> {

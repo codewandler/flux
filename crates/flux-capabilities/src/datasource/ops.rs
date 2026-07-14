@@ -12,7 +12,7 @@ use flux_datasource::{
     BatchGetInput, GetInput, ListInput, Match, Record, RelationInput, SearchInput, SourceSummary,
 };
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
-use flux_spec::ToolSpec;
+use flux_spec::{AccessKind, ToolSpec};
 
 use super::DatasourceBackend;
 
@@ -31,9 +31,19 @@ pub fn datasource_tools(backend: Arc<dyn DatasourceBackend>) -> Vec<Arc<dyn Tool
 
 /// Register all six datasource retrieval ops over `backend` into `registry`.
 pub fn register_datasource_ops(registry: &mut ToolRegistry, backend: Arc<dyn DatasourceBackend>) {
-    for tool in datasource_tools(backend) {
-        registry.register(tool);
-    }
+    try_register_datasource_ops(registry, backend)
+        .expect("flux datasource operation pack registration failed");
+}
+
+/// Fallibly register datasource operations with an auditable source label.
+pub fn try_register_datasource_ops(
+    registry: &mut ToolRegistry,
+    backend: Arc<dyn DatasourceBackend>,
+) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-capabilities datasource pack",
+        datasource_tools(backend),
+    )
 }
 
 /// `[entity id] (source, score) title — snippet`
@@ -72,6 +82,20 @@ fn parse<T: serde::de::DeserializeOwned>(op: &str, params: Value) -> Result<T> {
     serde_json::from_value(params).map_err(|e| Error::Other(format!("{op}: bad input: {e}")))
 }
 
+fn datasource_subjects(params: &Value) -> Vec<String> {
+    let source = params
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("*");
+    let entity = params
+        .get("entity")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("*");
+    vec![format!("datasource:{source}/{entity}")]
+}
+
 /// `search` — keyword search over the indexed datasource.
 struct SearchOp(Arc<dyn DatasourceBackend>);
 
@@ -92,14 +116,11 @@ impl Tool for SearchOp {
                 "required": ["query"]
             }),
         )
+        .with_access(vec![AccessKind::Datasource])
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(|s| vec![s.to_string()])
-            .unwrap_or_default()
+        datasource_subjects(params)
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -133,6 +154,11 @@ impl Tool for GetOp {
                 "required": ["source", "entity", "id"]
             }),
         )
+        .with_access(vec![AccessKind::Datasource])
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        datasource_subjects(params)
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -164,6 +190,11 @@ impl Tool for ListOp {
                 "required": ["source"]
             }),
         )
+        .with_access(vec![AccessKind::Datasource])
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        datasource_subjects(params)
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -201,6 +232,11 @@ impl Tool for RelationOp {
                 "required": ["source", "entity", "id"]
             }),
         )
+        .with_access(vec![AccessKind::Datasource])
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        datasource_subjects(params)
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -237,6 +273,11 @@ impl Tool for BatchGetOp {
                 "required": ["source", "entity", "ids"]
             }),
         )
+        .with_access(vec![AccessKind::Datasource])
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        datasource_subjects(params)
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -283,6 +324,11 @@ impl Tool for SourcesOp {
                 "properties": {}
             }),
         )
+        .with_access(vec![AccessKind::Datasource])
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec!["datasource:*/*".to_string()]
     }
 
     async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {

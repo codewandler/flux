@@ -319,7 +319,13 @@ pub(crate) fn cap_str(mut s: String, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flux_runtime::ToolContext;
+    use flux_policy::{
+        Action, AuthorizationPolicy, Grant, ResourceKind, ResourceRef, SubjectKind, SubjectRef,
+        TrustLevel,
+    };
+    use flux_runtime::{
+        AllowApprover, AuthorityRequirement, Executor, PermissionManager, ToolContext, ToolRegistry,
+    };
     use flux_system::{System, Workspace};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -723,6 +729,18 @@ mod tests {
             subjects.iter().any(|s| s == "http://example.com/p"),
             "still names the fetched URL: {subjects:?}"
         );
+        assert_eq!(
+            t.authority_requirements(&json!({ "url": "http://example.com/p" }), &subjects)
+                .unwrap(),
+            vec![
+                AuthorityRequirement::network_fetch("http://example.com/p"),
+                AuthorityRequirement::new(
+                    "flow.write_db",
+                    ResourceRef::named(ResourceKind::Datasource, "web.page"),
+                ),
+            ],
+            "the datasource marker must not be interpreted as a network destination"
+        );
         // The host effect stays Network: a `write_db` lowers to Network + the `flow.write_db` policy
         // action, deliberately NOT a filesystem `workspace.write`.
         assert_eq!(t.spec().effects, vec![Effect::Network]);
@@ -744,6 +762,65 @@ mod tests {
         );
     }
 
+    fn grant(action: &str, resource: ResourceRef) -> Grant {
+        Grant {
+            subjects: vec![SubjectRef {
+                kind: SubjectKind::User,
+                id: "*".into(),
+            }],
+            resources: vec![resource],
+            actions: vec![Action::from(action)],
+            required_trust: TrustLevel::Untrusted,
+            required_scopes: Vec::new(),
+            requires_approval: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_backed_fetch_requires_the_datasource_authority_at_dispatch() {
+        let build = |policy: AuthorizationPolicy| {
+            let fetch = Arc::new(tool(
+                PrivateNetAllow::None,
+                Some(Arc::new(RecordingSink::default())),
+            ));
+            let mut registry = ToolRegistry::new();
+            registry.register(fetch);
+            Executor::new(
+                registry,
+                PermissionManager::from_rules(&["web.fetch".into()], &[]),
+                Arc::new(AllowApprover),
+                ctx(),
+            )
+            .with_policy(policy)
+        };
+        let network_only = AuthorizationPolicy {
+            grants: vec![grant(
+                "network.fetch",
+                ResourceRef::any(ResourceKind::Network),
+            )],
+        };
+        let denied = build(network_only)
+            .dispatch_outcome("web.fetch", json!({"url": "http://127.0.0.1/"}))
+            .await;
+        assert!(denied.denied);
+        assert!(denied.result.content.contains("flow.write_db"));
+
+        let matching = AuthorizationPolicy {
+            grants: vec![
+                grant("network.fetch", ResourceRef::any(ResourceKind::Network)),
+                grant("flow.write_db", ResourceRef::any(ResourceKind::Datasource)),
+            ],
+        };
+        let admitted = build(matching)
+            .dispatch_outcome("web.fetch", json!({"url": "http://127.0.0.1/"}))
+            .await;
+        assert!(
+            !admitted.denied,
+            "matching datasource authority reaches guarded IO: {}",
+            admitted.result.content
+        );
+    }
+
     #[tokio::test]
     async fn without_record_sink_stays_network_only() {
         // No sink ⇒ nothing is persisted, so the tool must NOT declare a datasource write: no
@@ -759,6 +836,11 @@ mod tests {
             subjects,
             vec!["http://example.com/p".to_string()],
             "no sink ⇒ the URL is the only subject (no datasource target): {subjects:?}"
+        );
+        assert_eq!(
+            t.authority_requirements(&json!({ "url": "http://example.com/p" }), &subjects)
+                .unwrap(),
+            vec![AuthorityRequirement::network_fetch("http://example.com/p")]
         );
         assert_eq!(t.spec().effects, vec![Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);

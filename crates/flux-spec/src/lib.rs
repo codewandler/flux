@@ -119,6 +119,8 @@ pub enum AccessKind {
     Auth,
     Secret,
     Network,
+    Connection,
+    Datasource,
     Provider,
     Process,
     Browser,

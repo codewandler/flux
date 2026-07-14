@@ -142,12 +142,15 @@ pub enum ResourceKind {
     Path,
     Process,
     Network,
+    Connection,
     Datasource,
     Secret,
+    Host,
+    Provider,
 }
 
 /// A resource reference; `id` is wildcard-matchable and `path` (when set) uses glob matching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRef {
     pub kind: ResourceKind,
     #[serde(default = "star")]
@@ -180,6 +183,16 @@ impl ResourceRef {
             id: star(),
             name: None,
             path: Some(p.into()),
+        }
+    }
+
+    /// A named resource of `kind` (for example a datasource, provider, or connection target).
+    pub fn named(kind: ResourceKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+            name: None,
+            path: None,
         }
     }
 }
@@ -380,6 +393,55 @@ pub fn default_local_grants() -> AuthorizationPolicy {
                 vec![Action::from("network.fetch")],
                 vec![ResourceRef::any(ResourceKind::Network)],
                 false,
+            ),
+            grant(
+                vec![Action::from("connection.dial")],
+                vec![ResourceRef::any(ResourceKind::Connection)],
+                false,
+            ),
+            grant(
+                vec![Action::from("datasource.read")],
+                vec![ResourceRef::any(ResourceKind::Datasource)],
+                false,
+            ),
+            grant(
+                vec![
+                    Action::from("datasource.write"),
+                    Action::from("flow.write_db"),
+                ],
+                vec![ResourceRef::any(ResourceKind::Datasource)],
+                false,
+            ),
+            grant(
+                vec![Action::from("host.read")],
+                vec![ResourceRef::any(ResourceKind::Host)],
+                false,
+            ),
+            grant(
+                vec![Action::from("host.write")],
+                vec![ResourceRef::any(ResourceKind::Host)],
+                true,
+            ),
+            grant(
+                vec![Action::from("secret.read")],
+                vec![ResourceRef::any(ResourceKind::Secret)],
+                true,
+            ),
+            grant(
+                vec![Action::from("model.invoke")],
+                vec![ResourceRef::any(ResourceKind::Provider)],
+                false,
+            ),
+            // Externally-visible semantic actions are allowed only after explicit approval. Money
+            // movement and deletion are intentionally absent and therefore remain default-deny.
+            grant(
+                vec![
+                    Action::from("operation.mutate"),
+                    Action::from("flow.send_external"),
+                    Action::from("flow.calendar"),
+                ],
+                vec![ResourceRef::any(ResourceKind::Operation)],
+                true,
             ),
             grant(
                 vec![Action::from("process.exec")],

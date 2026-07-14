@@ -191,9 +191,23 @@ impl StoredFlowCatalog {
 
 /// Register the flow discovery/run pack. `flow_run` needs the model-in-the-loop host for nested
 /// authored execution and remains model-facing.
+pub fn try_register_flows(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools stored-flow pack",
+        vec![
+            Arc::new(FlowListTool) as Arc<dyn Tool>,
+            Arc::new(FlowRunTool),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_flows`].
 pub fn register_flows(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(FlowListTool));
-    registry.register(Arc::new(FlowRunTool));
+    try_register_flows(registry).expect("flux-tools stored-flow pack registration failed");
 }
 
 fn loop_host(ctx: &ToolContext) -> Result<&dyn LoopHost> {

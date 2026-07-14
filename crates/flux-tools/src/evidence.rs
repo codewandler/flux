@@ -18,10 +18,43 @@ use flux_spec::{tool_input_schema, Effect, Idempotency, Risk, ToolSpec};
 /// Register the evidence ops (`observe`, `evidence`, `metrics`). Called from
 /// [`register_builtins`](crate::register_builtins) — they are general-purpose audit primitives any flow
 /// may use, advertised like the other built-ins.
+pub fn try_register_evidence(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools evidence pack",
+        vec![
+            Arc::new(ObserveOp) as Arc<dyn Tool>,
+            Arc::new(EvidenceOp),
+            Arc::new(MetricsOp),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_evidence`].
 pub fn register_evidence(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(ObserveOp));
-    registry.register(Arc::new(EvidenceOp));
-    registry.register(Arc::new(MetricsOp));
+    try_register_evidence(registry).expect("flux-tools evidence pack registration failed");
+}
+
+/// Restore the canonical evidence primitives after an agent catalog subset/composition.
+///
+/// Agent loops require these control-plane operations even when a role's visible tool subset omits
+/// them. Use explicit source-labelled replacement so a conflicting injected handler cannot survive
+/// assembly and the override remains distinguishable from ordinary duplicate registration.
+pub fn install_evidence(registry: &mut ToolRegistry) -> Result<()> {
+    const SOURCE: &str = "flux-agent canonical evidence control plane";
+    let mut assembled = registry.clone();
+    for tool in [
+        Arc::new(ObserveOp) as Arc<dyn Tool>,
+        Arc::new(EvidenceOp),
+        Arc::new(MetricsOp),
+    ] {
+        assembled.replace_from(SOURCE, tool)?;
+    }
+    *registry = assembled;
+    Ok(())
 }
 
 /// `observe(kind, data?)` — append an observation to the run's shared evidence log.

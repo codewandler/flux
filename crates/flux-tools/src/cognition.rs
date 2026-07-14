@@ -29,33 +29,55 @@ use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{Idempotency, Risk, ToolSpec};
 
 /// Register all pure cognition ops into a registry.
+pub fn try_register_cognition(registry: &mut ToolRegistry) -> Result<()> {
+    let mut assembled = registry.clone();
+    assembled.try_register_all_from(
+        "flux-tools pure cognition pack",
+        vec![
+            Arc::new(NeedTool) as Arc<dyn Tool>,
+            Arc::new(GapsTool),
+            Arc::new(CompareTool),
+            Arc::new(TopTool),
+            Arc::new(MergeTool),
+            Arc::new(CiteTool),
+            Arc::new(LenTool),
+            Arc::new(FirstTool),
+            Arc::new(LastTool),
+        ],
+    )?;
+    crate::transform::try_register_transforms(&mut assembled)?;
+    assembled.try_register_all_from(
+        "flux-tools review and object cognition pack",
+        vec![
+            Arc::new(ReviewNormalizeTool) as Arc<dyn Tool>,
+            Arc::new(ReviewAggregateTool),
+            Arc::new(RegexMatchTool),
+            Arc::new(RegexExtractTool),
+            Arc::new(PickTool),
+            Arc::new(OmitTool),
+            Arc::new(MergeObjTool),
+            Arc::new(CoalesceTool),
+            Arc::new(KeysTool),
+            Arc::new(ValuesTool),
+            Arc::new(SumTool),
+            Arc::new(CountByTool),
+            Arc::new(GroupByTool),
+            Arc::new(AnyTool),
+            Arc::new(AllTool),
+            Arc::new(HasTool),
+        ],
+    )?;
+    *registry = assembled;
+    Ok(())
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_cognition`].
 pub fn register_cognition(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(NeedTool));
-    registry.register(Arc::new(GapsTool));
-    registry.register(Arc::new(CompareTool));
-    registry.register(Arc::new(TopTool));
-    registry.register(Arc::new(MergeTool));
-    registry.register(Arc::new(CiteTool));
-    registry.register(Arc::new(LenTool));
-    registry.register(Arc::new(FirstTool));
-    registry.register(Arc::new(LastTool));
-    crate::transform::register_transforms(registry);
-    registry.register(Arc::new(ReviewNormalizeTool));
-    registry.register(Arc::new(ReviewAggregateTool));
-    registry.register(Arc::new(RegexMatchTool));
-    registry.register(Arc::new(RegexExtractTool));
-    registry.register(Arc::new(PickTool));
-    registry.register(Arc::new(OmitTool));
-    registry.register(Arc::new(MergeObjTool));
-    registry.register(Arc::new(CoalesceTool));
-    registry.register(Arc::new(KeysTool));
-    registry.register(Arc::new(ValuesTool));
-    registry.register(Arc::new(SumTool));
-    registry.register(Arc::new(CountByTool));
-    registry.register(Arc::new(GroupByTool));
-    registry.register(Arc::new(AnyTool));
-    registry.register(Arc::new(AllTool));
-    registry.register(Arc::new(HasTool));
+    try_register_cognition(registry).expect("flux-tools cognition pack registration failed");
 }
 
 // ---------------------------------------------------------------------------

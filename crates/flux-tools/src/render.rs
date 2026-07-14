@@ -349,8 +349,17 @@ fn resolve_source(ctx: &ToolContext, name: &str) -> Result<String> {
 }
 
 /// Register the render pack: `flow_render`, beside `flow_list` / `flow_run`.
+pub fn try_register_render(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_from("flux-tools flow-render pack", Arc::new(FlowRenderTool))
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_render`].
 pub fn register_render(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(FlowRenderTool));
+    try_register_render(registry).expect("flux-tools flow-render pack registration failed");
 }
 
 #[cfg(test)]

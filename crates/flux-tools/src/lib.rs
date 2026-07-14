@@ -18,12 +18,13 @@ pub mod render;
 pub mod toolchains;
 pub mod transform;
 
-pub use evidence::register_evidence;
+pub use evidence::{install_evidence, register_evidence, try_register_evidence};
 pub use flows::{
-    register_flows, ResolvedStoredFlow, StoredFlowCatalog, StoredFlowEntry, StoredFlowKind,
+    register_flows, try_register_flows, ResolvedStoredFlow, StoredFlowCatalog, StoredFlowEntry,
+    StoredFlowKind,
 };
-pub use reflect::register_reflect;
-pub use render::register_render;
+pub use reflect::{install_reflect, register_reflect, try_register_reflect};
+pub use render::{register_render, try_register_render};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -216,32 +217,49 @@ fn unified_diff(path: &str, before: &str, after: &str) -> String {
 }
 
 /// Register all built-in tools into a registry.
+pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
+    let mut assembled = registry.clone();
+    cargo::try_register_cargo(&mut assembled)?;
+    toolchains::try_register_toolchains(&mut assembled)?;
+    extra::try_register_extra(&mut assembled)?;
+    assembled.try_register_all_from(
+        "flux-tools core coding pack",
+        vec![
+            Arc::new(ReadTool) as Arc<dyn Tool>,
+            Arc::new(ReadManyTool),
+            Arc::new(WriteTool),
+            Arc::new(EditTool),
+            Arc::new(PatchTool),
+            Arc::new(AppendTool),
+            Arc::new(BashTool),
+            Arc::new(ProcRunTool),
+            Arc::new(GlobTool),
+            Arc::new(GrepTool),
+            Arc::new(GitStageTool),
+            Arc::new(GitCommitTool),
+            Arc::new(GitStatusTool),
+            Arc::new(GitDiffTool),
+            Arc::new(GitLogTool),
+            Arc::new(GitPushTool),
+            Arc::new(GitCheckoutTool),
+            Arc::new(GitUnstageTool),
+        ],
+    )?;
+    cognition::try_register_cognition(&mut assembled)?;
+    // Evidence primitives (`observe`/`evidence`): general-purpose audit ops any flow may use to emit
+    // and read its own runtime observations.
+    evidence::try_register_evidence(&mut assembled)?;
+    *registry = assembled;
+    Ok(())
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_builtins`] and propagate collision diagnostics.
 pub fn register_builtins(registry: &mut ToolRegistry) {
-    cargo::register_cargo(registry);
-    toolchains::register_toolchains(registry);
-    extra::register_extra(registry);
-    registry.register(Arc::new(ReadTool));
-    registry.register(Arc::new(ReadManyTool));
-    registry.register(Arc::new(WriteTool));
-    registry.register(Arc::new(EditTool));
-    registry.register(Arc::new(PatchTool));
-    registry.register(Arc::new(AppendTool));
-    registry.register(Arc::new(BashTool));
-    registry.register(Arc::new(ProcRunTool));
-    registry.register(Arc::new(GlobTool));
-    registry.register(Arc::new(GrepTool));
-    registry.register(Arc::new(GitStageTool));
-    registry.register(Arc::new(GitCommitTool));
-    registry.register(Arc::new(GitStatusTool));
-    registry.register(Arc::new(GitDiffTool));
-    registry.register(Arc::new(GitLogTool));
-    registry.register(Arc::new(GitPushTool));
-    registry.register(Arc::new(GitCheckoutTool));
-    registry.register(Arc::new(GitUnstageTool));
-    cognition::register_cognition(registry);
-    // Evidence primitives (`observe`/`evidence`): general-purpose audit ops any flow may use to emit and
-    // read its own runtime observations — the foundation of an evidence-based model-in-the-loop.
-    evidence::register_evidence(registry);
+    try_register_builtins(registry).expect("flux-tools built-in registration failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -2272,7 +2290,7 @@ impl Tool for GitPushTool {
             effects: vec![Effect::Process, Effect::Network],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
-            access: vec![AccessKind::Process],
+            access: vec![AccessKind::Process, AccessKind::Network],
             group: None,
         }
     }
@@ -2555,8 +2573,17 @@ fn reload_restart_hint() -> &'static str {
 }
 
 /// Register extra tools available only in `--dev` mode.
+pub fn try_register_dev_builtins(registry: &mut flux_runtime::ToolRegistry) -> Result<()> {
+    registry.try_register_from("flux-tools developer pack", std::sync::Arc::new(ReloadTool))
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_dev_builtins`].
 pub fn register_dev_builtins(registry: &mut flux_runtime::ToolRegistry) {
-    registry.register(std::sync::Arc::new(ReloadTool));
+    try_register_dev_builtins(registry).expect("flux-tools developer pack registration failed");
 }
 
 #[cfg(test)]
@@ -3525,10 +3552,11 @@ mod tests {
                 "sys_info",
                 "top",
                 "values",
-                "web.search",
                 "write"
             ]
         );
+        r.validate_authority_contracts()
+            .expect("every built-in has a coherent typed authority contract");
     }
 
     #[test]

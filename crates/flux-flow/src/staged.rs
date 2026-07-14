@@ -1439,15 +1439,18 @@ fn build_families(
 fn virtual_family(spec: &ToolSpec) -> &'static str {
     if spec.effects.contains(&Effect::Write) {
         "workspace.write"
-    } else if spec.access.contains(&AccessKind::Provider) {
-        "model"
     } else if spec.effects.contains(&Effect::Process)
         || spec.effects.contains(&Effect::LocalSystem)
         || spec.access.contains(&AccessKind::Process)
+        || spec.access.contains(&AccessKind::Connection)
         || spec.access.contains(&AccessKind::LocalSystem)
     {
         "process"
-    } else if spec.effects.contains(&Effect::Network) && spec.effects.contains(&Effect::Read) {
+    } else if spec.access.contains(&AccessKind::Provider) {
+        "model"
+    } else if (spec.effects.contains(&Effect::Network) && spec.effects.contains(&Effect::Read))
+        || spec.access.contains(&AccessKind::Datasource)
+    {
         "network.read"
     } else if spec.effects.contains(&Effect::Filesystem)
         || spec.access.contains(&AccessKind::Filesystem)
@@ -2356,10 +2359,12 @@ fn gather_safe(
         // No declared effects does not mean inert: an operation that reaches a code-running or
         // local-system host capability can still act during exploration. Trust an empty effect set
         // as gather-safe only when the access set is equally inert (a pure op declares neither).
-        return !spec
-            .access
-            .iter()
-            .any(|access| matches!(access, AccessKind::Process | AccessKind::LocalSystem));
+        return !spec.access.iter().any(|access| {
+            matches!(
+                access,
+                AccessKind::Process | AccessKind::Connection | AccessKind::LocalSystem
+            )
+        });
     }
     let allowed = spec
         .effects

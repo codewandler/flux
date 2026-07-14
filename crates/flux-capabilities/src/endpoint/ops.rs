@@ -17,9 +17,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_secret::endpoint::EndpointRecord;
-use flux_spec::ToolSpec;
+use flux_spec::{AccessKind, ToolSpec};
 
 use super::{EndpointBroker, EndpointRegistry};
 
@@ -49,9 +49,20 @@ pub fn register_endpoint_ops(
     broker: Arc<EndpointBroker>,
     endpoints: Arc<EndpointRegistry>,
 ) {
-    for tool in endpoint_tools(broker, endpoints) {
-        registry.register(tool);
-    }
+    try_register_endpoint_ops(registry, broker, endpoints)
+        .expect("flux endpoint operation pack registration failed");
+}
+
+/// Fallibly register endpoint operations with an auditable source label.
+pub fn try_register_endpoint_ops(
+    registry: &mut ToolRegistry,
+    broker: Arc<EndpointBroker>,
+    endpoints: Arc<EndpointRegistry>,
+) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-capabilities endpoint pack",
+        endpoint_tools(broker, endpoints),
+    )
 }
 
 /// A required, non-empty string field.
@@ -71,6 +82,16 @@ fn opt_str(params: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
+}
+
+fn endpoint_subject(params: &Value) -> String {
+    params
+        .get("id")
+        .or_else(|| params.get("product"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("endpoint-registry")
+        .to_string()
 }
 
 /// `[product] @endpoint/id url (protocol) [owner/health] labels` — a one-line weak-ref summary.
@@ -125,6 +146,7 @@ impl Tool for DiscoverOp {
                 "required": ["product"]
             }),
         )
+        .with_access(vec![AccessKind::Network, AccessKind::LocalSystem])
         .with_group(ENDPOINT_GROUP)
     }
 
@@ -134,6 +156,18 @@ impl Tool for DiscoverOp {
             .and_then(|v| v.as_str())
             .map(|s| vec![s.to_string()])
             .unwrap_or_default()
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        let subject = endpoint_subject(params);
+        Ok(vec![
+            AuthorityRequirement::network_fetch(subject.clone()),
+            AuthorityRequirement::host_read(subject),
+        ])
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -203,7 +237,16 @@ impl Tool for ListOp {
              config-bound so far), with owner and last health. Weak references only — no secrets.",
             json!({"type": "object", "properties": {}}),
         )
+        .with_access(vec![AccessKind::LocalSystem])
         .with_group(ENDPOINT_GROUP)
+    }
+
+    fn authority_requirements(
+        &self,
+        _params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        Ok(vec![AuthorityRequirement::host_read("endpoint-registry")])
     }
 
     async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
@@ -241,7 +284,18 @@ impl Tool for InfoOp {
                 "required": ["id"]
             }),
         )
+        .with_access(vec![AccessKind::LocalSystem])
         .with_group(ENDPOINT_GROUP)
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        Ok(vec![AuthorityRequirement::host_read(endpoint_subject(
+            params,
+        ))])
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -274,7 +328,18 @@ impl Tool for SelectOp {
                 "required": ["id"]
             }),
         )
+        .with_access(vec![AccessKind::LocalSystem])
         .with_group(ENDPOINT_GROUP)
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        Ok(vec![AuthorityRequirement::host_read(endpoint_subject(
+            params,
+        ))])
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -322,9 +387,19 @@ impl Tool for ImportOp {
             effects: vec![flux_spec::Effect::LocalSystem],
             risk: flux_spec::Risk::Low,
             idempotency: flux_spec::Idempotency::Idempotent,
-            access: Vec::new(),
+            access: vec![AccessKind::LocalSystem],
             group: Some(ENDPOINT_GROUP.into()),
         }
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        Ok(vec![AuthorityRequirement::host_write(endpoint_subject(
+            params,
+        ))])
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {

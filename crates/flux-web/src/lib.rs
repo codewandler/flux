@@ -21,7 +21,8 @@
 
 use std::sync::Arc;
 
-use flux_runtime::ToolRegistry;
+use flux_core::Result;
+use flux_runtime::{Tool, ToolRegistry};
 use flux_system::net::PrivateNetAllow;
 
 pub mod browser;
@@ -95,11 +96,11 @@ pub struct WebOptions {
 /// - tier 3: `browser.open`/`goto`/`snapshot`/`act`/`close` (evidence-gated behind the `browser`
 ///   group — surfaced only when a Chromium binary is discoverable; see [`browser_group`]).
 pub fn register_web(registry: &mut ToolRegistry, opts: &WebOptions) {
-    registry.register(Arc::new(http::HttpRequestTool::new(opts)));
-    registry.register(Arc::new(fetch::WebFetchTool::new(opts)));
-    registry.register(Arc::new(fetch::HtmlToMarkdownTool));
-    registry.register(Arc::new(crawl::WebCrawlTool::new(opts)));
+    try_register_web(registry, opts).expect("flux-web operation pack registration failed");
+}
 
+/// Fallibly register the native web pack with a source label retained in collision diagnostics.
+pub fn try_register_web(registry: &mut ToolRegistry, opts: &WebOptions) -> Result<()> {
     // Tier 3: a shared session registry + config for the browser ops. They always register (so the
     // `browser` group can list them); the evidence gate hides them from the catalog when no Chromium
     // is discoverable.
@@ -113,20 +114,29 @@ pub fn register_web(registry: &mut ToolRegistry, opts: &WebOptions) {
             .clone()
             .unwrap_or_else(|| "config:web".to_string()),
     };
-    registry.register(Arc::new(browser::BrowserOpenTool {
-        registry: registry_ref.clone(),
-        config,
-    }));
-    registry.register(Arc::new(browser::BrowserGotoTool {
-        registry: registry_ref.clone(),
-    }));
-    registry.register(Arc::new(browser::BrowserSnapshotTool {
-        registry: registry_ref.clone(),
-    }));
-    registry.register(Arc::new(browser::BrowserActTool {
-        registry: registry_ref.clone(),
-    }));
-    registry.register(Arc::new(browser::BrowserCloseTool {
-        registry: registry_ref,
-    }));
+    registry.try_register_all_from(
+        "flux-web native capability pack",
+        vec![
+            Arc::new(http::HttpRequestTool::new(opts)) as Arc<dyn Tool>,
+            Arc::new(fetch::WebFetchTool::new(opts)),
+            Arc::new(fetch::HtmlToMarkdownTool),
+            Arc::new(crawl::WebCrawlTool::new(opts)),
+            Arc::new(browser::BrowserOpenTool {
+                registry: registry_ref.clone(),
+                config,
+            }),
+            Arc::new(browser::BrowserGotoTool {
+                registry: registry_ref.clone(),
+            }),
+            Arc::new(browser::BrowserSnapshotTool {
+                registry: registry_ref.clone(),
+            }),
+            Arc::new(browser::BrowserActTool {
+                registry: registry_ref.clone(),
+            }),
+            Arc::new(browser::BrowserCloseTool {
+                registry: registry_ref,
+            }),
+        ],
+    )
 }

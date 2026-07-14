@@ -27,13 +27,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use flux_core::{OperationTiming, Result};
+use flux_core::{Error, OperationTiming, Result, Usage};
 use flux_evidence::{
     DestructiveEscalation, EvidenceLog, Observation, Phase, Reaction, KIND_DESTRUCTIVE,
 };
 use flux_policy::{
-    evaluate, Action, AuthorizationPolicy, Caller, CallerKind, Decision, Principal,
-    Request as PolicyRequest, ResourceKind, ResourceRef, Trust, TrustKind, TrustLevel,
+    default_local_grants, evaluate, local_identity, Action, AuthorizationPolicy, Caller, Decision,
+    Request as PolicyRequest, ResourceKind, ResourceRef, Trust,
 };
 use flux_secret::Redactor;
 use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, StagingDisposition, ToolSpec};
@@ -192,10 +192,133 @@ pub trait SpawnActivitySink: Send + Sync {
     fn emit(&self, activity: SpawnActivity);
 }
 
+/// Grace allowed for turn-owned sub-agent tasks to observe parent cancellation and durably
+/// finalize before the runtime aborts them. The child engine's cancellation path normally closes
+/// immediately; this bound exists for buggy or cancellation-insensitive [`Spawner`] implementations.
+pub const SPAWN_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Owns Tokio tasks started by `task` operations for one lexical turn.
+///
+/// Dropping the operation future only drops its [`tokio::task::JoinHandle`], which would otherwise
+/// detach the sub-agent. The supervisor keeps an abort handle until the task actually exits, letting
+/// the turn finalizer first await cooperative cancellation and only abort after
+/// [`SPAWN_CLEANUP_GRACE`]. A fresh instance is installed by each engine turn; nested child engines
+/// therefore supervise their own descendants transitively.
+pub struct SpawnTaskSupervisor {
+    next_id: AtomicU64,
+    tasks: Mutex<HashMap<u64, Option<tokio::task::AbortHandle>>>,
+    idle: tokio::sync::Notify,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Default for SpawnTaskSupervisor {
+    fn default() -> Self {
+        Self::with_cancel(tokio_util::sync::CancellationToken::new())
+    }
+}
+
+impl SpawnTaskSupervisor {
+    /// Create a turn owner whose descendants receive `cancel` as their cooperative stop signal.
+    pub fn with_cancel(cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+            tasks: Mutex::new(HashMap::new()),
+            idle: tokio::sync::Notify::new(),
+            cancel,
+        }
+    }
+
+    /// A child token for one supervised spawn. Cancelling the turn owner stops every token derived
+    /// here while keeping sibling cancellation scopes independent.
+    pub fn child_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.child_token()
+    }
+
+    /// Spawn and register one turn-owned task. The returned handle is awaited by the operation on
+    /// the normal path; the supervisor remains its owner if that operation future is cancelled.
+    pub fn spawn<F, T>(self: &Arc<Self>, future: F) -> tokio::task::JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.tasks.lock().unwrap().insert(id, None);
+        let supervisor = self.clone();
+        let handle = tokio::spawn(async move {
+            let _task = SpawnTaskGuard { id, supervisor };
+            future.await
+        });
+        let abort = handle.abort_handle();
+        if let Some(slot) = self.tasks.lock().unwrap().get_mut(&id) {
+            *slot = Some(abort);
+        }
+        handle
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.tasks.lock().unwrap().is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Wait for all children to finish cooperatively. If `grace` elapses, abort every remaining
+    /// task and wait for the abort drops to reap their registrations. Returns `true` when cleanup
+    /// was cooperative and `false` when the abort backstop was needed.
+    pub async fn shutdown(&self, grace: Duration) -> bool {
+        self.cancel.cancel();
+        if tokio::time::timeout(grace, self.wait_idle()).await.is_ok() {
+            return true;
+        }
+        let aborts = self
+            .tasks
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Clone::clone)
+            .collect::<Vec<_>>();
+        for abort in aborts {
+            abort.abort();
+        }
+        // Tokio runs a task's destructors when an abort is observed. Keep the parent turn alive
+        // until those drops have removed every registration; a second bound prevents a broken
+        // executor from turning the abort backstop into an unbounded wait.
+        let _ = tokio::time::timeout(grace, self.wait_idle()).await;
+        false
+    }
+
+    /// Whether no turn-owned sub-agent task remains. Primarily useful for diagnostics/tests; turn
+    /// finalization should call [`Self::shutdown`] so the empty state is actively enforced.
+    pub fn is_idle(&self) -> bool {
+        self.tasks.lock().unwrap().is_empty()
+    }
+}
+
+struct SpawnTaskGuard {
+    id: u64,
+    supervisor: Arc<SpawnTaskSupervisor>,
+}
+
+impl Drop for SpawnTaskGuard {
+    fn drop(&mut self) {
+        let became_idle = {
+            let mut tasks = self.supervisor.tasks.lock().unwrap();
+            tasks.remove(&self.id);
+            tasks.is_empty()
+        };
+        if became_idle {
+            self.supervisor.idle.notify_waiters();
+        }
+    }
+}
+
 /// Lexically scoped capabilities belonging to one live runtime turn. A conversational driver
 /// installs this around the future that actually drives the turn; guarded adapter tools and nested
-/// runtimes can then inherit cancellation, parent-session lineage, and child-activity reporting
-/// without reading process-global or long-lived mutable turn slots.
+/// runtimes can then inherit cancellation, parent-session lineage, child-activity reporting, and
+/// turn-owned sub-agent supervision without reading process-global or long-lived mutable slots.
 ///
 /// The scope is future-local: concurrent Tokio tasks do not exchange it, a nested scope restores
 /// its parent on exit (including cancellation/drop), and a context retained after the scope ends
@@ -207,6 +330,38 @@ pub struct RuntimeTurnContext {
     cancel: Option<tokio_util::sync::CancellationToken>,
     session: Option<String>,
     spawn_activity: Option<Arc<dyn SpawnActivitySink>>,
+    spawn_supervisor: Option<Arc<SpawnTaskSupervisor>>,
+    identity: Option<TurnIdentity>,
+}
+
+/// The caller and trust assertion frozen for one runtime turn.
+///
+/// Long-lived executors retain an immutable assembly-time fallback identity. Multi-principal
+/// surfaces install this value lexically through an engine's per-turn entry point after the engine
+/// acquires its single-active-turn gate. Policy checks, approval receipts, guarded tool calls, and
+/// spawned children in that turn therefore observe one immutable snapshot.
+#[derive(Clone, Debug)]
+pub struct TurnIdentity {
+    caller: Caller,
+    trust: Trust,
+}
+
+impl TurnIdentity {
+    pub fn new(caller: Caller, trust: Trust) -> Self {
+        Self { caller, trust }
+    }
+
+    pub fn caller(&self) -> &Caller {
+        &self.caller
+    }
+
+    pub fn trust(&self) -> &Trust {
+        &self.trust
+    }
+
+    pub fn into_parts(self) -> (Caller, Trust) {
+        (self.caller, self.trust)
+    }
 }
 
 impl RuntimeTurnContext {
@@ -234,6 +389,18 @@ impl RuntimeTurnContext {
         self
     }
 
+    /// Carry the owner for sub-agent tasks started during this turn.
+    pub fn with_spawn_supervisor(mut self, supervisor: Arc<SpawnTaskSupervisor>) -> Self {
+        self.spawn_supervisor = Some(supervisor);
+        self
+    }
+
+    /// Freeze the authorization identity for this lexical turn.
+    pub fn with_identity(mut self, identity: TurnIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
     /// The turn's cancellation token, when driven by a cancellable surface.
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancel.clone()
@@ -249,9 +416,23 @@ impl RuntimeTurnContext {
         self.spawn_activity.clone()
     }
 
+    /// The turn-owned sub-agent task supervisor, when an engine installed one.
+    pub fn spawn_supervisor(&self) -> Option<Arc<SpawnTaskSupervisor>> {
+        self.spawn_supervisor.clone()
+    }
+
+    /// The immutable authorization identity carried by this turn, when explicitly installed.
+    pub fn identity(&self) -> Option<TurnIdentity> {
+        self.identity.clone()
+    }
+
     /// Whether this snapshot carries no live turn capabilities.
     pub fn is_empty(&self) -> bool {
-        self.cancel.is_none() && self.session.is_none() && self.spawn_activity.is_none()
+        self.cancel.is_none()
+            && self.session.is_none()
+            && self.spawn_activity.is_none()
+            && self.spawn_supervisor.is_none()
+            && self.identity.is_none()
     }
 }
 
@@ -261,6 +442,14 @@ impl std::fmt::Debug for RuntimeTurnContext {
             .field("cancel", &self.cancel.is_some())
             .field("session", &self.session)
             .field("spawn_activity", &self.spawn_activity.is_some())
+            .field("spawn_supervisor", &self.spawn_supervisor.is_some())
+            .field(
+                "identity",
+                &self
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.caller().principal.id.as_str()),
+            )
             .finish()
     }
 }
@@ -344,6 +533,14 @@ pub trait Spawner: Send + Sync {
 /// stage values and provider-native calls; only caller-authored Flux reaches deterministic execution.
 #[async_trait]
 pub trait LoopHost: Send + Sync {
+    /// Record one independent model call made by a guarded operation inside the current turn.
+    ///
+    /// The callback is synchronous because cancellation may drop the operation future after usage
+    /// arrived; a drop guard must be able to publish the already-observed accounting before the
+    /// turn finalizes. Hosts that do not own turn accounting (direct one-shot runtimes) keep the
+    /// default no-op and can read the operation's evidence observation instead.
+    fn record_model_usage(&self, _provider: &str, _model: &str, _usage: Usage) {}
+
     /// Detect one turn's intent and resolve the initial capability signals into a durable stage
     /// artifact. Adaptive hosts override this; tool-only runtimes fail clearly.
     async fn detect_intent(&self) -> flux_core::Result<serde_json::Value> {
@@ -479,6 +676,13 @@ pub struct ToolContext {
     /// Stored child-activity fallback; see `cancel`. Ordinary engine turns manufacture a fresh
     /// reporter and carry it only in their lexical [`RuntimeTurnContext`].
     spawn_activity: Arc<Mutex<Option<Arc<dyn SpawnActivitySink>>>>,
+    /// Stored sub-agent supervisor fallback for deliberately pinned spawned runtimes. Ordinary
+    /// conversational turns carry it lexically with the rest of [`RuntimeTurnContext`].
+    spawn_supervisor: Arc<Mutex<Option<Arc<SpawnTaskSupervisor>>>>,
+    /// Immutable identity pinned when a fresh one-shot context deliberately inherits a lexical
+    /// turn before crossing a task boundary. Ordinary engines leave this empty and scope identity
+    /// lexically instead.
+    identity: Option<TurnIdentity>,
     /// The **capability-scope stack**: each entry is the effective tool-name allowlist of one active
     /// `with_tools` block, narrow-only (an entry is always the intersection of its own declared set
     /// with the one below it — see [`Executor::push_cap_scope`]). Empty stack = no scope active = every
@@ -502,6 +706,8 @@ impl ToolContext {
             cancel: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
             spawn_activity: Arc::new(Mutex::new(None)),
+            spawn_supervisor: Arc::new(Mutex::new(None)),
+            identity: None,
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -550,6 +756,17 @@ impl ToolContext {
         self.runtime_turn_context().spawn_activity_sink()
     }
 
+    /// Snapshot the current turn's owner for sub-agent tasks.
+    pub fn spawn_supervisor(&self) -> Option<Arc<SpawnTaskSupervisor>> {
+        self.runtime_turn_context().spawn_supervisor()
+    }
+
+    /// Snapshot the identity frozen for the active lexical turn. Direct one-shot runtimes may see
+    /// an inherited construction-time snapshot; an ordinary context outside a turn returns `None`.
+    pub fn turn_identity(&self) -> Option<TurnIdentity> {
+        self.runtime_turn_context().identity()
+    }
+
     /// The complete effective runtime-turn snapshot. An active lexical scope is authoritative,
     /// including absent fields; only outside such a scope are the stored compatibility values read.
     /// This distinction prevents a reused context from reviving a prior turn's cancellation or
@@ -559,16 +776,20 @@ impl ToolContext {
             cancel: self.cancel.lock().unwrap().clone(),
             session: self.session.lock().unwrap().clone(),
             spawn_activity: self.spawn_activity.lock().unwrap().clone(),
+            spawn_supervisor: self.spawn_supervisor.lock().unwrap().clone(),
+            identity: self.identity.clone(),
         })
     }
 
     /// Replace all stored runtime-turn fallbacks with one snapshot. This is the explicit bridge for
     /// a **fresh** nested context that is about to cross a spawned-task boundary; long-lived engine
     /// contexts should scope the turn instead, so retained contexts cannot keep obsolete state.
-    pub fn set_runtime_turn_context(&self, turn: RuntimeTurnContext) {
+    pub fn set_runtime_turn_context(&mut self, turn: RuntimeTurnContext) {
         *self.cancel.lock().unwrap() = turn.cancel;
         *self.session.lock().unwrap() = turn.session;
         *self.spawn_activity.lock().unwrap() = turn.spawn_activity;
+        *self.spawn_supervisor.lock().unwrap() = turn.spawn_supervisor;
+        self.identity = turn.identity;
     }
 
     /// Record that `path` was read at `mtime` (called by `read`/`read_many`).
@@ -647,6 +868,121 @@ impl SecretResolver {
     }
 }
 
+/// One exact authorization request required by a concrete tool invocation.
+///
+/// This is the shared authority vocabulary between plan preview and dispatch. `action` names the
+/// behavior being authorized; `resource` carries the resource family and invocation-level subject
+/// (path, datasource, provider, connection target, or operation identity).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityRequirement {
+    pub action: Action,
+    pub resource: ResourceRef,
+}
+
+impl AuthorityRequirement {
+    pub fn new(action: impl Into<Action>, resource: ResourceRef) -> Self {
+        Self {
+            action: action.into(),
+            resource,
+        }
+    }
+
+    pub fn operation(action: impl Into<Action>, operation: impl Into<String>) -> Self {
+        Self::new(
+            action,
+            ResourceRef::named(ResourceKind::Operation, operation),
+        )
+    }
+
+    pub fn workspace_read(path: impl Into<String>) -> Self {
+        Self::new("workspace.read", ResourceRef::path(path))
+    }
+
+    pub fn workspace_write(path: impl Into<String>) -> Self {
+        Self::new("workspace.write", ResourceRef::path(path))
+    }
+
+    pub fn datasource_read(subject: impl Into<String>) -> Self {
+        Self::new(
+            "datasource.read",
+            ResourceRef::named(ResourceKind::Datasource, subject),
+        )
+    }
+
+    pub fn datasource_write(subject: impl Into<String>) -> Self {
+        Self::new(
+            "datasource.write",
+            ResourceRef::named(ResourceKind::Datasource, subject),
+        )
+    }
+
+    pub fn network_fetch(subject: impl Into<String>) -> Self {
+        Self::new(
+            "network.fetch",
+            ResourceRef::named(ResourceKind::Network, subject),
+        )
+    }
+
+    pub fn connection_dial(subject: impl Into<String>) -> Self {
+        Self::new(
+            "connection.dial",
+            ResourceRef::named(ResourceKind::Connection, subject),
+        )
+    }
+
+    pub fn process_exec(subject: impl Into<String>) -> Self {
+        Self::new(
+            "process.exec",
+            ResourceRef::named(ResourceKind::Process, subject),
+        )
+    }
+
+    pub fn secret_read(subject: impl Into<String>) -> Self {
+        Self::new(
+            "secret.read",
+            ResourceRef::named(ResourceKind::Secret, subject),
+        )
+    }
+
+    pub fn provider_invoke(subject: impl Into<String>) -> Self {
+        Self::new(
+            "model.invoke",
+            ResourceRef::named(ResourceKind::Provider, subject),
+        )
+    }
+
+    pub fn browser_navigate(subject: impl Into<String>) -> Self {
+        Self::new(
+            "browser.navigate",
+            ResourceRef::named(ResourceKind::Network, subject),
+        )
+    }
+
+    pub fn host_read(subject: impl Into<String>) -> Self {
+        Self::new("host.read", ResourceRef::named(ResourceKind::Host, subject))
+    }
+
+    pub fn host_write(subject: impl Into<String>) -> Self {
+        Self::new(
+            "host.write",
+            ResourceRef::named(ResourceKind::Host, subject),
+        )
+    }
+
+    /// Whether this requirement represents mutation, process execution, or outbound contact for
+    /// the whole-plan disclosure. Dispatch does not rely on this classification.
+    pub fn is_mutating(&self) -> bool {
+        !matches!(
+            self.action.0.as_str(),
+            "workspace.read" | "datasource.read" | "host.read" | "secret.read" | "model.invoke"
+        )
+    }
+
+    pub fn is_destructive(&self) -> bool {
+        matches!(self.action.0.as_str(), "flow.delete" | "flow.money")
+    }
+}
+
 /// A tool the agent can invoke. Permission metadata and intents are declared here so the
 /// dispatcher can gate, render, and audit the call.
 #[async_trait]
@@ -683,6 +1019,21 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
+    /// Exact authorization requirements for this invocation.
+    ///
+    /// The dispatcher and whole-plan preview both consume this typed contract. The default adapter
+    /// is deliberately resource-aware: a generic `Read` is pure unless paired with a concrete
+    /// access kind, while unknown semantic actions fail closed. Tools whose resource identity is
+    /// richer than filesystem/network/process access (notably datasources and plugins) override
+    /// this method and return their invocation-level subjects directly.
+    fn authority_requirements(
+        &self,
+        _params: &Value,
+        subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        authority_requirements_from_declaration(&self.spec(), subjects, &self.semantic_effects())
+    }
+
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult>;
 }
 
@@ -690,6 +1041,7 @@ pub trait Tool: Send + Sync {
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    sources: HashMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -697,8 +1049,142 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// Register a tool from an unnamed direct source.
+    ///
+    /// This compatibility API fails closed by panicking on an invalid or duplicate declaration;
+    /// fallible production assembly should use [`try_register`](Self::try_register) or
+    /// [`try_register_from`](Self::try_register_from) and propagate the path-aware error.
+    ///
+    /// # Deprecated
+    ///
+    /// Kept source-compatible for integrations written before registration became fallible. New
+    /// assembly code must use a `try_*` method and return the error to its caller.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.spec().name, tool);
+        self.try_register(tool)
+            .unwrap_or_else(|err| panic!("tool registration failed: {err}"));
+    }
+
+    /// Fallible registration for direct/programmatic tools.
+    pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
+        self.try_register_from("direct", tool)
+    }
+
+    /// Fallible registration with a source label used in duplicate diagnostics (for example a
+    /// plugin descriptor path or built-in pack name).
+    pub fn try_register_from(
+        &mut self,
+        source: impl Into<String>,
+        tool: Arc<dyn Tool>,
+    ) -> Result<()> {
+        let source = source.into();
+        let spec = tool.spec();
+        let name = spec.name.clone();
+        if name.trim().is_empty() {
+            return Err(Error::Other(format!(
+                "tool from `{source}` has an empty operation name"
+            )));
+        }
+        if let Some(existing) = self.tools.get(&name) {
+            let existing_source = self
+                .sources
+                .get(&name)
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            let same =
+                serde_json::to_value(existing.spec()).ok() == serde_json::to_value(&spec).ok();
+            let shape = if same { "identical" } else { "conflicting" };
+            return Err(Error::Other(format!(
+                "duplicate operation `{name}` from `{source}` ({shape} declaration; already registered from `{existing_source}`)"
+            )));
+        }
+
+        let input = json!({});
+        let subjects = tool.permission_subjects(&input);
+        tool.authority_requirements(&input, &subjects)
+            .map_err(|err| {
+                Error::Other(format!(
+                    "invalid authority contract for `{name}` from `{source}`: {err}"
+                ))
+            })?;
+        self.tools.insert(name.clone(), tool);
+        self.sources.insert(name, source);
+        Ok(())
+    }
+
+    /// Atomically register a pack of tools under one auditable source label.
+    ///
+    /// If any declaration is invalid or collides, none of the pack is installed. Independently
+    /// assembled packs should use distinct source labels so the duplicate diagnostic names both
+    /// contributors.
+    pub fn try_register_all_from<I>(&mut self, source: impl Into<String>, tools: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Arc<dyn Tool>>,
+    {
+        let source = source.into();
+        let mut assembled = self.clone();
+        for tool in tools {
+            assembled.try_register_from(source.clone(), tool)?;
+        }
+        *self = assembled;
+        Ok(())
+    }
+
+    /// Explicitly replace a registered tool, returning the previous handler. Callers must name the
+    /// replacement source so the audit/catalog owner is visible; ordinary registration never
+    /// overwrites.
+    pub fn replace_from(
+        &mut self,
+        source: impl Into<String>,
+        tool: Arc<dyn Tool>,
+    ) -> Result<Option<Arc<dyn Tool>>> {
+        let source = source.into();
+        let spec = tool.spec();
+        let name = spec.name.clone();
+        if name.trim().is_empty() {
+            return Err(Error::Other(format!(
+                "replacement tool from `{source}` has an empty operation name"
+            )));
+        }
+        let input = json!({});
+        let subjects = tool.permission_subjects(&input);
+        tool.authority_requirements(&input, &subjects)
+            .map_err(|err| {
+                Error::Other(format!(
+                    "invalid authority contract for replacement `{name}` from `{source}`: {err}"
+                ))
+            })?;
+        self.sources.insert(name.clone(), source);
+        Ok(self.tools.insert(name, tool))
+    }
+
+    /// Merge another assembled catalog while preserving each operation's source label.
+    ///
+    /// This is the fallible composition seam for independently assembled packs (for example an L6
+    /// integration catalog joining the App's built-ins). A collision remains an error; intentional
+    /// control-plane overrides must use [`Self::replace_from`] explicitly.
+    pub fn try_extend(&mut self, mut other: ToolRegistry) -> Result<()> {
+        let mut assembled = self.clone();
+        let mut names: Vec<String> = other.tools.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let Some(tool) = other.tools.remove(&name) else {
+                return Err(Error::Other(format!(
+                    "registry changed while composing operation `{name}`"
+                )));
+            };
+            let source = other
+                .sources
+                .remove(&name)
+                .unwrap_or_else(|| "unknown".to_string());
+            assembled.try_register_from(source, tool)?;
+        }
+        *self = assembled;
+        Ok(())
+    }
+
+    /// The auditable source label attached to an operation, when registered.
+    pub fn source(&self, name: &str) -> Option<&str> {
+        self.sources.get(name).map(String::as_str)
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -708,6 +1194,7 @@ impl ToolRegistry {
     /// Remove a tool by name, returning it if present. Used to scope a sub-agent's registry (e.g.
     /// drop `task` so a sub-agent can't spawn further sub-agents).
     pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.sources.remove(name);
         self.tools.remove(name)
     }
 
@@ -729,13 +1216,19 @@ impl ToolRegistry {
         let Some(names) = names else {
             return self.clone();
         };
-        let tools = self
+        let tools: HashMap<String, Arc<dyn Tool>> = self
             .tools
             .iter()
             .filter(|(k, _)| names.iter().any(|n| n == *k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        ToolRegistry { tools }
+        let sources = self
+            .sources
+            .iter()
+            .filter(|(name, _)| tools.contains_key(*name))
+            .map(|(name, source)| (name.clone(), source.clone()))
+            .collect();
+        ToolRegistry { tools, sources }
     }
 
     /// Every registered tool name, sorted (see [`specs`](Self::specs) for why order must be stable).
@@ -743,6 +1236,27 @@ impl ToolRegistry {
         let mut names: Vec<String> = self.tools.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Validate every registered tool's static authority declaration.
+    ///
+    /// Registration owners call this after composing catalogs; dispatch still revalidates with the
+    /// concrete invocation. The empty object intentionally represents the least-specific call, so
+    /// an operation must either produce a conservative wildcard requirement or reject registration
+    /// rather than rely on runtime parameters to invent its resource family.
+    pub fn validate_authority_contracts(&self) -> Result<()> {
+        for tool in self.tools.values() {
+            let input = json!({});
+            let subjects = tool.permission_subjects(&input);
+            tool.authority_requirements(&input, &subjects)
+                .map_err(|err| {
+                    Error::Other(format!(
+                        "invalid authority contract for `{}`: {err}",
+                        tool.spec().name
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Specs for the ops that should be **advertised to the model** given the group manifest and the
@@ -999,6 +1513,10 @@ pub struct PlanApprovalRequest {
     /// at approval time — a command assembled from `$symbols` at runtime is NOT in here, which is
     /// why an *undisclosed* destructive op re-fires the per-op gate inside an approved scope.
     pub intents: IntentSet,
+    /// Exact typed authority requirements derived from the same invocation contract dispatch will
+    /// evaluate. Dynamic arguments may make this a conservative preview; dispatch always re-derives
+    /// and enforces the concrete set.
+    pub requirements: Vec<AuthorityRequirement>,
 }
 
 impl PlanApprovalRequest {
@@ -1064,106 +1582,615 @@ pub trait PreToolHook: Send + Sync {
     fn pre_tool(&self, tool: &str, input: &serde_json::Value) -> HookOutcome;
 }
 
-/// The resolved `(Caller, Trust)` the policy floor evaluates against, behind a shared handle.
+/// The immutable assembly-time `(Caller, Trust)` behind a cloneable shared handle.
 ///
-/// One cell can back an [`Executor`] *and* the sub-agent spawner, so a per-request surface that
-/// swaps the identity between turns (D-69: flux-server's principal mode) changes it for the whole
-/// tree at once — a child agent must never keep executing under the service identity after the
-/// surface resolved a request principal. Contract: [`set`](Self::set) is called only between turns,
-/// under the surface's turn serialization (e.g. the server's turn gate); mid-turn swaps would race
-/// the dispatch reads.
+/// An [`Executor`] and its sub-agent spawner may share this fallback snapshot. Multi-principal
+/// surfaces do not retarget it; they pass a [`TurnIdentity`] through the engine's lexical turn API.
 #[derive(Clone)]
-pub struct IdentityCell(Arc<Mutex<(Caller, Trust)>>);
+pub struct IdentityCell(Arc<(Caller, Trust)>);
 
 impl IdentityCell {
     pub fn new(caller: Caller, trust: Trust) -> Self {
-        Self(Arc::new(Mutex::new((caller, trust))))
+        Self(Arc::new((caller, trust)))
     }
 
     /// The local single-user identity (the default when a surface never resolves one).
     pub fn local() -> Self {
-        Self::new(default_local_caller(), default_local_trust())
+        let (caller, trust) = local_identity("local");
+        Self::new(caller, trust)
     }
 
-    /// Snapshot the current identity (cloned — dispatch holds no lock across evaluation).
+    /// Snapshot the immutable identity as its legacy tuple shape.
     pub fn get(&self) -> (Caller, Trust) {
-        self.0.lock().unwrap().clone()
+        self.0.as_ref().clone()
     }
 
-    /// Swap the identity. Per-request surfaces call this between turns, under turn serialization.
-    pub fn set(&self, caller: Caller, trust: Trust) {
-        *self.0.lock().unwrap() = (caller, trust);
-    }
-}
-
-/// A local single-user caller used when no identity is supplied (matches `flux-auth`'s
-/// `LocalIdentity`, duplicated here so the runtime needn't depend on the auth layer).
-fn default_local_caller() -> Caller {
-    Caller {
-        principal: Principal {
-            id: "local".into(),
-            name: "local".into(),
-            kind: CallerKind::User,
-        },
-        groups: Vec::new(),
-        source: "local".into(),
+    /// Snapshot the immutable identity as a lexical turn value.
+    pub fn snapshot(&self) -> TurnIdentity {
+        let (caller, trust) = self.get();
+        TurnIdentity::new(caller, trust)
     }
 }
 
-fn default_local_trust() -> Trust {
-    Trust {
-        kind: TrustKind::Invocation,
-        level: TrustLevel::Privileged,
-        scopes: Vec::new(),
+/// The authorization floor and resolved identity installed atomically on an [`Executor`].
+///
+/// Use [`local`](Self::local) for the documented single-user profile, or [`new`](Self::new) /
+/// [`with_identity_cell`](Self::with_identity_cell) when a surface resolves its own principal.
+/// There is deliberately no "disabled" profile: approval rules may narrow this floor, never remove
+/// it.
+#[derive(Clone)]
+pub struct ExecutionAuthorization {
+    policy: AuthorizationPolicy,
+    identity: IdentityCell,
+}
+
+impl ExecutionAuthorization {
+    /// Pair an explicit policy with a fixed caller and trust assertion.
+    pub fn new(policy: AuthorizationPolicy, caller: Caller, trust: Trust) -> Self {
+        Self::with_identity_cell(policy, IdentityCell::new(caller, trust))
+    }
+
+    /// Pair an explicit policy with an immutable identity snapshot shared by assembly components.
+    pub fn with_identity_cell(policy: AuthorizationPolicy, identity: IdentityCell) -> Self {
+        Self { policy, identity }
+    }
+
+    /// The documented local single-user profile: canonical local identity plus the default local
+    /// grants. This is the safe compatibility profile used by [`Executor::new`].
+    pub fn local() -> Self {
+        Self {
+            policy: default_local_grants(),
+            identity: IdentityCell::local(),
+        }
+    }
+
+    /// The policy floor carried by this profile.
+    pub fn policy(&self) -> &AuthorizationPolicy {
+        &self.policy
+    }
+
+    /// The shared immutable identity snapshot carried by this profile.
+    pub fn identity(&self) -> IdentityCell {
+        self.identity.clone()
     }
 }
 
-/// Translate a tool's declared effects + permission subjects into the (action, resource) pairs the
-/// authorization policy is evaluated against. Filesystem read/write map onto path resources (one
-/// per subject); process/network/browser map onto a kind-wide resource (their subjects are gated
-/// by the coder-style permission rules, not the policy).
-fn effect_requests(spec: &ToolSpec, subjects: &[String]) -> Vec<(Action, ResourceRef)> {
-    let mut reqs = Vec::new();
-    let has = |e: Effect| spec.effects.contains(&e);
-    let path_resources = || -> Vec<ResourceRef> {
+/// Mechanical assembly of one guarded execution environment.
+///
+/// Surfaces decide *which* workspace, tools, permission rules, approver, policy, and identity apply;
+/// this type owns the invariant-preserving mechanics that turn those decisions into an
+/// [`Executor`]. In particular, the guarded [`System`] is explicit and is reused for the
+/// [`ToolContext`] instead of consulting the process current directory during lazy construction.
+/// Plugin, endpoint, and datasource operations are ordinary entries in `registry`, so they take the
+/// same path once their L6 host-specific audit capabilities have been assembled.
+#[derive(Clone)]
+pub struct ExecutionEnvironment {
+    system: Arc<System>,
+    registry: ToolRegistry,
+    permissions: PermissionManager,
+    approver: Arc<dyn Approver>,
+    authorization: ExecutionAuthorization,
+    redactor: Redactor,
+    spawner: Option<Arc<dyn Spawner>>,
+    runtime_turn: Option<RuntimeTurnContext>,
+    hooks: Vec<Arc<dyn PreToolHook>>,
+    // Compatibility bridge for callers that already built a richer context. New assembly should
+    // use the explicit `System` constructor above so every derived executor receives a fresh
+    // evidence/read-set context over the same root.
+    exact_context: Option<ToolContext>,
+}
+
+impl ExecutionEnvironment {
+    /// Start an environment from all mandatory safety-envelope inputs.
+    pub fn new(
+        system: Arc<System>,
+        registry: ToolRegistry,
+        permissions: PermissionManager,
+        approver: Arc<dyn Approver>,
+        authorization: ExecutionAuthorization,
+    ) -> Self {
+        Self {
+            system,
+            registry,
+            permissions,
+            approver,
+            authorization,
+            redactor: Redactor::new(),
+            spawner: None,
+            runtime_turn: None,
+            hooks: Vec::new(),
+            exact_context: None,
+        }
+    }
+
+    /// Compatibility bridge for pre-builder callers that already own a [`ToolContext`].
+    ///
+    /// Prefer [`Self::new`]. This door exists so deprecated assembly shims can delegate to the same
+    /// executor construction path; it is scheduled for removal with those shims in the next minor
+    /// API cleanup.
+    pub fn from_context(
+        registry: ToolRegistry,
+        permissions: PermissionManager,
+        approver: Arc<dyn Approver>,
+        authorization: ExecutionAuthorization,
+        context: ToolContext,
+    ) -> Self {
+        Self {
+            system: context.system.clone(),
+            registry,
+            permissions,
+            approver,
+            authorization,
+            redactor: context.redactor.clone(),
+            spawner: context.spawner.clone(),
+            runtime_turn: None,
+            hooks: Vec::new(),
+            exact_context: Some(context),
+        }
+    }
+
+    /// The exact guarded system shared by every executor derived from this environment.
+    pub fn system(&self) -> &Arc<System> {
+        &self.system
+    }
+
+    /// The operation catalog this environment will install.
+    pub fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
+    /// Mutate the catalog while assembling a surface-specific tool set.
+    pub fn registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.registry
+    }
+
+    /// Replace the catalog while retaining every other environment invariant.
+    pub fn with_registry(mut self, registry: ToolRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Replace the pre-approval permission rules.
+    pub fn with_permissions(mut self, permissions: PermissionManager) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// Replace the surface-owned approval handler.
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = approver;
+        self
+    }
+
+    /// Replace the mandatory policy/identity profile.
+    pub fn with_authorization(mut self, authorization: ExecutionAuthorization) -> Self {
+        self.authorization = authorization;
+        self
+    }
+
+    /// Install the shared secret redactor on every derived context.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor.clone();
+        if let Some(context) = self.exact_context.take() {
+            self.exact_context = Some(context.with_redactor(redactor));
+        }
+        self
+    }
+
+    /// Install a sub-agent spawner on every derived context.
+    pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
+        self.spawner = Some(spawner.clone());
+        if let Some(context) = self.exact_context.take() {
+            self.exact_context = Some(context.with_spawner(spawner));
+        }
+        self
+    }
+
+    /// Pin a complete lexical runtime-turn snapshot onto the next fresh context.
+    ///
+    /// This is intentionally opt-in: one-shot runtimes that cross `tokio::spawn` need it, while a
+    /// long-lived engine context must not retain a parent turn's cancellation/session lineage.
+    pub fn with_runtime_turn(mut self, runtime_turn: RuntimeTurnContext) -> Self {
+        self.runtime_turn = Some(runtime_turn);
+        self
+    }
+
+    /// Snapshot the currently effective lexical turn for a one-shot runtime that may cross a task
+    /// boundary. Outside a turn this pins an explicitly empty context.
+    pub fn inherit_runtime_turn(self) -> Self {
+        self.with_runtime_turn(active_runtime_turn_context().unwrap_or_default())
+    }
+
+    /// Attach ordered pre-tool hooks.
+    pub fn with_hooks(mut self, hooks: Vec<Arc<dyn PreToolHook>>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Build the guarded executor. No ambient path lookup or policy defaulting occurs here.
+    pub fn into_executor(mut self) -> Executor {
+        let context = match self.exact_context.take() {
+            Some(context) => context,
+            None => {
+                let mut context = ToolContext::new(self.system).with_redactor(self.redactor);
+                if let Some(spawner) = self.spawner {
+                    context = context.with_spawner(spawner);
+                }
+                if let Some(runtime_turn) = self.runtime_turn {
+                    context.set_runtime_turn_context(runtime_turn);
+                }
+                context
+            }
+        };
+        Executor::new_with_authorization(
+            self.registry,
+            self.permissions,
+            self.approver,
+            context,
+            self.authorization,
+        )
+        .with_hooks(self.hooks)
+    }
+}
+
+/// Compatibility adapter from the catalog declaration to exact invocation requirements.
+///
+/// Effects by themselves are not resources. In particular, a generic `Read` can describe a pure
+/// transform, evidence lookup, datasource query, or filesystem read, so it never implies
+/// `workspace.read`. Concrete access kinds select the resource family; richer tools override
+/// [`Tool::authority_requirements`]. Inconsistent declarations and unknown semantic actions fail
+/// closed instead of being silently dropped.
+fn push_requirement(
+    requirements: &mut Vec<AuthorityRequirement>,
+    requirement: AuthorityRequirement,
+) {
+    if !requirements.contains(&requirement) {
+        requirements.push(requirement);
+    }
+}
+
+/// Normalize the untyped compatibility subjects that can identify ordinary resource families.
+///
+/// `datasource:` is the one typed subject carried through this legacy seam: it feeds the separate
+/// datasource/`flow.write_db` requirements and must never become a network, process, browser, or
+/// provider identity. Blank and wildcard placeholders are not concrete; duplicates are collapsed
+/// while preserving declaration order.
+fn concrete_authority_subjects(subjects: &[String]) -> Vec<&str> {
+    let mut concrete = Vec::new();
+    for subject in subjects {
+        let subject = subject.trim();
+        if subject.is_empty() || subject == "*" || subject.starts_with("datasource:") {
+            continue;
+        }
+        if !concrete.contains(&subject) {
+            concrete.push(subject);
+        }
+    }
+    concrete
+}
+
+fn push_declared_resource_requirements(
+    requirements: &mut Vec<AuthorityRequirement>,
+    subjects: &[String],
+    action: &'static str,
+    kind: ResourceKind,
+) {
+    let subjects = concrete_authority_subjects(subjects);
+    if subjects.is_empty() {
+        push_requirement(
+            requirements,
+            AuthorityRequirement::new(action, ResourceRef::any(kind)),
+        );
+    } else {
+        for subject in subjects {
+            push_requirement(
+                requirements,
+                AuthorityRequirement::new(action, ResourceRef::named(kind, subject)),
+            );
+        }
+    }
+}
+
+/// Derive exact requirements from a catalog declaration plus invocation-level subjects.
+///
+/// Most built-in tools use this through [`Tool::authority_requirements`]. Adapters such as the
+/// plugin host may call it and then replace coarse manifest-wide resources with their exact
+/// declared hosts, programs, or connection targets.
+pub fn authority_requirements_from_declaration(
+    spec: &ToolSpec,
+    subjects: &[String],
+    semantic_effects: &[String],
+) -> Result<Vec<AuthorityRequirement>> {
+    let has_effect = |effect| spec.effects.contains(&effect);
+    let has_access = |access| spec.access.contains(&access);
+    let mut requirements = Vec::new();
+    let concrete_subjects = || {
         if subjects.is_empty() {
-            vec![ResourceRef::path("")] // matches a `*` path glob
+            vec!["".to_string()]
         } else {
-            subjects
-                .iter()
-                .map(|s| ResourceRef::path(s.as_str()))
-                .collect()
+            subjects.to_vec()
         }
     };
-    if has(Effect::Write) {
-        for r in path_resources() {
-            reqs.push((Action::from("workspace.write"), r));
+
+    if has_access(AccessKind::Filesystem) {
+        if has_effect(Effect::Write) {
+            for subject in concrete_subjects() {
+                push_requirement(
+                    &mut requirements,
+                    AuthorityRequirement::workspace_write(subject),
+                );
+            }
+        } else if has_effect(Effect::Read) || has_effect(Effect::Filesystem) {
+            for subject in concrete_subjects() {
+                push_requirement(
+                    &mut requirements,
+                    AuthorityRequirement::workspace_read(subject),
+                );
+            }
+        } else {
+            return Err(Error::Other(format!(
+                "tool `{}` declares filesystem access without a read/write effect",
+                spec.name
+            )));
         }
-    } else if has(Effect::Read) || has(Effect::Filesystem) {
-        for r in path_resources() {
-            reqs.push((Action::from("workspace.read"), r));
+    }
+    if has_access(AccessKind::Process) {
+        push_declared_resource_requirements(
+            &mut requirements,
+            subjects,
+            "process.exec",
+            ResourceKind::Process,
+        );
+    }
+    if has_access(AccessKind::Network) {
+        push_declared_resource_requirements(
+            &mut requirements,
+            subjects,
+            "network.fetch",
+            ResourceKind::Network,
+        );
+    }
+    if has_access(AccessKind::Connection) {
+        if subjects.is_empty() {
+            push_requirement(
+                &mut requirements,
+                AuthorityRequirement::new(
+                    "connection.dial",
+                    ResourceRef::any(ResourceKind::Connection),
+                ),
+            );
+        } else {
+            for subject in subjects {
+                push_requirement(
+                    &mut requirements,
+                    AuthorityRequirement::new(
+                        "connection.dial",
+                        ResourceRef::named(ResourceKind::Connection, subject),
+                    ),
+                );
+            }
         }
     }
-    if has(Effect::Process) || has(Effect::LocalSystem) {
-        reqs.push((
-            Action::from("process.exec"),
-            ResourceRef::any(ResourceKind::Process),
-        ));
+    if has_access(AccessKind::Datasource) {
+        let action = if has_effect(Effect::Write)
+            || semantic_effects.iter().any(|effect| effect == "write_db")
+        {
+            "datasource.write"
+        } else {
+            "datasource.read"
+        };
+        if subjects.is_empty() {
+            push_requirement(
+                &mut requirements,
+                AuthorityRequirement::new(action, ResourceRef::any(ResourceKind::Datasource)),
+            );
+        } else {
+            for subject in subjects {
+                let subject = subject.strip_prefix("datasource:").unwrap_or(subject);
+                push_requirement(
+                    &mut requirements,
+                    AuthorityRequirement::new(
+                        action,
+                        ResourceRef::named(ResourceKind::Datasource, subject),
+                    ),
+                );
+            }
+        }
     }
-    if has(Effect::Network) {
-        reqs.push((
-            Action::from("network.fetch"),
-            ResourceRef::any(ResourceKind::Network),
-        ));
+    if has_access(AccessKind::Browser) {
+        push_declared_resource_requirements(
+            &mut requirements,
+            subjects,
+            "browser.navigate",
+            ResourceKind::Network,
+        );
     }
-    if has(Effect::Browser) {
-        // ResourceKind has no Browser variant; browser navigation is gated as network egress.
-        reqs.push((
-            Action::from("browser.navigate"),
-            ResourceRef::any(ResourceKind::Network),
-        ));
+    if has_access(AccessKind::Provider) {
+        push_declared_resource_requirements(
+            &mut requirements,
+            subjects,
+            "model.invoke",
+            ResourceKind::Provider,
+        );
     }
-    reqs
+    if has_access(AccessKind::Secret) {
+        if subjects.is_empty() {
+            push_requirement(
+                &mut requirements,
+                AuthorityRequirement::new("secret.read", ResourceRef::any(ResourceKind::Secret)),
+            );
+        } else {
+            for subject in subjects {
+                push_requirement(
+                    &mut requirements,
+                    AuthorityRequirement::new(
+                        "secret.read",
+                        ResourceRef::named(ResourceKind::Secret, subject),
+                    ),
+                );
+            }
+        }
+    }
+    if has_access(AccessKind::Auth) {
+        push_requirement(
+            &mut requirements,
+            AuthorityRequirement::new("host.read", ResourceRef::named(ResourceKind::Host, "auth")),
+        );
+    }
+    if has_access(AccessKind::LocalSystem) && !has_access(AccessKind::Process) {
+        let action = if has_effect(Effect::Write) || has_effect(Effect::LocalSystem) {
+            "host.write"
+        } else {
+            "host.read"
+        };
+        push_requirement(
+            &mut requirements,
+            AuthorityRequirement::new(action, ResourceRef::named(ResourceKind::Host, &spec.name)),
+        );
+    }
+
+    if has_effect(Effect::Filesystem) && !has_access(AccessKind::Filesystem) {
+        return Err(Error::Other(format!(
+            "tool `{}` declares a filesystem effect without filesystem access",
+            spec.name
+        )));
+    }
+    if has_effect(Effect::Process) && !has_access(AccessKind::Process) {
+        return Err(Error::Other(format!(
+            "tool `{}` declares a process effect without process access",
+            spec.name
+        )));
+    }
+    if has_effect(Effect::Browser) && !has_access(AccessKind::Browser) {
+        return Err(Error::Other(format!(
+            "tool `{}` declares a browser effect without browser access",
+            spec.name
+        )));
+    }
+    if has_effect(Effect::Network)
+        && !has_access(AccessKind::Network)
+        && !has_access(AccessKind::Connection)
+        && !has_access(AccessKind::Browser)
+        && !has_access(AccessKind::Provider)
+    {
+        return Err(Error::Other(format!(
+            "tool `{}` declares a network effect without network, browser, or provider access",
+            spec.name
+        )));
+    }
+    if has_effect(Effect::LocalSystem)
+        && !has_access(AccessKind::LocalSystem)
+        && !has_access(AccessKind::Process)
+    {
+        return Err(Error::Other(format!(
+            "tool `{}` declares a host-state effect without local-system access",
+            spec.name
+        )));
+    }
+    if has_effect(Effect::Write)
+        && !has_access(AccessKind::Filesystem)
+        && !has_access(AccessKind::LocalSystem)
+    {
+        if has_access(AccessKind::Network)
+            || has_access(AccessKind::Connection)
+            || has_access(AccessKind::Browser)
+        {
+            push_requirement(
+                &mut requirements,
+                AuthorityRequirement::operation("operation.mutate", &spec.name),
+            );
+        } else if !semantic_effects
+            .iter()
+            .any(|effect| matches!(effect.as_str(), "write_db" | "delete"))
+        {
+            return Err(Error::Other(format!(
+                "tool `{}` declares a write effect without a typed write resource",
+                spec.name
+            )));
+        }
+    }
+
+    for effect in semantic_effects {
+        match effect.as_str() {
+            "pure" | "read" | "human_visible" => {}
+            "model" => push_declared_resource_requirements(
+                &mut requirements,
+                subjects,
+                "model.invoke",
+                ResourceKind::Provider,
+            ),
+            "network" => push_declared_resource_requirements(
+                &mut requirements,
+                subjects,
+                "network.fetch",
+                ResourceKind::Network,
+            ),
+            "write_file" => {
+                if !requirements
+                    .iter()
+                    .any(|req| req.action.0 == "workspace.write")
+                {
+                    return Err(Error::Other(format!(
+                        "tool `{}` declares `write_file` without a filesystem write resource",
+                        spec.name
+                    )));
+                }
+            }
+            "write_db" => {
+                let datasource_subjects: Vec<&str> = subjects
+                    .iter()
+                    .filter_map(|subject| subject.strip_prefix("datasource:"))
+                    .collect();
+                if datasource_subjects.is_empty() {
+                    return Err(Error::Other(format!(
+                        "tool `{}` declares `write_db` without a `datasource:` subject",
+                        spec.name
+                    )));
+                }
+                for subject in datasource_subjects {
+                    push_requirement(
+                        &mut requirements,
+                        AuthorityRequirement::new(
+                            "flow.write_db",
+                            ResourceRef::named(ResourceKind::Datasource, subject),
+                        ),
+                    );
+                }
+            }
+            "send_external" => {
+                push_declared_resource_requirements(
+                    &mut requirements,
+                    subjects,
+                    "network.fetch",
+                    ResourceKind::Network,
+                );
+                push_requirement(
+                    &mut requirements,
+                    AuthorityRequirement::operation("flow.send_external", &spec.name),
+                );
+            }
+            "delete" => push_requirement(
+                &mut requirements,
+                AuthorityRequirement::operation("flow.delete", &spec.name),
+            ),
+            "money" => push_requirement(
+                &mut requirements,
+                AuthorityRequirement::operation("flow.money", &spec.name),
+            ),
+            "calendar" => push_requirement(
+                &mut requirements,
+                AuthorityRequirement::operation("flow.calendar", &spec.name),
+            ),
+            unknown => {
+                return Err(Error::Other(format!(
+                    "tool `{}` declares unknown semantic authority `{unknown}`",
+                    spec.name
+                )));
+            }
+        }
+    }
+
+    Ok(requirements)
 }
 
 /// The dispatcher: runs pre-tool hooks, enforces the authorization policy + permission rules +
@@ -1176,10 +2203,11 @@ pub struct Executor {
     approver: Mutex<Arc<dyn Approver>>,
     ctx: ToolContext,
     hooks: Vec<Arc<dyn PreToolHook>>,
-    /// The authorization floor. `None` disables the policy layer (permission rules only).
-    policy: Option<AuthorizationPolicy>,
-    /// The resolved identity the policy evaluates against — a shared cell (see [`IdentityCell`])
-    /// so per-request surfaces can swap it between turns and spawners can inherit the live value.
+    /// The mandatory authorization floor. Approval and permission rules may narrow it, never
+    /// disable it.
+    policy: AuthorizationPolicy,
+    /// The immutable assembly-time identity. Engine-driven turns override it only through their
+    /// lexical [`RuntimeTurnContext`], never by mutating this executor.
     identity: IdentityCell,
     /// Depth of the active "pre-approved plan" scope. `>0` means the ops being dispatched belong to a
     /// plan the user already approved as a whole, so the per-op approval gate is skipped (deny rules
@@ -1325,11 +2353,33 @@ impl Executor {
         }
     }
 
+    /// Construct under the documented local single-user authorization profile.
+    ///
+    /// This convenience door still installs a mandatory policy floor; it never disables
+    /// authorization. Multi-user and service surfaces should resolve their caller and use
+    /// [`new_with_authorization`](Self::new_with_authorization) instead.
     pub fn new(
         registry: ToolRegistry,
         perms: PermissionManager,
         approver: Arc<dyn Approver>,
         ctx: ToolContext,
+    ) -> Self {
+        Self::new_with_authorization(
+            registry,
+            perms,
+            approver,
+            ctx,
+            ExecutionAuthorization::local(),
+        )
+    }
+
+    /// Construct with an explicit mandatory authorization floor and identity profile.
+    pub fn new_with_authorization(
+        registry: ToolRegistry,
+        perms: PermissionManager,
+        approver: Arc<dyn Approver>,
+        ctx: ToolContext,
+        authorization: ExecutionAuthorization,
     ) -> Self {
         Self {
             registry,
@@ -1337,8 +2387,8 @@ impl Executor {
             approver: Mutex::new(approver),
             ctx,
             hooks: Vec::new(),
-            policy: None,
-            identity: IdentityCell::local(),
+            policy: authorization.policy,
+            identity: authorization.identity,
             plan_scope: AtomicU32::new(0),
             destructive_scope: Mutex::new(Vec::new()),
             trust_all: AtomicBool::new(false),
@@ -1437,10 +2487,10 @@ impl Executor {
     /// Receipt owners bind this byte string at approval and require an exact match at execution;
     /// dispatch still re-evaluates every policy and permission rule afterward.
     pub fn approval_context(&self) -> String {
-        let (caller, trust) = self.identity.get();
+        let identity = self.effective_identity();
         serde_json::to_string(&json!({
-            "caller": caller,
-            "trust": trust,
+            "caller": identity.caller(),
+            "trust": identity.trust(),
             "policy": self.policy,
             "allow_rules": self.perms.lock().unwrap().allow_rules(),
             "capability_scope": self.active_cap_scope(),
@@ -1541,40 +2591,63 @@ impl Executor {
         self.approver.lock().unwrap().clone()
     }
 
-    /// Enable the authorization-policy floor: every tool call's effects are evaluated against
-    /// `policy` (default-deny) before the permission rules run.
+    /// Replace the mandatory authorization-policy floor. Every tool call's effects are evaluated
+    /// against it (default-deny) before the permission rules run.
     pub fn with_policy(mut self, policy: AuthorizationPolicy) -> Self {
-        self.policy = Some(policy);
+        self.policy = policy;
+        self
+    }
+
+    /// Replace the policy and fixed identity atomically.
+    pub fn with_authorization(
+        mut self,
+        policy: AuthorizationPolicy,
+        caller: Caller,
+        trust: Trust,
+    ) -> Self {
+        let authorization = ExecutionAuthorization::new(policy, caller, trust);
+        self.policy = authorization.policy;
+        self.identity = authorization.identity;
+        self
+    }
+
+    /// Replace the policy and shared immutable identity snapshot atomically.
+    pub fn with_authorization_cell(
+        mut self,
+        policy: AuthorizationPolicy,
+        identity: IdentityCell,
+    ) -> Self {
+        self.policy = policy;
+        self.identity = identity;
         self
     }
 
     /// Set the resolved caller + trust the policy evaluates against (default: the local
     /// single-user identity). Surfaces resolve this via `flux-auth` before constructing the agent.
-    /// Replaces the identity cell with a fresh, unshared one — to share a cell with a spawner,
-    /// use [`with_identity_cell`](Self::with_identity_cell).
+    /// Replaces the identity snapshot with a fresh, unshared one — to share the assembly-time
+    /// fallback with a spawner, use [`with_identity_cell`](Self::with_identity_cell).
     pub fn with_identity(mut self, caller: Caller, trust: Trust) -> Self {
         self.identity = IdentityCell::new(caller, trust);
         self
     }
 
-    /// Share an externally-owned identity cell (the surface keeps a handle and may swap the
-    /// identity between turns; the sub-agent spawner may hold the same cell so children inherit
-    /// the live value). See [`IdentityCell`] for the turn-serialization contract.
+    /// Share an externally-owned immutable identity snapshot with sibling assembly components.
     pub fn with_identity_cell(mut self, cell: IdentityCell) -> Self {
         self.identity = cell;
         self
     }
 
-    /// The shared identity handle (for surfaces that need to swap identity per request and for
-    /// wiring the same cell into spawners after construction).
+    /// The shared immutable assembly-time identity handle.
     pub fn identity(&self) -> IdentityCell {
         self.identity.clone()
     }
 
-    /// Swap the identity on the shared cell — a per-request surface calls this between turns,
-    /// under its turn serialization (see [`IdentityCell::set`]).
-    pub fn set_identity(&self, caller: Caller, trust: Trust) {
-        self.identity.set(caller, trust);
+    /// The identity effective in the current lexical turn, or the immutable assembly-time default
+    /// when no turn scope is active.
+    pub fn effective_identity(&self) -> TurnIdentity {
+        self.ctx
+            .turn_identity()
+            .unwrap_or_else(|| self.identity.snapshot())
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -1710,39 +2783,53 @@ impl Executor {
         };
         let intents = tool.intents(&params);
 
-        // 1. Authorization-policy floor (if configured): default-deny on any ungranted effect. A
+        let requirements = match tool.authority_requirements(&params, &subjects) {
+            Ok(requirements) => requirements,
+            Err(err) => {
+                return self.finish_dispatch(
+                    name,
+                    started,
+                    approval_wait,
+                    None,
+                    ToolResult::error(format!(
+                        "`{name}` denied by invalid authority contract: {err}"
+                    )),
+                    true,
+                );
+            }
+        };
+
+        // 1. Mandatory authorization-policy floor: default-deny on any ungranted requirement. A
         //    `Deny` short-circuits; an `ApprovalRequired` (e.g. a grant marked `requires_approval`,
         //    like the default `process.exec`) forces the approval gate below even if a permissive
         //    allow-rule would otherwise satisfy it — the policy is the floor, rules can't widen it.
         let mut policy_requires_approval = false;
-        if let Some(policy) = &self.policy {
-            // Snapshot once per dispatch: the cell may be swapped between turns (never mid-turn,
-            // per the IdentityCell contract), and no lock is held across evaluation.
-            let (caller, trust) = self.identity.get();
-            for (action, resource) in effect_requests(&spec, &subjects) {
-                let req = PolicyRequest {
-                    caller: &caller,
-                    trust: &trust,
-                    action: &action,
-                    resource: &resource,
-                };
-                match evaluate(policy, &req).decision {
-                    Decision::Deny => {
-                        return self.finish_dispatch(
-                            name,
-                            started,
-                            approval_wait,
-                            None,
-                            ToolResult::error(format!(
-                                "`{name}` denied by policy ({} on {:?})",
-                                action.0, resource.kind
-                            )),
-                            true,
-                        );
-                    }
-                    Decision::ApprovalRequired => policy_requires_approval = true,
-                    Decision::Allow => {}
+        // Snapshot once per dispatch from the immutable lexical turn identity. The engine installs
+        // it only after acquiring its single-active-turn gate.
+        let identity = self.effective_identity();
+        for requirement in &requirements {
+            let req = PolicyRequest {
+                caller: identity.caller(),
+                trust: identity.trust(),
+                action: &requirement.action,
+                resource: &requirement.resource,
+            };
+            match evaluate(&self.policy, &req).decision {
+                Decision::Deny => {
+                    return self.finish_dispatch(
+                        name,
+                        started,
+                        approval_wait,
+                        None,
+                        ToolResult::error(format!(
+                            "`{name}` denied by policy ({} on {:?})",
+                            requirement.action.0, requirement.resource.kind
+                        )),
+                        true,
+                    );
                 }
+                Decision::ApprovalRequired => policy_requires_approval = true,
+                Decision::Allow => {}
             }
         }
 
@@ -1764,7 +2851,11 @@ impl Executor {
         let mut observations = vec![Observation::new(
             "tool_call",
             Phase::Turn,
-            json!({ "tool": name, "subjects": subjects }),
+            json!({
+                "tool": name,
+                "subjects": subjects,
+                "caller": identity.caller().principal.id.as_str(),
+            }),
         )];
         if intents.is_destructive() {
             observations.push(Observation::new(
@@ -1970,11 +3061,44 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_policy::{CallerKind, Principal, TrustKind, TrustLevel};
     use flux_system::Workspace;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_supervisor_aborts_and_reaps_only_after_its_grace() {
+        let supervisor = Arc::new(SpawnTaskSupervisor::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let handle = supervisor.spawn(async move {
+            let _drop = DropFlag(task_dropped);
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        entered_rx.await.unwrap();
+        drop(handle);
+
+        assert!(!dropped.load(Ordering::SeqCst));
+        let graceful = supervisor
+            .shutdown(std::time::Duration::from_millis(20))
+            .await;
+
+        assert!(!graceful, "the cancellation-insensitive task needed abort");
+        assert!(dropped.load(Ordering::SeqCst), "abort must reap task state");
+        assert!(supervisor.is_idle());
+    }
 
     struct DelayedAllowApprover;
 
@@ -2282,6 +3406,7 @@ mod tests {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("rm", "rm", json!({"type": "object"}))
                 .with_effects(vec![Effect::Process])
+                .with_access(vec![AccessKind::Process])
         }
         fn intents(&self, _p: &Value) -> IntentSet {
             let mut s = IntentSet::new();
@@ -2386,7 +3511,8 @@ mod tests {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let write_tool = crate::tool_fn(
             ToolSpec::read_only("cwrite", "mutates", json!({"type": "object"}))
-                .with_effects(vec![Effect::Write]),
+                .with_effects(vec![Effect::Write, Effect::Filesystem])
+                .with_access(vec![AccessKind::Filesystem]),
             |_params: Value| async move { Ok(Value::String("wrote".to_string())) },
         );
         let ex = cache_executor(vec![counting_read_tool(count.clone()), write_tool]);
@@ -3039,6 +4165,7 @@ mod tests {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("danger", "destructive", json!({"type": "object"}))
                 .with_effects(vec![Effect::Process])
+                .with_access(vec![AccessKind::Process])
                 .with_risk(Risk::High)
         }
         fn intents(&self, _p: &Value) -> IntentSet {
@@ -3113,6 +4240,7 @@ mod tests {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("save", "save", json!({"type": "object"}))
                 .with_effects(vec![Effect::Write, Effect::Filesystem])
+                .with_access(vec![AccessKind::Filesystem])
         }
         fn permission_subjects(&self, _p: &Value) -> Vec<String> {
             vec!["out.txt".into()]
@@ -3154,6 +4282,502 @@ mod tests {
         assert!(r.content.contains("denied by policy"), "got: {}", r.content);
     }
 
+    struct SemanticTool(&'static str);
+
+    #[async_trait]
+    impl Tool for SemanticTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                format!("semantic_{}", self.0),
+                "semantic authority probe",
+                json!({"type": "object"}),
+            )
+        }
+
+        fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+            if self.0 == "write_db" {
+                vec!["datasource:test.records".to_string()]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn semantic_effects(&self) -> Vec<String> {
+            vec![self.0.to_string()]
+        }
+
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("ran"))
+        }
+    }
+
+    fn semantic_policy(
+        action: &str,
+        resource: ResourceRef,
+        requires_approval: bool,
+    ) -> AuthorizationPolicy {
+        use flux_policy::{Grant, SubjectKind, SubjectRef};
+        let subject = || SubjectRef {
+            kind: SubjectKind::User,
+            id: "*".into(),
+        };
+        AuthorizationPolicy {
+            grants: vec![
+                // `send_external` also carries real network egress; grant that baseline so the
+                // semantic action itself is the decision under test.
+                Grant {
+                    subjects: vec![subject()],
+                    resources: vec![ResourceRef::any(ResourceKind::Network)],
+                    actions: vec![Action::from("network.fetch")],
+                    required_trust: TrustLevel::Untrusted,
+                    required_scopes: Vec::new(),
+                    requires_approval: false,
+                },
+                Grant {
+                    subjects: vec![subject()],
+                    resources: vec![resource],
+                    actions: vec![Action::from(action)],
+                    required_trust: TrustLevel::Untrusted,
+                    required_scopes: Vec::new(),
+                    requires_approval,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_write_db_delete_money_and_send_external_fail_closed_at_dispatch() {
+        let cases = [
+            ("write_db", "flow.write_db"),
+            ("delete", "flow.delete"),
+            ("money", "flow.money"),
+            ("send_external", "flow.send_external"),
+        ];
+        for (tag, action) in cases {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(SemanticTool(tag)));
+            let tool = format!("semantic_{tag}");
+            let executor = Executor::new(
+                registry,
+                PermissionManager::from_rules(std::slice::from_ref(&tool), &[]),
+                Arc::new(AllowApprover),
+                test_ctx(),
+            )
+            .with_policy(semantic_policy(
+                "unrelated.action",
+                ResourceRef::any(ResourceKind::Operation),
+                false,
+            ));
+
+            let result = executor.dispatch(&tool, json!({})).await;
+            assert!(
+                result.is_error && result.content.contains(action),
+                "{tag} must be denied on its exact semantic action: {}",
+                result.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_actions_can_require_approval_at_dispatch() {
+        let cases = [
+            (
+                "write_db",
+                "flow.write_db",
+                ResourceRef::any(ResourceKind::Datasource),
+            ),
+            (
+                "delete",
+                "flow.delete",
+                ResourceRef::any(ResourceKind::Operation),
+            ),
+            (
+                "money",
+                "flow.money",
+                ResourceRef::any(ResourceKind::Operation),
+            ),
+            (
+                "send_external",
+                "flow.send_external",
+                ResourceRef::any(ResourceKind::Operation),
+            ),
+        ];
+        for (tag, action, resource) in cases {
+            let approver = Arc::new(RecordingApprover {
+                asked: AtomicBool::new(false),
+                choice: || ApprovalChoice::Allow,
+            });
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(SemanticTool(tag)));
+            let tool = format!("semantic_{tag}");
+            let executor = Executor::new(
+                registry,
+                PermissionManager::from_rules(std::slice::from_ref(&tool), &[]),
+                approver.clone(),
+                test_ctx(),
+            )
+            .with_policy(semantic_policy(action, resource, true));
+
+            let result = executor.dispatch(&tool, json!({})).await;
+            assert!(!result.is_error, "{tag}: {}", result.content);
+            assert!(
+                approver.asked.load(Ordering::Relaxed),
+                "{tag} must force the approval gate"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_semantic_authority_is_rejected_at_registration() {
+        let mut registry = ToolRegistry::new();
+        let error = registry
+            .try_register_from("future-plugin", Arc::new(SemanticTool("future_unknown")))
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown semantic authority"));
+        assert!(registry.names().is_empty());
+    }
+
+    #[test]
+    fn duplicate_registration_rejects_identical_and_conflicting_specs_with_sources() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .try_register_from("builtins", Arc::new(EchoTool))
+            .unwrap();
+
+        let identical = registry
+            .try_register_from("plugin:/tmp/echo", Arc::new(EchoTool))
+            .unwrap_err()
+            .to_string();
+        assert!(identical.contains("duplicate operation `echo`"));
+        assert!(identical.contains("identical declaration"));
+        assert!(identical.contains("plugin:/tmp/echo"));
+        assert!(identical.contains("builtins"));
+
+        let conflicting = tool_fn(
+            ToolSpec::read_only(
+                "echo",
+                "different handler contract",
+                json!({"type": "object"}),
+            ),
+            |_params| async { Ok(Value::String("replacement".into())) },
+        );
+        let conflict = registry
+            .try_register_from("plugin:/tmp/conflict", conflicting.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(conflict.contains("conflicting declaration"));
+
+        let old = registry
+            .replace_from("explicit-test-override", conflicting)
+            .unwrap();
+        assert!(old.is_some());
+        assert_eq!(
+            registry.get("echo").unwrap().spec().description,
+            "different handler contract"
+        );
+        assert_eq!(registry.source("echo"), Some("explicit-test-override"));
+    }
+
+    #[test]
+    fn failed_pack_and_registry_composition_are_atomic() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .try_register_from("builtins", Arc::new(EchoTool))
+            .unwrap();
+        let fresh = tool_fn(
+            ToolSpec::read_only("fresh", "fresh", json!({"type": "object"})),
+            |_params| async { Ok(Value::Null) },
+        );
+
+        let error = registry
+            .try_register_all_from("plugin:alpha", vec![fresh, Arc::new(EchoTool)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("plugin:alpha"), "{error}");
+        assert_eq!(registry.names(), vec!["echo"]);
+        assert_eq!(registry.source("echo"), Some("builtins"));
+
+        let mut contributed = ToolRegistry::new();
+        contributed
+            .try_register_from(
+                "plugin:beta",
+                tool_fn(
+                    ToolSpec::read_only("another", "another", json!({"type": "object"})),
+                    |_params| async { Ok(Value::Null) },
+                ),
+            )
+            .unwrap();
+        contributed
+            .try_register_from("plugin:beta", Arc::new(EchoTool))
+            .unwrap();
+
+        let error = registry.try_extend(contributed).unwrap_err().to_string();
+        assert!(error.contains("plugin:beta"), "{error}");
+        assert!(registry.get("another").is_none());
+        assert_eq!(registry.names(), vec!["echo"]);
+    }
+
+    #[test]
+    fn typed_authority_catalog_matrix_is_resource_specific() {
+        let schema = json!({"type": "object"});
+        let pure = ToolSpec::read_only("pure", "pure", schema.clone());
+        assert!(authority_requirements_from_declaration(&pure, &[], &[])
+            .unwrap()
+            .is_empty());
+
+        let filesystem = ToolSpec::read_only("read", "read", schema.clone())
+            .with_access(vec![AccessKind::Filesystem]);
+        assert_eq!(
+            authority_requirements_from_declaration(&filesystem, &["src/lib.rs".into()], &[])
+                .unwrap(),
+            vec![AuthorityRequirement::workspace_read("src/lib.rs")]
+        );
+
+        let filesystem_write = ToolSpec::read_only("write", "write", schema.clone())
+            .with_effects(vec![Effect::Write])
+            .with_access(vec![AccessKind::Filesystem]);
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &filesystem_write,
+                &["src/lib.rs".into()],
+                &["write_file".into()],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::workspace_write("src/lib.rs")]
+        );
+
+        let datasource = ToolSpec::read_only("search", "search", schema.clone())
+            .with_access(vec![AccessKind::Datasource]);
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &datasource,
+                &["datasource:docs/page".into()],
+                &[],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::datasource_read("docs/page")]
+        );
+
+        let datasource_write = ToolSpec::read_only("index", "index", schema.clone())
+            .with_effects(vec![Effect::Write])
+            .with_access(vec![AccessKind::Datasource]);
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &datasource_write,
+                &["datasource:docs/page".into()],
+                &["write_db".into()],
+            )
+            .unwrap(),
+            vec![
+                AuthorityRequirement::new(
+                    "datasource.write",
+                    ResourceRef::named(ResourceKind::Datasource, "docs/page"),
+                ),
+                AuthorityRequirement::new(
+                    "flow.write_db",
+                    ResourceRef::named(ResourceKind::Datasource, "docs/page"),
+                ),
+            ]
+        );
+
+        let network = ToolSpec::read_only("fetch", "fetch", schema.clone())
+            .with_effects(vec![Effect::Network])
+            .with_access(vec![AccessKind::Network]);
+        assert_eq!(
+            authority_requirements_from_declaration(&network, &["https://example.com".into()], &[])
+                .unwrap(),
+            vec![AuthorityRequirement::network_fetch("https://example.com")]
+        );
+
+        let connection = ToolSpec::read_only("query", "query", schema.clone())
+            .with_effects(vec![Effect::Network])
+            .with_access(vec![AccessKind::Connection]);
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &connection,
+                &["tcp:db.example:5432".into()],
+                &[],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::connection_dial("tcp:db.example:5432")]
+        );
+
+        let process = ToolSpec::read_only("run", "run", schema.clone())
+            .with_effects(vec![Effect::Process])
+            .with_access(vec![AccessKind::Process]);
+        assert_eq!(
+            authority_requirements_from_declaration(&process, &["cargo:test".into()], &[]).unwrap(),
+            vec![AuthorityRequirement::process_exec("cargo:test")]
+        );
+
+        let secret = ToolSpec::read_only("credential", "credential", schema.clone())
+            .with_access(vec![AccessKind::Secret]);
+        assert_eq!(
+            authority_requirements_from_declaration(&secret, &["TAVILY_API_KEY".into()], &[])
+                .unwrap(),
+            vec![AuthorityRequirement::secret_read("TAVILY_API_KEY")]
+        );
+
+        let browser = ToolSpec::read_only("browse", "browse", schema.clone())
+            .with_effects(vec![Effect::Browser, Effect::Network])
+            .with_access(vec![AccessKind::Browser]);
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &browser,
+                &["https://example.com/app".into()],
+                &[],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::browser_navigate(
+                "https://example.com/app"
+            )]
+        );
+
+        let provider = ToolSpec::read_only("think", "think", schema.clone())
+            .with_effects(vec![Effect::Network])
+            .with_access(vec![AccessKind::Provider]);
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &provider,
+                &["anthropic/claude-sonnet".into()],
+                &[],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::provider_invoke(
+                "anthropic/claude-sonnet"
+            )]
+        );
+
+        let host = ToolSpec::read_only("settings", "settings", schema.clone())
+            .with_access(vec![AccessKind::LocalSystem]);
+        assert_eq!(
+            authority_requirements_from_declaration(&host, &[], &[]).unwrap(),
+            vec![AuthorityRequirement::host_read("settings")]
+        );
+
+        let host_write = ToolSpec::read_only("settings.save", "settings", schema.clone())
+            .with_effects(vec![Effect::LocalSystem])
+            .with_access(vec![AccessKind::LocalSystem]);
+        assert_eq!(
+            authority_requirements_from_declaration(&host_write, &[], &[]).unwrap(),
+            vec![AuthorityRequirement::host_write("settings.save")]
+        );
+
+        let auth =
+            ToolSpec::read_only("login", "login", schema).with_access(vec![AccessKind::Auth]);
+        assert_eq!(
+            authority_requirements_from_declaration(&auth, &[], &[]).unwrap(),
+            vec![AuthorityRequirement::host_read("auth")]
+        );
+    }
+
+    #[test]
+    fn typed_authority_concrete_subjects_are_normalized_by_resource_family() {
+        let spec = ToolSpec::read_only("mixed", "mixed", json!({"type": "object"}))
+            .with_effects(vec![Effect::Process, Effect::Network, Effect::Browser])
+            .with_access(vec![
+                AccessKind::Process,
+                AccessKind::Network,
+                AccessKind::Browser,
+                AccessKind::Provider,
+            ]);
+        let subjects = vec![
+            " concrete-target ".into(),
+            "datasource:web.page".into(),
+            "*".into(),
+            "concrete-target".into(),
+            "   ".into(),
+        ];
+
+        assert_eq!(
+            authority_requirements_from_declaration(&spec, &subjects, &[]).unwrap(),
+            vec![
+                AuthorityRequirement::process_exec("concrete-target"),
+                AuthorityRequirement::network_fetch("concrete-target"),
+                AuthorityRequirement::browser_navigate("concrete-target"),
+                AuthorityRequirement::provider_invoke("concrete-target"),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_network_and_model_authority_preserve_concrete_subjects() {
+        let spec = ToolSpec::read_only("semantic", "semantic", json!({"type": "object"}));
+
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &spec,
+                &["anthropic".into()],
+                &["model".into()],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::provider_invoke("anthropic")]
+        );
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &spec,
+                &["https://example.com/api".into()],
+                &["network".into()],
+            )
+            .unwrap(),
+            vec![AuthorityRequirement::network_fetch(
+                "https://example.com/api"
+            )]
+        );
+        assert_eq!(
+            authority_requirements_from_declaration(
+                &spec,
+                &["https://example.com/outbox".into()],
+                &["send_external".into()],
+            )
+            .unwrap(),
+            vec![
+                AuthorityRequirement::network_fetch("https://example.com/outbox"),
+                AuthorityRequirement::operation("flow.send_external", "semantic"),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_authority_resource_families_fall_back_to_wildcards_without_concrete_subjects() {
+        let schema = json!({"type": "object"});
+        let cases = [
+            (
+                ToolSpec::read_only("process", "process", schema.clone())
+                    .with_effects(vec![Effect::Process])
+                    .with_access(vec![AccessKind::Process]),
+                AuthorityRequirement::process_exec("*"),
+            ),
+            (
+                ToolSpec::read_only("network", "network", schema.clone())
+                    .with_effects(vec![Effect::Network])
+                    .with_access(vec![AccessKind::Network]),
+                AuthorityRequirement::network_fetch("*"),
+            ),
+            (
+                ToolSpec::read_only("browser", "browser", schema.clone())
+                    .with_effects(vec![Effect::Browser, Effect::Network])
+                    .with_access(vec![AccessKind::Browser]),
+                AuthorityRequirement::browser_navigate("*"),
+            ),
+            (
+                ToolSpec::read_only("provider", "provider", schema)
+                    .with_effects(vec![Effect::Network])
+                    .with_access(vec![AccessKind::Provider]),
+                AuthorityRequirement::provider_invoke("*"),
+            ),
+        ];
+
+        for (spec, expected) in cases {
+            assert_eq!(
+                authority_requirements_from_declaration(&spec, &[], &[]).unwrap(),
+                vec![expected],
+                "{} must conservatively request its whole resource family",
+                spec.name
+            );
+        }
+    }
+
     /// A read-effect tool gated only by the policy floor (permissive rules, auto-approve).
     struct ReadishTool;
     #[async_trait]
@@ -3161,18 +4785,20 @@ mod tests {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("peek", "read", json!({"type": "object"}))
                 .with_effects(vec![Effect::Read])
+                .with_access(vec![AccessKind::Filesystem])
+        }
+        fn permission_subjects(&self, _p: &Value) -> Vec<String> {
+            vec!["input.txt".into()]
         }
         async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
             Ok(ToolResult::ok("read"))
         }
     }
 
-    /// D-69 invariant: on a SHARED executor, `set_identity` swaps the policy subject between
-    /// turns — a deny for caller B is not bypassed because caller A ran first (and A's grant is
-    /// not sticky once B's identity is set). This is the per-request server mode's envelope
-    /// guarantee, proven at the layer that enforces it.
+    /// A lexical turn identity governs policy and approval context without mutating the executor's
+    /// assembly-time fallback. Exiting the scope restores that fallback.
     #[tokio::test]
-    async fn set_identity_swaps_the_policy_subject_between_turns() {
+    async fn lexical_turn_identity_scopes_policy_subject_and_restores_default() {
         use flux_policy::{Grant, SubjectKind, SubjectRef};
         let ident = |id: &str| {
             (
@@ -3215,7 +4841,7 @@ mod tests {
             Arc::new(AllowApprover),
             test_ctx(),
         )
-        .with_policy(alice_only)
+        .with_policy(alice_only.clone())
         .with_identity(caller, trust);
 
         let r = ex.dispatch("peek", json!({})).await;
@@ -3226,16 +4852,43 @@ mod tests {
         );
 
         let (caller, trust) = ident("alice");
-        ex.set_identity(caller, trust);
-        let r = ex.dispatch("peek", json!({})).await;
+        let alice = TurnIdentity::new(caller, trust);
+        let r = scope_runtime_turn(
+            RuntimeTurnContext::new().with_identity(alice.clone()),
+            ex.dispatch("peek", json!({})),
+        )
+        .await;
         assert!(!r.is_error, "alice is granted reads: {}", r.content);
 
-        let (caller, trust) = ident("bob");
-        ex.set_identity(caller, trust);
+        let default_context: Value = serde_json::from_str(&ex.approval_context()).unwrap();
+        assert_eq!(default_context["caller"]["principal"]["id"], "bob");
         let r = ex.dispatch("peek", json!({})).await;
         assert!(
             r.is_error,
-            "alice's grant must not stick to bob's turn: {}",
+            "alice's lexical grant must not stick to the default caller: {}",
+            r.content
+        );
+
+        // A fresh one-shot runtime may have to cross `tokio::spawn`, whose task does not inherit
+        // Tokio task-locals. The pinned snapshot must govern policy too, not only what ToolContext
+        // reports to the operation itself.
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ReadishTool));
+        let mut pinned_ctx = test_ctx();
+        pinned_ctx.set_runtime_turn_context(RuntimeTurnContext::new().with_identity(alice));
+        let (caller, trust) = ident("bob");
+        let pinned = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["peek".into()], &[]),
+            Arc::new(AllowApprover),
+            pinned_ctx,
+        )
+        .with_policy(alice_only)
+        .with_identity(caller, trust);
+        let r = pinned.dispatch("peek", json!({})).await;
+        assert!(
+            !r.is_error,
+            "a task-boundary snapshot must retain alice's authorization: {}",
             r.content
         );
     }
@@ -3262,6 +4915,7 @@ mod tests {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("proc", "run", json!({"type": "object"}))
                 .with_effects(vec![Effect::Process])
+                .with_access(vec![AccessKind::Process])
         }
         async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
             Ok(ToolResult::ok("ran"))
@@ -3315,7 +4969,8 @@ mod tests {
     impl Tool for UnscopedWriteTool {
         fn spec(&self) -> ToolSpec {
             ToolSpec::read_only("blindwrite", "write", json!({"type": "object"}))
-                .with_effects(vec![Effect::Write])
+                .with_effects(vec![Effect::Write, Effect::Filesystem])
+                .with_access(vec![AccessKind::Filesystem])
         }
         async fn execute(&self, _c: &ToolContext, _p: Value) -> Result<ToolResult> {
             Ok(ToolResult::ok("wrote"))

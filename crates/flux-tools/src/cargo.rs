@@ -576,12 +576,26 @@ impl Tool for CargoFmtTool {
 }
 
 /// Register all cargo tools into a registry.
+pub fn try_register_cargo(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools cargo pack",
+        vec![
+            Arc::new(CargoCheckTool) as Arc<dyn Tool>,
+            Arc::new(CargoBuildTool),
+            Arc::new(CargoTestTool),
+            Arc::new(CargoClippyTool),
+            Arc::new(CargoFmtTool),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_cargo`] and propagate the source-aware error.
 pub fn register_cargo(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(CargoCheckTool));
-    registry.register(Arc::new(CargoBuildTool));
-    registry.register(Arc::new(CargoTestTool));
-    registry.register(Arc::new(CargoClippyTool));
-    registry.register(Arc::new(CargoFmtTool));
+    try_register_cargo(registry).expect("flux-tools cargo pack registration failed");
 }
 
 #[cfg(test)]

@@ -11,15 +11,30 @@ use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{Idempotency, Risk, ToolSpec};
 
 /// Register deterministic list transform ops into the cognition group.
+pub fn try_register_transforms(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools deterministic transform pack",
+        vec![
+            Arc::new(MapTool) as Arc<dyn Tool>,
+            Arc::new(FilterTool),
+            Arc::new(DedupeTool),
+            Arc::new(SortTool),
+            Arc::new(FlattenTool),
+            Arc::new(SkipTool),
+            Arc::new(JoinTool),
+            Arc::new(SplitTool),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_transforms`].
 pub fn register_transforms(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(MapTool));
-    registry.register(Arc::new(FilterTool));
-    registry.register(Arc::new(DedupeTool));
-    registry.register(Arc::new(SortTool));
-    registry.register(Arc::new(FlattenTool));
-    registry.register(Arc::new(SkipTool));
-    registry.register(Arc::new(JoinTool));
-    registry.register(Arc::new(SplitTool));
+    try_register_transforms(registry)
+        .expect("flux-tools deterministic transform pack registration failed");
 }
 
 fn pure_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {

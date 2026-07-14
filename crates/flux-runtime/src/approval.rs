@@ -118,7 +118,7 @@ mod tests {
     use super::*;
     use crate::{Tool, ToolContext, ToolResult};
     use flux_core::Result as FluxResult;
-    use flux_spec::ToolSpec;
+    use flux_spec::{AccessKind, ToolSpec};
     use serde_json::{json, Value};
 
     struct Labeled(&'static str, Vec<Effect>, Risk);
@@ -126,9 +126,14 @@ mod tests {
     #[async_trait]
     impl Tool for Labeled {
         fn spec(&self) -> ToolSpec {
-            ToolSpec::read_only(self.0, "t", json!({"type": "object"}))
+            let spec = ToolSpec::read_only(self.0, "t", json!({"type": "object"}))
                 .with_effects(self.1.clone())
-                .with_risk(self.2)
+                .with_risk(self.2);
+            if self.1.contains(&Effect::Write) {
+                spec.with_access(vec![AccessKind::Filesystem])
+            } else {
+                spec
+            }
         }
 
         async fn execute(&self, _ctx: &ToolContext, _p: Value) -> FluxResult<ToolResult> {

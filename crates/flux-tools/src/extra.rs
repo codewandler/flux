@@ -1,17 +1,15 @@
-//! Extra built-in tools: file_stat, path_exists, sqlite_query, web.search, home_dir, now, cwd,
-//! sys_info.
+//! Extra built-in tools: file_stat, path_exists, sqlite_query, home_dir, now, cwd, sys_info.
 //!
 //! - `file_stat`    — file metadata (size, line count, mtime, mode). Risk: Low.
 //! - `path_exists`  — pure filesystem probe. Risk: Low.
 //! - `sqlite_query` — read-only SQLite query (no INSERT/UPDATE/DELETE/DROP/ALTER). Risk: Low.
-//! - `web.search`   — Tavily web search API. Risk: Low, goes through guard_url.
 //! - `home_dir`     — the user's home directory. Risk: Low.
 //! - `now`          — current wall-clock time (unix seconds + UTC). Replaces `date`. Risk: Low.
 //! - `cwd`          — the workspace root path. Replaces `pwd`. Risk: Low.
 //! - `sys_info`     — OS / arch / host metadata. Replaces `uname`. Risk: Low.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -357,171 +355,6 @@ impl Tool for SqliteQueryTool {
 }
 
 // ---------------------------------------------------------------------------
-// web.search (Tavily)
-// ---------------------------------------------------------------------------
-
-pub struct WebSearchTool;
-
-/// Arguments for the `web.search` op.
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct WebSearchInput {
-    /// Search query.
-    query: String,
-    /// Max results (default 5, max 10).
-    #[serde(default)]
-    max_results: Option<u64>,
-    /// Tavily API key (overrides TAVILY_API_KEY env var).
-    #[serde(default)]
-    api_key: Option<String>,
-}
-
-#[async_trait]
-impl Tool for WebSearchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "web.search".into(),
-            description: "Search the web via Tavily and return a ranked list of results \
-                          (title, URL, snippet, score). Requires the environment variable \
-                          `TAVILY_API_KEY` (or pass it as `api_key`). Optional `max_results` \
-                          (default 5, max 10). Use this when you need to find documentation, \
-                          current information, or a URL you don't already know."
-                .into(),
-            input_schema: tool_input_schema::<WebSearchInput>(),
-            output_schema: None,
-            effects: vec![Effect::Network],
-            risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
-            access: vec![AccessKind::Network],
-            group: None,
-        }
-    }
-
-    fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        let q = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("web.search");
-        vec![format!("web.search:{q}")]
-    }
-
-    fn intents(&self, params: &Value) -> IntentSet {
-        let mut set = IntentSet::new();
-        let q = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        set.push(Intent {
-            behavior: IntentBehavior::NetworkFetch,
-            target: IntentTarget::Url {
-                url: format!("https://api.tavily.com/search?q={q}"),
-            },
-            role: IntentRole::ReadTarget,
-            certainty: IntentCertainty::Certain,
-        });
-        set
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let query = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("web.search: required param `query` missing".into()))?;
-        let max_results = params
-            .get("max_results")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5)
-            .min(10) as usize;
-        let api_key = params
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .or_else(|| std::env::var("TAVILY_API_KEY").ok())
-            .ok_or_else(|| {
-                Error::Other(
-                    "web.search: TAVILY_API_KEY env var not set and no `api_key` param provided"
-                        .to_string(),
-                )
-            })?;
-
-        // Guard the URL through flux_system's net guard.
-        let endpoint = "https://api.tavily.com/search";
-        flux_system::net::guard_url(endpoint, false)
-            .map_err(|e| Error::Other(format!("web.search: URL guard rejected endpoint: {e}")))?;
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Other(format!("web.search: failed to build HTTP client: {e}")))?;
-
-        let body = json!({
-            "api_key": api_key,
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "basic",
-            "include_answer": false,
-            "include_raw_content": false
-        });
-
-        let resp = client
-            .post(endpoint)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("web.search: HTTP request failed: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Ok(ToolResult::error(format!(
-                "web.search: Tavily returned HTTP {status}: {text}"
-            )));
-        }
-
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::Other(format!("web.search: failed to parse response: {e}")))?;
-
-        let results = json
-            .get("results")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if results.is_empty() {
-            return Ok(ToolResult::ok("no results".to_string()));
-        }
-
-        // Build a clean text view and a JSON canonical value.
-        let mut view_lines = Vec::new();
-        let mut canonical = Vec::new();
-        for (i, r) in results.iter().enumerate() {
-            let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let snippet = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            view_lines.push(format!(
-                "[{}] {} ({:.2})\n    {}\n    {}",
-                i + 1,
-                title,
-                score,
-                url,
-                snippet
-            ));
-            canonical.push(json!({
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "score": score
-            }));
-        }
-
-        let canonical_str = Value::Array(canonical).to_string();
-        let view_str = view_lines.join("\n\n");
-        Ok(ToolResult::ok_view(canonical_str, view_str))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // home_dir
 // ---------------------------------------------------------------------------
 
@@ -719,15 +552,29 @@ impl Tool for SysInfoTool {
 }
 
 /// Register all extra tools into a registry.
+pub fn try_register_extra(registry: &mut ToolRegistry) -> Result<()> {
+    registry.try_register_all_from(
+        "flux-tools ambient and filesystem metadata pack",
+        vec![
+            Arc::new(FileStatTool) as Arc<dyn Tool>,
+            Arc::new(PathExistsTool),
+            Arc::new(SqliteQueryTool),
+            Arc::new(HomeDirTool),
+            Arc::new(NowTool),
+            Arc::new(CwdTool),
+            Arc::new(SysInfoTool),
+        ],
+    )
+}
+
+/// Compatibility wrapper for pre-fallible pack installers.
+///
+/// # Deprecated
+///
+/// Production assembly should call [`try_register_extra`].
 pub fn register_extra(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(FileStatTool));
-    registry.register(Arc::new(PathExistsTool));
-    registry.register(Arc::new(SqliteQueryTool));
-    registry.register(Arc::new(WebSearchTool));
-    registry.register(Arc::new(HomeDirTool));
-    registry.register(Arc::new(NowTool));
-    registry.register(Arc::new(CwdTool));
-    registry.register(Arc::new(SysInfoTool));
+    try_register_extra(registry)
+        .expect("flux-tools ambient and filesystem metadata pack registration failed");
 }
 
 #[cfg(test)]
