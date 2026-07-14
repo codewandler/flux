@@ -268,7 +268,7 @@ capability (the L0 types leave the door open, but v1 ships the native trait + pr
 
 Accepted implementation stories — each remains independently testable and committable:
 
-1. **D-168 — L0 live-datasource types** — add `Row`, `Page<T>`, `PageRequest`, `Filters`, `Reference`,
+1. **D-168 — L0 live-datasource types** ✅ — add `Row`, `Page<T>`, `PageRequest`, `Filters`, `Reference`,
    `LiveSchema`/`LiveEntity`, `FilterKey`/`FilterType` to `flux-datasource` (pure data, serde),
    with round-trip tests.
 2. **D-169 — the `LiveDatasource` trait** — `async list`/`get` + `schema()` and closed

@@ -13,6 +13,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Pure contracts for async, paged systems of record. Kept separate from the local-index
+/// [`Record`] vocabulary because live backends do not ingest or own a snapshot in flux.
+pub mod live;
+
 /// Where a record came from: a plugin (or `"local"` for the host's own ingesters) and an optional
 /// configured instance (e.g. two GitLab endpoints).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -8,6 +8,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **D-168: live datasources now have a pure shared contract.** The namespaced L0 vocabulary covers
+  deterministic scalar filters, typed entity schemas, cursor pages, compact rows, and tagged weak
+  references without adding IO/runtime dependencies or changing the indexed-record wire shape.
 - **D-62: the async live-datasource seam now has an accepted, safety-complete implementation
   contract.** The design separates live systems of record from the synchronous local index and
   sequences pure types, an async trait, generic list/get projection, validation, exact typed

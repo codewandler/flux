@@ -2,7 +2,8 @@
 id: D-169
 title: Add the async LiveDatasource trait
 pillar: Agent
-status: backlog
+status: ready
+priority: 3
 epic: async-live-datasource-seam
 design: docs/designs/async-live-datasource-seam.md
 note: "D-62 phase 2; depends on D-168"
