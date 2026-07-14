@@ -110,9 +110,8 @@ mod tests {
         );
         assert!(!valid);
         assert!(
-            problems
-                .iter()
-                .any(|p| p.contains("state") && p.contains("must be one of")),
+            problems.iter().any(|p| p.contains("state")
+                && (p.contains("must be one of") || p.contains("expected one of"))),
             "{problems:?}"
         );
         let (valid, _, _) = validate(
@@ -342,21 +341,33 @@ mod tests {
         assert!(runtime_err.contains("`tag_name`"), "{runtime_err}");
     }
 
-    /// GL-008: unknown fields are clearly warned (the schema is open — handlers may read
-    /// undocumented aliases — so this is advisory, not a rejection).
+    /// C-74: a migrated closed handler rejects unknown fields during typed decoding. Flexible
+    /// families remain advisory until their own bounded migration defines every compatibility
+    /// alias explicitly.
     #[test]
-    fn preflight_warns_on_unknown_fields() {
+    fn typed_handlers_reject_unknown_fields() {
         let (valid, problems, warnings) = validate(
             "gitlab.issue.list",
             json!({ "project": "g/a", "stat": "opened" }),
         );
-        assert!(valid, "{problems:?}");
+        assert!(!valid);
         assert!(
-            warnings
+            problems
                 .iter()
-                .any(|w| w.contains("`stat`") && w.contains("not in the op schema")),
-            "{warnings:?}"
+                .any(|problem| problem.contains("stat") && problem.contains("unknown field")),
+            "{problems:?}"
         );
+        assert!(
+            warnings.is_empty(),
+            "typed decode is an error, not a warning"
+        );
+
+        let (valid, problems, warnings) = validate(
+            "gitlab.pipeline.list",
+            json!({ "project": "g/a", "stat": "success" }),
+        );
+        assert!(valid, "{problems:?}");
+        assert!(warnings.iter().any(|warning| warning.contains("`stat`")));
     }
 
     // ---- D-89: honest read defaults ----
@@ -572,6 +583,86 @@ mod tests {
         );
         assert_eq!(out[0]["iid"], 3);
         assert_eq!(host.contributed.borrow()[0].id, "group/app!3");
+    }
+
+    #[test]
+    fn typed_read_results_preserve_vendor_extensions_and_nulls() {
+        let cases = [
+            (
+                "gitlab.project.list",
+                json!({}),
+                "/projects?membership=true",
+                json!([{ "id": 1, "description": null, "vendor_project": { "tier": 7 } }]),
+            ),
+            (
+                "gitlab.project.show",
+                json!({ "project": "group/app" }),
+                "/projects/group%2Fapp",
+                json!({ "id": 1, "description": null, "vendor_project": [1, 2] }),
+            ),
+            (
+                "gitlab.mr.list",
+                json!({ "project": "group/app" }),
+                "/projects/group%2Fapp/merge_requests",
+                json!([{ "iid": 7, "merged_at": null, "vendor_mr": { "mergeability": "checking" } }]),
+            ),
+            (
+                "gitlab.mr.show",
+                json!({ "ref": "group/app!7" }),
+                "/projects/group%2Fapp/merge_requests/7",
+                json!({ "iid": 7, "merged_at": null, "vendor_mr": ["new-field"] }),
+            ),
+            (
+                "gitlab.issue.list",
+                json!({ "project": "group/app" }),
+                "/projects/group%2Fapp/issues",
+                json!([{ "iid": 3, "closed_at": null, "vendor_issue": { "severity": "S2" } }]),
+            ),
+            (
+                "gitlab.issue.show",
+                json!({ "ref": "group/app#3" }),
+                "/projects/group%2Fapp/issues/3",
+                json!({ "iid": 3, "closed_at": null, "vendor_issue": [true] }),
+            ),
+        ];
+
+        for (operation, input, request, vendor_result) in cases {
+            let mut host = base().with_http(request, vendor_result.clone());
+            let output = run(operation, input, &mut host);
+            assert_eq!(output, vendor_result, "{operation} changed GitLab's result");
+        }
+    }
+
+    #[test]
+    fn typed_read_aliases_normalize_before_preflight_and_execution() {
+        let mut host = base().with_http(
+            "/projects/group%2Fapp/merge_requests/7",
+            json!({ "iid": 7 }),
+        );
+        let output = run("gitlab.mr.show", json!({ "id": "group/app!7" }), &mut host);
+        assert_eq!(output["iid"], 7);
+
+        let mut host = base().with_http("/projects/group%2Fapp/issues/3", json!({ "iid": 3 }));
+        let output = run(
+            "gitlab.issue.show",
+            json!({ "path": "group/app", "issue_iid": 3 }),
+            &mut host,
+        );
+        assert_eq!(output["iid"], 3);
+    }
+
+    #[test]
+    fn typed_read_rejects_a_vendor_result_with_the_wrong_top_level_shape() {
+        let mut host = base().with_http(
+            "/projects?membership=true",
+            json!({ "projects": [{ "id": 1 }] }),
+        );
+        let error = manifest_builder()
+            .build()
+            .call("gitlab.project.list", json!({}), &mut host)
+            .unwrap_err();
+        assert!(error.contains("gitlab.project.list"), "{error}");
+        assert!(error.contains("expected a sequence"), "{error}");
     }
 
     // ---- auth test + index ----
@@ -2395,6 +2486,60 @@ mod tests {
         );
         assert_eq!(host.contributed.borrow().len(), 1);
         assert_eq!(host.contributed.borrow()[0].id, "group/app!7");
+    }
+
+    /// C-74 keystone contract: these bounded read families publish successful-result schemas.
+    /// Before their executable typed migration every operation used `operation_flexible`, leaving
+    /// `output_schema` absent even though flux relies on stable fields in each vendor object.
+    #[test]
+    fn bounded_read_families_publish_output_schemas() {
+        let manifest = manifest_builder().build().manifest();
+        for name in [
+            "gitlab.project.list",
+            "gitlab.project.show",
+            "gitlab.mr.list",
+            "gitlab.mr.show",
+            "gitlab.issue.list",
+            "gitlab.issue.show",
+        ] {
+            let operation = manifest
+                .operations
+                .iter()
+                .find(|operation| operation.name == name)
+                .unwrap_or_else(|| panic!("missing operation {name}"));
+            assert!(
+                operation.output_schema.is_some(),
+                "{name} must derive an output schema from its executable type"
+            );
+        }
+
+        let output = |name: &str| {
+            manifest
+                .operations
+                .iter()
+                .find(|operation| operation.name == name)
+                .and_then(|operation| operation.output_schema.as_ref())
+                .unwrap_or_else(|| panic!("missing output schema for {name}"))
+        };
+        let project_list = output("gitlab.project.list");
+        assert_eq!(project_list["type"], "array");
+        let project_item = &project_list["$defs"]["GitLabProjectSchema"];
+        assert_eq!(project_item["type"], "object");
+        assert!(project_item["properties"]["path_with_namespace"].is_object());
+        assert_eq!(project_item["additionalProperties"], true);
+
+        let mr_show = output("gitlab.mr.show");
+        let mr = &mr_show["$defs"]["GitLabMergeRequestSchema"];
+        assert_eq!(mr["type"], "object");
+        assert!(mr["properties"]["iid"].is_object());
+        assert!(mr["properties"]["source_branch"].is_object());
+        assert_eq!(mr["additionalProperties"], true);
+
+        let issue_show = output("gitlab.issue.show");
+        let issue = &issue_show["$defs"]["GitLabIssueSchema"];
+        assert_eq!(issue["type"], "object");
+        assert!(issue["properties"]["title"].is_object());
+        assert_eq!(issue["additionalProperties"], true);
     }
 }
 

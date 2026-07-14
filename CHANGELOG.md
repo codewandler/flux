@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **C-74: GitLab's project, merge-request, and issue read families now execute through typed
+  contracts.** Six list/show handlers decode aliases and defaults once, publish generated output
+  schemas for stable fields, reject wrong top-level result shapes, and preserve unknown vendor
+  fields plus explicit nulls in the existing raw array/object results.
 - **D-169: live systems of record have a guarded async backend contract.** Implementations receive
   the canonical tool context, declare exact network/connection resource families, and fail static
   validation on malformed domains, entities, filters, page bounds, or authority before surfacing.

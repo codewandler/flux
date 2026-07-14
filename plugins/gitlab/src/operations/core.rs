@@ -6,21 +6,47 @@ use super::*;
 // Reads: projects / merge requests / issues / pipelines (the original surface).
 // ---------------------------------------------------------------------------
 
-pub(crate) fn project_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let membership = input
-        .get("membership")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let search = flex_str(&input, "search")
-        .or_else(|| flex_str(&input, "query"))
+fn trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn decode_gitlab<T: serde::de::DeserializeOwned>(
+    value: Value,
+    operation: &str,
+) -> Result<T, String> {
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid GitLab response for `{operation}`: {error}"))
+}
+
+fn contribution_value<T: serde::Serialize>(value: &T) -> Result<Value, String> {
+    serde_json::to_value(value).map_err(|error| format!("encode GitLab contribution: {error}"))
+}
+
+pub(crate) fn project_list(
+    input: ProjectListInput,
+    host: &mut Host,
+) -> Result<ProjectListOutput, String> {
+    let ProjectListInput {
+        search,
+        query,
+        order_by,
+        sort,
+        limit,
+        per_page,
+        page,
+        membership,
+        contribute,
+    } = input;
+    let membership = membership.unwrap_or(true);
+    let search = trimmed(search)
+        .or_else(|| trimmed(query))
         .unwrap_or_default();
-    let order_by = flex_str(&input, "order_by").unwrap_or_else(|| "last_activity_at".into());
-    let sort = flex_str(&input, "sort").unwrap_or_else(|| "desc".into());
-    let limit = clamp(
-        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
-        20,
-        100,
-    );
+    let order_by = trimmed(order_by).unwrap_or_else(|| "last_activity_at".into());
+    let sort = trimmed(sort).unwrap_or_else(|| "desc".into());
+    let limit = clamp(limit.or(per_page).unwrap_or(0), 20, 100);
     let pairs = [
         (
             "membership",
@@ -36,38 +62,57 @@ pub(crate) fn project_list(input: Value, host: &mut Host) -> Result<Value, Strin
         ("per_page", limit.to_string()),
         (
             "page",
-            flex_i64(&input, &["page"])
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            page.map(|page| page.to_string()).unwrap_or_default(),
         ),
     ];
-    let projects = gl_get(host, &format!("/projects{}", qs(&pairs)))?;
-    if wants_contribution(&input) {
-        contribute_projects(host, &projects);
+    let projects: ProjectListOutput = decode_gitlab(
+        gl_get(host, &format!("/projects{}", qs(&pairs)))?,
+        "gitlab.project.list",
+    )?;
+    if contribute.unwrap_or(false) {
+        contribute_projects(host, &contribution_value(&projects)?);
     }
     Ok(projects)
 }
 
-pub(crate) fn project_show(input: Value, host: &mut Host) -> Result<Value, String> {
-    let project = req_project(&input)?;
-    gl_get(host, &format!("/projects/{}", enc(&project)))
+pub(crate) fn project_show(
+    input: ProjectShowInput,
+    host: &mut Host,
+) -> Result<ProjectShowOutput, String> {
+    let project = input.project.trim();
+    decode_gitlab(
+        gl_get(host, &format!("/projects/{}", enc(project)))?,
+        "gitlab.project.show",
+    )
 }
 
-pub(crate) fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let project = req_project(&input)?;
-    let state = flex_str(&input, "state").unwrap_or_else(|| "opened".into());
-    let search = flex_str(&input, "search")
-        .or_else(|| flex_str(&input, "query"))
+pub(crate) fn mr_list(input: MrListInput, host: &mut Host) -> Result<MrListOutput, String> {
+    let MrListInput {
+        project,
+        state,
+        search,
+        query,
+        order_by,
+        sort,
+        limit,
+        per_page,
+        page,
+        source_branch,
+        target_branch,
+        contribute,
+    } = input;
+    let project = project.trim().to_string();
+    let state = state
+        .map(|state| state.as_str().to_string())
+        .unwrap_or_else(|| "opened".into());
+    let search = trimmed(search)
+        .or_else(|| trimmed(query))
         .unwrap_or_default();
-    let order_by = flex_str(&input, "order_by").unwrap_or_else(|| "updated_at".into());
-    let sort = flex_str(&input, "sort").unwrap_or_else(|| "desc".into());
-    let limit = clamp(
-        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
-        20,
-        100,
-    );
-    let source_branch = flex_str(&input, "source_branch").unwrap_or_default();
-    let target_branch = flex_str(&input, "target_branch").unwrap_or_default();
+    let order_by = trimmed(order_by).unwrap_or_else(|| "updated_at".into());
+    let sort = trimmed(sort).unwrap_or_else(|| "desc".into());
+    let limit = clamp(limit.or(per_page).unwrap_or(0), 20, 100);
+    let source_branch = trimmed(source_branch).unwrap_or_default();
+    let target_branch = trimmed(target_branch).unwrap_or_default();
     let pairs = [
         ("state", state),
         ("search", search),
@@ -76,44 +121,67 @@ pub(crate) fn mr_list(input: Value, host: &mut Host) -> Result<Value, String> {
         ("per_page", limit.to_string()),
         (
             "page",
-            flex_i64(&input, &["page"])
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            page.map(|page| page.to_string()).unwrap_or_default(),
         ),
         ("source_branch", source_branch),
         ("target_branch", target_branch),
     ];
-    let mrs = gl_get(
-        host,
-        &format!("/projects/{}/merge_requests{}", enc(&project), qs(&pairs)),
+    let mrs: MrListOutput = decode_gitlab(
+        gl_get(
+            host,
+            &format!("/projects/{}/merge_requests{}", enc(&project), qs(&pairs)),
+        )?,
+        "gitlab.mr.list",
     )?;
-    if wants_contribution(&input) {
-        contribute_list(host, &mrs, "gitlab.merge_request", &project);
+    if contribute.unwrap_or(false) {
+        contribute_list(
+            host,
+            &contribution_value(&mrs)?,
+            "gitlab.merge_request",
+            &project,
+        );
     }
     Ok(mrs)
 }
 
-pub(crate) fn mr_show(input: Value, host: &mut Host) -> Result<Value, String> {
-    let (project, iid) = mr_address(&input)?;
-    gl_get(
-        host,
-        &format!("/projects/{}/merge_requests/{iid}", enc(&project)),
+pub(crate) fn mr_show(input: MrShowInput, host: &mut Host) -> Result<MrShowOutput, String> {
+    let (project, iid) =
+        resolve_mr_address(input.r#ref.as_deref(), input.project.as_deref(), input.iid)?;
+    decode_gitlab(
+        gl_get(
+            host,
+            &format!("/projects/{}/merge_requests/{iid}", enc(&project)),
+        )?,
+        "gitlab.mr.show",
     )
 }
 
-pub(crate) fn issue_list(input: Value, host: &mut Host) -> Result<Value, String> {
-    let project = req_project(&input)?;
-    let state = flex_str(&input, "state").unwrap_or_else(|| "opened".into());
-    let search = flex_str(&input, "search")
-        .or_else(|| flex_str(&input, "query"))
+pub(crate) fn issue_list(
+    input: IssueListInput,
+    host: &mut Host,
+) -> Result<IssueListOutput, String> {
+    let IssueListInput {
+        project,
+        state,
+        search,
+        query,
+        order_by,
+        sort,
+        limit,
+        per_page,
+        page,
+        contribute,
+    } = input;
+    let project = project.trim().to_string();
+    let state = state
+        .map(|state| state.as_str().to_string())
+        .unwrap_or_else(|| "opened".into());
+    let search = trimmed(search)
+        .or_else(|| trimmed(query))
         .unwrap_or_default();
-    let order_by = flex_str(&input, "order_by").unwrap_or_default();
-    let sort = flex_str(&input, "sort").unwrap_or_default();
-    let limit = clamp(
-        flex_i64(&input, &["limit", "per_page"]).unwrap_or(0),
-        20,
-        100,
-    );
+    let order_by = trimmed(order_by).unwrap_or_default();
+    let sort = trimmed(sort).unwrap_or_default();
+    let limit = clamp(limit.or(per_page).unwrap_or(0), 20, 100);
     let pairs = [
         ("state", state),
         ("search", search),
@@ -122,17 +190,23 @@ pub(crate) fn issue_list(input: Value, host: &mut Host) -> Result<Value, String>
         ("per_page", limit.to_string()),
         (
             "page",
-            flex_i64(&input, &["page"])
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            page.map(|page| page.to_string()).unwrap_or_default(),
         ),
     ];
-    let issues = gl_get(
-        host,
-        &format!("/projects/{}/issues{}", enc(&project), qs(&pairs)),
+    let issues: IssueListOutput = decode_gitlab(
+        gl_get(
+            host,
+            &format!("/projects/{}/issues{}", enc(&project), qs(&pairs)),
+        )?,
+        "gitlab.issue.list",
     )?;
-    if wants_contribution(&input) {
-        contribute_list(host, &issues, "gitlab.issue", &project);
+    if contribute.unwrap_or(false) {
+        contribute_list(
+            host,
+            &contribution_value(&issues)?,
+            "gitlab.issue",
+            &project,
+        );
     }
     Ok(issues)
 }
@@ -675,9 +749,16 @@ pub(crate) fn mr_merge(input: Value, host: &mut Host) -> Result<Value, String> {
     )
 }
 
-pub(crate) fn issue_show(input: Value, host: &mut Host) -> Result<Value, String> {
-    let (project, iid) = issue_address(&input)?;
-    gl_get(host, &format!("/projects/{}/issues/{iid}", enc(&project)))
+pub(crate) fn issue_show(
+    input: IssueShowInput,
+    host: &mut Host,
+) -> Result<IssueShowOutput, String> {
+    let (project, iid) =
+        resolve_issue_address(input.r#ref.as_deref(), input.project.as_deref(), input.iid)?;
+    decode_gitlab(
+        gl_get(host, &format!("/projects/{}/issues/{iid}", enc(&project)))?,
+        "gitlab.issue.show",
+    )
 }
 
 pub(crate) fn issue_create(input: Value, host: &mut Host) -> Result<Value, String> {

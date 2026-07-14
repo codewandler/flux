@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **GitLab project, merge-request, and issue reads now validate their complete input before making
+  a request and advertise their stable result fields.** Existing raw GitLab results, including new
+  vendor fields and explicit nulls, remain unchanged.
+
 ### Fixed
 
 - **Rust SDK installation no longer stops at the runtime configuration dependency.** The config

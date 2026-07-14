@@ -52,35 +52,35 @@ pub(super) fn manifest_builder() -> PluginBuilder {
         ))
         .datasource(ds("gitlab.issues", "gitlab.issue", "GitLab issues."))
         // ---- reads: projects / merge requests / issues / pipelines ----
-        .operation_flexible(
+        .operation_typed::<ProjectListInput, ProjectListOutput>(
             read_op_typed::<ProjectListInput>(
                 "gitlab.project.list",
                 "List/search projects you are a MEMBER of by default (membership=true); pass membership=false to widen to every project the token can see.",
             ),
             project_list,
         )
-        .operation_flexible(
+        .operation_typed::<ProjectShowInput, ProjectShowOutput>(
             read_op_typed::<ProjectShowInput>(
                 "gitlab.project.show",
                 "Show one project by id or path.",
             ),
             project_show,
         )
-        .operation_flexible(
+        .operation_typed::<MrListInput, MrListOutput>(
             read_op_typed::<MrListInput>(
                 "gitlab.mr.list",
                 "List a project's merge requests (state: opened|closed|locked|merged|all). Defaults to state=opened — pass state=all to include closed/merged (index.build indexes all states).",
             ),
             mr_list,
         )
-        .operation_flexible(
+        .operation_typed::<MrShowInput, MrShowOutput>(
             read_op_typed::<MrShowInput>(
                 "gitlab.mr.show",
                 "Show one merge request by ref (PROJECT!IID) or project + iid.",
             ),
             mr_show,
         )
-        .operation_flexible(
+        .operation_typed::<IssueListInput, IssueListOutput>(
             read_op_typed::<IssueListInput>(
                 "gitlab.issue.list",
                 "List a project's issues (state: opened|closed|all). Defaults to state=opened — pass state=all to include closed issues (index.build indexes all states).",
@@ -157,7 +157,7 @@ pub(super) fn manifest_builder() -> PluginBuilder {
             mr_merge,
         )
         // ---- issues ----
-        .operation_flexible(
+        .operation_typed::<IssueShowInput, IssueShowOutput>(
             read_op_typed::<IssueShowInput>(
                 "gitlab.issue.show",
                 "Show one GitLab issue, including its Markdown description.",

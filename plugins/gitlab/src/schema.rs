@@ -1,26 +1,37 @@
 //! Schemars-derived input contracts for the GitLab operation catalog.
 
 use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 // ─── op input schemas (D-36) ───────────────────────────────────────────────
 // Each op's `input_schema` is schemars-derived (`host_kit::read_op_typed::<T>` /
 // `write_op_typed::<T>`) instead of a hand-written `so(json!{...}, json![...])` literal,
-// so the schema the model sees cannot drift. The structs are schema-only: handlers
-// keep their existing `flex_str`/`flex_i64`/`Value` extraction (D-34 precedent).
+// so the schema the model sees cannot drift. Most structs remain schema-only while their bounded
+// executable migrations are pending; C-74 makes the project/MR/issue list+show contracts live.
 // The enum/bound/typed-element constraints below are enforced by host-kit's shared
 // preflight in BOTH `--dry-run` and runtime dispatch (D-88), so a green dry-run can
 // no longer fail the same check at runtime.
 
 /// Issue state filter (GL-011).
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub(super) enum IssueStateFilter {
     Opened,
     Closed,
     All,
+}
+
+impl IssueStateFilter {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
 }
 
 /// Project/snippet visibility level (GL-011).
@@ -54,7 +65,7 @@ pub(super) enum VariableType {
 }
 
 /// Merge-request state filter (GL-038).
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub(super) enum MrStateFilter {
@@ -63,6 +74,18 @@ pub(super) enum MrStateFilter {
     Locked,
     Merged,
     All,
+}
+
+impl MrStateFilter {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Closed => "closed",
+            Self::Locked => "locked",
+            Self::Merged => "merged",
+            Self::All => "all",
+        }
+    }
 }
 
 /// CI job status scope entry (GL-033) — typed so a non-string or unknown entry is rejected
@@ -163,93 +186,193 @@ pub(super) struct PipelineVariable {
 }
 
 /// `gitlab.project.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProjectListInput {
-    search: Option<String>,
-    query: Option<String>,
-    order_by: Option<String>,
-    sort: Option<String>,
+    pub(crate) search: Option<String>,
+    pub(crate) query: Option<String>,
+    pub(crate) order_by: Option<String>,
+    pub(crate) sort: Option<String>,
     #[schemars(range(min = 1, max = 100))]
-    limit: Option<i64>,
+    pub(crate) limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
     #[schemars(range(min = 1, max = 100))]
-    per_page: Option<i64>,
+    pub(crate) per_page: Option<i64>,
     /// 1-based results page (GL-019) — walk a list beyond a capped first page.
     #[schemars(range(min = 1))]
-    page: Option<i64>,
-    membership: Option<bool>,
+    pub(crate) page: Option<i64>,
+    pub(crate) membership: Option<bool>,
     /// Feed the results into the local search index as `gitlab.project` records (GL-015). Off by
     /// default so a plain read is a pure read with no datasource side effects; use `index.build`
     /// (or pass `contribute=true`) to index deliberately.
-    contribute: Option<bool>,
+    pub(crate) contribute: Option<bool>,
 }
 
 /// `gitlab.project.show`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProjectShowInput {
-    project: String,
+    #[serde(alias = "project_id", alias = "path")]
+    pub(crate) project: String,
 }
 
 /// `gitlab.mr.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct MrListInput {
-    project: String,
-    state: Option<MrStateFilter>,
-    search: Option<String>,
-    query: Option<String>,
-    order_by: Option<String>,
-    sort: Option<String>,
+    #[serde(alias = "project_id", alias = "path")]
+    pub(crate) project: String,
+    pub(crate) state: Option<MrStateFilter>,
+    pub(crate) search: Option<String>,
+    pub(crate) query: Option<String>,
+    pub(crate) order_by: Option<String>,
+    pub(crate) sort: Option<String>,
     #[schemars(range(min = 1, max = 100))]
-    limit: Option<i64>,
+    pub(crate) limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
     #[schemars(range(min = 1, max = 100))]
-    per_page: Option<i64>,
+    pub(crate) per_page: Option<i64>,
     /// 1-based results page (GL-019) — walk a list beyond a capped first page.
     #[schemars(range(min = 1))]
-    page: Option<i64>,
-    source_branch: Option<String>,
-    target_branch: Option<String>,
+    pub(crate) page: Option<i64>,
+    pub(crate) source_branch: Option<String>,
+    pub(crate) target_branch: Option<String>,
     /// Feed the results into the local search index as `gitlab.merge_request` records (GL-015).
     /// Off by default so a plain read has no datasource side effects; `index.build` indexes
     /// deliberately.
-    contribute: Option<bool>,
+    pub(crate) contribute: Option<bool>,
 }
 
 /// `gitlab.mr.show`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct MrShowInput {
-    r#ref: Option<String>,
-    project: Option<String>,
+    #[serde(alias = "id")]
+    pub(crate) r#ref: Option<String>,
+    #[serde(alias = "project_id", alias = "path")]
+    pub(crate) project: Option<String>,
     #[schemars(range(min = 1))]
-    iid: Option<i64>,
+    #[serde(alias = "merge_request_iid")]
+    pub(crate) iid: Option<i64>,
 }
 
 /// `gitlab.issue.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct IssueListInput {
-    project: String,
-    state: Option<IssueStateFilter>,
-    search: Option<String>,
-    query: Option<String>,
-    order_by: Option<String>,
-    sort: Option<String>,
+    #[serde(alias = "project_id", alias = "path")]
+    pub(crate) project: String,
+    pub(crate) state: Option<IssueStateFilter>,
+    pub(crate) search: Option<String>,
+    pub(crate) query: Option<String>,
+    pub(crate) order_by: Option<String>,
+    pub(crate) sort: Option<String>,
     #[schemars(range(min = 1, max = 100))]
-    limit: Option<i64>,
+    pub(crate) limit: Option<i64>,
     /// Alias of `limit` (GL-009); `limit` wins when both are set.
     #[schemars(range(min = 1, max = 100))]
-    per_page: Option<i64>,
+    pub(crate) per_page: Option<i64>,
     /// 1-based results page (GL-019) — walk a list beyond a capped first page.
     #[schemars(range(min = 1))]
-    page: Option<i64>,
+    pub(crate) page: Option<i64>,
     /// Feed the results into the local search index as `gitlab.issue` records (GL-015). Off by
     /// default so a plain read has no datasource side effects; `index.build` indexes deliberately.
-    contribute: Option<bool>,
+    pub(crate) contribute: Option<bool>,
 }
+
+// C-74 output contracts. GitLab evolves these objects by adding fields, so each executable output
+// retains the vendor object as an exact map. `schemars(with = ...)` projects the stable fields flux
+// consumes without making the open vendor tail disappear from either the schema or the result.
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct GitLabProjectSchema {
+    id: Option<i64>,
+    name: Option<String>,
+    path: Option<String>,
+    path_with_namespace: Option<String>,
+    name_with_namespace: Option<String>,
+    description: Option<String>,
+    web_url: Option<String>,
+    default_branch: Option<String>,
+    visibility: Option<String>,
+    archived: Option<bool>,
+    last_activity_at: Option<String>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub(super) struct GitLabProject(
+    #[schemars(with = "GitLabProjectSchema")] pub(crate) Map<String, Value>,
+);
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct GitLabMergeRequestSchema {
+    id: Option<i64>,
+    iid: Option<i64>,
+    project_id: Option<i64>,
+    title: Option<String>,
+    description: Option<String>,
+    state: Option<String>,
+    draft: Option<bool>,
+    web_url: Option<String>,
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    merged_at: Option<String>,
+    closed_at: Option<String>,
+    labels: Option<Vec<String>>,
+    author: Option<Value>,
+    assignees: Option<Vec<Value>>,
+    references: Option<Value>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub(super) struct GitLabMergeRequest(
+    #[schemars(with = "GitLabMergeRequestSchema")] pub(crate) Map<String, Value>,
+);
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct GitLabIssueSchema {
+    id: Option<i64>,
+    iid: Option<i64>,
+    project_id: Option<i64>,
+    title: Option<String>,
+    description: Option<String>,
+    state: Option<String>,
+    confidential: Option<bool>,
+    web_url: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    closed_at: Option<String>,
+    labels: Option<Vec<String>>,
+    author: Option<Value>,
+    assignees: Option<Vec<Value>>,
+    references: Option<Value>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub(super) struct GitLabIssue(
+    #[schemars(with = "GitLabIssueSchema")] pub(crate) Map<String, Value>,
+);
+
+pub(super) type ProjectListOutput = Vec<GitLabProject>;
+pub(super) type ProjectShowOutput = GitLabProject;
+pub(super) type MrListOutput = Vec<GitLabMergeRequest>;
+pub(super) type MrShowOutput = GitLabMergeRequest;
+pub(super) type IssueListOutput = Vec<GitLabIssue>;
+pub(super) type IssueShowOutput = GitLabIssue;
 
 /// `gitlab.pipeline.list`.
 #[derive(Deserialize, JsonSchema)]
@@ -406,13 +529,16 @@ pub(super) struct MrMergeInput {
 }
 
 /// `gitlab.issue.show`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct IssueShowInput {
-    r#ref: Option<String>,
-    project: Option<String>,
+    #[serde(alias = "id")]
+    pub(crate) r#ref: Option<String>,
+    #[serde(alias = "project_id", alias = "path")]
+    pub(crate) project: Option<String>,
     #[schemars(range(min = 1))]
-    iid: Option<i64>,
+    #[serde(alias = "issue_iid")]
+    pub(crate) iid: Option<i64>,
 }
 
 /// `gitlab.issue.create`.

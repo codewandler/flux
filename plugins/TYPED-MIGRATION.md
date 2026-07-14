@@ -8,10 +8,11 @@ the compatibility `operation` spelling is deprecated and must not be used by fir
 
 The first migrations deliberately cover both ends of the spectrum: `websearch` has the empty-input
 `provider.list` operation and the alias-heavy, multi-query `web.search` operation; Jira has the
-stable attachment list/get family while preserving each open Atlassian attachment object verbatim.
-These result families have generated output schemas. Other operations already derive input schemas
-(D-36), but their handlers remain on the explicit flexible adapter until each vendor result family
-is typed without erasing vendor-specific semantics.
+stable attachment list/get family while preserving each open Atlassian attachment object verbatim;
+and GitLab has the project/MR/issue list+show read families. These result families have generated
+output schemas. Other operations already derive input schemas (D-36), but their handlers remain on
+the explicit flexible adapter until each vendor result family is typed without erasing
+vendor-specific semantics.
 
 | Plugin | Typed executable handlers | Next migration unit |
 | --- | --- | --- |
@@ -20,7 +21,7 @@ is typed without erasing vendor-specific semantics.
 | aws | pending | caller identity/list outputs before credential-heavy operations |
 | confluence | pending | test/page show/list outputs |
 | docker | pending | version/container list, then stream variants |
-| gitlab | pending | project/MR/issue list+show families in bounded batches |
+| gitlab | project/MR/issue list+show, typed raw vendor arrays/objects | pipeline/job reads, then mutation result families |
 | grafana | pending | health/dashboard list+show |
 | homer | pending | service list/status |
 | huggingface | pending | model/dataset/space list+get |
@@ -34,6 +35,13 @@ is typed without erasing vendor-specific semantics.
 | sql | pending | server info and row-envelope output |
 | vault | pending | mount/list metadata before secret-bearing reads |
 | websearch | **migrated** | `web.search`, `websearch.provider.list`, typed ranked/provider outputs |
+
+GitLab's migrated objects use transparent map-backed Rust types: their schemas name the stable
+fields flux consumes, set `additionalProperties: true`, and preserve every unknown vendor field and
+explicit `null` in the result. The remaining GitLab handlers intentionally stay on
+`operation_flexible` for now because pipeline/job responses, diffs, mutation receipts, and binary
+transfers have distinct open shapes and side conditions; each needs a bounded contract batch rather
+than a single lossy catch-all type.
 
 Migration rules:
 

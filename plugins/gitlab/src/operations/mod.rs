@@ -85,40 +85,86 @@ pub(super) fn resolve_project_id(host: &mut Host, project: &str) -> Result<i64, 
 
 /// Resolve a merge request to (project, iid) from a `ref`/`id` (PROJECT!IID) or project + iid.
 pub(super) fn mr_address(input: &Value) -> Result<(String, i64), String> {
-    if let Some(r) = flex_str(input, "ref").or_else(|| flex_str(input, "id")) {
-        let (p, iid) = r
+    let reference = flex_str(input, "ref").or_else(|| flex_str(input, "id"));
+    let project = ["project", "project_id", "path"]
+        .into_iter()
+        .find_map(|key| flex_str(input, key));
+    resolve_mr_address(
+        reference.as_deref(),
+        project.as_deref(),
+        flex_i64(input, &["iid", "merge_request_iid"]),
+    )
+}
+
+/// Resolve the canonical MR address shared by flexible preflight and C-74 typed handlers.
+pub(super) fn resolve_mr_address(
+    reference: Option<&str>,
+    project: Option<&str>,
+    iid: Option<i64>,
+) -> Result<(String, i64), String> {
+    if let Some(reference) = reference.map(str::trim).filter(|value| !value.is_empty()) {
+        let (project, iid) = reference
             .split_once('!')
             .ok_or("merge request ref must be PROJECT!IID")?;
         let iid = iid
             .trim()
             .parse::<i64>()
             .map_err(|_| "merge request ref must be PROJECT!IID".to_string())?;
-        if p.trim().is_empty() || iid <= 0 {
+        if project.trim().is_empty() || iid <= 0 {
             return Err("merge request ref must be PROJECT!IID".into());
         }
-        return Ok((p.trim().to_string(), iid));
+        return Ok((project.trim().to_string(), iid));
     }
-    let project = req_project(input)?;
-    let iid = flex_i64(input, &["iid", "merge_request_iid"]).ok_or("`iid` (integer) required")?;
-    Ok((project, iid))
+    let project = project
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("`project` (string) required")?;
+    let iid = iid
+        .filter(|iid| *iid > 0)
+        .ok_or("`iid` (integer) required")?;
+    Ok((project.to_string(), iid))
 }
 
 /// Resolve an issue to (project, iid) from a `ref`/`id` (PROJECT#IID) or project + iid.
 pub(super) fn issue_address(input: &Value) -> Result<(String, i64), String> {
-    if let Some(r) = flex_str(input, "ref").or_else(|| flex_str(input, "id")) {
-        let (p, iid) = r.split_once('#').ok_or("issue ref must be PROJECT#IID")?;
+    let reference = flex_str(input, "ref").or_else(|| flex_str(input, "id"));
+    let project = ["project", "project_id", "path"]
+        .into_iter()
+        .find_map(|key| flex_str(input, key));
+    resolve_issue_address(
+        reference.as_deref(),
+        project.as_deref(),
+        flex_i64(input, &["iid", "issue_iid"]),
+    )
+}
+
+/// Resolve the canonical issue address shared by flexible preflight and C-74 typed handlers.
+pub(super) fn resolve_issue_address(
+    reference: Option<&str>,
+    project: Option<&str>,
+    iid: Option<i64>,
+) -> Result<(String, i64), String> {
+    if let Some(reference) = reference.map(str::trim).filter(|value| !value.is_empty()) {
+        let (project, iid) = reference
+            .split_once('#')
+            .ok_or("issue ref must be PROJECT#IID")?;
         let iid = iid
             .trim()
             .parse::<i64>()
             .map_err(|_| "issue ref must be PROJECT#IID".to_string())?;
-        if p.trim().is_empty() || iid <= 0 {
+        if project.trim().is_empty() || iid <= 0 {
             return Err("issue ref must be PROJECT#IID".into());
         }
-        return Ok((p.trim().to_string(), iid));
+        return Ok((project.trim().to_string(), iid));
     }
-    let project = req_project(input)?;
-    let iid = flex_i64(input, &["iid", "issue_iid"]).ok_or("`iid` (integer) required")?;
-    Ok((project, iid))
+    let project = project
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("`project` (string) required")?;
+    let iid = iid
+        .filter(|iid| *iid > 0)
+        .ok_or("`iid` (integer) required")?;
+    Ok((project.to_string(), iid))
 }
 
 // ─── custom preflight rules (D-88) ──────────────────────────────────────────
@@ -225,17 +271,6 @@ pub(super) fn pf_search_blobs(input: &Value) -> Vec<String> {
 /// GL-034: index selectors must resolve to at least one known index.
 pub(super) fn pf_index_build(input: &Value) -> Vec<String> {
     index_include(input).err().into_iter().collect()
-}
-
-/// GL-015: whether a plain read/list op should feed its results into the local search index.
-/// Off by default so a pure read has no datasource side effects (no records, no stderr
-/// `(N record(s) contributed)` line — the host prints it only when records are contributed);
-/// `index.build` is the deliberate indexing path.
-pub(super) fn wants_contribution(input: &Value) -> bool {
-    input
-        .get("contribute")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
 }
 
 /// `&page=N` when the caller asked for a specific 1-based results page (GL-019), else "".
