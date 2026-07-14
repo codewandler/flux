@@ -356,6 +356,16 @@ impl NativeProvider {
         self
     }
 
+    /// Override the client used by the generic HTTP path.
+    ///
+    /// Embedders may use this to install their own proxy, TLS, DNS, and timeout policy. It also
+    /// provides a deterministic transport seam for lifecycle tests that must exercise credential
+    /// application without reaching a real provider endpoint.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
     /// Attach an alternative [`StreamTransport`] (axis c) tried before the HTTP path. A
     /// connect-time failure falls back transparently to HTTP — see [`StreamTransport`].
     pub fn with_transport(mut self, transport: Arc<dyn StreamTransport>) -> Self {

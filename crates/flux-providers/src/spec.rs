@@ -4,12 +4,13 @@
 //!
 //! Extracted from the CLI (D-152) so every embedder resolves a model spec exactly the way `flux`
 //! does — `spec::build("claude/sonnet")` wires the subscription token source, `spec::build(
-//! "aws/sonnet")` materializes the AWS chain, bare aliases resolve per each provider's
-//! `resolve_model` map — instead of re-implementing the mapping. The pure front half,
+//! "aws/sonnet")` installs the lazy, expiry-aware AWS chain, bare aliases resolve per each
+//! provider's `resolve_model` map — instead of re-implementing the mapping. The pure front half,
 //! [`parse_model_spec`], is credential-free and unit-testable.
 
 use flux_core::{Error, Result};
 use flux_provider::NativeProvider;
+use std::sync::Arc;
 
 /// The providers a model spec may name. A spec is either `provider/model` with `provider` in this
 /// set, or a bare short alias mapped by [`provider_prefix`].
@@ -94,37 +95,73 @@ pub fn parse_model_spec(spec: &str) -> Result<(String, String)> {
     }
 }
 
-/// Materialize the AWS credential chain into env from a **sync** context (C-11): [`build`] stays
-/// sync (the sub-agent `Spawner` closure demands it), but the chain resolution (SSO/IRSA HTTP) is
-/// async. Inside a multi-thread tokio runtime this hops through `block_in_place`; with no runtime
-/// (plain sync callers, tests) it spins a one-shot current-thread runtime. A no-op when
-/// `AWS_ACCESS_KEY_ID` is already set (static env / already materialized).
-fn ensure_aws_chain() -> Result<()> {
-    if std::env::var("AWS_ACCESS_KEY_ID")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(crate::bedrock::materialize_chain_into_env())
-        })?,
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| Error::Other(format!("aws chain: build runtime: {e}")))?
-            .block_on(crate::bedrock::materialize_chain_into_env())?,
-    }
-    Ok(())
-}
-
-/// Parse a model spec and build the matching provider from environment credentials. Returns
-/// `(native, provider, resolved_model)` so callers can reconstruct the canonical `provider/model`
-/// spec (e.g. for cost/subscription detection, which reads the provider prefix). Spec forms and
-/// validation live in [`parse_model_spec`].
+/// Parse a model spec and build the matching provider with its provider-specific credential source
+/// (API/OAuth env sources, or Bedrock's lazy default chain). Returns `(native, provider,
+/// resolved_model)` so callers can reconstruct the canonical `provider/model` spec (e.g. for
+/// cost/subscription detection, which reads the provider prefix). Spec forms and validation live in
+/// [`parse_model_spec`].
 pub fn build(spec: &str) -> Result<(NativeProvider, String, String)> {
     let (provider, model) = parse_model_spec(spec)?;
+    build_parsed(provider, model, None)
+}
+
+/// Parse an AWS model spec and build it with an explicitly injected, lazy Bedrock credential
+/// resolver pinned to `region`.
+///
+/// This is the public embedding/testing seam for custom AWS credential sources. Like [`build`], it
+/// resolves the model alias and returns the canonical `(provider, model)` pair, but it neither
+/// reads nor writes AWS credential/region environment variables. Resolution remains lazy: the
+/// first provider request calls `resolver`, and later requests re-resolve through the same object
+/// whenever the cached credentials enter Bedrock's expiry window.
+///
+/// Non-AWS specs are rejected so a supplied resolver can never be silently ignored.
+pub fn build_with_bedrock_resolver(
+    spec: &str,
+    region: impl Into<String>,
+    resolver: Arc<dyn crate::bedrock::BedrockCredentialsResolver>,
+) -> Result<(NativeProvider, String, String)> {
+    let (provider, model) = parse_model_spec(spec)?;
+    if provider != "aws" {
+        return Err(Error::Other(format!(
+            "Bedrock resolver injection requires an `aws` model spec, got `{spec}`"
+        )));
+    }
+    let region = region.into();
+    let region = region.trim();
+    if region.is_empty() {
+        return Err(Error::Other(
+            "Bedrock resolver injection requires a non-empty AWS region".to_string(),
+        ));
+    }
+    build_parsed(
+        provider,
+        model,
+        Some(BedrockFactoryOverride {
+            region: region.to_string(),
+            resolver,
+        }),
+    )
+}
+
+struct BedrockFactoryOverride {
+    region: String,
+    resolver: Arc<dyn crate::bedrock::BedrockCredentialsResolver>,
+}
+
+fn build_parsed(
+    provider: String,
+    model: String,
+    bedrock: Option<BedrockFactoryOverride>,
+) -> Result<(NativeProvider, String, String)> {
+    let model = match provider.as_str() {
+        "anthropic" | "claude" => crate::anthropic::resolve_model(&model),
+        "codex" => crate::codex::resolve_model(&model),
+        "aws" => match bedrock.as_ref() {
+            Some(injected) => crate::bedrock::resolve_model_for_region(&model, &injected.region),
+            None => crate::bedrock::resolve_model(&model),
+        },
+        _ => model,
+    };
 
     let native = match provider.as_str() {
         "anthropic" => crate::anthropic::anthropic_from_env()
@@ -150,17 +187,19 @@ pub fn build(spec: &str) -> Result<(NativeProvider, String, String)> {
                 .map_err(|e| Error::Other(format!("codex provider: {e}")))?;
             crate::codex::oauth(ts)
         }
-        // AWS Bedrock (Anthropic over SigV4), streaming via invoke-with-response-stream. The full
-        // credential chain (env → SSO → IRSA → EKS Pod Identity) is materialized into `AWS_*` env
-        // HERE, in the one factory — so every caller that builds a provider gets the chain. Bedrock
-        // bakes the model id into the credential (it's in the invoke URL), so resolve after the
-        // chain sets the region.
-        "aws" => {
-            ensure_aws_chain()?;
-            let m = crate::bedrock::resolve_model(&model);
-            crate::bedrock::bedrock_with_env(m)
-                .map_err(|e| Error::Other(format!("aws provider: {e}")))?
-        }
+        // AWS Bedrock (Anthropic over SigV4), streaming via invoke-with-response-stream. Install
+        // the full env → SSO → IRSA → EKS Pod Identity resolver without walking it: the first
+        // request resolves credentials, and later requests re-resolve near expiry (C-37/C-63).
+        // Construction stays synchronous for sub-agent factories, works inside either Tokio
+        // runtime flavor, and never snapshots temporary credentials into process-global env.
+        "aws" => match bedrock {
+            Some(injected) => crate::bedrock::bedrock_with_lazy_resolver(
+                model.clone(),
+                injected.region,
+                injected.resolver,
+            ),
+            None => crate::bedrock::bedrock_with_chain(model.clone()),
+        },
         other => {
             return Err(Error::Other(format!(
                 "unknown provider `{other}` (known: {})",
@@ -169,18 +208,240 @@ pub fn build(spec: &str) -> Result<(NativeProvider, String, String)> {
         }
     };
 
-    let model = match provider.as_str() {
-        "anthropic" | "claude" => crate::anthropic::resolve_model(&model),
-        "codex" => crate::codex::resolve_model(&model),
-        "aws" => crate::bedrock::resolve_model(&model),
-        _ => model,
-    };
     Ok((native, provider, model))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_provider::{Provider as _, Request};
+
+    const AWS_FACTORY_ENV: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_CONFIG_FILE",
+        "AWS_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    ];
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            Self(
+                AWS_FACTORY_ENV
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn aws_env_snapshot() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        AWS_FACTORY_ENV
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect()
+    }
+
+    fn configure_credential_free_aws_env() -> EnvRestore {
+        let restore = EnvRestore::capture();
+        for key in AWS_FACTORY_ENV {
+            std::env::remove_var(key);
+        }
+        // Pin model/endpoint selection while ensuring the old eager chain has no credential source
+        // and no real profile file to inspect.
+        std::env::set_var("AWS_REGION", "eu-central-1");
+        std::env::set_var("AWS_CONFIG_FILE", "/definitely/missing/flux-c63-aws-config");
+        restore
+    }
+
+    fn assert_lazy_aws_build(result: Result<(NativeProvider, String, String)>) {
+        let (_native, provider, model) =
+            result.unwrap_or_else(|e| panic!("lazy aws factory must construct without creds: {e}"));
+        assert_eq!(provider, "aws");
+        assert_eq!(model, "eu.anthropic.claude-sonnet-4-6");
+    }
+
+    struct FactoryLifecycleResolver {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FactoryLifecycleResolver {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::bedrock::BedrockCredentialsResolver for FactoryLifecycleResolver {
+        async fn resolve(&self) -> Result<crate::bedrock::BedrockCreds> {
+            let generation = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::bedrock::BedrockCreds {
+                access_key: format!("AKIA_FACTORY_{generation}"),
+                secret_key: "factory-secret".to_string(),
+                session_token: Some(format!("factory-session-{generation}")),
+                region: "resolver-region-is-coerced".to_string(),
+                expiration: Some(if generation == 0 {
+                    chrono::Utc::now() + chrono::Duration::seconds(60)
+                } else {
+                    chrono::Utc::now() + chrono::Duration::hours(2)
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_aws_factory_re_resolves_near_expiry_creds_on_second_provider_use() {
+        let before = {
+            let _env = crate::bedrock::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            aws_env_snapshot()
+        };
+        let resolver = FactoryLifecycleResolver::new();
+
+        let (provider, provider_name, model) =
+            build_with_bedrock_resolver("aws/sonnet", "eu-central-1", resolver.clone())
+                .expect("injected public factory builds");
+        assert_eq!(provider_name, "aws");
+        assert_eq!(model, "eu.anthropic.claude-sonnet-4-6");
+        assert_eq!(resolver.count(), 0, "factory construction stays lazy");
+
+        // Resolve the Bedrock hostname to a local listener that never completes TLS. The injected
+        // client's request timeout bounds both uses, exercises credential application, and proves
+        // this lifecycle test cannot reach AWS or depend on ambient proxy configuration.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let local_sink = listener.local_addr().unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("bedrock-runtime.eu-central-1.amazonaws.com", local_sink)
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .timeout(std::time::Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let provider = provider.with_http_client(http).with_max_retries(0);
+
+        for expected_resolves in 1..=2 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                provider.stream(Request::new(model.clone(), "test")),
+            )
+            .await
+            .expect("injected HTTP client bounds the provider use");
+            assert!(
+                result.is_err(),
+                "the local TLS sink must not return a stream"
+            );
+            assert_eq!(
+                resolver.count(),
+                expected_resolves,
+                "the first near-expiry generation must be re-resolved on the second provider use"
+            );
+        }
+
+        let after = {
+            let _env = crate::bedrock::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            aws_env_snapshot()
+        };
+        assert_eq!(after, before, "factory/provider mutated AWS environment");
+    }
+
+    #[test]
+    fn aws_factory_constructs_inside_current_thread_runtime_without_resolving() {
+        let _env = crate::bedrock::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = configure_credential_free_aws_env();
+        let before = aws_env_snapshot();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async { build("aws/sonnet") })
+        }));
+        let result = outcome.unwrap_or_else(|_| {
+            panic!("aws factory panicked while already inside a current-thread Tokio runtime")
+        });
+        assert_lazy_aws_build(result);
+        assert_eq!(
+            aws_env_snapshot(),
+            before,
+            "factory mutated AWS environment"
+        );
+    }
+
+    #[test]
+    fn aws_factory_constructs_inside_multi_thread_runtime_without_resolving() {
+        let _env = crate::bedrock::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = configure_credential_free_aws_env();
+        let before = aws_env_snapshot();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async { build("aws/sonnet") });
+        assert_lazy_aws_build(result);
+        assert_eq!(
+            aws_env_snapshot(),
+            before,
+            "factory mutated AWS environment"
+        );
+    }
+
+    #[test]
+    fn aws_factory_preserves_static_credential_and_region_environment() {
+        let _env = crate::bedrock::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::capture();
+        for key in AWS_FACTORY_ENV {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA_C63_SENTINEL");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-c63-sentinel");
+        std::env::set_var("AWS_SESSION_TOKEN", "session-c63-sentinel");
+        std::env::set_var("AWS_DEFAULT_REGION", "eu-west-1");
+        let before = aws_env_snapshot();
+
+        let (_native, provider, model) = build("aws/sonnet").unwrap();
+        assert_eq!(provider, "aws");
+        assert_eq!(model, "eu.anthropic.claude-sonnet-4-6");
+        assert_eq!(
+            aws_env_snapshot(),
+            before,
+            "factory mutated AWS environment"
+        );
+    }
 
     #[test]
     fn parse_covers_aliases_defaults_and_rejects_empty_models() {

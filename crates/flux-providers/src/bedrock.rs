@@ -46,6 +46,11 @@ const SIGV4_SERVICE: &str = "bedrock";
 const SIGV4_TERMINATOR: &str = "aws4_request";
 const SIGV4_ALGO: &str = "AWS4-HMAC-SHA256";
 
+/// Serializes tests that inspect or mutate the process-global AWS environment across both the
+/// Bedrock owner module and the shared spec factory tests.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Quirks profile
 // ---------------------------------------------------------------------------
@@ -741,7 +746,14 @@ pub fn resolve_model(alias: &str) -> String {
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_default();
-    let prefix = region_prefix(&region);
+    resolve_model_for_region(alias, &region)
+}
+
+/// Resolve an alias for an explicitly pinned request region. The public model-spec factory uses
+/// this path when a caller injects a credential resolver, so model selection and the credential's
+/// endpoint cannot drift through ambient `AWS_REGION` state.
+pub(crate) fn resolve_model_for_region(alias: &str, region: &str) -> String {
+    let prefix = region_prefix(region);
     match alias {
         // The active Claude 4-6 generation. Region-prefixed (us./eu.) — both exist in their
         // respective region catalogs. `global.` is not available for sonnet-4-6 in all regions.
@@ -787,12 +799,10 @@ fn region_prefix(region: &str) -> &'static str {
 // Constructors
 // ---------------------------------------------------------------------------
 
-/// Build the `aws` Bedrock provider from `AWS_*` env (the static-creds stand-in), **sync** — for
-/// the CLI's sync `build_provider`. Reads env once via [`creds_from_env`]; the stored
-/// [`EnvStaticResolver`] backs the C-04 refresh path. For the dev account (SSO-only), materialize
-/// short-lived creds into env first: `aws configure export-credentials --profile <p> --format env`.
-/// (When the `aws-bedrock` plugin lands, this is replaced by the async [`bedrock_with`] with an
-/// injected plugin resolver — the L1 seam is unchanged.)
+/// Build an `aws` Bedrock provider explicitly from static `AWS_*` environment credentials. Reads
+/// env once via [`creds_from_env`]; the stored [`EnvStaticResolver`] backs the C-04 refresh path.
+/// The shared model-spec factory deliberately uses [`bedrock_with_chain`] instead, so temporary
+/// SSO/IRSA credentials stay lazy and refreshable rather than being snapshotted into env.
 pub fn bedrock_with_env(model_id: String) -> Result<NativeProvider> {
     let creds = creds_from_env()?;
     Ok(NativeProvider::new(
@@ -874,12 +884,11 @@ pub async fn resolve_default_chain() -> Result<BedrockCreds> {
     ))
 }
 
-/// Resolve the default chain and materialize the result into `AWS_*` env vars (idempotent: a no-op
-/// when `AWS_ACCESS_KEY_ID` is already set). The CLI's async `build_agent` calls this for the `aws`
-/// provider arm before the sync `build_provider` → `bedrock_with_env` reads env — so the resolved
-/// creds reach every sync path (REPL `/model`, sub-agent factory, server) without making
-/// `build_provider` async (the sub-agent `Spawner` closure is sync). The session token + region are
-/// set too.creds stay in the process env for the session.
+/// Explicit compatibility helper that resolves the default chain and materializes it into `AWS_*`
+/// env vars (idempotent when `AWS_ACCESS_KEY_ID` is already set). Production provider construction
+/// does not call this: [`crate::spec::build`] uses [`bedrock_with_chain`], keeping temporary creds
+/// lazy, cached, and expiry-refreshable. Callers that opt into materialization own its process-wide
+/// mutation and snapshot semantics.
 pub async fn materialize_chain_into_env() -> Result<()> {
     // Idempotent: if env is already populated (e.g. `aws configure export-credentials` ran, or
     // prod injected env creds), don't re-resolve / overwrite.
@@ -932,6 +941,17 @@ pub fn bedrock_with_chain(model_id: String) -> NativeProvider {
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".to_string());
+    bedrock_with_lazy_resolver(model_id, region, Arc::new(AwsChainResolver))
+}
+
+/// Assemble a lazy Bedrock provider from an explicit region and resolver. Kept crate-private so
+/// public callers use [`crate::spec::build_with_bedrock_resolver`], preserving model-spec parsing
+/// and alias resolution instead of constructing credentials directly.
+pub(crate) fn bedrock_with_lazy_resolver(
+    model_id: String,
+    region: String,
+    resolver: Arc<dyn BedrockCredentialsResolver>,
+) -> NativeProvider {
     NativeProvider::new(
         "aws",
         Arc::new(BedrockAnthropic),
@@ -939,7 +959,7 @@ pub fn bedrock_with_chain(model_id: String) -> NativeProvider {
             model_id,
             region,
             creds: Mutex::new(None),
-            resolver: Arc::new(AwsChainResolver),
+            resolver,
         }),
     )
 }
@@ -1394,12 +1414,8 @@ mod tests {
     use super::*;
     use flux_core::{Chunk, ContentBlock, StopReason};
 
-    /// Serializes the tests that mutate process-global env (`AWS_REGION` + friends) — without it
-    /// they race across test threads (e.g. `resolve_model` sees another test's region).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // -- SigV4 known-answer test ---------------------------------------------------------------
@@ -1907,10 +1923,16 @@ mod tests {
         assert_eq!(creds.secret_key, "secret");
         assert_eq!(creds.session_token.as_deref(), Some("tok"));
         assert_eq!(creds.region, "eu-west-1");
+        let chain_creds = AwsChainResolver.resolve().await.unwrap();
+        assert_eq!(chain_creds.access_key, "AKIATEST");
+        assert_eq!(chain_creds.secret_key, "secret");
+        assert_eq!(chain_creds.session_token.as_deref(), Some("tok"));
+        assert_eq!(chain_creds.region, "eu-west-1");
         unsafe {
             std::env::remove_var("AWS_ACCESS_KEY_ID");
             std::env::remove_var("AWS_SECRET_ACCESS_KEY");
             std::env::remove_var("AWS_SESSION_TOKEN");
+            std::env::remove_var("AWS_REGION");
         }
     }
 
