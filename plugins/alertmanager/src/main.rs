@@ -129,35 +129,35 @@ fn manifest_builder() -> PluginBuilder {
             entity_schema: None,
         })
         // ---- ops ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "alertmanager.test",
                 "Check Alertmanager readiness and return version/cluster status.",
             ),
             test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<AlertsInput>(
                 "alertmanager.alerts",
                 "List alerts from Alertmanager with optional label matchers and state filters (active/silenced/inhibited).",
             ),
             alerts,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<SilenceListInput>(
                 "alertmanager.silence.list",
                 "List silences with their matchers, state (active/pending/expired), creator, and comment.",
             ),
             silence_list,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<SilenceCreateInput>(
                 "alertmanager.silence.create",
                 "Create a silence: label matchers, duration or explicit end time, creator, and comment.",
             ),
             silence_create,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<SilenceDeleteInput>(
                 "alertmanager.silence.delete",
                 "Expire (delete) a silence by id.",
@@ -639,8 +639,8 @@ fn normalise_silence(s: &Value) -> Value {
     })
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

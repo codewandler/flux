@@ -726,11 +726,11 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("docker.networks", "docker.network", "Docker networks."))
         .datasource(ds("docker.volumes", "docker.volume", "Docker volumes."))
         // ---- system ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<InfoInput>("docker.info", "Show Docker daemon and server information."),
             system_info,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<SystemDfInput>(
                 "docker.system.df",
                 "Show Docker disk usage by object type.",
@@ -738,39 +738,39 @@ fn manifest_builder() -> PluginBuilder {
             system_df,
         )
         // ---- containers ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<ContainerListInput>("docker.container.list", "List Docker containers."),
             container_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ContainerShowInput>(
                 "docker.container.show",
                 "Show one Docker container by ID or name.",
             ),
             container_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ContainerLogsInput>(
                 "docker.container.logs",
                 "Read recent Docker container logs (non-streaming).",
             ),
             container_logs,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ContainerTopInput>(
                 "docker.container.top",
                 "Show processes running inside a Docker container.",
             ),
             container_top,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ContainerInspectRawInput>(
                 "docker.container.inspect.raw",
                 "Show raw Docker container inspect data.",
             ),
             container_inspect_raw,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ContainerStartInput>(
                     "docker.container.start",
@@ -781,7 +781,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             container_start,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ContainerStopInput>(
                     "docker.container.stop",
@@ -792,7 +792,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             container_stop,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ContainerRestartInput>(
                     "docker.container.restart",
@@ -803,7 +803,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             container_restart,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ContainerRemoveInput>(
                     "docker.container.remove",
@@ -814,7 +814,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             container_remove,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ContainerCreateInput>(
                     "docker.container.create",
@@ -825,7 +825,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             container_create,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ContainerCreateInput>(
                     "docker.container.run",
@@ -836,7 +836,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             container_run,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<PruneInput>(
                     "docker.container.prune",
@@ -848,25 +848,25 @@ fn manifest_builder() -> PluginBuilder {
             container_prune,
         )
         // ---- images ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<ImageListInput>("docker.image.list", "List local Docker images."),
             image_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ImageShowInput>(
                 "docker.image.show",
                 "Show one Docker image by ID, digest, or reference.",
             ),
             image_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ImageInspectRawInput>(
                 "docker.image.inspect.raw",
                 "Show raw Docker image inspect data.",
             ),
             image_inspect_raw,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op =
                     write_op_typed::<ImagePullInput>("docker.image.pull", "Pull a Docker image.");
@@ -875,7 +875,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             image_pull,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op =
                     write_op_typed::<ImageTagInput>("docker.image.tag", "Tag a Docker image.");
@@ -884,7 +884,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             image_tag,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ImageRemoveInput>(
                     "docker.image.remove",
@@ -895,7 +895,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             image_remove,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<ImagePruneInput>(
                     "docker.image.prune",
@@ -907,25 +907,25 @@ fn manifest_builder() -> PluginBuilder {
             image_prune,
         )
         // ---- networks ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<NetworkListInput>("docker.network.list", "List Docker networks."),
             network_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<NetworkShowInput>(
                 "docker.network.show",
                 "Show one Docker network by ID or name.",
             ),
             network_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<NetworkInspectRawInput>(
                 "docker.network.inspect.raw",
                 "Show raw Docker network inspect data.",
             ),
             network_inspect_raw,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<NetworkCreateInput>(
                     "docker.network.create",
@@ -936,7 +936,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             network_create,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<NetworkRemoveInput>(
                     "docker.network.remove",
@@ -947,7 +947,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             network_remove,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<PruneInput>(
                     "docker.network.prune",
@@ -959,25 +959,25 @@ fn manifest_builder() -> PluginBuilder {
             network_prune,
         )
         // ---- volumes ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<VolumeListInput>("docker.volume.list", "List Docker volumes."),
             volume_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<VolumeShowInput>(
                 "docker.volume.show",
                 "Show one Docker volume by name.",
             ),
             volume_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<VolumeInspectRawInput>(
                 "docker.volume.inspect.raw",
                 "Show raw Docker volume inspect data.",
             ),
             volume_inspect_raw,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<VolumeCreateInput>(
                     "docker.volume.create",
@@ -988,7 +988,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             volume_create,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<VolumeRemoveInput>(
                     "docker.volume.remove",
@@ -999,7 +999,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             volume_remove,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<PruneInput>(
                     "docker.volume.prune",
@@ -2128,8 +2128,8 @@ fn contribute_volumes(host: &mut Host, volumes: &[Value]) {
 // Entry point.
 // ---------------------------------------------------------------------------
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

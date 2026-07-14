@@ -132,21 +132,21 @@ fn manifest_builder() -> PluginBuilder {
                 "vault.kv.metadata_delete",
             ],
         ))
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>("vault.health", "Read Vault sys/health status."),
                 GROUP_ADMIN,
             ),
             op_health,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>("vault.auth.list", "List enabled Vault auth methods."),
                 GROUP_ADMIN,
             ),
             op_auth_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>(
                     "vault.mount.list",
@@ -156,21 +156,21 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_mount_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>("vault.policy.list", "List Vault ACL policies."),
                 GROUP_ADMIN,
             ),
             op_policy_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<PolicyReadInput>("vault.policy.read", "Read one Vault ACL policy."),
                 GROUP_ADMIN,
             ),
             op_policy_read,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>(
                     "vault.token.lookup_self",
@@ -180,7 +180,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_token_lookup_self,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<KvListInput>(
                     "vault.kv.list",
@@ -190,7 +190,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<KvReadInput>(
                     "vault.kv.read",
@@ -200,14 +200,14 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_read,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<KvWriteInput>("vault.kv.write", "Write a Vault KV-v2 secret."),
                 GROUP_KV,
             ),
             op_kv_write,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<KvWriteInput>(
                     "vault.kv.patch",
@@ -217,7 +217,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_patch,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<KvPathInput>(
                     "vault.kv.metadata",
@@ -227,7 +227,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_metadata,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<KvMetadataUpdateInput>(
                     "vault.kv.metadata.update",
@@ -237,7 +237,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_metadata_update,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<KvPathInput>(
                     "vault.kv.delete_latest",
@@ -247,7 +247,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_delete_latest,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<KvVersionsInput>(
                     "vault.kv.delete_versions",
@@ -257,7 +257,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_delete_versions,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<KvVersionsInput>(
                     "vault.kv.undelete_versions",
@@ -267,7 +267,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_undelete_versions,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 risked(
                     write_op_typed::<KvVersionsInput>(
@@ -280,7 +280,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_kv_destroy_versions,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 risked(
                     write_op_typed::<KvPathInput>(
@@ -295,8 +295,8 @@ fn manifest_builder() -> PluginBuilder {
         )
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 fn mount(input: &Value) -> String {

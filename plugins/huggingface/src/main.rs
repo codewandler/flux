@@ -159,7 +159,7 @@ fn manifest_builder() -> PluginBuilder {
         .datasource(ds("huggingface.datasets", "huggingface.dataset", "Hugging Face Hub datasets."))
         .datasource(ds("huggingface.spaces", "huggingface.space", "Hugging Face Hub spaces."))
         // ---- reachability / auth test ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "huggingface.test",
                 "Test reachability of the Hub (anonymous) and, when a token is present, validate it via whoami.",
@@ -167,14 +167,14 @@ fn manifest_builder() -> PluginBuilder {
             op_test,
         )
         // ---- model ops ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<ModelSearchInput>(
                 "huggingface.model.search",
                 "Search the Hugging Face Hub for models (GET /api/models).",
             ),
             op_model_search,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ModelGetInput>(
                 "huggingface.model.get",
                 "Get metadata for a single Hugging Face model repo (GET /api/models/{repo_id}).",
@@ -182,14 +182,14 @@ fn manifest_builder() -> PluginBuilder {
             op_model_get,
         )
         // ---- dataset ops ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<DatasetSearchInput>(
                 "huggingface.dataset.search",
                 "Search the Hugging Face Hub for datasets (GET /api/datasets).",
             ),
             op_dataset_search,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DatasetGetInput>(
                 "huggingface.dataset.get",
                 "Get metadata for a single Hugging Face dataset repo (GET /api/datasets/{repo_id}).",
@@ -197,7 +197,7 @@ fn manifest_builder() -> PluginBuilder {
             op_dataset_get,
         )
         // ---- space ops ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<SpaceSearchInput>(
                 "huggingface.space.search",
                 "Search the Hugging Face Hub for spaces (GET /api/spaces).",
@@ -205,7 +205,7 @@ fn manifest_builder() -> PluginBuilder {
             op_space_search,
         )
         // ---- identity ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<WhoamiInput>(
                 "huggingface.whoami",
                 "Show the identity associated with the stored Hugging Face token (GET /api/whoami-v2).",
@@ -213,14 +213,14 @@ fn manifest_builder() -> PluginBuilder {
             op_whoami,
         )
         // ---- inference ----
-        .operation(
+        .operation_flexible(
             write_op_typed::<ChatInput>(
                 "huggingface.chat",
                 "Run a chat completion via the Hugging Face inference router (OpenAI-compatible POST /v1/chat/completions, non-streaming).",
             ),
             op_chat,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<EmbedInput>(
                 "huggingface.embed",
                 "Create embeddings via the Hugging Face inference router (OpenAI-compatible POST /v1/embeddings).",
@@ -540,8 +540,8 @@ fn req_str(input: &Value, key: &str) -> Result<String, String> {
 // Entry point.
 // ---------------------------------------------------------------------------
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

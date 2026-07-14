@@ -222,42 +222,42 @@ fn manifest_builder() -> PluginBuilder {
             capabilities: vec!["search".into()],
             entity_schema: None,
         })
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "sql.test",
                 "Test SQL endpoint connectivity with a SELECT 1 round trip; reports the server version.",
             ),
             op_test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<QueryInput>(
                 "sql.query",
                 "Run a bounded, read-only SQL query (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH only) against the endpoint.",
             ),
             op_query,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DatabaseListInput>(
                 "sql.database.list",
                 "List databases and the connected database's non-system schemas.",
             ),
             op_database_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<TableListInput>(
                 "sql.table.list",
                 "List tables (optionally views) with a cheap row estimate where the engine keeps statistics.",
             ),
             op_table_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<TableShowInput>(
                 "sql.table.show",
                 "Describe a table: columns with types and nullability, the primary key, and foreign keys.",
             ),
             op_table_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<IndexListInput>(
                 "sql.index.list",
                 "List indexes across a schema or for one table, with columns and uniqueness.",
@@ -266,8 +266,8 @@ fn manifest_builder() -> PluginBuilder {
         )
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ===========================================================================

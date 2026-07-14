@@ -148,7 +148,7 @@ fn manifest_builder() -> PluginBuilder {
                 "onepassword.file.content",
             ],
         ))
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>(
                     "onepassword.heartbeat",
@@ -158,7 +158,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_heartbeat,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>(
                     "onepassword.health",
@@ -168,7 +168,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_health,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>(
                     "onepassword.activity.list",
@@ -178,21 +178,21 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_activity_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<EmptyInput>("onepassword.vault.list", "List 1Password vaults."),
                 GROUP_VAULTS,
             ),
             op_vault_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<VaultInput>("onepassword.vault.show", "Show one 1Password vault."),
                 GROUP_VAULTS,
             ),
             op_vault_show,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<ItemListInput>(
                     "onepassword.item.list",
@@ -202,7 +202,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_item_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<ItemInput>(
                     "onepassword.item.show",
@@ -212,7 +212,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_item_show,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<ItemCreateInput>(
                     "onepassword.item.create",
@@ -222,7 +222,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_item_create,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<ItemReplaceInput>(
                     "onepassword.item.replace",
@@ -232,7 +232,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_item_replace,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 write_op_typed::<ItemPatchInput>(
                     "onepassword.item.patch",
@@ -242,7 +242,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_item_patch,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 risked(
                     write_op_typed::<ItemInput>(
@@ -255,7 +255,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_item_delete,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<ItemInput>(
                     "onepassword.file.list",
@@ -265,7 +265,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_file_list,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<FileInput>(
                     "onepassword.file.show",
@@ -275,7 +275,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             op_file_show,
         )
-        .operation(
+        .operation_flexible(
             grouped(
                 read_op_typed::<FileContentInput>(
                     "onepassword.file.content",
@@ -287,8 +287,8 @@ fn manifest_builder() -> PluginBuilder {
         )
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 fn req(input: &Value, key: &str) -> Result<String, String> {

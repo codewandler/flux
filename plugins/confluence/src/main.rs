@@ -310,105 +310,105 @@ fn manifest_builder() -> PluginBuilder {
         })
         .datasource(ds("confluence.pages", "confluence.page", "Confluence pages."))
         .datasource(ds("confluence.users", "confluence.user", "Confluence users."))
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "confluence.test",
                 "Test Confluence authentication by fetching the current user.",
             ),
             test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<IndexBuildInput>(
                 "confluence.index.build",
                 "Build Confluence page and user index records (contributes to the datasource index).",
             ),
             index_build,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AttachmentAddInput>(
                 "confluence.page.attachment.add",
                 "Upload an attachment to a Confluence page from a host blob ref or base64 content_bytes.",
             ),
             attachment_add,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<AttachmentListInput>(
                 "confluence.page.attachment.list",
                 "List the attachments on a Confluence page.",
             ),
             attachment_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<AttachmentGetInput>(
                 "confluence.attachment.get",
                 "Download a Confluence attachment into a host blob (or return its metadata).",
             ),
             attachment_get,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AttachmentDeleteInput>(
                 "confluence.attachment.delete",
                 "Delete a Confluence attachment.",
             ),
             attachment_delete,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<PageCreateInput>(
                 "confluence.page.create",
                 "Create a Confluence page from Markdown (body_markdown) or storage XHTML (body_storage).",
             ),
             page_create,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<PageUpdateInput>(
                 "confluence.page.update",
                 "Update a page's title and/or body (replaces the whole body), bumping the version.",
             ),
             page_update,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<PageDeleteInput>(
                 "confluence.page.delete",
                 "Delete a Confluence page.",
             ),
             page_delete,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PageSearchInput>(
                 "confluence.page.search",
                 "Search Confluence pages with CQL (or a text/title query).",
             ),
             page_search,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PageListInput>(
                 "confluence.page.list",
                 "List Confluence pages, filterable by space and title; returns next_start for pagination.",
             ),
             page_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PageShowInput>(
                 "confluence.page.show",
                 "Show one page by id with its body as Markdown (body_format selects markdown/storage/both).",
             ),
             page_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<CommentListInput>(
                 "confluence.page.comment.list",
                 "List the comments on a Confluence page as Markdown; returns next_start and has_more.",
             ),
             comment_list,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<CommentAddInput>(
                 "confluence.page.comment.add",
                 "Add a comment to a Confluence page (Markdown or storage XHTML).",
             ),
             comment_add,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<UserSearchInput>(
                 "confluence.user.search",
                 "Search Confluence users (returns the current user when no query is given).",
@@ -2306,8 +2306,8 @@ fn user_search(input: Value, host: &mut Host) -> Result<Value, String> {
     Ok(json!({ "users": users, "count": users.len() }))
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 #[cfg(test)]

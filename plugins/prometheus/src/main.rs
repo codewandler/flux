@@ -121,14 +121,14 @@ fn manifest_builder() -> PluginBuilder {
             "prometheus.alert",
             "Prometheus active alerts.",
         ))
-        .operation(read_op_typed::<TestInput>("prometheus.test", "Check whether the Prometheus endpoint is reachable and ready."), test)
-        .operation(read_op_typed::<QueryInput>("prometheus.query", "Evaluate a PromQL expression at a single instant (optionally at `time`)."), query)
-        .operation(read_op_typed::<QueryRangeInput>("prometheus.query_range", "Evaluate a PromQL expression over a time range at a fixed step."), query_range)
-        .operation(read_op_typed::<LabelsInput>("prometheus.labels", "List label names, or the values of one `label`; narrow with `match` selectors."), labels)
-        .operation(read_op_typed::<SeriesInput>("prometheus.series", "List the series (label sets) matching one or more PromQL selectors."), series)
-        .operation(read_op_typed::<TargetsInput>("prometheus.targets", "List the scrape targets and their health (state: active|dropped|any)."), targets)
-        .operation(read_op_typed::<RulesInput>("prometheus.rules", "List alerting and recording rules with state and health (type: alert|record to filter)."), rules)
-        .operation(read_op_typed::<AlertsInput>("prometheus.alerts", "List the currently active alerts."), alerts)
+        .operation_flexible(read_op_typed::<TestInput>("prometheus.test", "Check whether the Prometheus endpoint is reachable and ready."), test)
+        .operation_flexible(read_op_typed::<QueryInput>("prometheus.query", "Evaluate a PromQL expression at a single instant (optionally at `time`)."), query)
+        .operation_flexible(read_op_typed::<QueryRangeInput>("prometheus.query_range", "Evaluate a PromQL expression over a time range at a fixed step."), query_range)
+        .operation_flexible(read_op_typed::<LabelsInput>("prometheus.labels", "List label names, or the values of one `label`; narrow with `match` selectors."), labels)
+        .operation_flexible(read_op_typed::<SeriesInput>("prometheus.series", "List the series (label sets) matching one or more PromQL selectors."), series)
+        .operation_flexible(read_op_typed::<TargetsInput>("prometheus.targets", "List the scrape targets and their health (state: active|dropped|any)."), targets)
+        .operation_flexible(read_op_typed::<RulesInput>("prometheus.rules", "List alerting and recording rules with state and health (type: alert|record to filter)."), rules)
+        .operation_flexible(read_op_typed::<AlertsInput>("prometheus.alerts", "List the currently active alerts."), alerts)
 }
 
 fn ds(name: &str, entity: &str, desc: &str) -> Declaration {
@@ -898,8 +898,8 @@ fn contribute_alerts(host: &mut Host, resp: &Value) {
     }
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 #[cfg(test)]

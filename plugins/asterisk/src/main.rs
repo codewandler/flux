@@ -200,35 +200,35 @@ fn manifest_builder() -> PluginBuilder {
             description: "Asterisk AMI port (default 5038)".into(),
         })
         // ---- reads ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<PingInput>(
                 "asterisk.ami.ping",
                 "Ping an Asterisk Manager Interface endpoint and return the greeting + pong.",
             ),
             ami_ping,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ChannelListInput>(
                 "asterisk.channel.list",
                 "List active Asterisk channels (live calls) with state, caller ID, dialplan position, application, and duration.",
             ),
             channel_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PeerListInput>(
                 "asterisk.peer.list",
                 "List Asterisk peers/endpoints (pjsip default, sip, or iax) with registration address and device status.",
             ),
             peer_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<QueueStatusInput>(
                 "asterisk.queue.status",
                 "Show Asterisk call queues: stats, members with status/pause, and waiting callers.",
             ),
             queue_status,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DeviceStateListInput>(
                 "asterisk.devicestate.list",
                 "List Asterisk device states (NOT_INUSE, INUSE, RINGING, …), filterable by device-name substring.",
@@ -236,7 +236,7 @@ fn manifest_builder() -> PluginBuilder {
             devicestate_list,
         )
         // ---- writes (destructive) ----
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<HangupInput>(
                     "asterisk.channel.hangup",
@@ -247,7 +247,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             channel_hangup,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<OriginateInput>(
                     "asterisk.call.originate",
@@ -258,7 +258,7 @@ fn manifest_builder() -> PluginBuilder {
             },
             call_originate,
         )
-        .operation(
+        .operation_flexible(
             {
                 let mut op = write_op_typed::<CommandInput>(
                     "asterisk.command",
@@ -1329,8 +1329,8 @@ fn ami_command(input: Value, host: &mut Host) -> Result<Value, String> {
 // Entry point.
 // ---------------------------------------------------------------------------
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

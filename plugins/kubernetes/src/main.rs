@@ -268,18 +268,18 @@ fn manifest_builder() -> PluginBuilder {
             "Kubernetes namespaces, services, pods, deployments, containers, and ingresses.",
         ))
         // --- cluster discovery -------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<ClusterListInput>("kubernetes.cluster.list", "List kubeconfig contexts."),
             cluster_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ClusterTestInput>(
                 "kubernetes.test",
                 "Probe Kubernetes cluster reachability through kubeconfig.",
             ),
             cluster_test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<EndpointDiscoverInput>(
                 "kubernetes.endpoint.discover",
                 "Discover product endpoints as weak references (URL + credential location, never a \
@@ -297,7 +297,7 @@ fn manifest_builder() -> PluginBuilder {
             endpoint_discover,
         )
         // --- secrets (sensitive) ----------------------------------------------
-        .operation(
+        .operation_flexible(
             op_spec_typed::<SecretReadInput>(
                 "kubernetes.secret.read",
                 "Read one Kubernetes secret's decoded values. Sensitive: the result is secret \
@@ -309,33 +309,33 @@ fn manifest_builder() -> PluginBuilder {
             secret_read,
         )
         // --- inventory ---------------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryListInput>("kubernetes.namespace.list", "List Kubernetes namespaces."),
             namespace_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.service.list",
                 "List Kubernetes services (all namespaces unless `namespace` is set).",
             ),
             service_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryShowInput>("kubernetes.service.show", "Show one Kubernetes service."),
             service_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.pod.list",
                 "List Kubernetes pods (all namespaces unless `namespace` is set).",
             ),
             pod_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryShowInput>("kubernetes.pod.show", "Show one Kubernetes pod."),
             pod_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PodLogsInput>(
                 "kubernetes.pod.logs",
                 "Read bounded logs for one Kubernetes pod (by name) or label selector.",
@@ -343,7 +343,7 @@ fn manifest_builder() -> PluginBuilder {
             pod_logs,
         )
         // --- port-forward (held by the host's managed-process registry) --------
-        .operation(
+        .operation_flexible(
             op_spec_typed::<PortForwardStartInput>(
                 "kubernetes.portforward.start",
                 "Start a managed Kubernetes port-forward for a service, pod, or deployment. The \
@@ -356,7 +356,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             portforward_start,
         )
-        .operation(
+        .operation_flexible(
             op_spec_typed::<PortForwardStopInput>(
                 "kubernetes.portforward.stop",
                 "Stop a managed Kubernetes port-forward by ID (the `id` returned by \
@@ -367,7 +367,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             portforward_stop,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PortForwardListInput>(
                 "kubernetes.portforward.list",
                 "List the managed Kubernetes port-forwards this plugin started, each probed for \
@@ -376,18 +376,18 @@ fn manifest_builder() -> PluginBuilder {
             portforward_list,
         )
         // --- deployments -------------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.deployment.list",
                 "List Kubernetes deployments (all namespaces unless `namespace` is set).",
             ),
             deployment_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryShowInput>("kubernetes.deployment.show", "Show one Kubernetes deployment."),
             deployment_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DeploymentHistoryInput>(
                 "kubernetes.deployment.history",
                 "List a deployment's rollout revisions (ReplicaSets, newest first) with images, \
@@ -395,7 +395,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             deployment_history,
         )
-        .operation(
+        .operation_flexible(
             op_spec_typed::<DeploymentScaleInput>(
                 "kubernetes.deployment.scale",
                 "Scale a Kubernetes deployment to a desired replica count.",
@@ -405,7 +405,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             deployment_scale,
         )
-        .operation(
+        .operation_flexible(
             op_spec_typed::<DeploymentRestartInput>(
                 "kubernetes.deployment.restart",
                 "Rolling-restart a Kubernetes deployment (kubectl rollout restart).",
@@ -416,28 +416,28 @@ fn manifest_builder() -> PluginBuilder {
             deployment_restart,
         )
         // --- ingresses / containers / nodes -----------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.ingress.list",
                 "List Kubernetes ingresses (all namespaces unless `namespace` is set).",
             ),
             ingress_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.container.list",
                 "List Kubernetes containers derived from pods.",
             ),
             container_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InventoryShowInput>(
                 "kubernetes.container.show",
                 "Show one Kubernetes container (by name) derived from a pod.",
             ),
             container_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<EventListInput>(
                 "kubernetes.event.list",
                 "List Kubernetes events (newest-first via the API), filterable by namespace, \
@@ -445,7 +445,7 @@ fn manifest_builder() -> PluginBuilder {
             ),
             event_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<NodeListInput>(
                 "kubernetes.node.list",
                 "List Kubernetes nodes with readiness, roles, kubelet version, and capacity.",
@@ -453,7 +453,7 @@ fn manifest_builder() -> PluginBuilder {
             node_list,
         )
         // --- exec (sensitive) --------------------------------------------------
-        .operation(
+        .operation_flexible(
             op_spec_typed::<PodExecInput>(
                 "kubernetes.pod.exec",
                 "Run a one-shot command in a pod container and return bounded stdout/stderr with \
@@ -486,6 +486,7 @@ fn op_spec_typed<T: JsonSchema + 'static>(
     idempotency: Idempotency,
 ) -> OperationSpec {
     OperationSpec {
+        public_name: None,
         name: name.into(),
         description: description.into(),
         input_schema: op_input_schema::<T>(),
@@ -2180,8 +2181,8 @@ fn contribute_simple(
     }
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 #[cfg(test)]

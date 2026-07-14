@@ -164,14 +164,14 @@ fn manifest_builder() -> PluginBuilder {
             "EC2 instances searchable by Name tag.",
         ))
         // --- connectivity / setup ---------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "aws.test",
                 "Verify AWS connectivity and credential validity via STS GetCallerIdentity.",
             ),
             aws_test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<InspectInput>(
                 "aws.inspect",
                 "Inspect non-secret AWS environment configuration and credential presence \
@@ -180,7 +180,7 @@ fn manifest_builder() -> PluginBuilder {
             aws_inspect,
         )
         // --- EC2 ---------------------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<Ec2InstancesInput>(
                 "aws.ec2.instances",
                 "List EC2 instances with Name-tag wildcard and state filters.",
@@ -188,7 +188,7 @@ fn manifest_builder() -> PluginBuilder {
             ec2_instances,
         )
         // --- EKS ---------------------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<EksClustersInput>(
                 "aws.eks.clusters",
                 "List and describe EKS clusters (version, status, endpoint, VPC).",
@@ -196,7 +196,7 @@ fn manifest_builder() -> PluginBuilder {
             eks_clusters,
         )
         // --- RDS ---------------------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<RdsInstancesInput>(
                 "aws.rds.instances",
                 "List RDS/Aurora clusters (writer/reader endpoints, members) and database instances.",
@@ -204,14 +204,14 @@ fn manifest_builder() -> PluginBuilder {
             rds_instances,
         )
         // --- S3 ----------------------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<S3BucketsInput>(
                 "aws.s3.buckets",
                 "List S3 buckets, optionally filtered by name prefix.",
             ),
             s3_buckets,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<S3ObjectsInput>(
                 "aws.s3.objects",
                 "List S3 objects under a prefix with continuation-token pagination.",
@@ -219,21 +219,21 @@ fn manifest_builder() -> PluginBuilder {
             s3_objects,
         )
         // --- CloudWatch Logs ---------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<LogsGroupsInput>(
                 "aws.logs.groups",
                 "List CloudWatch log groups with retention and size.",
             ),
             logs_groups,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<LogsTailInput>(
                 "aws.logs.tail",
                 "Read recent events from a CloudWatch log group (FilterLogEvents over a time window).",
             ),
             logs_tail,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<LogsQueryInput>(
                 "aws.logs.query",
                 "Run a bounded CloudWatch Logs Insights query and wait for its results.",
@@ -241,7 +241,7 @@ fn manifest_builder() -> PluginBuilder {
             logs_query,
         )
         // --- CloudWatch Metrics ------------------------------------------------
-        .operation(
+        .operation_flexible(
             read_op_typed::<CloudWatchMetricsInput>(
                 "aws.cloudwatch.metrics",
                 "Fetch one CloudWatch metric series (GetMetricData) over a time window.",
@@ -1550,8 +1550,8 @@ impl HostExt for Host<'_> {
 // main
 // ---------------------------------------------------------------------------
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

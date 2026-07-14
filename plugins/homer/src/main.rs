@@ -186,56 +186,56 @@ fn manifest_builder() -> PluginBuilder {
             "Homer RTCP QoS stream metrics.",
         ))
         // ─── ops ──────────────────────────────────────────────────────────
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "homer.test",
                 "Probe reachability and JWT authentication against a Homer instance.",
             ),
             op_test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<SearchInput>(
                 "homer.search",
                 "Search SIP messages by number, from_user, to_user, method, Call-ID, or a query DSL. Contributes message records.",
             ),
             op_search,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<CallListInput>(
                 "homer.call.list",
                 "List calls grouped by Call-ID; same filters as homer.search. Contributes call-summary records.",
             ),
             op_call_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<CallShowInput>(
                 "homer.call.show",
                 "Ordered SIP flow for one or more Call-IDs, with SDP annotations and optional raw messages.",
             ),
             op_call_show,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<CallQosInput>(
                 "homer.call.qos",
                 "Per-stream QoS from RTCP (packet loss, jitter, MOS). Contributes stream-metric records.",
             ),
             op_call_qos,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<CallAnalyzeInput>(
                 "homer.call.analyze",
                 "Multi-leg call analysis via a correlation SIP header; fan-out from a seed call_id.",
             ),
             op_call_analyze,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PcapExportInput>(
                 "homer.pcap.export",
                 "Export call messages as PCAP; stores bytes via blob_put and returns the blob ref.",
             ),
             op_pcap_export,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<AliasListInput>(
                 "homer.alias.list",
                 "List IP/port aliases configured in Homer. Contributes alias records.",
@@ -1773,8 +1773,8 @@ fn op_alias_list(_input: Value, host: &mut Host) -> Result<Value, String> {
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────

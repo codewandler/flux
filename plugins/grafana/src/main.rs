@@ -269,7 +269,7 @@ fn manifest_builder() -> PluginBuilder {
             "Grafana annotations.",
         ))
         // ---- connectivity / auth ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "grafana.test",
                 "Probe Grafana reachability (/api/health, no auth) then credential validity (/api/org).",
@@ -277,14 +277,14 @@ fn manifest_builder() -> PluginBuilder {
             op_test,
         )
         // ---- datasources ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<DatasourceListInput>(
                 "grafana.datasource.list",
                 "List Grafana datasources with derived cluster aliases.",
             ),
             op_datasource_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DatasourceHealthInput>(
                 "grafana.datasource.health",
                 "Check health of one Grafana datasource by UID.",
@@ -292,21 +292,21 @@ fn manifest_builder() -> PluginBuilder {
             op_datasource_health,
         )
         // ---- folders / dashboards ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<FolderListInput>(
                 "grafana.folder.list",
                 "List Grafana folders.",
             ),
             op_folder_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DashboardListInput>(
                 "grafana.dashboard.list",
                 "Search Grafana dashboards; optionally filter by query, folder_uid, or tags.",
             ),
             op_dashboard_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<DashboardGetInput>(
                 "grafana.dashboard.get",
                 "Fetch a Grafana dashboard by UID and extract panel target queries.",
@@ -314,14 +314,14 @@ fn manifest_builder() -> PluginBuilder {
             op_dashboard_get,
         )
         // ---- annotations ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<AnnotationListInput>(
                 "grafana.annotation.list",
                 "List Grafana annotations; filter by tags, dashboard_uid, and time window.",
             ),
             op_annotation_list,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AnnotationAddInput>(
                 "grafana.annotation.add",
                 "Create a Grafana annotation.",
@@ -329,21 +329,21 @@ fn manifest_builder() -> PluginBuilder {
             op_annotation_add,
         )
         // ---- Loki (proxied) ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<LokiLabelsInput>(
                 "grafana.loki.labels",
                 "List Loki labels (or values for one label) through the Grafana datasource proxy.",
             ),
             op_loki_labels,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<LokiQueryInput>(
                 "grafana.loki.query",
                 "Run a Loki range query through the Grafana datasource proxy.",
             ),
             op_loki_query,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<LokiRecentLogsInput>(
                 "grafana.loki.recent_logs",
                 "Query recent Loki logs by cluster, app, namespace, and optional contains filter.",
@@ -351,21 +351,21 @@ fn manifest_builder() -> PluginBuilder {
             op_loki_recent_logs,
         )
         // ---- Prometheus (proxied) ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<PrometheusQueryInput>(
                 "grafana.prometheus.query",
                 "Run an instant Prometheus query through the Grafana datasource proxy.",
             ),
             op_prometheus_query,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PrometheusRangeInput>(
                 "grafana.prometheus.range",
                 "Run a Prometheus range query through the Grafana datasource proxy.",
             ),
             op_prometheus_range,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<PrometheusRulesInput>(
                 "grafana.prometheus.rules",
                 "List Prometheus alerting and recording rules through the Grafana datasource proxy.",
@@ -373,28 +373,28 @@ fn manifest_builder() -> PluginBuilder {
             op_prometheus_rules,
         )
         // ---- Alertmanager (proxied) ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<AlertsActiveInput>(
                 "grafana.alerts.active",
                 "List active Alertmanager alerts through the Grafana datasource proxy.",
             ),
             op_alerts_active,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<AlertsSilencesListInput>(
                 "grafana.alerts.silences.list",
                 "List Alertmanager silences through the Grafana datasource proxy.",
             ),
             op_alerts_silences_list,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AlertsSilencesCreateInput>(
                 "grafana.alerts.silences.create",
                 "Create an Alertmanager silence through the Grafana datasource proxy.",
             ),
             op_alerts_silences_create,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AlertsSilencesDeleteInput>(
                 "grafana.alerts.silences.delete",
                 "Delete an Alertmanager silence through the Grafana datasource proxy.",
@@ -402,14 +402,14 @@ fn manifest_builder() -> PluginBuilder {
             op_alerts_silences_delete,
         )
         // ---- Tempo (proxied) ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<TempoSearchInput>(
                 "grafana.tempo.search",
                 "Search Tempo traces through the Grafana datasource proxy.",
             ),
             op_tempo_search,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<TempoTraceGetInput>(
                 "grafana.tempo.trace.get",
                 "Fetch a Tempo trace by ID through the Grafana datasource proxy.",
@@ -2186,8 +2186,8 @@ fn op_tempo_trace_get(input: Value, host: &mut Host) -> Result<Value, String> {
     }))
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

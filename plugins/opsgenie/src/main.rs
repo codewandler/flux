@@ -121,7 +121,7 @@ fn manifest_builder() -> PluginBuilder {
             "Opsgenie alerts.",
         ))
         // ---- auth test ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "opsgenie.test",
                 "Validate the Opsgenie API key and report account name, user count, and plan.",
@@ -129,14 +129,14 @@ fn manifest_builder() -> PluginBuilder {
             op_test,
         )
         // ---- alert reads ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<AlertListInput>(
                 "opsgenie.alert.list",
                 "List Opsgenie alerts (newest first) using the Opsgenie query language. Contributes records.",
             ),
             op_alert_list,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<AlertGetInput>(
                 "opsgenie.alert.get",
                 "Show one Opsgenie alert by id, alias, or tiny id — full details, status, owner, acknowledgement state.",
@@ -144,21 +144,21 @@ fn manifest_builder() -> PluginBuilder {
             op_alert_get,
         )
         // ---- alert writes ----
-        .operation(
+        .operation_flexible(
             write_op_typed::<AlertActionInput>(
                 "opsgenie.alert.ack",
                 "Acknowledge an Opsgenie alert (stops escalation). The API is async — returns Accepted + RequestId.",
             ),
             op_alert_ack,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AlertActionInput>(
                 "opsgenie.alert.close",
                 "Close an Opsgenie alert, optionally with a note. The API is async — returns Accepted + RequestId.",
             ),
             op_alert_close,
         )
-        .operation(
+        .operation_flexible(
             write_op_typed::<AlertNoteInput>(
                 "opsgenie.alert.note",
                 "Add a note to an Opsgenie alert. The API is async — returns Accepted + RequestId.",
@@ -166,14 +166,14 @@ fn manifest_builder() -> PluginBuilder {
             op_alert_note,
         )
         // ---- schedules / on-call ----
-        .operation(
+        .operation_flexible(
             read_op_typed::<OnCallInput>(
                 "opsgenie.oncall",
                 "Who is on call right now: every enabled schedule with its current on-call participants. Optionally filter by schedule name.",
             ),
             op_oncall,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<ScheduleListInput>(
                 "opsgenie.schedule.list",
                 "List Opsgenie schedules with id, name, timezone, and enabled state.",
@@ -653,8 +653,8 @@ fn op_oncall(input: Value, host: &mut Host) -> Result<Value, String> {
 // main
 // ---------------------------------------------------------------------------
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 // ---------------------------------------------------------------------------

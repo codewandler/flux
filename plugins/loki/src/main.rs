@@ -156,21 +156,21 @@ fn manifest_builder() -> PluginBuilder {
             "Loki log entries.",
         ))
         .datasource(ds("loki.labels", "loki.label", "Loki label names or values."))
-        .operation(
+        .operation_flexible(
             read_op_typed::<TestInput>(
                 "loki.test",
                 "Check Loki readiness (GET /ready) and report latency.",
             ),
             test,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<QueryInput>(
                 "loki.query",
                 "Run a LogQL stream query over a time window (query_range) and return the matching log entries.",
             ),
             query,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<MetricInput>(
                 "loki.metric",
                 "Run a LogQL metric query over a window (query_range, matrix result) — one call for rate/count \
@@ -178,14 +178,14 @@ fn manifest_builder() -> PluginBuilder {
             ),
             metric,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<LabelsInput>(
                 "loki.labels",
                 "List Loki label names, or the values of one label.",
             ),
             labels,
         )
-        .operation(
+        .operation_flexible(
             read_op_typed::<RecentLogsInput>(
                 "loki.recent_logs",
                 "Query recent logs by app, pod, container, namespace, or text filter (builds the LogQL selector for you).",
@@ -891,8 +891,8 @@ fn contribute_labels(host: &mut Host, label: &str, values: &[String]) {
     }
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 #[cfg(test)]
