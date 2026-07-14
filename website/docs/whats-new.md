@@ -12,6 +12,60 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Plugin authors can bind an operation directly to typed input and output.** Flux generates both
+  schemas, reports the exact bad field when decoding fails, and uses the same normalized input for a
+  preview and the real call. Guest-only builds also avoid pulling in the host's HTTP, credential,
+  scripting, signing, and installer stacks.
+
+### Improved
+
+- **Web search now has one canonical `web.search` operation.** It uses Tavily when a host
+  credential is configured and falls back to DuckDuckGo without a key, while keeping credentials
+  out of model-visible inputs and results.
+- **Embedded applications now preserve their configured workspace and integration environment when
+  agents are created lazily**, so eager and lazy runs use the same root, authorization, redaction,
+  specialist, plugin, and endpoint setup.
+
+### Fixed
+
+- **Concurrent, resumed, and cancelled agent work is now isolated cleanly.** Fresh and resumed turns
+  share the same lifecycle, one agent instance cannot overlap its own mutable turn state, cancelled
+  specialists are reaped, and concurrent app deliveries cannot steal or duplicate cascade results.
+- **Private A2A notification webhooks can no longer redirect credentials or change destination
+  after approval.** Flux rechecks DNS on every delivery, rejects redirects, and requires an exact
+  private-host grant instead of a blanket local-network switch.
+- **Project instructions, roles, skills, and config can no longer escape the workspace through a
+  symlink or absolute path.** Trusted user-global configuration remains supported separately.
+- **Bedrock setup is now lazy and refreshable.** Creating a provider no longer resolves or exports
+  AWS credentials, works safely inside an existing async runtime, and refreshes temporary SSO or
+  workload credentials near expiry.
+- **Duplicate operation names now stop with a source-labelled error** instead of silently replacing
+  the earlier handler in a built-in or plugin catalog.
+- **Token usage reported before a failed or cancelled cognition call is no longer lost.** Billing,
+  usage totals, and cost projections retain it once without hiding the original failure.
+- **Malformed, unreadable, or duplicate specialist roles now fail with their source path** instead
+  of being skipped or accidentally inheriting the parent's operations.
+- **Automatic approval no longer bypasses authorization.** Database writes, deletes, payments,
+  external sends, and exact filesystem, network, process, datasource, secret, and provider resources
+  are checked against the caller's grants before any approval decision can execute them.
+
+### Action needed
+
+- **Embedded multi-principal hosts must pass caller identity into each agent turn.** Replace
+  `Executor::set_identity` or `IdentityCell::set` with a `TurnIdentity` passed to
+  `FlowEngine::run_turn_as` / `run_turn_cancellable_as` (or the authored-flow equivalents). This
+  prevents one request from changing another in-flight turn's authorization identity.
+- **If you send A2A notifications to a private host, list each hostname in
+  `FLUX_A2A_PUSH_PRIVATE_HOSTS`.** `FLUX_A2A_PUSH_ALLOW_LOCAL=1` now grants only `localhost`,
+  `127.0.0.1`, and `::1`.
+- **`web.search` no longer accepts an `api_key` input.** Configure `TAVILY_API_KEY` on the host, or
+  rely on the keyless DuckDuckGo fallback, and ensure the first-party web-search integration is
+  installed.
+- **Fix invalid or duplicate role files before starting an agent.** Unknown frontmatter keys and
+  malformed `tools`, effort, or loop settings are now rejected rather than ignored.
+
 ## [0.24.0] - 2026-07-14
 
 ### Improved

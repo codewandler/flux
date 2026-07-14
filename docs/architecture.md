@@ -31,7 +31,8 @@ the *surfaces* (CLI/TUI/server/SDK).
 Why this matters: it keeps the safety core (L0–L2) small and auditable, and makes "route around the
 envelope" structurally hard. Notable rules that fall out:
 - **`flux-runtime` (L2) does not depend on `flux-auth` (L5).** Surfaces resolve identity
-  (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)` and inject it via `Executor::with_identity`.
+  (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)`, pair it with the policy in an atomic
+  `ExecutionAuthorization`, and pass that through `ExecutionEnvironment`.
 - `flux-evidence`, `flux-skill`, `flux-config`, and `flux-lang` are L0 leaves on purpose, so
   runtime/agent crates may depend on them without a layering violation. `flux-lang` is the language
   **and its reference interpreter** — it uses async but takes all effects (op dispatch, value store,
@@ -112,6 +113,24 @@ substrate the flow engine executes against:
 capability-scope floor → pre-tool hooks → authorization policy (default-deny) → permission rules → approval gate → guarded IO
 ```
 
+Every production `Executor` is constructed with a non-optional `ExecutionAuthorization`: an
+`AuthorizationPolicy`, `Caller`, and `Trust`. Embedded surfaces pass that profile explicitly;
+`Executor::new` selects the documented local-user profile rather than omitting policy. Approval is
+therefore always layered over an authorization floor and cannot widen it.
+
+Automatic repository metadata uses a narrower boundary than model-facing tool access: project
+context, config, skills, and roles are confined to the repository even when the operator widens the
+tool workspace. Trusted user-global control-plane roots are separate, explicit APIs. The complete
+boundary is documented in [project metadata IO](designs/project-metadata-io.md).
+
+CLI, App, SDK, and `AgentSpec` turn their surface-specific choices into an `Executor` through one
+`ExecutionEnvironment`, keeping the resolved workspace, catalog, approval policy, authorization,
+redactor, spawner, and hooks together. See
+[shared execution-environment assembly](designs/execution-environment-assembly.md).
+The assembled identity is immutable. Multi-principal surfaces pass a request-owned `TurnIdentity`
+to `FlowEngine::run_turn_as` (or its cancellable/authored counterpart); the engine installs it
+lexically after acquiring its own turn gate, and spawned children inherit that frozen snapshot.
+
 1. **Capability-scope floor** — checked first, before hooks and policy: when a `with_tools` block is
    active, its tool-name allowlist must contain the op or the dispatch is refused outright (recorded
    as `cap_scope_denied` evidence). Scopes stack as narrow-only intersections — including into
@@ -119,12 +138,18 @@ capability-scope floor → pre-tool hooks → authorization policy (default-deny
    policy, never looser. No active scope is a strict no-op.
 2. **Pre-tool hooks** may observe / modify the input / deny the call (and short-circuit everything
    below). JS hooks run with a wall-clock interrupt so a runaway hook fails closed.
-3. **Authorization policy** (`flux-policy`, pure, default-deny): the tool's declared `effects` +
-   permission subjects are translated into `(action, resource)` requests and evaluated against grants
-   (subjects × resources × actions, gated by trust + scopes). A `Deny` short-circuits; an
+3. **Authorization policy** (`flux-policy`, pure, default-deny): each concrete call produces typed
+   `(action, resource)` requirements from one tool-owned contract — workspace paths, datasources,
+   network destinations, connection targets, providers, and semantic actions do not collapse into a
+   generic read/write bucket. Dispatch and whole-plan preview consume the same requirements; unknown
+   semantic effects and inconsistent effect/access declarations fail closed during registration. The
+   requirements are evaluated against grants (subjects × resources × actions, gated by trust +
+   scopes). A `Deny` short-circuits; an
    `ApprovalRequired` (e.g. a grant marked `requires_approval`) forces the approval gate below — the
    policy is the floor, permission rules can't widen past it. A usable `default_local_grants()` keeps
    the local user working out of the box.
+   The complete action/resource vocabulary and fail-closed derivation rules are pinned in
+   [typed authority requirements](designs/typed-authority-requirements.md).
 4. **Permission rules** (coder-style ergonomics layered on the policy): `Bash(git:*)`, `read`, etc.,
    deny-first then allow, otherwise prompt. "Always-allow" choices persist to `.flux/config.toml`.
 5. **Approval gate**: forced for destructive intents, `Risk::Destructive`, policy `ApprovalRequired`,

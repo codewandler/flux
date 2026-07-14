@@ -148,9 +148,15 @@ never base64 in-plugin, never read the token from env — declare the scheme and
 3. **Never read env directly** — you can't (it's cleared), and you shouldn't. Ask the host via the
    declared `secret`/`config` names; endpoints resolve host-side — address them by reference.
 4. **Never hand-roll auth** — declare an `AuthScheme` and pass the purpose; the host injects.
-5. **Pick real effects** — every op is `read_op` (`[Read]`, idempotent) or `write_op`
-   (`[Write, Network]`); a write/destructive op sets `Risk`. An empty-effects op is forced through
-   approval as a conservative `[Process, Network]` — never ship one by accident.
+5. **Pick real effects and authority** — every closed op starts from `read_op_typed` (`[Read]`,
+   idempotent) or `write_op_typed` (`[Write, Network]`); the raw `read_op`/`write_op` constructors
+   remain for the explicit flexible adapter. A write/destructive op sets `Risk`. Effects disclose
+   scheduling and risk, while the manifest's declared `http`/`process`/`conn`/`secret`/datasource
+   capabilities provide the typed resource requirements enforced by policy. Stable semantic effects
+   (`write_db`, `send_external`, `delete`, `money`, `calendar`) add their own action requirement.
+   Missing or inconsistent access declarations and unknown semantic effects reject the operation
+   before it is advertised. An empty-effects op is forced through approval as a conservative
+   `[Process, Network]` — never ship one by accident.
 6. **Contribute knowledge** — for list ops, `host.contribute(&records)` so results feed the search
    index (optional but expected where natural).
 7. **Test hermetically** — one `MockHost` test per op (below). No network/subprocess in unit tests.
@@ -170,26 +176,58 @@ never base64 in-plugin, never read the token from env — declare the scheme and
 Edit `plugins/<name>/src/main.rs` (reference: `plugins/gitlab/src/main.rs` for HTTP,
 `plugins/kubernetes/src/main.rs` for process). For each op:
 
-1. **Declare** in `manifest_builder()`: `.operation(read_op|write_op("<name>", "<desc>", json!(<schema>)), <handler>)`,
-   plus any new `Caps.secrets`, `EndpointSpec`, `AuthMethod`, or `.datasource(...)`.
-   Declare the result shape with the `with_output_schema(read_op(...), json!(<schema>))` combinator
-   (or `PluginBuilder::map_operations(...)` for schemas generated in bulk from an external contract)
-   when the successful result has a stable JSON shape — it is the machine-readable return contract
-   used by generated references and is projected unchanged onto the runtime `ToolSpec`. Keep it absent
-   only when the output is genuinely open-ended.
-2. **Handler** `fn <handler>(input: Value, host: &mut Host) -> Result<Value, String>`: validate input,
-   do IO through `host.get_json_ref`/`send_json_ref`/`http_ref`/`http_bytes_ref` (endpoint-reference
-   HTTP) or `run`/`conn_*`/`blob_*`, and for knowledge ops emit `Record`s via `host.contribute`.
+1. **Declare** closed contracts in `manifest_builder()` with
+   `.operation_typed::<Input, Output>(read_op_typed::<Input>("<name>", "<desc>"), <handler>)`
+   (or `write_op_typed`). Derive `Deserialize + Serialize + JsonSchema` on `Input` and
+   `Serialize + JsonSchema` on `Output`; host-kit generates both manifest schemas from those types.
+   Add any new `Caps.secrets`, `EndpointSpec`, `AuthMethod`, or `.datasource(...)` in the same
+   builder. For an intentionally open result, use the explicit `operation_flexible` adapter and
+   attach `with_output_schema(...)` only when a truthful stable envelope can still be described.
+   The legacy value-only `.operation(...)` spelling is deprecated.
+2. **Handler**: accept the typed `Input` and return the typed `Output`. Host-kit reports path-aware
+   decode errors, normalizes serde aliases/defaults before shared preflight, and passes the
+   already-decoded input to the handler. Keep `operation_flexible` only for a deliberately open
+   vendor payload, with the reason documented beside it. Do IO through
+   `host.get_json_ref`/`send_json_ref`/`http_ref`/`http_bytes_ref`
+   (endpoint-reference HTTP) or `run`/`conn_*`/`blob_*`, and for knowledge ops emit `Record`s via
+   `host.contribute`. The per-plugin rollout is tracked in [TYPED-MIGRATION.md](TYPED-MIGRATION.md).
 3. **Test** against a `MockHost` (`with_http`/`with_process`/`with_http_bytes` match by **substring** in
    insertion order — give each canned response a distinguishing substring): assert the returned value
    **and** `host.contributed`.
+4. **Serve fallibly** — make the binary entry point `fn main() -> Result<(), String>` and return
+   `manifest_builder().try_serve()`. The legacy `build`/`serve` wrappers panic on invalid assembly;
+   `try_build`/`try_serve` preserve the duplicate or manifest/handler mismatch as a startup error.
 
-`host-kit` (`plugins/host-kit/src/lib.rs`) is the SDK: `PluginBuilder`, `read_op`/`write_op`, the typed
+Operation names must be unique within a plugin manifest. `PluginBuilder` rejects identical and
+conflicting duplicates before serving; the host also rejects collisions between built-ins, custom
+tools, and multiple installed plugins with both sources in the error. Do not rely on registration
+order as an override mechanism.
+
+`host-kit` (`plugins/host-kit/src/lib.rs`) is the SDK: `PluginBuilder`,
+`operation_typed`/`operation_flexible`, `read_op_typed`/`write_op_typed`, the typed
 `Host` (`secret`/`config`/`http`/`get_json`/`send_json`/`http_bytes`/`http_ref`/`http_bytes_ref`/
 `get_json_ref`/`send_json_ref`/`run`/`process_*`/`conn_*`/`conn_dial_ref`/`conn_authenticate`/
 `credential`/`credential_for_endpoint`/`blob_*`/`contribute`), and `MockHost`. Contract types
 (`AuthMethod`/`AuthScheme`/`OperationSpec`/`PluginCapabilities`) live in `crates/flux-plugin/src/lib.rs`,
 re-exported through host-kit.
+
+`flux-plugin` is feature-partitioned. Guest binaries must use only the protocol SDK:
+
+```toml
+flux-plugin = { version = "0.24", default-features = false, features = ["guest"] }
+```
+
+The `guest` surface contains frames, manifest/operation contracts, `GuestHost`, `PluginHandler`, and
+`serve`; it deliberately excludes the host transport (`reqwest`, credentials, runtime/system), JS
+hooks, and signed-pack installer/archive stack. `host-kit` already selects this configuration, so
+normal first-party plugins inherit the lightweight boundary automatically. The flux host uses the
+default `host + hooks + pack` feature set. Do not enable those host features from a guest to reach
+IO—request IO through a declared host capability instead. At the C-69 cutover the host-kit normal
+dependency tree fell from the review's roughly 237 entries to 80; a structural test keeps excluded
+host packages out and caps accidental tree growth. A clean release build of the representative
+`flux-plugin-alertmanager` binary (empty target directories, same machine and warm source cache)
+fell from 41.106 s / 2,014,936 bytes before the cutover to 15.098 s / 1,608,624 bytes after it, so
+the guest binary is about 20.2% smaller rather than regressing.
 
 ## Gate
 
@@ -201,6 +239,7 @@ cargo build  -p flux-plugin-<name>
 cargo test   -p flux-plugin-<name>
 cargo clippy -p flux-plugin-<name> --all-targets -- -D warnings
 cargo fmt    -p flux-plugin-<name>
+cargo test   -p codewandler-flux-host-kit --test guest_dependency_boundary
 ```
 
 A new plugin is a new member in `plugins/Cargo.toml`. Heavy vendor deps live here, never in the root

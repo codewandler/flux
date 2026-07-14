@@ -6,6 +6,81 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-62: authorization requirements are now typed and resource-specific.** Tool declarations lower
+  to exact filesystem, datasource, network, connection, process, host, secret, and provider actions;
+  `write_db`, `delete`, `money`, and `send_external` semantic effects retain their own authority
+  checks, and unknown authority kinds fail closed during catalog assembly and dispatch.
+- **C-68/C-69: plugin guests gain one typed, lightweight operation API.**
+  `operation_typed<I, O>` derives both schemas, decodes once with field-path errors, and gives
+  dry-run preflight and live dispatch the same normalized value; `operation_flexible` remains the
+  explicit escape hatch for open payloads. The guest feature now excludes host HTTP, credentials,
+  hooks, signing, archive, runtime, and installer dependencies; default host builds retain them.
+
+### Changed
+
+- **BREAKING (A-87): per-turn caller identity is now lexical and engine-owned.**
+  `IdentityCell::set` and `Executor::set_identity` are removed; multi-principal hosts construct a
+  `TurnIdentity` and use `FlowEngine::run_turn_as` / `run_turn_cancellable_as` (or the authored-flow
+  counterparts). The engine freezes that identity only after acquiring its mandatory turn gate, so
+  policy, receipts, audit, and spawned children cannot be retargeted by another request mid-turn.
+- **C-60: every production executor is assembled with an explicit policy and caller identity.**
+  Automatic approval controls only the approval prompt and can no longer widen or replace
+  authorization; local CLI use receives the documented local policy profile.
+- **C-65: architecture gates now resolve the real Cargo graph and parse Rust syntax.** Layer checks
+  include renamed, target-specific, build, and dev dependencies, while guarded-process checks and
+  project-metadata checks detect aliases, multiline calls, and both `std` and Tokio process
+  constructors without comment/string false positives.
+- **C-67: CLI, App, AgentSpec, and SDK assembly now share `ExecutionEnvironment`.** The common value
+  carries the explicit workspace root, authorization identity, redactor, spawner, hooks, plugin
+  catalog, and endpoint registry through eager and lazy construction; deprecated compatibility
+  constructors remain while the split-root lazy-App failure is removed.
+- **C-70: the first-party web-search plugin is the sole owner of `web.search`.** It provides Tavily
+  through host-resolved credentials, falls back to DuckDuckGo without a key, returns typed search
+  results and datasource records, and keeps the public compatibility alias without exposing an API
+  key in the model-facing schema. The redundant native implementation and HTTP dependency were
+  removed from `flux-tools`.
+- **C-71: high-churn surfaces are split into responsibility-focused internal modules.** CLI command
+  families and assembly, App/SDK execution, server A2A task transitions, TUI state/render/terminal
+  control, plugin protocol/host loading, and the largest first-party integrations now have explicit
+  internal boundaries without adding product binaries or architectural crates.
+- **L-80: strict Flux-Lang parsing now has one accepting CST path.** `parse`, `parse_program`, range
+  projection, formatter, LSP, and workbench consumers lower from the validated lossless tree; the
+  legacy second acceptance path is gone, with agreement and round-trip coverage preserving syntax,
+  diagnostics, comments, ranges, and runtime semantics.
+
+### Fixed
+
+- **A-85: role discovery now fails closed.** Malformed or unknown frontmatter, invalid loop/effort
+  values, unreadable files, workspace symlink escapes, and duplicate names produce source-labelled
+  errors instead of silently dropping a role or inheriting the parent's tools. Omitting `tools`
+  still inherits, while `tools: []` still grants none.
+- **A-86/A-87/A-88/A-89: turn and delivery ownership is now explicit.** Fresh and resumed turns
+  share one cache/cancellation/telemetry/checkpoint lifecycle (A-86); one `FlowEngine` serializes
+  its own turns while independent engines remain concurrent (A-87); cancelled turns supervise,
+  bound, and reap child tasks exactly once (A-88); and one App-owned delivery actor routes `run`,
+  direct delivery, and public bus roots while causal tags prevent concurrent or cross-App cascades
+  from consuming or duplicating one another's events (A-89).
+- **C-59: A2A push delivery uses scoped, DNS-aware egress on registration and every send.**
+  Redirects are refused, DNS is rechecked, bearer tokens stay on the exact registered origin, and
+  private destinations require an exact `FLUX_A2A_PUSH_PRIVATE_HOSTS` grant; the legacy local switch
+  now permits loopback spellings only.
+- **C-61: repository-controlled metadata is confined to the guarded workspace.** Project
+  instructions, context, roles, skills, and config reads reject symlink/absolute escapes; project
+  config writes use guarded atomic replacement, while trusted user-global roots remain a separate
+  control-plane path.
+- **C-63: the public Bedrock factory preserves the lazy AWS credential chain.** Provider
+  construction no longer blocks an existing Tokio runtime, resolves credentials early, or
+  materializes temporary credentials into process environment; requests retain expiry-aware
+  refresh across environment, SSO, IRSA, and EKS sources.
+- **C-64: duplicate operation names can no longer silently replace handlers.** Runtime catalogs and
+  plugin builders reject identical and conflicting duplicates with both source labels; intentional
+  replacement is available only through the explicit replacement API.
+- **C-66: cognition usage observed before provider failure or cancellation is retained exactly
+  once.** The same billable usage now reaches evidence, turn totals, cost projections, SDK/App
+  results, and sub-agent aggregation without replacing the original error.
+
 ## [0.24.0] - 2026-07-14
 
 ### Changed

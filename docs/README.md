@@ -29,6 +29,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | The design — layers, safety envelope, loop, **crate map** | [architecture.md](architecture.md) |
 | Status + what's next | [roadmap.md](roadmap.md) |
 | **What to work on right now** | [stories/README.md](stories/README.md) — the backlog/status board |
+| Latest repository architecture review | [designs/architecture-review-2026-07-14/review.md](designs/architecture-review-2026-07-14/review.md) — ranked findings, evidence, and linked remediation stories |
 | Using the CLI / TUI / SDK / server | [usage.md](usage.md) |
 | Choosing a model/provider | [model.md](model.md) |
 | The self-hosted agent loop | [agent-loop.md](agent-loop.md) |

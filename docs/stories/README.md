@@ -16,10 +16,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   `web.fetch`/`web.search` dot-rename; D-160…D-166), **plugin operation output schemas** (D-164), a
   **runnable Slack support-bot** example (D-165), and a public beginner tutorial. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Focus:** the Agent pillar. **Nothing is currently promoted to `ready`**, so `Now`/`Next` below are
-  empty — the live work sits in Backlog + Blocked. The strongest ready-candidates are the
-  gitlab-hardening wave (D-91…D-95) and the flux-lsp stories (L-68…L-70); promote one to
-  `status: ready` and re-run `/track:board` to queue it.
+- **Focus:** the 19-story `architecture-review-2026-07-14` epic is complete: all four release
+  blockers and every lifecycle/consolidation finding are implemented, verified, and indexed under
+  Done. There are currently no `ready` stories.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
@@ -136,6 +135,11 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-82 — Configure adaptive cognition policy for spawned sub-agents](A-82-configure-sub-agent-adaptive-policy.md) · Agent · let embedding hosts bound child intent/explore models, effort, output and calls without changing existing spawner defaults
 - [A-83 — Bound cumulative adaptive capability families](A-83-bound-cumulative-adaptive-families.md) · Agent · A later signal could append a fifth family even though intent and each signal were individually capped at four, deferring failure to schema expansion.
 - [A-84 — Validate the adaptive family ceiling on resume](A-84-validate-resumed-adaptive-family-ceiling.md) · Agent · A serialized state created before A-83 can already contain five small families and bypass the signal-time guard when exploration resumes.
+- [A-85 — Fail closed on malformed role metadata](A-85-fail-closed-role-metadata.md) · Agent · strict path-aware role loading preserves omitted-vs-empty tools and fails before provider/tool execution
+- [A-86 — Unify fresh and resumed turn lifecycle](A-86-unify-fresh-resumed-turn-lifecycle.md) · Agent · adaptive, authored, and resumed turns share cancellation, cache generation, usage, history, and recoverable checkpoint handling
+- [A-87 — Make FlowEngine own the single-active-turn invariant](A-87-flowengine-single-active-turn.md) · Agent · one engine-level gate isolates concurrent turns while independent engines overlap and nested flows avoid relocking
+- [A-88 — Supervise sub-agent cancellation through durable cleanup](A-88-supervise-child-cancellation.md) · Agent · cooperative child cancellation, bounded reap, and exactly-once audit/usage finalization cover provider, tool, and nested hangs
+- [A-89 — Make App own delivery serialization](A-89-app-delivery-serialization.md) · Agent · one App-owned delivery actor routes `run`, direct delivery, and bus roots exactly once; observer taps cannot compete and per-App causal tags isolate cascades
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`
@@ -193,6 +197,19 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-56 — Make the model call-argument contract actionable](C-56-make-call-argument-contract-actionable.md) · Core · Matched Codex E2E emitted the same invalid four-position grep call in four consecutive runs; each repair cost 6–10 seconds and about 17k input tokens.
 - [C-57 — Route flux_reload process replacement through the guarded process path](C-57-guard-flux-reload-process-replacement.md) · Core · 2026 codebase review: dev reload directly execs/spawns std::process::Command outside flux-system's single guarded process seam.
 - [C-58 — Make web.fetch and web.crawl record persistence honest in effects](C-58-honest-web-record-persistence-effects.md) · Core · 2026 codebase review: web read tools advertise network-only effects while optionally contributing persistent web.page datasource records.
+- [C-59 — Route A2A push delivery through scoped guarded egress](C-59-guard-a2a-push-scoped-egress.md) · Core · registration and delivery use scoped DNS-aware authorization with redirects refused and notification credentials contained
+- [C-60 — Require policy and identity in public executor assembly](C-60-require-policy-identity-executor-assembly.md) · Core · mandatory authorization profiles make auto-approval subordinate to policy across every production surface
+- [C-61 — Confine project metadata IO to the guarded workspace](C-61-confine-project-metadata-io.md) · Core · context/config/roles/skills use confined guarded IO, atomic writes, and a structural no-raw-IO gate
+- [C-62 — Use one typed authority contract for planning and dispatch](C-62-typed-authority-requirements.md) · Core · exact resource-aware requirements now drive previews, policy, approval, and dispatch, including semantic actions
+- [C-63 — Preserve lazy Bedrock credential refresh in shared construction](C-63-preserve-bedrock-lazy-chain.md) · Core · shared factory retains lazy expiry-aware credentials and deterministic region without runtime blocking or env mutation
+- [C-64 — Reject duplicate operation registration](C-64-reject-duplicate-operation-registration.md) · Core · source-aware atomic registries reject catalog/handler collisions; intentional replacement is explicit
+- [C-65 — Make architecture gates resolve real dependencies and process APIs](C-65-harden-architecture-gates.md) · Core · Cargo metadata and Rust-syntax gates cover aliases, target/build edges, both command APIs, both workspaces, and project metadata IO
+- [C-66 — Retain cognition usage on provider errors](C-66-retain-cognition-error-usage.md) · Core · usage survives provider error and cancellation/drop exactly once through SDK, event/cost, and sub-agent projections
+- [C-67 — Centralize execution-environment assembly](C-67-centralize-execution-environment-assembly.md) · Core · one explicit-root environment supplies registry, authority, identity, redaction, and guarded system mechanics to CLI/App/SDK/AgentSpec
+- [C-68 — Bind plugin schemas to typed handlers and outputs](C-68-typed-plugin-handlers-output-schemas.md) · Core · typed host-kit seam plus representative websearch/Jira cutover; all remaining first-party handlers are explicitly flexible and matrix-tracked
+- [C-69 — Partition plugin guest dependencies from host features](C-69-partition-plugin-guest-dependencies.md) · Core · guest-only feature boundary excludes host transport/hooks/install stacks and shrinks the reviewed normal tree from about 237 packages to 80
+- [C-70 — Consolidate web search behind one guarded implementation](C-70-consolidate-web-search.md) · Core · the websearch plugin solely owns guarded Tavily/DuckDuckGo behavior behind the `web.search` compatibility name
+- [C-71 — Decompose high-churn modules without adding crates](C-71-decompose-high-churn-modules.md) · Core · responsibility-focused internal modules and parity kernels reduce churn without changing crate, layer, or binary boundaries
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
@@ -422,6 +439,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [L-76 — flow_render built-in tool — flux source/plan → SVG (source + tree views)](L-76-flow-render-tool-svg.md) · Language · model-facing flow_render beside flow_list/flow_run: render_flux_svg pure core in flux-tools (One-Dark theme ported verbatim from the tree-sitter Node script), source|tree views, name-or-source input, SVG returned inline via ok_view — text-only ToolResult keeps it read-only/SVG-only
 - [L-77 — flux render CLI subcommand + retire the tree-sitter doc-image Node script](L-77-flux-render-cli-subcommand.md) · Language · flux render <file.flux> [--view source|tree] [-o out.svg] over render_flux_svg (SVG is text → system.write_file); becomes the doc-image generator — flux-tree-sitter's scripts/render-example.mjs retires, its README/AGENTS point at flux render
 - [L-79 — Run saved flows directly from the CLI](L-79-run-saved-flows-cli.md) · Language · flux flow list|ls + name-or-path flow run; strict --inputs/--arg contract; opt-in --map-inputs lowered into recorded ai.extract/parse/assert/bind nodes
+- [L-80 — Complete the CST parser cutover](L-80-complete-cst-parser-cutover.md) · Language · the tolerant CST is the sole accepting grammar, strict structured lowering replaces the legacy parser, and corpus/property/LSP gates pin compatibility
 
 _See [CHANGELOG.md](../../CHANGELOG.md) for the full released history._
 <!-- END track:board -->

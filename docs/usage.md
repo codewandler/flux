@@ -95,12 +95,16 @@ latest activity. `Ctrl-E` expands thinking/tool details, `Ctrl-C` interrupts a t
 Every operation—whether it is an exploration read, an approved batch action, or an authored-flow
 call—goes through the same envelope:
 
-- **Reads** are pre-allowed; they run without prompting.
+- **Authorization is the floor.** Each concrete call is checked against its typed workspace,
+  datasource, host, provider, network, connection, process, secret, or semantic-action requirements.
+  The plan preview and dispatch use the same requirements; a denial stops before approval or IO.
+- **Reads** allowed by the authorization profile are pre-approved by the default permission rules;
+  they run without prompting.
 - **Writes / commands** prompt for approval unless you pass `--yes` or have an allow-rule in
   `.flux/config.toml`.
 - **Destructive** operations (`rm -rf`, force-push, `mkfs`, …) are disclosed in the aggregate batch
-  approval. `--yes` auto-approves everything, destructive actions included, because it installs a
-  headless allow-all approver for trusted unattended work.
+  approval. `--yes` installs a headless allow-all approver for trusted unattended work, but it never
+  overrides an authorization-policy denial.
 - Secrets are redacted from tool output and logs.
 
 Approve a prompt with `y` (once), `a` (always — saved to `.flux/config.toml`), or `N` (deny).

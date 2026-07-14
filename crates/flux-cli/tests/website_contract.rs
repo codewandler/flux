@@ -488,6 +488,7 @@ fn tutorial_app_exits_cleanly_on_direct_sigint() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_flux"))
         .args(["app", "run", "assistant.flux", "-m", "mock"])
         .current_dir(&root)
+        .env("HOME", &root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
