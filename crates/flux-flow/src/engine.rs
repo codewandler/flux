@@ -13,9 +13,12 @@ use tokio_util::sync::CancellationToken;
 use flux_core::{Chunk, ContentBlock, Error, Message, Result, Usage};
 use flux_events::EventStore;
 use flux_provider::{Effort, Provider, Request};
-use flux_runtime::{scope_runtime_turn, Executor, RuntimeTurnContext};
+use flux_runtime::{
+    scope_runtime_turn, Executor, RuntimeTurnContext, SpawnTaskSupervisor, TurnIdentity,
+    SPAWN_CLEANUP_GRACE,
+};
 
-use crate::ast::DraftAst;
+use crate::ast::{DraftAst, Node, NodeId};
 use crate::composites::DynamicComposites;
 use crate::model::StageOptions;
 use crate::registry::OpRegistry;
@@ -134,6 +137,73 @@ pub struct FlowEngine {
     /// executor's log is append-only and shared across this engine's turns, so a plain high-water
     /// mark attributes each tail to the turn that just ended.
     evidence_flushed: std::sync::atomic::AtomicUsize,
+    /// One active public turn per engine. Nested authored operations stay inside the already-held
+    /// lifecycle and call the runtime directly, so they never recursively acquire this gate.
+    turn_gate: tokio::sync::Mutex<()>,
+}
+
+enum TurnProgram<'a> {
+    Adaptive,
+    Authored(&'a DraftAst),
+    Resume {
+        flow_name: Option<String>,
+        body: Vec<Node>,
+        node: NodeId,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnProgramKind {
+    Adaptive,
+    Authored,
+    Resume,
+}
+
+impl TurnProgram<'_> {
+    fn kind(&self) -> TurnProgramKind {
+        match self {
+            Self::Adaptive => TurnProgramKind::Adaptive,
+            Self::Authored(_) => TurnProgramKind::Authored,
+            Self::Resume { .. } => TurnProgramKind::Resume,
+        }
+    }
+
+    fn label<'a>(&'a self, user_input: Option<&'a str>) -> &'a str {
+        match self {
+            Self::Authored(flow) => flow.name.as_deref().unwrap_or("(flow start)"),
+            Self::Adaptive | Self::Resume { .. } => user_input.unwrap_or_default(),
+        }
+    }
+}
+
+struct SuspensionWrite {
+    flow_name: Option<String>,
+    body: Vec<Node>,
+    node: NodeId,
+    source: String,
+}
+
+struct TurnTerminal {
+    outcome: &'static str,
+    steps: u32,
+    answer: String,
+    cancelled: bool,
+    consume_checkpoint: bool,
+    suspension: Option<SuspensionWrite>,
+}
+
+struct TurnLifecycle {
+    accounting: TurnAccounting,
+    channel: Arc<std::sync::Mutex<dyn AgentSink>>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<crate::loop_host::SinkEvent>,
+    runtime: RuntimeTurnContext,
+    spawn_supervisor: Arc<SpawnTaskSupervisor>,
+}
+
+struct TurnAccounting {
+    turn_id: i64,
+    iteration_base: usize,
+    subagent_base: usize,
 }
 
 impl FlowEngine {
@@ -252,6 +322,7 @@ impl FlowEngine {
             ambient_signals: Vec::new(),
             sticky_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
+            turn_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -288,6 +359,174 @@ impl FlowEngine {
         Ok(())
     }
 
+    fn begin_turn_lifecycle(
+        &self,
+        session_id: &str,
+        label: &str,
+        user_message: Option<&str>,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        identity: &TurnIdentity,
+    ) -> Result<TurnLifecycle> {
+        let skill_input = user_message.unwrap_or_default();
+        // The cache boundary precedes every execution flavor, including a persisted continuation.
+        self.executor.begin_cache_turn();
+        if let Some(message) = user_message {
+            self.events
+                .record_message(session_id, &Message::user_text(message))?;
+        }
+        let turn_id = self
+            .events
+            .begin_turn(
+                session_id,
+                label,
+                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
+            )
+            .unwrap_or(-1);
+        self.executor.observe(flux_evidence::Observation::new(
+            "turn.identity",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "caller": identity.caller().principal.id.as_str(),
+                "source": identity.caller().source.as_str(),
+                "trust": identity.trust(),
+            }),
+        ));
+        let iteration_base = self.executor.evidence().by_kind("turn.iteration").count();
+        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
+        let base_system = self.base_system_with_skills(skill_input, sink);
+        let advertised = self.surfaced_for_turn(session_id, skill_input, sink);
+        let (sender, receiver) =
+            tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
+        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
+            crate::loop_host::ChannelSink::new(sender),
+        ));
+        let activity = self.loop_host.set_turn(
+            session_id.to_string(),
+            Some(base_system),
+            channel.clone(),
+            Some(advertised),
+            Some((self.events.clone(), turn_id)),
+        );
+        let spawn_supervisor = Arc::new(SpawnTaskSupervisor::with_cancel(cancel.child_token()));
+        let runtime = RuntimeTurnContext::new()
+            .with_cancel(cancel.clone())
+            .with_session(session_id)
+            .with_spawn_activity_sink(activity)
+            .with_spawn_supervisor(spawn_supervisor.clone())
+            .with_identity(identity.clone());
+        if crate::cassette::enabled() {
+            self.flow
+                .set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
+                    crate::cassette::RecordScope::new(self.events.clone(), session_id),
+                ))));
+        } else {
+            self.flow.set_cassette(None);
+        }
+        Ok(TurnLifecycle {
+            accounting: TurnAccounting {
+                turn_id,
+                iteration_base,
+                subagent_base,
+            },
+            channel,
+            receiver,
+            runtime,
+            spawn_supervisor,
+        })
+    }
+
+    async fn race_turn<F>(
+        lifecycle: TurnLifecycle,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        future: F,
+    ) -> (Option<Result<FlowOutcome>>, TurnAccounting)
+    where
+        F: std::future::Future<Output = Result<FlowOutcome>>,
+    {
+        let TurnLifecycle {
+            accounting,
+            channel: _,
+            mut receiver,
+            runtime,
+            spawn_supervisor,
+        } = lifecycle;
+        let reveal = show_loop();
+        let outcome = scope_runtime_turn(runtime, async {
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    event = receiver.recv() => {
+                        if let Some(event) = event {
+                            drain_event(event, sink, reveal);
+                        }
+                    }
+                    result = &mut future => break Some(result),
+                }
+            }
+        })
+        .await;
+        // `task` runs its spawner in a turn-owned Tokio task. Dropping an operation branch detaches
+        // its JoinHandle, so every terminal path retains the turn until children have observed the
+        // supervisor token and finalized; abort is only the bounded backstop.
+        spawn_supervisor.shutdown(SPAWN_CLEANUP_GRACE).await;
+        while let Ok(event) = receiver.try_recv() {
+            drain_event(event, sink, reveal);
+        }
+        (outcome, accounting)
+    }
+
+    fn finish_turn_lifecycle(
+        &self,
+        session_id: &str,
+        sink: &mut dyn AgentSink,
+        accounting: &TurnAccounting,
+        mut terminal: TurnTerminal,
+    ) -> Result<()> {
+        let persistence = if let Some(suspension) = terminal.suspension.take() {
+            self.flow.save_suspension(
+                session_id,
+                suspension.flow_name.as_deref(),
+                &suspension.body,
+                suspension.node,
+                &suspension.source,
+            )
+        } else if terminal.consume_checkpoint {
+            self.flow.clear_suspension(session_id)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = persistence {
+            terminal.outcome = "error";
+            terminal.cancelled = false;
+            terminal.answer = format!(
+                "The turn finished, but its continuation checkpoint could not be persisted — {error}"
+            );
+        }
+        sink.text_delta(&terminal.answer);
+        let usage =
+            self.record_resume_usage(session_id, accounting.turn_id, accounting.subagent_base);
+        let _ = self.events.end_turn(
+            session_id,
+            accounting.turn_id,
+            terminal.outcome,
+            terminal.steps,
+            &terminal.answer,
+            usage.clone(),
+        );
+        self.finish_turn(
+            session_id,
+            accounting.turn_id,
+            sink,
+            &terminal.answer,
+            terminal.cancelled,
+            usage,
+        )
+    }
+
     /// Run one user turn to completion, uninterruptible.
     pub async fn run_turn(
         &self,
@@ -310,212 +549,259 @@ impl FlowEngine {
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        // If a flow is suspended on a top-level `await`, THIS turn's message is the awaited input:
-        // resume the persisted flow instead of starting a fresh outer-loop turn. (`take_suspension`
-        // clears it.)
-        if let Some((flow_name, body, node, _source)) = self.flow.take_suspension(session_id)? {
-            return self
-                .resume_suspended(session_id, user_input, flow_name, body, node, sink)
-                .await;
-        }
+        let _turn = self.turn_gate.lock().await;
+        let identity = self.executor.identity().snapshot();
+        self.run_turn_locked(session_id, user_input, sink, cancel, identity)
+            .await
+    }
 
-        self.events
-            .record_message(session_id, &Message::user_text(user_input))?;
-        // Turn boundary for the deterministic read cache (L-54): between turns the user (or any
-        // external process) may have changed what a read observes, so the cache never survives a
-        // turn — its reuse window is repair rounds / retries / sub-plans WITHIN this turn.
-        self.executor.begin_cache_turn();
-        // Non-fatal: a DB hiccup must never prevent a turn from running.
-        let turn_id = self
-            .events
-            .begin_turn(
-                session_id,
-                user_input,
-                // Canonical attribution key (C-15) — the old-log cost fallback rolls turns up by
-                // this stamp, so it must match the per-call `CallUsage` keys.
-                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
-            )
-            .unwrap_or(-1);
-
-        // Agent identity + project context + explicitly enabled skills — included in every model
-        // stage without activating discovery metadata implicitly.
-        let base_system = self.base_system_with_skills(user_input, sink);
-
-        // Evidence-gated surfacing for this turn: probe the workspace signals once and hand the
-        // advertised op set to the loop host, so every adaptive stage sees the gated catalog.
-        let advertised = self.surfaced_for_turn(session_id, user_input, sink);
-
-        // Drive the flux-lang agent loop (`agent_loop`) through an OWNED channel sink — the `'static`
-        // loop host owns it while stages are in flight — draining its events onto the borrowed
-        // `sink` live (inner ops stream as they happen; loop-machinery ops are filtered by
-        // `drain_event`).
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
-        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
-            crate::loop_host::ChannelSink::new(tx),
-        ));
-        let activity = self.loop_host.set_turn(
-            session_id.to_string(),
-            Some(base_system),
-            channel.clone(),
-            Some(advertised),
-            Some((self.events.clone(), turn_id)),
-        );
-        let runtime_turn = RuntimeTurnContext::new()
-            .with_cancel(cancel.clone())
-            .with_session(session_id)
-            .with_spawn_activity_sink(activity);
-
-        // Everything that can enter the guarded runtime runs under one future-local turn snapshot.
-        // It is authoritative even when a field is absent, restores any outer scope on exit, and
-        // never leaves cancellation/session/reporter state pinned to the long-lived executor.
-        scope_runtime_turn(
-            runtime_turn,
-            self.drive_runtime_turn(session_id, sink, cancel, turn_id, channel, rx),
+    /// Run one user turn under an explicit immutable caller identity. The identity is installed
+    /// only after this engine acquires its single-active-turn gate and remains lexical to the turn.
+    pub async fn run_turn_as(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        sink: &mut dyn AgentSink,
+        identity: TurnIdentity,
+    ) -> Result<()> {
+        self.run_turn_cancellable_as(
+            session_id,
+            user_input,
+            sink,
+            &CancellationToken::new(),
+            identity,
         )
         .await
     }
 
-    async fn drive_runtime_turn(
+    /// Cancellable counterpart to [`Self::run_turn_as`].
+    pub async fn run_turn_cancellable_as(
         &self,
         session_id: &str,
+        user_input: &str,
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
-        turn_id: i64,
-        channel: Arc<std::sync::Mutex<dyn AgentSink>>,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::loop_host::SinkEvent>,
+        identity: TurnIdentity,
     ) -> Result<()> {
-        // Snapshot per-turn evidence BEFORE compaction: a failed/cancelled compaction is still this
-        // turn and must close with correctly scoped telemetry through the same finalization path.
-        let iter_base = self.executor.evidence().by_kind("turn.iteration").count();
-        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
+        let _turn = self.turn_gate.lock().await;
+        self.run_turn_locked(session_id, user_input, sink, cancel, identity)
+            .await
+    }
 
-        // Compact only after `set_turn` reset the host's accounting. Summary generation is a real
-        // provider call, and usage that arrives before a stream error must be charged exactly once.
-        // Any error occurs after the user message + TurnStarted are durable, so close the turn with
-        // one assistant message instead of `?`-returning an invalid user tail / pending turn.
-        let (compaction, compaction_usage) =
-            self.compaction_attempt(session_id, sink, cancel).await;
-        if let Some(usage) = compaction_usage {
-            self.loop_host
-                .record_external_call(self.provider.name(), &self.model, usage);
-        }
-        if let Err(error) = compaction {
-            let answer = format!(
-                "I couldn't compact the conversation before continuing — {}",
-                model_error(&error)
-            );
-            sink.text_delta(&answer);
-            let subagent_calls = self.subagent_calls_since(subagent_base);
-            self.record_call_usage_events(session_id, turn_id, &subagent_calls);
-            let usage = self.turn_usage(&subagent_calls);
-            let _ = self
-                .events
-                .end_turn(session_id, turn_id, "error", 0, &answer, usage.clone());
-            return self.finish_turn(session_id, turn_id, sink, &answer, false, usage);
-        }
-        // C-43: arm the per-turn cassette recorder — every leaf-op dispatch this turn lands as a
-        // redacted `OpRecorded` cell on the session stream, making the turn hermetically
-        // replayable (`flux replay`). Off with FLUX_CASSETTE=0; the recorder is telemetry-grade
-        // (append failures never fail the turn).
-        if crate::cassette::enabled() {
-            self.flow.set_cassette(Some(std::sync::Arc::new(
-                crate::cassette::CassetteScope::Record(crate::cassette::RecordScope::new(
-                    self.events.clone(),
-                    session_id,
-                )),
-            )));
-        } else {
-            self.flow.set_cassette(None);
-        }
+    /// Run one user turn after the engine-level single-active-turn gate has been acquired.
+    async fn run_turn_locked(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        identity: TurnIdentity,
+    ) -> Result<()> {
+        let program = match self.flow.load_suspension(session_id)? {
+            Some((flow_name, body, node, _source)) => TurnProgram::Resume {
+                flow_name,
+                body,
+                node,
+            },
+            None => TurnProgram::Adaptive,
+        };
+        self.run_turn_lifecycle(
+            session_id,
+            Some(user_input),
+            program,
+            sink,
+            cancel,
+            identity,
+        )
+        .await
+    }
 
-        // Reveal the loop machinery on the surface when `--show-loop`/`FLUX_SHOW_LOOP` is set.
-        let reveal = show_loop();
-        let outcome = {
-            let mut outer = crate::loop_host::SharedSink::new(channel.clone());
-            let flow_fut = execute_flow_traced(
-                &self.flow,
-                &self.executor,
-                session_id,
-                &self.agent_loop,
-                &mut outer,
-                trace_loop(),
-            );
-            tokio::pin!(flow_fut);
+    async fn run_turn_lifecycle(
+        &self,
+        session_id: &str,
+        user_input: Option<&str>,
+        program: TurnProgram<'_>,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        identity: TurnIdentity,
+    ) -> Result<()> {
+        let lifecycle = self.begin_turn_lifecycle(
+            session_id,
+            program.label(user_input),
+            user_input,
+            sink,
+            cancel,
+            &identity,
+        )?;
+        let future = self.execute_turn_program(
+            session_id,
+            user_input.unwrap_or_default(),
+            &program,
+            lifecycle.channel.clone(),
+            cancel,
+        );
+        let (outcome, accounting) = Self::race_turn(lifecycle, sink, cancel, future).await;
+        let terminal = self.turn_terminal(&program, outcome, accounting.iteration_base);
+        self.finish_turn_lifecycle(session_id, sink, &accounting, terminal)
+    }
 
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break None,
-                    maybe = rx.recv() => {
-                        if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
-                    }
-                    res = &mut flow_fut => break Some(res),
+    async fn execute_turn_program(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        program: &TurnProgram<'_>,
+        channel: Arc<std::sync::Mutex<dyn AgentSink>>,
+        cancel: &CancellationToken,
+    ) -> Result<FlowOutcome> {
+        let mut output = crate::loop_host::SharedSink::new(channel);
+        match program {
+            TurnProgram::Adaptive => {
+                let (compaction, usage) = self
+                    .compaction_attempt(session_id, &mut output, cancel)
+                    .await;
+                if let Some(usage) = usage {
+                    self.loop_host
+                        .record_external_call(self.provider.name(), &self.model, usage);
                 }
+                if let Err(error) = compaction {
+                    return Err(Error::Other(format!("compaction: {}", model_error(&error))));
+                }
+                execute_flow_traced(
+                    &self.flow,
+                    &self.executor,
+                    session_id,
+                    &self.agent_loop,
+                    &mut output,
+                    trace_loop(),
+                )
+                .await
+                .map_err(|error| Error::Other(error.to_string()))
+            }
+            TurnProgram::Authored(flow) => {
+                self.composites
+                    .ensure_session_loaded(&self.flow, session_id)?;
+                let composites = self.composites.active_for_session(session_id);
+                execute_flow_with_composites(
+                    &self.flow,
+                    &self.executor,
+                    session_id,
+                    flow,
+                    &composites,
+                    &mut output,
+                )
+                .await
+                .map_err(|error| Error::Other(error.to_string()))
+            }
+            TurnProgram::Resume {
+                flow_name,
+                body,
+                node,
+            } => {
+                self.composites
+                    .ensure_session_loaded(&self.flow, session_id)?;
+                let composites = self.composites.active_for_session(session_id);
+                resume_flow_with_composites(
+                    &self.flow,
+                    &self.executor,
+                    session_id,
+                    flow_name.as_deref(),
+                    body,
+                    *node,
+                    flux_lang::ast::Value::String(user_input.to_string()),
+                    &composites,
+                    &mut output,
+                )
+                .await
+                .map_err(|error| Error::Other(error.to_string()))
+            }
+        }
+    }
+
+    fn turn_terminal(
+        &self,
+        program: &TurnProgram<'_>,
+        outcome: Option<Result<FlowOutcome>>,
+        iteration_base: usize,
+    ) -> TurnTerminal {
+        let kind = program.kind();
+        let Some(outcome) = outcome else {
+            return TurnTerminal {
+                outcome: "cancelled",
+                steps: 0,
+                answer: "(turn cancelled)".into(),
+                cancelled: true,
+                consume_checkpoint: false,
+                suspension: None,
+            };
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let error = error.to_string();
+                let answer = match kind {
+                    TurnProgramKind::Adaptive if error.starts_with("compaction: ") => format!(
+                        "I couldn't compact the conversation before continuing — {}",
+                        error.trim_start_matches("compaction: ")
+                    ),
+                    TurnProgramKind::Adaptive => {
+                        format!("I couldn't complete the turn — {error}")
+                    }
+                    TurnProgramKind::Authored => {
+                        format!("The flow failed to start — {error}")
+                    }
+                    TurnProgramKind::Resume => {
+                        format!("The resumed flow failed — {error}")
+                    }
+                };
+                return TurnTerminal {
+                    outcome: "error",
+                    steps: 0,
+                    answer,
+                    cancelled: false,
+                    consume_checkpoint: false,
+                    suspension: None,
+                };
             }
         };
-        // Cancellation drops the in-flight flow (and any `task` child collector) at the end of the
-        // scope above. Drain only afterwards so drop-time terminal activity is not stranded in the
-        // channel when the borrowed surface is about to return.
-        while let Ok(ev) = rx.try_recv() {
-            drain_event(ev, sink, reveal);
-        }
-        let Some(outcome) = outcome else {
-            let subagent_calls = self.subagent_calls_since(subagent_base);
-            self.record_call_usage_events(session_id, turn_id, &subagent_calls);
-            let usage = self.turn_usage(&subagent_calls);
-            let _ = self.events.end_turn(
-                session_id,
-                turn_id,
-                "cancelled",
-                0,
-                "(turn cancelled)",
-                usage.clone(),
-            );
-            return self.finish_turn(session_id, turn_id, sink, "(turn cancelled)", true, usage);
-        };
 
-        // The adaptive loop's decision point is an authored, top-level conditional `await`. Park it
-        // through the SAME durable suspension store used by every authored flow, so the next user
-        // message resumes after the await with all prior stage artifacts still bound.
-        if let Ok(flow_outcome) = &outcome {
-            if let Some(suspension) = &flow_outcome.suspension {
-                self.flow.save_suspension(
-                    session_id,
-                    self.agent_loop.name.as_deref(),
-                    &self.agent_loop.body,
-                    suspension.node,
-                    &suspension.source,
-                )?;
-                let answer = suspension_prompt(flow_outcome);
-                sink.text_delta(&answer);
-                let iterations = self
-                    .executor
+        if let Some(suspension) = &outcome.suspension {
+            let (flow_name, body) = match program {
+                TurnProgram::Adaptive => {
+                    (self.agent_loop.name.clone(), self.agent_loop.body.clone())
+                }
+                TurnProgram::Authored(flow) => (flow.name.clone(), flow.body.clone()),
+                TurnProgram::Resume {
+                    flow_name, body, ..
+                } => (flow_name.clone(), body.clone()),
+            };
+            let steps = if kind == TurnProgramKind::Adaptive {
+                self.executor
                     .evidence()
                     .by_kind("turn.iteration")
                     .count()
-                    .saturating_sub(iter_base) as u32;
-                let subagent_calls = self.subagent_calls_since(subagent_base);
-                self.record_call_usage_events(session_id, turn_id, &subagent_calls);
-                let usage = self.turn_usage(&subagent_calls);
-                let _ = self.events.end_turn(
-                    session_id,
-                    turn_id,
-                    "suspended",
-                    iterations,
-                    &answer,
-                    usage.clone(),
-                );
-                return self.finish_turn(session_id, turn_id, sink, &answer, false, usage);
-            }
+                    .saturating_sub(iteration_base) as u32
+            } else {
+                outcome.steps as u32
+            };
+            return TurnTerminal {
+                outcome: "suspended",
+                steps,
+                answer: suspension_prompt(&outcome),
+                cancelled: false,
+                consume_checkpoint: false,
+                suspension: Some(SuspensionWrite {
+                    flow_name,
+                    body,
+                    node: suspension.node,
+                    source: suspension.source.clone(),
+                }),
+            };
         }
 
-        // The loop returns `$answer` — the model's prose, grounded in the fed-back results (the `chat`
-        // case). On failure (e.g. a model stage errored through the op envelope) we surface it as
-        // the answer so the session shape stays valid and the turn never ends in silence.
-        let (answer, tag) = match outcome {
-            Ok(o) => {
-                let a = o.result.trim().to_string();
-                if a.is_empty() {
+        match kind {
+            TurnProgramKind::Adaptive => {
+                let answer = outcome.result.trim().to_string();
+                let (answer, status) = if answer.is_empty() {
                     (
                         format!(
                             "Reached the maximum of {} adaptive iterations for this turn; stopping.",
@@ -524,26 +810,47 @@ impl FlowEngine {
                         "max_iter",
                     )
                 } else {
-                    (a, "ok")
+                    (answer, "ok")
+                };
+                TurnTerminal {
+                    outcome: status,
+                    steps: self
+                        .executor
+                        .evidence()
+                        .by_kind("turn.iteration")
+                        .count()
+                        .saturating_sub(iteration_base) as u32,
+                    answer,
+                    cancelled: false,
+                    consume_checkpoint: false,
+                    suspension: None,
                 }
             }
-            Err(e) => (format!("I couldn't complete the turn — {e}"), "error"),
-        };
-        // The loop binds `$answer` but does not stream it (a `jq`/`fmt` bind is silent), so emit it now.
-        sink.text_delta(&answer);
-        let iterations = self
-            .executor
-            .evidence()
-            .by_kind("turn.iteration")
-            .count()
-            .saturating_sub(iter_base) as u32;
-        let subagent_calls = self.subagent_calls_since(subagent_base);
-        self.record_call_usage_events(session_id, turn_id, &subagent_calls);
-        let usage = self.turn_usage(&subagent_calls);
-        let _ = self
-            .events
-            .end_turn(session_id, turn_id, tag, iterations, &answer, usage.clone());
-        self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
+            TurnProgramKind::Authored => TurnTerminal {
+                outcome: "completed",
+                steps: outcome.steps as u32,
+                answer: if outcome.result.trim().is_empty() {
+                    format!("Flow completed ({} step(s)).", outcome.steps)
+                } else {
+                    outcome.result.trim().to_string()
+                },
+                cancelled: false,
+                consume_checkpoint: false,
+                suspension: None,
+            },
+            TurnProgramKind::Resume => TurnTerminal {
+                outcome: "resumed",
+                steps: outcome.steps as u32,
+                answer: if outcome.result.trim().is_empty() {
+                    format!("Resumed and completed ({} step(s)).", outcome.steps)
+                } else {
+                    outcome.result.trim().to_string()
+                },
+                cancelled: false,
+                consume_checkpoint: true,
+                suspension: None,
+            },
+        }
     }
 
     fn surfaced_for_turn(
@@ -633,6 +940,7 @@ impl FlowEngine {
         // watermark 0, so startup observations land too.
         self.flush_observations(session_id, turn_id);
         self.composites.clear_turn(session_id);
+        self.flow.set_cassette(None);
         self.events.record_message(
             session_id,
             &Message::assistant(vec![ContentBlock::Text {
@@ -683,11 +991,7 @@ impl FlowEngine {
     fn turn_usage(&self, subagent_calls: &[(String, Usage)]) -> Option<Usage> {
         let mut usage = self.loop_host.turn_usage();
         for (_, call) in subagent_calls {
-            usage.output_tokens += call.output_tokens;
-            usage.input_tokens += call.input_tokens;
-            usage.cache_creation_input_tokens += call.cache_creation_input_tokens;
-            usage.cache_read_input_tokens += call.cache_read_input_tokens;
-            usage.reasoning_tokens += call.reasoning_tokens;
+            usage.sum_independent(call);
         }
         (usage.total() > 0).then_some(usage)
     }
@@ -746,7 +1050,7 @@ impl FlowEngine {
 
     /// Start an authored flow as the session's conversation driver (D-131). Executes the flow
     /// **fresh** to its first top-level `await`, persists the suspension so every later `run_turn`
-    /// routes through the existing suspension-first branch (`resume_suspended`), and surfaces the
+    /// routes through the shared suspension-first turn runner, and surfaces the
     /// flow's own **authored prompt** (its last emitted view) as the assistant turn — no adaptive stage is
     /// invoked for this deterministic skeleton. A flow that completes without any `await` surfaces
     /// its result as a single completed turn.
@@ -761,296 +1065,80 @@ impl FlowEngine {
         flow: &DraftAst,
         sink: &mut dyn AgentSink,
     ) -> Result<()> {
-        // Open a first-class turn. The flow speaks first (no user utterance), so the turn's
-        // attribution label is the flow's name — or a generic marker for an anonymous flow.
-        let label = flow.name.as_deref().unwrap_or("(flow start)");
-        let turn_id = self
-            .events
-            .begin_turn(
-                session_id,
-                label,
-                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
-            )
-            .unwrap_or(-1);
-        // Fresh turn boundary for the deterministic read cache (L-54), as in `run_turn`.
-        self.executor.begin_cache_turn();
-        // A fresh authored-flow drive bypasses the adaptive loop host exactly like a resume: the only billable
-        // spend is `task` sub-agents in the flow body. Snapshot the count so only this turn's fold in
-        // (`record_resume_usage` reads observations since this base — the same helper resume uses).
-        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
-
-        // Arm the authored-loop host so a top-level `ai_segment` can delegate a bounded
-        // native-schema model stage (D-131 Phase B). No user utterance drives this turn, so skills match
-        // against an empty input. For a flow with no `ai_segment` this is harmless overhead — the
-        // authored prompt is still surfaced explicitly below (Phase A unchanged).
-        let base_system = self.base_system_with_skills("", sink);
-        let advertised = self.surfaced_for_turn(session_id, "", sink);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
-        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
-            crate::loop_host::ChannelSink::new(tx),
-        ));
-        let activity = self.loop_host.set_turn(
-            session_id.to_string(),
-            Some(base_system),
-            channel.clone(),
-            Some(advertised),
-            Some((self.events.clone(), turn_id)),
-        );
-        let runtime_turn = RuntimeTurnContext::new()
-            .with_session(session_id)
-            .with_spawn_activity_sink(activity);
-
-        self.composites
-            .ensure_session_loaded(&self.flow, session_id)?;
-        let composites = self.composites.active_for_session(session_id);
-
-        // Run the authored flow through an OWNED channel sink, draining its events onto the borrowed
-        // `sink` live — so an `ai_segment`'s native leaf ops stream as they happen (the machinery
-        // ops are filtered by `drain_event`). Mirrors `run_turn_cancellable`'s plumbing.
-        let mut outer = crate::loop_host::SharedSink::new(channel.clone());
-        let reveal = show_loop();
-        let result = scope_runtime_turn(runtime_turn, async {
-            let flow_fut = execute_flow_with_composites(
-                &self.flow,
-                &self.executor,
-                session_id,
-                flow,
-                &composites,
-                &mut outer,
-            );
-            tokio::pin!(flow_fut);
-            loop {
-                tokio::select! {
-                    biased;
-                    maybe = rx.recv() => { if let Some(ev) = maybe { drain_event(ev, sink, reveal); } }
-                    res = &mut flow_fut => {
-                        while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
-                        break res;
-                    }
-                }
-            }
-        })
-        .await;
-        let outcome = match result {
-            Ok(o) => o,
-            Err(e) => {
-                let msg = format!("The flow failed to start — {e}");
-                sink.text_delta(&msg);
-                let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
-                let _ = self
-                    .events
-                    .end_turn(session_id, turn_id, "error", 0, &msg, usage.clone());
-                return self.finish_turn(session_id, turn_id, sink, &msg, true, usage);
-            }
-        };
-
-        // Suspended on the first top-level `await`: persist the resume point (the flow name rides
-        // along so a NAMED flow's resume derives the same checkpoint `flow_key`, L-21) and surface
-        // the flow's authored prompt. Every subsequent `run_turn` now routes through the existing
-        // suspension-first branch — no second parking mechanism (invariant 3).
-        if let Some(susp) = &outcome.suspension {
-            self.flow.save_suspension(
-                session_id,
-                flow.name.as_deref(),
-                &flow.body,
-                susp.node,
-                &susp.source,
-            )?;
-            let prompt = suspension_prompt(&outcome);
-            sink.text_delta(&prompt);
-            let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
-            let _ = self.events.end_turn(
-                session_id,
-                turn_id,
-                "suspended",
-                outcome.steps as u32,
-                &prompt,
-                usage.clone(),
-            );
-            return self.finish_turn(session_id, turn_id, sink, &prompt, false, usage);
-        }
-
-        // Completed with no `await`: the flow's own output is the answer.
-        let answer = if !outcome.result.trim().is_empty() {
-            outcome.result.trim().to_string()
-        } else {
-            format!("Flow completed ({} step(s)).", outcome.steps)
-        };
-        sink.text_delta(&answer);
-        let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
-        let _ = self.events.end_turn(
-            session_id,
-            turn_id,
-            "completed",
-            outcome.steps as u32,
-            &answer,
-            usage.clone(),
-        );
-        self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
+        self.start_flow_turn_cancellable(session_id, flow, sink, &CancellationToken::new())
+            .await
     }
 
-    /// Resume a flow suspended on a top-level `await`, with this turn's message as the awaited input.
-    /// Continues from the next statement (the prefix and its side effects are not re-run); the flow may
-    /// suspend again on a later `await` (persist + wait) or complete (surface its result). Bypasses
-    /// intent detection — a resume is deterministic continuation, not a fresh outer-loop turn.
-    ///
-    /// v1 limitations (accepted; refinements later): (1) the suspension is taken (deleted) before the
-    /// remainder runs, so if a post-await op *fails*, the unfinished flow is not retryable (its earlier
-    /// side effects stay committed) — per-statement resume checkpoints would fix this. (2) Once a flow
-    /// is awaiting, the next message is *always* consumed as the input — there is no escape sentinel or
-    /// TTL, so the user can't redirect to a new request without first answering (a REPL `/cancel` is the
-    /// natural home for an escape, above the engine).
-    async fn resume_suspended(
+    /// Start an authored flow under the engine's single-active-turn gate and cancellation context.
+    pub async fn start_flow_turn_cancellable(
         &self,
         session_id: &str,
-        user_input: &str,
-        flow_name: Option<String>,
-        body: Vec<flux_lang::ast::Node>,
-        node: flux_lang::ast::NodeId,
+        flow: &DraftAst,
         sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
     ) -> Result<()> {
-        self.events
-            .record_message(session_id, &Message::user_text(user_input))?;
-        // C-26: a resumed continuation is a first-class turn. Open it here so its observations are
-        // turn-scoped and it emits a `TurnSummary`/`CallUsage`, instead of flushing unscoped under a
-        // hardcoded `turn_id = -1`. A NEW turn id (not a continuation of the suspended one) — the
-        // suspended turn already closed when it parked; this reply is a distinct unit of work.
-        let turn_id = self
-            .events
-            .begin_turn(
-                session_id,
-                user_input,
-                &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
-            )
-            .unwrap_or(-1);
-        // Sub-agent spend during the resume (a `task` op in the resumed body) rides the shared
-        // evidence log as `subagent.usage` observations, exactly as in `run_turn` — snapshot the
-        // count so only THIS resume's sub-agents fold in. The resumed body may also invoke the
-        // model via a top-level `ai_segment` (D-131 Phase B), whose spend rides the loop host's
-        // per-turn tally, reset by the `set_turn` below.
-        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
-
-        let input = flux_lang::ast::Value::String(user_input.to_string());
-
-        // Arm the authored-loop host so a top-level `ai_segment` AFTER the resumed `await` can
-        // delegate a bounded run of model turns (D-131 Phase B). Skills match the reply text; a
-        // resume with no segment pays only harmless overhead.
-        let base_system = self.base_system_with_skills(user_input, sink);
-        let advertised = self.surfaced_for_turn(session_id, user_input, sink);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
-        let channel: Arc<std::sync::Mutex<dyn AgentSink>> = Arc::new(std::sync::Mutex::new(
-            crate::loop_host::ChannelSink::new(tx),
-        ));
-        let activity = self.loop_host.set_turn(
-            session_id.to_string(),
-            Some(base_system),
-            channel.clone(),
-            Some(advertised),
-            Some((self.events.clone(), turn_id)),
-        );
-        let runtime_turn = RuntimeTurnContext::new()
-            .with_session(session_id)
-            .with_spawn_activity_sink(activity);
-
-        self.composites
-            .ensure_session_loaded(&self.flow, session_id)?;
-        let composites = self.composites.active_for_session(session_id);
-
-        // Run the resumed continuation through an owned channel sink, draining onto the borrowed
-        // `sink` live (a segment's inner ops stream as they happen). The persisted flow name rides
-        // along so a NAMED flow's resumed run derives the same checkpoint `flow_key` (L-21).
-        let mut outer = crate::loop_host::SharedSink::new(channel.clone());
-        let reveal = show_loop();
-        let result = scope_runtime_turn(runtime_turn, async {
-            let flow_fut = resume_flow_with_composites(
-                &self.flow,
-                &self.executor,
-                session_id,
-                flow_name.as_deref(),
-                &body,
-                node,
-                input,
-                &composites,
-                &mut outer,
-            );
-            tokio::pin!(flow_fut);
-            loop {
-                tokio::select! {
-                    biased;
-                    maybe = rx.recv() => { if let Some(ev) = maybe { drain_event(ev, sink, reveal); } }
-                    res = &mut flow_fut => {
-                        while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
-                        break res;
-                    }
-                }
-            }
-        })
-        .await;
-        let outcome = match result {
-            Ok(o) => o,
-            Err(e) => {
-                let msg = format!("The resumed flow failed — {e}");
-                sink.text_delta(&msg);
-                let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
-                let _ = self
-                    .events
-                    .end_turn(session_id, turn_id, "error", 0, &msg, usage.clone());
-                return self.finish_turn(session_id, turn_id, sink, &msg, true, usage);
-            }
-        };
-
-        // Suspended again on a later `await`: persist the new resume point (name included) and wait
-        // for more input.
-        if let Some(susp) = &outcome.suspension {
-            self.flow.save_suspension(
-                session_id,
-                flow_name.as_deref(),
-                &body,
-                susp.node,
-                &susp.source,
-            )?;
-            // D-131: surface the flow's own authored prompt (its last emitted view) rather than the
-            // fixed hint — the hint remains only as the empty-emit fallback (`suspension_prompt`).
-            let prompt = suspension_prompt(&outcome);
-            sink.text_delta(&prompt);
-            let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
-            let _ = self.events.end_turn(
-                session_id,
-                turn_id,
-                "suspended",
-                outcome.steps as u32,
-                &prompt,
-                usage.clone(),
-            );
-            return self.finish_turn(session_id, turn_id, sink, &prompt, false, usage);
-        }
-
-        // Completed: the flow's own output is the answer (a model-grounded summary is a later refinement).
-        let answer = if !outcome.result.trim().is_empty() {
-            outcome.result.trim().to_string()
-        } else {
-            format!("Resumed and completed ({} step(s)).", outcome.steps)
-        };
-        sink.text_delta(&answer);
-        let usage = self.record_resume_usage(session_id, turn_id, subagent_base);
-        let _ = self.events.end_turn(
-            session_id,
-            turn_id,
-            "resumed",
-            outcome.steps as u32,
-            &answer,
-            usage.clone(),
-        );
-        self.finish_turn(session_id, turn_id, sink, &answer, false, usage)
+        let _turn = self.turn_gate.lock().await;
+        let identity = self.executor.identity().snapshot();
+        self.start_flow_turn_locked(session_id, flow, sink, cancel, identity)
+            .await
     }
 
-    /// Record a flow-driven turn's spend and return the turn total (C-26). Used by both
-    /// [`Self::start_flow_turn`] and [`Self::resume_suspended`]; both now arm (and reset) the loop
-    /// host before running, so this folds BOTH the loop host's model-stage calls — non-zero only when a
-    /// top-level `ai_segment` delegated to the model this turn (D-131) — AND the `task` sub-agent
+    /// Start an authored flow under an explicit immutable caller identity.
+    pub async fn start_flow_turn_as(
+        &self,
+        session_id: &str,
+        flow: &DraftAst,
+        sink: &mut dyn AgentSink,
+        identity: TurnIdentity,
+    ) -> Result<()> {
+        self.start_flow_turn_cancellable_as(
+            session_id,
+            flow,
+            sink,
+            &CancellationToken::new(),
+            identity,
+        )
+        .await
+    }
+
+    /// Cancellable counterpart to [`Self::start_flow_turn_as`].
+    pub async fn start_flow_turn_cancellable_as(
+        &self,
+        session_id: &str,
+        flow: &DraftAst,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        identity: TurnIdentity,
+    ) -> Result<()> {
+        let _turn = self.turn_gate.lock().await;
+        self.start_flow_turn_locked(session_id, flow, sink, cancel, identity)
+            .await
+    }
+
+    async fn start_flow_turn_locked(
+        &self,
+        session_id: &str,
+        flow: &DraftAst,
+        sink: &mut dyn AgentSink,
+        cancel: &CancellationToken,
+        identity: TurnIdentity,
+    ) -> Result<()> {
+        self.run_turn_lifecycle(
+            session_id,
+            None,
+            TurnProgram::Authored(flow),
+            sink,
+            cancel,
+            identity,
+        )
+        .await
+    }
+
+    /// Record a turn's spend and return the turn total (C-26). The shared lifecycle arms (and
+    /// resets) the loop host before every adaptive, authored, or resumed turn, so this folds BOTH
+    /// the loop host's model-stage calls and the `task` sub-agent
     /// spend recorded since `subagent_base`, emitting one `CallUsage` per call and returning the
-    /// turn aggregate. `None` when nothing billed, mirroring [`Self::turn_usage`]. Identical
-    /// accounting to `run_turn_cancellable`'s turn-end (`record_call_usage_events` + `turn_usage`).
+    /// turn aggregate. `None` when nothing billed, mirroring [`Self::turn_usage`].
     fn record_resume_usage(
         &self,
         session_id: &str,
@@ -1645,7 +1733,7 @@ mod tests {
     use super::*;
 
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -1742,6 +1830,7 @@ mod tests {
                 }),
             )
             .with_effects(vec![Effect::Write, Effect::Filesystem])
+            .with_access(vec![flux_spec::AccessKind::Filesystem])
             .with_risk(Risk::Medium);
             spec.idempotency = Idempotency::NonIdempotent;
             spec
@@ -1760,11 +1849,212 @@ mod tests {
         }
     }
 
+    struct FileProbeTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for FileProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "file_probe",
+                "Read the lifecycle cache fixture.",
+                json!({"type": "object", "additionalProperties": false}),
+            )
+            .with_access(vec![flux_spec::AccessKind::Filesystem])
+        }
+
+        fn permission_subjects(&self, _input: &Value) -> Vec<String> {
+            vec!["value.txt".into()]
+        }
+
+        async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok(ctx.system.read_file("value.txt").await?))
+        }
+    }
+
+    struct NestedAuthoredTool;
+
+    #[async_trait]
+    impl Tool for NestedAuthoredTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "nested_authored",
+                "Run one authored flow through the active loop host.",
+                json!({"type": "object", "additionalProperties": false}),
+            )
+        }
+
+        async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+            let host = ctx
+                .loop_host
+                .as_ref()
+                .ok_or_else(|| Error::Other("test loop host is missing".into()))?;
+            let ast = DraftAst {
+                body: vec![Node::Return {
+                    value: Box::new(Node::Lit {
+                        value: json!("nested result"),
+                    }),
+                }],
+                ..Default::default()
+            };
+            let outcome = host.run_authored_flow(serde_json::to_value(ast)?).await?;
+            Ok(ToolResult::ok(
+                outcome
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ))
+        }
+    }
+
+    struct TurnBarrier {
+        entered: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        notify: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for TurnBarrier {
+        fn default() -> Self {
+            Self {
+                entered: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                notify: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl TurnBarrier {
+        async fn wait_for_entered(&self, expected: usize) {
+            loop {
+                let notified = self.notify.notified();
+                if self.entered.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release(&self, permits: usize) {
+            self.release.add_permits(permits);
+        }
+    }
+
+    struct ActiveCall<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveCall<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingTurnTool(Arc<TurnBarrier>);
+
+    #[async_trait]
+    impl Tool for BlockingTurnTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "blocking_turn",
+                "Hold a turn open until the test releases it.",
+                json!({"type": "object", "additionalProperties": false}),
+            )
+        }
+
+        async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+            let session_id = ctx.session_id().unwrap_or_default();
+            let active = self.0.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.max_active.fetch_max(active, Ordering::SeqCst);
+            let _active = ActiveCall(&self.0.active);
+            let call_number = self.0.entered.fetch_add(1, Ordering::SeqCst) + 1;
+            ctx.evidence
+                .lock()
+                .unwrap()
+                .record(flux_evidence::Observation::new(
+                    "test.turn_context",
+                    flux_evidence::Phase::Turn,
+                    json!({"session_id": session_id}),
+                ));
+            ctx.evidence
+                .lock()
+                .unwrap()
+                .record(flux_evidence::Observation::new(
+                    "subagent.usage",
+                    flux_evidence::Phase::Turn,
+                    json!({
+                        "model": format!("child-{session_id}"),
+                        "usage": Usage {
+                            input_tokens: call_number as u64,
+                            output_tokens: (call_number * 10) as u64,
+                            ..Usage::default()
+                        }
+                    }),
+                ));
+            self.0.notify.notify_waiters();
+            let permit = self
+                .0
+                .release
+                .acquire()
+                .await
+                .map_err(|error| Error::Other(error.to_string()))?;
+            permit.forget();
+            Ok(ToolResult::ok(session_id))
+        }
+    }
+
+    struct IdentityBlockingTool(Arc<TurnBarrier>);
+
+    #[async_trait]
+    impl Tool for IdentityBlockingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "identity_blocking",
+                "Hold a turn open and report its immutable caller identity.",
+                json!({"type": "object", "additionalProperties": false}),
+            )
+        }
+
+        async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
+            let session_id = ctx.session_id().unwrap_or_default();
+            let caller = ctx
+                .turn_identity()
+                .ok_or_else(|| Error::Other("test turn identity is missing".into()))?
+                .caller()
+                .principal
+                .id
+                .clone();
+            let active = self.0.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.max_active.fetch_max(active, Ordering::SeqCst);
+            let _active = ActiveCall(&self.0.active);
+            self.0.entered.fetch_add(1, Ordering::SeqCst);
+            ctx.evidence
+                .lock()
+                .unwrap()
+                .record(flux_evidence::Observation::new(
+                    "test.identity_context",
+                    flux_evidence::Phase::Turn,
+                    json!({"session_id": session_id.as_str(), "caller": caller.as_str()}),
+                ));
+            self.0.notify.notify_waiters();
+            let permit = self
+                .0
+                .release
+                .acquire()
+                .await
+                .map_err(|error| Error::Other(error.to_string()))?;
+            permit.forget();
+            Ok(ToolResult::ok(format!("{session_id}:{caller}")))
+        }
+    }
+
     #[derive(Default)]
     struct CollectSink {
         text: String,
         tools: Vec<String>,
         observations: Vec<flux_evidence::Observation>,
+        usages: Vec<Option<Usage>>,
         ended: usize,
     }
 
@@ -1781,7 +2071,8 @@ mod tests {
             self.observations.push(observation.clone());
         }
 
-        fn turn_end(&mut self, _usage: Option<Usage>) {
+        fn turn_end(&mut self, usage: Option<Usage>) {
+            self.usages.push(usage);
             self.ended += 1;
         }
     }
@@ -1859,7 +2150,7 @@ mod tests {
             Vec::new(),
             0,
             Vec::new(),
-            root,
+            root.clone(),
             loop_spec,
         );
         (engine, events)
@@ -1927,6 +2218,143 @@ mod tests {
         )
         .unwrap();
         (engine, events, requests, writes)
+    }
+
+    fn tool_engine(
+        tool: Arc<dyn Tool>,
+        agent_loop: DraftAst,
+    ) -> (FlowEngine, Arc<EventStore>, std::path::PathBuf) {
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "flux-turn-lifecycle-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = tool.spec().name;
+        let mut registry = ToolRegistry::new();
+        registry.register(tool);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(std::slice::from_ref(&name), &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap()))),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble_with_loop(
+            Arc::new(flux_provider::NullProvider),
+            executor,
+            events.clone(),
+            flow,
+            "test-model".into(),
+            "Test turn isolation.".into(),
+            2_048,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            root.clone(),
+            AgentLoopSpec::Flux(agent_loop),
+        )
+        .unwrap();
+        (engine, events, root)
+    }
+
+    fn call_node(op: &str) -> flux_lang::ast::Node {
+        flux_lang::ast::Node::Call {
+            op: op.into(),
+            args: Vec::new(),
+        }
+    }
+
+    fn blocking_agent_loop() -> DraftAst {
+        DraftAst {
+            body: vec![flux_lang::ast::Node::Return {
+                value: Box::new(call_node("blocking_turn")),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn identity_blocking_agent_loop() -> DraftAst {
+        DraftAst {
+            body: vec![flux_lang::ast::Node::Return {
+                value: Box::new(call_node("identity_blocking")),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn idle_agent_loop() -> DraftAst {
+        DraftAst {
+            body: vec![flux_lang::ast::Node::Return {
+                value: Box::new(flux_lang::ast::Node::Lit {
+                    value: json!("idle"),
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn nested_authored_agent_loop() -> DraftAst {
+        DraftAst {
+            body: vec![Node::Return {
+                value: Box::new(call_node("nested_authored")),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn resumable_read_flow() -> DraftAst {
+        use flux_lang::ast::{Node, SymbolName};
+        DraftAst {
+            name: Some("cache_resume".into()),
+            body: vec![
+                Node::Bind {
+                    name: SymbolName("before".into()),
+                    value: Box::new(call_node("file_probe")),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Await {
+                    binding: Some(SymbolName("reply".into())),
+                    source: "user_input".into(),
+                    as_type: None,
+                    condition: None,
+                },
+                Node::Bind {
+                    name: SymbolName("after".into()),
+                    value: Box::new(call_node("file_probe")),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Return {
+                    value: Box::new(Node::Var {
+                        name: SymbolName("after".into()),
+                    }),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn blocking_resume_flow() -> DraftAst {
+        use flux_lang::ast::{Node, SymbolName};
+        DraftAst {
+            name: Some("cancel_resume".into()),
+            body: vec![
+                Node::Await {
+                    binding: Some(SymbolName("reply".into())),
+                    source: "user_input".into(),
+                    as_type: None,
+                    condition: None,
+                },
+                Node::Return {
+                    value: Box::new(call_node("blocking_turn")),
+                },
+            ],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2411,6 +2839,448 @@ mod tests {
         assert_eq!(sink.text, "custom loop");
         assert!(requests.lock().unwrap().is_empty());
         assert_eq!(events.conversation(&session).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resumed_turn_starts_a_fresh_deterministic_read_cache_generation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (engine, events, root) =
+            tool_engine(Arc::new(FileProbeTool(calls.clone())), idle_agent_loop());
+        std::fs::write(root.join("value.txt"), "before").unwrap();
+        let session = events.create_session("test-model").unwrap();
+        let flow = resumable_read_flow();
+        let mut started = CollectSink::default();
+
+        engine
+            .start_flow_turn(&session, &flow, &mut started)
+            .await
+            .unwrap();
+        assert!(engine.flow.has_suspension(&session).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::write(root.join("value.txt"), "after").unwrap();
+        let mut resumed = CollectSink::default();
+        engine
+            .run_turn(&session, "continue", &mut resumed)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed.text, "after");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the post-await read must execute in the resumed turn, not reuse the prior turn cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_resume_is_terminal_and_keeps_its_checkpoint() {
+        let barrier = Arc::new(TurnBarrier::default());
+        let (engine, events, _root) = tool_engine(
+            Arc::new(BlockingTurnTool(barrier.clone())),
+            idle_agent_loop(),
+        );
+        let session = events.create_session("test-model").unwrap();
+        let mut started = CollectSink::default();
+        engine
+            .start_flow_turn(&session, &blocking_resume_flow(), &mut started)
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut resumed = CollectSink::default();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            engine.run_turn_cancellable(&session, "answer", &mut resumed, &cancel),
+        )
+        .await
+        .expect("a pre-cancelled resume must return promptly")
+        .unwrap();
+
+        assert_eq!(barrier.entered.load(Ordering::SeqCst), 0);
+        assert!(engine.flow.has_suspension(&session).unwrap());
+        assert_eq!(resumed.text, "(turn cancelled)");
+        assert_eq!(resumed.ended, 1);
+        let conversation = events.conversation(&session).unwrap();
+        assert_eq!(conversation.len(), 3);
+        assert_eq!(conversation[1].text(), "answer");
+        assert_eq!(conversation[2].text(), "(turn cancelled)");
+        assert_eq!(
+            events.turns(&session).unwrap().last().unwrap().outcome,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_in_flight_resume_keeps_its_checkpoint() {
+        let barrier = Arc::new(TurnBarrier::default());
+        let (engine, events, _root) = tool_engine(
+            Arc::new(BlockingTurnTool(barrier.clone())),
+            idle_agent_loop(),
+        );
+        let session = events.create_session("test-model").unwrap();
+        let mut started = CollectSink::default();
+        engine
+            .start_flow_turn(&session, &blocking_resume_flow(), &mut started)
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let mut resumed = CollectSink::default();
+        let run = engine.run_turn_cancellable(&session, "answer", &mut resumed, &cancel);
+        let controller = async {
+            barrier.wait_for_entered(1).await;
+            cancel.cancel();
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (result, ()) = tokio::join!(run, controller);
+            result
+        })
+        .await
+        .expect("an in-flight resumed operation must stop on cancellation");
+        result.unwrap();
+
+        assert_eq!(barrier.active.load(Ordering::SeqCst), 0);
+        assert!(engine.flow.has_suspension(&session).unwrap());
+        assert_eq!(resumed.text, "(turn cancelled)");
+        assert_eq!(resumed.ended, 1);
+        let conversation = events.conversation(&session).unwrap();
+        assert_eq!(conversation.len(), 3);
+        assert_eq!(conversation[1].text(), "answer");
+        assert_eq!(conversation[2].text(), "(turn cancelled)");
+        assert_eq!(
+            events.turns(&session).unwrap().last().unwrap().outcome,
+            "cancelled"
+        );
+    }
+
+    fn persisted_turn_contexts(events: &EventStore, session_id: &str) -> Vec<String> {
+        events
+            .observations(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|observation| observation.kind == "test.turn_context")
+            .filter_map(|observation| observation.data["session_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn persisted_callers(events: &EventStore, session_id: &str, kind: &str) -> Vec<String> {
+        events
+            .observations(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|observation| observation.kind == kind)
+            .filter_map(|observation| observation.data["caller"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_raw_engine_serializes_turns_without_cross_wiring_sinks_or_audit() {
+        let barrier = Arc::new(TurnBarrier::default());
+        let (mut engine, events, _root) = tool_engine(
+            Arc::new(BlockingTurnTool(barrier.clone())),
+            blocking_agent_loop(),
+        );
+        engine.groups = vec![
+            flux_evidence::ToolGroup {
+                name: "turn.first".into(),
+                description: "First-turn-only test catalog.".into(),
+                tools: vec!["blocking_turn".into()],
+                surface_when: vec![flux_evidence::SignalMatch {
+                    kind: flux_evidence::KIND_TURN_INTENT.into(),
+                    signal: Some("first".into()),
+                }],
+            },
+            flux_evidence::ToolGroup {
+                name: "turn.second".into(),
+                description: "Second-turn-only test catalog.".into(),
+                tools: vec!["second_only".into()],
+                surface_when: vec![flux_evidence::SignalMatch {
+                    kind: flux_evidence::KIND_TURN_INTENT.into(),
+                    signal: Some("second".into()),
+                }],
+            },
+        ];
+        let engine = Arc::new(engine);
+        let authority_before = engine.executor.approval_context();
+        let first_session = events.create_session("test-model").unwrap();
+        let second_session = events.create_session("test-model").unwrap();
+
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let session = first_session.clone();
+            async move {
+                let mut sink = CollectSink::default();
+                let result = engine.run_turn(&session, "first", &mut sink).await;
+                (result, sink)
+            }
+        });
+        barrier.wait_for_entered(1).await;
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            let session = second_session.clone();
+            async move {
+                let mut sink = CollectSink::default();
+                let result = engine.run_turn(&session, "second", &mut sink).await;
+                (result, sink)
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                barrier.wait_for_entered(2)
+            )
+            .await
+            .is_err(),
+            "the second call must wait at the engine boundary"
+        );
+        barrier.release(1);
+        let (first_result, first_sink) = first.await.unwrap();
+        first_result.unwrap();
+        barrier.wait_for_entered(2).await;
+        barrier.release(1);
+        let (second_result, second_sink) = second.await.unwrap();
+        second_result.unwrap();
+
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(first_sink.text, first_session);
+        assert_eq!(second_sink.text, second_session);
+        assert_eq!(first_sink.tools, ["blocking_turn"]);
+        assert_eq!(second_sink.tools, ["blocking_turn"]);
+        assert_eq!(first_sink.usages.len(), 1);
+        assert_eq!(second_sink.usages.len(), 1);
+        assert_eq!(first_sink.usages[0].as_ref().unwrap().input_tokens, 1);
+        assert_eq!(first_sink.usages[0].as_ref().unwrap().output_tokens, 10);
+        assert_eq!(second_sink.usages[0].as_ref().unwrap().input_tokens, 2);
+        assert_eq!(second_sink.usages[0].as_ref().unwrap().output_tokens, 20);
+        assert_eq!(first_sink.ended, 1);
+        assert_eq!(second_sink.ended, 1);
+        let active_groups = |sink: &CollectSink| {
+            sink.observations
+                .iter()
+                .find(|observation| observation.kind == "groups.active")
+                .and_then(|observation| observation.data["groups"].as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(active_groups(&first_sink), vec![json!("turn.first")]);
+        assert_eq!(active_groups(&second_sink), vec![json!("turn.second")]);
+        let (first_advertised, _) = surfaced_op_names(
+            engine.executor.registry(),
+            &engine.groups,
+            &engine.cwd,
+            &engine.sticky_groups,
+            &first_session,
+            &[],
+            "",
+        );
+        let (second_advertised, _) = surfaced_op_names(
+            engine.executor.registry(),
+            &engine.groups,
+            &engine.cwd,
+            &engine.sticky_groups,
+            &second_session,
+            &[],
+            "",
+        );
+        assert!(first_advertised.contains("blocking_turn"));
+        assert!(!second_advertised.contains("blocking_turn"));
+        assert_eq!(engine.executor.approval_context(), authority_before);
+        let authority: Value = serde_json::from_str(&authority_before).unwrap();
+        assert_eq!(authority["caller"]["principal"]["id"], "local");
+        assert_eq!(
+            events
+                .conversation(&first_session)
+                .unwrap()
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["first", first_session.as_str()]
+        );
+        assert_eq!(
+            events
+                .conversation(&second_session)
+                .unwrap()
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["second", second_session.as_str()]
+        );
+        assert_eq!(
+            persisted_turn_contexts(&events, &first_session),
+            vec![first_session]
+        );
+        assert_eq!(
+            persisted_turn_contexts(&events, &second_session),
+            vec![second_session]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_raw_turns_keep_distinct_lexical_identities_in_sink_dispatch_and_audit() {
+        let barrier = Arc::new(TurnBarrier::default());
+        let (engine, events, _root) = tool_engine(
+            Arc::new(IdentityBlockingTool(barrier.clone())),
+            identity_blocking_agent_loop(),
+        );
+        let identity = |id: &str| {
+            let (mut caller, trust) = engine.executor.identity().get();
+            caller.principal.id = id.to_string();
+            caller.principal.name = id.to_string();
+            caller.source = "raw-engine-test".into();
+            TurnIdentity::new(caller, trust)
+        };
+        let alice = identity("alice");
+        let bob = identity("bob");
+        let engine = Arc::new(engine);
+        let first_session = events.create_session("test-model").unwrap();
+        let second_session = events.create_session("test-model").unwrap();
+
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let session = first_session.clone();
+            async move {
+                let mut sink = CollectSink::default();
+                let result = engine
+                    .run_turn_as(&session, "first", &mut sink, alice)
+                    .await;
+                (result, sink)
+            }
+        });
+        barrier.wait_for_entered(1).await;
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            let session = second_session.clone();
+            async move {
+                let mut sink = CollectSink::default();
+                let result = engine.run_turn_as(&session, "second", &mut sink, bob).await;
+                (result, sink)
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                barrier.wait_for_entered(2),
+            )
+            .await
+            .is_err(),
+            "bob's turn must wait without retargeting alice's active context"
+        );
+        barrier.release(1);
+        let (first_result, first_sink) = first.await.unwrap();
+        first_result.unwrap();
+        barrier.wait_for_entered(2).await;
+        barrier.release(1);
+        let (second_result, second_sink) = second.await.unwrap();
+        second_result.unwrap();
+
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(first_sink.text, format!("{first_session}:alice"));
+        assert_eq!(second_sink.text, format!("{second_session}:bob"));
+        assert_eq!(first_sink.tools, ["identity_blocking"]);
+        assert_eq!(second_sink.tools, ["identity_blocking"]);
+        assert_eq!(
+            persisted_callers(&events, &first_session, "turn.identity"),
+            ["alice"]
+        );
+        assert_eq!(
+            persisted_callers(&events, &second_session, "turn.identity"),
+            ["bob"]
+        );
+        assert_eq!(
+            persisted_callers(&events, &first_session, "tool_call"),
+            ["alice"]
+        );
+        assert_eq!(
+            persisted_callers(&events, &second_session, "tool_call"),
+            ["bob"]
+        );
+        assert_eq!(
+            persisted_callers(&events, &first_session, "test.identity_context"),
+            ["alice"]
+        );
+        assert_eq!(
+            persisted_callers(&events, &second_session, "test.identity_context"),
+            ["bob"]
+        );
+        assert_eq!(
+            engine.executor.identity().get().0.principal.id,
+            "local",
+            "explicit turns must not mutate the executor's assembly-time identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_authored_flow_reuses_the_active_lifecycle_without_relocking() {
+        let (engine, events, _root) =
+            tool_engine(Arc::new(NestedAuthoredTool), nested_authored_agent_loop());
+        let session = events.create_session("test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            engine.run_turn(&session, "run nested", &mut sink),
+        )
+        .await
+        .expect("a nested authored flow must not recursively acquire the engine turn gate")
+        .unwrap();
+
+        assert_eq!(sink.text, "nested result");
+        assert_eq!(sink.ended, 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_raw_engines_can_overlap() {
+        let barrier = Arc::new(TurnBarrier::default());
+        let (first_engine, first_events, _root) = tool_engine(
+            Arc::new(BlockingTurnTool(barrier.clone())),
+            blocking_agent_loop(),
+        );
+        let (second_engine, second_events, _root) = tool_engine(
+            Arc::new(BlockingTurnTool(barrier.clone())),
+            blocking_agent_loop(),
+        );
+        let first_engine = Arc::new(first_engine);
+        let second_engine = Arc::new(second_engine);
+        let first_session = first_events.create_session("test-model").unwrap();
+        let second_session = second_events.create_session("test-model").unwrap();
+
+        let first = tokio::spawn({
+            let engine = first_engine.clone();
+            let session = first_session.clone();
+            async move {
+                let mut sink = CollectSink::default();
+                let result = engine.run_turn(&session, "first", &mut sink).await;
+                (result, sink)
+            }
+        });
+        let second = tokio::spawn({
+            let engine = second_engine.clone();
+            let session = second_session.clone();
+            async move {
+                let mut sink = CollectSink::default();
+                let result = engine.run_turn(&session, "second", &mut sink).await;
+                (result, sink)
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            barrier.wait_for_entered(2),
+        )
+        .await
+        .expect("independent engines must reach their operations concurrently");
+        assert_eq!(barrier.max_active.load(Ordering::SeqCst), 2);
+        barrier.release(2);
+        let (first_result, first_sink) = first.await.unwrap();
+        let (second_result, second_sink) = second.await.unwrap();
+        first_result.unwrap();
+        second_result.unwrap();
+        assert_eq!(first_sink.text, first_session);
+        assert_eq!(second_sink.text, second_session);
     }
 
     #[test]

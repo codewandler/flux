@@ -474,8 +474,10 @@ impl FlowStore {
 
     /// Persist a flow suspended on a top-level `await`: the flow's declared name (if any), its body,
     /// the suspended node index, and the awaited input `source`. One pending suspension per session —
-    /// a new one replaces any prior. Resumed (and cleared) by [`take_suspension`] when the awaited
-    /// input arrives next turn. The name is part of the resume point on purpose: a *named* flow's
+    /// a new one replaces any prior. The engine loads this recoverably and clears it only after the
+    /// awaited continuation reaches a durable terminal outcome; lower-level callers may still use
+    /// [`take_suspension`](Self::take_suspension) for explicit one-shot semantics. The name is part
+    /// of the resume point on purpose: a *named* flow's
     /// checkpoint `flow_key` is name + body hash, so the resume must carry the name to record/read
     /// checkpoints under the same key the original run used (L-21).
     pub fn save_suspension(
@@ -512,6 +514,54 @@ impl FlowStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(map_sql(e)),
         }
+    }
+
+    /// Load a session's pending continuation without consuming it.
+    ///
+    /// Engine-driven resume uses this recoverable read and clears the row only after the resumed
+    /// suffix completes (or atomically replaces it when the flow suspends again). Cancellation or
+    /// failure therefore leaves the sole continuation checkpoint available for an explicit retry.
+    #[allow(clippy::type_complexity)]
+    pub fn load_suspension(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(Option<String>, Vec<Node>, NodeId, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT flow_name, body, node, source FROM suspensions WHERE session_id = ?1",
+            [session_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        );
+        match row {
+            Ok((flow_name, body_json, node, source)) => {
+                let body = serde_json::from_str::<Vec<Node>>(&body_json).map_err(|error| {
+                    Error::Other(format!(
+                        "stored suspension for session `{session_id}` is invalid: {error}"
+                    ))
+                })?;
+                Ok(Some((flow_name, body, NodeId(node as u32), source)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(map_sql(error)),
+        }
+    }
+
+    /// Clear a pending continuation after the engine has durably handled its terminal outcome.
+    pub fn clear_suspension(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM suspensions WHERE session_id = ?1",
+            [session_id],
+        )
+        .map_err(map_sql)?;
+        Ok(())
     }
 
     /// Take (load **and** remove) a session's pending suspension, if any — a one-shot resume point.
