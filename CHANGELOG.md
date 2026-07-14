@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-90: host-owned channel operations can remain available after adaptive intent narrowing.**
+  Operations in the reserved `flux.ambient` physical group stay in every live exploration catalog
+  without becoming an intent or capability-signal family. They still count against native schema
+  budgets and remain subject to registry, permission, authored-scope, approval, and dispatch gates;
+  the `ToolSpec` marker carries the same rule into role-derived child runtimes.
+
 ## [0.24.0] - 2026-07-14
 
 ### Changed

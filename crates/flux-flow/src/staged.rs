@@ -30,6 +30,10 @@ const MAX_INTENT_ATTEMPTS: usize = 2;
 const MAX_FAMILIES: usize = 4;
 const MAX_NATIVE_TOOLS: usize = 64;
 const MAX_NATIVE_SCHEMA_CHARS: usize = 128_000;
+/// Reserved physical group for host-owned channel facilities that must remain available after
+/// functional intent narrowing. Ambient operations are visibility-only: every live executor,
+/// permission, authored scope, schema budget, approval, and dispatch check still applies.
+pub const ADAPTIVE_AMBIENT_GROUP: &str = "flux.ambient";
 /// Per-invocation provider-round cap for an authored `[agent.stages]` model stage. Named stages are
 /// a separate mechanism from the adaptive intent/explore loop, so their repair-round ceiling is a
 /// fixed, self-contained bound rather than the user-tunable adaptive model-call budget (a tight or
@@ -416,6 +420,7 @@ pub(crate) async fn detect_intent_stage(ctx: StagedContext) -> StagedRun {
 pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Value> {
     let specs = live_visible_specs(ctx);
     let families = build_families(&specs, &ctx.groups, &ctx.advertised);
+    let ambient = ambient_specs(&specs, &ctx.groups);
     if families.is_empty() {
         return Err(Error::Other(
             "ai_segment has no registered operation inside its capability scope".into(),
@@ -425,7 +430,7 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
         intent: goal.to_string(),
         families: families.keys().cloned().collect(),
     };
-    let selected = selected_specs(&declaration, &families)?;
+    let selected = selected_specs(&declaration, &families, &ambient)?;
     let selected_names = selected
         .iter()
         .map(|spec| spec.name.clone())
@@ -471,6 +476,7 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
     ensure_control_names_free(ctx)?;
     let specs = live_visible_specs(ctx);
     let families = build_families(&specs, &ctx.groups, &ctx.advertised);
+    let ambient = ambient_specs(&specs, &ctx.groups);
     if families.is_empty() {
         return Err(Error::Other(
             "adaptive planning has no registered capability families".into(),
@@ -491,7 +497,7 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
                 intent: intent.clone(),
                 families: Vec::new(),
             },
-            selected: Vec::new(),
+            selected: ambient.iter().map(|spec| spec.name.clone()).collect(),
             messages: ctx.conversation.clone(),
             proposed: Vec::new(),
             gathered: Vec::new(),
@@ -537,7 +543,7 @@ async fn detect_intent_inner(ctx: &StagedContext, usages: &mut Vec<Usage>) -> Re
             }),
         );
     }
-    let selected = selected_specs(&declaration, &families)?;
+    let selected = selected_specs(&declaration, &families, &ambient)?;
     let selected_names = selected
         .iter()
         .map(|spec| spec.name.clone())
@@ -874,6 +880,7 @@ async fn explore_stage_inner(
             Some(PendingResponse::Routing { candidates }) => {
                 let specs = live_visible_specs(ctx);
                 let families = build_families(&specs, &ctx.groups, &ctx.advertised);
+                let ambient = ambient_specs(&specs, &ctx.groups);
                 let live_candidates = candidates
                     .iter()
                     .filter(|candidate| families.contains_key(candidate.as_str()))
@@ -898,7 +905,7 @@ async fn explore_stage_inner(
                     );
                 };
                 state.declaration.families = vec![chosen.clone()];
-                state.selected = selected_specs(&state.declaration, &families)?
+                state.selected = selected_specs(&state.declaration, &families, &ambient)?
                     .into_iter()
                     .map(|spec| spec.name)
                     .collect();
@@ -1064,10 +1071,11 @@ async fn adaptive_explore(
     // compute it once instead of rebuilding a sorted spec clone + family map on every round.
     let specs = live_visible_specs(ctx);
     let families = build_families(&specs, &ctx.groups, &ctx.advertised);
+    let ambient = ambient_specs(&specs, &ctx.groups);
     for _round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
         ensure_model_call_budget(ctx, state.intent_calls, state.explore_calls, "explore")?;
-        let selected = selected_specs_for_state(&state, &families, ctx)?;
+        let selected = selected_specs_for_state(&state, &families, &ambient, ctx)?;
         let mut selected_by_native = BTreeMap::<String, ToolSpec>::new();
         for spec in &selected {
             let native = native_tool_name(&spec.name);
@@ -1180,7 +1188,7 @@ async fn adaptive_explore(
 
         if calls[0].1 == SIGNAL_CAPABILITIES {
             let (call_id, _, input) = &calls[0];
-            let added = apply_capability_signal(&mut state, input, &families)?;
+            let added = apply_capability_signal(&mut state, input, &families, &ambient)?;
             observe(
                 ctx,
                 "turn.capability_signal",
@@ -1374,6 +1382,7 @@ fn build_families(
     let mut out: BTreeMap<String, Family> = BTreeMap::new();
     for spec in specs {
         if spec.name == FINALIZE_PLAN
+            || effective_group(spec, groups) == Some(ADAPTIVE_AMBIENT_GROUP)
             || effective_group(spec, groups) == Some(flux_runtime::REFLECT_GROUP)
         {
             continue;
@@ -1434,6 +1443,19 @@ fn build_families(
         family.specs.sort_by(|a, b| a.name.cmp(&b.name));
     }
     out
+}
+
+/// Ambient specs are rebuilt from the same live, permission-filtered registry snapshot as normal
+/// families. They never enter the router's family index, but they count in every selected native
+/// operation/schema union because the provider receives them on every exploration round.
+fn ambient_specs(specs: &[ToolSpec], groups: &[ToolGroup]) -> Vec<ToolSpec> {
+    let mut ambient = specs
+        .iter()
+        .filter(|spec| effective_group(spec, groups) == Some(ADAPTIVE_AMBIENT_GROUP))
+        .cloned()
+        .collect::<Vec<_>>();
+    ambient.sort_by(|a, b| a.name.cmp(&b.name));
+    ambient
 }
 
 fn virtual_family(spec: &ToolSpec) -> &'static str {
@@ -1684,6 +1706,7 @@ fn parse_intent(
 fn selected_specs(
     declaration: &IntentDeclaration,
     families: &BTreeMap<String, Family>,
+    ambient: &[ToolSpec],
 ) -> Result<Vec<ToolSpec>> {
     let distinct_family_count = declaration
         .families
@@ -1696,7 +1719,10 @@ fn selected_specs(
             "adaptive capability declaration selected {distinct_family_count} distinct families; the maximum is {MAX_FAMILIES}"
         )));
     }
-    let mut selected: BTreeMap<String, ToolSpec> = BTreeMap::new();
+    let mut selected: BTreeMap<String, ToolSpec> = ambient
+        .iter()
+        .map(|spec| (spec.name.clone(), spec.clone()))
+        .collect();
     for name in &declaration.families {
         let family = families
             .get(name)
@@ -1726,6 +1752,7 @@ fn selected_specs(
 fn selected_specs_for_state(
     state: &AdaptiveState,
     families: &BTreeMap<String, Family>,
+    ambient: &[ToolSpec],
     ctx: &StagedContext,
 ) -> Result<Vec<ToolSpec>> {
     // Re-expand the accumulated family signals from the LIVE registry on every stage call. This
@@ -1746,7 +1773,7 @@ fn selected_specs_for_state(
             Some(&unavailable_families),
         ));
     }
-    let selected = selected_specs(&state.declaration, families)?;
+    let selected = selected_specs(&state.declaration, families, ambient)?;
     let names = selected
         .iter()
         .map(|spec| spec.name.as_str())
@@ -1785,13 +1812,18 @@ fn stale_capability_state_error(
     ctx: &StagedContext,
     unavailable_families: Option<&[String]>,
 ) -> Error {
-    let selected_live = state
+    let mut selected_live = state
         .declaration
         .families
         .iter()
         .filter_map(|name| families.get(name))
-        .flat_map(|family| family.specs.iter().map(|spec| spec.name.as_str()))
+        .flat_map(|family| family.specs.iter().map(|spec| spec.name.clone()))
         .collect::<HashSet<_>>();
+    selected_live.extend(
+        ambient_specs(&live_visible_specs(ctx), &ctx.groups)
+            .into_iter()
+            .map(|spec| spec.name),
+    );
     let mut unavailable = state
         .selected
         .iter()
@@ -1964,6 +1996,7 @@ fn apply_capability_signal(
     state: &mut AdaptiveState,
     input: &Value,
     families: &BTreeMap<String, Family>,
+    ambient: &[ToolSpec],
 ) -> Result<Vec<String>> {
     let reason = input
         .get("reason")
@@ -2014,7 +2047,7 @@ fn apply_capability_signal(
         intent: format!("{}; additional signal: {reason}", state.declaration.intent),
         families: new_families,
     };
-    let selected = selected_specs(&declaration, families)?;
+    let selected = selected_specs(&declaration, families, ambient)?;
     let prior = state.selected.iter().cloned().collect::<HashSet<_>>();
     let added = selected
         .iter()
@@ -3000,6 +3033,154 @@ mod tests {
         );
     }
 
+    /// A-90 failing first: a production-shaped router selects only the functional reporting
+    /// family. Channel facilities are not another intent choice, but they remain available to the
+    /// exploration model. The old family-only expansion exposed `flux.ambient` to intent and then
+    /// dropped both facilities when the model correctly selected only `reporting`.
+    #[tokio::test]
+    async fn ambient_operations_survive_single_family_intent_routing() {
+        let responses = vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({
+                    "intent": "read the reporting fixture",
+                    "capability_families": ["reporting"]
+                }),
+            ),
+            prose("grounded answer"),
+        ];
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(responses);
+        context.groups = vec![
+            ToolGroup {
+                name: "reporting".into(),
+                description: "Read reporting data".into(),
+                tools: vec!["inspect".into()],
+                surface_when: Vec::new(),
+            },
+            ToolGroup {
+                name: "flux.ambient".into(),
+                description: "Host channel facilities".into(),
+                tools: vec!["change".into()],
+                surface_when: Vec::new(),
+            },
+        ];
+
+        assert_eq!(run(context).await.result.unwrap()["kind"], "chat");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let intent_families = requests[0].tools[0].input_schema["properties"]
+            ["capability_families"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(intent_families, &vec![json!("reporting")]);
+        assert!(requests[1].tools.iter().any(|tool| tool.name == "inspect"));
+        assert!(
+            requests[1].tools.iter().any(|tool| tool.name == "change"),
+            "the ambient operation remains visible without selecting its group"
+        );
+        let signal = requests[1]
+            .tools
+            .iter()
+            .find(|tool| tool.name == SIGNAL_CAPABILITIES)
+            .unwrap();
+        assert_eq!(
+            signal.input_schema["properties"]["capability_families"]["items"]["enum"],
+            json!(["reporting"]),
+            "ambient is not a semantic capability family"
+        );
+    }
+
+    #[test]
+    fn ambient_operations_share_native_budgets_and_live_authority_ceilings() {
+        let functional = (0..63)
+            .map(|index| {
+                spec(
+                    &format!("reporting.read-{index}"),
+                    vec![Effect::Read],
+                    vec![],
+                    Some("reporting"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let families = BTreeMap::from([(
+            "reporting".into(),
+            Family {
+                name: "reporting".into(),
+                description: "Reporting reads".into(),
+                specs: functional,
+                exhaustive_members: false,
+                routing_signals: Vec::new(),
+            },
+        )]);
+        let ambient = vec![
+            spec(
+                "ui.present",
+                vec![Effect::Read],
+                vec![],
+                Some(ADAPTIVE_AMBIENT_GROUP),
+            ),
+            spec(
+                "ui.status",
+                vec![Effect::Read],
+                vec![],
+                Some(ADAPTIVE_AMBIENT_GROUP),
+            ),
+        ];
+        let declaration = IntentDeclaration {
+            intent: "read reporting data".into(),
+            families: vec!["reporting".into()],
+        };
+        let error = selected_specs(&declaration, &families, &ambient)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("65 operations"), "{error}");
+
+        let TestHarness {
+            context: original, ..
+        } = staged_context(Vec::new());
+        let ambient_group = ToolGroup {
+            name: ADAPTIVE_AMBIENT_GROUP.into(),
+            description: "Host channel facilities".into(),
+            tools: vec!["change".into()],
+            surface_when: Vec::new(),
+        };
+
+        let denied_executor = Arc::new(Executor::new(
+            original.executor.registry().clone(),
+            PermissionManager::from_rules(&["change".into()], &["change".into()]),
+            Arc::new(AllowApprover),
+            original.executor.context().clone(),
+        ));
+        let mut denied = original.clone();
+        denied.executor = denied_executor;
+        denied.groups = vec![ambient_group.clone()];
+        assert!(
+            ambient_specs(&live_visible_specs(&denied), &denied.groups).is_empty(),
+            "ambient visibility must not re-grant a denied operation"
+        );
+
+        let mut scoped = original.clone();
+        scoped.groups = vec![ambient_group.clone()];
+        let _scope = scoped.executor.push_cap_scope(&["inspect".into()]);
+        assert!(
+            ambient_specs(&live_visible_specs(&scoped), &scoped.groups).is_empty(),
+            "ambient visibility must stay inside an active with_tools ceiling"
+        );
+
+        let mut authored = original;
+        authored.groups = vec![ambient_group];
+        authored.authored_ceiling = Some(HashSet::from(["inspect".into()]));
+        assert!(
+            ambient_specs(&live_visible_specs(&authored), &authored.groups).is_empty(),
+            "ambient visibility must stay inside an authored model-stage ceiling"
+        );
+    }
+
     #[tokio::test]
     async fn staged_consultation_indicator_balances_on_error_and_cancellation() {
         for (provider, cancelled) in [
@@ -3404,7 +3585,7 @@ mod tests {
             explore_calls: 0,
         };
 
-        let error = selected_specs_for_state(&state, &families, &context)
+        let error = selected_specs_for_state(&state, &families, &[], &context)
             .unwrap_err()
             .to_string();
         assert!(error.contains("`removed.inspect`"), "{error}");
@@ -3548,6 +3729,7 @@ mod tests {
                 "reason": "later evidence named one more integration"
             }),
             &families,
+            &[],
         )
         .unwrap_err()
         .to_string();
@@ -3602,7 +3784,7 @@ mod tests {
         let state: AdaptiveState = serde_json::from_value(serialized).unwrap();
         let TestHarness { context, .. } = staged_context(Vec::new());
 
-        let error = selected_specs_for_state(&state, &families, &context)
+        let error = selected_specs_for_state(&state, &families, &[], &context)
             .unwrap_err()
             .to_string();
 
@@ -3655,7 +3837,7 @@ mod tests {
         let state: AdaptiveState = serde_json::from_value(serialized).unwrap();
         let TestHarness { context, .. } = staged_context(Vec::new());
 
-        let selected = selected_specs_for_state(&state, &families, &context).unwrap();
+        let selected = selected_specs_for_state(&state, &families, &[], &context).unwrap();
 
         assert_eq!(selected.len(), 4);
         assert_eq!(selected[0].name, "fixture_0.inspect");
