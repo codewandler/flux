@@ -10,7 +10,8 @@
 
 // Agent roles + definitions live in the Agent-pillar crate (`flux-agent`); re-exported here so
 // `flux_orchestrate::{Role, RoleRegistry, parse_role}` keep resolving for consumers.
-pub use flux_agent::{parse_role, Role, RoleRegistry};
+#[allow(deprecated)]
+pub use flux_agent::{parse_role, try_parse_role, Role, RoleRegistry};
 
 use std::sync::Arc;
 
@@ -24,11 +25,12 @@ use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
-    ApprovalChoice, Approver, Executor, IdentityCell, PermissionManager, SpawnActivity,
-    SpawnActivityEvent, SpawnActivitySink, SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext,
-    ToolRegistry, ToolResult,
+    active_runtime_turn_context, scope_runtime_turn, ApprovalChoice, Approver,
+    AuthorityRequirement, ExecutionAuthorization, Executor, IdentityCell, PermissionManager,
+    SpawnActivity, SpawnActivityEvent, SpawnActivitySink, SpawnOutcome, SpawnRequest, Spawner,
+    Tool, ToolContext, ToolRegistry, ToolResult, SPAWN_CLEANUP_GRACE,
 };
-use flux_spec::{tool_input_schema, Effect, Idempotency, IntentSet, Risk, ToolSpec};
+use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
 use tokio_util::sync::CancellationToken;
 
@@ -96,8 +98,8 @@ pub struct SpawnLimits {
     /// Optional wall-clock deadline. On expiry the child's cancel token is **fired** and `spawn` then
     /// awaits the child so it reaches its own cancel path and persists a finalizing assistant message
     /// — rather than abandoning it, which would leave an **unterminated turn** (a user message with no
-    /// finalizing assistant message) in a shared audit store. (A bounded grace backstops a child that
-    /// somehow doesn't observe the cancel; see `spawn`.)
+    /// finalizing assistant message) in a shared audit store. (The bounded
+    /// [`SPAWN_CLEANUP_GRACE`] backstops a child that somehow doesn't observe the cancel.)
     pub wall_clock: Option<std::time::Duration>,
 }
 
@@ -130,11 +132,9 @@ pub struct LocalSpawner {
     /// (auto-approve non-destructive, deny destructive). A multi-tenant consumer injects an approver
     /// that approval-gates its mutations.
     approver: Option<Arc<dyn Approver>>,
-    /// Authorization the sub-agents inherit (policy floor + a shared identity cell). The cell is
-    /// read at *spawn time*, so a per-request surface that swaps the parent identity between turns
-    /// (server principal mode) has children run under the current request's principal — never a
-    /// stale build-time service identity. When unset, sub-agents still run under the headless
-    /// approver but without the policy gate.
+    /// Authorization the sub-agents inherit (policy floor + immutable assembly-time identity).
+    /// A lexical parent-turn identity takes precedence at spawn time, so multi-principal surfaces
+    /// propagate the exact request principal without mutating this shared fallback.
     auth: Option<(AuthorizationPolicy, IdentityCell)>,
     /// When set, child runs persist into this shared (tenant) event store instead of a throwaway
     /// in-memory one, so a sub-agent's inner tool calls land in the audit log the parent reads.
@@ -174,8 +174,7 @@ impl LocalSpawner {
 
     /// Bound spawned sub-agents by an authorization policy + resolved identity (inherited from the
     /// parent). Sub-agents then traverse the same policy floor as the top-level agent. Wraps the
-    /// identity in a fresh, unshared cell — a per-request surface shares its live cell via
-    /// [`with_authorization_cell`](Self::with_authorization_cell) instead.
+    /// immutable fallback identity in a fresh handle; lexical turn identity still takes priority.
     pub fn with_authorization(
         self,
         policy: AuthorizationPolicy,
@@ -186,8 +185,7 @@ impl LocalSpawner {
     }
 
     /// Like [`with_authorization`](Self::with_authorization), but sharing an externally-owned
-    /// identity cell (typically the parent executor's — see `Executor::identity`), so identity
-    /// swaps on the parent propagate to every subsequently spawned child.
+    /// immutable fallback identity (typically the parent executor's).
     pub fn with_authorization_cell(
         mut self,
         policy: AuthorizationPolicy,
@@ -315,7 +313,7 @@ impl Spawner for LocalSpawner {
             ),
         };
         let mut registry = self.base_registry.subset(effective_tools.as_deref());
-        register_agent_ops(&mut registry);
+        register_agent_ops(&mut registry)?;
 
         // Recursion bound: a child at the leaf depth must never spawn further sub-agents, so `task` is
         // stripped from its registry AND no spawner is installed in its context (the two guards that
@@ -338,7 +336,13 @@ impl Spawner for LocalSpawner {
             // transitive across nested delegation: a grandchild role's `tools` allowlist can only ever
             // draw from a pool this ancestor has already narrowed, no matter how many hops down
             // (capabilities only ever narrow on descent, see `push_cap_scope`'s doc).
-            registry.register(Arc::new(TaskTool));
+            // Nested delegation intentionally restores the canonical task handler after role
+            // narrowing. Use the explicit replacement seam so an injected same-name handler can
+            // never survive silently.
+            registry.replace_from(
+                "flux-orchestrate canonical nested task operation",
+                Arc::new(TaskTool),
+            )?;
             let child_base = self.base_registry.subset(effective_tools.as_deref());
             ctx = ctx.with_spawner(Arc::new(self.at_depth(child_depth, child_base)));
         } else {
@@ -352,17 +356,24 @@ impl Spawner for LocalSpawner {
             .clone()
             .unwrap_or_else(|| Arc::new(SubAgentApprover));
         let activity_redactor = ctx.redactor.clone();
-        let mut executor = Executor::new(registry, PermissionManager::new(), approver, ctx);
-        if let Some((policy, cell)) = &self.auth {
-            // Snapshot the *current* identity at spawn time: under a per-request surface the cell
-            // holds the request principal, not the build-time service identity. The child gets a
-            // snapshot rather than the live cell — a child completes within one serialized turn,
-            // and sharing would let a later request's identity bleed into a still-draining child.
-            let (caller, trust) = cell.get();
-            executor = executor
-                .with_policy(policy.clone())
-                .with_identity(caller, trust);
-        }
+        let authorization = if let Some((policy, cell)) = &self.auth {
+            // Prefer the immutable identity scoped by the parent engine turn. The shared cell is
+            // only an assembly-time fallback for direct spawns outside a driven turn.
+            let (caller, trust) = active_runtime_turn_context()
+                .and_then(|turn| turn.identity())
+                .unwrap_or_else(|| cell.snapshot())
+                .into_parts();
+            ExecutionAuthorization::new(policy.clone(), caller, trust)
+        } else {
+            ExecutionAuthorization::local()
+        };
+        let executor = Executor::new_with_authorization(
+            registry,
+            PermissionManager::new(),
+            approver,
+            ctx,
+            authorization,
+        );
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
@@ -407,13 +418,9 @@ impl Spawner for LocalSpawner {
         // provider/model spec (C-15): this string keys the parent's `CallUsage` attribution.
         let model = flux_core::canonical_model_spec(Some(&provider_name), &engine.model);
 
-        // The child runs under a child of the parent's cancel token: cancelling the parent turn
-        // cancels the child. A wall-clock deadline fires that same token so the child reaches its own
-        // cancel path (a finalizing assistant message, valid in a shared audit store) and `spawn`
-        // returns a typed error. NOTE: this clean finalization holds for the *deadline* path; if the
-        // *parent turn* is cancelled, the parent engine drops the whole turn future (this `task` call
-        // included) without awaiting the child — so under `with_audit` a parent Ctrl-C can leave the
-        // child's turn unterminated in the shared store. See docs/designs/sub-agent-hardening.md.
+        // The child runs under a child of the parent's cancel token. Parent cancellation and the
+        // optional wall-clock deadline both fire that token, then bounded-await this SAME engine
+        // future so its cancellation path persists the assistant terminal before ownership ends.
         let run_cancel = cancel.child_token();
         let spawn_id = NEXT_SPAWN_ACTIVITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut sink = TextCollector::new(
@@ -425,32 +432,46 @@ impl Spawner for LocalSpawner {
             child_depth,
             activity_redactor,
         );
-        match self.limits.wall_clock {
-            Some(dur) => {
-                let run = engine.run_turn_cancellable(&session_id, task, &mut sink, &run_cancel);
-                tokio::pin!(run);
-                tokio::select! {
-                    res = &mut run => { res?; }
-                    _ = tokio::time::sleep(dur) => {
-                        run_cancel.cancel();
-                        // Let the child observe the cancel and finalize a valid session shape. A bounded
-                        // grace backstops the (currently unreachable) case where an await inside the
-                        // child doesn't observe the token — e.g. a compaction-time provider call, which
-                        // sub-agents never hit since they run a single fresh-session turn. Without the
-                        // backstop such a child would hang `spawn` forever, defeating the deadline.
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
-                        return Err(Error::Other(format!(
-                            "sub-agent '{role_name}' exceeded its {dur:?} wall-clock limit"
-                        )));
-                    }
+        enum StopTrigger {
+            ParentCancellation,
+            Deadline(std::time::Duration),
+        }
+        enum RunRace {
+            Finished(Result<()>),
+            Stopped(StopTrigger),
+        }
+        let (run_result, stop) = {
+            let run = engine.run_turn_cancellable(&session_id, task, &mut sink, &run_cancel);
+            tokio::pin!(run);
+            let race = match self.limits.wall_clock {
+                Some(dur) => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => RunRace::Stopped(StopTrigger::ParentCancellation),
+                    result = &mut run => RunRace::Finished(result),
+                    _ = tokio::time::sleep(dur) => RunRace::Stopped(StopTrigger::Deadline(dur)),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => RunRace::Stopped(StopTrigger::ParentCancellation),
+                    result = &mut run => RunRace::Finished(result),
+                },
+            };
+            match race {
+                RunRace::Finished(result) => (result, None),
+                RunRace::Stopped(trigger) => {
+                    run_cancel.cancel();
+                    let cleanup = tokio::time::timeout(SPAWN_CLEANUP_GRACE, &mut run)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Error::Other(format!(
+                                "sub-agent '{role_name}' did not stop within the \
+                                 {SPAWN_CLEANUP_GRACE:?} cancellation grace"
+                            )))
+                        });
+                    (cleanup, Some(trigger))
                 }
             }
-            None => {
-                engine
-                    .run_turn_cancellable(&session_id, task, &mut sink, &run_cancel)
-                    .await?;
-            }
-        }
+        };
         // The child's accumulated per-turn usage (C-06 sub-agent rollup): `TaskTool` folds this into
         // the PARENT turn's tally and records it as a `CallUsage` attributed to the child's own model,
         // so the sub-agent's spend counts toward the parent's total without being double-attributed to
@@ -458,7 +479,26 @@ impl Spawner for LocalSpawner {
         let usage = engine.loop_host.turn_usage();
         let usage = (usage.total() > 0).then_some(usage);
         let cancelled = sink.cancelled;
-        sink.finish(cancelled, usage.clone());
+        sink.finish(
+            stop.is_some() || cancelled || run_result.is_err(),
+            usage.clone(),
+        );
+        if let Some(stop) = stop {
+            let cleanup = run_result
+                .err()
+                .map(|error| format!("; cleanup failed: {error}"));
+            return Err(Error::Other(match stop {
+                StopTrigger::ParentCancellation => format!(
+                    "sub-agent '{role_name}' was cancelled{}",
+                    cleanup.as_deref().unwrap_or_default()
+                ),
+                StopTrigger::Deadline(dur) => format!(
+                    "sub-agent '{role_name}' exceeded its {dur:?} wall-clock limit{}",
+                    cleanup.as_deref().unwrap_or_default()
+                ),
+            }));
+        }
+        run_result?;
         if cancelled {
             return Err(Error::Other(format!(
                 "sub-agent '{role_name}' was cancelled"
@@ -503,8 +543,9 @@ pub struct SubAgents {
 }
 
 impl SubAgents {
-    /// A bundle with default limits for `max_tokens`; everything else off (no approver override, no
-    /// inherited authorization, no audit store, children are leaves). Set those with the `with_*` methods.
+    /// A bundle with default limits for `max_tokens`; everything else off (no approver override,
+    /// documented local authorization, no audit store, children are leaves). Set those with the
+    /// `with_*` methods.
     pub fn new(
         roles: RoleRegistry,
         child_base: ToolRegistry,
@@ -528,8 +569,8 @@ impl SubAgents {
     }
 
     /// Inherit an authorization policy + resolved identity (the parent's floor) for every sub-agent.
-    /// Wraps the identity in a fresh cell; a per-request surface shares its live cell via
-    /// [`with_authorization_cell`](Self::with_authorization_cell).
+    /// Wraps the immutable fallback identity in a fresh handle; lexical turn identity still takes
+    /// priority.
     pub fn with_authorization(
         self,
         policy: AuthorizationPolicy,
@@ -540,8 +581,7 @@ impl SubAgents {
     }
 
     /// Like [`with_authorization`](Self::with_authorization), but sharing an externally-owned
-    /// identity cell (typically the parent executor's), so per-turn identity swaps propagate to
-    /// every subsequently spawned child.
+    /// immutable fallback identity (typically the parent executor's).
     pub fn with_authorization_cell(
         mut self,
         policy: AuthorizationPolicy,
@@ -703,9 +743,8 @@ impl TextCollector {
 impl Drop for TextCollector {
     fn drop(&mut self) {
         if !self.terminal_emitted {
-            // Covers engine errors, wall-clock returns, and cancellation dropping the in-flight
-            // spawner future. Drop is synchronous, so the parent sees a terminal failure even when
-            // no async cleanup path can be awaited.
+            // Backstop panics or a supervisor abort after the cooperative grace. Ordinary success,
+            // error, timeout, and cancellation all call `finish` explicitly in `LocalSpawner`.
             self.finish(true, self.terminal_usage.clone());
         }
     }
@@ -1010,14 +1049,14 @@ impl Tool for TaskTool {
                 .into(),
             input_schema: tool_input_schema::<TaskInput>(),
             output_schema: None,
-            // A sub-agent runs arbitrary work (on its own executor) over the SHARED workspace:
-            // declaring Process makes every `task` dispatch bump the parent's op-cache
-            // invalidation generation, so post-task reads never replay pre-task state (L-54
-            // review, 2026-07-09).
+            // A sub-agent invokes a provider and may run arbitrary work (on its own executor) over
+            // the SHARED workspace. The Process effect bumps the parent's op-cache invalidation
+            // generation, so post-task reads never replay pre-task state (L-54
+            // review, 2026-07-09); Provider is the exact authority family, not OS-process access.
             effects: vec![Effect::Process],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
-            access: Vec::new(),
+            access: vec![AccessKind::Provider],
             group: None,
         }
     }
@@ -1029,6 +1068,15 @@ impl Tool for TaskTool {
             .unwrap_or_default()
     }
 
+    fn authority_requirements(
+        &self,
+        _params: &Value,
+        subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        let role = subjects.first().map(String::as_str).unwrap_or("sub-agent");
+        Ok(vec![AuthorityRequirement::provider_invoke(role)])
+    }
+
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: TaskInput = parse_params(params, "task")?;
         let Some(spawner) = &ctx.spawner else {
@@ -1037,9 +1085,11 @@ impl Tool for TaskTool {
         // Thread a child of the parent turn's cancellation token (installed on the context per turn by
         // the engine) so cancelling the parent turn cancels the sub-agent. Outside a cancellable driver
         // (e.g. the one-shot SDK path) no token is installed and the sub-agent runs to completion.
-        let cancel = ctx
-            .cancel_token()
-            .map(|t| t.child_token())
+        let supervisor = ctx.spawn_supervisor();
+        let cancel = supervisor
+            .as_ref()
+            .map(|owner| owner.child_token())
+            .or_else(|| ctx.cancel_token().map(|token| token.child_token()))
             .unwrap_or_default();
         // The active `with_tools` block scope (if any) narrows the child's tool set too — capabilities
         // only ever narrow on descent, and a sub-agent invocation is a descent step like any other.
@@ -1054,7 +1104,22 @@ impl Tool for TaskTool {
             parent_session: ctx.session_id(),
             activity: ctx.spawn_activity_sink(),
         };
-        match spawner.spawn(request, &cancel).await {
+        let spawned = if let Some(supervisor) = supervisor {
+            let spawner = spawner.clone();
+            let child_cancel = cancel.clone();
+            let runtime_turn = ctx.runtime_turn_context();
+            supervisor
+                .spawn(scope_runtime_turn(runtime_turn, async move {
+                    spawner.spawn(request, &child_cancel).await
+                }))
+                .await
+                .map_err(|error| {
+                    Error::Other(format!("sub-agent supervisor task failed: {error}"))
+                })?
+        } else {
+            spawner.spawn(request, &cancel).await
+        };
+        match spawned {
             Ok(outcome) => {
                 // C-06 sub-agent rollup: the child's token spend doesn't flow back through
                 // `ToolResult` (a plain string) — it rides the shared evidence log instead, the same
@@ -1108,6 +1173,10 @@ mod tests {
     use flux_provider::{ChunkStream, Request};
     use flux_system::Workspace;
     use serde_json::json;
+
+    fn parse_role(content: &str, name_fallback: &str) -> Role {
+        try_parse_role(content, name_fallback).unwrap()
+    }
 
     fn request_has_tool(request: &Request, name: &str) -> bool {
         request.tools.iter().any(|tool| tool.name == name)
@@ -1806,7 +1875,7 @@ mod tests {
         let system = temp_system();
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(TaskTool));
-        register_agent_ops(&mut registry);
+        register_agent_ops(&mut registry).unwrap();
         let executor = Executor::new(
             registry,
             PermissionManager::from_rules(&["task".into()], &[]),
@@ -1866,7 +1935,7 @@ mod tests {
             async fn spawn(
                 &self,
                 request: SpawnRequest,
-                _cancel: &CancellationToken,
+                cancel: &CancellationToken,
             ) -> Result<SpawnOutcome> {
                 let collector = TextCollector::new(
                     request.activity,
@@ -1878,9 +1947,9 @@ mod tests {
                     flux_secret::Redactor::new(),
                 );
                 let _ = self.entered.send(());
-                futures::future::pending::<()>().await;
+                cancel.cancelled().await;
                 drop(collector);
-                unreachable!()
+                Err(Error::Other("cancelled test child".into()))
             }
         }
 
@@ -1936,7 +2005,7 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(TaskTool));
-        register_agent_ops(&mut registry);
+        register_agent_ops(&mut registry).unwrap();
         let executor = Executor::new(
             registry,
             PermissionManager::from_rules(&["task".into()], &[]),
@@ -2001,6 +2070,507 @@ mod tests {
             "the cancelled child must leave exactly one visible failure terminal: {:?}",
             sink.children
         );
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_finalizes_an_audited_hanging_child() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct HangState {
+            active: AtomicUsize,
+            entered: tokio::sync::Notify,
+            dropped: tokio::sync::Notify,
+        }
+
+        impl HangState {
+            async fn wait_until_entered(&self) {
+                loop {
+                    let entered = self.entered.notified();
+                    if self.active.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    entered.await;
+                }
+            }
+
+            async fn wait_until_dropped(&self) {
+                loop {
+                    let dropped = self.dropped.notified();
+                    if self.active.load(Ordering::SeqCst) == 0 {
+                        return;
+                    }
+                    dropped.await;
+                }
+            }
+        }
+
+        struct AuditedHangStream {
+            state: Arc<HangState>,
+        }
+
+        impl futures::Stream for AuditedHangStream {
+            type Item = Result<Chunk>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for AuditedHangStream {
+            fn drop(&mut self) {
+                self.state.active.fetch_sub(1, Ordering::SeqCst);
+                self.state.dropped.notify_waiters();
+            }
+        }
+
+        struct AuditedHangProvider {
+            state: Arc<HangState>,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for AuditedHangProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            async fn stream(&self, _request: Request) -> Result<ChunkStream> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut chunks = intent_chunks("wait for cancellation", &[]);
+                    chunks.insert(
+                        chunks.len() - 1,
+                        Chunk::Usage(Usage {
+                            input_tokens: 7,
+                            output_tokens: 3,
+                            ..Usage::default()
+                        }),
+                    );
+                    return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+                }
+                self.state.active.fetch_add(1, Ordering::SeqCst);
+                self.state.entered.notify_waiters();
+                Ok(Box::pin(AuditedHangStream {
+                    state: self.state.clone(),
+                }))
+            }
+        }
+
+        struct ParentSink;
+        impl AgentSink for ParentSink {}
+
+        let audit = Arc::new(EventStore::in_memory().unwrap());
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\ntools: []\n---\nWait forever.", "sloth"));
+        let hang = Arc::new(HangState::default());
+        let child_hang = hang.clone();
+        let spawner: Arc<dyn Spawner> = Arc::new(
+            LocalSpawner::new(
+                Arc::new(move || {
+                    Ok(Box::new(AuditedHangProvider {
+                        state: child_hang.clone(),
+                        calls: AtomicUsize::new(0),
+                    }))
+                }),
+                Arc::new(roles),
+                ToolRegistry::new(),
+                temp_system(),
+                "mock",
+                1_024,
+            )
+            .with_audit(audit.clone()),
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TaskTool));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["task".into()], &[]),
+            Arc::new(flux_runtime::AllowApprover),
+            ToolContext::new(temp_system()).with_spawner(spawner),
+        );
+        let parent_loop = flux_flow::ast::DraftAst {
+            body: vec![flux_flow::ast::Node::Return {
+                value: Box::new(flux_flow::ast::Node::Call {
+                    op: "task".into(),
+                    args: vec![flux_flow::ast::Node::Lit {
+                        value: json!({"role": "sloth", "task": "wait"}),
+                    }],
+                }),
+            }],
+            ..Default::default()
+        };
+        let parent_flow =
+            flux_flow::state::FlowStore::in_memory_with_events(audit.clone()).unwrap();
+        let engine = flux_flow::engine::FlowEngine::assemble_with_loop(
+            Arc::new(flux_provider::NullProvider),
+            executor,
+            audit.clone(),
+            parent_flow,
+            "mock".into(),
+            "Delegate exactly once.".into(),
+            1_024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            std::env::temp_dir(),
+            flux_flow::engine::AgentLoopSpec::Flux(parent_loop),
+        )
+        .unwrap();
+        let parent = audit.create_session("mock").unwrap();
+        let cancel = CancellationToken::new();
+        let mut sink = ParentSink;
+
+        let turn = engine.run_turn_cancellable(&parent, "delegate", &mut sink, &cancel);
+        tokio::pin!(turn);
+        tokio::select! {
+            () = hang.wait_until_entered() => {}
+            result = &mut turn => panic!("parent ended before its child provider hung: {result:?}"),
+        }
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut turn)
+            .await
+            .expect("parent cancellation must remain bounded")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), hang.wait_until_dropped())
+            .await
+            .expect("the hanging provider future must be reaped");
+
+        let children = audit.children_of(&parent).unwrap();
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        let history = audit.conversation(child).unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "child history must close user → assistant"
+        );
+        assert_eq!(history[0].role, flux_core::Role::User);
+        assert_eq!(history[1].role, flux_core::Role::Assistant);
+        assert_eq!(history[1].text(), "(turn cancelled)");
+        let turns = audit.turns(child).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].outcome, "cancelled");
+        let usage = turns[0]
+            .usage
+            .as_ref()
+            .expect("usage observed before cancellation must be flushed");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (7, 3));
+        assert_eq!(turns[0].calls, 1, "one partial provider call is audited");
+        assert_eq!(
+            (
+                turns[0].call_usage.input_tokens,
+                turns[0].call_usage.output_tokens,
+            ),
+            (7, 3)
+        );
+        assert_eq!(
+            audit
+                .observations(child)
+                .unwrap()
+                .iter()
+                .filter(|observation| observation.kind == "turn.cancelled")
+                .count(),
+            1,
+            "the child cancellation terminal must be audited exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_reaps_an_audited_child_hanging_in_a_tool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct ToolHangState {
+            active: AtomicUsize,
+            entered: tokio::sync::Notify,
+            dropped: tokio::sync::Notify,
+        }
+
+        impl ToolHangState {
+            async fn wait_until_entered(&self) {
+                loop {
+                    let entered = self.entered.notified();
+                    if self.active.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    entered.await;
+                }
+            }
+
+            async fn wait_until_dropped(&self) {
+                loop {
+                    let dropped = self.dropped.notified();
+                    if self.active.load(Ordering::SeqCst) == 0 {
+                        return;
+                    }
+                    dropped.await;
+                }
+            }
+        }
+
+        struct ActiveTool(Arc<ToolHangState>);
+        impl Drop for ActiveTool {
+            fn drop(&mut self) {
+                self.0.active.fetch_sub(1, Ordering::SeqCst);
+                self.0.dropped.notify_waiters();
+            }
+        }
+
+        struct HangingTool(Arc<ToolHangState>);
+        #[async_trait]
+        impl Tool for HangingTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(
+                    "hang_forever",
+                    "Wait until the parent cancels this test operation.",
+                    json!({"type": "object", "additionalProperties": false}),
+                )
+            }
+
+            async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+                self.0.active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveTool(self.0.clone());
+                self.0.entered.notify_waiters();
+                futures::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        struct HangingToolProvider;
+        #[async_trait]
+        impl Provider for HangingToolProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                let chunks = if request_has_tool(&request, "declare_intent") {
+                    intent_chunks("wait in the hanging tool", &["core"])
+                } else if request_has_tool(&request, "hang_forever") {
+                    native_call("hang-1", "hang_forever", json!({}))
+                } else {
+                    prose_chunks("unexpected child continuation")
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        struct ParentSink;
+        impl AgentSink for ParentSink {}
+
+        let audit = Arc::new(EventStore::in_memory().unwrap());
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [hang_forever]\n---\nCall the hanging tool.",
+            "worker",
+        ));
+        let hang = Arc::new(ToolHangState::default());
+        let mut child_tools = ToolRegistry::new();
+        child_tools.register(Arc::new(HangingTool(hang.clone())));
+        let spawner: Arc<dyn Spawner> = Arc::new(
+            LocalSpawner::new(
+                Arc::new(|| Ok(Box::new(HangingToolProvider))),
+                Arc::new(roles),
+                child_tools,
+                temp_system(),
+                "mock",
+                1_024,
+            )
+            .with_audit(audit.clone()),
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TaskTool));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["task".into()], &[]),
+            Arc::new(flux_runtime::AllowApprover),
+            ToolContext::new(temp_system()).with_spawner(spawner),
+        );
+        let parent_loop = flux_flow::ast::DraftAst {
+            body: vec![flux_flow::ast::Node::Return {
+                value: Box::new(flux_flow::ast::Node::Call {
+                    op: "task".into(),
+                    args: vec![flux_flow::ast::Node::Lit {
+                        value: json!({"role": "worker", "task": "hang"}),
+                    }],
+                }),
+            }],
+            ..Default::default()
+        };
+        let parent_flow =
+            flux_flow::state::FlowStore::in_memory_with_events(audit.clone()).unwrap();
+        let engine = flux_flow::engine::FlowEngine::assemble_with_loop(
+            Arc::new(flux_provider::NullProvider),
+            executor,
+            audit.clone(),
+            parent_flow,
+            "mock".into(),
+            "Delegate exactly once.".into(),
+            1_024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            std::env::temp_dir(),
+            flux_flow::engine::AgentLoopSpec::Flux(parent_loop),
+        )
+        .unwrap();
+        let parent = audit.create_session("mock").unwrap();
+        let cancel = CancellationToken::new();
+        let mut sink = ParentSink;
+
+        let turn = engine.run_turn_cancellable(&parent, "delegate", &mut sink, &cancel);
+        tokio::pin!(turn);
+        tokio::select! {
+            () = hang.wait_until_entered() => {}
+            result = &mut turn => panic!("parent ended before the child tool hung: {result:?}"),
+        }
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut turn)
+            .await
+            .expect("parent cancellation must remain bounded")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), hang.wait_until_dropped())
+            .await
+            .expect("the hanging tool future must be reaped");
+
+        let children = audit.children_of(&parent).unwrap();
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        let history = audit.conversation(child).unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "child history must close user → assistant"
+        );
+        assert_eq!(history[1].role, flux_core::Role::Assistant);
+        assert_eq!(history[1].text(), "(turn cancelled)");
+        let turns = audit.turns(child).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].outcome, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancellation_transitively_finalizes_an_opt_in_nested_child() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct LeafHang {
+            active: AtomicUsize,
+            entered: tokio::sync::Notify,
+            dropped: tokio::sync::Notify,
+        }
+
+        impl LeafHang {
+            async fn wait_until_entered(&self) {
+                loop {
+                    let entered = self.entered.notified();
+                    if self.active.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    entered.await;
+                }
+            }
+
+            async fn wait_until_dropped(&self) {
+                loop {
+                    let dropped = self.dropped.notified();
+                    if self.active.load(Ordering::SeqCst) == 0 {
+                        return;
+                    }
+                    dropped.await;
+                }
+            }
+        }
+
+        struct ActiveLeaf(Arc<LeafHang>);
+        impl Drop for ActiveLeaf {
+            fn drop(&mut self) {
+                self.0.active.fetch_sub(1, Ordering::SeqCst);
+                self.0.dropped.notify_waiters();
+            }
+        }
+
+        struct NestedCancelProvider(Arc<LeafHang>);
+
+        #[async_trait]
+        impl Provider for NestedCancelProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            async fn stream(&self, _request: Request) -> Result<ChunkStream> {
+                self.0.active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveLeaf(self.0.clone());
+                self.0.entered.notify_waiters();
+                futures::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let audit = Arc::new(EventStore::in_memory().unwrap());
+        let parent = audit.create_session("mock").unwrap();
+        let mut roles = RoleRegistry::default();
+        let mut delegator = parse_role(
+            "---\ntools: [task]\n---\nDELEGATE to the leaf role.",
+            "delegator",
+        );
+        delegator.agent_loop = Some(
+            "flow nested_cancel -> string\n  return task({ role: \"leaf\", task: \"wait forever\" })"
+                .into(),
+        );
+        roles.insert(delegator);
+        roles.insert(parse_role("---\ntools: []\n---\nRemain blocked.", "leaf"));
+        let leaf = Arc::new(LeafHang::default());
+        let child_leaf = leaf.clone();
+        let spawner = LocalSpawner::new(
+            Arc::new(move || Ok(Box::new(NestedCancelProvider(child_leaf.clone())))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1_024,
+        )
+        .with_max_depth(2)
+        .with_audit(audit.clone());
+        let cancel = CancellationToken::new();
+        let mut request = SpawnRequest::new("delegator", "delegate");
+        request.parent_session = Some(parent.clone());
+
+        let run = spawner.spawn(request, &cancel);
+        tokio::pin!(run);
+        tokio::select! {
+            () = leaf.wait_until_entered() => {}
+            result = &mut run => panic!("nested spawn ended before its leaf hung: {result:?}"),
+        }
+        cancel.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
+            .await
+            .expect("nested cancellation must remain bounded")
+            .expect_err("the cancelled delegator must not report success");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), leaf.wait_until_dropped())
+            .await
+            .expect("the nested leaf provider must be reaped");
+
+        let children = audit.children_of(&parent).unwrap();
+        assert_eq!(children.len(), 1, "one direct child is audited");
+        let grandchildren = audit.children_of(&children[0]).unwrap();
+        assert_eq!(grandchildren.len(), 1, "one nested child is audited");
+        for child in [&children[0], &grandchildren[0]] {
+            let history = audit.conversation(child).unwrap();
+            assert_eq!(history.len(), 2, "{child} must close user → assistant");
+            assert_eq!(history[1].role, flux_core::Role::Assistant);
+            assert_eq!(history[1].text(), "(turn cancelled)");
+            let turns = audit.turns(child).unwrap();
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].outcome, "cancelled");
+        }
     }
 
     /// A mock provider that names a real provider (not `"mock"`) and records the `model` string it
@@ -2575,7 +3145,7 @@ mod tests {
         let system = temp_system();
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(TaskTool));
-        register_agent_ops(&mut registry);
+        register_agent_ops(&mut registry).unwrap();
         let executor = Executor::new(
             registry,
             PermissionManager::from_rules(&["task".into()], &[]),
@@ -2663,6 +3233,7 @@ mod tests {
             fn spec(&self) -> ToolSpec {
                 ToolSpec::read_only("danger", "d", json!({"type": "object"}))
                     .with_effects(vec![Effect::Process])
+                    .with_access(vec![AccessKind::Process])
             }
             fn intents(&self, _p: &Value) -> IntentSet {
                 let mut s = IntentSet::new();
