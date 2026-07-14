@@ -73,7 +73,7 @@ flux-orchestrate = { package = "codewandler-flux-orchestrate", version = "0.24.0
 flux-lang = { package = "codewandler-flux-lang", version = "0.24.0", path = "crates/flux-lang" }
 flux-flow = { package = "codewandler-flux-flow", version = "0.24.0", path = "crates/flux-flow" }
 flux-eval = { path = "crates/flux-eval" }
-flux-plugin = { package = "codewandler-flux-plugin", version = "0.24.0", path = "crates/flux-plugin" }
+flux-plugin = { package = "codewandler-flux-plugin", version = "0.24.0", path = "crates/flux-plugin", default-features = false, features = ["host", "hooks", "pack"] }
 flux-auth = { path = "crates/flux-auth" }
 flux-evidence = { package = "codewandler-flux-evidence", version = "0.24.0", path = "crates/flux-evidence" }
 flux-datasource = { package = "codewandler-flux-datasource", version = "0.24.0", path = "crates/flux-datasource" }

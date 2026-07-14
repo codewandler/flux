@@ -13,36 +13,66 @@ name = "flux_plugin"
 [package.metadata.dist]
 dist = false
 
+[features]
+# Root hosts retain the historical all-in build. Guest plugins should opt out of defaults and select
+# `guest`; that surface contains only wire/manifest types plus the synchronous stdio SDK.
+default = ["host", "hooks", "pack"]
+guest = []
+host = [
+    "dep:flux-core",
+    "dep:flux-runtime",
+    "dep:flux-system",
+    "dep:flux-secret",
+    "dep:flux-credentials",
+    "dep:tokio",
+    "dep:async-trait",
+    "dep:reqwest",
+    "dep:base64",
+    "dep:sha2",
+    "dep:hmac",
+    "dep:rand",
+    "dep:url",
+    "dep:toml",
+]
+hooks = ["host", "dep:rquickjs"]
+pack = [
+    "host",
+    "dep:minisign-verify",
+    "dep:tar",
+    "dep:lzma-rs",
+    "dep:zip",
+]
+
 [dependencies]
-flux-core.workspace = true
+flux-core = { workspace = true, optional = true }
 flux-datasource.workspace = true
 flux-lang.workspace = true
-flux-runtime.workspace = true
+flux-runtime = { workspace = true, optional = true }
 flux-spec.workspace = true
-flux-system.workspace = true
-flux-secret.workspace = true
-flux-credentials.workspace = true
+flux-system = { workspace = true, optional = true }
+flux-secret = { workspace = true, optional = true }
+flux-credentials = { workspace = true, optional = true }
 flux-evidence.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-async-trait.workspace = true
-reqwest.workspace = true
-base64.workspace = true
-sha2.workspace = true
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 # Host-terminated Postgres SCRAM-SHA-256 handshake (D-31): HMAC-SHA256 + SHA-256 + a random client
 # nonce. PBKDF2 is a short HMAC loop implemented in `pg.rs`, not a separate crate.
-hmac.workspace = true
-rand.workspace = true
-url.workspace = true
-toml.workspace = true
-rquickjs.workspace = true
+hmac = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+rquickjs = { workspace = true, optional = true }
 # Plugin pack distribution (D-47, `pack` module): verified fetch-and-install from the signed
 # `plugins-v*` release channel. See `pack.rs` module docs for the trust ladder.
-minisign-verify.workspace = true
-tar.workspace = true
-lzma-rs.workspace = true
-zip.workspace = true
+minisign-verify = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+lzma-rs = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
