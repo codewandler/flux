@@ -6,6 +6,12 @@ inside their capability ceiling. Operations are an **engine** concern (mostly pr
 `flux-tools`), not part of the Flux-Lang language — see
 [`flux-lang/docs/reference.md`](../../flux-lang/docs/reference.md) for the language itself.
 
+Every concrete call carries typed authorization requirements in addition to the risk/effect summary
+shown here. Whole-plan preview and dispatch consume the same workspace, datasource, host, provider,
+network, connection, process, secret, and semantic-action resources; approval cannot widen a policy
+denial. See the repository's
+[typed authority contract](../../../docs/designs/typed-authority-requirements.md).
+
 ## Registered ops quick reference
 
 Ops are passed by name to `call`. Arguments are positional in the order shown;
@@ -38,7 +44,7 @@ optional arguments are in `[brackets]`.
 | `file_stat` | `path` | Low | File metadata: size, line count, mtime (replaces `wc -l`, `stat`, `ls -la`) |
 | `path_exists` | `path` | Low | Returns `"true"`/`"false"` — use with `when`/`unless` to branch on file presence |
 | `sqlite_query` | `db, sql[, params]` | Low | Read-only SQLite query (SELECT/PRAGMA only) |
-| `web.search` | `query[, max_results]` | Low | Tavily web search — requires `TAVILY_API_KEY` env var |
+| `web.search` | `query|queries[, max_results, providers]` | Low | First-party `websearch` plugin alias: Tavily when host auth is configured, otherwise DuckDuckGo; credentials never enter call input |
 | `now` | | Low | Current wall-clock time: unix seconds + UTC string (replaces `date`) |
 | `cwd` | | Low | Absolute path of the workspace root (replaces `pwd`) |
 | `sys_info` | | Low | Host metadata: os, arch, family, hostname (replaces `uname`) |

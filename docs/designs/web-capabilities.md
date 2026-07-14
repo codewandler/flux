@@ -1,22 +1,22 @@
 # Design: Web capabilities — request · read · browse
 
-**Status:** implemented (2026-07-09) · **Pillar:** Agent / Core · **Stories:**
+**Status:** implemented (2026-07-09; search ownership consolidated 2026-07-14) · **Pillar:** Agent / Core · **Stories:**
 [D-98](../stories/D-98-flux-web-crate-and-http-request-op.md) ·
 [D-120](../stories/D-120-web-fetch-readable-markdown.md) ·
 [D-121](../stories/D-121-browser-cdp-foundation.md) ·
 [D-122](../stories/D-122-browser-page-digest.md) ·
 [D-123](../stories/D-123-browser-actions-delta.md) ·
-[D-124](../stories/D-124-browser-egress-interception.md)
+[D-124](../stories/D-124-browser-egress-interception.md) ·
+[C-70](../stories/C-70-consolidate-web-search.md)
 
 ## Why
 
-flux's web surface grew bottom-up and it shows. Today there are exactly two model-facing web ops:
-`web.fetch` (native, raw `[status]\n<body>` text capped at 256 KiB, **no** condensation, and a
-bespoke per-tool private-net path — the caveat recorded on
-[D-96](../stories/D-96-allow-private-net-cli-override.md)) and `web.search` (native, Tavily) plus
-the `websearch` plugin. Integration plugins do vendor-scoped HTTP through the host `http.do`
-capability, but nothing exposes *generic* HTTP to the model. And there is no browser at all —
-`flux-capabilities/src/browser.rs` names CDP automation as deferred in a comment.
+flux's web surface grew bottom-up. Before this epic, `web.fetch` was a raw native fetch with a
+bespoke private-net path, generic HTTP was unavailable, and there was no browser surface. Search
+also had two owners: a native Tavily tool and the `websearch` integration plugin. The tiered native
+surface below fixed request/read/browse; C-70 later made the first-party plugin the sole search
+owner because plugin host capabilities already provide scoped HTTP, host-side secret injection, and
+the keyless DuckDuckGo fallback.
 
 The organizing idea of this epic: **working with the web is three fundamentally different
 capabilities**, distinguished by what the model *sees* and what can go wrong — and they should be
@@ -33,9 +33,10 @@ applications → tier 3.** Tier 3 is deliberately **non-visual by default**: the
 screen reader sees (roles, names, states) plus condensed text — not screenshots, not HTML source,
 and after the first observation it sees *deltas*, not the page again.
 
-**All three tiers are native — no plugins.** These are table-stakes capabilities of a daily-driver
-agent; none of them should sit behind an install step (user call, 2026-07-09, revising the first
-draft of this design). They live in **one new library crate, `crates/flux-web`** (package
+**All three request/read/browse tiers are native — no plugins.** These are table-stakes capabilities
+of a daily-driver agent; none of them should sit behind an install step (user call, 2026-07-09,
+revising the first draft of this design). Search is deliberately outside those tiers and is owned by
+the first-party plugin pack. The native tiers live in **one library crate, `crates/flux-web`** (package
 `codewandler-flux-web`, the workspace convention), and all of them are governed by **one
 family-wide scoped egress policy** instead of today's per-tool special case.
 
@@ -168,11 +169,35 @@ No off switch — this *is* the policy (no-fallbacks rule).
 
 - **Determinism / Time Machine:** all of this is ordinary ops through normal dispatch, so outputs
   ride the C-43 cassette — a browsing run replays hermetically and forks/diffs like any other run.
-- **The `websearch` plugin and native `web.search` are untouched** (non-goal); a later story may
-  fold search into flux-web for symmetry, but nothing here depends on it.
+- **Search has one owner after C-70.** The `websearch` plugin projects its stable wire operation
+  `websearch.search` as the compatibility name `web.search`. Tavily credentials remain in the host,
+  every request goes through manifest-scoped `http.do`, and DuckDuckGo remains the no-key fallback.
+  `flux-tools` and `flux-web` contain no second search transport or model-facing API-key field.
 - **Vision:** screenshots are a **non-goal** for v1 — `ToolResult` is text-only (the flux-render
   constraint), and the non-visual digest is the product thesis; revisit only if a multimodal
   content-model seam lands.
+
+### Search ownership — C-70
+
+The first-party `websearch` plugin is the sole Tavily/DuckDuckGo implementation. This is an
+ownership decision, not a second optional backend:
+
+- the raw subprocess/CLI identity stays `websearch.search`, while `OperationSpec.public_name`
+  projects exactly one model-facing compatibility name, `web.search`;
+- Tavily availability is queried through `auth.available` and its bearer value is injected by the
+  host into the declared `api.tavily.com` request; the guest never reads `TAVILY_API_KEY` or accepts
+  an API key in operation input;
+- Tavily and DuckDuckGo requests use the plugin host's DNS-aware URL guard, bounded same-origin
+  redirect handling, and manifest/operator private-network intersection;
+- results retain the stable `web.result` datasource contribution contract and provider selection;
+- native registry assembly and the language server do not install a schema stub for an absent
+  plugin. An installed descriptor projects the alias into the live catalog, avoiding a catalog that
+  advertises an operation the runtime cannot dispatch.
+
+The native Tavily client, its `reqwest` dependency in `flux-tools`, and its environment-secret path
+were removed together. Direct `flux plugin call websearch websearch.search` remains a wire-level
+compatibility path; authored/model-facing programs continue to use `web.search` once the first-party
+plugin is installed.
 
 ## Alternatives considered
 

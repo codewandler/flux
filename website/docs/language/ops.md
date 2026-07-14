@@ -50,13 +50,15 @@ policy.
 | `browser.snapshot` | `session[, view]` | low | Re-observe a session (`full`, `actions`, or `content`) |
 | `browser.act` | `session, action[, ref, value, full]` | medium, approval | Click, type, fill, select, press, scroll, navigate, or go back using digest refs |
 | `browser.close` | `session` | low | Close a browser session and its Chromium child |
-| `web.search` | `query[, max_results]` | low | Tavily web search (requires `TAVILY_API_KEY`) |
+| `web.search` | `query|queries[, max_results, providers]` | low | First-party `websearch` plugin alias: Tavily with host-managed auth, otherwise DuckDuckGo; no credential field |
 | `sqlite_query` | `db, sql[, limit]` | low | Read-only SQLite query (`limit` caps rows, default 200) |
 | `now` / `cwd` / `home_dir` / `sys_info` | | low | Clock, workspace/home paths, and host metadata — no shell needed |
 
 All native web operations share the `[private_net] web` scope. Public destinations are allowed by
 default; private/internal destinations require an explicit grant. Browser operations register in
-every host but are advertised only when a Chromium binary is discoverable.
+every host but are advertised only when a Chromium binary is discoverable. `web.search` is the
+model-facing alias projected by the first-party `websearch` plugin; its destinations are additionally
+bounded by that plugin's manifest and its Tavily credential is injected host-side.
 
 ## Processes and toolchains
 

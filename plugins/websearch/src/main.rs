@@ -4,26 +4,27 @@
 //! and which one is active.
 //!
 //! Flux folds both backends into this one plugin (Tavily primary, DuckDuckGo fallback) rather than the
-//! fluxplane aggregator + per-provider-plugin split; `websearch.search` takes an optional `providers`
-//! filter to pin a backend.
+//! fluxplane aggregator + per-provider-plugin split. Its stable wire/CLI operation
+//! `websearch.search` projects into the agent catalog as `web.search`; the operation takes an
+//! optional `providers` filter to pin a backend.
 
 use host_kit::*;
 use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 
 // ===========================================================================
-// Schema-only op input structs (D-36)
+// Typed operation contracts (C-68)
 // ===========================================================================
 // Each op's `input_schema` is derived from the structs below via schemars
 // (`host_kit::read_op_typed::<T>`), instead of a hand-written `json!({...})`
-// object, so the schema the model sees cannot drift from a separately-maintained
-// literal. The structs are schema-only: handlers keep their existing Value
-// extraction (the D-34 schema-only precedent).
+// object. Host-kit deserializes these exact types before preflight/dispatch and
+// derives both input and output schemas from the executable contract.
 
-/// `websearch.search`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+/// `web.search` (wire/CLI identity: `websearch.search`).
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct SearchInput {
     /// Single search query (convenience field).
     query: Option<String>,
@@ -40,9 +41,39 @@ struct SearchInput {
 }
 
 /// `websearch.provider.list`.
-#[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 struct ProviderListInput {}
+
+#[derive(Serialize, JsonSchema)]
+struct SearchResult {
+    title: String,
+    url: String,
+    content: String,
+    snippet: String,
+    score: f64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SearchOutput {
+    results: Vec<SearchResult>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ProviderInfo {
+    name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+    description: String,
+    auth_required: bool,
+    available: bool,
+    active: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ProviderListOutput {
+    providers: Vec<ProviderInfo>,
+    count: u64,
+}
 
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("websearch", env!("CARGO_PKG_VERSION"))
@@ -65,17 +96,22 @@ fn manifest_builder() -> PluginBuilder {
             capabilities: vec!["search".into(), "get".into()],
             entity_schema: None,
         })
-        .operation(
-            read_op_typed::<SearchInput>(
-                "websearch.search",
-                "Search the web (Tavily if configured, else DuckDuckGo). Returns ranked results.",
+        .operation_typed::<SearchInput, SearchOutput>(
+            exposed_as(
+                read_op(
+                    "websearch.search",
+                    "Search the web (Tavily if configured, else DuckDuckGo). Returns ranked results.",
+                    json!({}),
+                ),
+                "web.search",
             ),
             search,
         )
-        .operation(
-            read_op_typed::<ProviderListInput>(
+        .operation_typed::<ProviderListInput, ProviderListOutput>(
+            read_op(
                 "websearch.provider.list",
                 "List the web-search backends and which one is active (Tavily when configured, else DuckDuckGo).",
+                json!({}),
             ),
             provider_list,
         )
@@ -86,7 +122,7 @@ const MAX_RESULTS: u64 = 20;
 const MAX_QUERIES: usize = 5;
 const MAX_QUERY_LENGTH: usize = 500;
 
-fn search(input: Value, host: &mut Host) -> Result<Value, String> {
+fn search(input: SearchInput, host: &mut Host) -> Result<SearchOutput, String> {
     let queries = normalize_queries(&input)?;
     let max = normalize_max(&input);
 
@@ -101,21 +137,18 @@ fn search(input: Value, host: &mut Host) -> Result<Value, String> {
         ));
     }
 
+    let tavily_available = allow_tavily && host.auth_available("tavily_api_key")?;
     let mut all_results = Vec::new();
     for query in &queries {
-        let mut results = if allow_tavily {
-            match host.secret("tavily_api_key") {
-                Ok(key) => tavily(host, &key, query, max)?,
-                Err(_) if allow_ddg => duckduckgo(host, query, max)?,
-                Err(_) => {
-                    return Err(
-                        "websearch.search: provider `tavily` requested but TAVILY_API_KEY is not configured"
-                            .into(),
-                    )
-                }
-            }
-        } else {
+        let mut results = if tavily_available {
+            tavily(host, query, max)?
+        } else if allow_ddg {
             duckduckgo(host, query, max)?
+        } else {
+            return Err(
+                "websearch.search: provider `tavily` requested but TAVILY_API_KEY is not configured"
+                    .into(),
+            );
         };
         all_results.append(&mut results);
     }
@@ -123,26 +156,27 @@ fn search(input: Value, host: &mut Host) -> Result<Value, String> {
     // Contribute the results as records so they're searchable knowledge afterwards.
     let records: Vec<Record> = all_results
         .iter()
-        .filter_map(|r| {
-            let url = r.get("url").and_then(|v| v.as_str())?;
-            Some(Record::new(
+        .map(|r| {
+            Record::new(
                 Source::new("websearch"),
                 "web.result",
-                url,
-                r.get("title").and_then(|v| v.as_str()).unwrap_or(url),
-                r.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-            ))
+                &r.url,
+                if r.title.is_empty() { &r.url } else { &r.title },
+                &r.content,
+            )
         })
         .collect();
     if !records.is_empty() {
         let _ = host.contribute(&records);
     }
 
-    Ok(json!({ "results": all_results }))
+    Ok(SearchOutput {
+        results: all_results,
+    })
 }
 
 /// Normalize queries from `query` and/or `queries`, trim, deduplicate, and validate.
-fn normalize_queries(input: &Value) -> Result<Vec<String>, String> {
+fn normalize_queries(input: &SearchInput) -> Result<Vec<String>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     let mut push = |q: &str| {
@@ -154,14 +188,12 @@ fn normalize_queries(input: &Value) -> Result<Vec<String>, String> {
         out.push(q.to_string());
     };
 
-    if let Some(q) = input.get("query").and_then(|v| v.as_str()) {
+    if let Some(q) = input.query.as_deref() {
         push(q);
     }
-    if let Some(arr) = input.get("queries").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(q) = v.as_str() {
-                push(q);
-            }
+    if let Some(queries) = &input.queries {
+        for query in queries {
+            push(query);
         }
     }
 
@@ -184,12 +216,12 @@ fn normalize_queries(input: &Value) -> Result<Vec<String>, String> {
 }
 
 /// Resolve `max_results` → `max` → `limit`, defaulting to 10 and capping at 20.
-fn normalize_max(input: &Value) -> u64 {
+fn normalize_max(input: &SearchInput) -> u64 {
     let pick = input
-        .get("max_results")
-        .and_then(|v| v.as_u64())
-        .or_else(|| input.get("max").and_then(|v| v.as_u64()))
-        .or_else(|| input.get("limit").and_then(|v| v.as_u64()))
+        .max_results
+        .or(input.max)
+        .or(input.limit)
+        .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(DEFAULT_MAX);
     if pick == 0 || pick > MAX_RESULTS {
         MAX_RESULTS
@@ -199,13 +231,13 @@ fn normalize_max(input: &Value) -> u64 {
 }
 
 /// Normalized, lowercased provider names from the `providers` input (empty = no filter).
-fn providers_filter(input: &Value) -> Vec<String> {
+fn providers_filter(input: &SearchInput) -> Vec<String> {
     input
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
+        .providers
+        .as_ref()
+        .map(|providers| {
+            providers
+                .iter()
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect()
@@ -215,39 +247,44 @@ fn providers_filter(input: &Value) -> Vec<String> {
 
 /// List the search backends folded into this plugin and which one is active. Tavily is active (primary)
 /// when `TAVILY_API_KEY` resolves; otherwise the keyless DuckDuckGo fallback is active.
-fn provider_list(_input: Value, host: &mut Host) -> Result<Value, String> {
-    let tavily_available = host.secret("tavily_api_key").is_ok();
-    Ok(json!({
-        "providers": [
-            {
-                "name": "tavily",
-                "description": "Tavily Search API (ranked results; requires TAVILY_API_KEY).",
-                "auth_required": true,
-                "available": tavily_available,
-                "active": tavily_available
+fn provider_list(_input: ProviderListInput, host: &mut Host) -> Result<ProviderListOutput, String> {
+    let tavily_available = host.auth_available("tavily_api_key")?;
+    Ok(ProviderListOutput {
+        providers: vec![
+            ProviderInfo {
+                name: "tavily".into(),
+                aliases: Vec::new(),
+                description: "Tavily Search API (ranked results; requires TAVILY_API_KEY).".into(),
+                auth_required: true,
+                available: tavily_available,
+                active: tavily_available,
             },
-            {
-                "name": "duckduckgo",
-                "aliases": ["ddg"],
-                "description": "DuckDuckGo Instant Answer API (no key; fallback).",
-                "auth_required": false,
-                "available": true,
-                "active": !tavily_available
-            }
+            ProviderInfo {
+                name: "duckduckgo".into(),
+                aliases: vec!["ddg".into()],
+                description: "DuckDuckGo Instant Answer API (no key; fallback).".into(),
+                auth_required: false,
+                available: true,
+                active: !tavily_available,
+            },
         ],
-        "count": 2
-    }))
+        count: 2,
+    })
 }
 
-/// Tavily: POST /search with the API key in the body (not a bearer header).
-fn tavily(host: &mut Host, key: &str, query: &str, max: u64) -> Result<Vec<Value>, String> {
+/// Tavily: POST /search with the API key injected as a Bearer header by the host.
+fn tavily(host: &mut Host, query: &str, max: u64) -> Result<Vec<SearchResult>, String> {
     let body = json!({
-        "api_key": key,
         "query": query,
         "max_results": max,
         "search_depth": "basic"
     });
-    let resp = host.send_json("POST", "https://api.tavily.com/search", None, &body)?;
+    let resp = host.send_json(
+        "POST",
+        "https://api.tavily.com/search",
+        Some("tavily_api_key"),
+        &body,
+    )?;
     let results = resp
         .get("results")
         .and_then(|v| v.as_array())
@@ -255,18 +292,21 @@ fn tavily(host: &mut Host, key: &str, query: &str, max: u64) -> Result<Vec<Value
         .unwrap_or_default()
         .into_iter()
         .map(|r| {
-            json!({
-                "title": r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                "url": r.get("url").and_then(|v| v.as_str()).unwrap_or(""),
-                "content": r.get("content").and_then(|v| v.as_str()).unwrap_or("")
-            })
+            let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            SearchResult {
+                title: r.get("title").and_then(|v| v.as_str()).unwrap_or("").into(),
+                url: r.get("url").and_then(|v| v.as_str()).unwrap_or("").into(),
+                content: content.into(),
+                snippet: content.into(),
+                score: r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            }
         })
         .collect();
     Ok(results)
 }
 
 /// DuckDuckGo Instant Answer API (no key): GET /?q=…&format=json. Best-effort, limited recall.
-fn duckduckgo(host: &mut Host, query: &str, max: u64) -> Result<Vec<Value>, String> {
+fn duckduckgo(host: &mut Host, query: &str, max: u64) -> Result<Vec<SearchResult>, String> {
     let url = format!(
         "https://api.duckduckgo.com/?q={}&format=json&no_html=1",
         urlencode(query)
@@ -275,11 +315,21 @@ fn duckduckgo(host: &mut Host, query: &str, max: u64) -> Result<Vec<Value>, Stri
     let mut out = Vec::new();
     if let Some(abstract_text) = resp.get("AbstractText").and_then(|v| v.as_str()) {
         if !abstract_text.is_empty() {
-            out.push(json!({
-                "title": resp.get("Heading").and_then(|v| v.as_str()).unwrap_or(query),
-                "url": resp.get("AbstractURL").and_then(|v| v.as_str()).unwrap_or(""),
-                "content": abstract_text
-            }));
+            out.push(SearchResult {
+                title: resp
+                    .get("Heading")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(query)
+                    .into(),
+                url: resp
+                    .get("AbstractURL")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
+                content: abstract_text.into(),
+                snippet: abstract_text.into(),
+                score: 0.0,
+            });
         }
     }
     for topic in resp
@@ -295,7 +345,13 @@ fn duckduckgo(host: &mut Host, query: &str, max: u64) -> Result<Vec<Value>, Stri
             topic.get("Text").and_then(|v| v.as_str()),
             topic.get("FirstURL").and_then(|v| v.as_str()),
         ) {
-            out.push(json!({ "title": text, "url": url, "content": text }));
+            out.push(SearchResult {
+                title: text.into(),
+                url: url.into(),
+                content: text.into(),
+                snippet: text.into(),
+                score: 0.0,
+            });
         }
     }
     Ok(out)
@@ -315,8 +371,8 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-fn main() {
-    manifest_builder().serve();
+fn main() -> Result<(), String> {
+    manifest_builder().try_serve()
 }
 
 #[cfg(test)]
@@ -331,20 +387,84 @@ mod tests {
             .with_http(
                 "api.tavily.com",
                 json!({ "results": [
-                    { "title": "Warm transfer", "url": "https://x/y", "content": "how warm transfer works" }
+                    {
+                        "title": "Warm transfer",
+                        "url": "https://x/y",
+                        "content": "how warm transfer works",
+                        "score": 0.91
+                    }
                 ]}),
             );
         let out = plugin
-            .call(
-                "websearch.search",
-                json!({ "query": "warm transfer" }),
-                &mut host,
-            )
+            .call("web.search", json!({ "query": "warm transfer" }), &mut host)
             .unwrap();
         assert_eq!(out["results"][0]["url"], "https://x/y");
+        assert_eq!(out["results"][0]["snippet"], "how warm transfer works");
+        assert_eq!(out["results"][0]["score"], 0.91);
         // result was contributed as a record
         assert_eq!(host.contributed.borrow().len(), 1);
         assert_eq!(host.contributed.borrow()[0].entity, "web.result");
+    }
+
+    #[test]
+    fn tavily_secret_is_host_injected_and_never_enters_guest_payloads_or_results() {
+        let secret = "tvly-C70-secret-sentinel";
+        let plugin = manifest_builder().build();
+        let mut host = MockHost::default()
+            .with_secret("tavily_api_key", secret)
+            .with_http(
+                "api.tavily.com",
+                json!({ "results": [
+                    { "title": "Safe", "url": "https://example.test/", "content": "result" }
+                ]}),
+            );
+
+        let out = plugin
+            .call(
+                "websearch.search",
+                json!({ "query": "secret containment" }),
+                &mut host,
+            )
+            .unwrap();
+
+        assert!(!out.to_string().contains(secret));
+        assert!(!host.contributed.borrow()[0].body.contains(secret));
+        let calls = host.calls.borrow();
+        assert!(calls.iter().any(|(command, payload)| {
+            command == "http.do"
+                && payload["auth_purpose"] == "tavily_api_key"
+                && !payload.to_string().contains(secret)
+        }));
+        assert!(
+            calls
+                .iter()
+                .all(|(_, payload)| !payload.to_string().contains(secret)),
+            "the guest must pass only the auth purpose, never the resolved key"
+        );
+    }
+
+    #[test]
+    fn manifest_exposes_one_canonical_search_name_without_api_key_input() {
+        let manifest = manifest_builder().build().manifest();
+        let visible: Vec<String> = manifest
+            .operations
+            .iter()
+            .filter(|op| !op.internal)
+            .map(|op| op.projected_name(&manifest.name))
+            .collect();
+        assert_eq!(visible, vec!["web.search", "websearch.provider.list"]);
+
+        let search = manifest
+            .operations
+            .iter()
+            .find(|op| op.name == "websearch.search")
+            .unwrap();
+        assert_eq!(search.public_name.as_deref(), Some("web.search"));
+        assert!(search.input_schema["properties"].get("api_key").is_none());
+        assert_eq!(
+            manifest.capabilities.http_hosts,
+            vec!["api.tavily.com", "api.duckduckgo.com"]
+        );
     }
 
     #[test]
@@ -608,6 +728,29 @@ mod schema_contract {
         assert_eq!(req_set, want_req, "{op_name}: required set");
     }
 
+    fn property_names(schema: &Value) -> Vec<&str> {
+        let mut names: Vec<&str> = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|properties| properties.keys().map(String::as_str))
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn required_names(schema: &Value) -> Vec<&str> {
+        let mut names: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     #[test]
     fn derived_schemas_match_contract() {
         let ops = contracts();
@@ -625,5 +768,19 @@ mod schema_contract {
                 .unwrap_or_else(|| panic!("missing op {name}"));
             assert_contract(name, &spec.input_schema, contract);
         }
+
+        let search_output = by_name["websearch.search"]
+            .output_schema
+            .as_ref()
+            .expect("typed search output schema");
+        assert_eq!(property_names(search_output), ["results"]);
+        assert_eq!(required_names(search_output), ["results"]);
+
+        let provider_output = by_name["websearch.provider.list"]
+            .output_schema
+            .as_ref()
+            .expect("typed provider-list output schema");
+        assert_eq!(property_names(provider_output), ["count", "providers"]);
+        assert_eq!(required_names(provider_output), ["count", "providers"]);
     }
 }
