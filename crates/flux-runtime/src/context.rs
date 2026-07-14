@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use flux_core::Result;
+use flux_core::{Error, Result};
 
 /// A source of context for a turn.
 #[async_trait]
@@ -46,15 +46,27 @@ impl ContextProvider for ProjectFiles {
     }
 
     async fn render(&self) -> Result<Option<String>> {
+        // Project files are repository-controlled inputs. Build a deliberately confined workspace
+        // here instead of borrowing the agent's possibly widened (`--add-dir`/`--allow-all-paths`)
+        // tool workspace: automatic prompt context must never inherit an operator's tool-path
+        // escape hatch.
+        let system = flux_system::System::new(flux_system::Workspace::new(&self.root)?);
         let mut out = String::new();
         for f in &self.files {
-            if let Ok(content) = tokio::fs::read_to_string(self.root.join(f)).await {
-                if !content.trim().is_empty() {
-                    if !out.is_empty() {
-                        out.push_str("\n\n");
-                    }
-                    out.push_str(&format!("## {f}\n{}", content.trim_end()));
+            let content = match system.read_file(f).await {
+                Ok(content) => content,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(Error::Config(format!(
+                        "project context `{f}` is unreadable or outside the workspace: {error}"
+                    )))
                 }
+            };
+            if !content.trim().is_empty() {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("## {f}\n{}", content.trim_end()));
             }
         }
         Ok((!out.is_empty()).then_some(out))
@@ -264,11 +276,13 @@ impl Projector {
         self
     }
 
-    /// Build the full system prompt: `base` followed by each provider's block.
-    pub async fn system_prompt(&self, base: &str) -> String {
+    /// Build the full system prompt: `base` followed by each provider's block. Provider failures
+    /// are returned to the caller so a repository-controlled guard error cannot silently look like
+    /// an absent optional file.
+    pub async fn try_system_prompt(&self, base: &str) -> Result<String> {
         let mut out = base.to_string();
         for p in &self.providers {
-            if let Ok(Some(block)) = p.render().await {
+            if let Some(block) = p.render().await? {
                 out.push_str(&format!(
                     "\n\n<context source=\"{}\">\n{}\n</context>",
                     p.name(),
@@ -276,7 +290,17 @@ impl Projector {
                 ));
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Compatibility wrapper for callers that deliberately tolerate unavailable auxiliary
+    /// context. Production agent assembly uses [`Self::try_system_prompt`] so guard failures are
+    /// fail-closed.
+    #[deprecated(note = "use try_system_prompt so context guard failures are surfaced")]
+    pub async fn system_prompt(&self, base: &str) -> String {
+        self.try_system_prompt(base)
+            .await
+            .unwrap_or_else(|_| base.to_string())
     }
 }
 
@@ -311,6 +335,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_files_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_dir();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE SECRET").unwrap();
+        for file in ["AGENTS.md", "CLAUDE.md", ".flux/context.md"] {
+            let dir = temp_dir();
+            let path = dir.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            symlink(outside.join("secret.md"), &path).unwrap();
+
+            let error = ProjectFiles::new(&dir).render().await.unwrap_err();
+            assert!(error.to_string().contains("outside"), "{error}");
+            let projector = Projector::new().with(Box::new(ProjectFiles::new(&dir)));
+            assert!(
+                projector.try_system_prompt("BASE").await.is_err(),
+                "projector silently discarded the guard error for {file}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
     #[tokio::test]
     async fn git_context_none_outside_repo() {
         // A plain directory (no .git) contributes nothing rather than erroring.
@@ -338,7 +389,7 @@ mod tests {
         let projector = Projector::new()
             .with(Box::new(EnvContext::new(&dir)))
             .with(Box::new(ProjectFiles::new(&dir)));
-        let sys = projector.system_prompt("BASE").await;
+        let sys = projector.try_system_prompt("BASE").await.unwrap();
         assert!(sys.starts_with("BASE"));
         assert!(sys.contains("<context source=\"environment\">"));
         assert!(sys.contains("<context source=\"project-files\">"));

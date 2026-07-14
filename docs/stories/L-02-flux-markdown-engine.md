@@ -47,7 +47,7 @@ and replace flux's "inject the whole skill body on match" activation with standa
     test); vanished files degrade to empty.
   - **Config:** `[skills] dirs` (project-before-user merge, `~/` expansion) + a repeatable
     `--skill-dir` CLI flag — layering CLI > project > user > defaults pinned by test.
-  - **Agent/SDK parity:** `AgentSpec::with_default_skills` + the SDK builder populate via
+  - **Agent/SDK parity:** `AgentSpec::try_with_default_skills` + the SDK builder populate via
     `default_skill_dirs`.
   - Live-verified: a scratch-workspace `flux run -m mock` activates a project skill through the
     real engine.

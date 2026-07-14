@@ -14,6 +14,7 @@ name = "flux_agent"
 flux-core.workspace = true
 flux-provider.workspace = true
 flux-runtime.workspace = true
+flux-system.workspace = true
 flux-events.workspace = true
 flux-evidence.workspace = true
 flux-skill.workspace = true

@@ -132,7 +132,7 @@ fn reference_md(name: &str, m: &PluginManifest) -> String {
             };
             s.push_str(&format!(
                 "| `{}` | {} | {} | {} |\n",
-                cell(&op.name),
+                cell(&op.projected_name(&m.name)),
                 cell(&op.description),
                 cell(&req),
                 risk
@@ -314,6 +314,24 @@ mod tests {
         let (_, md) = &r.references[0];
         assert!(md.contains("| Low |"), "declared risk should render: {md}");
         assert!(!md.contains("Medium*") && !md.contains("risk not declared"));
+    }
+
+    #[test]
+    fn compatibility_public_name_is_the_only_operation_name_in_generated_reference() {
+        let manifest = PluginManifest {
+            name: "websearch".into(),
+            operations: vec![OperationSpec {
+                name: "websearch.search".into(),
+                public_name: Some("web.search".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let rendered = render_plugin_skill(&[("websearch".into(), manifest)]);
+        let (_, reference) = &rendered.references[0];
+        assert!(reference.contains("`web.search`"));
+        assert!(!reference.contains("`websearch.search`"));
     }
 
     #[test]

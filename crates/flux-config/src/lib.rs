@@ -5,11 +5,17 @@
 //! contributes nothing; a malformed file is an error. CLI flags layer on top of the result (the
 //! caller resolves that). The config carries the coder-style permission rules, an optional default
 //! model, an optional [`AuthorizationPolicy`] (extends [`flux_policy::default_local_grants`]), and
-//! scoped private-network egress grants. Newly "always-allow"ed approval rules are persisted back to the
-//! **project** file via [`persist_allow_rules`].
+//! scoped private-network egress grants. Filesystem discovery and atomic persistence live in the
+//! guarded outer control plane; this crate parses, merges, and serializes injected documents.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::io::Write as _;
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +146,22 @@ pub struct SkillsConfig {
     /// against the workspace root; a leading `~/` expands to the home directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<String>,
+}
+
+/// Provenance of one configured skill root after user/project layering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillDirOrigin {
+    /// Repository-controlled `.flux/config.toml`.
+    Project,
+    /// Trusted operator-controlled `~/.flux/config.toml`.
+    User,
+}
+
+/// A configured skill directory paired with the config layer that supplied it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredSkillDir {
+    pub path: String,
+    pub origin: SkillDirOrigin,
 }
 
 /// Agent-runtime selection and declarative model-backed stages.
@@ -343,6 +365,12 @@ pub struct Config {
     /// Skill-discovery settings (custom skill directories, L-02).
     #[serde(default, skip_serializing_if = "SkillsConfig::is_default")]
     pub skills: SkillsConfig,
+    /// Non-serialized provenance retained by [`from_sources`]. Programmatic `Config` values leave
+    /// this empty and are treated conservatively as project-controlled by
+    /// [`Config::skill_dirs_with_origin`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub configured_skill_dirs: Vec<ConfiguredSkillDir>,
     /// Filesystem access widening (C-21): extra read-only roots + the unconfined hatch.
     #[serde(default, skip_serializing_if = "WorkspaceConfig::is_default")]
     pub workspace: WorkspaceConfig,
@@ -497,6 +525,35 @@ impl Config {
             .collect()
     }
 
+    /// Configured skill roots with their trust provenance. This keeps a project config from
+    /// smuggling an absolute path into the trusted user-global discovery boundary after merge.
+    pub fn skill_dirs_with_origin(&self) -> Vec<(PathBuf, SkillDirOrigin)> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let sources = if self.configured_skill_dirs.is_empty() {
+            self.skills
+                .dirs
+                .iter()
+                .cloned()
+                .map(|path| ConfiguredSkillDir {
+                    path,
+                    origin: SkillDirOrigin::Project,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.configured_skill_dirs.clone()
+        };
+        sources
+            .into_iter()
+            .map(|entry| {
+                let path = match (entry.path.strip_prefix("~/"), &home) {
+                    (Some(rest), Some(home)) => home.join(rest),
+                    _ => PathBuf::from(entry.path),
+                };
+                (path, entry.origin)
+            })
+            .collect()
+    }
+
     /// The configured extra read-only roots as paths (C-21), with a leading `~/` expanded. Relative
     /// paths are left relative (resolved against the cwd by the caller).
     pub fn workspace_add_dirs(&self) -> Vec<PathBuf> {
@@ -548,15 +605,49 @@ impl Config {
     }
 }
 
+#[cfg(test)]
 fn home_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".flux").join("config.toml"))
 }
 
-fn project_config_path(cwd: &Path) -> PathBuf {
-    cwd.join(".flux").join("config.toml")
+/// Resolve the project config's lexical path against the canonical workspace and reject any
+/// existing file or parent-directory symlink whose physical target leaves that workspace.
+#[cfg(test)]
+fn guarded_project_config_path(cwd: &Path) -> Result<PathBuf> {
+    let root = cwd
+        .canonicalize()
+        .map_err(|error| Error::Config(format!("project config workspace: {error}")))?;
+    let path = root.join(".flux").join("config.toml");
+    let mut existing = path.as_path();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    Error::Config("project config path has no existing ancestor".to_string())
+                })?;
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    let physical = existing.canonicalize().map_err(|error| {
+        Error::Config(format!(
+            "project config path `{}` is not a valid workspace path: {error}",
+            path.display()
+        ))
+    })?;
+    if !physical.starts_with(&root) {
+        return Err(Error::Config(format!(
+            "project config path `{}` resolves outside workspace `{}`",
+            path.display(),
+            root.display()
+        )));
+    }
+    Ok(path)
 }
 
 /// Read a config file, returning `None` if it doesn't exist and erroring if it's malformed.
+#[cfg(test)]
 fn read_optional(path: &Path) -> Result<Option<Config>> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
@@ -569,9 +660,66 @@ fn read_optional(path: &Path) -> Result<Option<Config>> {
     }
 }
 
+/// Parse one injected configuration document. Filesystem discovery belongs to the guarded outer
+/// control plane; this L0 contract only interprets bytes and preserves the source in diagnostics.
+pub fn parse_source(source: &str, text: &str) -> Result<Config> {
+    toml::from_str(text).map_err(|error| Error::Config(format!("{source}: {error}")))
+}
+
+/// Parse and merge injected user/project configuration documents. Project values retain their
+/// existing precedence over trusted user-global defaults; missing documents contribute defaults.
+pub fn from_sources(user: Option<(&str, &str)>, project: Option<(&str, &str)>) -> Result<Config> {
+    let parse = |source: Option<(&str, &str)>| -> Result<Config> {
+        source
+            .map(|(name, text)| parse_source(name, text))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    Ok(merge(parse(user)?, parse(project)?))
+}
+
+/// Merge new always-allow rules into an injected project config and return the complete serialized
+/// document. The guarded outer control plane owns the atomic write.
+pub fn render_allow_rules(project: Option<(&str, &str)>, rules: &[String]) -> Result<String> {
+    let mut cfg = project
+        .map(|(source, text)| parse_source(source, text))
+        .transpose()?
+        .unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    cfg.permissions.allow = cfg
+        .permissions
+        .allow
+        .iter()
+        .chain(rules)
+        .filter(|rule| seen.insert((*rule).clone()))
+        .cloned()
+        .collect();
+    toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
+}
+
 /// Merge `project` onto `user`: lists (and policy grants) concatenate (user first), scalars prefer
 /// project, legacy `allow_private_net` is true if either enables it, scoped private-net grants merge.
 fn merge(user: Config, project: Config) -> Config {
+    let configured_skill_dirs = {
+        let mut seen = BTreeSet::new();
+        project
+            .skills
+            .dirs
+            .iter()
+            .map(|path| (path, SkillDirOrigin::Project))
+            .chain(
+                user.skills
+                    .dirs
+                    .iter()
+                    .map(|path| (path, SkillDirOrigin::User)),
+            )
+            .filter(|(path, _)| seen.insert((*path).clone()))
+            .map(|(path, origin)| ConfiguredSkillDir {
+                path: path.clone(),
+                origin,
+            })
+            .collect::<Vec<_>>()
+    };
     Config {
         model: project.model.or(user.model),
         allow_private_net: user.allow_private_net || project.allow_private_net,
@@ -662,6 +810,7 @@ fn merge(user: Config, project: Config) -> Config {
         skills: SkillsConfig {
             dirs: dedupe([project.skills.dirs, user.skills.dirs].concat()),
         },
+        configured_skill_dirs,
         // Extra read-only roots concatenate (project first); the unconfined hatch is true if either sets it.
         workspace: WorkspaceConfig {
             add_dirs: dedupe([project.workspace.add_dirs, user.workspace.add_dirs].concat()),
@@ -782,19 +931,21 @@ fn merge_static_endpoints(
 }
 
 /// Load and merge `~/.flux/config.toml` (user) then `<cwd>/.flux/config.toml` (project).
-pub fn load(cwd: &Path) -> Result<Config> {
+#[cfg(test)]
+fn load(cwd: &Path) -> Result<Config> {
     let user = match home_config_path() {
         Some(p) => read_optional(&p)?.unwrap_or_default(),
         None => Config::default(),
     };
-    let project = read_optional(&project_config_path(cwd))?.unwrap_or_default();
+    let project = read_optional(&guarded_project_config_path(cwd)?)?.unwrap_or_default();
     Ok(merge(user, project))
 }
 
 /// Persist allow rules back to the **project** config (`<cwd>/.flux/config.toml`), unioned with
 /// whatever is already there (order-preserving, de-duplicated). Creates `.flux/` if needed.
-pub fn persist_allow_rules(cwd: &Path, rules: &[String]) -> Result<()> {
-    let path = project_config_path(cwd);
+#[cfg(test)]
+fn persist_allow_rules(cwd: &Path, rules: &[String]) -> Result<()> {
+    let path = guarded_project_config_path(cwd)?;
     let mut cfg = read_optional(&path)?.unwrap_or_default();
 
     let mut seen = BTreeSet::new();
@@ -810,7 +961,30 @@ pub fn persist_allow_rules(cwd: &Path, rules: &[String]) -> Result<()> {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
     }
     let body = toml::to_string_pretty(&cfg).map_err(|e| Error::Config(e.to_string()))?;
-    std::fs::write(&path, body).map_err(Error::Io)?;
+    // Write a sibling with create-new semantics, then atomically replace the config. Besides
+    // avoiding torn TOML, this prevents the destination file itself from being opened through a
+    // symlink between validation and the write.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_extension(format!(
+        "toml.tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(Error::Io)?;
+        file.write_all(body.as_bytes()).map_err(Error::Io)?;
+        file.sync_all().map_err(Error::Io)?;
+        std::fs::rename(&temp, &path).map_err(Error::Io)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write_result?;
     Ok(())
 }
 
@@ -826,10 +1000,34 @@ struct GroupsManifest {
     groups: Vec<flux_evidence::ToolGroup>,
 }
 
+/// Parse one injected tool-group manifest, retaining its source in diagnostics.
+pub fn parse_groups_source(source: &str, text: &str) -> Result<Vec<flux_evidence::ToolGroup>> {
+    toml::from_str::<GroupsManifest>(text)
+        .map(|manifest| manifest.groups)
+        .map_err(|error| Error::Config(format!("{source}: {error}")))
+}
+
+/// Merge injected user/project tool-group manifests. A project group replaces a trusted
+/// user-global group with the same name, matching the historical precedence.
+pub fn groups_from_sources(
+    user: Option<(&str, &str)>,
+    project: Option<(&str, &str)>,
+) -> Result<Vec<flux_evidence::ToolGroup>> {
+    let parse = |source: Option<(&str, &str)>| -> Result<Vec<flux_evidence::ToolGroup>> {
+        source
+            .map(|(name, text)| parse_groups_source(name, text))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    Ok(merge_groups(parse(user)?, parse(project)?))
+}
+
+#[cfg(test)]
 fn home_groups_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".flux").join("groups.toml"))
 }
 
+#[cfg(test)]
 fn project_groups_path(cwd: &Path) -> PathBuf {
     cwd.join(".flux").join("groups.toml")
 }
@@ -837,7 +1035,8 @@ fn project_groups_path(cwd: &Path) -> PathBuf {
 /// Load user (`~/.flux/groups.toml`) then project (`<cwd>/.flux/groups.toml`) group definitions.
 /// A project entry overrides a user entry of the same `name`. Missing files are not an error; a
 /// malformed file is skipped (a warning is printed) rather than failing the session.
-pub fn load_groups(cwd: &Path) -> Vec<flux_evidence::ToolGroup> {
+#[cfg(test)]
+fn load_groups(cwd: &Path) -> Vec<flux_evidence::ToolGroup> {
     let mut out: Vec<flux_evidence::ToolGroup> = Vec::new();
     let paths = home_groups_path()
         .into_iter()
@@ -1519,5 +1718,95 @@ allow = ["read"]
         let cfg = load(&dir).unwrap();
         assert_eq!(cfg.permissions.allow, vec!["read", "Bash(git:*)", "write"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn injected_sources_parse_merge_and_render_without_filesystem_authority() {
+        let user = "model = \"user\"\n[permissions]\nallow = [\"read\"]\n[skills]\ndirs = [\"/trusted\", \"shared\"]\n";
+        let project = "model = \"project\"\n[permissions]\nallow = [\"write\"]\n[skills]\ndirs = [\"/project-escape\", \"shared\"]\n";
+        let merged = from_sources(
+            Some(("trusted-user", user)),
+            Some(("guarded-project", project)),
+        )
+        .unwrap();
+        assert_eq!(merged.model.as_deref(), Some("project"));
+        assert_eq!(merged.permissions.allow, ["read", "write"]);
+        assert_eq!(
+            merged.configured_skill_dirs,
+            [
+                ConfiguredSkillDir {
+                    path: "/project-escape".into(),
+                    origin: SkillDirOrigin::Project,
+                },
+                ConfiguredSkillDir {
+                    path: "shared".into(),
+                    origin: SkillDirOrigin::Project,
+                },
+                ConfiguredSkillDir {
+                    path: "/trusted".into(),
+                    origin: SkillDirOrigin::User,
+                },
+            ]
+        );
+
+        let rendered = render_allow_rules(
+            Some(("guarded-project", project)),
+            &["write".into(), "bash".into()],
+        )
+        .unwrap();
+        let reparsed = parse_source("rendered", &rendered).unwrap();
+        assert_eq!(reparsed.model.as_deref(), Some("project"));
+        assert_eq!(reparsed.permissions.allow, ["write", "bash"]);
+
+        let error = from_sources(None, Some(("guarded-project", "unknown = true")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("guarded-project"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_config_file_symlink_cannot_read_or_overwrite_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let outside = temp_dir();
+        let target = outside.join("config.toml");
+        std::fs::write(&target, "model = \"outside-secret\"\n").unwrap();
+        symlink(&target, dir.join(".flux").join("config.toml")).unwrap();
+
+        assert!(load(&dir).is_err(), "project config read followed symlink");
+        assert!(
+            persist_allow_rules(&dir, &["read".into()]).is_err(),
+            "project config write followed symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "model = \"outside-secret\"\n"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_config_parent_symlink_cannot_write_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let outside = temp_dir();
+        std::fs::remove_dir_all(dir.join(".flux")).unwrap();
+        symlink(&outside, dir.join(".flux")).unwrap();
+
+        let error = persist_allow_rules(&dir, &["read".into()]).unwrap_err();
+        assert!(error.to_string().contains("outside workspace"), "{error}");
+        assert!(
+            !outside.join("config.toml").exists(),
+            "guarded persistence created an external config"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

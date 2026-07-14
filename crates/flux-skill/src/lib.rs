@@ -76,6 +76,9 @@ enum BodySource {
     Inline(String),
     File {
         path: PathBuf,
+        /// When present, lazy loading re-resolves `path` and refuses targets outside this root.
+        /// Project discovery sets it; explicitly trusted user-global discovery may leave it unset.
+        root: Option<PathBuf>,
         /// Bytes after the frontmatter block (untrimmed) — a cheap stand-in for the body length so
         /// [`ActivationLimits::max_total_bytes`] can cap without reading anything.
         approx_len: usize,
@@ -95,7 +98,22 @@ impl SkillBody {
     /// frontmatter block (used for activation byte-capping without a read).
     pub fn lazy(path: PathBuf, approx_len: usize) -> Self {
         SkillBody {
-            source: BodySource::File { path, approx_len },
+            source: BodySource::File {
+                path,
+                root: None,
+                approx_len,
+            },
+            cache: OnceLock::new(),
+        }
+    }
+
+    fn lazy_confined(path: PathBuf, root: PathBuf, approx_len: usize) -> Self {
+        SkillBody {
+            source: BodySource::File {
+                path,
+                root: Some(root),
+                approx_len,
+            },
             cache: OnceLock::new(),
         }
     }
@@ -105,7 +123,9 @@ impl SkillBody {
     pub fn text(&self) -> &str {
         match &self.source {
             BodySource::Inline(s) => s,
-            BodySource::File { path, .. } => self.cache.get_or_init(|| load_body(path)),
+            BodySource::File { path, root, .. } => {
+                self.cache.get_or_init(|| load_body(path, root.as_deref()))
+            }
         }
     }
 
@@ -134,7 +154,15 @@ impl SkillBody {
 }
 
 /// Read a lazy body: re-split the file so trimming matches what [`parse`] would have produced.
-fn load_body(path: &Path) -> String {
+fn load_body(path: &Path, confined_root: Option<&Path>) -> String {
+    if let Some(root) = confined_root {
+        let Ok(target) = path.canonicalize() else {
+            return String::new();
+        };
+        if !target.starts_with(root) {
+            return String::new();
+        }
+    }
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let (_, body) = flux_markdown::split_frontmatter(&content);
@@ -393,7 +421,7 @@ fn assemble(meta: SkillFrontmatter, body: SkillBody, source: Option<PathBuf>) ->
 
 /// Parse a skill file progressively: read only the frontmatter head (Level-1 metadata) and hand out
 /// a lazy [`SkillBody`] that reads the file when first rendered (Level-2).
-fn parse_file(path: &Path) -> Option<Skill> {
+fn parse_file(path: &Path, confined_root: Option<&Path>) -> Option<Skill> {
     let head = scan_frontmatter(path).ok()?;
     let meta: SkillFrontmatter = head
         .yaml
@@ -402,7 +430,14 @@ fn parse_file(path: &Path) -> Option<Skill> {
         .unwrap_or_default();
     Some(assemble(
         meta,
-        SkillBody::lazy(path.to_path_buf(), head.approx_body_len),
+        match confined_root {
+            Some(root) => SkillBody::lazy_confined(
+                path.to_path_buf(),
+                root.to_path_buf(),
+                head.approx_body_len,
+            ),
+            None => SkillBody::lazy(path.to_path_buf(), head.approx_body_len),
+        },
         Some(path.to_path_buf()),
     ))
 }
@@ -466,15 +501,29 @@ fn scan_frontmatter(path: &Path) -> std::io::Result<FrontmatterHead> {
 /// `SKILL.md` (which takes its name from the directory when the frontmatter omits one). Unsorted.
 fn discover_dir(dir: &Path) -> Vec<Skill> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(root) = dir.canonicalize() else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
+        let Ok(path) = entry.path().canonicalize() else {
+            continue;
+        };
+        if !path.starts_with(&root) {
+            continue;
+        }
         if path.is_dir() {
             let skill_md = path.join("SKILL.md");
             if skill_md.is_file() {
-                if let Some(mut s) = parse_file(&skill_md) {
+                let Ok(skill_md) = skill_md.canonicalize() else {
+                    continue;
+                };
+                if !skill_md.starts_with(&root) {
+                    continue;
+                }
+                if let Some(mut s) = parse_file(&skill_md, Some(&root)) {
                     // a directory skill takes its name from the directory if unset
                     if s.name == "SKILL" {
                         if let Some(n) = path.file_name() {
@@ -485,7 +534,7 @@ fn discover_dir(dir: &Path) -> Vec<Skill> {
                 }
             }
         } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-            if let Some(s) = parse_file(&path) {
+            if let Some(s) = parse_file(&path, Some(&root)) {
                 out.push(s);
             }
         }
@@ -517,12 +566,15 @@ pub fn discover_merged(dirs: &[PathBuf]) -> Vec<Skill> {
     out
 }
 
+/// Legacy test fixture for the former filesystem-owning project discovery path. Production project
+/// discovery lives in `flux_runtime::metadata` and injects guarded bytes into [`parse`].
 /// The default skill directories, highest-precedence first: the project's `.flux/skills`, then the
 /// project's Claude-compatible `.claude/skills`, then the user-global `~/.flux/skills`, then the
 /// cross-agent conventions `~/.agents/skills` and `~/.claude/skills`. Canonicalized, de-duplicated,
 /// and filtered to existing directories (so the HOME-equals-cwd case can't scan a dir twice). Pass to
 /// [`discover_merged`].
-pub fn default_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+#[cfg(test)]
+fn default_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     push_default_dirs(&mut dirs, cwd);
     dirs
@@ -533,23 +585,27 @@ pub fn default_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// the built-in well-known set from [`default_skill_dirs`]. Relative extras resolve against `cwd`.
 /// Canonicalized, de-duplicated, filtered to existing directories. Pass to [`discover_merged`],
 /// where dir order is name-clash precedence.
-pub fn skill_dirs(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
+#[cfg(test)]
+fn skill_dirs(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for d in extra {
-        let p = if d.is_absolute() {
-            d.clone()
+        if d.is_absolute() {
+            // Absolute extras are caller-designated roots. The caller owns the trust distinction
+            // between an explicit control-plane path and repository-derived configuration.
+            push_existing(&mut dirs, d.clone());
         } else {
-            cwd.join(d)
-        };
-        push_existing(&mut dirs, p);
+            // Relative extras originate in project configuration and remain project-confined.
+            push_project_existing(&mut dirs, cwd, cwd.join(d));
+        }
     }
     push_default_dirs(&mut dirs, cwd);
     dirs
 }
 
+#[cfg(test)]
 fn push_default_dirs(dirs: &mut Vec<PathBuf>, cwd: &Path) {
-    push_existing(dirs, cwd.join(".flux").join("skills"));
-    push_existing(dirs, cwd.join(".claude").join("skills"));
+    push_project_existing(dirs, cwd, cwd.join(".flux").join("skills"));
+    push_project_existing(dirs, cwd, cwd.join(".claude").join("skills"));
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         push_existing(dirs, home.join(".flux").join("skills"));
@@ -558,6 +614,20 @@ fn push_default_dirs(dirs: &mut Vec<PathBuf>, cwd: &Path) {
     }
 }
 
+#[cfg(test)]
+fn push_project_existing(dirs: &mut Vec<PathBuf>, cwd: &Path, path: PathBuf) {
+    let Ok(root) = cwd.canonicalize() else {
+        return;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return;
+    };
+    if path.starts_with(root) && path.is_dir() && !dirs.contains(&path) {
+        dirs.push(path);
+    }
+}
+
+#[cfg(test)]
 fn push_existing(dirs: &mut Vec<PathBuf>, p: PathBuf) {
     let c = p.canonicalize().unwrap_or(p);
     if c.is_dir() && !dirs.contains(&c) {
@@ -713,6 +783,87 @@ mod tests {
         // directory skill with no `name` takes the directory name
         assert!(names.contains(&"beta"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_project_skills_reject_symlinked_files_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        let skills = root.join(".flux").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            outside.join("secret.md"),
+            "---\nname: escaped-secret\n---\nOUTSIDE SECRET",
+        )
+        .unwrap();
+        symlink(outside.join("secret.md"), skills.join("escaped.md")).unwrap();
+
+        let discovered = discover_merged(&default_skill_dirs(&root));
+        assert!(
+            discovered
+                .iter()
+                .all(|skill| skill.name != "escaped-secret"),
+            "project skill discovery followed an out-of-workspace symlink"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_project_skill_directory_cannot_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        std::fs::write(
+            outside.join("secret.md"),
+            "---\nname: escaped-directory\n---\nOUTSIDE SECRET",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".flux")).unwrap();
+        symlink(&outside, root.join(".flux/skills")).unwrap();
+
+        let discovered = discover_merged(&default_skill_dirs(&root));
+        assert!(
+            discovered
+                .iter()
+                .all(|skill| skill.name != "escaped-directory"),
+            "project skill discovery followed an out-of-workspace directory symlink"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lazy_project_skill_body_rechecks_symlink_confinement() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        let skills = root.join(".flux/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let path = skills.join("swap.md");
+        std::fs::write(&path, "---\nname: swap\n---\nSAFE").unwrap();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE SECRET").unwrap();
+
+        let discovered = discover_merged(&default_skill_dirs(&root));
+        let skill = discovered
+            .iter()
+            .find(|skill| skill.name == "swap")
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(outside.join("secret.md"), &path).unwrap();
+        assert_eq!(skill.body.text(), "");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

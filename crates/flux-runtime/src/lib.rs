@@ -15,6 +15,7 @@ mod fn_tool;
 pub use fn_tool::{tool_fn, FnTool};
 
 pub mod context;
+pub mod metadata;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

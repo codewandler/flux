@@ -60,6 +60,25 @@ impl Workspace {
         })
     }
 
+    /// Create a workspace only when `root` exists. Missing optional control-plane roots return
+    /// `None`; every other canonicalization failure remains an error.
+    pub fn new_optional(root: impl AsRef<Path>) -> Result<Option<Self>> {
+        let root = root.as_ref();
+        match root.canonicalize() {
+            Ok(root) => Ok(Some(Self {
+                root,
+                named: HashMap::new(),
+                read_roots: Vec::new(),
+                unconfined: false,
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::Config(format!(
+                "optional workspace root {}: {error}",
+                root.display()
+            ))),
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -1054,6 +1073,20 @@ impl System {
         String::from_utf8(bytes).map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))
     }
 
+    /// Read an optional UTF-8 control-plane file synchronously through the workspace guard.
+    /// Missing files are `None`; path escapes, invalid UTF-8, and all other failures remain errors.
+    /// Startup-time metadata loaders use this instead of owning raw project filesystem IO.
+    pub fn read_optional_text(&self, path: &str) -> Result<Option<String>> {
+        let resolved = self.workspace.resolve_read(path)?;
+        match std::fs::read(&resolved) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| Error::Other(format!("{path}: not valid UTF-8"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Write a file within the workspace, creating parent directories (also confined).
     pub async fn write_file(&self, path: &str, contents: &str) -> Result<()> {
         let p = self.workspace.resolve(path)?;
@@ -1062,6 +1095,58 @@ impl System {
         }
         tokio::fs::write(&p, contents).await?;
         Ok(())
+    }
+
+    /// Atomically replace a UTF-8 workspace file from a create-new sibling. Both the destination
+    /// and its parent are resolved through the write guard before any open, so file and directory
+    /// symlinks cannot redirect project control-plane persistence outside the workspace.
+    pub fn write_file_atomic(&self, path: &str, contents: &str) -> Result<()> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+        let destination = self.workspace.resolve(path)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Config(format!("path {path:?} has no parent")))?;
+        std::fs::create_dir_all(parent)?;
+
+        // Resolve again after creating the parent. This closes the common parent-symlink swap
+        // window and gives the sibling its physical, guarded directory.
+        let destination = self.workspace.resolve(path)?;
+        let file_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Config(format!("path {path:?} is not valid UTF-8")))?;
+        let temp = destination.with_file_name(format!(
+            ".{file_name}.tmp-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+
+            // A final identity check catches a destination or parent retarget before replacement.
+            let final_destination = self.workspace.resolve(path)?;
+            if final_destination != destination {
+                return Err(Error::Config(format!(
+                    "path {path:?} changed identity during atomic write"
+                )));
+            }
+            std::fs::rename(&temp, &final_destination)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        write_result
     }
 
     /// Read the raw bytes of a file within the workspace (no UTF-8 decode). Used to sniff binary
@@ -1179,6 +1264,67 @@ impl System {
             } else {
                 format!("{base}/{name}")
             };
+            let resolved = self.workspace.resolve_read(&path)?;
+            let bytes = std::fs::read(&resolved)?;
+            let content = String::from_utf8(bytes)
+                .map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))?;
+            out.push((path, content));
+        }
+        Ok(out)
+    }
+
+    /// Read text files directly under `dir` plus `nested_file` from each immediate child
+    /// directory. Every entry is resolved independently, so a symlinked file/directory is rejected
+    /// rather than silently omitted. This is the guarded discovery shape used by project skills
+    /// (`*.md` and `<name>/SKILL.md`).
+    pub fn read_dir_text_files_with_nested(
+        &self,
+        dir: &str,
+        extension: &str,
+        nested_file: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let root = self.workspace.resolve_read(dir)?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+
+        let base = dir.trim_end_matches('/');
+        let mut paths = Vec::new();
+        for name in names {
+            let child = if base.is_empty() {
+                name.clone()
+            } else {
+                format!("{base}/{name}")
+            };
+            let resolved = self.workspace.resolve_read(&child)?;
+            let metadata = std::fs::metadata(&resolved)?;
+            if metadata.is_dir() {
+                let nested = format!("{child}/{nested_file}");
+                let nested_path = self.workspace.resolve_read(&nested)?;
+                match std::fs::metadata(&nested_path) {
+                    Ok(metadata) if metadata.is_file() => paths.push(nested),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            } else if std::path::Path::new(&name)
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some(extension)
+            {
+                paths.push(child);
+            }
+        }
+
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
             let resolved = self.workspace.resolve_read(&path)?;
             let bytes = std::fs::read(&resolved)?;
             let content = String::from_utf8(bytes)
@@ -2052,6 +2198,74 @@ mod tests {
         let err = sys.read_file("etclink/hostname").await;
         assert!(err.is_err(), "expected symlink escape to be rejected");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_plane_reads_and_discovery_surface_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, sys) = temp_workspace();
+        let outside = std::env::temp_dir().join(format!(
+            "flux-sys-metadata-outside-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE").unwrap();
+        std::fs::create_dir_all(dir.join(".flux/skills")).unwrap();
+
+        symlink(outside.join("secret.md"), dir.join(".flux/config.toml")).unwrap();
+        symlink(
+            outside.join("secret.md"),
+            dir.join(".flux/skills/escaped.md"),
+        )
+        .unwrap();
+
+        assert!(sys.read_optional_text(".flux/config.toml").is_err());
+        assert!(sys
+            .read_dir_text_files_with_nested(".flux/skills", "md", "SKILL.md")
+            .is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_control_plane_write_rejects_file_and_parent_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        for parent_escape in [false, true] {
+            let (dir, sys) = temp_workspace();
+            let outside = std::env::temp_dir().join(format!(
+                "flux-sys-atomic-outside-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&outside).unwrap();
+            if parent_escape {
+                symlink(&outside, dir.join(".flux")).unwrap();
+            } else {
+                std::fs::create_dir_all(dir.join(".flux")).unwrap();
+                std::fs::write(outside.join("config.toml"), "outside").unwrap();
+                symlink(outside.join("config.toml"), dir.join(".flux/config.toml")).unwrap();
+            }
+
+            assert!(sys
+                .write_file_atomic(".flux/config.toml", "permissions = {}")
+                .is_err());
+            if !parent_escape {
+                assert_eq!(
+                    std::fs::read_to_string(outside.join("config.toml")).unwrap(),
+                    "outside"
+                );
+            } else {
+                assert!(!outside.join("config.toml").exists());
+            }
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::remove_dir_all(&outside).ok();
+        }
     }
 
     #[cfg(unix)]

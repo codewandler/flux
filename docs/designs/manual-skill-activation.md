@@ -9,7 +9,7 @@ matched `name`, `description`, or `triggers`.
 The CLI activates a skill only through repeatable `--skill <name>`. `--skill-dir` and `[skills].dirs`
 add discovery locations; they do not activate their contents. An unknown requested name fails before
 provider construction. The SDK follows the same principle: `AgentSpec.skills` is the explicit active
-set, and an empty set stays empty. Calling `AgentSpec::with_default_skills` is itself an explicit,
+set, and an empty set stays empty. Calling `AgentSpec::try_with_default_skills` is itself an explicit,
 deliberately broad opt-in.
 
 Every enabled skill is injected on each turn of that agent. This keeps the prompt stable and makes
