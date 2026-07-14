@@ -5,5 +5,9 @@ version.workspace = true
 license.workspace = true
 description = "flux architecture lint: enforces that inner crates never depend on outer layers (the codegate analog)"
 
+[dependencies]
+proc-macro2.workspace = true
+syn.workspace = true
+
 [dev-dependencies]
-toml.workspace = true
+cargo_metadata.workspace = true

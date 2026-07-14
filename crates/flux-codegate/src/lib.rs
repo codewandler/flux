@@ -73,108 +73,621 @@ pub fn violations(deps_by_crate: &[(String, Vec<String>)]) -> Vec<String> {
     out
 }
 
-/// Report production (non-test) references to a raw `std::process::Command` in one Rust source file,
-/// as 1-based line numbers.
-///
-/// The guarded process seam lives **only** in `flux-system`; every other tool/runtime/plugin path
-/// must route process creation through `flux_system::System` (AGENTS.md, "One guarded path starts
-/// every OS process"). This scanner backs the regression guard that fails if a new raw `Command`
-/// seam is introduced outside `flux-system`.
-///
-/// It deliberately ignores:
-/// - code inside a `#[cfg(test)]` module or item (test code may spawn processes directly), and
-/// - line / inline / doc comments,
-///
-/// so only real, non-test source references are reported. Matching the fully-qualified
-/// `std::process::Command` also catches a `use std::process::Command;` import (which would enable a
-/// bare `Command::new`), closing the aliasing gap, while never matching `tokio::process::Command`.
-pub fn raw_process_command_lines(src: &str) -> Vec<usize> {
-    const NEEDLE: &str = "std::process::Command";
-    let mut hits = Vec::new();
-    // Net brace depth, and the depth at which the current `#[cfg(test)]` region was entered.
-    let mut depth: i32 = 0;
-    let mut test_region_depth: Option<i32> = None;
-    let mut pending_cfg_test = false;
+use proc_macro2::Span;
+use std::collections::{BTreeSet, HashMap};
+use syn::spanned::Spanned;
+use syn::visit::Visit;
 
-    for (idx, raw_line) in src.lines().enumerate() {
-        // Strip a line/inline/doc comment. A `//` inside a string literal would only ever cause a
-        // missed match, never a false positive — acceptable for a lint.
-        let code = match raw_line.find("//") {
-            Some(pos) => &raw_line[..pos],
-            None => raw_line,
-        };
-        let has_cfg_test = code.contains("#[cfg(test)]");
-        let opens = code.matches('{').count() as i32;
-        let closes = code.matches('}').count() as i32;
+/// Which unguarded process constructor a syntax-tree scan resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProcessApi {
+    Std,
+    Tokio,
+}
 
-        if has_cfg_test {
-            pending_cfg_test = true;
+/// One production raw-process construction resolved from a Rust syntax tree.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RawProcessCommand {
+    pub line: usize,
+    pub api: ProcessApi,
+    /// Nearest containing function/method, or `<module>` for a module-level initializer.
+    pub function: String,
+}
+
+#[derive(Default)]
+struct ProcessAliases {
+    commands: HashMap<String, ProcessApi>,
+    modules: HashMap<String, ProcessApi>,
+    type_aliases: Vec<(String, syn::Path)>,
+}
+
+fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr.meta.require_list().is_ok_and(|list| {
+                list.tokens
+                    .to_string()
+                    .split_whitespace()
+                    .any(|t| t == "test")
+            })
+    })
+}
+
+fn direct_process_type(segments: &[String]) -> Option<ProcessApi> {
+    match segments {
+        [root, process, command]
+            if root == "std" && process == "process" && command == "Command" =>
+        {
+            Some(ProcessApi::Std)
         }
+        [root, process, command]
+            if root == "tokio" && process == "process" && command == "Command" =>
+        {
+            Some(ProcessApi::Tokio)
+        }
+        _ => None,
+    }
+}
 
-        let mut in_test = test_region_depth.is_some();
-        if pending_cfg_test {
-            if opens > 0 {
-                // The `#[cfg(test)]` item opens a block: this line and its block are test code.
-                if test_region_depth.is_none() {
-                    test_region_depth = Some(depth);
-                }
-                in_test = true;
-                pending_cfg_test = false;
-            } else if !has_cfg_test {
-                // A single-line guarded item (e.g. `#[cfg(test)]` then `use …;`): skip this one line.
-                in_test = true;
-                pending_cfg_test = false;
+impl ProcessAliases {
+    fn resolve_type_segments(&self, segments: &[String]) -> Option<ProcessApi> {
+        direct_process_type(segments).or_else(|| match segments {
+            [command] => self.commands.get(command).copied(),
+            [module, command] if command == "Command" => self.modules.get(module).copied(),
+            _ => None,
+        })
+    }
+
+    fn resolve_path(&self, path: &syn::Path) -> Option<ProcessApi> {
+        let segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        self.resolve_type_segments(&segments)
+    }
+
+    fn add_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.add_use(&path.tree, prefix);
+                prefix.pop();
             }
-            // else: the bare `#[cfg(test)]` attribute line itself — keep waiting for its item.
-        }
-
-        if !in_test && code.contains(NEEDLE) {
-            hits.push(idx + 1);
-        }
-
-        depth += opens - closes;
-        if let Some(td) = test_region_depth {
-            if depth <= td {
-                test_region_depth = None;
+            syn::UseTree::Name(name) => {
+                if name.ident == "self" {
+                    if let Some(api) = process_module(prefix) {
+                        if let Some(local) = prefix.last() {
+                            self.modules.insert(local.clone(), api);
+                        }
+                    }
+                    return;
+                }
+                prefix.push(name.ident.to_string());
+                if let Some(api) = direct_process_type(prefix) {
+                    self.commands.insert(name.ident.to_string(), api);
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Rename(rename) => {
+                if rename.ident == "self" {
+                    if let Some(api) = process_module(prefix) {
+                        self.modules.insert(rename.rename.to_string(), api);
+                    }
+                    return;
+                }
+                prefix.push(rename.ident.to_string());
+                if let Some(api) = direct_process_type(prefix) {
+                    self.commands.insert(rename.rename.to_string(), api);
+                } else if let Some(api) = process_module(prefix) {
+                    self.modules.insert(rename.rename.to_string(), api);
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.add_use(item, prefix);
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                if let Some(api) = process_module(prefix) {
+                    self.commands.insert("Command".into(), api);
+                }
             }
         }
     }
-    hits
+
+    fn resolve_type_aliases(&mut self) {
+        loop {
+            let mut changed = false;
+            for (alias, path) in &self.type_aliases {
+                if self.commands.contains_key(alias) {
+                    continue;
+                }
+                if let Some(api) = self.resolve_path(path) {
+                    self.commands.insert(alias.clone(), api);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+fn process_module(segments: &[String]) -> Option<ProcessApi> {
+    match segments {
+        [root, process] if root == "std" && process == "process" => Some(ProcessApi::Std),
+        [root, process] if root == "tokio" && process == "process" => Some(ProcessApi::Tokio),
+        _ => None,
+    }
+}
+
+struct AliasCollector<'a>(&'a mut ProcessAliases);
+
+impl<'ast> Visit<'ast> for AliasCollector<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if !has_cfg_test(&item.attrs) {
+            self.0.add_use(&item.tree, &mut Vec::new());
+        }
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        if let syn::Type::Path(path) = item.ty.as_ref() {
+            self.0
+                .type_aliases
+                .push((item.ident.to_string(), path.path.clone()));
+        }
+        syn::visit::visit_item_type(self, item);
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_trait_item_fn(self, item);
+        }
+    }
+}
+
+struct ProcessVisitor<'a> {
+    aliases: &'a ProcessAliases,
+    functions: Vec<String>,
+    hits: BTreeSet<RawProcessCommand>,
+}
+
+impl ProcessVisitor<'_> {
+    fn record_call(&mut self, call: &syn::ExprCall) {
+        let syn::Expr::Path(function) = call.func.as_ref() else {
+            return;
+        };
+        let mut segments: Vec<String> = function
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        if segments.len() < 2 {
+            return;
+        }
+        // Any associated constructor on either Command type creates a raw process builder. This
+        // covers `new`, `from`, and future constructors without maintaining a spelling blacklist.
+        segments.pop();
+        let Some(api) = self.aliases.resolve_type_segments(&segments) else {
+            return;
+        };
+        self.hits.insert(RawProcessCommand {
+            line: start_line(function.path.span()),
+            api,
+            function: self
+                .functions
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<module>".into()),
+        });
+    }
+}
+
+fn start_line(span: Span) -> usize {
+    span.start().line.max(1)
+}
+
+impl<'ast> Visit<'ast> for ProcessVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_trait_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        self.record_call(call);
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// Resolve production raw-process constructions in one Rust source file through imports, renamed
+/// imports, module aliases, type aliases, and multiline syntax. Test-only items are excluded by
+/// their parsed `cfg(test)` attributes; comments and string literals are naturally invisible.
+pub fn raw_process_commands(src: &str) -> syn::Result<Vec<RawProcessCommand>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = ProcessAliases::default();
+    AliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_type_aliases();
+    let mut visitor = ProcessVisitor {
+        aliases: &aliases,
+        functions: Vec::new(),
+        hits: BTreeSet::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.hits.into_iter().collect())
+}
+
+/// Backwards-compatible line-only view of [`raw_process_commands`]. A parse failure is returned as
+/// line 1 so callers that have not migrated to the fallible API still fail closed.
+pub fn raw_process_command_lines(src: &str) -> Vec<usize> {
+    raw_process_commands(src)
+        .map(|hits| hits.into_iter().map(|hit| hit.line).collect())
+        .unwrap_or_else(|_| vec![1])
+}
+
+/// One raw filesystem call in a function that names project-controlled metadata.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RawProjectMetadataIo {
+    pub line: usize,
+    pub function: String,
+}
+
+#[derive(Default)]
+struct FsAliases {
+    modules: BTreeSet<String>,
+    types: BTreeSet<String>,
+    functions: BTreeSet<String>,
+}
+
+fn fs_module(segments: &[String]) -> bool {
+    matches!(segments, [root, fs] if (root == "std" || root == "tokio") && fs == "fs")
+}
+
+impl FsAliases {
+    fn add_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.add_use(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                if name.ident == "self" {
+                    if fs_module(prefix) {
+                        if let Some(local) = prefix.last() {
+                            self.modules.insert(local.clone());
+                        }
+                    }
+                    return;
+                }
+                prefix.push(name.ident.to_string());
+                self.add_fs_leaf(prefix, name.ident.to_string());
+                prefix.pop();
+            }
+            syn::UseTree::Rename(rename) => {
+                if rename.ident == "self" {
+                    if fs_module(prefix) {
+                        self.modules.insert(rename.rename.to_string());
+                    }
+                    return;
+                }
+                prefix.push(rename.ident.to_string());
+                if fs_module(prefix) {
+                    self.modules.insert(rename.rename.to_string());
+                } else if prefix.len() >= 3 && fs_module(&prefix[..2]) {
+                    if matches!(rename.ident.to_string().as_str(), "File" | "OpenOptions") {
+                        self.types.insert(rename.rename.to_string());
+                    } else {
+                        self.functions.insert(rename.rename.to_string());
+                    }
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    self.add_use(tree, prefix);
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                if fs_module(prefix) {
+                    for function in [
+                        "read",
+                        "read_to_string",
+                        "write",
+                        "copy",
+                        "rename",
+                        "remove_file",
+                        "remove_dir_all",
+                        "create_dir",
+                        "create_dir_all",
+                        "canonicalize",
+                        "metadata",
+                        "symlink_metadata",
+                        "read_dir",
+                    ] {
+                        self.functions.insert(function.into());
+                    }
+                    self.types.insert("File".into());
+                    self.types.insert("OpenOptions".into());
+                }
+            }
+        }
+    }
+
+    fn add_fs_leaf(&mut self, segments: &[String], local: String) {
+        if fs_module(segments) {
+            self.modules.insert(local);
+        } else if segments.len() >= 3 && fs_module(&segments[..2]) {
+            if matches!(
+                segments.last().map(String::as_str),
+                Some("File" | "OpenOptions")
+            ) {
+                self.types.insert(local);
+            } else {
+                self.functions.insert(local);
+            }
+        }
+    }
+
+    fn resolves_call(&self, segments: &[String]) -> bool {
+        if segments.len() >= 3 && fs_module(&segments[..2]) {
+            return true;
+        }
+        match segments {
+            [function] => self.functions.contains(function),
+            [owner, _function] => self.modules.contains(owner) || self.types.contains(owner),
+            [module, _ty, _function] => self.modules.contains(module),
+            _ => false,
+        }
+    }
+}
+
+struct FsAliasCollector<'a>(&'a mut FsAliases);
+
+impl<'ast> Visit<'ast> for FsAliasCollector<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if !has_cfg_test(&item.attrs) {
+            self.0.add_use(&item.tree, &mut Vec::new());
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProjectMetadataMarker(bool);
+
+impl<'ast> Visit<'ast> for ProjectMetadataMarker {
+    fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+        let value = literal.value().replace('\\', "/");
+        if value == "AGENTS.md"
+            || value == "CLAUDE.md"
+            || value.contains(".flux/")
+            || value.ends_with("/.flux")
+        {
+            self.0 = true;
+        }
+    }
+}
+
+struct ProjectIoVisitor<'a> {
+    aliases: &'a FsAliases,
+    contexts: Vec<(String, bool)>,
+    hits: BTreeSet<RawProjectMetadataIo>,
+}
+
+impl ProjectIoVisitor<'_> {
+    fn enter_function(&mut self, name: String, block: &syn::Block) {
+        let mut marker = ProjectMetadataMarker::default();
+        marker.visit_block(block);
+        self.contexts.push((name, marker.0));
+    }
+
+    fn record_call(&mut self, call: &syn::ExprCall) {
+        let Some((function, true)) = self.contexts.last() else {
+            return;
+        };
+        let syn::Expr::Path(path) = call.func.as_ref() else {
+            return;
+        };
+        let segments: Vec<String> = path
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        if self.aliases.resolves_call(&segments) {
+            self.hits.insert(RawProjectMetadataIo {
+                line: start_line(path.path.span()),
+                function: function.clone(),
+            });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ProjectIoVisitor<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(item.sig.ident.to_string(), &item.block);
+        syn::visit::visit_item_fn(self, item);
+        self.contexts.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if has_cfg_test(&item.attrs) {
+            return;
+        }
+        self.enter_function(item.sig.ident.to_string(), &item.block);
+        syn::visit::visit_impl_item_fn(self, item);
+        self.contexts.pop();
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        self.record_call(call);
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// Find production raw std/Tokio filesystem calls in functions that name repository-controlled
+/// metadata (`AGENTS.md`, `CLAUDE.md`, or `.flux/*`). This conservative dataflow-lite check catches
+/// a path built in one statement and read in another, including imported aliases; guarded
+/// `System`/`Workspace` calls are not raw filesystem calls and therefore remain valid.
+pub fn raw_project_metadata_io(src: &str) -> syn::Result<Vec<RawProjectMetadataIo>> {
+    let file = syn::parse_file(src)?;
+    let mut aliases = FsAliases::default();
+    FsAliasCollector(&mut aliases).visit_file(&file);
+    let mut visitor = ProjectIoVisitor {
+        aliases: &aliases,
+        contexts: Vec::new(),
+        hits: BTreeSet::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.hits.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// Read every `crates/*/Cargo.toml`, collect its `flux-*` runtime dependencies, and assert the
-    /// whole workspace respects the layering (no inner crate depends on an outer one).
+    /// Collect production Rust sources from both Cargo workspaces. Keeping this traversal shared
+    /// makes it impossible for one architecture gate to quietly forget the separately-built
+    /// integration plugins.
+    fn workspace_source_files(repo_root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for workspace_dir in [repo_root.join("crates"), repo_root.join("plugins")] {
+            let Ok(entries) = std::fs::read_dir(workspace_dir) else {
+                continue;
+            };
+            for entry in entries {
+                let dir = entry.unwrap().path();
+                if dir.is_dir() {
+                    collect_rs(&dir.join("src"), &mut files);
+                }
+            }
+        }
+        files
+    }
+
+    /// Build the layer graph from Cargo's resolved package metadata. Dependency keys are never
+    /// consulted: `Dependency::name` is the actual package identity, so `package =` renames cannot
+    /// hide an edge. Cargo reports normal/build/dev kind and target predicates independently; the
+    /// architecture contract includes normal + build edges on every target and explicitly excludes
+    /// dev-only edges.
+    fn metadata_layer_graph(metadata: &Metadata) -> Vec<(String, Vec<String>)> {
+        let workspace_names: BTreeSet<String> = metadata
+            .workspace_packages()
+            .into_iter()
+            .map(|package| package.name.to_string())
+            .collect();
+
+        metadata
+            .workspace_packages()
+            .into_iter()
+            .map(|package| {
+                let dependencies = package
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| dependency.kind != DependencyKind::Development)
+                    .map(|dependency| dependency.name.to_string())
+                    .filter(|name| workspace_names.contains(name))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                (package.name.to_string(), dependencies)
+            })
+            .collect()
+    }
+
+    /// Resolve the real Cargo package graph and assert the whole workspace respects layering.
     #[test]
     fn workspace_respects_layering() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let mut deps_by_crate: Vec<(String, Vec<String>)> = Vec::new();
-
-        for entry in std::fs::read_dir(crates_dir).unwrap() {
-            let manifest = entry.unwrap().path().join("Cargo.toml");
-            if !manifest.is_file() {
-                continue;
-            }
-            let txt = std::fs::read_to_string(&manifest).unwrap();
-            let val: toml::Value = toml::from_str(&txt).unwrap();
-            let name = val["package"]["name"].as_str().unwrap().to_string();
-            // Only [dependencies] constrain layering; [dev-dependencies] may point upward for tests.
-            let deps = val
-                .get("dependencies")
-                .and_then(|d| d.as_table())
-                .map(|t| {
-                    t.keys()
-                        .filter(|k| k.starts_with("flux-"))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            deps_by_crate.push((name, deps));
-        }
+        let repo_root = crates_dir.parent().unwrap();
+        let metadata = MetadataCommand::new()
+            .manifest_path(repo_root.join("Cargo.toml"))
+            .other_options(vec!["--locked".into(), "--offline".into()])
+            .exec()
+            .expect("resolve root workspace metadata");
+        let deps_by_crate = metadata_layer_graph(&metadata);
 
         // sanity: we actually found the workspace crates
         assert!(
@@ -187,6 +700,76 @@ mod tests {
             v.is_empty(),
             "architecture layering violations:\n  {}",
             v.join("\n  ")
+        );
+    }
+
+    fn fixture_metadata(dependency_section: &str) -> Metadata {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "flux-codegate-metadata-{}-{nonce}",
+            std::process::id()
+        ));
+        let inner = root.join("inner");
+        let outer = root.join("outer");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::create_dir_all(&outer).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner\", \"outer\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"flux-runtime\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n{dependency_section}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            outer.join("Cargo.toml"),
+            "[package]\nname = \"flux-auth\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(inner.join("src.rs"), "").unwrap();
+        std::fs::write(outer.join("src.rs"), "").unwrap();
+        // Explicit lib paths keep the fixture tiny and avoid creating source trees.
+        for manifest in [inner.join("Cargo.toml"), outer.join("Cargo.toml")] {
+            let mut text = std::fs::read_to_string(&manifest).unwrap();
+            text.push_str("\n[lib]\npath = \"src.rs\"\n");
+            std::fs::write(manifest, text).unwrap();
+        }
+
+        let metadata = MetadataCommand::new()
+            .manifest_path(root.join("Cargo.toml"))
+            .other_options(vec!["--offline".into()])
+            .exec()
+            .expect("resolve fixture metadata");
+        std::fs::remove_dir_all(root).ok();
+        metadata
+    }
+
+    #[test]
+    fn metadata_gate_sees_renamed_target_and_build_dependencies() {
+        for section in [
+            "[dependencies]\nidentity = { package = \"flux-auth\", path = \"../outer\" }",
+            "[target.'cfg(unix)'.dependencies]\nidentity = { package = \"flux-auth\", path = \"../outer\" }",
+            "[build-dependencies]\nidentity = { package = \"flux-auth\", path = \"../outer\" }",
+        ] {
+            let graph = metadata_layer_graph(&fixture_metadata(section));
+            let found = violations(&graph);
+            assert_eq!(found.len(), 1, "section `{section}` produced {graph:?}");
+            assert!(found[0].contains("flux-auth"), "{found:?}");
+        }
+
+        let dev = metadata_layer_graph(&fixture_metadata(
+            "[dev-dependencies]\nidentity = { package = \"flux-auth\", path = \"../outer\" }",
+        ));
+        assert!(
+            violations(&dev).is_empty(),
+            "dev-only upward dependencies are explicitly outside the production layer contract"
         );
     }
 
@@ -229,10 +812,10 @@ mod tests {
 
         // A `#[cfg(test)] mod tests { … }` block is ignored, however the brace is placed.
         let in_test_mod =
-            "#[cfg(test)]\nmod tests {\n    use std::process::Command;\n    let c = std::process::Command::new(\"x\");\n}\n";
+            "#[cfg(test)]\nmod tests {\n    use std::process::Command;\n    fn run() { let c = std::process::Command::new(\"x\"); }\n}\n";
         assert!(raw_process_command_lines(in_test_mod).is_empty());
         let same_line =
-            "#[cfg(test)] mod tests {\n    let c = std::process::Command::new(\"x\");\n}\n";
+            "#[cfg(test)] mod tests {\n    fn run() { let c = std::process::Command::new(\"x\"); }\n}\n";
         assert!(raw_process_command_lines(same_line).is_empty());
 
         // A single-line `#[cfg(test)]` item (a test-only import) is ignored.
@@ -244,9 +827,27 @@ mod tests {
             "/// never use std::process::Command here\n// std::process::Command\nfn f() {}\n";
         assert!(raw_process_command_lines(commented).is_empty());
 
-        // `tokio::process::Command` is not the std seam and must not be flagged.
+        // Tokio process creation is a second raw seam and is equally forbidden.
         let tokio = "fn f() {\n    let c = tokio::process::Command::new(\"x\");\n}\n";
-        assert!(raw_process_command_lines(tokio).is_empty());
+        assert_eq!(raw_process_command_lines(tokio), vec![2]);
+
+        // Imported aliases, module aliases, type aliases, and multiline calls all resolve to the
+        // same two underlying process APIs.
+        let aliases = r#"
+use std::process::Command as StdCommand;
+use tokio::process as async_process;
+type AsyncCommand = async_process::Command;
+fn spawn() {
+    StdCommand
+        ::new("one");
+    AsyncCommand::new("two");
+}
+"#;
+        let hits = raw_process_commands(aliases).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].api, ProcessApi::Std);
+        assert_eq!(hits[1].api, ProcessApi::Tokio);
+        assert!(hits.iter().all(|hit| hit.function == "spawn"));
 
         // Production code after a test module is still scanned (regions close on brace balance).
         let after =
@@ -254,42 +855,60 @@ mod tests {
         assert_eq!(raw_process_command_lines(after), vec![6]);
     }
 
-    /// Architecture guard: no production (non-test) tool/runtime/plugin path may spawn a raw
-    /// `std::process::Command`. Every process start must route through `flux_system::System`'s one
-    /// guarded seam (AGENTS.md). `flux-system` itself owns the seam and is exempt. Adding a new raw
-    /// `Command` anywhere else fails this test — an explicit exception must be added below with a
-    /// justification if one is ever genuinely warranted.
+    #[test]
+    fn project_metadata_io_scanner_resolves_aliases_and_ignores_guarded_io() {
+        let raw = r#"
+use std::fs as disk;
+fn load(root: &std::path::Path) {
+    let path = root.join(".flux/config.toml");
+    let _ = disk::read_to_string(path);
+}
+"#;
+        let hits = raw_project_metadata_io(raw).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].function, "load");
+
+        let guarded = r#"
+fn load(system: &flux_system::System) {
+    let _ = system.read_file("AGENTS.md");
+}
+"#;
+        assert!(raw_project_metadata_io(guarded).unwrap().is_empty());
+
+        let test_only = r#"
+#[cfg(test)]
+fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
+"#;
+        assert!(raw_project_metadata_io(test_only).unwrap().is_empty());
+    }
+
+    /// Architecture guard: no production (non-test) tool/runtime/plugin path may construct a raw
+    /// std or Tokio process command. `flux-system` owns exactly two reviewed construction points:
+    /// the canonical std builder and its Tokio conversion. Allowances are single-use, so a second
+    /// constructor even inside either function fails.
     #[test]
     fn no_raw_process_command_outside_system() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let repo_root = crates_dir.parent().unwrap();
 
-        // Documented, reviewed exceptions: `(repo-relative path, 1-based line)`. Empty by design —
-        // the seam belongs in flux-system only.
-        const ALLOW: &[(&str, usize)] = &[];
+        // Documented, reviewed single-use exceptions: `(path, containing function, API)`.
+        const ALLOW: &[(&str, &str, ProcessApi)] = &[
+            (
+                "crates/flux-system/src/lib.rs",
+                "build_command",
+                ProcessApi::Std,
+            ),
+            (
+                "crates/flux-system/src/lib.rs",
+                "build_tokio_command",
+                ProcessApi::Tokio,
+            ),
+        ];
+        let mut allowance_use = vec![0usize; ALLOW.len()];
 
-        let mut rs_files: Vec<PathBuf> = Vec::new();
-        // Root workspace crates' `src/` — skip `flux-system` (the guarded owner of the seam) and
-        // `flux-codegate` itself (this lint's own source names the pattern as a string needle).
-        const EXEMPT_CRATES: &[&str] = &["flux-system", "flux-codegate"];
-        for entry in std::fs::read_dir(crates_dir).unwrap() {
-            let dir = entry.unwrap().path();
-            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !dir.is_dir() || EXEMPT_CRATES.contains(&name) {
-                continue;
-            }
-            collect_rs(&dir.join("src"), &mut rs_files);
-        }
-        // Nested plugins workspace: every `plugins/*/src/`.
-        let plugins_dir = repo_root.join("plugins");
-        if plugins_dir.is_dir() {
-            for entry in std::fs::read_dir(&plugins_dir).unwrap() {
-                let dir = entry.unwrap().path();
-                if dir.is_dir() {
-                    collect_rs(&dir.join("src"), &mut rs_files);
-                }
-            }
-        }
+        // Root crates include flux-system itself: its two constructors are admitted only by the
+        // single-use entries above. The shared traversal also covers every nested plugin `src/`.
+        let rs_files = workspace_source_files(repo_root);
 
         assert!(
             rs_files.len() > 20,
@@ -305,17 +924,86 @@ mod tests {
                 .to_string_lossy()
                 .replace('\\', "/");
             let src = std::fs::read_to_string(file).unwrap();
-            for line in raw_process_command_lines(&src) {
-                if !ALLOW.contains(&(rel.as_str(), line)) {
-                    violations.push(format!("{rel}:{line}"));
+            let hits = raw_process_commands(&src).unwrap_or_else(|error| {
+                panic!("parse {} for process gate: {error}", file.display())
+            });
+            for hit in hits {
+                if let Some((index, _)) = ALLOW.iter().enumerate().find(|(_, allowed)| {
+                    allowed.0 == rel && allowed.1 == hit.function && allowed.2 == hit.api
+                }) {
+                    allowance_use[index] += 1;
+                    if allowance_use[index] > 1 {
+                        violations.push(format!(
+                            "{rel}:{}: duplicate use of single-use allowance for {} ({:?})",
+                            hit.line, hit.function, hit.api
+                        ));
+                    }
+                } else {
+                    violations.push(format!(
+                        "{rel}:{}: raw {:?} Command construction in {}",
+                        hit.line, hit.api, hit.function
+                    ));
                 }
+            }
+        }
+
+        for (index, count) in allowance_use.into_iter().enumerate() {
+            if count != 1 {
+                violations.push(format!(
+                    "reviewed process allowance {:?} was used {count} times (expected exactly once)",
+                    ALLOW[index]
+                ));
             }
         }
 
         assert!(
             violations.is_empty(),
-            "raw `std::process::Command` outside flux-system (route through flux_system::System \
-             instead, or add a justified exception to ALLOW):\n  {}",
+            "raw process construction outside the canonical flux-system seam:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// Automatic project metadata must go through `System`/`Workspace`; the L0 parsers receive
+    /// injected bytes and have no file-wide exemption. A new direct AGENTS/config/role/skill read
+    /// in either Cargo workspace therefore fails here.
+    #[test]
+    fn no_raw_project_metadata_io_outside_guarded_boundary() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        // These long CLI orchestration functions mention `.flux` control paths but their raw read
+        // is of an explicit user argument (`fork --edit` / `app run <program>`), not automatic
+        // project metadata. Keep the exception function-scoped rather than exempting the CLI file.
+        const EXPLICIT_INPUT_READS: &[(&str, &str)] = &[
+            ("crates/flux-cli/src/session.rs", "run_fork"),
+            ("crates/flux-cli/src/app_cmd.rs", "run_app"),
+        ];
+
+        let files = workspace_source_files(repo_root);
+
+        let mut violations = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = std::fs::read_to_string(&file).unwrap();
+            for hit in raw_project_metadata_io(&source).unwrap_or_else(|error| {
+                panic!(
+                    "parse {} for project metadata IO gate: {error}",
+                    file.display()
+                )
+            }) {
+                if EXPLICIT_INPUT_READS.contains(&(rel.as_str(), hit.function.as_str())) {
+                    continue;
+                }
+                violations.push(format!("{rel}:{} ({})", hit.line, hit.function));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "raw project metadata IO outside the guarded boundary:\n  {}",
             violations.join("\n  ")
         );
     }
@@ -333,5 +1021,23 @@ mod tests {
                 out.push(path);
             }
         }
+    }
+
+    #[test]
+    fn architecture_source_walk_covers_both_workspaces() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let relative = workspace_source_files(repo_root)
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(repo_root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert!(relative.contains("crates/flux-system/src/lib.rs"));
+        assert!(relative.contains("plugins/host-kit/src/lib.rs"));
     }
 }
