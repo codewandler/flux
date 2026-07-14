@@ -8,9 +8,8 @@
 //! byte-for-byte — which is what gives the language server precise spans and error recovery without
 //! changing the semantic [`crate::ast::Node`] AST.
 //!
-//! The token set is complete. The **node** set is intentionally minimal here ([`SyntaxKind::ROOT`]
-//! plus [`SyntaxKind::ERROR`]) — the grammar's node kinds arrive with the tolerant parser (L-58);
-//! new variants are appended before [`SyntaxKind::__LAST`] so the `u16` round-trip stays valid.
+//! The token and node sets cover the complete writable grammar. New variants are appended before
+//! [`SyntaxKind::__LAST`] so the `u16` round-trip stays valid.
 
 /// Every token and node kind in the Flux-Lang CST.
 ///
@@ -102,8 +101,12 @@ pub enum SyntaxKind {
     /// One `name: Type` parameter.
     PARAM,
     /// A pure-data top-level declaration the L6 host interprets (`agent`/`channel`/`datasource`/
-    /// `trigger`/`journey`). Kept as one opaque node here; the module loader owns their grammar.
+    /// `trigger`/`journey`).
     DECL,
+    /// The first line of a pure-data declaration.
+    DECL_HEADER,
+    /// One `key value` line inside a pure-data declaration.
+    DECL_ATTR,
     /// An indented block of statements (a flow/clause body).
     BLOCK,
 
@@ -136,7 +139,7 @@ pub enum SyntaxKind {
     EFFECT_ANNOT,    // @effect(tag) on the line above a bind
     JSON_ESCAPE,     // @json <compact-json> (statement position)
 
-    // new native statements (L-60..L-63) — currently @json-only
+    // native statements added in L-60..L-63
     MEMO_STMT,       // memo $x = expr
     ONCE_STMT,       // once "label" [-> $b] …
     CHECKPOINT_STMT, // checkpoint "label"
@@ -174,8 +177,8 @@ pub enum SyntaxKind {
     ARG_LIST,   // (a, b, …)  or bare `a, b`
     NAME,       // an identifier in name position (op names, keys, types)
 
-    /// One `purpose`/`include`/`exclude`/`budget` sub-line inside a `ctx` block. Kept opaque —
-    /// the sub-line grammar belongs to the semantic parser; the CST only needs the span.
+    /// One `purpose`/`include`/`exclude`/`budget` sub-line inside a `ctx` block. Its ownership is
+    /// structural; semantic lowering decodes the scalar header fields from its leaf tokens.
     CTX_ENTRY,
 
     /// Sentinel marking the end of the enum — keep last. Not a real kind.

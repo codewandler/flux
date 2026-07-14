@@ -1,25 +1,23 @@
-//! `lower_cst` — the CST front-end host (L-59): strict lowering from the lossless rowan tree to
+//! `lower_cst` — strict lowering from the lossless rowan tree to
 //! the semantic [`DraftAst`], plus the **range side-map** that gives the message-only analyzer
 //! diagnostics real [`TextRange`]s.
 //!
 //! # Architecture
-//! The tolerant CST models statement *structure* completely, but statement headers are token runs
-//! (that is what an editor needs). Reproducing the `DraftAst` — and the pinned parse-error texts —
-//! from the tree alone would mean re-implementing the whole content grammar, so the lowering keeps
-//! the proven line machinery in [`crate::parse`] as the **semantic authority**: behavior is
-//! byte-identical by construction. What the CST contributes here:
+//! The tolerant CST is the sole accepting grammar. Strict callers first reject its recovered
+//! lexer/parser errors, then [`crate::cst_decode`] recursively lowers structured declarations,
+//! statements, blocks, and expressions into the unchanged semantic AST. Scalar leaves still read
+//! their lossless token text, while layout and declaration/block ownership are never reconstructed
+//! from source lines.
 //!
 //! - **Strictness with spans** ([`cst_to_draft`]): any parser/lexer error is reported with its
-//!   `TextRange` (the LSP path), and a clean tree lowers to the exact legacy `DraftAst`.
+//!   `TextRange` (the LSP path), and a clean tree lowers to the semantic `DraftAst`.
 //! - **The range side-map** ([`RangeMap`]): a lockstep walk pairs every statement-level AST node
 //!   with its CST statement node, keyed by the analyzer's own node-path rendering
 //!   (`body[3].then[1]`). [`RangeMap::resolve`] does longest-prefix lookup, so a diagnostic at a
 //!   sub-expression path (`body[3].args[0]`) still lands on its statement's range.
 //!
-//! Acceptance agreement (legacy-accepted ⇒ ERROR-free CST) is enforced by the round-trip property
-//! test and the `cst_agreement` corpus sweep, so the two front-ends cannot drift apart silently.
-//! The follow-up that retires the line machinery entirely (tree-driven content lowering) is the
-//! documented residual of L-59.
+//! The corpus/property guards pin losslessness, semantic round trips, ranges, comments, and tolerant
+//! recovery so future syntax changes have one acceptance point.
 
 use std::collections::BTreeMap;
 
@@ -102,54 +100,30 @@ pub struct LoweredModule {
     pub ops: Vec<DeclarationRanges>,
 }
 
-/// Strict CST lowering: any lexer/parser error fails with spans; a clean tree lowers to the exact
-/// legacy `DraftAst` (semantic authority: the shared line machinery) plus the range side-map.
-pub fn cst_to_draft(parse: &Parse, src: &str) -> std::result::Result<Lowered, Vec<LowerError>> {
-    if !parse.errors.is_empty() {
-        return Err(parse
-            .errors
-            .iter()
-            .map(|e| LowerError {
-                message: e.message.clone(),
-                range: Some(e.range),
-            })
-            .collect());
+/// Strict CST lowering: any lexer/parser error fails with spans; a clean tree lowers directly from
+/// its lossless tokens to the semantic AST plus the range side-map.
+pub fn cst_to_draft(parse: &Parse) -> std::result::Result<Lowered, Vec<LowerError>> {
+    let strict_errors = strict_cst_errors(parse);
+    if !strict_errors.is_empty() {
+        return Err(strict_errors);
     }
-    let ast = crate::parse::parse_flow_text(src).map_err(|e| {
-        vec![LowerError {
-            range: legacy_error_range(&e.to_string(), src),
-            message: e.to_string(),
-        }]
-    })?;
+    let root = parse.syntax();
+    let ast = crate::cst_decode::lower_flow(&root).map_err(|error| vec![error])?;
     let mut ranges = RangeMap::default();
-    map_flow(&parse.syntax(), &ast, &mut ranges);
+    map_flow(&root, &ast, &mut ranges);
     Ok(Lowered { ast, ranges })
 }
 
 /// Strict CST lowering for a complete module. Unlike [`cst_to_draft`], this accepts any mix of
 /// top-level flows and composite operations and retains an independent body-path range map for each
 /// declaration, so repeated `body[0]` analyzer paths never collide across declarations.
-pub fn cst_to_module(
-    parse: &Parse,
-    src: &str,
-) -> std::result::Result<LoweredModule, Vec<LowerError>> {
-    if !parse.errors.is_empty() {
-        return Err(parse
-            .errors
-            .iter()
-            .map(|e| LowerError {
-                message: e.message.clone(),
-                range: Some(e.range),
-            })
-            .collect());
+pub fn cst_to_module(parse: &Parse) -> std::result::Result<LoweredModule, Vec<LowerError>> {
+    let strict_errors = strict_cst_errors(parse);
+    if !strict_errors.is_empty() {
+        return Err(strict_errors);
     }
-    let module = Module::parse_str(src).map_err(|e| {
-        vec![LowerError {
-            range: legacy_error_range(&e.to_string(), src),
-            message: e.to_string(),
-        }]
-    })?;
     let root = parse.syntax();
+    let module = crate::cst_decode::lower_module(&root).map_err(|error| vec![error])?;
     let lowered = match &module {
         Module::Flow(ast) => LoweredModule {
             module: module.clone(),
@@ -171,6 +145,43 @@ pub fn cst_to_module(
         },
     };
     Ok(lowered)
+}
+
+fn strict_cst_errors(parse: &Parse) -> Vec<LowerError> {
+    if !parse.errors.is_empty() {
+        return parse
+            .errors
+            .iter()
+            .map(|error| LowerError {
+                message: error.message.clone(),
+                range: Some(error.range),
+            })
+            .collect();
+    }
+
+    // The lexer is total: an unrecognized character is retained as an ERROR token. Most grammar
+    // positions turn that into a parser diagnostic, but recovery paths may consume it into a
+    // larger header node. Strict compilation must still refuse every ERROR token; tolerant editor
+    // consumers keep the complete tree either way.
+    let root = parse.syntax();
+    let mut errors: Vec<LowerError> = root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::ERROR)
+        .map(|node| LowerError {
+            message: "invalid syntax".into(),
+            range: Some(node.text_range()),
+        })
+        .collect();
+    errors.extend(
+        root.descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == SyntaxKind::ERROR)
+            .map(|token| LowerError {
+                message: format!("unrecognized token `{}`", token.text()),
+                range: Some(token.text_range()),
+            }),
+    );
+    errors
 }
 
 fn declaration_ranges(
@@ -201,33 +212,11 @@ fn declaration_ranges(
         .collect()
 }
 
-/// The range-bearing flow front-end: legacy semantics/errors (pinned texts), CST-derived ranges.
-/// Costs one extra (CST) parse over [`crate::parse::parse`], so it is for callers that consume
-/// the ranges — the LSP. Acceptance drift between the two front-ends is enforced by the dedicated
-/// test guards (`cst_agreement`, the round-trip property test), not asserted per parse: an
-/// assertion here aborted debug builds on untrusted model-emitted text (review, 2026-07-09).
+/// The range-bearing strict flow front-end. This performs the same single CST parse as
+/// [`crate::parse::parse`] and additionally retains statement ranges for analyzer/LSP consumers.
 pub fn parse_with_ranges(src: &str) -> Result<Lowered> {
-    let ast = crate::parse::parse_flow_text(src)?;
     let parse = parse_cst(src);
-    let mut ranges = RangeMap::default();
-    map_flow(&parse.syntax(), &ast, &mut ranges);
-    Ok(Lowered { ast, ranges })
-}
-
-/// Best-effort range for a legacy `line N: …` error message: the whole 1-based line `N`.
-fn legacy_error_range(message: &str, src: &str) -> Option<TextRange> {
-    let rest = message.strip_prefix("line ")?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let line: usize = digits.parse().ok()?;
-    let mut start = 0usize;
-    for (i, l) in src.split_inclusive('\n').enumerate() {
-        if i + 1 == line {
-            let end = start + l.trim_end_matches(['\r', '\n']).len();
-            return Some(TextRange::new((start as u32).into(), (end as u32).into()));
-        }
-        start += l.len();
-    }
-    None
+    cst_to_draft(&parse).map_err(|errors| crate::parse::lowering_error(errors, &parse.syntax()))
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +594,7 @@ mod tests {
     fn module_lowering_maps_each_flow_and_composite_independently() {
         let src = "op summarize(text: String) -> String\n  description \"Summarize text\"\n  risk \"low\"\n  $out = ai.reason($text)\n  return $out\n\nflow first\n  $a = summarize(\"one\")\n  return $a\n\nflow second\n  $b = missing()\n  return $b\n";
         let parsed = parse_cst(src);
-        let lowered = cst_to_module(&parsed, src).expect("module lowers");
+        let lowered = cst_to_module(&parsed).expect("module lowers");
         assert!(matches!(lowered.module, Module::Program(_)));
         assert_eq!(lowered.ops.len(), 1);
         assert_eq!(lowered.flows.len(), 2);
@@ -642,12 +631,61 @@ mod tests {
     fn strict_cst_to_draft_errors_carry_ranges() {
         let src = "flow f\n  $x = (unclosed\n  return $x\n";
         let parse = parse_cst(src);
-        let err = cst_to_draft(&parse, src).expect_err("strict on ERROR");
+        let err = cst_to_draft(&parse).expect_err("strict on ERROR");
         assert!(!err.is_empty());
         assert!(
             err.iter().all(|e| e.range.is_some()),
             "every error has a span: {err:?}"
         );
+    }
+
+    #[test]
+    fn lowering_reads_semantics_from_cst_tokens() {
+        let parsed = parse_cst("flow from_cst\n  return \"tree\"\n");
+        let lowered = cst_to_draft(&parsed).expect("clean CST lowers");
+        assert_eq!(lowered.ast.name.as_deref(), Some("from_cst"));
+        assert_eq!(
+            lowered.ast.body,
+            vec![Node::Return {
+                value: Box::new(Node::Lit {
+                    value: serde_json::Value::String("tree".into()),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn tolerant_tree_survives_incomplete_input_while_strict_parse_refuses_it() {
+        let src = "flow f\n  $a =\n  $b = 2\n";
+        let parsed = parse_cst(src);
+        assert!(
+            !parsed.errors.is_empty(),
+            "tolerant parser records the hole"
+        );
+        assert_eq!(parsed.syntax().text().to_string(), src);
+        assert!(
+            parsed
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::BIND_STMT)
+                .count()
+                >= 2
+        );
+        assert!(crate::parse::parse(src).is_err());
+    }
+
+    #[test]
+    fn strict_lowering_refuses_error_tokens_inside_recovered_declarations() {
+        let src = "agent guide\n  note 🦀\n";
+        let parsed = parse_cst(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "recovered CST remains editor-tolerant"
+        );
+        let errors = cst_to_module(&parsed).expect_err("ERROR token must fail strict lowering");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("unrecognized token"));
+        assert_eq!(errors[0].range, Some(TextRange::new(19.into(), 23.into())));
     }
 
     #[test]

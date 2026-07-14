@@ -222,12 +222,12 @@ fn compact<T: serde::Serialize>(v: &T) -> String {
 /// Whether `s` can be safely spelled as `"""<s>"""` (L-39). Three hazards, each of which would
 /// break `parse(&format(&ast)) == ast`:
 /// - The closing delimiter is discovered by scanning forward for the *next* literal `"""` (see
-///   `parse.rs`'s `preprocess`), so content that itself contains `"""` cannot round-trip.
+///   the CST lexer's triple-string token), so content that itself contains `"""` cannot round-trip.
 /// - Content **ending** in a `"` would merge with the closer into an accidental run of 3+ quotes
 ///   and get swallowed one character short.
-/// - `preprocess` normalizes `\r\n` -> `\n` on the *whole source* before scanning for blocks (to
-///   keep the char scanner simple), so a `\r` anywhere in the content — most commonly as part of a
-///   `\r\n` pair — would silently lose it on the way back through `parse`.
+/// - CST semantic lowering normalizes `\r\n` -> `\n` inside triple-string content, so a `\r`
+///   anywhere in the content — most commonly as part of a `\r\n` pair — would silently lose it on
+///   the way back through `parse`.
 ///
 /// All three are vanishingly rare in real payloads; the formatter falls back to the always-safe
 /// escaped form for them, so the round-trip invariant stays total.
@@ -1312,13 +1312,10 @@ mod tests {
 
     #[test]
     fn crlf_content_falls_back_to_the_escaped_spelling() {
-        // `parse.rs`'s `preprocess` normalizes `\r\n` -> `\n` on the *whole source* before
-        // scanning for `"""` blocks (so the char-by-char scanner only has to special-case `\n`,
-        // matching old `str::lines()` behavior on Windows-authored sources). That means a `\r`
-        // immediately followed by `\n` inside a `"""..."""` block would silently lose the `\r` on
-        // the way back through `parse` — a real round-trip violation if the formatter ever chose
-        // the multi-line spelling for such a string. The formatter must treat `\r` as unsafe (like
-        // the `"""`/trailing-`"` hazards) and fall back to the escaped spelling instead.
+        // CST semantic lowering normalizes `\r\n` -> `\n` inside a `"""..."""` token. That means
+        // the `\r` would be lost on the way back through `parse` — a real round-trip violation if
+        // the formatter chose the multi-line spelling. Treat `\r` as unsafe (like the
+        // `"""`/trailing-`"` hazards) and fall back to the escaped spelling instead.
         let value = serde_json::json!("line one\r\nline two");
         let ast = DraftAst {
             body: vec![Node::Lit {

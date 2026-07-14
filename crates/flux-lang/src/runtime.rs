@@ -3701,7 +3701,7 @@ fn map_args_to_input(
                             "op `{op}` accepts {} parameter(s) but {} argument(s) were supplied",
                             order.len(),
                             i + 1
-                        )))
+                        )));
                     }
                 }
             }
@@ -3872,7 +3872,7 @@ fn eval_jq_path(
                         return Err(jq_access_error(
                             path,
                             &format!("has no field `{key}`{}", present_keys_hint(map)),
-                        ))
+                        ));
                     }
                 },
                 // Dotted numeric index into a list: `$nums.0` is the first element (L-53). A
@@ -3888,7 +3888,7 @@ fn eval_jq_path(
                                     "index {idx} is past the end of a {}-element list",
                                     arr.len()
                                 ),
-                            ))
+                            ));
                         }
                     },
                     Err(_) if optional => J::Null,
@@ -3898,7 +3898,7 @@ fn eval_jq_path(
                             &format!(
                                 "cannot read field `{key}` of a list (use an index like `.0`)"
                             ),
-                        ))
+                        ));
                     }
                 },
                 _ if optional => J::Null,
@@ -3906,7 +3906,7 @@ fn eval_jq_path(
                     return Err(jq_access_error(
                         path,
                         &format!("cannot read field `{key}` of {}", json_type_name(other)),
-                    ))
+                    ));
                 }
             };
         }
@@ -3932,7 +3932,7 @@ fn eval_jq_path(
                                     "index [{idx}] is past the end of a {}-element list",
                                     arr.len()
                                 ),
-                            ))
+                            ));
                         }
                     },
                     _ if optional => J::Null,
@@ -3940,7 +3940,7 @@ fn eval_jq_path(
                         return Err(jq_access_error(
                             path,
                             &format!("cannot index [{idx}] into {}", json_type_name(other)),
-                        ))
+                        ));
                     }
                 };
                 bracket = bracket[end + 1..].to_string();

@@ -7,10 +7,10 @@
 //! exactly what the language server needs. Every non-layout token is fed to the builder in order, so
 //! the tree round-trips to the source byte-for-byte.
 //!
-//! Scope: the **flow** grammar is parsed precisely (that is the `parse` path, where the 16
-//! native-syntax nodes live and what the editor edits most); other top-level declarations
-//! (`agent`/`channel`/…) are captured structurally as opaque [`SyntaxKind::DECL`] nodes; composite
-//! `op` declarations are structured like flows so the LSP can analyze their bodies with ranges.
+//! The tree structures the complete writable surface: flow/composite bodies contain typed statement
+//! and expression nodes; pure-data module declarations expose explicit headers and attributes; and
+//! journeys contain a nested flow declaration. The semantic lowerer therefore follows CST ownership
+//! directly instead of rebuilding indentation or statement boundaries from source text.
 
 use crate::lexer::{lex, LexToken};
 use crate::syntax::{FluxLang, SyntaxKind};
@@ -143,10 +143,10 @@ impl<'s> Parser<'s> {
 
     // --- header/block boundary lookahead --------------------------------
     //
-    // The legacy preprocess drops blank and comment-only lines before the grammar ever sees them,
-    // so at a header→block or block→clause boundary (`flow f` + blank + body; `try` body + blank +
-    // `catch`) those lines are insignificant. `nth`/`at` deliberately treat NEWLINE as significant
-    // (the grammar is line-oriented), so boundaries use these dedicated helpers instead.
+    // Blank and comment-only lines are semantically insignificant at a header→block or
+    // block→clause boundary (`flow f` + blank + body; `try` body + blank + `catch`). `nth`/`at`
+    // deliberately treat NEWLINE as significant (the grammar is line-oriented), so boundaries use
+    // these dedicated helpers instead.
 
     /// True when the next non-blank content is an INDENT — an indented block follows, possibly
     /// after blank or comment-only lines.
@@ -306,11 +306,18 @@ impl<'s> Parser<'s> {
                 }
                 SyntaxKind::IDENT if self.at_kw("flow") => self.flow_decl(),
                 SyntaxKind::IDENT if self.at_kw("op") => self.op_decl(),
-                SyntaxKind::IDENT if self.at_decl_kw() => self.opaque_decl(),
+                SyntaxKind::IDENT if self.at_decl_kw() => self.data_decl(),
                 _ => {
                     // Unexpected top-level content: recover a line at a time.
                     self.start(SyntaxKind::ERROR);
-                    self.error("expected a `flow` header or a top-level declaration");
+                    if self.at(SyntaxKind::IDENT) {
+                        self.error(format!(
+                            "unknown top-level declaration: `{}`",
+                            self.cur_text()
+                        ));
+                    } else {
+                        self.error("expected a `flow` header or a top-level declaration");
+                    }
                     self.eat_to_end_of_line();
                     self.finish_node();
                 }
@@ -322,43 +329,98 @@ impl<'s> Parser<'s> {
     fn at_decl_kw(&self) -> bool {
         matches!(
             self.cur_text(),
-            "permissions" | "agent" | "channel" | "datasource" | "trigger" | "journey"
+            "goal"
+                | "permissions"
+                | "agent_loop"
+                | "agent"
+                | "channel"
+                | "datasource"
+                | "trigger"
+                | "journey"
         )
     }
 
-    /// A pure-data top-level declaration, captured structurally (header line + its indented block)
-    /// as one opaque DECL node. Its interior grammar belongs to the module loader, not the flow CST.
-    fn opaque_decl(&mut self) {
+    /// A pure-data top-level declaration. Its header and attribute lines are explicit CST nodes;
+    /// `agent_loop` owns a normal statement block and `journey` may own a nested flow declaration.
+    /// This is enough structure for semantic lowering without reconstructing indentation lines.
+    fn data_decl(&mut self) {
+        let keyword = self.cur_text().to_string();
         self.start(SyntaxKind::DECL);
+        self.start(SyntaxKind::DECL_HEADER);
         self.eat_to_end_of_line();
-        self.block_if_indented(Self::opaque_block);
+        self.finish_node();
+        match keyword.as_str() {
+            "agent_loop" => self.block_if_indented(Self::block),
+            "journey" => self.block_if_indented(Self::journey_block),
+            _ => self.block_if_indented(Self::declaration_attr_block),
+        }
         self.finish_node();
     }
 
-    /// Consume a whole INDENT…DEDENT block without interpreting it (for opaque decls).
-    fn opaque_block(&mut self) {
-        self.eat_trivia();
-        self.pos += 1; // INDENT (not emitted)
-        let mut depth = 1;
-        while depth > 0 && !self.at_eof() {
+    fn declaration_attr_block(&mut self) {
+        self.start(SyntaxKind::BLOCK);
+        self.pos += 1; // INDENT
+        loop {
+            self.eat_trivia();
             match self.nth(0) {
-                SyntaxKind::INDENT => {
-                    self.pos += 1;
-                    depth += 1;
-                }
                 SyntaxKind::DEDENT => {
                     self.pos += 1;
-                    depth -= 1;
+                    break;
                 }
-                _ => self.bump(),
+                SyntaxKind::EOF => break,
+                SyntaxKind::NEWLINE => self.bump(),
+                SyntaxKind::INDENT => {
+                    // Keep malformed nested declaration content lossless and recover at its
+                    // matching dedent. Strict lowering rejects the parser error; editor users still
+                    // receive the complete tree.
+                    self.error("declaration attributes cannot contain nested blocks");
+                    self.pos += 1;
+                    self.start(SyntaxKind::ERROR);
+                    while !self.at_eof() && !self.at(SyntaxKind::DEDENT) {
+                        self.bump();
+                    }
+                    if self.at(SyntaxKind::DEDENT) {
+                        self.pos += 1;
+                    }
+                    self.finish_node();
+                }
+                _ => {
+                    self.start(SyntaxKind::DECL_ATTR);
+                    self.eat_to_end_of_line();
+                    self.finish_node();
+                }
             }
         }
+        self.finish_node();
+    }
+
+    fn journey_block(&mut self) {
+        self.start(SyntaxKind::BLOCK);
+        self.pos += 1; // INDENT
+        loop {
+            self.eat_trivia();
+            match self.nth(0) {
+                SyntaxKind::DEDENT => {
+                    self.pos += 1;
+                    break;
+                }
+                SyntaxKind::EOF => break,
+                SyntaxKind::NEWLINE => self.bump(),
+                SyntaxKind::IDENT if self.at_kw("flow") => self.flow_decl(),
+                _ => {
+                    self.start(SyntaxKind::DECL_ATTR);
+                    self.eat_to_end_of_line();
+                    self.finish_node();
+                }
+            }
+        }
+        self.finish_node();
     }
 
     fn flow_decl(&mut self) {
         self.start(SyntaxKind::FLOW_DECL);
         self.flow_header();
-        // Column-0 `goal "…"` directive lines are tolerated-and-ignored by the legacy parser —
+        // Column-0 `goal "…"` directive lines are tolerated-and-ignored by semantic lowering —
         // they may appear between the header and the body (or between body chunks). Consume each
         // as an opaque line; a body block may follow any of them.
         loop {
@@ -397,16 +459,8 @@ impl<'s> Parser<'s> {
     fn callable_header(&mut self, kind: SyntaxKind) {
         self.start(kind);
         self.bump(); // `flow` / `op`
-        if self.at(SyntaxKind::IDENT) {
-            self.bump(); // optional name…
-                         // …which may be kebab-case (`god-code-review`): the lexer splits it into
-                         // IDENT/NUMBER segments joined by `-`, all legal per `is_valid_decl_name`.
-            while self.at(SyntaxKind::MINUS)
-                && matches!(self.nth(1), SyntaxKind::IDENT | SyntaxKind::NUMBER)
-            {
-                self.bump(); // -
-                self.bump(); // segment
-            }
+        if matches!(self.nth(0), SyntaxKind::IDENT | SyntaxKind::NUMBER) {
+            self.decl_name(); // optional alphanumeric/underscore/kebab declaration name
         }
         if self.at(SyntaxKind::L_PAREN) {
             self.param_list();
@@ -461,7 +515,9 @@ impl<'s> Parser<'s> {
         self.bump(); // (
         while !self.at(SyntaxKind::R_PAREN) && !self.at_eof() && !self.at_newline() {
             self.start(SyntaxKind::PARAM);
-            self.expect(SyntaxKind::IDENT, "a parameter name");
+            if !self.decl_name() {
+                self.error("expected a parameter name");
+            }
             self.expect(SyntaxKind::COLON, "`:` after the parameter name");
             self.type_ref();
             self.finish_node();
@@ -477,12 +533,44 @@ impl<'s> Parser<'s> {
     /// IDENT possibly followed by `< … >`; captured as a TYPE reference span for now.
     fn type_ref(&mut self) {
         self.start(SyntaxKind::NAME);
-        self.expect(SyntaxKind::IDENT, "a type name");
+        if !self.decl_name() {
+            self.error("expected a type name");
+        }
         if self.eat(SyntaxKind::LT) {
             self.type_ref();
             self.expect(SyntaxKind::GT, "`>` to close the `List<…>` type");
         }
         self.finish_node();
+    }
+
+    /// Consume one declaration-name token run. Flux declaration names allow ASCII letters, digits,
+    /// `_`, and `-`; the lexer may therefore split a legal name such as `9lives-v2` into adjacent
+    /// NUMBER/IDENT/MINUS tokens. Only raw-adjacent tokens join the name — trivia ends it.
+    fn decl_name(&mut self) -> bool {
+        self.eat_trivia();
+        if !matches!(
+            self.raw_kind_at(self.pos),
+            SyntaxKind::IDENT | SyntaxKind::NUMBER
+        ) {
+            return false;
+        }
+        self.feed_one();
+        loop {
+            match self.raw_kind_at(self.pos) {
+                SyntaxKind::IDENT | SyntaxKind::NUMBER => self.feed_one(),
+                SyntaxKind::MINUS
+                    if matches!(
+                        self.raw_kind_at(self.pos + 1),
+                        SyntaxKind::IDENT | SyntaxKind::NUMBER
+                    ) =>
+                {
+                    self.feed_one();
+                    self.feed_one();
+                }
+                _ => break,
+            }
+        }
+        true
     }
 
     /// An indented block of statements: INDENT stmt* DEDENT.
@@ -546,24 +634,32 @@ impl<'s> Parser<'s> {
                 "seq" => return self.simple_block_stmt(SyntaxKind::SEQ_STMT, false),
                 "ctx" => return self.ctx_stmt(),
                 "return" => return self.return_stmt(),
-                "assert" => return self.header_only_stmt(SyntaxKind::ASSERT_STMT),
+                "assert" => return self.assert_stmt(),
                 "memo" => return self.memo_stmt(),
                 "once" => return self.simple_block_stmt(SyntaxKind::ONCE_STMT, false),
                 "checkpoint" => return self.header_only_stmt(SyntaxKind::CHECKPOINT_STMT),
-                "await" => return self.header_only_stmt(SyntaxKind::AWAIT_STMT),
+                "await" => return self.await_stmt(),
                 "confirm" => return self.simple_block_stmt(SyntaxKind::CONFIRM_STMT, false),
                 "throttle" => return self.simple_block_stmt(SyntaxKind::THROTTLE_STMT, false),
                 "debounce" => return self.simple_block_stmt(SyntaxKind::DEBOUNCE_STMT, false),
-                "verify" => return self.header_only_stmt(SyntaxKind::VERIFY_STMT),
+                "verify" => return self.verify_stmt(),
                 "try" => return self.try_stmt(),
                 "scope" => return self.scope_stmt(),
                 "saga" => return self.saga_stmt(),
                 "pipe" => return self.simple_block_stmt(SyntaxKind::PIPE_STMT, false),
+                "else" => return self.orphan_clause("`else` without a matching `when`"),
                 _ => {}
             }
         }
         // Otherwise: a bare call (`op(args)`) or an expression statement.
         self.expr_stmt();
+    }
+
+    fn orphan_clause(&mut self, message: &str) {
+        self.start(SyntaxKind::ERROR);
+        self.error(message);
+        self.eat_to_end_of_line();
+        self.finish_node();
     }
 
     /// `$x = expr` / `$x: T = expr` / `$x += a, b` / a `$x`-led expression, dispatched on the token
@@ -620,9 +716,11 @@ impl<'s> Parser<'s> {
                      // `do op arg, arg` — the op name then a comma-separated arg list to end of line.
         self.start(SyntaxKind::NAME);
         self.expect(SyntaxKind::IDENT, "an operation name after `do`");
-        while self.at(SyntaxKind::DOT) && self.nth(1) == SyntaxKind::IDENT {
-            self.bump(); // .
-            self.bump(); // ident — dotted op names (`slack.message.send`) are one NAME
+        while matches!(self.nth(0), SyntaxKind::DOT | SyntaxKind::MINUS)
+            && self.nth(1) == SyntaxKind::IDENT
+        {
+            self.bump(); // . / -
+            self.bump(); // ident — dotted/hyphenated operation names are one NAME
         }
         self.finish_node();
         if !self.at_newline() && !self.at_eof() {
@@ -641,7 +739,7 @@ impl<'s> Parser<'s> {
         self.eat(SyntaxKind::NEWLINE);
         self.block_if_indented(Self::block);
         // optional `else` clause at the same level (blank/comment-only lines before it are
-        // insignificant, exactly as in the legacy preprocess)
+        // insignificant, exactly as elsewhere in the CST grammar)
         if self.at_kw_past_blank("else") {
             self.skip_blank_lines();
             self.start(SyntaxKind::ELSE_CLAUSE);
@@ -711,7 +809,9 @@ impl<'s> Parser<'s> {
     /// `match`/`route`: header to end of line, then a body of `case …` / `default` arms.
     fn match_like(&mut self, kind: SyntaxKind) {
         self.start(kind);
-        self.eat_to_end_of_line();
+        self.bump(); // match / route
+        self.expr(0);
+        self.eat(SyntaxKind::NEWLINE);
         self.block_if_indented(|p| p.arm_block(&["case", "default"]));
         self.finish_node();
     }
@@ -740,7 +840,13 @@ impl<'s> Parser<'s> {
                 SyntaxKind::IDENT if arms.contains(&self.cur_text()) => {
                     let kind = arm_kind(self.cur_text());
                     self.start(kind);
-                    self.eat_to_end_of_line();
+                    self.bump(); // case / default / branch / step / undo
+                    if kind == SyntaxKind::CASE_ARM {
+                        self.expr(0);
+                        self.eat(SyntaxKind::NEWLINE);
+                    } else {
+                        self.eat_to_end_of_line();
+                    }
                     self.block_if_indented(Self::block);
                     self.finish_node();
                 }
@@ -774,7 +880,13 @@ impl<'s> Parser<'s> {
 
     fn scope_stmt(&mut self) {
         self.start(SyntaxKind::SCOPE_STMT);
-        self.eat_to_end_of_line(); // scope [$r = acquire]
+        self.bump(); // scope
+        if self.at(SyntaxKind::VAR) {
+            self.bump();
+            self.expect(SyntaxKind::EQ, "`=` after the scope binding");
+            self.expr(0);
+        }
+        self.eat(SyntaxKind::NEWLINE);
         self.block_if_indented(Self::block);
         if self.at_kw_past_blank("finally") {
             self.skip_blank_lines();
@@ -812,6 +924,53 @@ impl<'s> Parser<'s> {
         self.bump(); // return
         if !self.at_newline() && !self.at_eof() {
             self.expr(0);
+        }
+        self.eat(SyntaxKind::NEWLINE);
+        self.finish_node();
+    }
+
+    fn assert_stmt(&mut self) {
+        self.start(SyntaxKind::ASSERT_STMT);
+        self.bump(); // assert
+        self.expr(0);
+        if self.eat(SyntaxKind::COMMA) {
+            self.expect(SyntaxKind::STRING, "a quoted `assert` message");
+        }
+        self.eat(SyntaxKind::NEWLINE);
+        self.finish_node();
+    }
+
+    fn await_stmt(&mut self) {
+        self.start(SyntaxKind::AWAIT_STMT);
+        self.bump(); // await
+        if self.at(SyntaxKind::VAR) {
+            self.bump();
+            if self.eat(SyntaxKind::COLON) {
+                self.type_ref();
+            }
+            self.expect(SyntaxKind::EQ, "`=` after the await binding");
+        }
+        self.expect(SyntaxKind::STRING, "an await source string");
+        if self.at_kw("when") {
+            self.bump();
+            self.expr(0);
+        }
+        self.eat(SyntaxKind::NEWLINE);
+        self.finish_node();
+    }
+
+    fn verify_stmt(&mut self) {
+        self.start(SyntaxKind::VERIFY_STMT);
+        self.bump(); // verify
+        self.expr(0);
+        if self.at_kw("contains") {
+            self.bump();
+        } else {
+            self.error("expected `contains` in `verify`");
+        }
+        self.expr(0);
+        if self.eat(SyntaxKind::COLON) {
+            self.expect(SyntaxKind::STRING, "a quoted `verify` message");
         }
         self.eat(SyntaxKind::NEWLINE);
         self.finish_node();
@@ -1005,8 +1164,10 @@ impl<'s> Parser<'s> {
                 let cp = self.checkpoint();
                 self.start(SyntaxKind::NAME);
                 self.bump(); // first ident
-                while self.at(SyntaxKind::DOT) && self.nth(1) == SyntaxKind::IDENT {
-                    self.bump(); // .
+                while matches!(self.nth(0), SyntaxKind::DOT | SyntaxKind::MINUS)
+                    && self.nth(1) == SyntaxKind::IDENT
+                {
+                    self.bump(); // . / -
                     self.bump(); // ident
                 }
                 self.finish_node();
@@ -1018,17 +1179,28 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// `thing <kind> [<custom-kind-str>] <selector-kw> "<value>"` — the whole form is a
-    /// space-delimited run of idents/strings/numbers (`thing custom "widget" key "w-1"`,
-    /// `thing person name "john"`), so consume that run greedily; operators/parens/EOL end it.
+    /// `thing <kind> [<custom-kind-str>] <selector-kw> "<value>"`.
+    ///
+    /// Consume the four semantic fields explicitly instead of greedily taking every following
+    /// identifier. In particular, `verify thing … contains …` must leave `contains` to the verify
+    /// statement grammar.
     fn eat_to_end_of_thing(&mut self) {
         self.bump(); // thing
-        while matches!(
-            self.nth(0),
-            SyntaxKind::IDENT | SyntaxKind::STRING | SyntaxKind::NUMBER
-        ) {
-            self.bump();
+        if !self.at(SyntaxKind::IDENT) {
+            self.error("expected a thing kind");
+            return;
         }
+        let custom = self.cur_text() == "custom";
+        self.bump(); // kind
+        if custom {
+            self.expect(SyntaxKind::STRING, "a quoted custom thing kind");
+        }
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            self.error("expected a thing selector kind");
+        }
+        self.expect(SyntaxKind::STRING, "a quoted thing selector");
     }
 
     fn call_args(&mut self) {
@@ -1153,6 +1325,7 @@ mod tests {
             "flow f\n  # comment\n  $x = 1\n\n  $y = $x.a.b\n",
             "flow f\n  each $it in $items -> flat $all\n    do process $it\n",
             "flow f\n  match $s\n    case \"a\"\n      do a\n    default\n      do b\n",
+            "journey handle\n  agent \"guide\"\n  flow\n    $claims = ai.extract($input)\n    return $claims\n",
         ];
         for src in srcs {
             let p = parse_cst(src);

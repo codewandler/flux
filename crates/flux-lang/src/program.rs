@@ -6,8 +6,9 @@
 //! the multi-agent vision coherent without expanding the language core: **orchestration is an op-pack**
 //! (`ask`/`send`/`emit`/`spawn`), so this layer needs **zero new node kinds**.
 //!
-//! A program is authored in **native flux-lang text** ([`crate::parse::parse_program`], reached via
-//! [`Module::parse_str`]); a bare single-flow file still loads, wrapping a lone [`DraftAst`]. "User
+//! A program is authored in **native flux-lang text** (the lossless CST, strictly lowered through
+//! [`crate::parse::parse_program`] and reached via [`Module::parse_str`]); a bare single-flow file
+//! still loads, wrapping a lone [`DraftAst`]. "User
 //! input is just an event": a trigger's `on` label shares the event-label space with
 //! [`crate::ast::Node::Await`].
 

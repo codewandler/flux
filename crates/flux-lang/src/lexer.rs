@@ -9,8 +9,8 @@
 //! Flux-Lang is indentation-sensitive, so the flat stream also carries the block structure as
 //! **zero-width** [`SyntaxKind::INDENT`]/[`SyntaxKind::DEDENT`] markers (empty text, so still
 //! lossless) inserted at the first token of each content line. Blank and comment-only lines never
-//! move the indent stack. Tabs in leading indentation are recorded as a [`LexError`] (parity with
-//! the legacy `preprocess`), but still lexed — the lexer is total.
+//! move the indent stack. Tabs in leading indentation are recorded as a [`LexError`] but still
+//! lexed — the lexer is total, while strict compile entry points refuse the recorded error.
 
 use crate::syntax::SyntaxKind;
 use text_size::{TextRange, TextSize};

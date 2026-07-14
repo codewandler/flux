@@ -1,6 +1,7 @@
 # Flux-Lang CST front-end + native-syntax coverage
 
-**Status:** proposed 2026-07-09 · **Pillar:** Language · **Epic slug:** `flux-lsp` (workstream 1 of 2)
+**Status:** implemented 2026-07-14 (CST sole accepting parser in L-80) · **Pillar:** Language ·
+**Epic slug:** `flux-lsp` (workstream 1 of 2)
 
 Replaces Flux-Lang's hand-written recursive-descent front-end with a **lossless concrete syntax
 tree (CST)** built on [`rowan`](https://crates.io/crates/rowan) — the rust-analyzer model — so that
@@ -53,24 +54,32 @@ behaviour-preserving.
 - **`SyntaxKind`** (`crates/flux-lang/src/syntax.rs`, new) — one `#[repr(u16)]` enum covering every
   token kind *and* every node kind, plus `ERROR`, `TRIVIA` (whitespace/comment), and the layout
   tokens below. This is the rowan `Language` alphabet.
-- **Lossless layout-aware lexer** (`src/lexer.rs`, new) — emits a flat token stream that preserves
-  *everything*: comments and newlines become **trivia tokens** (not stripped, unlike today's
-  `preprocess`), a `"""…"""` block is one STRING token (the `"""`→escaped-JSON re-encode moves to
-  lowering, out of the lexer), and significant **`NEWLINE` / `INDENT` / `DEDENT`** tokens carry the
+- **Lossless layout-aware lexer** (`src/lexer.rs`) — emits a flat token stream that preserves
+  *everything*: comments and newlines become **trivia tokens**, a `"""…"""` block is one STRING
+  token (the `"""`→escaped-JSON re-encode happens while decoding a structured CST leaf, out of the
+  lexer), and significant **`NEWLINE` / `INDENT` / `DEDENT`** tokens carry the
   indentation grammar into the flat model. Tabs-in-indent stays an error (parity). Invariant:
   concatenating all token texts reproduces the source byte-for-byte.
-- **Tolerant event parser + green-tree builder** (`src/cst.rs`, new) — a hand-written recursive
+- **Tolerant parser + green-tree builder** (`src/parser.rs`) — a hand-written recursive
   descent that emits `start-node` / `token` / `finish-node` / `error` events and **always completes a
   tree**, wrapping unexpected input in `ERROR` nodes and resyncing at the next `NEWLINE` / `DEDENT`.
-  A thin typed layer (`BindStmt(SyntaxNode)`, `WhenStmt(SyntaxNode)`, …) gives typed accessors over
-  `SyntaxNode`.
-- **`cst_to_draft`** (`src/lower_cst.rs`, new) — projects a (clean) CST to today's `DraftAst`,
-  reproducing it exactly. Records a `DraftAst` node-path → `TextRange` **side-map** so the
-  message-only `analyze::Diagnostic` resolves to a real LSP range without changing `Node`. The
-  `"""`→JSON re-encode (`parse.rs:754`) lives here.
+- **`cst_to_draft`** (`src/lower_cst.rs`) — strictly projects a clean CST to today's `DraftAst`,
+  reproducing it exactly. `src/cst_decode.rs` recursively traverses structured declaration,
+  statement, block, and expression nodes; only scalar leaves decode their lossless token text. It
+  does not reconstruct logical lines or parse the source a second time. `lower_cst` also records a
+  `DraftAst` node-path → `TextRange` **side-map** so the message-only `analyze::Diagnostic` resolves
+  to a real LSP range without changing `Node`. Triple-string decoding lives in the scalar-leaf
+  helpers.
 - **Re-pointed entry points** — `parse`/`parse_program` become `lex → parse → (strict) cst_to_draft`
   (error if any `ERROR` node), so every existing caller (CLI, engine, data-transforms) is unchanged.
   The LSP calls the tolerant path directly and reads the CST + diagnostics.
+
+The first L-59 landing retained the old source parser as the semantic authority while compatibility
+settled. L-80 completed the cutover: the CST now owns all production acceptance, strict entry points
+refuse its recovered errors/ERROR tokens before structured lowering, and production no longer has a
+logical-line projection or line-oriented semantic parser. Frozen pre-cutover source/AST fixtures and
+error classifications remain as plain test data, giving compatibility coverage without preserving
+executable legacy parser code or a possible runtime bypass.
 
 New L0 deps: `rowan` + `text-size` — pure, no-IO data-structure crates, L0-safe, but new external
 deps in the foundational crate (called out in review/CHANGELOG).
@@ -141,7 +150,7 @@ unspellable bind name, or an all-literal `obj`) so they still prove `@json` work
   (native-expr conditions) and all future syntax work inherit it. This is the real ongoing price of
   the rust-analyzer model on a small, machine-generated DSL — the LSP quality and full native syntax
   are what buy it.
-- **Strict-path error-string reproduction.** Several tests pin exact error text
+- **Strict-path error-string reproduction.** Several tests pin located error classes
   (`parse_errors_carry_line_numbers`, `"tabs are not allowed for indentation"`, `"the `flow` header
   must start at column 0"`). Lowering must reproduce these strings or the pinned tests are
   *consciously* updated. Inviolable: the round-trip invariant and `DraftAst` shape; negotiable: error
@@ -149,9 +158,9 @@ unspellable bind name, or an all-literal `obj`) so they still prove `@json` work
 - **Two trees.** The CST and `DraftAst` coexist by design (containment). A future, larger step could
   make the CST the sole tree with the semantic AST as a typed view — explicitly **not** in scope here.
 
-## Isolation gate
+## Historical isolation gate
 
-This work **replaces `parse.rs`/`format.rs`'s front-end** and would collide with the active
+This work **replaced `parse.rs`/`format.rs`'s front-end** and would have collided with the active
 `data-transforms` session (L-51 edits the same files). **No worktree.** The stories are hard-gated on
 flux-lang's front-end being quiescent, then land in-place on `main`. Confirm before starting L-57
 (`git log`/`status` on `crates/flux-lang/src/{parse,format}.rs`, no active L-51).
@@ -159,13 +168,14 @@ flux-lang's front-end being quiescent, then land in-place on `main`. Confirm bef
 ## Stories
 
 L-57 (SyntaxKind + lexer) → L-58 (tolerant parser + rowan + ERROR) → L-59 (typed layer +
-`cst_to_draft` + re-point; behaviour-preserving backbone) → L-60..L-63 (native-syntax coverage). See
-the board and [flux-lsp.md](flux-lsp.md) for the editor stories (L-64+).
+`cst_to_draft` backbone) → L-60..L-63 (native-syntax coverage) → L-80 (sole-parser cutover). See the
+board and [flux-lsp.md](flux-lsp.md) for the editor stories (L-64+).
 
 ## References
 
 - Node inventory: `crates/flux-lang/src/ast.rs:363` (`enum Node`), `schema.rs:25`
   (`node_kind_rows()` — reflectively derived, so the enum is the SSOT).
-- Current front-end: `parse.rs` (`preprocess` lexer `:708`, statement dispatch `:1044`, `@json`
-  reader `:1025`), `format.rs` (`fmt_stmt` `:495`, `fmt_expr` `:292`, `@json` fallback `:852`/`:351`).
+- Current front-end: `lexer.rs` (lossless layout tokens), `parser.rs` (tolerant CST), `lower_cst.rs`
+  (strict diagnostics + ranges), `cst_decode.rs` (structured CST → semantic AST), `parse.rs` (strict
+  public wrappers plus frozen compatibility fixtures), and `format.rs` (canonical AST text).
 - Related: [flux-lang-evolution.md](flux-lang-evolution.md) (node-vs-op philosophy, deferred items).

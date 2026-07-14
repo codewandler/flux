@@ -580,14 +580,17 @@ fn random_draft_asts_round_trip_exactly() {
             serde_json::to_string_pretty(&ast).unwrap(),
             serde_json::to_string_pretty(&back).unwrap()
         );
-        // L-59 front-end agreement: anything the legacy parser accepts must be ERROR-free in the
-        // tolerant CST too, across the whole generated AST space — the guard that keeps the CST
-        // grammar from silently rotting behind the semantic parser.
+        // The sole accepting CST remains lossless and ERROR-free across the generated AST space.
         let cst = flux_lang::parser::parse_cst(&text);
         assert!(
             cst.errors.is_empty(),
-            "seed {seed}: legacy parses but the CST reported {:?}\n--- text ---\n{text}",
+            "seed {seed}: strict parse succeeded but the CST reported {:?}\n--- text ---\n{text}",
             cst.errors
+        );
+        assert_eq!(
+            cst.syntax().text().to_string(),
+            text,
+            "seed {seed}: CST loss"
         );
     }
     // The generator really exercised every node kind (guards against pool drift as kinds grow).

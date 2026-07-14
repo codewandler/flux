@@ -76,7 +76,8 @@ caching / dead-step elimination the optimizer targets.
 | `prelude` | the artifact-type ontology (`Claim`/`Evidence`/`Need`/`Ctx`/`Verdict`/…) ops declare I/O against |
 | `analyze` | validate a flow against an `OpCatalog`; `lower` → typed HIR (effects + arity + arg type-checking) |
 | `optimize` | the read-parallelizing optimizer → `PhysicalPlan` (run by `runtime::execute_plan`) |
-| `parse` / `format` | the round-trippable `.flux` **text syntax** (`parse(format(ast)) == ast`) |
+| `lexer` / `parser` / `cst_decode` / `lower_cst` | the sole lossless `.flux` CST grammar, tolerant editor recovery, structured semantic lowering, and source-range side maps |
+| `parse` / `format` | strict CST-backed entry points plus canonical round-trippable text (`parse(format(ast)) == ast`) |
 | `program` | the multi-agent `Program` layer (capabilities/agents/channels/triggers/owned journeys) + module loader |
 | `effects` | lower semantic `FlowEffect`s onto host effects + policy actions |
 | `render` | render an AST as a human-readable (one-way) execution tree |

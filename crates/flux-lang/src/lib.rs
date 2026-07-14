@@ -30,6 +30,7 @@
 pub mod analyze;
 pub mod ast;
 pub mod context_slice;
+mod cst_decode;
 pub mod dsl;
 pub mod effects;
 pub mod error;

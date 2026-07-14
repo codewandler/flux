@@ -41,6 +41,11 @@ follow are hand-written.
 > These nodes also have a writable **text form** — see [`syntax.md`](syntax.md) (`format`/`parse`); this
 > reference covers the JSON wire shape.
 
+The writable form is accepted by one lossless CST grammar. Strict `parse`/`parse_program` lower only
+ERROR-free CSTs; the LSP retains the same tree under incomplete input for diagnostics, ranges,
+semantic tokens, and comment-preserving formatting. Semantic lowering follows the CST's structured
+declaration, statement, block, and expression nodes; it does not reconstruct logical source lines.
+
 <!-- BEGIN generated:node-kinds -->
 | kind | description |
 |---|---|
@@ -243,8 +248,9 @@ A multi-param call uses a named object:
 ]}
 ```
 
-Every `call` goes through `Executor::dispatch` (policy -> approval -> redaction) —
-there is no bypass surface.
+Every `call` goes through `Executor::dispatch` (typed authorization requirements -> permission
+rules -> approval -> redaction) — there is no bypass surface. Planning previews and dispatch derive
+the same invocation-level actions/resources, so approving a batch cannot widen past policy.
 
 **Fields**
 
@@ -1313,7 +1319,10 @@ re-applies the pack's budget.
 a `bind`/`memo` node (`effect: money`), or declared directly on the op's own catalog
 signature (`OpSignature::semantic_effects` — a plugin manifest's `OperationSpec` or an
 `OpSpec` can declare it, so a plain, untagged call still annotates correctly). Either
-way it drives risk scoring and approval decisions:
+way it drives risk scoring and the typed authorization requirements used by both preview and
+dispatch. The non-authority tags (`pure`, `read`, `human_visible`) add no policy action;
+`write_file`, `write_db`, `send_external`, `delete`, `money`, and `calendar` must resolve to the
+matching resource/action contract or registration/dispatch fails closed:
 
 | tag | meaning |
 |---|---|

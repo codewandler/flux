@@ -26,18 +26,22 @@ use text_size::{TextRange, TextSize};
 /// hand-built approximation.
 fn authoring_registry() -> flux_runtime::ToolRegistry {
     let mut reg = flux_runtime::ToolRegistry::new();
-    flux_tools::register_builtins(&mut reg);
+    flux_tools::try_register_builtins(&mut reg)
+        .expect("flux-lsp built-in authoring catalog registration failed");
 
     // Catalog-only registrations: none of these constructors performs IO. The provider never
     // generates, the datasource is empty and in-memory, and WebOptions::default is public-only with
     // no audit/record sink. Execution still belongs to the real host; the LSP only reads specs.
     flux_cognition::CognitionPack::new(Arc::new(flux_provider::NullProvider), "flux-lsp")
-        .register(&mut reg);
-    flux_capabilities::register_datasource_ops(
+        .try_register_from("flux-lsp cognition authoring catalog", &mut reg)
+        .expect("flux-lsp cognition authoring catalog registration failed");
+    flux_capabilities::try_register_datasource_ops(
         &mut reg,
         Arc::new(flux_capabilities::MemoryBackend::new()),
-    );
-    flux_web::register_web(&mut reg, &flux_web::WebOptions::default());
+    )
+    .expect("flux-lsp datasource authoring catalog registration failed");
+    flux_web::try_register_web(&mut reg, &flux_web::WebOptions::default())
+        .expect("flux-lsp web authoring catalog registration failed");
     reg
 }
 
@@ -417,7 +421,7 @@ fn analyzer_diagnostics_for(
     text: &str,
 ) -> Vec<Diagnostic> {
     let index = LineIndex::new(text);
-    let lowered = match flux_lang::lower_cst::cst_to_module(parsed, text) {
+    let lowered = match flux_lang::lower_cst::cst_to_module(parsed) {
         Ok(lowered) => lowered,
         Err(errors) => {
             return errors
@@ -1414,7 +1418,7 @@ mod tests {
         // diagnostic's node path must resolve to that line via the L-59 range side-map.
         let src = "flow f\n  $x = read(\"a.txt\")\n  $y = read($nope)\n  return $x\n";
         let mut reg = flux_runtime::ToolRegistry::new();
-        flux_tools::register_builtins(&mut reg);
+        flux_tools::try_register_builtins(&mut reg).unwrap();
         let ops = flux_flow::registry::OpRegistry::new(&reg).signatures();
         let lowered = flux_lang::lower_cst::parse_with_ranges(src).expect("parses");
         let findings = flux_lang::analyze::analyze_flow(
@@ -1470,6 +1474,7 @@ mod tests {
             "synth",
             "search",
             "sources",
+            "http.request",
             "web.fetch",
         ] {
             assert!(
@@ -1482,7 +1487,7 @@ mod tests {
     #[test]
     fn stable_host_ops_do_not_report_unknown_operation() {
         let src = r#"flow research
-  $web = web.search({query: "flux", max_results: 2})
+  $response = http.request({url: "https://example.com/api", method: "GET"})
   $page = web.fetch("https://example.com")
   $hits = search({query: "flux", limit: 2})
   $inventory = sources()

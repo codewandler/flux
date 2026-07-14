@@ -17,6 +17,12 @@ for shapes the grammar cannot express (non-identifier names (L-18), non-invertib
 formulas, bracket-path `jq`, all-literal `obj`/`list` templates); property-tested
 (`tests/roundtrip_property.rs`).
 
+The lossless rowan CST is the **sole accepting parser**. `parse` and `parse_program` run the tolerant
+lexer/CST once, then strictly refuse any recovered diagnostic or `ERROR` token before lowering the
+validated tree to `DraftAst`/`Module`. Editor tooling uses that same tolerant tree while a document
+is incomplete, preserving comments and exact ranges; there is no second source parser behind the
+strict APIs.
+
 Body sections below marked **aspirational** describe *target* syntax the parser does **not**
 accept today; everything unmarked is implemented.
 
@@ -1292,9 +1298,11 @@ flow improve -> EvalReport
 
 ## Toolchain
 
-- `parse.rs` — `parse(src: &str) -> Result<DraftAst>` (a single flow). Hand-written, indentation-sensitive
-  recursive descent; malformed input returns `FlowError::Parse` (never panics). Accepts both the canonical
-  `do <op> <args>` and inline `op(args)` call forms, and reads the `@json` escape back.
+- `lexer.rs` / `parser.rs` — the sole lossless, indentation-aware grammar. The parser always returns
+  a tolerant CST with recovery diagnostics, which keeps incomplete editor buffers useful.
+- `cst_decode.rs` / `lower_cst.rs` / `parse.rs` — recursively lower structured CST declarations,
+  statements, blocks, and expressions; strict `parse` rejects recovered errors and returns
+  `FlowError::Parse` (never panics). There is no production logical-line or second source parser.
 - `format.rs` — `format(ast: &DraftAst) -> String`. Canonical emitter, always 2-space indentation,
   brace-free indentation blocks; emits `@json` for shapes without a native form. Separate from `render.rs`
   (a lossy one-way terminal display tree).

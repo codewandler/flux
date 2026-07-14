@@ -1672,7 +1672,8 @@ mod tests {
             .collect();
 
         assert_eq!(
-            built, catalog,
+            built,
+            catalog,
             "DSL must construct every catalog node kind.\nmissing from DSL: {:?}\nextra in DSL: {:?}",
             catalog.difference(&built).collect::<Vec<_>>(),
             built.difference(&catalog).collect::<Vec<_>>(),
