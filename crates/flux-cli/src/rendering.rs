@@ -1,0 +1,1126 @@
+use super::*;
+
+/// Whether tool output is shown in full (set by `-v`/`--verbose`, which exports `FLUX_VERBOSE`).
+pub(super) fn verbose() -> bool {
+    flux_system::env_truthy("FLUX_VERBOSE")
+}
+
+pub(super) fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() > n {
+        let head: String = s.chars().take(n).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
+}
+
+/// A preview of a tool result for the CLI: continuation lines indented under the header, with a
+/// trailing note when lines were elided. `full` (from `-v`/`FLUX_VERBOSE`) disables the caps and shows
+/// everything. This affects only what the user sees — the model always receives the full result.
+pub(super) fn tool_preview(s: &str, full: bool) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_LINE_CHARS: usize = 500;
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= 1 {
+        return if full {
+            s.to_string()
+        } else {
+            truncate(s, MAX_LINE_CHARS)
+        };
+    }
+    let shown = if full {
+        lines.len()
+    } else {
+        lines.len().min(MAX_LINES)
+    };
+    let mut out = String::new();
+    for (i, line) in lines.iter().take(shown).enumerate() {
+        if i > 0 {
+            out.push_str("\n  ");
+        }
+        let line = line.trim_end();
+        out.push_str(&if full {
+            line.to_string()
+        } else {
+            truncate(line, MAX_LINE_CHARS)
+        });
+    }
+    let extra = lines.len() - shown;
+    if extra > 0 {
+        out.push_str(&format!(
+            "\n  … (+{extra} more line{}; -v for full)",
+            if extra == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
+/// Shared between [`CliSink`] and its spinner ticker task.
+pub(super) struct SpinnerState {
+    pub(super) active: bool,
+    pub(super) label: String,
+    pub(super) frame: usize,
+}
+
+/// Render an op call as a concise, colored *semantic* label: the cyan op name padded to a gutter, then
+/// a readable argument — `bash → $ cargo test`, `read → foo.rs:100-180`, `grep → "needle" in src/`. The
+/// arg is capped unless `-v`; the full plan is always shown separately (the `flow.plan` tree).
+/// Render the session's evidence log for `/evidence`: a one-line summary plus one line per
+/// observation (phase, kind, compact data), flagging `tool_error` rows. Returns the empty-state
+/// message when nothing has been recorded yet. Reads the same shared log the `observe`/`evidence`/
+/// grading ops write.
+pub(super) fn format_evidence(log: &flux_evidence::EvidenceLog) -> String {
+    let obs = log.all();
+    if obs.is_empty() {
+        return "no evidence recorded yet — run a turn first".to_string();
+    }
+    let errors = obs.iter().filter(|o| o.kind == "tool_error").count();
+    let iters = obs.iter().filter(|o| o.kind == "turn.iteration").count();
+    let mut out = format!(
+        "evidence: {} observation{}, {iters} iteration{}, {errors} error{}",
+        obs.len(),
+        if obs.len() == 1 { "" } else { "s" },
+        if iters == 1 { "" } else { "s" },
+        if errors == 1 { "" } else { "s" },
+    );
+    for o in obs {
+        // Pad before coloring — `{:<N}` counts ANSI bytes, so styling a padded column would break
+        // alignment.
+        let phase = format!("{:<9}", format!("{:?}", o.phase).to_lowercase());
+        let mark = if o.kind == "tool_error" {
+            style::red("!")
+        } else {
+            " ".to_string()
+        };
+        let data = if o.data.is_null() {
+            String::new()
+        } else {
+            truncate(&o.data.to_string(), 100)
+        };
+        out.push_str(&format!(
+            "\n  {mark} {} {:<16} {}",
+            style::dim(&phase),
+            o.kind,
+            style::dim(&data)
+        ));
+    }
+    out
+}
+
+/// A compact, readable label for an authored-loop operation shown when
+/// `--show-loop` reveals the loop. Returns `None` for ordinary ops (which fall through to the normal
+/// label path). These ops carry large inputs, so the label deliberately omits the payload.
+pub(super) fn loop_machinery_label(name: &str, input: &Value) -> Option<String> {
+    let (verb, note) = match name {
+        "detect_intent" => ("intent", "classify the request"),
+        "explore" => ("explore", "gather / propose actions"),
+        "approve_batch" => ("approve", "freeze the action batch"),
+        "execute_batch" => ("execute", "run approved actions"),
+        "present_results" => ("present", "render the result"),
+        "ai_segment" => ("AI segment", "bounded model stage"),
+        "observe" => {
+            let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            return Some(format!("{}  {}", style::cyan("observe"), style::dim(kind)));
+        }
+        "evidence" => ("evidence", "read the audit trail"),
+        "metrics" => ("metrics", "calls / errors / iterations"),
+        "grade" => ("grade", "check a criterion"),
+        _ => return None,
+    };
+    Some(format!("{}  {}", style::cyan(verb), style::dim(note)))
+}
+
+pub(super) fn render_call_label(name: &str, input: &Value, verbose: bool) -> String {
+    // Column width: wide enough for the longest built-in op name (`web.fetch` = 9).
+    const GUTTER: usize = 10;
+    const ARG_CAP: usize = 120;
+    // The loop machinery (revealed by `--show-loop`) may carry large typed state values.
+    // Give those a compact, readable label so the stream reads as loop iterations, not a payload dump.
+    if let Some(label) = loop_machinery_label(name, input) {
+        return label;
+    }
+    let call = flux_tui::toolview::format_call(name, input);
+    let verb = style::cyan(&call.verb);
+    if call.arg.is_empty() {
+        return verb;
+    }
+    let arg = if verbose {
+        call.arg
+    } else {
+        truncate(&call.arg, ARG_CAP)
+    };
+    let pad = GUTTER.saturating_sub(call.verb.chars().count()).max(1);
+    format!("{verb}{}{arg}", " ".repeat(pad))
+}
+
+/// A concise result summary for the execution stream: `done` for empty output, the line(s) for a
+/// small result, or a tool-aware summary for larger results. `-v` shows everything.
+///
+/// For `grep` and `glob` results the first few matches are shown rather than a bare line count;
+/// for `bash` the last non-empty line is used as a quick exit hint. Pass `tool` as `""` for the
+/// generic (tool-unaware) path.
+pub(super) fn result_summary_for(content: &str, tool: &str, verbose: bool) -> String {
+    let content = content.trim();
+    if content.is_empty() {
+        return "done".to_string();
+    }
+    if verbose {
+        return tool_preview(content, true);
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+
+    // Tool-aware previews.
+    match tool {
+        "read" | "read_many" => {
+            // Never dump raw file contents — show a digest: first 3 lines + count.
+            if n <= 3 {
+                return lines
+                    .iter()
+                    .map(|l| truncate(l.trim_end(), 120))
+                    .collect::<Vec<_>>()
+                    .join("\n    ");
+            }
+            let head = lines[..3]
+                .iter()
+                .map(|l| truncate(l.trim_end(), 120))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            return format!("{head}\n    … ({} more lines; -v for full)", n - 3);
+        }
+        "grep" if n > 3 => {
+            let head = lines[..3]
+                .iter()
+                .map(|l| truncate(l.trim_end(), 120))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            return format!(
+                "{head}\n    … (+{} more match{}; -v for full)",
+                n - 3,
+                if n - 3 == 1 { "" } else { "es" }
+            );
+        }
+        "glob" if n > 5 => {
+            let head = lines[..5]
+                .iter()
+                .map(|l| truncate(l.trim_end(), 120))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+            return format!("{head}\n    … (+{} more; -v for full)", n - 5);
+        }
+        "bash" if n > 1 => {
+            // Show the last non-empty line as a quick exit hint.
+            let last = lines
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or(&lines[n - 1]);
+            let last = truncate(last.trim_end(), 160);
+            return format!("{n} lines · last: {last}  (-v for full)");
+        }
+        _ => {}
+    }
+
+    match n {
+        0 => "done".to_string(),
+        1 => truncate(content, 200),
+        _ if n <= 6 => lines
+            .iter()
+            .map(|l| truncate(l.trim_end(), 200))
+            .collect::<Vec<_>>()
+            .join("\n    "),
+        _ => format!("{n} lines · -v for full"),
+    }
+}
+
+/// Color a risk summary by its leading level (`low` green, `medium` yellow, else red).
+pub(super) fn risk_badge(summary: &str) -> String {
+    match summary.split([' ', '·']).next().unwrap_or("").trim() {
+        "low" | "no-op" => style::green(summary),
+        "medium" => style::yellow(summary),
+        _ => style::red(summary),
+    }
+}
+
+pub(super) fn format_operation_timing(timing: flux_core::OperationTiming) -> String {
+    let fmt = |micros| style::fmt_elapsed(std::time::Duration::from_micros(micros));
+    match (timing.execution_us, timing.approval_wait_us) {
+        (Some(execution), Some(approval)) => {
+            format!("exec {} + approval {}", fmt(execution), fmt(approval))
+        }
+        (Some(execution), None) => format!("exec {}", fmt(execution)),
+        (None, Some(approval)) => format!("approval {}", fmt(approval)),
+        (None, None) => format!("dispatch {}", fmt(timing.total_us)),
+    }
+}
+
+pub(super) fn format_model_call(o: &flux_evidence::Observation) -> String {
+    let stage = o
+        .data
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("model");
+    let round = o.data.get("round").and_then(Value::as_u64).unwrap_or(0);
+    let duration = o
+        .data
+        .get("duration_us")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_micros)
+        .map(style::fmt_elapsed)
+        .unwrap_or_else(|| "?".into());
+    let ttft = o
+        .data
+        .get("ttft_us")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_micros)
+        .map(style::fmt_elapsed)
+        .unwrap_or_else(|| "n/a".into());
+    let operations = o
+        .data
+        .get("operations")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let schema_bytes = o
+        .data
+        .get("schema_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let schema = if schema_bytes >= 1024 {
+        format!("{:.1} KiB", schema_bytes as f64 / 1024.0)
+    } else {
+        format!("{schema_bytes} B")
+    };
+    format!(
+        "◇ model {stage} #{round} · {duration} · ttft {ttft} · {operations} op{} · {schema} schema",
+        if operations == 1 { "" } else { "s" }
+    )
+}
+
+/// Renders streaming assistant text to stdout as live-rendered Markdown, and tool activity to stderr,
+/// in the "Refined" style: a syntax-highlighted plan, colored `→`/`✓`/`✗` markers, a live spinner while
+/// each op runs, and a completion rule with timing. All color is tty/`NO_COLOR`/`--color`-aware.
+pub(super) struct CliSink {
+    pub(super) live: flux_markdown::render::LiveRenderer,
+    /// Show tool output in full (no truncation) — from `-v`/`FLUX_VERBOSE`.
+    pub(super) verbose: bool,
+    pub(super) width: usize,
+    pub(super) stderr_tty: bool,
+    pub(super) steps: usize,
+    pub(super) turn_start: Option<std::time::Instant>,
+    /// The current op's `(label, start)`, set on `tool_call` and finalized on `tool_result`.
+    pub(super) pending: Option<(String, std::time::Instant)>,
+    /// Dispatcher-attributed phases for the pending op, delivered immediately before its result.
+    pub(super) pending_timing: Option<flux_core::OperationTiming>,
+    pub(super) spinner: Option<(
+        Arc<std::sync::Mutex<SpinnerState>>,
+        tokio::task::JoinHandle<()>,
+    )>,
+    /// Iteration counter: how many tool round-trips have completed this turn.
+    pub(super) iter: usize,
+    /// Max iterations cap (threaded from `Agent::max_iterations` for display).
+    pub(super) max_iter: usize,
+    /// The resolved model spec (e.g. `codex/gpt-5.5`) + pricing table for the per-turn cost
+    /// annotation. `None` when the sink wasn't given a spec (sub-paths that don't show cost).
+    pub(super) model_spec: Option<String>,
+    pub(super) pricing: Option<flux_core::PricingTable>,
+    /// The phase of the most recent `loop.phase` observation this turn. Current adaptive stages use
+    /// `intent`/`explore`; historical sessions may still project `orient`/`gather`/`execute`.
+    /// Drives the spinner label via `phase_spinner_label`.
+    pub(super) phase: Option<String>,
+    /// How many `execute`-phase `loop.phase` observations have landed this turn — the first is the
+    /// turn's actual execution planning, every one after it means the prior round didn't finish
+    /// (a revision), so the spinner reads "revising…" once this exceeds 1. A plain counter over
+    /// observations already reaching the sink; no new flux-flow signal needed.
+    pub(super) execute_rounds: usize,
+    /// Whether the NEXT `flow.plan` observation is a bounded, read-only gather round rather than
+    /// the full execution plan — set on a `gather`-phase `loop.phase` or a `flow.brief` (a brief
+    /// only ever accompanies a `gather: true` plan), cleared on `orient`/`execute`. `flow.plan`
+    /// itself carries no `gather` flag (that lives on `Compiled`/the host, not the observation), so
+    /// this is the cheapest surface-side derivation available without new flux-flow plumbing.
+    pub(super) gather_mode: bool,
+}
+
+impl CliSink {
+    pub(super) fn new(max_iter: usize) -> Self {
+        let stdout_tty = std::io::stdout().is_terminal();
+        let width = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|c| c.parse::<usize>().ok())
+            .filter(|&w| w >= 20)
+            .unwrap_or(80);
+        CliSink {
+            live: flux_markdown::render::LiveRenderer::new(
+                flux_markdown::render::Theme::auto(),
+                width,
+                stdout_tty,
+            ),
+            verbose: verbose(),
+            width,
+            stderr_tty: std::io::stderr().is_terminal(),
+            steps: 0,
+            turn_start: None,
+            pending: None,
+            pending_timing: None,
+            spinner: None,
+            iter: 0,
+            max_iter,
+            model_spec: None,
+            pricing: None,
+            phase: None,
+            execute_rounds: 0,
+            gather_mode: false,
+        }
+    }
+
+    /// Attach a model spec + pricing table so the per-turn annotation appends a dollar cost. The
+    /// spec is the full `provider/model` (e.g. `codex/gpt-5.5`) so subscription spend is detected
+    /// from the provider prefix; the table is the loaded overlay-on-builtin (`load_pricing_table`).
+    pub(super) fn with_cost(
+        mut self,
+        model_spec: String,
+        pricing: flux_core::PricingTable,
+    ) -> Self {
+        self.model_spec = Some(model_spec);
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// The per-turn dollar-cost suffix for the annotation, when a model spec + pricing table are
+    /// attached and the turn reported usage — see [`cost_suffix`] for the full rendering rules
+    /// (incl. the C-30 `$? (unpriced)` marker for un-tabled metered cloud models).
+    pub(super) fn cost_inline(&self, usage: Option<&Usage>) -> String {
+        cost_suffix(self.model_spec.as_deref(), self.pricing.as_ref(), usage)
+    }
+
+    /// Commit any in-progress assistant render so subsequent stderr lines appear below it.
+    fn commit(&mut self) {
+        if self.live.is_active() {
+            let mut out = std::io::stdout().lock();
+            let _ = self.live.finish(&mut out);
+        }
+    }
+
+    fn use_spinner(&self) -> bool {
+        self.stderr_tty && style::enabled()
+    }
+
+    /// Start an animated spinner on the op's line (a background ticker rewriting it via `\r`).
+    fn start_spinner(&mut self, label: String) {
+        let state = Arc::new(std::sync::Mutex::new(SpinnerState {
+            active: true,
+            label,
+            frame: 0,
+        }));
+        let s = state.clone();
+        let start = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            loop {
+                {
+                    // Hold the lock while drawing so `stop_spinner` can't interleave.
+                    let mut st = s.lock().unwrap();
+                    if !st.active {
+                        break;
+                    }
+                    let frame = FRAMES[st.frame % FRAMES.len()];
+                    st.frame += 1;
+                    let elapsed = style::fmt_elapsed(start.elapsed());
+                    eprint!(
+                        "\r\x1b[K{} {}  {}",
+                        style::cyan(&frame.to_string()),
+                        st.label,
+                        style::dim(&elapsed)
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+        });
+        self.spinner = Some((state, task));
+    }
+
+    /// Stop a running spinner and clear its line. Returns true if one was active.
+    fn stop_spinner(&mut self) -> bool {
+        if let Some((state, task)) = self.spinner.take() {
+            state.lock().unwrap().active = false;
+            eprint!("\r\x1b[K");
+            std::io::stderr().flush().ok();
+            task.abort();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl AgentSink for CliSink {
+    fn text_delta(&mut self, t: &str) {
+        let mut out = std::io::stdout().lock();
+        let _ = self.live.push(t, &mut out);
+    }
+    fn thinking_delta(&mut self, t: &str) {
+        // Stream extended-thinking tokens dimmed on stderr so reasoning is observable in the REPL.
+        eprint!("{}", style::dim(t));
+        std::io::stderr().flush().ok();
+    }
+    fn planning(&mut self, active: bool) {
+        // Fill an otherwise-silent provider wait with a phase-aware spinner. The intent/exploration
+        // observation replaces it once the typed model stage completes.
+        if active {
+            self.turn_start.get_or_insert_with(std::time::Instant::now);
+            self.commit();
+            let label = phase_spinner_label(self.phase.as_deref(), self.execute_rounds);
+            if self.use_spinner() {
+                self.start_spinner(style::dim(&label));
+            } else if matches!(self.phase.as_deref(), Some("intent" | "explore")) {
+                // Redirected runs have no animated line to rewrite. Preserve one stable
+                // phase marker per provider consultation so logs and CI output do not reproduce
+                // the otherwise-silent wait that A-72 closes for interactive terminals.
+                eprintln!("{}", style::dim(&label));
+            }
+        } else {
+            self.stop_spinner();
+        }
+    }
+    fn tool_call(&mut self, name: &str, input: &Value) {
+        self.commit();
+        self.steps += 1;
+        self.iter += 1;
+        if self.turn_start.is_none() {
+            self.turn_start = Some(std::time::Instant::now());
+        }
+        let base_label = render_call_label(name, input, self.verbose);
+        // Prefix with [N/max] iteration counter when a cap is known.
+        let label = if self.max_iter > 0 {
+            format!("[{}/{}] {base_label}", self.iter, self.max_iter)
+        } else {
+            base_label
+        };
+        if self.use_spinner() {
+            self.start_spinner(label.clone());
+        } else {
+            eprintln!("\n{} {label}", style::blue("→"));
+        }
+        self.pending = Some((label, std::time::Instant::now()));
+        self.pending_timing = None;
+    }
+    fn tool_timing(&mut self, _name: &str, timing: &flux_core::OperationTiming) {
+        self.pending_timing = Some(*timing);
+    }
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        let (label, start) = self
+            .pending
+            .take()
+            .unwrap_or_else(|| (String::new(), std::time::Instant::now()));
+        // If a spinner ran, its line is cleared — reprint the call line so it stays in the scrollback.
+        if self.stop_spinner() {
+            eprintln!("\n{} {label}", style::blue("→"));
+        }
+        let elapsed = self
+            .pending_timing
+            .take()
+            .map(format_operation_timing)
+            .unwrap_or_else(|| style::fmt_elapsed(start.elapsed()));
+        let elapsed = style::dim(&format!("· {elapsed}"));
+        let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
+            .unwrap_or_else(|| result_summary_for(&result.content, name, self.verbose));
+        let mark = if result.is_error {
+            style::red("✗")
+        } else {
+            style::green("✓")
+        };
+        eprintln!("  {mark} {body}  {elapsed}");
+    }
+    fn observation(&mut self, o: &flux_evidence::Observation) {
+        self.commit();
+        if o.kind == flux_evidence::KIND_DESTRUCTIVE {
+            eprintln!(
+                "{}",
+                style::yellow("⚠ destructive operation — approval required")
+            );
+        } else if o.kind == "skill.activated" {
+            if let Some(name) = o.data.get("skill").and_then(|v| v.as_str()) {
+                eprintln!("{}", style::dim(&format!("✦ skill: {name}")));
+            }
+        } else if o.kind == "context.compacted" {
+            let from = o
+                .data
+                .get("from_messages")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let to = o
+                .data
+                .get("to_messages")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            eprintln!(
+                "{}",
+                style::dim(&format!("⊙ context compacted ({from} → {to} messages)"))
+            );
+        } else if o.kind == "context.shrunk" {
+            // A-63 / F-011: a context pack dropped members to fit its budget — surface it once so a
+            // plain run shows the eviction (the model-facing transcript line alone never did).
+            let dropped = o.data.get("dropped").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = o.data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+            eprintln!(
+                "{}",
+                style::dim(&format!("⊙ context: dropped {dropped} of {total} members"))
+            );
+        } else if o.kind == "turn.cancelled" {
+            eprintln!("{}", style::dim("⊘ turn cancelled"));
+        } else if o.kind == "model.call" && flux_flow::engine::show_loop() {
+            eprintln!("{}", style::dim(&format_model_call(o)));
+        } else if o.kind == "loop.phase" {
+            self.record_phase(o);
+        } else if o.kind == flux_evidence::KIND_TURN_INTENT
+            && o.data.get("intent").and_then(|v| v.as_str()).is_some()
+        {
+            self.render_intent(o);
+        } else if o.kind == "loop.round" {
+            // A-39 (`--trace-loop`/`FLUX_TRACE_LOOP`): one dim line per outer-loop round.
+            let round = o.data.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max = o.data.get("max").and_then(|v| v.as_u64()).unwrap_or(0);
+            eprintln!("{}", style::dim(&format!("⟳ round {round}/{max}")));
+        } else if o.kind == "loop.node" {
+            // A-39: one dim line per structural AST node the outer loop executes.
+            eprintln!("{}", style::dim(&trace_node_line(&o.data)));
+        } else if o.kind == "flow.brief" {
+            // A brief only ever accompanies a `gather: true` plan (`compile.rs`'s `parse_brief`
+            // call site) — its arrival marks gather mode even when the phase alone (`orient`) is
+            // ambiguous between a gather round and a full plan emitted directly.
+            self.gather_mode = true;
+            self.render_brief(o);
+        } else if o.kind == "flow.plan" {
+            // A-17 (closes the A-15 residual): `flow.plan` now carries its own `gather` flag,
+            // computed host-side from the plan's own `settled` signal — prefer it directly over the
+            // surface's `loop.phase`/`flow.brief`-order inference, which couldn't tell an
+            // orient-phase gather plan apart from orient emitting the full plan directly when the
+            // model's `brief` was unusable. Falls back to the tracked state for a phase-less caller
+            // that predates the field (e.g. a stale override still on the pre-A-17 wire shape).
+            let gather = o
+                .data
+                .get("gather")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(self.gather_mode);
+            if gather {
+                self.render_gather_compact(o);
+            } else {
+                self.render_plan(o);
+            }
+        } else if o.kind == "flow.halt" {
+            self.render_halt(o);
+        }
+    }
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        self.commit();
+        self.stop_spinner();
+        let elapsed = self
+            .turn_start
+            .map(|t| style::fmt_elapsed(t.elapsed()))
+            .unwrap_or_default();
+        // The right-hand token annotation: context-window occupancy, generated tokens, cache + hit-rate.
+        let token_inline = usage.as_ref().map(usage_annotation).unwrap_or_default();
+        // The dollar cost of this turn's tokens, when a model spec + pricing table were attached.
+        let cost_inline = self.cost_inline(usage.as_ref());
+        // Always print a rule so the turn boundary is visible even for prose-only replies.
+        let summary = if self.steps > 0 {
+            let plural = if self.steps == 1 { "" } else { "s" };
+            format!(
+                "{} step{plural} · {elapsed}{token_inline}{cost_inline}",
+                self.steps
+            )
+        } else {
+            // Prose-only turn: a minimal rule with elapsed + token stats.
+            format!("· {elapsed}{token_inline}{cost_inline}")
+        };
+        let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
+        eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
+    }
+}
+
+/// The compact token annotation appended to a turn-end rule (and the prose `/goal` footer): the
+/// context-window occupancy (the final prompt size), the tokens generated, cache tiers (read AND
+/// write — C-06 added the write side, which used to be silently dropped), and reasoning tokens when
+/// the provider reported any. Cost itself is a separate suffix ([`cost_annotation`], appended by the
+/// caller via `CliSink::cost_inline`) — this function is only the token breakdown. Empty when nothing
+/// was billed (e.g. an offline `-m mock` turn).
+pub(super) fn usage_annotation(u: &Usage) -> String {
+    let context = u.context_tokens();
+    if context == 0 && u.output_tokens == 0 {
+        return String::new();
+    }
+    let mut s = format!(
+        " · ctx {} · out {}",
+        style::fmt_tokens(context),
+        style::fmt_tokens(u.output_tokens)
+    );
+    if u.cache_read_input_tokens > 0 && context > 0 {
+        let pct = (u.cache_read_input_tokens as f64 / context as f64 * 100.0).round() as u64;
+        s.push_str(&format!(
+            " · cache {} ({pct}% hit)",
+            style::fmt_tokens(u.cache_read_input_tokens)
+        ));
+    }
+    if u.cache_creation_input_tokens > 0 {
+        s.push_str(&format!(
+            " · cache write {}",
+            style::fmt_tokens(u.cache_creation_input_tokens)
+        ));
+    }
+    if u.reasoning_tokens > 0 {
+        s.push_str(&format!(
+            " · reasoning {}",
+            style::fmt_tokens(u.reasoning_tokens)
+        ));
+    }
+    s
+}
+
+/// The dollar-cost suffix for the turn-end annotation. Subscription spend (claude/codex) is shown
+/// as an *equivalent metered cost* prefixed with `~` and tagged `(sub)` — it bills against a flat
+/// subscription, not the API, so the figure is illustrative, not a charge. Metered spend shows the
+/// raw dollar amount. Returns an empty string for a zero-cost turn (e.g. a cached/no-op call).
+pub(super) fn cost_annotation(money: &flux_core::Money) -> String {
+    if money.usd <= 0.0 {
+        return String::new();
+    }
+    let usd = format!("${:.4}", money.usd);
+    if money.subscription {
+        format!(" · ~{usd} (sub)")
+    } else {
+        format!(" · {usd}")
+    }
+}
+
+/// The complete turn-line cost suffix (shared by every sink): the dollar amount when the table
+/// prices the spec; the C-30 ` · $? (unpriced)` marker when a **metered cloud** model has no
+/// pricing row (real dollars are being spent invisibly — the marker says so and the once-per-run
+/// note points at the `~/.flux/pricing.toml` override); empty when usage/spec/table are absent,
+/// when the priced cost is zero, or for local/unknown specs (`ollama*`, `mock`, ad-hoc providers —
+/// nothing is billed, and hermetic e2e output must stay byte-identical).
+pub(super) fn cost_suffix(
+    spec: Option<&str>,
+    table: Option<&flux_core::PricingTable>,
+    usage: Option<&Usage>,
+) -> String {
+    let (Some(u), Some(spec), Some(table)) = (usage, spec, table) else {
+        return String::new();
+    };
+    match table.cost(u, spec) {
+        Some(money) => cost_annotation(&money),
+        None if unpriced_marker_applies(spec) => {
+            note_unpriced_once(spec);
+            " · $? (unpriced)".to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// The `$?` marker fires only for known metered **cloud** providers — a table miss there hides
+/// real spend. Local `ollama*` and unknown/mock providers stay silent. Thin delegate onto
+/// `flux_core::is_metered_cloud_spec` (C-33) — the TUI's header uses the same predicate, so the
+/// rule has one definition.
+pub(super) fn unpriced_marker_applies(spec: &str) -> bool {
+    flux_core::is_metered_cloud_spec(spec)
+}
+
+/// One-time (per process) plain-stderr hint explaining the `$?` marker and how to price the model.
+pub(super) fn note_unpriced_once(spec: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "note: no pricing entry for `{spec}` — add one to ~/.flux/pricing.toml to see $ costs"
+        );
+    });
+}
+
+impl CliSink {
+    /// Render a `flow.plan` observation: the syntax-highlighted plan tree + a risk badge header. A
+    /// resumed/halted plan (`resumed: true`, A-17) carries per-statement ✓/✗/· status markers in its
+    /// `plan` text instead of full syntax highlighting — patch-and-continue's granularity is
+    /// top-level statements only — so that text is rendered (marker-colored) directly rather than
+    /// reconstructing a fresh, unmarked tree from `plan_ast`.
+    fn render_plan(&self, o: &flux_evidence::Observation) {
+        let resumed = o
+            .data
+            .get("resumed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let rendered = if resumed {
+            o.data
+                .get("plan")
+                .and_then(|v| v.as_str())
+                .map(style_marked_plan)
+        } else {
+            o.data
+                .get("plan_ast")
+                .and_then(|v| serde_json::from_value::<flux_flow::ast::DraftAst>(v.clone()).ok())
+                .map(|ast| flux_flow::render::render_styled(&ast, &style::plan_palette()))
+                .or_else(|| {
+                    o.data
+                        .get("plan")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+        };
+        let Some(rendered) = rendered else { return };
+        let risk = o.data.get("risk").and_then(|v| v.as_str()).unwrap_or("");
+        let ops = o.data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+        eprintln!(
+            "\n{}  {}{}",
+            style::bold("plan"),
+            risk_badge(risk),
+            style::dim(&format!(" · {ops} op(s)"))
+        );
+        eprintln!("{rendered}");
+    }
+
+    /// Render a `flow.halt` observation: a red one-liner marking exactly where guarded execution
+    /// halted before the execution report returns to the native stage for correction.
+    fn render_halt(&self, o: &flux_evidence::Observation) {
+        eprintln!("{}", style::red(&halt_line(&o.data)));
+    }
+
+    /// Track a `loop.phase` observation so the spinner names the current typed stage. Historical
+    /// gather/execute values remain readable when old sessions are projected.
+    fn record_phase(&mut self, o: &flux_evidence::Observation) {
+        let phase = o
+            .data
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match phase.as_str() {
+            "execute" => {
+                self.execute_rounds += 1;
+                self.gather_mode = false;
+            }
+            "gather" => self.gather_mode = true,
+            "orient" | "intent" | "explore" => self.gather_mode = false,
+            _ => {}
+        }
+        self.phase = Some(phase);
+    }
+
+    /// Render A-72's accepted staged intent from the already-durable `turn.intent` observation.
+    /// Keyword-derived turn signals use the same observation kind but carry only `signal`, so the
+    /// caller filters those out. Normal output stays compact; `-v` adds the exact selected ops.
+    fn render_intent(&self, o: &flux_evidence::Observation) {
+        for (index, line) in intent_lines(&o.data, self.verbose, self.width)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 {
+                eprintln!("{}", style::cyan(&line));
+            } else {
+                eprintln!("{}", style::dim(&line));
+            }
+        }
+    }
+
+    /// Render a `flow.brief` observation the moment the grounding artifact is accepted (design
+    /// Part 1's "feedback within seconds"): `◆ goal: …` plus a dim `needs: …` line when present.
+    fn render_brief(&self, o: &flux_evidence::Observation) {
+        let mut lines = brief_lines(&o.data).into_iter();
+        if let Some(goal_line) = lines.next() {
+            eprintln!("{}", style::cyan(&goal_line));
+        }
+        for line in lines {
+            eprintln!("{}", style::dim(&line));
+        }
+    }
+
+    /// Render a gather-plan `flow.plan` observation as a compact one-liner (op names, not the full
+    /// tree + risk badge a full execution plan gets — those are for the small, read-only,
+    /// approval-free collect rounds design Part 1 bounds to ~12 call nodes).
+    fn render_gather_compact(&self, o: &flux_evidence::Observation) {
+        eprintln!("{}", style::dim(&gather_compact_line(&o.data)));
+    }
+}
+
+/// The planning spinner's label (A-15): phase-derived so it reads "orienting…"/"gathering…" for
+/// the collect passes and "planning…" for the execute pass's first round. "revising…" only once
+/// the execute phase has already produced a round THIS turn — a plain counter over the
+/// `loop.phase` observations already reaching the sink, not a new flux-flow signal. The halt-aware
+/// "✗ step N/M — revising…" line is a separate, real-time render (`render_halt`/`halt_line`, A-17)
+/// fired the moment an execution flow halts, distinct from this spinner label. A phase-less caller
+/// falls back to "working…".
+pub(super) fn phase_spinner_label(phase: Option<&str>, execute_rounds: usize) -> String {
+    match phase {
+        Some("intent") => "routing intent…".to_string(),
+        Some("explore") => "exploring…".to_string(),
+        Some("orient") => "orienting…".to_string(),
+        Some("gather") => "gathering…".to_string(),
+        Some("execute") => {
+            if execute_rounds > 1 {
+                "revising…".to_string()
+            } else {
+                "planning…".to_string()
+            }
+        }
+        _ => "working…".to_string(),
+    }
+}
+
+/// Format the accepted staged intent as bounded, stable plain lines. The intent is model-authored,
+/// so whitespace is collapsed before display; families and operation names are host-validated.
+pub(super) fn intent_lines(data: &Value, verbose: bool, width: usize) -> Vec<String> {
+    let raw_intent = data
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let sanitized: String = raw_intent
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let intent = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let intent_cap = width.saturating_sub(12).clamp(24, 160);
+    let families = data
+        .get("families")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let operations = data
+        .get("operations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let capabilities = if families.is_empty() {
+        "none".to_string()
+    } else {
+        families.join(", ")
+    };
+    let plural = if operations.len() == 1 {
+        "operation"
+    } else {
+        "operations"
+    };
+    let mut lines = vec![
+        format!("◆ intent: {}", truncate(&intent, intent_cap)),
+        format!(
+            "  capabilities: {capabilities} · {} {plural}",
+            operations.len()
+        ),
+    ];
+    if verbose && !operations.is_empty() {
+        lines.push(format!("  operations: {}", operations.join(", ")));
+    }
+    lines
+}
+
+/// Format a `flow.brief` observation's `data` as plain lines (no color, so it's directly testable):
+/// `◆ goal: …` then, when present, a `needs: …` list line.
+pub(super) fn brief_lines(data: &Value) -> Vec<String> {
+    let goal = data.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+    let mut lines = vec![format!("◆ goal: {goal}")];
+    if let Some(needs) = data.get("needs").and_then(|v| v.as_array()) {
+        let items: Vec<&str> = needs.iter().filter_map(|v| v.as_str()).collect();
+        if !items.is_empty() {
+            lines.push(format!("  needs: {}", items.join(", ")));
+        }
+    }
+    lines
+}
+
+/// Format a `flow.halt` observation's `data` (A-17) as a plain line: `✗ step N/M <op> failed —
+/// revising…` — or, when the op isn't directly derivable from the failing statement (a composite/
+/// control-flow node), `✗ step N/M failed — revising…`. Emitted once per mid-plan halt, right where
+/// the action execution report is built — a real-time cue distinct from the per-tool ✓/✗ markers.
+pub(super) fn halt_line(data: &Value) -> String {
+    let step = data.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
+    let of = data.get("of").and_then(|v| v.as_u64()).unwrap_or(0);
+    match data.get("op").and_then(|v| v.as_str()) {
+        Some(op) => format!("✗ step {step}/{of} {op} failed — revising…"),
+        None => format!("✗ step {step}/{of} failed — revising…"),
+    }
+}
+
+/// Format a `loop.node` observation's `data` (A-39, `--trace-loop`/`FLUX_TRACE_LOOP`) as a plain,
+/// colorless line — one per structural AST node the outer agent loop executes. Falls back to the
+/// raw JSON for any `node` kind this hasn't been taught (defensive: the interpreter's trace helper
+/// is meant to grow new emission sites without this formatter going stale/panicking).
+pub(super) fn trace_node_line(data: &Value) -> String {
+    let label = |key: &str| data.get(key).and_then(|v| v.as_str());
+    match data.get("node").and_then(|v| v.as_str()) {
+        Some("call") => {
+            let op = label("op").unwrap_or("?");
+            match label("bind") {
+                Some(bind) => format!("· {op} → ${bind}"),
+                None => format!("· {op}"),
+            }
+        }
+        Some("when") => {
+            let branch = label("branch").unwrap_or("?");
+            match label("cond") {
+                Some(cond) => format!("· when {cond} → {branch}"),
+                None => format!("· when → {branch}"),
+            }
+        }
+        Some("unless") => {
+            let entered = data
+                .get("entered")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let word = if entered { "enter" } else { "skip" };
+            match label("cond") {
+                Some(cond) => format!("· unless {cond} → {word}"),
+                None => format!("· unless → {word}"),
+            }
+        }
+        Some("match") => {
+            let value = label("value").unwrap_or("");
+            let arm = label("arm").unwrap_or("?");
+            match label("subject") {
+                Some(subject) => format!("· match {subject} = {value} → {arm}"),
+                None => format!("· match {value} → {arm}"),
+            }
+        }
+        Some("return") => match label("value") {
+            Some(v) => format!("· return {v}"),
+            None => "· return".to_string(),
+        },
+        Some("repeat") => {
+            let rounds = data.get("rounds").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max = data.get("max").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("· until hit — exit after {rounds}/{max}")
+        }
+        Some("parallel.branch") => {
+            let name = label("name").unwrap_or("?");
+            format!("· parallel branch ${name}")
+        }
+        _ => format!("· {data}"),
+    }
+}
+
+/// Color each line of a marker-prefixed plan render (A-17): `✓` done lines green, `✗` the failed
+/// statement red, `·` not-yet-run lines dim — the per-statement status text a resumed/halted plan's
+/// `flow.plan` observation carries (`render_marked_plan` in `flux-flow`) instead of a fresh full
+/// tree. Any line that doesn't start with one of those three markers passes through unstyled.
+pub(super) fn style_marked_plan(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.chars().next() {
+            Some('✓') => style::green(line),
+            Some('✗') => style::red(line),
+            Some('·') => style::dim(line),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format a gather-plan `flow.plan` observation's `data` as a compact one-liner: `gathering ·
+/// <op> <arg> · <op> <arg> …`, pulling call nodes off `plan_ast` and reusing the same
+/// `format_call` the tool-call stream uses (so `read Cargo.toml`/`grep "needle"` etc. read
+/// identically to a real op line). Falls back to a bare op count when the AST can't be walked.
+pub(super) fn gather_compact_line(data: &Value) -> String {
+    const ARG_CAP: usize = 60;
+    let calls = data
+        .get("plan_ast")
+        .and_then(|v| serde_json::from_value::<flux_flow::ast::DraftAst>(v.clone()).ok())
+        .map(|ast| {
+            let mut out = Vec::new();
+            for n in &ast.body {
+                collect_plan_calls(n, &mut out);
+            }
+            out
+        })
+        .unwrap_or_default();
+    let summary = if calls.is_empty() {
+        let ops = data.get("ops").and_then(|v| v.as_u64()).unwrap_or(0);
+        let plural = if ops == 1 { "" } else { "s" };
+        format!("{ops} op{plural}")
+    } else {
+        calls
+            .iter()
+            .map(|(op, input)| {
+                let call = flux_tui::toolview::format_call(op, input);
+                if call.arg.is_empty() {
+                    call.verb
+                } else {
+                    format!("{} {}", call.verb, truncate(&call.arg, ARG_CAP))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    format!("gathering · {summary}")
+}
+
+/// Walk a gather plan's top-level shape (a `Call`, a `$x = Call(...)` bind, or a `seq` of either)
+/// collecting each call's op name + its input (the single literal-object argument a tool call
+/// carries, when the plan author wrote one plainly — a computed/templated argument falls back to
+/// an empty input, which `format_call` renders as just the bare verb).
+pub(super) fn collect_plan_calls(node: &flux_flow::ast::Node, out: &mut Vec<(String, Value)>) {
+    use flux_flow::ast::Node;
+    match node {
+        Node::Call { op, args } => {
+            let input = args
+                .first()
+                .and_then(|a| match a {
+                    Node::Lit { value } => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Value::Null);
+            out.push((op.clone(), input));
+        }
+        Node::Bind { value, .. } => collect_plan_calls(value, out),
+        Node::Seq { body, .. } => body.iter().for_each(|n| collect_plan_calls(n, out)),
+        _ => {}
+    }
+}
+
+/// Like [`CliSink`] but also accumulates the assistant text (so `/goal`'s evaluator can read it).
+#[derive(Default)]
+pub(super) struct GoalSink {
+    pub(super) text: String,
+    /// `(model spec, pricing table)` for the per-turn cost suffix (C-30); `None` in tests.
+    pub(super) cost: Option<(String, flux_core::PricingTable)>,
+}
+
+impl AgentSink for GoalSink {
+    fn text_delta(&mut self, t: &str) {
+        print!("{t}");
+        std::io::stdout().flush().ok();
+        self.text.push_str(t);
+    }
+    fn tool_call(&mut self, name: &str, input: &Value) {
+        eprintln!(
+            "\n{} {}",
+            style::blue("→"),
+            render_call_label(name, input, verbose())
+        );
+    }
+    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+        let mark = if result.is_error {
+            style::red("✗")
+        } else {
+            style::green("✓")
+        };
+        let body = flux_tui::toolview::format_result(name, &result.content, result.is_error)
+            .unwrap_or_else(|| result_summary_for(&result.content, name, verbose()));
+        eprintln!("  {mark} {body}");
+    }
+    fn turn_end(&mut self, usage: Option<Usage>) {
+        println!();
+        if let Some(u) = usage {
+            // Same figures as the main rule (tokens + C-30 cost suffix), without the leading separator.
+            let (spec, table) = match &self.cost {
+                Some((s, t)) => (Some(s.as_str()), Some(t)),
+                None => (None, None),
+            };
+            let stats = format!(
+                "{}{}",
+                usage_annotation(&u),
+                cost_suffix(spec, table, Some(&u))
+            );
+            let stats = stats.trim_start_matches(" · ");
+            if !stats.is_empty() {
+                eprintln!("{}", style::dim(stats));
+            }
+        }
+    }
+}
