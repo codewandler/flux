@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (slack plugin op): `slack.channel.mark-read` → `slack.channel.mark_read`.** It was the
+  only hyphenated op name in the plugin pack; every other multi-word op uses an underscore. No known
+  external dependents (C-52).
+- **`flux_reload` (dev-only) is now rebuild-only.** After a successful guarded rebuild it returns
+  manual-restart instructions instead of replacing the running process via a direct
+  `std::process::Command` exec/spawn — closing the last OS-process seam outside `flux_system::System`.
+  A new `flux-codegate` guard (`no_raw_process_command_outside_system`) fails the build if a raw
+  `std::process::Command` is reintroduced in a tool/runtime/plugin path (C-57).
+- **`web.fetch`/`web.crawl` honestly disclose durable persistence.** When configured with a record
+  sink (the default agent path), they now declare the `write_db` semantic effect and a
+  `datasource:web.page` permission subject, so policy, plan-approval previews, and audit see that a
+  page is saved to the searchable index — a bare network read no longer becomes silent durable
+  storage. No sink ⇒ network-only, unchanged (C-58).
+
 ## [0.23.1] - 2026-07-14
 
 ### Fixed

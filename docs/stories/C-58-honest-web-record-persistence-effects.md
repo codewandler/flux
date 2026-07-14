@@ -2,7 +2,7 @@
 id: C-58
 title: Make web.fetch and web.crawl record persistence honest in effects
 pillar: Core
-status: backlog
+status: done
 note: "2026 codebase review: web read tools advertise network-only effects while optionally contributing persistent web.page datasource records."
 ---
 

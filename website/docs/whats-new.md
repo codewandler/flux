@@ -12,6 +12,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **Reading or crawling web pages now clearly shows when a page will also be saved to your searchable
+  knowledge index**, so approval prompts and the audit trail disclose that storage instead of treating
+  it as a plain network read.
+
+### Action needed
+
+- **The Slack `slack.channel.mark-read` operation is now `slack.channel.mark_read`** (underscore),
+  matching every other operation name.
+- **The dev-only `flux_reload` now rebuilds and asks you to restart** (exit and re-run, resuming your
+  session) instead of replacing the running process.
+
 ## [0.23.1] - 2026-07-14
 
 ### Fixed

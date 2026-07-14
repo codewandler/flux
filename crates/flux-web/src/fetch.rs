@@ -25,7 +25,9 @@ use flux_spec::{
 };
 use flux_system::net::PrivateNetAllow;
 
-use crate::{condense, egress, RecordSink, WebOptions};
+use crate::{
+    condense, egress, RecordSink, WebOptions, WEB_PAGE_RECORD_SUBJECT, WRITE_DB_EFFECT_TAG,
+};
 
 /// Cap on the returned document (bytes, char-boundary safe) — applied *after* condensation so the
 /// budget buys content, not tags. Mirrors the historical `web.fetch` `MAX_BYTES`.
@@ -69,13 +71,24 @@ impl WebFetchTool {
 #[async_trait]
 impl Tool for WebFetchTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec::read_only(
-            "web.fetch",
+        let mut description = String::from(
             "Read a web page as a readable document: HTML is returned as condensed markdown \
              (navigation, scripts, and boilerplate stripped) and PDFs are returned as extracted \
              text; other non-HTML content is returned raw. Pass `raw: true` for the unprocessed \
              body. Use this to read a page; for calling an API prefer `http.request`. \
              Loopback/private addresses are blocked unless the `web` egress scope grants them.",
+        );
+        if self.records.is_some() {
+            // Disclose the durable side effect in the model-facing spec too (C-58): a read here also
+            // persists the page into the searchable knowledge datasource.
+            description.push_str(
+                " Read HTML pages are also persisted as searchable `web.page` datasource records (a \
+                 durable datasource write).",
+            );
+        }
+        ToolSpec::read_only(
+            "web.fetch",
+            description,
             json!({
                 "type": "object",
                 "properties": {
@@ -90,11 +103,28 @@ impl Tool for WebFetchTool {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        params
+        let mut subjects: Vec<String> = params
             .get("url")
             .and_then(Value::as_str)
             .map(|s| vec![s.to_string()])
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // With a record sink configured, a fetched HTML page is persisted as a durable `web.page`
+        // datasource record; name that write target so approval + audit disclose the persistence
+        // (C-58). Paired with the `write_db` semantic effect below.
+        if self.records.is_some() {
+            subjects.push(WEB_PAGE_RECORD_SUBJECT.to_string());
+        }
+        subjects
+    }
+
+    fn semantic_effects(&self) -> Vec<String> {
+        // Contributing `web.page` records is a durable datasource write (C-58) — disclosed only when a
+        // sink is actually wired, so the catalog-only registry stays a pure network read.
+        if self.records.is_some() {
+            vec![WRITE_DB_EFFECT_TAG.to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
     fn intents(&self, params: &Value) -> IntentSet {
@@ -667,6 +697,71 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "web:web.fetch");
         assert_eq!(calls[0].2, "config:web");
+    }
+
+    #[tokio::test]
+    async fn with_record_sink_declares_the_datasource_write_it_performs() {
+        // Contract (C-58): configured WITH a record sink, `web.fetch` durably persists each fetched
+        // HTML page as a searchable `web.page` datasource record. That persistence is disclosed — as
+        // the `write_db` semantic effect + a `datasource:web.page` permission subject — so the
+        // DECLARED contract matches the record actually contributed, instead of a bare network read
+        // silently becoming durable local storage.
+        let sink = Arc::new(RecordingSink::default());
+        let t = tool(PrivateNetAllow::Any, Some(sink.clone()));
+
+        assert!(
+            t.semantic_effects().iter().any(|e| e == "write_db"),
+            "sink-configured web.fetch must declare the `write_db` datasource-write effect: {:?}",
+            t.semantic_effects()
+        );
+        let subjects = t.permission_subjects(&json!({ "url": "http://example.com/p" }));
+        assert!(
+            subjects.iter().any(|s| s == "datasource:web.page"),
+            "must name the durable `web.page` record target as a permission subject: {subjects:?}"
+        );
+        assert!(
+            subjects.iter().any(|s| s == "http://example.com/p"),
+            "still names the fetched URL: {subjects:?}"
+        );
+        // The host effect stays Network: a `write_db` lowers to Network + the `flow.write_db` policy
+        // action, deliberately NOT a filesystem `workspace.write`.
+        assert_eq!(t.spec().effects, vec![Effect::Network]);
+
+        // Observed: the declaration matches a real contribution.
+        let base = one_shot(
+            "200 OK",
+            "text/html",
+            "<html><head><title>Doc</title></head><body><article><h1>Hi</h1>\
+             <p>Body text long enough to beat the readability threshold so the article region is the \
+             one selected for condensation on this fixture page.</p></article></body></html>",
+        )
+        .await;
+        t.execute(&ctx(), json!({ "url": base })).await.unwrap();
+        assert_eq!(
+            sink.records.lock().unwrap().len(),
+            1,
+            "declared write_db matches the observed record contribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_record_sink_stays_network_only() {
+        // No sink ⇒ nothing is persisted, so the tool must NOT declare a datasource write: no
+        // `write_db` effect and no `datasource:` subject — a pure network read.
+        let t = tool(PrivateNetAllow::Any, None);
+        assert!(
+            t.semantic_effects().is_empty(),
+            "no sink ⇒ no datasource-write effect: {:?}",
+            t.semantic_effects()
+        );
+        let subjects = t.permission_subjects(&json!({ "url": "http://example.com/p" }));
+        assert_eq!(
+            subjects,
+            vec!["http://example.com/p".to_string()],
+            "no sink ⇒ the URL is the only subject (no datasource target): {subjects:?}"
+        );
+        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        assert_eq!(t.spec().access, vec![AccessKind::Network]);
     }
 
     #[tokio::test]

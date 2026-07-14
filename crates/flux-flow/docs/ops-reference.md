@@ -65,6 +65,7 @@ optional arguments are in `[brackets]`.
 | `git_unstage` | `paths` | Low | Unstage files |
 | `flow_list` | | Low | List reusable flows and composite ops under `.flux/flows` / `~/.flux/flows` (and the legacy `.flux/ops` / `@global_ops`) — each with its description and params |
 | `flow_run` | `name[, inputs]` | Medium | Run a stored flow by name from the flows home; `inputs` (a JSON object) are seeded as `$key` binds. Runs as an authored flow in the current session (needs a `LoopHost`) |
+| `flow_render` | `source\|name[, view]` | Low | Render Flux-Lang as a syntax-highlighted SVG. Pass exactly one of inline `source` or the `name` of a stored flow. `view: "source"` (default) renders the highlighted source; `view: "tree"` renders the execution-path plan tree. Returns the SVG markup inline — for surfaces that can't highlight `.flux` themselves (READMEs, Slack, docs, chat) |
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,
 `python_run`, `pytest`, `npm`, `node_run`, `make`) may pause for user approval (controlled by the

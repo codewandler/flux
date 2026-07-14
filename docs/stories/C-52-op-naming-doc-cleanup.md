@@ -2,7 +2,7 @@
 id: C-52
 title: Op-catalog naming and doc cleanup — mark_read hyphen, flow_render docs gap, dead cognition ops
 pillar: Core
-status: backlog
+status: done
 priority:
 design:
 epic:

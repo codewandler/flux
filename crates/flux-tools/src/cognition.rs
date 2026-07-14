@@ -142,41 +142,6 @@ fn claim_text(claim: &Value) -> Option<&str> {
     }
 }
 
-/// A total order over JSON values: numbers numerically, strings/bools naturally, otherwise by a
-/// stable type rank (null < bool < number < string < array < object), with arrays/objects compared
-/// by their compact JSON. Never panics (NaN can't arise from JSON; it degrades to `Equal`).
-fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    fn rank(v: &Value) -> u8 {
-        match v {
-            Value::Null => 0,
-            Value::Bool(_) => 1,
-            Value::Number(_) => 2,
-            Value::String(_) => 3,
-            Value::Array(_) => 4,
-            Value::Object(_) => 5,
-        }
-    }
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Number(x), Value::Number(y)) => x
-            .as_f64()
-            .unwrap_or(0.0)
-            .partial_cmp(&y.as_f64().unwrap_or(0.0))
-            .unwrap_or(Ordering::Equal),
-        (Value::String(x), Value::String(y)) => x.cmp(y),
-        _ => {
-            let (ra, rb) = (rank(a), rank(b));
-            if ra == rb {
-                a.to_string().cmp(&b.to_string())
-            } else {
-                ra.cmp(&rb)
-            }
-        }
-    }
-}
-
 /// Collect an iterator of values, dropping later duplicates (whole-value equality), first-seen order.
 fn dedup_keep(items: impl Iterator<Item = Value>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
@@ -345,130 +310,6 @@ impl Tool for CompareTool {
         let common = dedup_keep(a.iter().filter(|x| b.iter().any(|y| y == *x)).cloned());
         let out = json!({ "added": added, "removed": removed, "common": common });
         Ok(ToolResult::ok(serde_json::to_string(&out)?))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// dedupe
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct DedupeInput {
-    items: Vec<Value>,
-    /// Optional object field to de-duplicate by
-    #[serde(default)]
-    by: Option<String>,
-}
-
-pub struct DedupeTool;
-
-#[async_trait]
-impl Tool for DedupeTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "dedupe",
-            "Remove duplicates from an array, preserving first-seen order. By default duplicates are \
-             by whole-value equality; pass `by` to de-duplicate on that object field instead.",
-            flux_spec::tool_input_schema::<DedupeInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "dedupe")?;
-        let by = match params.get("by") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(_) => return Err(Error::Other("dedupe: param `by` must be a string".into())),
-        };
-        let mut out: Vec<Value> = Vec::new();
-        let mut keys: Vec<Value> = Vec::new();
-        for it in items {
-            let key = match &by {
-                Some(f) => it.get(f.as_str()).cloned().unwrap_or(Value::Null),
-                None => it.clone(),
-            };
-            if !keys.contains(&key) {
-                keys.push(key);
-                out.push(it);
-            }
-        }
-        Ok(ToolResult::ok(serde_json::to_string(&out)?))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// sort
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-enum SortOrder {
-    Asc,
-    Desc,
-}
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SortInput {
-    items: Vec<Value>,
-    /// Optional object field to sort by
-    #[serde(default)]
-    by: Option<String>,
-    /// Sort direction (default asc)
-    #[serde(default)]
-    order: Option<SortOrder>,
-}
-
-pub struct SortTool;
-
-#[async_trait]
-impl Tool for SortTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "sort",
-            "Stably sort an array. By default values sort naturally; pass `by` to sort on an object \
-             field, and `order` (\"asc\" | \"desc\", default \"asc\") to choose direction.",
-            flux_spec::tool_input_schema::<SortInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let mut items = arr_or_empty(&params, "items", "sort")?;
-        let by = match params.get("by") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(_) => return Err(Error::Other("sort: param `by` must be a string".into())),
-        };
-        let desc = match params.get("order") {
-            None | Some(Value::Null) => false,
-            Some(Value::String(s)) if s == "asc" => false,
-            Some(Value::String(s)) if s == "desc" => true,
-            Some(_) => {
-                return Err(Error::Other(
-                    "sort: param `order` must be \"asc\" or \"desc\"".into(),
-                ))
-            }
-        };
-        let key = |v: &Value| -> Value {
-            match &by {
-                Some(f) => v.get(f.as_str()).cloned().unwrap_or(Value::Null),
-                None => v.clone(),
-            }
-        };
-        // `sort_by` is stable, so equal keys keep their input order.
-        items.sort_by(|a, b| {
-            let ord = cmp_value(&key(a), &key(b));
-            if desc {
-                ord.reverse()
-            } else {
-                ord
-            }
-        });
-        Ok(ToolResult::ok(serde_json::to_string(&items)?))
     }
 }
 
@@ -671,65 +512,6 @@ impl Tool for LastTool {
         let items = arr_param(&params, "items", "last")?;
         let v = items.into_iter().next_back().unwrap_or(Value::Null);
         Ok(ToolResult::ok(serde_json::to_string(&v)?))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// filter
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct FilterInput {
-    items: Vec<Value>,
-    /// Optional object field to inspect
-    #[serde(default)]
-    by: Option<String>,
-    /// Optional value to match (default: keep truthy)
-    #[serde(default)]
-    equals: Option<Value>,
-}
-
-pub struct FilterTool;
-
-#[async_trait]
-impl Tool for FilterTool {
-    fn spec(&self) -> ToolSpec {
-        pure_spec(
-            "filter",
-            "Keep array items that satisfy a predicate. With `by`, the object field of that name is \
-             inspected (otherwise the item itself). With `equals`, an item is kept when the inspected \
-             value equals it; without `equals`, when the inspected value is truthy.",
-            flux_spec::tool_input_schema::<FilterInput>(),
-        )
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let items = arr_or_empty(&params, "items", "filter")?;
-        let by = match params.get("by") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(_) => return Err(Error::Other("filter: param `by` must be a string".into())),
-        };
-        let equals = match params.get("equals") {
-            None | Some(Value::Null) => None,
-            Some(v) => Some(v.clone()),
-        };
-        let out: Vec<Value> = items
-            .into_iter()
-            .filter(|it| {
-                let probe = match &by {
-                    Some(f) => it.get(f.as_str()).cloned().unwrap_or(Value::Null),
-                    None => it.clone(),
-                };
-                match &equals {
-                    Some(eq) => &probe == eq,
-                    None => is_truthy(&probe),
-                }
-            })
-            .collect();
-        Ok(ToolResult::ok(serde_json::to_string(&out)?))
     }
 }
 
@@ -2126,40 +1908,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filter_by_truthy_and_by_equals() {
-        let c = ctx();
-        // Keep items whose `active` field is truthy.
-        let r = FilterTool
-            .execute(
-                &c,
-                json!({"items": [{"id": 1, "active": true}, {"id": 2, "active": false}], "by": "active"}),
-            )
-            .await
-            .unwrap();
-        let out: Vec<Value> = serde_json::from_str(&r.content).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["id"], 1);
-
-        // Keep items whose `status` field equals "ok".
-        let r2 = FilterTool
-            .execute(
-                &c,
-                json!({"items": [{"status": "ok"}, {"status": "fail"}], "by": "status", "equals": "ok"}),
-            )
-            .await
-            .unwrap();
-        let out2: Vec<Value> = serde_json::from_str(&r2.content).unwrap();
-        assert_eq!(out2, json!([{"status": "ok"}]).as_array().unwrap().clone());
-
-        // Bare truthy filter over scalars.
-        let r3 = FilterTool
-            .execute(&c, json!({"items": [0, 1, "", "x", false, true]}))
-            .await
-            .unwrap();
-        assert_eq!(r3.content, "[1,\"x\",true]");
-    }
-
-    #[tokio::test]
     async fn need_constructs_artifact_with_done_when_default() {
         let c = ctx();
         let r = NeedTool
@@ -2232,63 +1980,6 @@ mod tests {
         assert_eq!(v["added"], json!([4]));
         assert_eq!(v["removed"], json!([1]));
         assert_eq!(v["common"], json!([2, 3]));
-    }
-
-    #[tokio::test]
-    async fn dedupe_whole_value_and_by_field() {
-        let c = ctx();
-        let r = DedupeTool
-            .execute(&c, json!({"items": [1, 1, 2, 1, 3, 2]}))
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Vec<Value>>(&r.content).unwrap(),
-            json!([1, 2, 3]).as_array().unwrap().clone()
-        );
-
-        let r2 = DedupeTool
-            .execute(
-                &c,
-                json!({"items": [{"id": 1, "n": "a"}, {"id": 1, "n": "b"}, {"id": 2}], "by": "id"}),
-            )
-            .await
-            .unwrap();
-        let out: Vec<Value> = serde_json::from_str(&r2.content).unwrap();
-        assert_eq!(out.len(), 2, "first-seen per `id` kept: {out:?}");
-        assert_eq!(out[0]["n"], "a");
-    }
-
-    #[tokio::test]
-    async fn sort_natural_by_field_and_desc() {
-        let c = ctx();
-        let r = SortTool
-            .execute(&c, json!({"items": [3, 1, 2]}))
-            .await
-            .unwrap();
-        assert_eq!(r.content, "[1,2,3]");
-
-        let r2 = SortTool
-            .execute(
-                &c,
-                json!({"items": [{"k": 2}, {"k": 1}, {"k": 3}], "by": "k", "order": "desc"}),
-            )
-            .await
-            .unwrap();
-        let out: Vec<Value> = serde_json::from_str(&r2.content).unwrap();
-        assert_eq!(
-            out.iter()
-                .map(|v| v["k"].as_i64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![3, 2, 1]
-        );
-
-        // A bad `order` is a clear error.
-        let err = SortTool
-            .execute(&c, json!({"items": [], "order": "sideways"}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("order"), "got: {err}");
     }
 
     #[tokio::test]

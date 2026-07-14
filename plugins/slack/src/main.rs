@@ -162,7 +162,7 @@ struct ChannelJoinInput {
     channel: String,
 }
 
-/// `slack.channel.mark-read`.
+/// `slack.channel.mark_read`.
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 struct ChannelMarkReadInput {
@@ -439,7 +439,7 @@ fn manifest_builder() -> PluginBuilder {
         )
         .operation(
             write_op_typed::<ChannelMarkReadInput>(
-                "slack.channel.mark-read",
+                "slack.channel.mark_read",
                 "Mark a Slack channel read through a timestamp. Provide `ref` OR `channel`+`ts`.",
             ),
             channel_mark,
@@ -3017,7 +3017,7 @@ mod tests {
         let mut h = host().with_http("conversations.mark", json!({ "ok": true }));
         let out = plugin()
             .call(
-                "slack.channel.mark-read",
+                "slack.channel.mark_read",
                 json!({ "channel": "C1", "ts": "1.1" }),
                 &mut h,
             )
@@ -3703,6 +3703,36 @@ mod tests {
             .iter()
             .all(|d| d.capabilities.iter().any(|c| c == "index")));
     }
+
+    /// C-52: the mark-read op was the only hyphenated op name in the whole plugin pack; every
+    /// multi-word leaf segment now uses an underscore. Assert the renamed op is advertised and that
+    /// no advertised op name carries a hyphen (guards the convention against reintroduction).
+    #[test]
+    fn op_names_use_underscores_not_hyphens() {
+        let m = plugin().manifest();
+        assert!(
+            m.operations
+                .iter()
+                .any(|o| o.name == "slack.channel.mark_read"),
+            "expected the renamed `slack.channel.mark_read` op"
+        );
+        assert!(
+            !m.operations
+                .iter()
+                .any(|o| o.name == "slack.channel.mark-read"),
+            "the hyphenated `slack.channel.mark-read` op must be gone"
+        );
+        let hyphenated: Vec<&str> = m
+            .operations
+            .iter()
+            .map(|o| o.name.as_str())
+            .filter(|name| name.contains('-'))
+            .collect();
+        assert!(
+            hyphenated.is_empty(),
+            "op names must use underscores, not hyphens: {hyphenated:?}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -3889,7 +3919,7 @@ mod schema_contract {
                 c(vec![p("channel", Kind::Str)], vec!["channel"]),
             ),
             (
-                "slack.channel.mark-read",
+                "slack.channel.mark_read",
                 c(
                     vec![
                         p("ref", Kind::Str),

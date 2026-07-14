@@ -2464,12 +2464,17 @@ impl Tool for GitUnstageTool {
 // flux_reload (dev mode only)
 // ---------------------------------------------------------------------------
 
-/// `flux_reload` — recompile flux-cli and replace the current process (dev mode only).
+/// `flux_reload` — recompile flux-cli, then instruct a manual restart (dev mode only).
 ///
 /// Safety: this tool is only registered when `--dev` is active. It runs `cargo build -p flux-cli`
-/// synchronously (via the guarded system), and on success replaces the current process with
-/// `execv` using the original argv + `--resume`. On build failure it returns an error and
-/// the session continues uninterrupted.
+/// synchronously through the guarded system (`ctx.system.run`, argv-only — never model input). It is
+/// deliberately **rebuild-only**: replacing the running process image (`execv`, or spawning a
+/// replacement) would be a direct OS-process seam outside `flux_system::System`'s single guarded path
+/// (AGENTS.md, "One guarded path starts every OS process"). A re-exec cannot reuse
+/// `System::build_command`'s env-clear/workspace-pin semantics without breaking session resume, so
+/// rather than open a second, differently-guarded seam the tool stops after a successful build and
+/// returns a manual-restart hint. On build failure it returns an error and the session continues
+/// uninterrupted.
 pub struct ReloadTool;
 
 #[async_trait]
@@ -2477,9 +2482,10 @@ impl Tool for ReloadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "flux_reload".into(),
-            description: "Recompile flux-cli and hot-reload: replaces the current process with \
-                          the freshly built binary, resuming the session. Dev mode only. Call \
-                          this when you want to apply code changes without losing session state."
+            description: "Recompile flux-cli in place (dev mode only). On success the freshly built \
+                          binary is on disk, but this still-running session keeps the OLD build, so \
+                          the tool returns instructions to restart (exit and re-run with `--resume`) \
+                          to load the new binary. It does not replace the running process."
                 .into(),
             input_schema: tool_input_schema::<FluxReloadInput>(),
             output_schema: None,
@@ -2532,41 +2538,20 @@ impl Tool for ReloadTool {
             )));
         }
 
-        // Build succeeded — replace the current process via execv.
-        // Collect original argv, appending `--resume` if neither --resume nor -c is already present.
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult::error(format!(
-                    "cannot locate current executable: {e}"
-                )))
-            }
-        };
-        let mut args: Vec<String> = std::env::args().collect();
-        if !args
-            .iter()
-            .any(|a| a == "--resume" || a == "-c" || a == "--continue")
-        {
-            args.push("--resume".to_string());
-        }
-
-        // Replace the current process with the freshly built binary.
-        #[cfg(unix)]
-        {
-            // exec() replaces the process image (execv under the hood). Only returns on failure.
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&exe).args(&args[1..]).exec();
-            Ok(ToolResult::error(format!("execv failed: {err}")))
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows has no execv; spawn the replacement, wait for it, and exit with its code.
-            match std::process::Command::new(&exe).args(&args[1..]).status() {
-                Ok(status) => std::process::exit(status.code().unwrap_or(0)),
-                Err(e) => Ok(ToolResult::error(format!("reload spawn failed: {e}"))),
-            }
-        }
+        // Rebuild succeeded. flux_reload is deliberately rebuild-only: replacing the running process
+        // image (execv / a spawned replacement) is a direct OS-process seam outside
+        // `flux_system::System`'s single guarded path, so we stop here and return a manual-restart
+        // hint rather than opening a second, differently-guarded seam. See the `ReloadTool` doc.
+        Ok(ToolResult::ok(reload_restart_hint()))
     }
+}
+
+/// The message `flux_reload` returns after a successful rebuild. Rebuild-only by design (see
+/// [`ReloadTool`]): the freshly built binary is on disk, but this process still runs the previous
+/// image, so the operator must restart to pick it up.
+fn reload_restart_hint() -> &'static str {
+    "rebuilt flux-cli successfully. this session is still running the previous build — exit and \
+     re-run flux with `--resume` (or `-c`) to load the new binary."
 }
 
 /// Register extra tools available only in `--dev` mode.
@@ -2589,6 +2574,32 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
         (dir, c)
+    }
+
+    /// C-57: `flux_reload` is rebuild-only — it no longer replaces the running process image. The
+    /// post-build path returns a manual-restart hint (not an `execv`), and the tool no longer
+    /// advertises process replacement. The architecture guard against re-adding a raw
+    /// `std::process::Command` lives in `flux-codegate`.
+    #[test]
+    fn flux_reload_is_rebuild_only_and_instructs_manual_restart() {
+        let hint = reload_restart_hint();
+        assert!(
+            hint.contains("--resume"),
+            "hint must tell the user how to restart: {hint}"
+        );
+        assert!(
+            hint.to_lowercase().contains("exit"),
+            "hint must ask the user to exit/restart: {hint}"
+        );
+        let desc = ReloadTool.spec().description.to_lowercase();
+        assert!(
+            desc.contains("restart"),
+            "flux_reload must advertise a manual restart: {desc}"
+        );
+        assert!(
+            !desc.contains("hot-reload") && !desc.contains("replaces the current process"),
+            "flux_reload must no longer advertise replacing the running process: {desc}"
+        );
     }
 
     #[tokio::test]

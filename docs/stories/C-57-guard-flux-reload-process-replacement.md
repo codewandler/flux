@@ -2,7 +2,7 @@
 id: C-57
 title: Route flux_reload process replacement through the guarded process path
 pillar: Core
-status: backlog
+status: done
 note: "2026 codebase review: dev reload directly execs/spawns std::process::Command outside flux-system's single guarded process seam."
 ---
 

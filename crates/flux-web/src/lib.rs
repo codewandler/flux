@@ -39,9 +39,30 @@ pub use browser::{browser_group, chromium_present};
 /// (title/url/content) so read content is groundable later — the `websearch` → `web.result` pattern.
 /// The surface adapts its datasource backend to this seam; `None` disables contribution (e.g. the
 /// catalog-only registry).
+///
+/// **Contract (C-58): a configured sink is a durable datasource write, not ephemeral evidence.** Its
+/// purpose is populating a searchable index that outlives the turn, so a tool constructed WITH a sink
+/// declares that persistence honestly instead of masquerading as a bare network read: it reports the
+/// [`WRITE_DB_EFFECT_TAG`] semantic effect and names [`WEB_PAGE_RECORD_SUBJECT`] as a permission
+/// subject, so policy and the approval preview see the write. A tool constructed WITHOUT a sink stays
+/// network-only. The disclosure is computed per-instance from whether `self.records` is set.
 pub trait RecordSink: Send + Sync {
     fn contribute(&self, records: &[flux_datasource::Record]);
 }
+
+/// The semantic-effect tag (`flux_lang::ast::FlowEffect::WriteDb`, D-138) `web.fetch` / `web.crawl`
+/// declare when configured WITH a [`RecordSink`]: contributing `web.page` records is a durable
+/// datasource write. The flow layer lowers it to `Effect::Network` + the `flow.write_db` policy
+/// action, so the persistence is disclosed in plan-risk previews and gateable by policy — WITHOUT
+/// mis-declaring a filesystem `workspace.write`. A plain string per the [`flux_runtime::Tool::semantic_effects`]
+/// contract (that seam stays free of a `flux-lang` dependency).
+pub(crate) const WRITE_DB_EFFECT_TAG: &str = "write_db";
+
+/// The permission subject naming the durable `web.page` datasource record target that `web.fetch` /
+/// `web.crawl` write when configured WITH a [`RecordSink`]. Reported by `permission_subjects` so plan
+/// approval and the audit trail disclose the persistence side effect alongside the fetched URL —
+/// never an empty subject for the write (see the `permission_subjects` safety invariant in AGENTS.md).
+pub(crate) const WEB_PAGE_RECORD_SUBJECT: &str = "datasource:web.page";
 
 /// The egress + audit wiring the surface hands the web ops at registration.
 ///

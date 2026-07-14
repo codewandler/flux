@@ -211,6 +211,7 @@ Discover and run reusable flows and composite ops stored under `.flux/flows` (pr
 |---|---|---|
 | `flow_list` | | List the flows and composite ops in the flows home, each with its description and params |
 | `flow_run` | `name[, inputs]` | Run a stored flow by name; an `inputs` object is seeded as `$key` binds, then it runs in the current session |
+| `flow_render` | `source\|name[, view]` | Render Flux-Lang as a syntax-highlighted SVG — inline `source` or a stored flow `name`; `view: "source"` (default) renders the highlighted source, `view: "tree"` the execution-path plan tree. Returns SVG markup inline for surfaces that can't highlight `.flux` (READMEs, Slack, docs, chat) |
 | `op.register` | `source, scope[, replace, expose]` | Validate and register one composite op for the turn, session, project, or global scope |
 
 ## Evidence and strict-review helpers
