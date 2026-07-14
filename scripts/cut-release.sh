@@ -10,8 +10,9 @@
 #
 # It stages ONLY the release files (root/plugins manifests + locks, both changelogs, and the
 # generated website customer-changelog mirror) so concurrent uncommitted work from other sessions
-# is never swept in. It does NOT push — it prints the push command (pushing the tag triggers the
-# Release + crates.io workflows). Run from the repo root, and commit your actual code/content
+# is never swept in. It does NOT push. It prints the build-once sequence: push the commit, prepare
+# its exact-SHA binary artifacts, then push the already-created local tag to promote those artifacts
+# and start crates.io publication. Run from the repo root, and commit your actual code/content
 # changes first: this cuts the release on top of them.
 #
 set -euo pipefail
@@ -142,6 +143,11 @@ git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure 
 git tag -a "v$NEW" -m "flux $NEW"
 
 echo
-echo "== cut v$NEW. Review 'git show', then push to trigger the Release + crates.io workflows: =="
-echo "   git push origin main \"v$NEW\""
-echo "   (verify: git ls-remote origin \"refs/tags/v$NEW\")"
+echo "== cut v$NEW. Review 'git show', then prepare + promote the exact commit: =="
+echo "   git push origin main"
+echo "   gh workflow run release.yml --ref main -f version=$NEW"
+echo "   # wait for that candidate run to succeed and confirm its SHA equals:"
+echo "   git rev-list -n1 \"v$NEW^{}\""
+echo "   git push origin \"v$NEW\"   # promotes candidate binaries + starts crates.io"
+echo "   (verify tag: git ls-remote origin \"refs/tags/v$NEW\")"
+echo "   (no candidate? the tag workflow logs a warning and performs the legacy full build)"

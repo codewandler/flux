@@ -17,6 +17,9 @@
 
 ### Improved
 
+- **Prepared release binaries can now be promoted by a matching version tag without rebuilding all
+  five platforms.** Promotion is tied to the exact source commit and retains the existing public
+  asset verification; missing candidates fall back visibly to the full build.
 - **Slack channel, user, history, and thread reads now validate their complete input before making
   a request and advertise their stable result envelope.** Slack's evolving object fields, cursors,
   and response metadata remain available unchanged.

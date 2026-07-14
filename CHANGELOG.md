@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **C-73: version tags can promote an exact-SHA release candidate without recompiling it.** A manual
+  run builds and retains all five cargo-dist targets with an immutable provenance receipt; the tag
+  workflow verifies the version, commit, run, and complete artifact set before publishing, while a
+  missing candidate takes an explicit compatibility-build path.
 - **C-75: Slack's channel, user, history, and thread reads now execute through typed contracts.**
   Four handlers reject input drift before HTTP, publish generated stable envelopes, and preserve
   Slack-owned channel, member, message, cursor, metadata, and extension fields without narrowing

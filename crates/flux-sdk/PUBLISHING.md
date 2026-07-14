@@ -120,8 +120,25 @@ skipped, so a failed run is re-runnable).
 (https://crates.io/settings/tokens) from an account that can publish the `codewandler-flux-*` names.
 Without it the job fails fast with a clear message and nothing is published.
 
-To release: cut the version (`scripts/cut-release.sh <ver>`), then `git push --follow-tags origin main`.
-The tag fans out to both the binary `Release` workflow and this crates.io publish.
+To release, cut the version (`scripts/cut-release.sh <ver>`), then use the build-once sequence printed
+by the script:
+
+```sh
+git push origin main
+gh workflow run release.yml --ref main -f version=X.Y.Z
+# Wait for the candidate run to succeed; its summary SHA must equal `git rev-list -n1 vX.Y.Z^{}`.
+git push origin vX.Y.Z
+```
+
+The manual run builds all five cargo-dist targets for that exact main SHA and retains the immutable
+workflow artifacts plus a version/SHA/run receipt for 14 days. The matching tag run verifies the
+receipt and promotes those artifacts without recompiling, while retaining the normal public-release
+asset verification. The tag simultaneously starts this crates.io publish workflow.
+
+If no successful, unexpired candidate exists at the tag's exact SHA, the binary workflow emits a
+prominent warning and performs the legacy full build. It never searches by version alone. A malformed
+or mismatched receipt fails closed before release creation; re-running promotion remains safe because
+GitHub Release uploads use `--clobber` and the crates publisher skips versions already present.
 
 **Binary Release workflow secret:** add **`RELEASE_TOKEN`** under
 *Settings → Secrets and variables → Actions* on the `codewandler/flux` repo. It must be a fine-grained

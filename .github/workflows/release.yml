@@ -5,17 +5,18 @@
 #
 # CI that:
 #
-# * checks for a Git Tag that looks like a release
-# * builds artifacts with dist (archives, installers, hashes)
-# * uploads those artifacts to temporary workflow zip
-# * on success, uploads the artifacts to a GitHub Release
+# * prepares artifacts for an exact release commit when manually dispatched
+# * promotes those immutable artifacts when the matching Git tag arrives
+# * falls back to building on the tag when no prepared candidate exists
+# * uploads the artifacts to a GitHub Release and verifies its public asset shape
 #
 # Note that the GitHub Release will be created with a generated
 # title/body based on your changelogs.
 
 name: Release
 permissions:
-  "contents": "write"
+  contents: write
+  actions: read
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -40,9 +41,21 @@ permissions:
 # will be marked as a prerelease.
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Plain X.Y.Z workspace version to prepare at this exact main commit"
+        required: true
+        type: string
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+
+# A tag pushed while its exact candidate is still building waits for that build, then promotes it.
+# Different release commits remain independent.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -50,9 +63,10 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      tag: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || (startsWith(github.ref, 'refs/tags/') && github.ref_name || '') }}
+      tag-flag: ${{ github.event_name == 'workflow_dispatch' && format('--tag=v{0}', inputs.version) || (startsWith(github.ref, 'refs/tags/') && format('--tag={0}', github.ref_name) || '') }}
+      publishing: ${{ startsWith(github.ref, 'refs/tags/') }}
+      preparing: ${{ github.event_name == 'workflow_dispatch' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -60,8 +74,25 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Validate release-candidate request
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          CANDIDATE_VERSION: ${{ inputs.version }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "::error::release candidates must be prepared from main, got $DISPATCH_REF"
+            exit 1
+          fi
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$CANDIDATE_VERSION" != "$workspace_version" ]; then
+            echo "::error::candidate version $CANDIDATE_VERSION does not match workspace version $workspace_version"
+            exit 1
+          fi
+          scripts/release-candidate.sh write "$RUNNER_TEMP/request-receipt" \
+            "$CANDIDATE_VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID"
       - name: Check release token is configured
-        if: ${{ !github.event.pull_request }}
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         env:
           RELEASE_TOKEN_CONFIGURED: ${{ secrets.RELEASE_TOKEN != '' }}
         run: |
@@ -85,8 +116,16 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          CANDIDATE_VERSION: ${{ inputs.version }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --allow-dirty --output-format=json > plan-dist-manifest.json
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            dist host --steps=create --tag="v$CANDIDATE_VERSION" --allow-dirty --output-format=json > plan-dist-manifest.json
+          elif [[ "$GITHUB_REF" = refs/tags/* ]]; then
+            dist host --steps=create --tag="$GITHUB_REF_NAME" --allow-dirty --output-format=json > plan-dist-manifest.json
+          else
+            dist plan --allow-dirty --output-format=json > plan-dist-manifest.json
+          fi
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -95,6 +134,61 @@ jobs:
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
+          retention-days: 14
+
+  # A tag may reuse only a successful manual run of this workflow at the tag's exact commit. The
+  # receipt repeats the version, SHA, and immutable run ID so lookup cannot degrade to version-only.
+  resolve-release-candidate:
+    needs: plan
+    runs-on: ubuntu-22.04
+    outputs:
+      run-id: ${{ steps.select.outputs.run-id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: lookup
+        name: Find successful exact-SHA candidate
+        if: ${{ needs.plan.outputs.publishing == 'true' }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::$GITHUB_REF_NAME is not a plain vX.Y.Z tag; using the compatibility build path"
+            exit 0
+          fi
+          run_id=$(scripts/find-release-candidate.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+      - name: Download candidate receipt
+        if: ${{ steps.lookup.outputs.run-id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: release-candidate-receipt
+          path: candidate
+          run-id: ${{ steps.lookup.outputs.run-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - id: select
+        name: Verify candidate provenance or select fallback
+        env:
+          CANDIDATE_RUN_ID: ${{ steps.lookup.outputs.run-id }}
+          VERSION: ${{ steps.lookup.outputs.version }}
+        run: |
+          if [ -z "$CANDIDATE_RUN_ID" ]; then
+            if [ "${{ needs.plan.outputs.publishing }}" = "true" ]; then
+              echo "::warning::no prepared candidate exists for $GITHUB_SHA; rebuilding all release targets"
+              echo "### Release candidate: compatibility rebuild" >> "$GITHUB_STEP_SUMMARY"
+              echo "No successful prepared candidate was found at \`$GITHUB_SHA\`." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+          scripts/release-candidate.sh verify candidate/release-candidate.txt \
+            "$VERSION" "$GITHUB_SHA" "$CANDIDATE_RUN_ID"
+          echo "run-id=$CANDIDATE_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "### Release candidate: promoted without rebuilding" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate run: [$CANDIDATE_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID)" >> "$GITHUB_STEP_SUMMARY"
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -102,7 +196,8 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+      - resolve-release-candidate
+    if: ${{ always() && needs.plan.result == 'success' && needs.resolve-release-candidate.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.preparing == 'true' || (needs.plan.outputs.publishing == 'true' && needs.resolve-release-candidate.outputs.run-id == '') || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -173,6 +268,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+          retention-days: 14
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
@@ -220,14 +316,53 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-  # Determines if we should publish/announce
-  host:
+          retention-days: 14
+
+  # A preparation run becomes eligible for promotion only after every cargo-dist build succeeds.
+  # Its receipt is deliberately separate from `artifacts-*`, so it can never become a release asset.
+  record-release-candidate:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+    if: ${{ always() && needs.plan.outputs.preparing == 'true' && needs.plan.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.build-global-artifacts.result == 'success' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Write exact-SHA candidate receipt
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          scripts/release-candidate.sh write release-candidate.txt \
+            "$VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID"
+      - name: Upload candidate receipt
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-receipt
+          path: release-candidate.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Summarize prepared candidate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "### Release candidate prepared" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Candidate run: \`$GITHUB_RUN_ID\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Retention: 14 days; after expiry the tag workflow rebuilds explicitly" >> "$GITHUB_STEP_SUMMARY"
+
+  # Determines if we should publish/announce
+  host:
+    needs:
+      - plan
+      - resolve-release-candidate
+      - build-local-artifacts
+      - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.resolve-release-candidate.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -244,8 +379,20 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Fetch artifacts from scratch-storage
-      - name: Fetch artifacts
+      # A prepared candidate is downloaded by immutable run ID. Without one, these artifacts come
+      # from the current tag run's compatibility builds.
+      - name: Fetch prepared candidate artifacts
+        if: ${{ needs.resolve-release-candidate.outputs.run-id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+          run-id: ${{ needs.resolve-release-candidate.outputs.run-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: Fetch compatibility-build artifacts
+        if: ${{ needs.resolve-release-candidate.outputs.run-id == '' }}
         uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
@@ -264,13 +411,32 @@ jobs:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
+          retention-days: 14
       # Create a GitHub Release while uploading all files to it
-      - name: "Download GitHub Artifacts"
+      - name: "Download prepared GitHub artifacts"
+        if: ${{ needs.resolve-release-candidate.outputs.run-id != '' }}
         uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
+          run-id: ${{ needs.resolve-release-candidate.outputs.run-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+      - name: "Download compatibility-build GitHub artifacts"
+        if: ${{ needs.resolve-release-candidate.outputs.run-id == '' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+      - name: Record promoted candidate
+        if: ${{ needs.resolve-release-candidate.outputs.run-id != '' }}
+        env:
+          CANDIDATE_RUN_ID: ${{ needs.resolve-release-candidate.outputs.run-id }}
+        run: |
+          echo "Promoting immutable artifacts from candidate run $CANDIDATE_RUN_ID"
+          echo "Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
       - name: Cleanup
         run: |
           # Remove the granular manifests
