@@ -25,7 +25,8 @@ run so nested or concurrent same-named operations remain pairable.
 - [x] Every event carries role + child session + child-local call correlation. Nested child events relay
       unchanged, and repeated operation names in different children cannot mis-pair.
 - [x] Existing child final-text collection, usage roll-up, audit correlation, block presentation,
-      cancellation and wall-clock behavior remain intact.
+      cancellation and wall-clock behavior remain intact; parent cancellation delivers one child
+      failure completion before its activity channel closes.
 - [x] Public API and architecture comments document the privacy/projection boundary; CHANGELOG and
       customer-facing release notes describe the visible improvement.
 - [x] Full workspace build/test/clippy/fmt and `flux-codegate` are green.
@@ -46,6 +47,9 @@ run so nested or concurrent same-named operations remain pairable.
 - 2026-07-14 closed for the 0.22.0 release. The previously recorded A-79 test/clippy/codegate pass plus
   A-77's complete post-merge repository gate provide the release evidence; the user explicitly requested
   that the release itself not rerun validation.
+- 2026-07-14 post-release review fixed cancellation teardown ordering: the parent now drops an
+  in-flight child collector before the final activity drain, with an end-to-end pending-`task`
+  regression requiring the correlated failure completion.
 
 ## Notes
 - The downstream acceptance boundary is ai-agent-platform E-40. Do not flatten child callbacks into the

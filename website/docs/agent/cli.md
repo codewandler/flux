@@ -66,7 +66,7 @@ flux run --loop loops/support.flux "triage this request"
 - `--max-model-calls` bounds provider consultations across intent, exploration, repairs, and
   decision resumes for one logical adaptive turn (default: 50).
 - `--max-iterations` separately bounds decision/batch iterations in the authored outer loop
-  (default: 50).
+  (default: 50; accepted range: 1–1,000).
 - `--skill NAME` explicitly enables a discovered skill. Skills do not activate from prompt keywords.
 
 ## Saved flow inputs

@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent-loop assembly now rejects `max_iterations` values above 1,000 before expanding the
+  built-in Flux program.** The shared engine boundary protects CLI/config, SDK, embedded-agent, and
+  sub-agent callers from input-driven startup memory exhaustion; CLI diagnostics identify whether
+  the rejected value came from `--max-iterations` or `[agent] max_iterations`.
+- **Cancelling a parent turn now delivers an in-flight child's terminal activity before tearing
+  down the parent sink.** The engine drops the child-owning flow future before its final channel
+  drain, so surfaces receive exactly one correlated failure completion instead of retaining stale
+  child planning state.
+- **The adaptive-latency keep gate now requires an exact confirmation and Slack matrix.** Missing,
+  duplicate, header-only, and stale in-scope rows reject with named diagnostics before metric joins
+  run, so an interrupted evaluation cannot be reported as `KEEP`.
+
 ## [0.22.0] - 2026-07-14
 
 ### Added

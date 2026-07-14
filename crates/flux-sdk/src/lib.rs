@@ -378,8 +378,9 @@ impl ClientBuilder {
         self.spec.max_tokens = n;
         self
     }
-    /// Cap the authored outer loop's decision/batch iterations per turn (default: 50). This is
-    /// separate from the adaptive policy's provider-call budget.
+    /// Cap the authored outer loop's decision/batch iterations per turn (default: 50, maximum:
+    /// 1,000). This is separate from the adaptive policy's provider-call budget. Out-of-range
+    /// values fail when the agent is assembled.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.spec.max_iterations = n;
         self

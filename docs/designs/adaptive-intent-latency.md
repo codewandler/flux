@@ -31,6 +31,11 @@ end-to-end latency by at least 10%, and keep support latency within 5% of baseli
 smaller behavior change: baseline, cap-only, then low-effort/cap. Failure to qualify is a valid
 result: the evaluator and report land, but the shipped intent defaults remain unchanged.
 
+Before comparing metrics, the gate requires exactly one row for every configured
+baseline/candidate, model, workload, and confirmation trial, plus one candidate Slack row per model.
+It rejects missing, duplicate, or stale in-scope keys with named diagnostics; an interrupted or
+header-only result set can never qualify through an empty inner join.
+
 Only redacted `model.call`, approval, execution, and wall-clock measurements enter the report. Full
 provider bodies and private reasoning are neither required nor retained.
 

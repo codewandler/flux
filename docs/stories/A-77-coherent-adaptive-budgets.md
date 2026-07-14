@@ -23,7 +23,7 @@ making the separate authored decision/batch repeat configurable on every normal 
 - [x] The authored outer-loop repeat defaults to 50 and is configurable through
       `[agent] max_iterations`, `--max-iterations`, `AgentSpec`, and the SDK builder, with
       CLI > project > user > default precedence.
-- [x] Zero/overflow values fail before a provider request or Flux-Lang execution, and decision
+- [x] Zero or over-limit values fail before AST expansion, a provider request, or Flux-Lang execution, and decision
       suspension/resume cannot reset either logical budget.
 - [x] Public docs, both changelogs, and self-improvement status distinguish model calls,
       `ai_segment.max_rounds`, and outer-loop iterations.
@@ -38,6 +38,9 @@ making the separate authored decision/batch repeat configurable on every normal 
 - 2026-07-14: workspace build/test, clippy with warnings denied, formatting, the architecture
   layering gate, and exact `task install` all pass. The install run replaced both `flux` and
   `flux-lsp`; all 110 `flux-system` tests passed in its library-test phase.
+- 2026-07-14: post-release review capped the configurable outer repeat at 1,000 in the shared
+  assembly path, before the built-in loop's linear AST expansion; 1,000/1,001 and CLI/config
+  diagnostics are covered.
 
 ## Notes
 - The safety envelope is unchanged. Larger bounds permit more cognition; they do not grant an

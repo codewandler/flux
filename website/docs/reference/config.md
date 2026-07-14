@@ -117,8 +117,9 @@ max_calls = 8
 All ceilings must be greater than zero. A matching provider prefix is accepted and stripped; a
 different provider fails during startup rather than opening another credential path. The CLI
 `--max-model-calls` overrides the configured provider-call total for one invocation;
-`--max-iterations` independently overrides the outer repeat. An authored `ai_segment.max_rounds`
-is its own exact local provider-call ceiling and is not clamped to either default.
+`--max-iterations` independently overrides the outer repeat and accepts 1 through 1,000. An
+authored `ai_segment.max_rounds` is its own exact local provider-call ceiling and is not clamped to
+either default.
 
 Config may register model-backed stages as ordinary typed guarded operations. Input and output have
 independent JSON Schemas; there is no common stage envelope:

@@ -142,6 +142,8 @@ pub struct AgentSpec {
     /// Pre-allow/deny rules for the safety envelope.
     pub permissions: Permissions,
     pub max_tokens: u32,
+    /// Authored decision/batch iterations per turn. Must be between 1 and
+    /// [`flux_flow::MAX_AGENT_LOOP_ITERATIONS`], inclusive.
     pub max_iterations: usize,
     /// Ask capable providers/models to expose adaptive thinking for this agent's calls.
     pub thinking: bool,

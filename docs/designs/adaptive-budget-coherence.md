@@ -28,13 +28,14 @@ ceiling and the shared safety envelope.
 The outer Flux repeat counts decision/batch state-machine iterations, not provider calls. It also
 defaults to 50 but remains a separate setting: `[agent] max_iterations`, CLI
 `--max-iterations`, `AgentSpec.max_iterations`, and the SDK builder. Precedence is CLI, project
-config, user config, then the default. Values must be positive; the existing Flux-Lang `u32` repeat
-bound remains the overflow check. A sub-agent spawner may intentionally narrow this through its
-separate `SpawnLimits`; that explicit child resource ceiling is not a competing hidden default.
+config, user config, then the default. Values must be in `1..=1_000`; the shared engine loader
+checks that practical bound before the built-in repeat is expanded into a durable top-level state
+machine. A sub-agent spawner may intentionally narrow this through its separate `SpawnLimits`; that
+explicit child resource ceiling is not a competing hidden default.
 
 ## Verification
 
 Scripted providers pin the exact 50/51 boundary, a non-completing `ai_segment` pins its authored
-bound, and config/CLI tests pin precedence and early validation. Suspension tests prove counters
-survive resume. None of these changes touches capability visibility, authorization, approval,
-dispatch, or guarded IO.
+bound, and config/CLI tests pin precedence and early validation. Assembly tests accept 1,000 and
+reject 1,001 before repeat lowering. Suspension tests prove counters survive resume. None of these
+changes touches capability visibility, authorization, approval, dispatch, or guarded IO.

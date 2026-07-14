@@ -1,6 +1,6 @@
 # Live, correlated sub-agent activity
 
-**Status:** implementing ([A-79](../stories/A-79-stream-correlated-sub-agent-activity.md)) · **Layer:**
+**Status:** implemented ([A-79](../stories/A-79-stream-correlated-sub-agent-activity.md)) · **Layer:**
 L2 reporter contract (`flux-runtime`) + L3 engine/orchestration wiring (`flux-flow`,
 `flux-orchestrate`)
 
@@ -75,6 +75,8 @@ the intermediate collector, preserving the originating role/session/call identit
 - Tool result/error content never enters `SpawnActivity`; only `is_error` and timing cross.
 - Completion fires once at the spawner boundary. Engine errors, deadlines, cancellation, and a dropped
   in-flight spawn report failure without forwarding error text.
+- Parent cancellation drops the child-owning flow future before the parent's final activity-channel
+  drain, so the collector's synchronous drop-time completion reaches the surface before teardown.
 - Every tool still executes through the child's `Executor`; forwarding is observational only.
 - Reporter callbacks are synchronous send-only and hold no lock across an await.
 - Fresh nested-context reporter inheritance exists only while the outer guarded tool future is executing;
@@ -89,6 +91,8 @@ The failing-first regressions cover each boundary: a child status + read is visi
 blocked; a real parent engine derives and snapshots its reporter; a guarded adapter's nested context sees
 the reporter only inside the lexical execution scope; a streamed nested runtime pins it across
 `tokio::spawn`; concurrent storeless children have distinct spawn ids; JSON keys and values are scrubbed;
-and a timed-out child emits one failure terminal. Downstream, a projector unit interleaves same-named calls
-by child identity, while the served-chat regression drives the complete nested-`FlowClient` manager route.
-Existing cancellation, usage and audit tests remain the regression net.
+and a timed-out child emits one failure terminal. A parent-cancellation regression holds a real `task`
+collector pending, cancels the parent, and requires its single failure completion on the borrowed surface.
+Downstream, a projector unit interleaves same-named calls by child identity, while the served-chat
+regression drives the complete nested-`FlowClient` manager route. Existing cancellation, usage and audit
+tests remain the regression net.

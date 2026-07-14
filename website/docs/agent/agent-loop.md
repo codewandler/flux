@@ -144,6 +144,9 @@ iterations, not provider calls. Override it with `--max-iterations`, `[agent] ma
 max_iterations = 50
 ```
 
+The accepted range is 1 through 1,000. The upper bound is checked before the built-in repeat is
+expanded into its durable top-level state machine.
+
 An authored `ai_segment` owns a third, local bound: its required `max_rounds` is honored exactly and
 is not clamped to either normal-turn default. All three controls must be positive.
 

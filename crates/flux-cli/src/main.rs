@@ -157,8 +157,8 @@ struct AgentFlags {
     #[arg(long, value_parser = parse_positive_usize)]
     max_model_calls: Option<usize>,
 
-    /// Maximum decision/batch iterations in the authored outer loop. This is separate from model
-    /// calls: one iteration may execute a batch, ask a question, or continue from a report.
+    /// Maximum decision/batch iterations in the authored outer loop (1–1,000). This is separate
+    /// from model calls: one iteration may execute a batch, ask a question, or continue from a report.
     /// Overrides `[agent] max_iterations`.
     #[arg(long, value_parser = parse_positive_usize)]
     max_iterations: Option<usize>,
@@ -934,15 +934,25 @@ fn adaptive_loop_policy(
 }
 
 fn agent_max_iterations(flags: &AgentFlags, config: &flux_config::AgentConfig) -> Result<usize> {
-    // Resolve under CLI > config > default precedence first, then reject a zero that actually takes
-    // effect. A valid `--max-iterations` (already `parse_positive_usize`-checked) must override a
-    // bad `[agent] max_iterations = 0`, not be defeated by it.
-    let resolved = flags
-        .max_iterations
-        .or(config.max_iterations)
-        .unwrap_or(flux_flow::DEFAULT_AGENT_LOOP_ITERATIONS);
+    // Resolve under CLI > config > default precedence first, then validate the value that actually
+    // takes effect. A valid `--max-iterations` must override bad project/user config, not be
+    // defeated by it; retaining the winning source also keeps the startup diagnostic actionable.
+    let (resolved, source) = match (flags.max_iterations, config.max_iterations) {
+        (Some(value), _) => (value, "`--max-iterations`"),
+        (None, Some(value)) => (value, "[agent] max_iterations"),
+        (None, None) => (
+            flux_flow::DEFAULT_AGENT_LOOP_ITERATIONS,
+            "default max_iterations",
+        ),
+    };
     if resolved == 0 {
-        bail!("[agent] max_iterations must be greater than zero");
+        bail!("{source} must be greater than zero");
+    }
+    if resolved > flux_flow::MAX_AGENT_LOOP_ITERATIONS {
+        bail!(
+            "{source} must not exceed the maximum of {}",
+            flux_flow::MAX_AGENT_LOOP_ITERATIONS
+        );
     }
     Ok(resolved)
 }
@@ -2251,6 +2261,8 @@ async fn build_agent_with(
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = std::env::current_dir().context("current dir")?;
     let cfg = flux_config::load(&cwd).context("load .flux/config.toml")?;
+    // Validate this input-driven expansion bound before provider, plugin, or agent assembly work.
+    let max_iterations = agent_max_iterations(flags, &cfg.agent)?;
     // Opt into the generic `bash` op when config enables it — via the runtime's in-process
     // override, NOT `set_var` (we're on a live multi-threaded runtime here). A user who set
     // `FLUX_ENABLE_BASH` directly is honored too (we only ever turn it on here, never off).
@@ -2756,7 +2768,7 @@ async fn build_agent_with(
         system_prompt,
         skills: load_skills(&cwd, &cfg, &flags.skill_dirs, &flags.skills)?,
         max_tokens: flags.max_tokens,
-        max_iterations: agent_max_iterations(flags, &cfg.agent)?,
+        max_iterations,
         thinking: flags.think,
         effort: flags.effort.map(Into::into),
         agent_loop: resolve_agent_loop(
@@ -9532,6 +9544,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("[agent] max_iterations must be greater than zero"));
+    }
+
+    #[test]
+    fn outer_loop_iterations_reject_cli_and_config_values_above_the_practical_cap() {
+        use clap::Parser;
+
+        let default_flags = super::AgentFlags::from_model_yes(Some("mock"), true);
+        let at_max = flux_config::AgentConfig {
+            max_iterations: Some(flux_flow::MAX_AGENT_LOOP_ITERATIONS),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::agent_max_iterations(&default_flags, &at_max).unwrap(),
+            flux_flow::MAX_AGENT_LOOP_ITERATIONS
+        );
+
+        let above_max = flux_flow::MAX_AGENT_LOOP_ITERATIONS + 1;
+        let config = flux_config::AgentConfig {
+            max_iterations: Some(above_max),
+            ..Default::default()
+        };
+        let config_error = super::agent_max_iterations(&default_flags, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            config_error.contains("[agent] max_iterations"),
+            "{config_error}"
+        );
+        assert!(
+            config_error.contains(&format!(
+                "maximum of {}",
+                flux_flow::MAX_AGENT_LOOP_ITERATIONS
+            )),
+            "{config_error}"
+        );
+
+        let cli_flags =
+            super::AgentFlagsOnly::parse_from(["flux", "--max-iterations", &above_max.to_string()])
+                .agent;
+        let cli_error = super::agent_max_iterations(&cli_flags, &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(cli_error.contains("--max-iterations"), "{cli_error}");
+        assert!(
+            cli_error.contains(&format!(
+                "maximum of {}",
+                flux_flow::MAX_AGENT_LOOP_ITERATIONS
+            )),
+            "{cli_error}"
+        );
     }
 
     #[test]

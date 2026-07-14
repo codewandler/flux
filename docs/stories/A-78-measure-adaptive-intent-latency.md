@@ -21,9 +21,9 @@ away grounding, routing correctness, or cross-model reliability.
       Codex gpt-5.5, Gemini 3.5 Flash, DeepSeek V4 Flash Nitro, and GPT-5-mini.
 - [x] Baseline and the provisional winner receive five fresh trials per model on pure conversation,
       live time, and adversarial support retrieval; evaluator turns remain explicitly capped at 12.
-- [x] A universal default changes only when every answer passes, repairs/calls do not increase,
-      median intent latency improves at least 20%, greeting/time improve at least 10%, and support
-      latency does not regress by more than 5%.
+- [x] A universal default changes only when the exact confirmation/Slack matrix is present, every
+      answer passes, repairs/calls do not increase, median intent latency improves at least 20%,
+      greeting/time improve at least 10%, and support latency does not regress by more than 5%.
 - [x] Gemini 3.5 Flash as an OpenRouter-only intent override is screened under a DeepSeek parent,
       advances only if it qualifies, and never becomes an automatic cross-provider default.
 - [x] A Bitcoin-to-Slack approval-denial smoke runs on every model, selects Slack, and never executes
@@ -40,6 +40,8 @@ away grounding, routing correctness, or cross-model reliability.
 - 2026-07-14: all Slack smokes selected Slack and executed no write; Gemini failed before approval
   because its endpoint rejected valid-but-nonportable array schemas. Follow-up A-81 owns that
   structural provider issue.
+- 2026-07-14: post-release review made matrix completeness a precondition for the keep gate; exact
+  per-key coverage rejects missing, duplicate, stale, and header-only confirmation/Slack results.
 
 ## Notes
 - This is targeted shipped-harness hardening, not a restart of the paused autonomous improvement

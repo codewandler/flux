@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Fixed
+
+- **Extreme outer-loop limits fail safely at startup.** `max_iterations` accepts values from 1 to
+  1,000; larger CLI, config, SDK, or embedded-agent values are rejected before Flux builds the
+  repeated control program.
+- **Cancelling delegated work clears its live activity state.** A specialist that is still running
+  when its parent turn is cancelled now reports a correlated failure completion, so chat surfaces
+  do not leave that child shown as active.
+
 ## [0.22.0] - 2026-07-14
 
 ### Improved

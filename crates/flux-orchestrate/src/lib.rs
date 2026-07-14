@@ -1638,6 +1638,157 @@ mod tests {
         );
     }
 
+    /// Cancelling a parent while its `task` call is still awaiting a child must surface the
+    /// child's drop-time failure terminal before the parent engine tears down its activity channel.
+    #[tokio::test]
+    async fn parent_cancellation_delivers_the_child_terminal_event() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PendingCollectorSpawner {
+            entered: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait]
+        impl Spawner for PendingCollectorSpawner {
+            async fn spawn(
+                &self,
+                request: SpawnRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<SpawnOutcome> {
+                let collector = TextCollector::new(
+                    request.activity,
+                    77,
+                    request.role,
+                    "child-77".into(),
+                    request.parent_session,
+                    1,
+                    flux_secret::Redactor::new(),
+                );
+                let _ = self.entered.send(());
+                futures::future::pending::<()>().await;
+                drop(collector);
+                unreachable!()
+            }
+        }
+
+        struct ParentProvider {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ParentProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, request: Request) -> Result<ChunkStream> {
+                if request_has_tool(&request, "declare_intent") {
+                    return Ok(Box::pin(futures::stream::iter(
+                        intent_chunks("delegate the read", &["process"])
+                            .into_iter()
+                            .map(Ok),
+                    )));
+                }
+                let chunks = match self.calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => native_call(
+                        "task-1",
+                        "task",
+                        json!({"role": "sloth", "task": "wait for cancellation"}),
+                    ),
+                    1 => native_call(
+                        "finalize-1",
+                        "finalize_plan",
+                        json!({"instructions": "Wait for the delegated result."}),
+                    ),
+                    _ => prose_chunks("unexpected parent continuation"),
+                };
+                Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            }
+        }
+
+        #[derive(Default)]
+        struct ParentSink {
+            children: Vec<SpawnActivity>,
+        }
+        impl AgentSink for ParentSink {
+            fn observation(&mut self, observation: &flux_evidence::Observation) {
+                if let Some(activity) = SpawnActivity::from_observation(observation) {
+                    self.children.push(activity);
+                }
+            }
+        }
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let child_spawner: Arc<dyn Spawner> = Arc::new(PendingCollectorSpawner {
+            entered: entered_tx,
+        });
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TaskTool));
+        register_agent_ops(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["task".into()], &[]),
+            Arc::new(flux_runtime::AllowApprover),
+            ToolContext::new(temp_system()).with_spawner(child_spawner),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = flux_flow::state::FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = flux_flow::engine::FlowEngine::assemble(
+            Arc::new(ParentProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            executor,
+            events.clone(),
+            flow,
+            "mock".into(),
+            "test".into(),
+            1024,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            std::env::temp_dir().join(format!(
+                "flux-orch-parent-cancel-activity-{}",
+                std::process::id()
+            )),
+        )
+        .unwrap();
+        let session = events.create_session("mock").unwrap();
+        let cancel = CancellationToken::new();
+        let mut sink = ParentSink::default();
+
+        {
+            let turn = engine.run_turn_cancellable(&session, "delegate this", &mut sink, &cancel);
+            tokio::pin!(turn);
+            tokio::select! {
+                entered = entered_rx.recv() => {
+                    assert!(entered.is_some(), "child provider closed before its task started");
+                }
+                result = &mut turn => {
+                    panic!("parent turn ended before the child was in flight: {result:?}");
+                }
+            }
+            cancel.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut turn)
+                .await
+                .expect("parent cancellation must finish promptly")
+                .unwrap();
+        }
+
+        let terminals: Vec<_> = sink
+            .children
+            .iter()
+            .filter_map(|activity| match activity.event {
+                SpawnActivityEvent::Finished { is_error, .. } => Some(is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            terminals,
+            vec![true],
+            "the cancelled child must leave exactly one visible failure terminal: {:?}",
+            sink.children
+        );
+    }
+
     /// A mock provider that names a real provider (not `"mock"`) and records the `model` string it
     /// actually received on the wire — used to prove a role's `model:` override reaches the
     /// provider request through [`flux_core::resolve_role_model`], not verbatim (A-41).

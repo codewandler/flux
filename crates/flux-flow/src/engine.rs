@@ -29,6 +29,13 @@ use flux_lang::runtime::FlowOutcome;
 /// Default bound for the authored decision/batch repeat in the shipped agent loop.
 pub const DEFAULT_AGENT_LOOP_ITERATIONS: usize = 50;
 
+/// Maximum configurable bound for an authored agent loop.
+///
+/// The shipped loop lowers its repeat into a durable top-level state machine by cloning the loop
+/// body once per iteration. Keeping this at twenty times the normal default permits unusually long
+/// turns without allowing configuration input to drive unbounded startup work.
+pub const MAX_AGENT_LOOP_ITERATIONS: usize = 1_000;
+
 /// A shipped agent-loop preset. Presets are ordinary Flux-Lang programs selected explicitly by an
 /// agent definition; the host does not probe the workspace for an implicit override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -404,38 +411,50 @@ impl FlowEngine {
             self.flow.set_cassette(None);
         }
 
-        let mut outer = crate::loop_host::SharedSink::new(channel.clone());
-        let flow_fut = execute_flow_traced(
-            &self.flow,
-            &self.executor,
-            session_id,
-            &self.agent_loop,
-            &mut outer,
-            trace_loop(),
-        );
-        tokio::pin!(flow_fut);
-
         // Reveal the loop machinery on the surface when `--show-loop`/`FLUX_SHOW_LOOP` is set.
         let reveal = show_loop();
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
-                    let subagent_calls = self.subagent_calls_since(subagent_base);
-                    self.record_call_usage_events(session_id, turn_id, &subagent_calls);
-                    let usage = self.turn_usage(&subagent_calls);
-                    let _ = self.events.end_turn(session_id, turn_id, "cancelled", 0, "(turn cancelled)", usage.clone());
-                    return self.finish_turn(session_id, turn_id, sink, "(turn cancelled)", true, usage);
-                }
-                maybe = rx.recv() => {
-                    if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
-                }
-                res = &mut flow_fut => {
-                    while let Ok(ev) = rx.try_recv() { drain_event(ev, sink, reveal); }
-                    break res;
+        let outcome = {
+            let mut outer = crate::loop_host::SharedSink::new(channel.clone());
+            let flow_fut = execute_flow_traced(
+                &self.flow,
+                &self.executor,
+                session_id,
+                &self.agent_loop,
+                &mut outer,
+                trace_loop(),
+            );
+            tokio::pin!(flow_fut);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    maybe = rx.recv() => {
+                        if let Some(ev) = maybe { drain_event(ev, sink, reveal); }
+                    }
+                    res = &mut flow_fut => break Some(res),
                 }
             }
+        };
+        // Cancellation drops the in-flight flow (and any `task` child collector) at the end of the
+        // scope above. Drain only afterwards so drop-time terminal activity is not stranded in the
+        // channel when the borrowed surface is about to return.
+        while let Ok(ev) = rx.try_recv() {
+            drain_event(ev, sink, reveal);
+        }
+        let Some(outcome) = outcome else {
+            let subagent_calls = self.subagent_calls_since(subagent_base);
+            self.record_call_usage_events(session_id, turn_id, &subagent_calls);
+            let usage = self.turn_usage(&subagent_calls);
+            let _ = self.events.end_turn(
+                session_id,
+                turn_id,
+                "cancelled",
+                0,
+                "(turn cancelled)",
+                usage.clone(),
+            );
+            return self.finish_turn(session_id, turn_id, sink, "(turn cancelled)", true, usage);
         };
 
         // The adaptive loop's decision point is an authored, top-level conditional `await`. Park it
@@ -1304,16 +1323,22 @@ pub fn load_agent_loop(cwd: &std::path::Path) -> Result<DraftAst> {
 /// configuration of the parsed program, not a second Rust turn loop. Custom loops without that
 /// conventional execute pass remain byte-for-byte as authored.
 fn load_agent_loop_with_iterations(spec: AgentLoopSpec, max_iterations: usize) -> Result<DraftAst> {
+    if max_iterations == 0 {
+        return Err(flux_core::Error::Other(
+            "max_iterations must be greater than zero".into(),
+        ));
+    }
+    if max_iterations > MAX_AGENT_LOOP_ITERATIONS {
+        return Err(flux_core::Error::Other(format!(
+            "max_iterations {max_iterations} exceeds the maximum of \
+             {MAX_AGENT_LOOP_ITERATIONS} (the built-in agent loop expands once per iteration)"
+        )));
+    }
     let max = u32::try_from(max_iterations).map_err(|_| {
         flux_core::Error::Other(format!(
             "max_iterations {max_iterations} exceeds Flux-Lang's u32 repeat bound"
         ))
     })?;
-    if max == 0 {
-        return Err(flux_core::Error::Other(
-            "max_iterations must be greater than zero".into(),
-        ));
-    }
     let builtin = matches!(spec, AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive));
     let mut ast = match spec {
         AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive) => {
@@ -1910,18 +1935,28 @@ mod tests {
     }
 
     #[test]
-    fn outer_loop_iteration_bounds_reject_zero_and_overflow_before_execution() {
+    fn outer_loop_iteration_bounds_reject_zero_and_values_above_the_practical_cap() {
         let zero = load_agent_loop_with_iterations(AgentLoopSpec::default(), 0)
             .unwrap_err()
             .to_string();
         assert!(zero.contains("must be greater than zero"), "{zero}");
 
-        if usize::BITS > u32::BITS {
-            let overflow =
-                load_agent_loop_with_iterations(AgentLoopSpec::default(), (u32::MAX as usize) + 1)
-                    .unwrap_err()
-                    .to_string();
-            assert!(overflow.contains("exceeds Flux-Lang's u32 repeat bound"));
+        load_agent_loop_with_iterations(AgentLoopSpec::default(), MAX_AGENT_LOOP_ITERATIONS)
+            .expect("the practical maximum remains usable");
+
+        let above_max = load_agent_loop_with_iterations(
+            AgentLoopSpec::default(),
+            MAX_AGENT_LOOP_ITERATIONS + 1,
+        );
+        match above_max {
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    error.contains(&format!("maximum of {MAX_AGENT_LOOP_ITERATIONS}")),
+                    "{error}"
+                );
+            }
+            Ok(_) => panic!("a bound above the practical maximum must fail before AST expansion"),
         }
     }
 

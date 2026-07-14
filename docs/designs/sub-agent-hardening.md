@@ -321,9 +321,10 @@ multi-tenant surface wires real cancellation.
   cancelled (e.g. Ctrl-C), the parent's `select!` returns immediately and **drops** the whole turn future
   — the in-flight `task` call and its child included — without awaiting the child's `finish_turn`. Under
   `with_audit`, that can leave the child's turn **unterminated** (a user message with no finalizing
-  assistant message) in the shared store. Harmless for the CLI default (throwaway child store). *Fix when
-  needed:* a short grace window in the engine's cancel branch that awaits in-flight spawning tools before
-  dropping. Noted in the `spawn` code comment.
+  assistant message) in the shared store. The child's synchronous activity failure is delivered before
+  the parent sink closes, but that does not finalize the durable child conversation. Harmless for the CLI
+  default (throwaway child store). *Fix when needed:* a short grace window in the engine's cancel branch
+  that awaits in-flight spawning tools before dropping. Noted in the `spawn` code comment.
 - **The per-turn cancel slot assumes one active turn per engine.** `ToolContext::set_cancel` writes into a
   single interior-mutable slot on the engine's shared context — the **same** one-active-turn-per-engine
   assumption `loop_host.set_turn` already relies on. A surface that drives two turns concurrently on one

@@ -391,7 +391,79 @@ report() {
     "select phase,arm,model,workload,n,passes,round(total_median) total_med_ms,round(intent_median) intent_med_ms,round(calls_median,1) calls_med,round(repairs_median,1) repairs_med from workload_medians where phase<>'confirm' order by phase,arm,model,workload;"
 }
 
+validate_gate_matrix() {
+  awk -F '\t' -v models="$MODELS" -v candidate="$CONFIRM_ARM" -v trials="$CONFIRM_TRIALS" '
+    function expect(phase, arm, model, workload, trial, key) {
+      key = phase SUBSEP arm SUBSEP model SUBSEP workload SUBSEP trial
+      if (!(key in expected)) {
+        expected[key] = phase
+        label[key] = phase ":" arm ":" model ":" workload ":" trial
+        expected_rows[phase]++
+      }
+    }
+    BEGIN {
+      model_count = split(models, configured_models, /[[:space:]]+/)
+      for (model_index = 1; model_index <= model_count; model_index++) {
+        model = configured_models[model_index]
+        if (model == "") continue
+        for (workload_index = 1; workload_index <= 3; workload_index++) {
+          workload = workload_index == 1 ? "greeting" : workload_index == 2 ? "time" : "support"
+          for (trial = 1; trial <= trials; trial++) {
+            expect("confirm_paired", "baseline", model, workload, trial)
+            expect("confirm_paired", candidate, model, workload, trial)
+          }
+        }
+        expect("slack", candidate, model, "slack", 1)
+      }
+    }
+    NR == 1 { next }
+    {
+      key = $1 SUBSEP $2 SUBSEP $3 SUBSEP $4 SUBSEP $5
+      if ($1 == "confirm_paired" && ($2 == "baseline" || $2 == candidate)) {
+        observed_rows["confirm_paired"]++
+      } else if ($1 == "slack" && $2 == candidate) {
+        observed_rows["slack"]++
+      } else {
+        next
+      }
+      if (key in expected) {
+        actual[key]++
+      } else {
+        unexpected[key]++
+        unexpected_label[key] = $1 ":" $2 ":" $3 ":" $4 ":" $5
+      }
+    }
+    END {
+      for (phase in expected_rows) {
+        found = observed_rows[phase] + 0
+        if (found != expected_rows[phase]) {
+          print "matrix:" phase ":expected=" expected_rows[phase] ":found=" found
+        }
+      }
+      for (key in expected) {
+        count = actual[key] + 0
+        if (count == 0) {
+          print "missing:" label[key]
+        } else if (count > 1) {
+          print "duplicate:" label[key] ":count=" count
+        }
+      }
+      for (key in unexpected) {
+        print "unexpected:" unexpected_label[key] ":count=" unexpected[key]
+      }
+    }
+  ' "$SUMMARY" | LC_ALL=C sort
+}
+
 gate() {
+  local matrix_violations
+  matrix_violations="$(validate_gate_matrix)"
+  if [[ -n "$matrix_violations" ]]; then
+    echo "REJECT $CONFIRM_ARM"
+    printf '%s\n' "$matrix_violations"
+    return 1
+  fi
+
   build_report_db
   local violations
   violations="$(sqlite3 "$REPORT_DB" <<EOF
