@@ -522,7 +522,8 @@ async fn tasks_resubscribe_follows_live_and_replays_terminal() {
 /// the webhook; delete stops delivery. A non-public URL is refused with `-32003`.
 #[tokio::test]
 async fn push_notification_config_and_delivery() {
-    // The SSRF policy refuses loopback in production; tests opt out explicitly.
+    // The SSRF policy refuses loopback in production. This compatibility setting is resolved at
+    // router construction into a loopback-only `PrivateNetAllow` (not the former boolean bypass).
     std::env::set_var("FLUX_A2A_PUSH_ALLOW_LOCAL", "1");
 
     // The card flips the capability (A-57).
@@ -550,6 +551,7 @@ async fn push_notification_config_and_delivery() {
 
     let engine = test_engine(Arc::new(ProseProvider));
     let app = flux_server::router(engine, ServerAuth::Open, CardInfo::flux_coding());
+    std::env::remove_var("FLUX_A2A_PUSH_ALLOW_LOCAL");
 
     // Mint the task (task id = session id, stable across the context's turns).
     let (_, first) = post_json(
@@ -584,19 +586,16 @@ async fn push_notification_config_and_delivery() {
     )
     .await;
     assert_eq!(listed["result"].as_array().unwrap().len(), 1, "{listed}");
-    std::env::remove_var("FLUX_A2A_PUSH_ALLOW_LOCAL");
     let (_, refused) = post_json(
         app.clone(),
         "/a2a",
         rpc(
             "tasks/pushNotificationConfig/set",
-            json!({ "taskId": task_id, "pushNotificationConfig": { "url": "http://127.0.0.1:9/x" } }),
+            json!({ "taskId": task_id, "pushNotificationConfig": { "url": "http://10.0.0.1:9/x" } }),
         ),
     )
     .await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
-    std::env::set_var("FLUX_A2A_PUSH_ALLOW_LOCAL", "1");
-
     // A second turn on the same context (same task id) delivers its terminal transition.
     let (_, second) = post_json(
         app.clone(),

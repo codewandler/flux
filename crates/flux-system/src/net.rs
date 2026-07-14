@@ -57,9 +57,39 @@ impl PrivateNetAllow {
     }
 }
 
+/// DNS resolution seam used by the URL guard. Production uses [`SystemHostResolver`]; callers that
+/// store destinations can inject a deterministic resolver in tests to prove registration and
+/// delivery each resolve independently.
+pub trait HostResolver: Send + Sync {
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// Host resolver backed by the operating system's configured DNS implementation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemHostResolver;
+
+impl HostResolver for SystemHostResolver {
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<IpAddr>> {
+        (host, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.map(|address| address.ip()).collect())
+    }
+}
+
 /// Reject URLs that aren't safe to fetch. Private addresses are allowed only when `allow` covers the
 /// URL host for this caller.
 pub fn guard_url_scoped(raw: &str, allow: &PrivateNetAllow) -> Result<url::Url> {
+    guard_url_scoped_with_resolver(raw, allow, &SystemHostResolver)
+}
+
+/// Resolve and guard a URL with an explicit DNS resolver. If a hostname has multiple answers, one
+/// blocked address rejects the whole destination. Resolution failures remain connection errors,
+/// not grants; the eventual client will fail to connect.
+pub fn guard_url_scoped_with_resolver(
+    raw: &str,
+    allow: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> Result<url::Url> {
     let url = url::Url::parse(raw).map_err(|e| Error::Other(format!("invalid url: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
@@ -81,9 +111,9 @@ pub fn guard_url_scoped(raw: &str, allow: &PrivateNetAllow) -> Result<url::Url> 
             // Resolve to IPs and reject if ANY resolved address is in a blocked range. An
             // unresolvable host is left to fail at connect time (it's not an SSRF).
             let port = url.port_or_known_default().unwrap_or(80);
-            if let Ok(addrs) = (domain, port).to_socket_addrs() {
-                for sa in addrs {
-                    block_if(sa.ip(), domain, allow)?;
+            if let Ok(addresses) = resolver.resolve(domain, port) {
+                for address in addresses {
+                    block_if(address, domain, allow)?;
                 }
             }
             Ok(url)
@@ -365,6 +395,65 @@ mod tests {
         let localhost = PrivateNetAllow::from_hosts(vec!["localhost".to_string()]);
         assert!(guard_url_scoped("http://localhost:8080/", &localhost).is_ok());
         assert!(guard_url_scoped("http://metadata.google.internal/", &localhost).is_err());
+    }
+
+    struct FixedResolver(Vec<IpAddr>);
+
+    impl HostResolver for FixedResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn dns_resolution_matrix_blocks_every_internal_family_and_mixed_answers() {
+        let blocked = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ];
+        for address in blocked {
+            let resolver = FixedResolver(vec![address.parse().unwrap()]);
+            assert!(
+                guard_url_scoped_with_resolver(
+                    "https://rebinding.example/hook",
+                    &PrivateNetAllow::None,
+                    &resolver,
+                )
+                .is_err(),
+                "hostname resolution admitted {address}"
+            );
+        }
+
+        let mixed = FixedResolver(vec![
+            "93.184.216.34".parse().unwrap(),
+            "169.254.169.254".parse().unwrap(),
+        ]);
+        assert!(guard_url_scoped_with_resolver(
+            "https://rebinding.example/hook",
+            &PrivateNetAllow::None,
+            &mixed,
+        )
+        .is_err());
+
+        let exact = PrivateNetAllow::from_hosts(["rebinding.example".to_string()]);
+        assert!(
+            guard_url_scoped_with_resolver("https://rebinding.example/hook", &exact, &mixed,)
+                .is_ok()
+        );
+        let wrong = PrivateNetAllow::from_hosts(["other.example".to_string()]);
+        assert!(
+            guard_url_scoped_with_resolver("https://rebinding.example/hook", &wrong, &mixed,)
+                .is_err()
+        );
     }
 
     #[tokio::test]

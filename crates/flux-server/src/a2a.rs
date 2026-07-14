@@ -58,6 +58,11 @@ use flux_a2a::{error, server};
 use flux_a2a::{AgentCard, Message, Task, TaskState, TaskStatus};
 use flux_events::EventKind;
 use flux_flow::AgentSink;
+#[cfg(test)]
+use flux_system::net::guard_url_scoped;
+use flux_system::net::{
+    guard_url_scoped_with_resolver, HostResolver, PrivateNetAllow, SystemHostResolver,
+};
 
 use std::sync::Arc;
 
@@ -175,15 +180,26 @@ struct LiveTask {
 /// the webhook delivery client. One per router (like the turn gate), shared across the mount's
 /// agents: keys are `(scope, task_id)` — scope is `""` on the single-agent mount and the
 /// `agent_id` on a multi-agent mount — so two agents' identical `s_<n>` ids never collide.
-#[derive(Default)]
 pub struct TaskRegistry {
     live: std::sync::Mutex<HashMap<(String, String), LiveTask>>,
     /// Push configs live beside (not inside) the live map so a config set while running is still
     /// readable after the task finishes. In-process only, like the live map: a restart drops
     /// them, and delivery only happens for in-process runs anyway.
     push: std::sync::Mutex<HashMap<(String, String), Vec<Value>>>,
-    /// One pooled HTTP client for webhook delivery (A-57).
+    /// One pooled, redirect-disabled HTTP client for webhook delivery (A-57/C-59).
     http: reqwest::Client,
+    /// The one A2A-push egress scope. Registration and delivery both evaluate URLs against this
+    /// exact allow-set; no per-request or process-global bypass reaches the client.
+    private_net: PrivateNetAllow,
+    /// Shared DNS seam. Production uses the OS resolver; tests inject changing answers to prove
+    /// registration and delivery are separate authorization decisions.
+    resolver: Arc<dyn HostResolver>,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self::with_private_net(configured_push_private_net())
+    }
 }
 
 /// What [`mint_and_register`] hands the run that was just registered.
@@ -212,6 +228,30 @@ enum MintError {
 }
 
 impl TaskRegistry {
+    fn with_private_net(private_net: PrivateNetAllow) -> Self {
+        Self::with_private_net_and_resolver(private_net, Arc::new(SystemHostResolver))
+    }
+
+    fn with_private_net_and_resolver(
+        private_net: PrivateNetAllow,
+        resolver: Arc<dyn HostResolver>,
+    ) -> Self {
+        Self {
+            live: std::sync::Mutex::new(HashMap::new()),
+            push: std::sync::Mutex::new(HashMap::new()),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("the redirect-disabled A2A push client uses only static options"),
+            private_net,
+            resolver,
+        }
+    }
+
+    fn push_url_allowed(&self, url: &str) -> bool {
+        guard_url_scoped_with_resolver(url, &self.private_net, self.resolver.as_ref()).is_ok()
+    }
+
     /// Realm-checked lookup: `Some` only when the task is live **and** minted in the caller's
     /// realm; a cross-realm hit is `None`, indistinguishable from an unknown id.
     fn snapshot(&self, scope: &str, id: &str, realm: Option<&str>) -> Option<(TaskState, String)> {
@@ -1338,12 +1378,12 @@ async fn push_config(
             let Some(url) = cfg.get("url").and_then(Value::as_str) else {
                 return rpc_err(id, -32602, "pushNotificationConfig.url is required");
             };
-            if !push_url_allowed(url) {
+            if !registry.push_url_allowed(url) {
                 // -32003: this server does not push to that destination (scheme/host policy).
                 return rpc_err(
                     id,
                     error::PUSH_NOTIFICATION_NOT_SUPPORTED,
-                    "push URL not supported: only public http(s) endpoints are allowed",
+                    "push URL not supported by the configured A2A egress scope",
                 );
             }
             // The config id defaults to its URL (the spec lets servers key configs that way).
@@ -1410,47 +1450,71 @@ async fn push_config(
     }
 }
 
-/// The push-destination policy (documented SSRF posture): only `http`/`https`, and never a
-/// loopback, private, link-local, or unspecified **literal** address (nor `localhost`) — a
-/// webhook must be a public endpoint. Resolution-time tricks (DNS rebinding) are out of scope:
-/// deployments that need stronger egress guarantees should enforce them at the network layer.
-/// `FLUX_A2A_PUSH_ALLOW_LOCAL=1` lifts the host policy for local development and tests.
-fn push_url_allowed(url: &str) -> bool {
-    let Ok(u) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    if !matches!(u.scheme(), "http" | "https") {
-        return false;
-    }
+/// Resolve the explicit comma-separated private-host grant plus the compatibility local-development
+/// switch into one narrow allow-set. Unlike the old boolean bypass, `FLUX_A2A_PUSH_ALLOW_LOCAL=1`
+/// admits only the three loopback spellings; other private targets must be named in
+/// `FLUX_A2A_PUSH_PRIVATE_HOSTS`. Both paths still route through [`PrivateNetAllow`].
+fn configured_push_private_net() -> PrivateNetAllow {
+    let mut hosts = std::env::var("FLUX_A2A_PUSH_PRIVATE_HOSTS")
+        .ok()
+        .into_iter()
+        .flat_map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     if std::env::var("FLUX_A2A_PUSH_ALLOW_LOCAL").is_ok_and(|v| v == "1") {
-        return true;
+        hosts.extend(["localhost", "127.0.0.1", "::1"].map(str::to_string));
     }
-    let Some(host) = u.host_str() else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return false;
-    }
-    if let Ok(ip) = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-    {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified())
-            }
-            std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
-        };
-    }
-    true
+    PrivateNetAllow::from_hosts(hosts)
 }
 
-/// Best-effort webhook delivery of one transition frame (A-57): one POST per registered config,
-/// fire-and-forget on a spawned task, 10s timeout, failures logged, **no retry** (the documented
-/// policy — the durable task projection is the source of truth; push is a hint to poll). A
-/// config's `token` rides along as `X-A2A-Notification-Token` so receivers can authenticate the
-/// caller.
+/// Apply the shared DNS-aware SSRF guard at registration time. Delivery repeats this check so a
+/// stored config is not trusted after DNS or configuration changes.
+#[cfg(test)]
+fn push_url_allowed(url: &str, private_net: &PrivateNetAllow) -> bool {
+    guard_url_scoped(url, private_net).is_ok()
+}
+
+/// Send one guarded push request. The pooled client never follows redirects: a 3xx is a refused
+/// delivery rather than an opportunity to replay the notification token to another origin. The
+/// caller intentionally does not retry; the durable task projection remains the source of truth.
+async fn send_push_guarded(
+    client: &reqwest::Client,
+    private_net: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+    url: &str,
+    token: Option<&str>,
+    frame: &Value,
+) -> Result<reqwest::StatusCode, String> {
+    // Re-resolve immediately before sending. Registration-time admission is not authority for a
+    // later request: the hostname may have changed resolution or the config may predate this guard.
+    let url =
+        guard_url_scoped_with_resolver(url, private_net, resolver).map_err(|e| e.to_string())?;
+    let mut request = client
+        .post(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(frame);
+    if let Some(token) = token {
+        request = request.header("X-A2A-Notification-Token", token);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    if response.status().is_redirection() {
+        return Err(format!(
+            "redirect refused (HTTP {}); A2A push does not forward notification credentials",
+            response.status()
+        ));
+    }
+    Ok(response.status())
+}
+
+/// Best-effort webhook delivery of one transition frame (A-57/C-59): one POST per registered
+/// config, fire-and-forget on a spawned task, 10s timeout, failures logged, **no redirect and no
+/// retry**. Every delivery repeats the scoped DNS-aware URL guard. A config's `token` rides only
+/// to the exact registered origin as `X-A2A-Notification-Token`.
 fn deliver_push(registry: &Arc<TaskRegistry>, scope: &str, task_id: &str, frame: &Value) {
     let configs: Vec<Value> = registry
         .push
@@ -1465,18 +1529,22 @@ fn deliver_push(registry: &Arc<TaskRegistry>, scope: &str, task_id: &str, frame:
         };
         let token = cfg.get("token").and_then(Value::as_str).map(str::to_string);
         let client = registry.http.clone();
+        let private_net = registry.private_net.clone();
+        let resolver = registry.resolver.clone();
         let frame = frame.clone();
         tokio::spawn(async move {
-            let mut req = client
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(10))
-                .json(&frame);
-            if let Some(t) = token {
-                req = req.header("X-A2A-Notification-Token", t);
-            }
-            match req.send().await {
-                Ok(resp) if !resp.status().is_success() => {
-                    eprintln!("(a2a push: {url} answered {})", resp.status());
+            match send_push_guarded(
+                &client,
+                &private_net,
+                resolver.as_ref(),
+                &url,
+                token.as_deref(),
+                &frame,
+            )
+            .await
+            {
+                Ok(status) if !status.is_success() => {
+                    eprintln!("(a2a push: {url} answered {status})");
                 }
                 Err(e) => eprintln!("(a2a push: delivery to {url} failed: {e})"),
                 _ => {}
@@ -1707,6 +1775,251 @@ impl AgentSink for StreamSink {
 mod tests {
     use super::*;
     use flux_flow::engine::FlowEngine;
+
+    #[test]
+    fn push_url_policy_rejects_the_shared_guard_ranges() {
+        for url in [
+            "http://localhost/hook",
+            "http://127.0.0.1/hook",
+            "http://10.0.0.1/hook",
+            "http://169.254.169.254/hook",
+            "http://100.64.0.1/hook",
+            "http://[::ffff:10.0.0.1]/hook",
+            "http://metadata.google.internal/hook",
+        ] {
+            assert!(
+                !push_url_allowed(url, &PrivateNetAllow::None),
+                "unexpectedly admitted {url}"
+            );
+        }
+
+        let granted = PrivateNetAllow::from_hosts(["10.0.0.1".to_string()]);
+        assert!(push_url_allowed("http://10.0.0.1/hook", &granted));
+        assert!(!push_url_allowed("http://10.0.0.2/hook", &granted));
+    }
+
+    #[tokio::test]
+    async fn push_delivery_never_follows_a_cross_origin_redirect() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{any, post};
+        use axum::Router;
+
+        let target_headers: Arc<tokio::sync::Mutex<Vec<HeaderMap>>> = Arc::default();
+        let seen = target_headers.clone();
+        let target = Router::new().route(
+            "/target",
+            any(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().await.push(headers);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!(
+            "http://localhost:{}/target",
+            target_listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            axum::serve(target_listener, target).await.unwrap();
+        });
+
+        let source_headers: Arc<tokio::sync::Mutex<Vec<HeaderMap>>> = Arc::default();
+        let source_seen = source_headers.clone();
+        let source = Router::new().route(
+            "/source",
+            post(move |headers: HeaderMap| {
+                let target_url = target_url.clone();
+                let source_seen = source_seen.clone();
+                async move {
+                    source_seen.lock().await.push(headers);
+                    (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, target_url)],
+                    )
+                }
+            }),
+        );
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/source", source_listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(source_listener, source).await.unwrap();
+        });
+
+        let registry = Arc::new(TaskRegistry::with_private_net(PrivateNetAllow::from_hosts(
+            ["127.0.0.1".to_string()],
+        )));
+        registry.push.lock().unwrap().insert(
+            (String::new(), "task".to_string()),
+            vec![json!({ "url": source_url, "token": "must-not-cross-origin" })],
+        );
+        deliver_push(&registry, "", "task", &json!({ "status": "working" }));
+
+        for _ in 0..25 {
+            if !source_headers.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let source_headers = source_headers.lock().await;
+        assert_eq!(
+            source_headers.len(),
+            1,
+            "registered origin received one push"
+        );
+        assert_eq!(
+            source_headers[0]
+                .get("X-A2A-Notification-Token")
+                .and_then(|value| value.to_str().ok()),
+            Some("must-not-cross-origin")
+        );
+        drop(source_headers);
+        assert!(
+            target_headers.lock().await.is_empty(),
+            "redirect target received the push request (and potentially its token)"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_delivery_reguards_a_stored_private_destination() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+
+        let received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = received.clone();
+        let target = Router::new().route(
+            "/target",
+            post(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, target).await.unwrap();
+        });
+
+        // Insert directly to model a config stored before the hostname changed resolution. The
+        // delivery boundary must guard it again instead of trusting registration-time admission.
+        let registry = Arc::new(TaskRegistry::with_private_net(PrivateNetAllow::None));
+        registry.push.lock().unwrap().insert(
+            (String::new(), "task".to_string()),
+            vec![json!({ "url": target_url })],
+        );
+        deliver_push(&registry, "", "task", &json!({ "status": "working" }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !received.load(std::sync::atomic::Ordering::SeqCst),
+            "delivery trusted a stored URL without re-running the scoped egress guard"
+        );
+    }
+
+    struct RebindingResolver {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HostResolver for RebindingResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![if call == 0 {
+                "93.184.216.34".parse().unwrap()
+            } else {
+                "169.254.169.254".parse().unwrap()
+            }])
+        }
+    }
+
+    struct StaticResolver(std::net::IpAddr);
+
+    impl HostResolver for StaticResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec![self.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn push_delivery_rejects_every_internal_dns_family_before_io() {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let cases = [
+            ("loopback-v4", "127.0.0.1", "delivery.example.invalid"),
+            ("loopback-v6", "::1", "delivery.example.invalid"),
+            ("rfc1918-10", "10.1.2.3", "delivery.example.invalid"),
+            ("rfc1918-172", "172.16.2.3", "delivery.example.invalid"),
+            ("rfc1918-192", "192.168.2.3", "delivery.example.invalid"),
+            ("link-local-v4", "169.254.1.2", "delivery.example.invalid"),
+            ("link-local-v6", "fe80::1", "delivery.example.invalid"),
+            ("cgnat", "100.64.0.1", "delivery.example.invalid"),
+            (
+                "ipv4-mapped-private",
+                "::ffff:10.1.2.3",
+                "delivery.example.invalid",
+            ),
+            ("unique-local-v6", "fd00::1", "delivery.example.invalid"),
+            (
+                "internal-hostname",
+                "93.184.216.34",
+                "metadata.google.internal",
+            ),
+        ];
+
+        for (label, ip, host) in cases {
+            let resolver = StaticResolver(ip.parse().unwrap());
+            let result = send_push_guarded(
+                &client,
+                &PrivateNetAllow::None,
+                &resolver,
+                &format!("https://{host}/hook"),
+                Some("must-not-send"),
+                &json!({"status": "working"}),
+            )
+            .await;
+            assert!(result.is_err(), "{label} unexpectedly reached network IO");
+        }
+    }
+
+    #[tokio::test]
+    async fn push_delivery_reresolves_hostname_and_blocks_rebinding() {
+        let resolver = Arc::new(RebindingResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let registry = Arc::new(TaskRegistry::with_private_net_and_resolver(
+            PrivateNetAllow::None,
+            resolver.clone(),
+        ));
+        let url = "https://rebind.example.invalid/hook";
+
+        assert!(
+            registry.push_url_allowed(url),
+            "the registration-time public answer should be admitted"
+        );
+        registry.push.lock().unwrap().insert(
+            (String::new(), "task".to_string()),
+            vec![json!({ "url": url, "token": "must-not-send" })],
+        );
+        deliver_push(&registry, "", "task", &json!({ "status": "working" }));
+
+        for _ in 0..50 {
+            if resolver.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            resolver.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "delivery must make a fresh DNS authorization decision"
+        );
+    }
 
     /// A provider that declares an intent, then answers with one word. (Mirrors
     /// `crate::tests::ProseProvider`; duplicated locally so this module stays self-contained.)

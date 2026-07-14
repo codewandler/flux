@@ -49,6 +49,11 @@ and a delivery layer, and flipping `capabilities.pushNotifications` to `true`.
   `true` (new `AgentCard::with_push_notifications`). Test:
   `push_notification_config_and_delivery` (set/list/refused-URL/delivery-to-live-webhook/delete
   stops delivery; card flip).
+- 2026-07-14 — C-59 superseded the original literal-host-only SSRF posture: registration and every
+  delivery now use the shared DNS-aware scoped URL guard, redirects are disabled, and private
+  targets require an exact `PrivateNetAllow` host grant. The compatibility local-development flag
+  is narrowed to the three loopback spellings; DNS rebinding and redirect handling are no longer
+  deferred.
 
 ## Notes
 - Shipped with A-54..A-56 in one Tier-3 pass. Epic:

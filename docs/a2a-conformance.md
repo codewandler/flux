@@ -29,7 +29,7 @@ A-48); one context runs one task at a time (its id is stable across the context'
 | `tasks/get` | ✅ | Server + client (A-54): live tasks answer from the registry, finished ones from the event-log projection; realm-scoped; unknown/cross-realm → `-32001`. |
 | `tasks/cancel` | ✅ | Fires the live run's `CancellationToken` out-of-band (A-55); terminal/not-in-process → `-32002`; unknown → `-32001`. |
 | `tasks/resubscribe` | ✅ | Re-attach SSE (A-56): live tasks replay a state snapshot then follow the run's broadcast to the final frame; finished tasks replay the terminal frame and close. |
-| `tasks/pushNotificationConfig/{set,get,list,delete}` | ✅ | Per-task webhook configs + best-effort delivery of status transitions (A-57); non-public URLs refused with `-32003`. |
+| `tasks/pushNotificationConfig/{set,get,list,delete}` | ✅ | Per-task webhook configs + best-effort delivery of status transitions (A-57/C-59); destinations are DNS-checked against the scoped private-network grant and redirects are refused. |
 | `agent/getAuthenticatedExtendedCard` | ❌ | No extended card; returns `-32004` (A-50). |
 
 Reusable `flux-a2a::server::dispatch` handles only `message/send` (synchronous-turn); the stateful
@@ -106,16 +106,19 @@ task surface and `message/stream` live in the `flux-server` HTTP layer.
 | `-32005` ContentTypeNotSupported | ✅ | Emitted when an inbound message carries a `file` part (A-51) or otherwise has parts but no usable text/data part (A-50). |
 | `-32001` TaskNotFound | ✅ | Emitted for unknown/cross-realm/non-A2A task ids — one constant answer (A-54). |
 | `-32002` TaskNotCancelable | ✅ | Emitted for terminal or not-in-process tasks (A-55). |
-| `-32003` PushNotificationNotSupported | ✅ | Emitted for refused push URLs (scheme/host policy, A-57). |
+| `-32003` PushNotificationNotSupported | ✅ | Emitted for push URLs refused by the shared DNS-aware scheme/host/private-network policy (A-57/C-59). |
 | `-32006` / `-32007` | ❌ | Constants defined (`flux_a2a::error`); no producing path yet. |
 
 ## Push notifications & extensions
 
 - **Push notifications** — ✅ per-task webhook configs + best-effort delivery of status
   transitions (A-57): one POST per transition, 10s timeout, no retry (the durable task projection
-  is the source of truth); config `token` rides as `X-A2A-Notification-Token`. SSRF posture: only
-  public `http(s)` endpoints (loopback/private/link-local literals and `localhost` refused;
-  `FLUX_A2A_PUSH_ALLOW_LOCAL=1` for local development).
+  is the source of truth); config `token` rides as `X-A2A-Notification-Token`. SSRF posture: the
+  shared URL guard resolves hostnames and refuses loopback, private, link-local, CGNAT, mapped, and
+  internal destinations by default. `FLUX_A2A_PUSH_PRIVATE_HOSTS` grants only the named private
+  hosts; the compatibility `FLUX_A2A_PUSH_ALLOW_LOCAL=1` grants only `localhost`, `127.0.0.1`, and
+  `::1`. Delivery re-checks the destination, never follows redirects, and never forwards the token
+  to a redirected origin.
 - **Extensions** — ⚠️ tolerant passthrough only: unknown fields survive round-trips via
   `#[serde(flatten)]`, but there is no extension-URI declaration/activation. Negotiation is a 🚫
   non-goal.
