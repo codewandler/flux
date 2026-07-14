@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.24.0] - 2026-07-14
+
 ### Improved
 
 - **Reading or crawling web pages now clearly shows when a page will also be saved to your searchable

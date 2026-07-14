@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-07-14
+
 ### Changed
 
 - **BREAKING (slack plugin op): `slack.channel.mark-read` → `slack.channel.mark_read`.** It was the
