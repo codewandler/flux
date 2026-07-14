@@ -65,6 +65,7 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   installed.
 - **Fix invalid or duplicate role files before starting an agent.** Unknown frontmatter keys and
   malformed `tools`, effort, or loop settings are now rejected rather than ignored.
+
 ## [0.24.1] - 2026-07-14
 
 ### Improved

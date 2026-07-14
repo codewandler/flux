@@ -80,6 +80,7 @@ All notable changes to this project are documented in this file. The format is b
 - **C-66: cognition usage observed before provider failure or cancellation is retained exactly
   once.** The same billable usage now reaches evidence, turn totals, cost projections, SDK/App
   results, and sub-agent aggregation without replacing the original error.
+
 ## [0.24.1] - 2026-07-14
 
 ### Added
