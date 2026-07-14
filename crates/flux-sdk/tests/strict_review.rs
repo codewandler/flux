@@ -170,7 +170,8 @@ impl Provider for UnusedTopLevelProvider {
 fn build_client() -> FlowClient {
     // Load the REAL checked-in reviewer role files, exercising the actual restricted role
     // definitions (frontmatter `tools: []`) the story ships.
-    let roles = RoleRegistry::load(&[repo_root().join(".flux/agents")]);
+    let system = flux_system::System::new(flux_system::Workspace::new(repo_root()).unwrap());
+    let roles = RoleRegistry::try_load_project(&system, ".flux/agents").unwrap();
     assert!(
         roles.get("review-security").is_some(),
         "review-security role must load from .flux/agents"

@@ -16,10 +16,14 @@ pub use flux_flow::engine::{AgentLoopSpec, BuiltinAgentLoop};
 use flux_flow::state::FlowStore;
 pub use flux_flow::{AdaptiveLoopPolicy, AgentStagePolicy};
 use flux_provider::{Effort, Provider};
-use flux_runtime::{Approver, Executor, PermissionManager, ToolContext, ToolRegistry};
+use flux_runtime::{
+    Approver, ExecutionAuthorization, ExecutionEnvironment, Executor, PermissionManager,
+    ToolContext, ToolRegistry,
+};
 
 pub mod role;
-pub use role::{parse_role, Role, RoleRegistry};
+#[allow(deprecated)]
+pub use role::{parse_role, try_parse_role, Role, RoleRegistry};
 
 /// The default system prompt: the coding-agent contract (approach, tool discipline, the guarded
 /// envelope, safety/git rules, and output style). Per-turn context (environment, git state, repo
@@ -114,6 +118,37 @@ pub struct Permissions {
     pub deny: Vec<String>,
 }
 
+/// Surface-owned inputs used when [`AgentSpec`] constructs its guarded [`Executor`].
+///
+/// Keeping the approval handler and dispatch context beside the mandatory authorization profile
+/// makes the simple assembly door explicit without duplicating the broader executor builder that
+/// richer surfaces use through [`AgentSpec::into_engine`].
+#[deprecated(
+    since = "0.24.0",
+    note = "use flux_runtime::ExecutionEnvironment and AgentSpec::assemble_in; this shim is planned for removal in 0.26"
+)]
+pub struct AgentExecutorConfig {
+    approver: Arc<dyn Approver>,
+    context: ToolContext,
+    authorization: ExecutionAuthorization,
+}
+
+#[allow(deprecated)]
+impl AgentExecutorConfig {
+    /// Bundle the surface's approval posture, guarded tool context, and authorization floor.
+    pub fn new(
+        approver: Arc<dyn Approver>,
+        context: ToolContext,
+        authorization: ExecutionAuthorization,
+    ) -> Self {
+        Self {
+            approver,
+            context,
+            authorization,
+        }
+    }
+}
+
 /// Default byte budget for injected `context` blocks (A-19); overridable per spec.
 pub const DEFAULT_CONTEXT_BUDGET: usize = 8192;
 
@@ -205,14 +240,20 @@ impl AgentSpec {
         }
     }
 
-    /// Explicitly enable every skill from the default skill directories rooted at this spec's `cwd`
-    /// ([`flux_skill::default_skill_dirs`]: project `.flux/skills` + `.claude/skills`, then the
-    /// user-global dirs; project wins name clashes). Discovery is progressive — only Level-1
-    /// metadata is read here; bodies load when the engine injects the explicitly enabled skills.
-    /// Set `cwd` first. Most callers should select named skills instead of enabling the whole set.
-    pub fn with_default_skills(mut self) -> Self {
-        self.skills = flux_skill::discover_merged(&flux_skill::default_skill_dirs(&self.cwd));
-        self
+    /// Explicitly enable every skill from the guarded project and trusted user-global default
+    /// directories rooted at this spec's `cwd`. Set `cwd` first. Most callers should select named
+    /// skills instead of enabling the whole set.
+    pub fn try_with_default_skills(mut self) -> Result<Self> {
+        self.skills = flux_runtime::metadata::discover_skills(&self.cwd, &[])?;
+        Ok(self)
+    }
+
+    /// Compatibility wrapper for the former infallible builder. Guard failures are intentionally
+    /// loud; new code should propagate [`Self::try_with_default_skills`].
+    #[deprecated(note = "use try_with_default_skills and propagate project metadata failures")]
+    pub fn with_default_skills(self) -> Self {
+        self.try_with_default_skills()
+            .expect("guarded default skill discovery failed")
     }
 
     /// Set the compaction threshold (serialized chars) — the size past which older turns are
@@ -251,22 +292,53 @@ impl AgentSpec {
     }
 
     /// Build the standard agent executor for this spec (select the `tools` subset, apply
-    /// `permissions`, register the authored-loop ops) and assemble the engine. The simple path for
-    /// surfaces that don't need custom hooks/policy/identity (e.g. the SDK). For full control over
-    /// the executor, build it yourself and call [`AgentSpec::into_engine`].
+    /// `permissions`, install the mandatory authorization profile, register the authored-loop ops)
+    /// and assemble the engine. For full control over the executor, build it yourself and call
+    /// [`AgentSpec::into_engine`].
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.24.0",
+        note = "use AgentSpec::assemble_in with flux_runtime::ExecutionEnvironment; this shim is planned for removal in 0.26"
+    )]
     pub fn assemble(
         self,
         provider: Arc<dyn Provider>,
         registry: ToolRegistry,
-        approver: Arc<dyn Approver>,
-        ctx: ToolContext,
+        executor: AgentExecutorConfig,
         events: Arc<EventStore>,
         flow: FlowStore,
     ) -> Result<FlowEngine> {
-        let mut registry = registry.subset(self.tools.as_deref());
-        register_agent_ops(&mut registry);
         let perms = PermissionManager::from_rules(&self.permissions.allow, &self.permissions.deny);
-        let executor = Executor::new(registry, perms, approver, ctx);
+        let environment = ExecutionEnvironment::from_context(
+            registry,
+            perms,
+            executor.approver,
+            executor.authorization,
+            executor.context,
+        );
+        self.assemble_in(provider, environment, events, flow)
+    }
+
+    /// Assemble this definition through the shared guarded execution-environment path.
+    ///
+    /// The surface owns workspace, catalog, approval, and authority decisions. This method applies
+    /// the spec's tool subset and permission rules, restores the canonical authored-loop control
+    /// plane, then builds the executor without consulting ambient process state.
+    pub fn assemble_in(
+        self,
+        provider: Arc<dyn Provider>,
+        environment: ExecutionEnvironment,
+        events: Arc<EventStore>,
+        flow: FlowStore,
+    ) -> Result<FlowEngine> {
+        let mut registry = environment.registry().subset(self.tools.as_deref());
+        register_agent_ops(&mut registry)?;
+        let permissions =
+            PermissionManager::from_rules(&self.permissions.allow, &self.permissions.deny);
+        let executor = environment
+            .with_registry(registry)
+            .with_permissions(permissions)
+            .into_executor();
         self.into_engine(provider, executor, events, flow)
     }
 
@@ -347,14 +419,131 @@ fn resolve_adaptive_policy(provider: &str, policy: &mut AdaptiveLoopPolicy) -> R
 /// **after** any [`subset`](flux_runtime::ToolRegistry::subset), so a tool-restricted agent (a role
 /// with `tools: [read, grep]`) still has the loop machinery (these ops are the engine's own control
 /// flow, not model-facing tools, and match what [`FlowEngine::assemble`] pre-allows).
-pub fn register_agent_ops(registry: &mut ToolRegistry) {
-    flux_tools::register_reflect(registry);
-    flux_tools::register_evidence(registry);
+pub fn register_agent_ops(registry: &mut ToolRegistry) -> Result<()> {
+    let mut assembled = registry.clone();
+    flux_tools::install_reflect(&mut assembled)?;
+    flux_tools::install_evidence(&mut assembled)?;
+    *registry = assembled;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_control_plane_replaces_conflicts_and_survives_tool_subsets() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .try_register_from(
+                "injected conflicting control plane",
+                flux_runtime::tool_fn(
+                    flux_spec::ToolSpec::read_only(
+                        "observe",
+                        "injected observe handler",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    |_input| async { Ok(serde_json::Value::Null) },
+                ),
+            )
+            .unwrap();
+        registry
+            .try_register_from(
+                "visible role tool",
+                flux_runtime::tool_fn(
+                    flux_spec::ToolSpec::read_only(
+                        "visible",
+                        "visible role tool",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                    |_input| async { Ok(serde_json::Value::Null) },
+                ),
+            )
+            .unwrap();
+
+        register_agent_ops(&mut registry).unwrap();
+        assert_ne!(
+            registry.get("observe").unwrap().spec().description,
+            "injected observe handler",
+            "agent-owned control-plane names must use the canonical handler"
+        );
+
+        let mut restricted = registry.subset(Some(&["visible".to_string()]));
+        register_agent_ops(&mut restricted).unwrap();
+        assert_eq!(
+            restricted.names(),
+            vec![
+                "ai_segment",
+                "approve_batch",
+                "detect_intent",
+                "evidence",
+                "execute_batch",
+                "explore",
+                "metrics",
+                "observe",
+                "op.register",
+                "present_results",
+                "visible",
+            ]
+        );
+    }
+
+    /// C-60: the convenience assembly door receives an explicit authorization profile, and an
+    /// allow-everything approver cannot widen an empty (deny-all) policy floor.
+    #[tokio::test]
+    async fn assemble_auto_approval_cannot_widen_the_authorization_floor() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_hits = hits.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only("guarded_probe", "probe", serde_json::json!({}))
+                .with_access(vec![flux_spec::AccessKind::Filesystem]),
+            move |_input| {
+                let hits = tool_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!("ran"))
+                }
+            },
+        ));
+        let mut spec = AgentSpec::new("null");
+        spec.permissions.allow.push("guarded_probe".into());
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "flux-agent-c60-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let system = Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&root).unwrap(),
+        ));
+        let (caller, trust) = flux_policy::local_identity("agent-test");
+        let environment = ExecutionEnvironment::new(
+            system,
+            registry,
+            PermissionManager::new(),
+            Arc::new(flux_runtime::AllowApprover),
+            ExecutionAuthorization::new(flux_policy::AuthorizationPolicy::default(), caller, trust),
+        );
+        let engine = spec
+            .assemble_in(
+                Arc::new(flux_provider::NullProvider),
+                environment,
+                events,
+                flow,
+            )
+            .unwrap();
+
+        let result = engine
+            .executor
+            .dispatch("guarded_probe", serde_json::json!({}))
+            .await;
+        assert!(result.is_error && result.content.contains("denied by policy"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
 
     /// The `bash` bullet in `DEFAULT_SYSTEM_PROMPT` must contain both new clauses:
     /// (1) verify runtime tools with `command -v` before writing files, and
@@ -509,8 +698,7 @@ mod tests {
         assert!(error.contains("parent's provider ('codex')"), "{error}");
     }
 
-    /// L-02: `with_default_skills` discovers from `flux_skill::default_skill_dirs(cwd)` — a skill
-    /// under `<cwd>/.flux/skills` lands in the spec, with its body still unloaded (progressive).
+    /// L-02: guarded default discovery injects a project skill's bytes into the pure L0 parser.
     #[test]
     fn with_default_skills_populates_from_cwd_dirs() {
         let dir = std::env::temp_dir().join(format!("flux-agent-skills-{}", std::process::id()));
@@ -526,15 +714,16 @@ mod tests {
             cwd: dir.clone(),
             ..AgentSpec::new("mock")
         }
-        .with_default_skills();
+        .try_with_default_skills()
+        .unwrap();
         let s = spec
             .skills
             .iter()
             .find(|s| s.name == "agent-spec-l02")
             .expect("project skill discovered");
         assert!(
-            !s.body.is_loaded(),
-            "population is Level-1 only; the body loads on activation"
+            s.body.is_loaded(),
+            "guarded project bytes are injected inline"
         );
         assert_eq!(s.body.text(), "BODY");
         std::fs::remove_dir_all(&dir).ok();

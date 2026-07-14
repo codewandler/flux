@@ -47,7 +47,10 @@ pub const REVIEW_ROLE_SOURCES: &[(&str, &str)] = &[
 pub fn builtin_review_roles() -> Vec<flux_agent::Role> {
     REVIEW_ROLE_SOURCES
         .iter()
-        .map(|(name, src)| flux_agent::parse_role(src, name))
+        .map(|(name, src)| {
+            flux_agent::try_parse_role(src, name)
+                .expect("checked-in built-in reviewer role must have valid metadata")
+        })
         .collect()
 }
 

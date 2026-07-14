@@ -183,7 +183,8 @@ fn build_client() -> (FlowClient, Arc<Mutex<Vec<String>>>) {
 
 fn build_client_variant(omit_evidence: bool) -> (FlowClient, Arc<Mutex<Vec<String>>>) {
     // Load the REAL checked-in scout role files.
-    let roles = RoleRegistry::load(&[repo_root().join(".flux/agents")]);
+    let system = flux_system::System::new(flux_system::Workspace::new(repo_root()).unwrap());
+    let roles = RoleRegistry::try_load_project(&system, ".flux/agents").unwrap();
     assert!(
         roles.get("tech-scout").is_some(),
         "tech-scout role must load from .flux/agents"

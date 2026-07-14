@@ -23,3 +23,10 @@ flux-tools.workspace = true
 flux-markdown.workspace = true
 serde.workspace = true
 serde_norway.workspace = true
+
+[dev-dependencies]
+flux-policy.workspace = true
+flux-spec.workspace = true
+flux-system.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

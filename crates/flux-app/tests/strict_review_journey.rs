@@ -132,7 +132,8 @@ impl Provider for UnusedTopLevelProvider {
 }
 
 fn load_review_roles() -> RoleRegistry {
-    let roles = RoleRegistry::load(&[repo_root().join(".flux/agents")]);
+    let system = flux_system::System::new(flux_system::Workspace::new(repo_root()).unwrap());
+    let roles = RoleRegistry::try_load_project(&system, ".flux/agents").unwrap();
     assert!(roles.get("review-security").is_some());
     assert!(roles.get("review-correctness").is_some());
     assert!(roles.get("review-maintainability").is_some());
