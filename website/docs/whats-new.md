@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-14
+
 ### New
 
 - **Plugin authors can bind an operation directly to typed input and output.** Flux generates both

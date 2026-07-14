@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-14
+
 ### Added
 
 - **C-62: authorization requirements are now typed and resource-specific.** Tool declarations lower
