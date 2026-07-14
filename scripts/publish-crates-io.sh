@@ -28,6 +28,7 @@ CRATES=(
   codewandler-flux-policy
   codewandler-flux-secret
   codewandler-flux-evidence
+  codewandler-flux-config
   codewandler-flux-skill
   codewandler-flux-system
   codewandler-flux-provider
@@ -53,8 +54,8 @@ CRATES=(
 
 failed=""
 for c in "${CRATES[@]}"; do
-  # Retry the SAME crate on a crates.io new-crate rate limit (429) — publishing 20 brand-new crates
-  # trips it (burst then ~1/10min). We parse the "try again after <GMT>" hint and wait it out, so a
+  # Retry the SAME crate on a crates.io new-crate rate limit (429) — publishing a large new closure
+  # can trip it (burst then ~1/10min). We parse the "try again after <GMT>" hint and wait it out, so a
   # single run grinds through the whole closure unattended.
   while true; do
     # host-kit lives in the nested plugins/ workspace (excluded from root); publish via manifest path.

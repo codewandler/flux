@@ -62,7 +62,7 @@ flux-core = { package = "codewandler-flux-core", version = "0.25.0", path = "cra
 flux-policy = { package = "codewandler-flux-policy", version = "0.25.0", path = "crates/flux-policy" }
 flux-secret = { package = "codewandler-flux-secret", version = "0.25.0", path = "crates/flux-secret" }
 flux-spec = { package = "codewandler-flux-spec", version = "0.25.0", path = "crates/flux-spec" }
-flux-config = { path = "crates/flux-config" }
+flux-config = { package = "codewandler-flux-config", version = "0.25.0", path = "crates/flux-config" }
 flux-system = { package = "codewandler-flux-system", version = "0.25.0", path = "crates/flux-system" }
 flux-runtime = { package = "codewandler-flux-runtime", version = "0.25.0", path = "crates/flux-runtime" }
 flux-tools = { package = "codewandler-flux-tools", version = "0.25.0", path = "crates/flux-tools" }

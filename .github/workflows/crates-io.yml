@@ -1,4 +1,4 @@
-# Publishes the flux-sdk + flux-providers closure (the 20 `codewandler-flux-*` crates) to crates.io
+# Publishes the flux-sdk + flux-providers closure (the 29 `codewandler-flux-*` crates) to crates.io
 # when a version tag `vX.Y.Z` is pushed — alongside the binary `Release` workflow (release.yml).
 #
 # REQUIRED SECRET: `CARGO_REGISTRY_TOKEN` — a crates.io API token (https://crates.io/settings/tokens)

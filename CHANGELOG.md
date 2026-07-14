@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **C-72: the published runtime dependency graph is registry-resolvable again.** `flux-config` now
+  ships as `codewandler-flux-config` before `codewandler-flux-runtime`, while retaining the
+  `flux_config` Rust import path.
+
 ## [0.25.0] - 2026-07-14
 
 ### Added

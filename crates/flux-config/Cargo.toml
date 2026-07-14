@@ -1,9 +1,14 @@
 [package]
-name = "flux-config"
+name = "codewandler-flux-config"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "flux configuration: load/merge .flux/config.toml (project + user) — perm rules, default model, policy grants, network policy"
+
+[lib]
+name = "flux_config"
 
 [dependencies]
 flux-core.workspace = true

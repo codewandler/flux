@@ -15,6 +15,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rust SDK installation no longer stops at the runtime configuration dependency.** The config
+  contract now ships as part of the dependency-ordered crates.io release.
+
 ## [0.25.0] - 2026-07-14
 
 ### New

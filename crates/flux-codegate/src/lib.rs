@@ -703,6 +703,69 @@ mod tests {
         );
     }
 
+    /// A vanity-prefixed package is part of the crates.io closure. Every production path
+    /// dependency in that closure needs a registry version, and the ordered publisher must include
+    /// every closure member. Otherwise `cargo publish` fails only after a release tag is pushed.
+    #[test]
+    fn publish_script_covers_a_registry_resolvable_closure() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let manifests = [
+            repo_root.join("Cargo.toml"),
+            repo_root.join("plugins/Cargo.toml"),
+        ];
+        let mut closure = BTreeSet::new();
+        let mut path_only = Vec::new();
+
+        for manifest in manifests {
+            let metadata = MetadataCommand::new()
+                .manifest_path(manifest)
+                .other_options(vec!["--locked".into(), "--offline".into()])
+                .exec()
+                .expect("resolve workspace metadata");
+            for package in metadata.workspace_packages() {
+                if !package.name.starts_with("codewandler-") {
+                    continue;
+                }
+                closure.insert(package.name.to_string());
+                for dependency in &package.dependencies {
+                    if dependency.kind != DependencyKind::Development
+                        && dependency.path.is_some()
+                        && dependency.req.to_string() == "*"
+                    {
+                        path_only.push(format!("{} -> {}", package.name, dependency.name));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            path_only.is_empty(),
+            "publishable packages have path-only production dependencies:\n{}",
+            path_only.join("\n")
+        );
+
+        let script = std::fs::read_to_string(repo_root.join("scripts/publish-crates-io.sh"))
+            .expect("read publish script");
+        let array = script
+            .split_once("CRATES=(")
+            .and_then(|(_, rest)| rest.split_once("\n)"))
+            .map(|(array, _)| array)
+            .expect("find CRATES array in publish script");
+        let scripted = array
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("codewandler-"))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            scripted, closure,
+            "scripts/publish-crates-io.sh must list every vanity-prefixed workspace package exactly once"
+        );
+    }
+
     fn fixture_metadata(dependency_section: &str) -> Metadata {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

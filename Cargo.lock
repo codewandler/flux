@@ -822,6 +822,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-config"
+version = "0.25.0"
+dependencies = [
+ "codewandler-flux-core",
+ "codewandler-flux-evidence",
+ "codewandler-flux-policy",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "codewandler-flux-core"
 version = "0.25.0"
 dependencies = [
@@ -1062,6 +1074,7 @@ name = "codewandler-flux-runtime"
 version = "0.25.0"
 dependencies = [
  "async-trait",
+ "codewandler-flux-config",
  "codewandler-flux-core",
  "codewandler-flux-evidence",
  "codewandler-flux-policy",
@@ -1069,7 +1082,6 @@ dependencies = [
  "codewandler-flux-skill",
  "codewandler-flux-spec",
  "codewandler-flux-system",
- "flux-config",
  "serde",
  "serde_json",
  "tokio",
@@ -2159,6 +2171,7 @@ dependencies = [
  "codewandler-flux-agent",
  "codewandler-flux-capabilities",
  "codewandler-flux-cognition",
+ "codewandler-flux-config",
  "codewandler-flux-core",
  "codewandler-flux-credentials",
  "codewandler-flux-datasource",
@@ -2184,7 +2197,6 @@ dependencies = [
  "flux-app",
  "flux-auth",
  "flux-channels",
- "flux-config",
  "flux-eval",
  "flux-server",
  "flux-tui",
@@ -2209,18 +2221,6 @@ dependencies = [
  "cargo_metadata",
  "proc-macro2",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "flux-config"
-version = "0.25.0"
-dependencies = [
- "codewandler-flux-core",
- "codewandler-flux-evidence",
- "codewandler-flux-policy",
- "serde",
- "serde_json",
- "toml",
 ]
 
 [[package]]
@@ -2278,6 +2278,7 @@ dependencies = [
  "async-trait",
  "axum",
  "codewandler-flux-a2a",
+ "codewandler-flux-config",
  "codewandler-flux-core",
  "codewandler-flux-credentials",
  "codewandler-flux-events",
@@ -2288,7 +2289,6 @@ dependencies = [
  "codewandler-flux-system",
  "codewandler-flux-tools",
  "flux-auth",
- "flux-config",
  "futures",
  "reqwest 0.13.1",
  "serde",

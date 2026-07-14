@@ -131,9 +131,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # `flux-pg` is always Postgres (no `postgres` feature to toggle); the two backend crates gate it.
-      # NB: flux-pg and flux-events are in the crates.io publish closure, so their *package* names carry
-      # the `codewandler-` vanity prefix (import paths stay `flux_pg`/`flux_events`); flux-capabilities is
-      # non-closure and stays bare. See crates/flux-sdk/PUBLISHING.md.
+      # NB: flux-pg, flux-events, and flux-capabilities are in the crates.io publish closure, so their
+      # *package* names carry the `codewandler-` vanity prefix (import paths stay bare). See
+      # crates/flux-sdk/PUBLISHING.md.
       - name: Clippy (postgres feature, deny warnings)
         run: |
           cargo clippy -p codewandler-flux-pg --all-targets -- -D warnings
