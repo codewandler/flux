@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-07-14
+
 ### Improved
 
 - **Embedded chat and voice apps can keep presentation and progress operations available while Flux

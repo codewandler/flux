@@ -12,6 +12,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.24.1] - 2026-07-14
+
+### Improved
+
+- **Embedded chat and voice apps can keep presentation and progress operations available while Flux
+  narrows a turn to the relevant integration.** Those host-owned operations remain governed by the
+  same permissions, approvals, and operation limits as the rest of the active catalog.
+
 ## [0.24.0] - 2026-07-14
 
 ### Improved
