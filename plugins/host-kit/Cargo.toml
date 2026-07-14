@@ -8,7 +8,7 @@ rust-version.workspace = true
 # construction). An independent version line (0.2.x → flux 0.13, the short-lived 0.3.0 → 0.14)
 # silently froze whenever nothing remembered to bump it; the predecessor `codewandler-host-kit`
 # 0.1.0 (flux 0.10 line) is yanked.
-version = "0.24.0"
+version = "0.24.1"
 license.workspace = true
 description = "Shared SDK for flux integration plugins: typed host-capability calls (secret-by-purpose, http+bearer, endpoint, datasource records) + a manifest/op builder over flux-plugin's guest protocol"
 repository = "https://github.com/codewandler/flux"

@@ -80,6 +80,15 @@ All notable changes to this project are documented in this file. The format is b
 - **C-66: cognition usage observed before provider failure or cancellation is retained exactly
   once.** The same billable usage now reaches evidence, turn totals, cost projections, SDK/App
   results, and sub-agent aggregation without replacing the original error.
+## [0.24.1] - 2026-07-14
+
+### Added
+
+- **A-90: host-owned channel operations can remain available after adaptive intent narrowing.**
+  Operations in the reserved `flux.ambient` physical group stay in every live exploration catalog
+  without becoming an intent or capability-signal family. They still count against native schema
+  budgets and remain subject to registry, permission, authored-scope, approval, and dispatch gates;
+  the `ToolSpec` marker carries the same rule into role-derived child runtimes.
 
 ## [0.24.0] - 2026-07-14
 
