@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.22.0] - 2026-07-14
+
 ### Improved
 
 - **Long delegated work can report what each specialist is doing.** Embedded chat surfaces can show
