@@ -1,6 +1,6 @@
 # Design: an async, paged live-backend datasource seam
 
-**Status:** proposed (design-first) · **Pillar:** Agent · **Layer:** L0 (`flux-datasource` data types)
+**Status:** accepted 2026-07-15 · **Pillar:** Agent · **Layer:** L0 (`flux-datasource` data types)
 + L5 (`flux-capabilities` `datasource` module) · **Story:**
 [D-62](../stories/D-62-async-live-datasource-seam.md) ·
 **Related:** [datasource-discoverability.md](datasource-discoverability.md) (names D-62 as the
@@ -49,11 +49,21 @@ pub trait LiveDatasource: Send + Sync {
     fn schema(&self) -> LiveSchema;
 
     /// One page of an entity, honoring already-validated `filters` and a page cursor.
-    async fn list(&self, entity: &str, page: PageRequest, filters: &Filters) -> Result<Page<Row>>;
+    async fn list(
+        &self,
+        ctx: &ToolContext,
+        entity: &str,
+        page: PageRequest,
+        filters: &Filters,
+    ) -> Result<Page<Row>>;
 
     /// One row of an entity by id — resolves through the backend's own host-side auth,
     /// NOT by dereferencing a handle the model holds.
-    async fn get(&self, entity: &str, id: &str) -> Result<Option<Row>>;
+    async fn get(&self, ctx: &ToolContext, entity: &str, id: &str) -> Result<Option<Row>>;
+
+    /// The concrete guarded resource(s) used by this backend, separate from the datasource
+    /// resource added by the projection itself.
+    fn access(&self) -> Vec<LiveAccess>;
 }
 ```
 
@@ -62,7 +72,7 @@ The supporting **data types are pure and live in the L0 `flux-datasource` crate*
 plugin-contributed live datasource can speak the same shapes without a layering violation:
 
 ```rust
-// crates/flux-datasource/src/lib.rs (L0, pure data)
+// crates/flux-datasource/src/live.rs (L0, pure data)
 pub struct Row {                 // the projection output — NOT a capability
     pub id: String,              // a name the backend can re-resolve
     pub title: String,
@@ -84,6 +94,18 @@ pub struct FilterKey { pub name: String, pub ty: FilterType, pub required: bool,
 pub enum FilterType { String, Int, Bool, Enum(Vec<String>) }
 ```
 
+The types live under `flux_datasource::live` so the intentionally small names (`Row`, `Page`) do not
+pollute the existing record/index namespace. `Filters` uses deterministic key ordering. `Reference`
+is a tagged entity locator or human-navigation URL, never an opaque capability handle.
+
+`ToolContext` is passed into `list`/`get` so native implementations receive flux's guarded runtime
+context rather than inventing a parallel execution context. `LiveAccess` is an L5, closed enum
+(`Network { subject }` / `Connection { subject }`); the generated tools translate it into exact
+`AuthorityRequirement`s. An in-memory backend declares no external access. This keeps model-facing
+schema, datasource identity, and backend authority separate: the projection always requires
+`datasource.read` for `<domain>/<entity>`, then adds the exact network/connection requirements the
+backend declares.
+
 ### The generic two-op projection
 
 Registering a `LiveDatasource` under a domain name yields exactly two ops, built entirely from
@@ -91,12 +113,12 @@ Registering a `LiveDatasource` under a domain name yields exactly two ops, built
 (`crates/flux-capabilities/src/datasource/ops.rs:33`):
 
 ```rust
-pub fn register_live_datasource(
+pub fn try_register_live_datasource(
     registry: &mut ToolRegistry,
     groups: &mut Vec<ToolGroup>,
     domain: &str,
     backend: Arc<dyn LiveDatasource>,
-);
+) -> Result<LiveDatasourceSurface>;
 ```
 
 - **`<domain>.list {entity, page?, limit?, filters?}`** — validate `entity` against `schema()`;
@@ -133,10 +155,11 @@ projection, op generation — is now in this function. The backend supplies only
   `LiveDatasource` are independent traits for independent needs (local index vs remote SoR); a domain
   registers one, the other, or both under different names. No shared supertrait, no retrofit — the
   point of the story.
-- **Registration** mirrors the `flux-web`/`flux-eval` precedent: `register_live_datasource(...)` at
-  the same wiring sites where `register_datasource_ops` runs today
-  (`crates/flux-cli/src/main.rs:2461`, `:8720`), pushing the domain's group alongside
-  `groups.push(flux_eval::eval_group())` / `flux_web::browser_group()` (`:2770`).
+- **Registration** is host-owned. `try_register_live_datasource(...)` installs the two tools and
+  returns the domain's group + ambient signal as one `LiveDatasourceSurface`. The SDK conversational
+  builder gains a convenience seam that carries all three together. Lower-level hosts may compose
+  the same registry/group/signal values directly; the CLI wires a live domain only when it has a
+  concrete configured backend and does not invent a generic backend configuration in v1.
 - **Evidence-gated surfacing.** The two ops are grouped under a per-domain `ToolGroup`
   (`crates/flux-evidence/src/lib.rs:185`) named for the domain, `surface_when` a `<domain>` signal —
   and the signal is emitted **because the domain is configured/registered**, exactly like the
@@ -150,13 +173,13 @@ projection, op generation — is now in this function. The backend supplies only
   so `RiskApprover` auto-allows them (`crates/flux-runtime/src/approval.rs` — "permits reads
   freely"). But they are dispatched through the same runtime path as every tool (approval →
   guarded execute) — never a side channel. Crucially, when the backend does network egress the ops
-  **also** declare `Effect::Network` + `AccessKind::Network` so plan approval and audit see the
-  reach (the web-capabilities lesson: "honest metadata — plan approval sees it"), and the egress
-  itself goes through flux's guarded seams (the net guard for a native backend; the gated plugin
-  host-caps if it is plugin-backed, `crates/flux-capabilities/src/datasource/host_caps.rs`).
-  `permission_subjects` (`crates/flux-runtime/src/lib.rs:657`) surfaces `entity`/filter values for
-  rule authors. Reads for approval purposes; network-honest and fully enveloped in every other
-  respect.
+  also declare the matching `Effect::Network` / `AccessKind::Network` (or connection access) so
+  catalog metadata stays honest. More importantly, their `authority_requirements` override returns
+  exact `datasource.read` plus backend `network.fetch` / `connection.dial` requirements; planning
+  and dispatch consume that same typed contract. The egress itself goes through flux's guarded
+  seams (the net guard for a native backend; gated plugin host caps for a plugin-backed future).
+  `permission_subjects` surfaces the stable `<domain>/<entity>` resource rather than filter values.
+  Reads remain low-risk for approval purposes but are never authorization-free.
 
 ## Open questions (resolved)
 
@@ -243,26 +266,24 @@ capability (the L0 types leave the door open, but v1 ships the native trait + pr
 
 ## Story map
 
-Concrete implementation stories to split out after review — each a crisp one-liner:
+Accepted implementation stories — each remains independently testable and committable:
 
-1. **L0 live-datasource types** — add `Row`, `Page<T>`, `PageRequest`, `Filters`, `Reference`,
+1. **D-168 — L0 live-datasource types** — add `Row`, `Page<T>`, `PageRequest`, `Filters`, `Reference`,
    `LiveSchema`/`LiveEntity`, `FilterKey`/`FilterType` to `flux-datasource` (pure data, serde),
    with round-trip tests.
-2. **The `LiveDatasource` trait** — `async list`/`get` + `schema()` in
-   `flux-capabilities/src/datasource/live.rs`, `#[async_trait]`, behind the existing tokio dep.
-3. **The generic two-op projection** — `register_live_datasource(registry, groups, domain, backend)`
+2. **D-169 — the `LiveDatasource` trait** — `async list`/`get` + `schema()` and closed
+   `LiveAccess` declarations in `flux-capabilities/src/datasource/live.rs`, using the existing
+   async/runtime dependencies.
+3. **D-170 — the generic two-op projection** — `try_register_live_datasource(registry, groups,
+   domain, backend)`
    emitting `<domain>.list` + `<domain>.get` with schema-generated input schemas and compact row +
    `next:` rendering.
-4. **Validation, clamping & cursor plumbing** — filter-key/type validation (unknown-key + enum
+4. **D-171 — validation, clamping & cursor plumbing** — filter-key/type validation (unknown-key + enum
    rejection), `limit` clamp to `max_page` with `default_page`, opaque cursor pass-through — with
    the failing-first tests that pin each rule.
-5. **Surfacing + envelope wiring** — the per-domain `ToolGroup` + `<domain>` signal, honest
-   `Effect::Read`(+`Network`)/`Risk::Low` specs, `permission_subjects`, and the `flux-cli`
-   registration sites; a test that the ops gate off until the domain is registered and that
-   `FLUX_SURFACE_ALL` forces them.
-6. **A reference/example backend** — a small hermetic in-memory `LiveDatasource` (fixture entities +
-   cursor paging + declared filters) proving the projection end-to-end with no network, doubling as
-   the doc example.
-7. **Docs** — a website/concept note on the live-datasource seam (when to reach for it vs the sync
-   index, the references-only row contract, the two-op surface), cross-linked from the datasources
-   page.
+5. **D-172 — surfacing + envelope wiring** — the per-domain `ToolGroup` + ambient signal, honest
+   effects/access, exact typed authority requirements, stable permission subjects, and an SDK
+   convenience seam; tests prove catalog gating and plan/dispatch requirement identity.
+6. **D-173 — reference backend + adoption proof** — a hermetic in-memory `LiveDatasource` with
+   cursor paging and declared filters, end-to-end SDK coverage, and public docs explaining when to
+   use the live seam vs the sync index and why rows remain weak references.

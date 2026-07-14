@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **D-62: the async live-datasource seam now has an accepted, safety-complete implementation
+  contract.** The design separates live systems of record from the synchronous local index and
+  sequences pure types, an async trait, generic list/get projection, validation, exact typed
+  authority, SDK surfacing, and an adoption proof across D-168 through D-173.
+
 ### Fixed
 
 - **C-72: the published runtime dependency graph is registry-resolvable again.** `flux-config` now

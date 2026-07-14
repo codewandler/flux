@@ -10,15 +10,15 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.21.0 (2026-07-13). Since the 0.15.x line: the **flux-sdk surface** epic
+- **Released:** v0.25.0 (2026-07-14). Since the 0.15.x line: the **flux-sdk surface** epic
   (D-142…D-159, v0.16.0–v0.17.0), the **web-capabilities II** extensions (`web.crawl` + a
   `max_total_bytes` byte budget, PDF extraction, an embeddings pack, and the breaking
   `web.fetch`/`web.search` dot-rename; D-160…D-166), **plugin operation output schemas** (D-164), a
   **runnable Slack support-bot** example (D-165), and a public beginner tutorial. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Focus:** the 19-story `architecture-review-2026-07-14` epic is complete: all four release
-  blockers and every lifecycle/consolidation finding are implemented, verified, and indexed under
-  Done. There are currently no `ready` stories.
+- **Focus:** the architecture-review epic and v0.25.0 release are complete. The next wave starts
+  with the accepted async live-datasource design (D-62) and its dependency-ordered implementation
+  stories D-168…D-173; release promotion and typed GitLab/Slack handler work run independently.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
@@ -30,15 +30,21 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-_None._
+- [D-168 — Add pure live-datasource contracts](D-168-live-datasource-contracts.md) · Agent · **P2** · D-62 phase 1: deterministic L0 row, page, filter, reference, and schema types
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
 ## Backlog
-- [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
+
+### Async live datasource seam
+- [D-169 — Add the async LiveDatasource trait](D-169-live-datasource-trait.md) · Agent · D-62 phase 2; depends on D-168
+- [D-170 — Project live datasources into list and get operations](D-170-live-datasource-operations.md) · Agent · D-62 phase 3; depends on D-169
+- [D-171 — Enforce live-datasource filters limits and cursors](D-171-live-datasource-validation.md) · Agent · D-62 phase 4; depends on D-170
+- [D-172 — Wire live datasources through surfacing and typed authority](D-172-live-datasource-safety-surfacing.md) · Agent · D-62 phase 5; depends on D-171
+- [D-173 — Prove and document live-datasource adoption](D-173-live-datasource-adoption-proof.md) · Agent · D-62 phase 6; depends on D-172
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
@@ -272,6 +278,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-59 — Closure-backed FnTool + runtime object-schema builder](D-59-fn-tool-schema-builder.md) · Agent · from the 2026-07-06 downstream-consumer review: every flux tool is a bespoke impl Tool struct and ToolSpec offers only raw-Value or compile-time schemars schemas — consumers defining many tools dynamically re-invent a closure adapter + runtime schema DSL
 - [D-60 — Provider/lang ergonomics batch — null/static providers, bedrock haiku override, OPENAI_KEY alias, cap-scope wrap](D-60-provider-lang-ergonomics.md) · Agent · from the 2026-07-06 downstream-consumer review: four small thin-wrapper/copy sites in the consumer exist only because flux lacks the one-liner — batch them
 - [D-61 — flux-audio — L0 crate for PCM16 conversion, streaming resampling, framing](D-61-flux-audio-crate.md) · Agent · from the 2026-07-06 downstream-consumer review: flux-core's audio doc punts resampling to 'the consumer's concern', which guarantees every voice consumer re-writes identical DSP (PCM16 codecs, phase-carrying resampler, framer) — revise the doctrine, ship the crate
+- [D-62 — Async paged live-backend datasource seam](D-62-async-live-datasource-seam.md) · Agent · accepted design: live systems of record stay separate from the synchronous index and lower through typed authority + guarded IO
 - [D-63 — Multi-agent A2A mount in flux-server (resolver-keyed)](D-63-multi-agent-a2a-mount.md) · Agent · shipped (Unreleased): router_multi + AgentResolver/StaticResolver; auth stays one layer (answers its own + D-64's open question)
 - [D-64 — Per-request bearer→principal auth seam in flux-auth](D-64-request-auth-seam.md) · Agent · design approved + implemented same day via D-68/D-69
 - [D-65 — App-path redaction + audit parity — expose the App store/redactor seam, wire the dormant hooks](D-65-app-path-redaction-audit-parity.md) · Core · one root cause behind all four TODO(D-20/D-27/D-30) markers in flux-cli — `flux_app::App` owns its own store/bus, so the plugin-wiring sites have no EventStore/redactor in scope; the unwired cross-plugin secret sink is a (narrow) redaction-invariant gap

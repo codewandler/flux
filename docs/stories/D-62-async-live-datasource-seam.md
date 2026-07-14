@@ -2,7 +2,7 @@
 id: D-62
 title: Async paged live-backend datasource seam
 pillar: Agent
-status: backlog
+status: done
 design: docs/designs/async-live-datasource-seam.md
 note: "design-first (2026-07-06 downstream-consumer review): flux's DatasourceBackend is sync + index-shaped — wrong for live paginated APIs; the reviewed consumer built its own paged list/get tool projection"
 ---
@@ -33,9 +33,13 @@ paging/validation/projection machinery is generic.
   references (plugins are references-only — rows must not smuggle secrets/handles).
 
 ## Acceptance
-- [ ] Design doc in `docs/designs/` answering the open questions with the consumer's implementation
+- [x] Design doc in `docs/designs/` answering the open questions with the consumer's implementation
       as the reference case.
-- [ ] Implementation story/stories split out after design review.
+- [x] Implementation split into D-168 through D-173, including the post-C-62 typed-authority and
+      SDK-surfacing requirements.
 
 ## Progress
 - 2026-07-06 filed (design-first) from the downstream-consumer review.
+- 2026-07-15 design accepted. Typed filters, opaque cursors, weak references, exact backend
+  authority, evidence-gated surfacing, and the SDK assembly seam are resolved; implementation is
+  sequenced as D-168 → D-169 → D-170 → D-171 → D-172 → D-173.
