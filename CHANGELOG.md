@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A-84: resumed adaptive state revalidates the complete capability-family ceiling.** Durable
+  state created before the cumulative signal guard can no longer re-enter exploration with five
+  small families: the deduplicated four-family invariant is checked at the shared catalog-expansion
+  boundary before operation schemas are selected. Valid resumes with up to four distinct families,
+  including repeated serialized names, remain unchanged.
+
 ## [0.23.0] - 2026-07-14
 
 ### Added

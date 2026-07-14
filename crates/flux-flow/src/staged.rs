@@ -1685,6 +1685,17 @@ fn selected_specs(
     declaration: &IntentDeclaration,
     families: &BTreeMap<String, Family>,
 ) -> Result<Vec<ToolSpec>> {
+    let distinct_family_count = declaration
+        .families
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>()
+        .len();
+    if distinct_family_count > MAX_FAMILIES {
+        return Err(Error::Other(format!(
+            "adaptive capability declaration selected {distinct_family_count} distinct families; the maximum is {MAX_FAMILIES}"
+        )));
+    }
     let mut selected: BTreeMap<String, ToolSpec> = BTreeMap::new();
     for name in &declaration.families {
         let family = families
@@ -3545,6 +3556,110 @@ mod tests {
         assert!(error.contains("maximum is 4"), "error was: {error}");
         assert_eq!(state.declaration.families, initial_families);
         assert_eq!(state.selected, initial_selected);
+    }
+
+    /// A-84 (failing first): the durable state boundary must not trust a family union produced by
+    /// an older runtime. Five one-operation families stay below the independent operation/schema
+    /// budgets, so only the family invariant can reject this deserialized resume before expansion.
+    #[test]
+    fn resumed_adaptive_state_rejects_fifth_family_before_catalog_expansion() {
+        let families = (0..5)
+            .map(|index| {
+                let family_name = format!("plugin.fixture-{index}");
+                let operation = format!("fixture_{index}.inspect");
+                (
+                    family_name.clone(),
+                    Family {
+                        name: family_name,
+                        description: format!("Fixture family {index}"),
+                        specs: vec![spec(&operation, vec![Effect::Read], Vec::new(), None)],
+                        exhaustive_members: false,
+                        routing_signals: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let serialized = json!({
+            "version": 1,
+            "declaration": {
+                "intent": "inspect five fixture families",
+                "families": (0..5)
+                    .map(|index| format!("plugin.fixture-{index}"))
+                    .collect::<Vec<_>>()
+            },
+            "selected": (0..5)
+                .map(|index| format!("fixture_{index}.inspect"))
+                .collect::<Vec<_>>(),
+            "messages": [Message::user_text("inspect the fixtures")],
+            "proposed": [],
+            "gathered": [],
+            "native_step": 0,
+            "last_error": "",
+            "pending": null,
+            "intent_calls": 1,
+            "explore_calls": 1
+        });
+        let state: AdaptiveState = serde_json::from_value(serialized).unwrap();
+        let TestHarness { context, .. } = staged_context(Vec::new());
+
+        let error = selected_specs_for_state(&state, &families, &context)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("5 distinct families"), "error was: {error}");
+        assert!(error.contains("maximum is 4"), "error was: {error}");
+    }
+
+    #[test]
+    fn resumed_adaptive_state_accepts_four_distinct_families_with_duplicate_names() {
+        let families = (0..4)
+            .map(|index| {
+                let family_name = format!("plugin.fixture-{index}");
+                let operation = format!("fixture_{index}.inspect");
+                (
+                    family_name.clone(),
+                    Family {
+                        name: family_name,
+                        description: format!("Fixture family {index}"),
+                        specs: vec![spec(&operation, vec![Effect::Read], Vec::new(), None)],
+                        exhaustive_members: false,
+                        routing_signals: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let serialized = json!({
+            "version": 1,
+            "declaration": {
+                "intent": "inspect four fixture families",
+                "families": [
+                    "plugin.fixture-0",
+                    "plugin.fixture-1",
+                    "plugin.fixture-2",
+                    "plugin.fixture-3",
+                    "plugin.fixture-0"
+                ]
+            },
+            "selected": (0..4)
+                .map(|index| format!("fixture_{index}.inspect"))
+                .collect::<Vec<_>>(),
+            "messages": [Message::user_text("inspect the fixtures")],
+            "proposed": [],
+            "gathered": [],
+            "native_step": 0,
+            "last_error": "",
+            "pending": null,
+            "intent_calls": 1,
+            "explore_calls": 1
+        });
+        let state: AdaptiveState = serde_json::from_value(serialized).unwrap();
+        let TestHarness { context, .. } = staged_context(Vec::new());
+
+        let selected = selected_specs_for_state(&state, &families, &context).unwrap();
+
+        assert_eq!(selected.len(), 4);
+        assert_eq!(selected[0].name, "fixture_0.inspect");
+        assert_eq!(selected[3].name, "fixture_3.inspect");
     }
 
     #[tokio::test]
