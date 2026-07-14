@@ -2,7 +2,7 @@
 id: C-72
 title: Publish flux-config in the SDK closure
 pillar: Core
-status: in-progress
+status: done
 note: "release blocker found by the v0.25.0 crates.io run: runtime's config dependency must be registry-resolvable"
 ---
 
@@ -20,7 +20,7 @@ existing `flux_config` Rust import path.
 - [x] The root publish pin, ordered publish script, workflow documentation, and publishing runbook
   include config before runtime.
 - [x] Both workspaces remain locked and the config package passes `cargo publish --dry-run`.
-- [ ] The idempotent crates.io workflow resumes and publishes the remaining v0.25.0 closure.
+- [x] The idempotent crates.io workflow resumes and publishes the remaining v0.25.0 closure.
 
 ## Progress
 
@@ -31,6 +31,8 @@ existing `flux_config` Rust import path.
 - Kept that guard hermetic with `cargo metadata --no-deps`, so a root-only CI cache need not preload
   unrelated nested-plugin registry dependencies.
 - The full root gate and the isolated config publish dry-run pass.
+- The resumed crates.io workflow completed successfully; an independent API audit confirmed all 29
+  ordered packages at version 0.25.0.
 
 ## Notes
 
