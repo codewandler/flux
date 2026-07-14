@@ -720,7 +720,11 @@ mod tests {
         for manifest in manifests {
             let metadata = MetadataCommand::new()
                 .manifest_path(manifest)
-                .other_options(vec!["--locked".into(), "--offline".into()])
+                .other_options(vec![
+                    "--locked".into(),
+                    "--offline".into(),
+                    "--no-deps".into(),
+                ])
                 .exec()
                 .expect("resolve workspace metadata");
             for package in metadata.workspace_packages() {

@@ -28,6 +28,8 @@ existing `flux_config` Rust import path.
   dependency was path-only and therefore invalid in a published manifest.
 - Added a codegate regression test that rejects path-only production dependencies in the published
   closure and requires the ordered publish script to list every vanity-prefixed workspace package.
+- Kept that guard hermetic with `cargo metadata --no-deps`, so a root-only CI cache need not preload
+  unrelated nested-plugin registry dependencies.
 - The full root gate and the isolated config publish dry-run pass.
 
 ## Notes
