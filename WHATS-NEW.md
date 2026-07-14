@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-07-14
+
 ### Fixed
 
 - **Resuming an adaptive turn cannot restore an oversized integration catalog.** Flux rechecks the

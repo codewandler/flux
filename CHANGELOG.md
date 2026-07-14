@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-07-14
+
 ### Fixed
 
 - **A-84: resumed adaptive state revalidates the complete capability-family ceiling.** Durable

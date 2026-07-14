@@ -12,6 +12,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.23.1] - 2026-07-14
+
+### Fixed
+
+- **Resuming an adaptive turn cannot restore an oversized integration catalog.** Flux rechecks the
+  complete four-integration-family limit before exposing operation schemas, including for durable
+  state created by an older runtime. Valid resumed turns are unchanged.
+
 ## [0.23.0] - 2026-07-14
 
 ### New
