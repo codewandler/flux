@@ -86,6 +86,32 @@ pub struct Caller {
     pub source: String,
 }
 
+/// Resolve the canonical local single-user identity shared by every surface.
+///
+/// Authentication surfaces may choose the local user name (for example from `$USER`), while
+/// lower-layer runtimes that need the documented fallback profile pass `"local"`. Keeping the
+/// typed caller/trust shape here prevents each executor-assembly path from inventing a slightly
+/// different synthetic principal without making the runtime depend on the outer `flux-auth` crate.
+pub fn local_identity(user: impl Into<String>) -> (Caller, Trust) {
+    let user = user.into();
+    (
+        Caller {
+            principal: Principal {
+                id: user.clone(),
+                name: user,
+                kind: CallerKind::User,
+            },
+            groups: Vec::new(),
+            source: "local".to_string(),
+        },
+        Trust {
+            kind: TrustKind::Invocation,
+            level: TrustLevel::Privileged,
+            scopes: Vec::new(),
+        },
+    )
+}
+
 /// The kind of subject a grant targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

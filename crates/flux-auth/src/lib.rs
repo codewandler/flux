@@ -19,7 +19,9 @@ pub mod request;
 #[cfg(feature = "introspect")]
 pub mod introspect;
 
-use flux_policy::{Caller, CallerKind, Principal, Scope, Trust, TrustKind, TrustLevel};
+use flux_policy::{
+    local_identity, Caller, CallerKind, Principal, Scope, Trust, TrustKind, TrustLevel,
+};
 
 /// Resolves the caller behind a request.
 pub trait IdentityProvider: Send + Sync {
@@ -48,21 +50,7 @@ impl LocalIdentity {
 
 impl IdentityProvider for LocalIdentity {
     fn resolve(&self) -> (Caller, Trust) {
-        let caller = Caller {
-            principal: Principal {
-                id: self.user.clone(),
-                name: self.user.clone(),
-                kind: CallerKind::User,
-            },
-            groups: Vec::new(),
-            source: "local".to_string(),
-        };
-        let trust = Trust {
-            kind: TrustKind::Invocation,
-            level: TrustLevel::Privileged,
-            scopes: Vec::new(),
-        };
-        (caller, trust)
+        local_identity(self.user.clone())
     }
 }
 

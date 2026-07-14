@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use flux_runtime::{AllowApprover, Approver, DenyApprover};
+use flux_runtime::{AllowApprover, Approver, DenyApprover, ExecutionAuthorization};
+use flux_secret::Redactor;
 use flux_system::sandbox::{Sandbox, SandboxSettings};
 
 /// The envelope half of a builder: permission rules, the approval policy, and the OS-sandbox
@@ -15,6 +16,8 @@ pub(crate) struct Envelope {
     pub(crate) auto_approve: bool,
     pub(crate) approver: Option<Arc<dyn Approver>>,
     pub(crate) sandbox: Option<Sandbox>,
+    pub(crate) authorization: ExecutionAuthorization,
+    pub(crate) redactor: Redactor,
 }
 
 impl Envelope {
@@ -26,6 +29,8 @@ impl Envelope {
             auto_approve: false,
             approver: None,
             sandbox: None,
+            authorization: ExecutionAuthorization::local(),
+            redactor: Redactor::new(),
         }
     }
 
