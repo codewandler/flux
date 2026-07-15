@@ -30,7 +30,7 @@
 - **The SQLite tool is confined to your workspace and `~/.flux`.** It can no longer be steered into
   reading browser cookie stores or credential databases elsewhere on disk.
 - **Untrusted programs and plans can't exhaust the host.** The language interpreter now bounds
-  recursion depth (no crash from deeply nested input) and enforces a default step/time budget on loops;
+  recursion depth (no crash from deeply nested input) and caps runaway loops and oversized iterations;
   file reads check size before loading (no out-of-memory on a giant file, no hang on a named pipe); and
   the browser, plugin, and agent-to-agent surfaces cap their buffers and queues.
 - **Credentials stay out of logs and listings.** OAuth tokens redact themselves in debug output, and

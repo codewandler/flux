@@ -83,9 +83,11 @@ All notable changes to this project are documented in this file. The format is b
   on session close.
 - **L-81: the flux-lang parser, expr evaluator, and composite calls are depth-guarded.** Deeply nested
   input returns a bounded error instead of an uncatchable stack-overflow abort.
-- **L-82: the interpreter enforces a default execution budget.** A hot `loop` or oversized `each`
-  terminates under a default step/wall-clock budget (overridable by `Budget`), with `yield_now` per loop
-  iteration and bounded transcript growth.
+- **L-82: the interpreter bounds runaway loops at the execution boundary.** A hot `loop` now stops at a
+  default per-loop iteration cap (100k) and an oversized `each` at a default item cap (100k) — enforced
+  by the interpreter itself, not only the analyzer — with `yield_now` per loop iteration and a
+  ring-buffered transcript. The cap is per-loop, so deeply nested loops are not yet bounded globally and
+  there is no wall-clock budget; both are tracked as follow-ups.
 - **L-83: `memo`/`once` key on op + input provenance.** A cache hit is no longer decided by "the name is
   bound", so `memo` re-runs when the op or inputs change and same-label `once` blocks don't collide.
 - **C-72: the published runtime dependency graph is registry-resolvable again.** `flux-config` now
@@ -100,7 +102,9 @@ All notable changes to this project are documented in this file. The format is b
   model can no longer name `AWS_SECRET_ACCESS_KEY` (or any var) and send it to an attacker host.
 - **C-77: egress connections are pinned to the guard-vetted IP (DNS-rebinding closed).** `web.fetch`,
   `web.crawl`, and `http.request` connect only to the addresses the SSRF guard vetted, so a low-TTL host
-  can't answer public to the guard and internal (`169.254.169.254`, RFC1918) at connect.
+  can't answer public to the guard and internal (`169.254.169.254`, RFC1918) at connect. A host the guard
+  cannot resolve — and therefore never vetted — is now **refused** rather than connected unpinned, which
+  would have re-resolved at connect time and bypassed the pin entirely.
 - **C-78: `sqlite_query` is jailed to the workspace and `~/.flux`.** It can no longer open an arbitrary
   on-disk database (browser cookie stores, credential DBs) as a read-exfiltration primitive at Risk::Low.
 - **C-82: OAuth-token and inline-URL credential leaks are closed.** `OAuthToken`/`Refreshed` redact their

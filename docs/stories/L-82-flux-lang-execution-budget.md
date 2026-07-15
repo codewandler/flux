@@ -22,10 +22,13 @@ transcript-push grows memory without bound; `each` over an attacker-sized source
 - [x] Failing-first tests: `hot_loop_terminates_under_default_budget` and
       `each_over_oversized_source_is_rejected` — both terminate under the default budget with a clear
       error instead of running to `for_ms` / OOM.
-- [x] Default per-execution step + wall-clock budget enforced at the interpreter boundary, overridable
-      by the existing `Budget`.
-- [x] `tokio::task::yield_now()` per loop iteration; transcript growth bounded (`cap_transcript`) and
-      the step budget bounds a long run.
+- [~] Enforced at the interpreter boundary (not only the analyzer) — but as a **per-loop iteration cap**
+      (`DEFAULT_MAX_LOOP_ITERATIONS` = 100_000) plus a per-`each` item cap (`DEFAULT_MAX_EACH_ITEMS` =
+      100_000), **not** the global step + wall-clock budget this box originally specified.
+      **Residual (follow-up):** the cap is per-loop, so nested loops still multiply (100k^depth), and
+      there is no wall-clock bound. The primary single-hot-loop vector is closed; the global governor is not.
+- [x] `tokio::task::yield_now()` per loop iteration; transcript growth bounded by a ring-buffer drain
+      (`cap_transcript`, retaining the most recent `MAX_TRANSCRIPT_ENTRIES` = 10_000).
 
 ## Progress
 - **2026-07-15 — DONE (full workspace gate green).** A default step + wall-clock budget is enforced at

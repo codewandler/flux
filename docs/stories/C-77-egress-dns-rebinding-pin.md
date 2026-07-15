@@ -31,8 +31,16 @@ stealing cloud-metadata credentials via `web.fetch`/`web.crawl`/`http.request`/`
 - **2026-07-15 — DONE (compile + unit-test verified; full gate pending).** Added
   `guard_url_scoped_pinned[_with_resolver]` in `flux-system::net` (returns the vetted `Vec<SocketAddr>`
   alongside the URL, sharing one `guard_and_pin` core). `egress::send_guarded` now pins each hop via
-  `resolve_to_addrs`; `GuardedRequest` carries the pin; unresolvable hosts fall back to the shared
-  client. 114 flux-web + 56 flux-system tests pass. Residual: `browser.*` (CDP path).
+  `resolve_to_addrs`; `GuardedRequest` carries the pin. 114 flux-web + 56 flux-system tests pass.
+  Residual: `browser.*` (CDP path).
+- **2026-07-15 — SELF-REVIEW FIX (fail-open closed).** The first cut fell back to the *unpinned* shared
+  client when the pin set was empty. But an empty pin means `guard_and_pin`'s `block_if` loop never ran
+  (its resolve failed), so the guard had vetted **nothing** — an attacker who SERVFAILs the guard's query
+  and answers `169.254.169.254` at connect would bypass the pin on exactly the path it protects.
+  `pinned_client` now **fails closed** on an empty pin; IP literals always carry a pin, so this refuses
+  only unresolvable domains (which could not have connected anyway). Tests
+  `empty_pin_refuses_instead_of_connecting_unpinned` + `vetted_addresses_build_a_pinned_client`.
+  (Found by hand — the workflow code review never ran: 7/8 agents died on the session limit / logged-out.)
 
 ## Notes
 - `crates/flux-system/src/net.rs:114` (`guard_url_scoped`); consumers in `crates/flux-web/src/egress.rs:65,153`.
