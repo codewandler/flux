@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-07-15
+
 ### New
 
 - **Live systems of record can expose a consistent `<domain>.list` and `<domain>.get` operation

@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-07-15
+
 ### Changed
 
 - **harness-hardening (BREAKING): the `flux-web` CDP event stream is now bounded.** To close a
