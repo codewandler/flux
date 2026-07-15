@@ -217,6 +217,50 @@ fn is_write_sql(sql: &str) -> bool {
     false
 }
 
+/// Expand a leading `~` / `~/` to `$HOME`. Any other form is returned unchanged.
+fn expand_tilde(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            if let Ok(home) = std::env::var("HOME") {
+                return format!("{home}{rest}");
+            }
+        }
+    }
+    raw.to_string()
+}
+
+/// Confine `raw` to a database this tool may open (C-78). A workspace-relative path goes through the
+/// workspace read-jail (which rejects `..` and symlink escapes); an out-of-workspace absolute/`~`
+/// path is permitted only when it canonicalizes under `~/.flux` — the tool's advertised session-DB
+/// location. Everything else (browser cookie stores, credential DBs, arbitrary files) is refused so
+/// this Risk::Low read-only tool cannot exfiltrate secrets outside the jail.
+fn jail_sqlite_path(ctx: &ToolContext, raw: &str) -> Result<String> {
+    // In-workspace (or a configured read-only root): the workspace enforces the jail.
+    if let Ok(p) = ctx.system.workspace().resolve_read(raw) {
+        return Ok(p.to_string_lossy().into_owned());
+    }
+    // Out of the workspace jail: allow only databases under ~/.flux.
+    let expanded = expand_tilde(raw);
+    let home = std::env::var("HOME").map_err(|_| {
+        Error::Other(
+            "sqlite_query: HOME is not set, cannot resolve an out-of-workspace database".into(),
+        )
+    })?;
+    let flux_home = std::path::Path::new(&home).join(".flux");
+    let flux_home = std::fs::canonicalize(&flux_home).unwrap_or(flux_home);
+    let canon = std::fs::canonicalize(&expanded)
+        .map_err(|e| Error::Other(format!("sqlite_query: cannot open {expanded}: {e}")))?;
+    if canon.starts_with(&flux_home) {
+        Ok(canon.to_string_lossy().into_owned())
+    } else {
+        Err(Error::Other(format!(
+            "sqlite_query: refusing to open {} — only databases inside the workspace or under \
+             ~/.flux are permitted (an arbitrary on-disk database could exfiltrate secrets)",
+            canon.display()
+        )))
+    }
+}
+
 #[async_trait]
 impl Tool for SqliteQueryTool {
     fn spec(&self) -> ToolSpec {
@@ -225,8 +269,9 @@ impl Tool for SqliteQueryTool {
             description: "Execute a read-only SQL query against a SQLite database file. \
                           Only SELECT and PRAGMA statements are allowed — write operations \
                           (INSERT, UPDATE, DELETE, DROP, ALTER, …) are refused. \
-                          Returns rows as a JSON array. `db` may be an absolute path to a \
-                          file outside the workspace (e.g. ~/.flux/sessions.db)."
+                          Returns rows as a JSON array. `db` must be a database inside the \
+                          workspace or under ~/.flux (e.g. ~/.flux/sessions.db); other on-disk \
+                          databases are refused."
                 .into(),
             input_schema: tool_input_schema::<SqliteQueryInput>(),
             output_schema: None,
@@ -261,7 +306,7 @@ impl Tool for SqliteQueryTool {
         set
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let db_path = params
             .get("db")
             .and_then(|v| v.as_str())
@@ -279,17 +324,14 @@ impl Tool for SqliteQueryTool {
             ));
         }
 
-        // Expand a leading `~` to the home directory (sqlite_query bypasses
-        // Workspace::resolve for absolute paths, so we handle it here).
-        let db_path = if let Some(rest) = db_path.strip_prefix('~') {
-            if rest.is_empty() || rest.starts_with('/') {
-                let home = std::env::var("HOME").unwrap_or_default();
-                format!("{home}{rest}")
-            } else {
-                db_path.to_string()
-            }
-        } else {
-            db_path.to_string()
+        // Jail the database path (C-78): a relative path resolves inside the workspace; an
+        // out-of-workspace absolute/`~` path is permitted only under `~/.flux` (the tool's advertised
+        // session-DB use). Any other on-disk database — browser cookie stores, credential DBs,
+        // arbitrary user files — is refused, so this read-only tool at Risk::Low can't be turned into
+        // a secret-exfiltration primitive.
+        let db_path = match jail_sqlite_path(ctx, db_path) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(e.to_string())),
         };
         let sql = sql.to_string();
 
@@ -580,6 +622,48 @@ pub fn register_extra(registry: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_system::{System, Workspace};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn tool_ctx() -> (std::path::PathBuf, ToolContext) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("flux-extra-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
+        (dir, c)
+    }
+
+    /// C-78: a database outside the workspace and outside `~/.flux` must be refused before it is
+    /// opened — otherwise sqlite_query is a Risk::Low read-exfiltration primitive (browser cookie
+    /// stores, credential DBs). The file exists, so the refusal is the jail, not a missing file.
+    #[tokio::test]
+    async fn sqlite_query_refuses_database_outside_the_jail() {
+        let (_dir, c) = tool_ctx();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let outside =
+            std::env::temp_dir().join(format!("flux-outside-{}-{n}.db", std::process::id()));
+        std::fs::write(&outside, b"x").unwrap();
+        let r = SqliteQueryTool
+            .execute(
+                &c,
+                json!({"db": outside.to_string_lossy(), "sql": "SELECT 1"}),
+            )
+            .await
+            .expect("a jail refusal is a clean tool result, not an Err");
+        assert!(
+            r.is_error,
+            "an out-of-jail database must be refused: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("refusing") || r.content.contains("only databases"),
+            "the refusal names the jail: {}",
+            r.content
+        );
+        let _ = std::fs::remove_file(&outside);
+    }
 
     #[test]
     fn format_unix_utc_is_correct() {

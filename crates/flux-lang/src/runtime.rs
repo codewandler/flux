@@ -31,6 +31,39 @@ use crate::sink::FlowSink;
 use crate::store::{DurableStore, SessionView, SymbolView, ValueStore};
 use crate::{FlowError, Result};
 
+/// L-81: the default recursive-composite call-depth ceiling, used when a composite op declares no
+/// explicit `limits.max_depth`. Each nested composite call pushes a large async-interpreter frame
+/// (`execute_composite_call` → `execute_flow` → `exec_body` → `run_call` → …), so this is set
+/// conservatively — comfortably below the depth that overflows a 2 MiB worker/test stack in a debug
+/// build (empirically ~14) — with a 2× margin. Legitimate deep recursion raises it per-op via
+/// `limits.max_depth`; the point is that the process returns a bounded error rather than `SIGABRT`.
+pub const DEFAULT_MAX_COMPOSITE_DEPTH: u64 = 8;
+
+/// L-82: the default per-execution loop-iteration budget. `execute_flow`/`execute_plan` re-enforce
+/// none of the analyzer's caps, so a hot `loop` (`for_ms:600000` with `every_ms:0`) would spin,
+/// growing the value store / event log / transcript without bound until `for_ms` or OOM. A `loop`
+/// exceeding this many iterations fails with a clear error; an explicit `budget` scope can still
+/// bound work more tightly.
+pub const DEFAULT_MAX_LOOP_ITERATIONS: u64 = 100_000;
+
+/// L-82: the default per-execution `each` fan-out budget — an `each` over an attacker-sized source
+/// (millions of elements) is rejected up front rather than materialising a value per element.
+pub const DEFAULT_MAX_EACH_ITEMS: u64 = 100_000;
+
+/// L-82: the transcript is fed back to the model each round; an unbounded `loop`/`each` would grow it
+/// without limit. Kept as a ring buffer — the oldest entries are dropped once it exceeds twice this
+/// many, so a long run retains the most-recent context at bounded cost (amortised O(1) per push).
+const MAX_TRANSCRIPT_ENTRIES: usize = 10_000;
+
+/// Drop the oldest transcript entries once the buffer grows past twice [`MAX_TRANSCRIPT_ENTRIES`],
+/// keeping the most recent `MAX_TRANSCRIPT_ENTRIES`. Batched so draining is amortised O(1) per push.
+fn cap_transcript(transcript: &mut Vec<String>) {
+    if transcript.len() >= MAX_TRANSCRIPT_ENTRIES * 2 {
+        let drop = transcript.len() - MAX_TRANSCRIPT_ENTRIES;
+        transcript.drain(0..drop);
+    }
+}
+
 /// How to bind a single op's result to a session symbol.
 pub struct BindSpec<'a> {
     pub name: &'a SymbolName,
@@ -116,6 +149,30 @@ pub fn flow_key(name: Option<&str>, body: &[Node]) -> String {
 pub fn stmt_hash16(node: &Node) -> String {
     let json = serde_json::to_string(node).unwrap_or_default();
     sha256_hex(&json)[..16].to_string()
+}
+
+/// L-83: the hidden synthetic symbol under which a `memo` records its op + canonical-input
+/// provenance. Two `memo`s hit the same cache entry iff they call the same op with the same argument
+/// AST (canonical `Node` JSON — insensitive to formatting/key order, like [`stmt_hash16`]); a
+/// different op, different args, or an unrelated prior binding of the user's name all miss. The
+/// `\u{0}` reserved prefix keeps it out of the user symbol namespace.
+fn memo_cache_key(op: &str, args: &[Node]) -> SymbolName {
+    let args_json = serde_json::to_string(args).unwrap_or_default();
+    let hash = sha256_hex(&format!("{op}\u{0}{args_json}"));
+    // `@memo:` can never collide with a user `$symbol` (the parser forbids a leading `@`), and stays
+    // printable so it round-trips cleanly through the durable symbol table (a raw NUL would be
+    // truncated on read-back by SQLite's C-string column read).
+    SymbolName(format!("@memo:{}", &hash[..32]))
+}
+
+/// L-83: the durable key a `once` block records its completion under — the explicit `label` plus a
+/// content hash of its body. Two same-label blocks with different bodies get different keys (both
+/// run); an identical body under the same label coalesces (idempotent, the intended at-most-once).
+/// The stored value is still read back through the existing `(session, label)` `OnceCompleted` fold —
+/// the body identity is folded into the label string, so no event-schema change is needed.
+fn once_key(label: &str, body: &[Node]) -> String {
+    let hash = sha256_hex(&serde_json::to_string(body).unwrap_or_default());
+    format!("{label}\u{0}{}", &hash[..16])
 }
 
 /// A one-line, length-bounded summary of a value for the symbol table (never the raw bytes).
@@ -240,11 +297,14 @@ struct FrameBinding {
 struct FrameStore<'a> {
     parent: &'a dyn ValueStore,
     bindings: Mutex<HashMap<SymbolName, FrameBinding>>,
+    /// L-81: one deeper than the parent store — the recursive-composite call-depth counter.
+    depth: usize,
 }
 
 impl<'a> FrameStore<'a> {
     fn new(parent: &'a dyn ValueStore) -> Self {
         Self {
+            depth: parent.call_depth() + 1,
             parent,
             bindings: Mutex::new(HashMap::new()),
         }
@@ -347,6 +407,10 @@ impl ValueStore for FrameStore<'_> {
 
     fn as_durable(&self) -> Option<&dyn DurableStore> {
         self.parent.as_durable()
+    }
+
+    fn call_depth(&self) -> usize {
+        self.depth
     }
 }
 
@@ -452,6 +516,35 @@ async fn execute_composite_call(
     )?;
 
     let frame = FrameStore::new(store);
+    // L-81: enforce a call-depth ceiling so a recursive composite op (`op f() { call f() }`) returns
+    // a bounded error instead of overflowing the stack and aborting the process. The depth rides on
+    // the store chain (one deeper per nested frame), so it is correct across `await`/thread migration.
+    let max_depth = composite
+        .meta
+        .limits
+        .max_depth
+        .unwrap_or(DEFAULT_MAX_COMPOSITE_DEPTH);
+    if frame.call_depth() as u64 > max_depth {
+        let error = format!(
+            "composite op `{}` exceeded the maximum call depth of {max_depth} (recursion too deep)",
+            composite.name
+        );
+        store.append_event(
+            session_id,
+            &RunEvent::StepFailed {
+                step,
+                error: error.clone(),
+            },
+        )?;
+        return Ok(CallOutcome {
+            value_id: None,
+            is_error: true,
+            denied: false,
+            timing: None,
+            content: error.clone(),
+            view: error,
+        });
+    }
     let args = input.as_object().ok_or_else(|| {
         FlowError::Runtime(format!(
             "composite op `{}` expected object input",
@@ -1890,6 +1983,15 @@ fn exec_body<'a>(
                             "`each` source must evaluate to a list".to_string(),
                         ));
                     };
+                    // L-82: reject an attacker-sized source up front (a value is materialised per
+                    // element), rather than iterating an unbounded fan-out.
+                    if elems.len() as u64 > DEFAULT_MAX_EACH_ITEMS {
+                        return Err(crate::FlowError::Runtime(format!(
+                            "`each` source has {} elements, exceeding the default execution budget \
+                             of {DEFAULT_MAX_EACH_ITEMS} — filter or page the source first",
+                            elems.len()
+                        )));
+                    }
                     // The item symbol is loop-scoped: save any outer binding of the same name so the
                     // loop variable doesn't clobber it past the loop (F20d). Restored on normal
                     // completion; with no prior binding the last item stays bound (the store has no
@@ -1920,6 +2022,9 @@ fn exec_body<'a>(
                         if let Step::Return(v) = step {
                             return Ok((last, v.clone(), Step::Return(v)));
                         }
+                        // L-82: bound transcript growth and yield cooperatively per element.
+                        cap_transcript(transcript);
+                        tokio::task::yield_now().await;
                     }
                     // Restore the outer binding the loop variable shadowed (F20d), with its original
                     // metadata; done before `collect` binds so an explicit collect symbol wins.
@@ -2056,13 +2161,21 @@ fn exec_body<'a>(
                             "`memo` can only bind the result of a `call`".to_string(),
                         ));
                     };
-                    // Pinned across turns: if the symbol is already resolved for this session, reuse
-                    // the cached value and skip execution (compute-once-per-session, keyed on name).
-                    if let Some(existing) = store.resolve(session_id, name)? {
+                    // L-83: a cache hit is keyed on the op + canonical-input PROVENANCE, not merely
+                    // "the symbol name is bound". The provenance is recorded under a hidden synthetic
+                    // symbol, so `memo $x = a()` then `memo $x = b()` runs `b` (different op → different
+                    // key), editing `memo $s = v1()` → `v2()` re-runs, and a `memo` over a name an
+                    // unrelated op already bound re-executes (the provenance key is absent). The key
+                    // rides on the durable symbol table, so it still memoizes across turns.
+                    let memo_key = memo_cache_key(op, args);
+                    if let Some(existing) = store.resolve(session_id, &memo_key)? {
                         let text = store
                             .get_value(&existing)?
                             .map(|v| value_text(&v))
                             .unwrap_or_default();
+                        // Rebind the user-facing name to the memoized value (it may have been shadowed
+                        // or never bound in this session), so `$name` resolves to the cached result.
+                        bind_existing(store, session_id, name, &existing)?;
                         transcript.push(format!("[${} = memo {op} (cached)]\n{text}", name.0));
                         if !text.is_empty() {
                             last = text;
@@ -2081,6 +2194,19 @@ fn exec_body<'a>(
                     *steps += 1;
                     if outcome.is_error {
                         return Err(call_failure(&format!("step `{op}`"), &outcome));
+                    }
+                    // Record the op+input provenance so a later identical `memo` hits the cache. Hidden
+                    // so it never appears in the model-facing view.
+                    if let Some(vid) = &outcome.value_id {
+                        let summary = summarize(&outcome.content);
+                        store.bind(
+                            session_id,
+                            &memo_key,
+                            vid,
+                            None,
+                            &summary,
+                            Visibility::Hidden,
+                        )?;
                     }
                     // Transcript views are trimmed to the host's output budget, like every other
                     // transcript push (F20a); the canonical value is untouched.
@@ -2310,9 +2436,23 @@ fn exec_body<'a>(
                     let deadline =
                         std::time::Instant::now() + std::time::Duration::from_millis(*for_ms);
                     let mut last_vid: Option<ValueId> = None;
+                    // L-82: a default per-execution iteration budget enforced HERE at the interpreter
+                    // boundary (not only in the analyzer). A hot `loop` (`every_ms:0`) never sleeps
+                    // and its pure-bind body never bumps `steps`, so without this it would spin to
+                    // `for_ms`, growing the store / event log / transcript unbounded. An explicit
+                    // `budget` scope can still cap dispatches more tightly.
+                    let mut iters: u64 = 0;
                     loop {
                         if std::time::Instant::now() >= deadline {
                             break;
+                        }
+                        iters += 1;
+                        if iters > DEFAULT_MAX_LOOP_ITERATIONS {
+                            return Err(FlowError::Runtime(format!(
+                                "`loop` exceeded the default execution budget of \
+                                 {DEFAULT_MAX_LOOP_ITERATIONS} iterations — add an `until` guard, an \
+                                 `every_ms` interval, or a tighter `budget`"
+                            )));
                         }
                         match exec_body(
                             store,
@@ -2344,6 +2484,9 @@ fn exec_body<'a>(
                                 return Err(FlowError::Runtime(format!("`loop` body failed: {e}")));
                             }
                         }
+                        // L-82: bound the model-facing transcript so a long loop can't grow it without
+                        // limit.
+                        cap_transcript(transcript);
                         if let Some(u) = until {
                             if eval_cond(store, executor, session_id, u, &mut *sink, &mut *steps)
                                 .await?
@@ -2354,6 +2497,9 @@ fn exec_body<'a>(
                         if *every_ms > 0 {
                             tokio::time::sleep(std::time::Duration::from_millis(*every_ms)).await;
                         }
+                        // L-82: cooperatively yield every iteration so a tight (`every_ms:0`) loop
+                        // can't monopolise the runtime worker between the budget checks above.
+                        tokio::task::yield_now().await;
                     }
                     if let (Some(name), Some(vid)) = (bind, &last_vid) {
                         bind_existing(store, session_id, name, vid)?;
@@ -3063,10 +3209,15 @@ fn exec_body<'a>(
                     body: obody,
                     bind,
                 } => {
-                    // Effect-level memo: if a prior run in this session recorded this label's success,
-                    // skip the side effect and reuse the stored value. Keyed on (session, label).
+                    // Effect-level memo: if a prior run in this session recorded this block's success,
+                    // skip the side effect and reuse the stored value. L-83: the durable key folds the
+                    // BODY identity into the label, so two `once` blocks that share a label (an
+                    // LLM-picked default, a copy-paste, cross-turn drift) but have different bodies each
+                    // run their own genuinely-different side effect — instead of the second silently
+                    // skipping. Two identical-body blocks under one label still coalesce (idempotent).
+                    let once_id = once_key(label, obody);
                     if let Some(d) = store.as_durable() {
-                        if let Some(rec) = d.once_lookup(session_id, label)? {
+                        if let Some(rec) = d.once_lookup(session_id, &once_id)? {
                             if let (Some(name), Some(vid)) = (bind, &rec.value) {
                                 bind_existing(store, session_id, name, vid)?;
                             }
@@ -3094,7 +3245,7 @@ fn exec_body<'a>(
                         bind_existing(store, session_id, name, vid)?;
                     }
                     if let Some(d) = store.as_durable() {
-                        d.once_complete(session_id, label, bvid.as_ref(), &blast)?;
+                        d.once_complete(session_id, &once_id, bvid.as_ref(), &blast)?;
                     }
                     if !blast.is_empty() {
                         last = blast;
@@ -8087,6 +8238,178 @@ mod tests {
             host.dispatches.load(Ordering::SeqCst),
             1,
             "the denied guard was not re-evaluated across iterations"
+        );
+    }
+
+    /// L-81 (failing-first): a self-recursive composite op returns a bounded error instead of
+    /// overflowing the stack and aborting the process. `op f() { call f() }` recurses forever; the
+    /// call-depth ceiling (carried on the store chain) stops it. Reaching the assertion at all proves
+    /// no `SIGABRT` occurred.
+    #[tokio::test]
+    async fn recursive_composite_op_is_depth_bounded_not_aborting() {
+        struct RecCat(CompositeOpDecl);
+        impl OpCatalog for RecCat {
+            fn lookup(&self, name: &str) -> Option<OpSignature> {
+                (name == self.0.name)
+                    .then(|| sig(name, &[], &[]))
+                    .or_else(|| CfCat.lookup(name))
+            }
+            fn composite(&self, name: &str) -> Option<CompositeOpDecl> {
+                (name == self.0.name).then(|| self.0.clone())
+            }
+        }
+        struct RecHost(RecCat);
+        #[async_trait::async_trait]
+        impl OpHost for RecHost {
+            async fn dispatch(&self, _op: &str, _input: serde_json::Value) -> OpOutcome {
+                OpOutcome::ok("ok")
+            }
+            fn catalog(&self) -> &dyn OpCatalog {
+                &self.0
+            }
+            async fn request_approval(
+                &self,
+                _l: &str,
+                _i: &flux_spec::IntentSet,
+            ) -> ApprovalChoice {
+                ApprovalChoice::Allow
+            }
+            fn trim_output(&self, view: String, _op: &str) -> String {
+                view
+            }
+        }
+        let decl = CompositeOpDecl {
+            name: "f".into(),
+            params: vec![],
+            returns: None,
+            // No explicit `limits.max_depth`: exercise the SHIPPED default ceiling, proving it is
+            // itself abort-safe on a standard 2 MiB stack.
+            meta: Default::default(),
+            body: DraftAst {
+                body: vec![call("f", vec![])],
+                ..Default::default()
+            },
+        };
+        let host = RecHost(RecCat(decl));
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![call("f", vec![])],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("maximum call depth"),
+            "expected a bounded depth error, got: {err}"
+        );
+    }
+
+    /// L-82 (failing-first): a hot `loop` (`every_ms:0`, huge `for_ms`, pure-bind body that never
+    /// bumps `steps`) terminates under the default per-execution iteration budget with a clear error,
+    /// instead of spinning to `for_ms` and growing the store/transcript unbounded.
+    #[tokio::test]
+    async fn hot_loop_terminates_under_default_budget() {
+        let host = CfHost::new();
+        let body = vec![Node::Loop {
+            for_ms: 600_000,
+            every_ms: 0,
+            until: None,
+            body: vec![flow_bind("x", flow_lit(json!("y")))],
+            bind: None,
+        }];
+        let err = run(&host, body).await.unwrap_err();
+        assert!(
+            err.to_string().contains("execution budget"),
+            "a hot loop must hit the default budget, got: {err}"
+        );
+    }
+
+    /// L-82 (failing-first): an `each` over an attacker-sized source is rejected up front rather than
+    /// materialising a value per element.
+    #[tokio::test]
+    async fn each_over_oversized_source_is_rejected() {
+        let host = CfHost::new();
+        let big: Vec<serde_json::Value> = (0..=DEFAULT_MAX_EACH_ITEMS).map(|i| json!(i)).collect();
+        let body = vec![Node::Each {
+            source: Box::new(flow_lit(json!(big))),
+            item: SymbolName("it".into()),
+            body: vec![],
+            collect: None,
+            flat: false,
+        }];
+        let err = run(&host, body).await.unwrap_err();
+        assert!(
+            err.to_string().contains("execution budget"),
+            "an oversized each must be rejected, got: {err}"
+        );
+    }
+
+    /// L-83 (failing-first): `memo` keys a cache hit on op + input PROVENANCE, not "the name is
+    /// bound". So `memo $y = echo("a")` then `memo $y = echo("b")` runs `b` (different args), and a
+    /// `memo` over a name an unrelated op already bound re-executes.
+    #[tokio::test]
+    async fn memo_keys_on_op_and_input_provenance() {
+        let host = CfHost::new();
+        let memo = |name: &str, op: &str, arg: &str| Node::Memo {
+            name: SymbolName(name.into()),
+            value: Box::new(call(op, vec![flow_lit(json!(arg))])),
+            ty: None,
+            effect: None,
+        };
+        let body = vec![
+            // A plain (non-memo) binding of `$config` by an unrelated op.
+            flow_bind("config", call("echo", vec![flow_lit(json!("preexisting"))])),
+            // A `memo` over that same name must still run its op (the provenance key is absent).
+            memo("config", "pick", "real"),
+            // Same op, different arg → different provenance → runs again.
+            memo("y", "echo", "a"),
+            memo("y", "echo", "b"),
+        ];
+        let out = run(&host, body).await.unwrap();
+        let marks = host.marks();
+        assert!(
+            marks.contains(&"pick=real".to_string()),
+            "memo over an unrelated prior binding must re-execute; marks: {marks:?}"
+        );
+        assert!(
+            marks.contains(&"a".to_string()) && marks.contains(&"b".to_string()),
+            "a memo with different args must run again; marks: {marks:?}"
+        );
+        assert_eq!(out.result, "b", "the last memo's fresh value wins");
+    }
+
+    /// L-83 (failing-first): two `once` blocks with the same label but different bodies both run —
+    /// the durable key folds body identity in, so the second's genuinely-different side effect is not
+    /// silently skipped as a label collision.
+    #[tokio::test]
+    async fn once_distinguishes_same_label_different_bodies() {
+        let host = CfHost::new();
+        let body = vec![
+            Node::Once {
+                label: "setup".into(),
+                body: vec![echo("first")],
+                bind: None,
+            },
+            Node::Once {
+                label: "setup".into(),
+                body: vec![echo("second")],
+                bind: None,
+            },
+            // A THIRD block re-using the FIRST body under the same label must be coalesced (idempotent).
+            Node::Once {
+                label: "setup".into(),
+                body: vec![echo("first")],
+                bind: None,
+            },
+        ];
+        let _ = run(&host, body).await.unwrap();
+        let marks = host.marks();
+        assert_eq!(
+            marks,
+            vec!["first".to_string(), "second".to_string()],
+            "different bodies both run; an identical-body repeat coalesces; marks: {marks:?}"
         );
     }
 

@@ -6,8 +6,7 @@
 //! other tasks. The criterion is graded through a [`System`] rooted at the workspace — argv-only, no
 //! shell — so the agent can't "pass" by tampering with its own grader.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -22,18 +21,10 @@ use crate::adapter::RunContext;
 use crate::metrics::{iterations_from_messages, metrics_from_events, RunResult};
 use crate::spec::{Criterion, SeedFile, Setup, TaskSpec};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+use crate::util::unique_temp_dir;
 
 fn io_err(e: std::io::Error) -> Error {
     Error::Other(e.to_string())
-}
-
-/// A unique temp directory (created) under the system temp dir.
-fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(io_err)?;
-    Ok(dir)
 }
 
 /// Reject seed paths that would escape the workspace (absolute or `..`).
@@ -263,7 +254,7 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
         return Ok(RunResult::failed(&spec.id, 0, "cancelled before start"));
     }
 
-    let workdir = unique_temp_dir("flux-eval-task")?;
+    let workdir = unique_temp_dir("flux-eval-task").map_err(io_err)?;
     materialize(&spec.setup, &workdir)?;
     let home = workdir.join(".home");
     std::fs::create_dir_all(&home).map_err(io_err)?;
@@ -398,6 +389,7 @@ pub async fn run_local_task(spec: &TaskSpec, ctx: &RunContext<'_>) -> Result<Run
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_system() -> (PathBuf, System) {
         let dir = unique_temp_dir("flux-eval-runner-test").unwrap();

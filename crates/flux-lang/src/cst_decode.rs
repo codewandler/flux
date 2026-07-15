@@ -605,7 +605,7 @@ fn lower_budget(statement: &SyntaxNode) -> DecodeResult<Node> {
 
 fn lower_cap_scope(statement: &SyntaxNode) -> DecodeResult<Node> {
     let rest = rest_after_keyword(statement, "with_tools")?;
-    let (value, tail) = parse_setting_prefix(rest.trim_start(), statement)?;
+    let (value, tail) = parse_setting_prefix(rest.trim_start(), statement, 0)?;
     let tools = string_list(&value, "with_tools", statement)?;
     Ok(Node::CapScope {
         tools,
@@ -1937,8 +1937,13 @@ fn parse_json_exact(text: &str, at: &SyntaxNode) -> DecodeResult<serde_json::Val
     serde_json::from_str(text).map_err(|err| error(at, format!("invalid JSON literal: {err}")))
 }
 
+/// L-81: recursion cap for the setting-value grammar. `[[[…` / `{a:{a:{…` nest unboundedly, so a
+/// deeply nested settings literal (reachable from any `.flux` module header) would overflow the stack
+/// and `SIGABRT`. Threaded through the three mutually-recursive parsers and turned into a `LowerError`.
+const MAX_SETTING_DEPTH: usize = 256;
+
 fn parse_setting_exact(text: &str, at: &SyntaxNode) -> DecodeResult<serde_json::Value> {
-    let (value, tail) = parse_setting_prefix(text, at)?;
+    let (value, tail) = parse_setting_prefix(text, at, 0)?;
     if !tail.trim().is_empty() {
         return Err(error(
             at,
@@ -1951,7 +1956,11 @@ fn parse_setting_exact(text: &str, at: &SyntaxNode) -> DecodeResult<serde_json::
 fn parse_setting_prefix<'a>(
     text: &'a str,
     at: &SyntaxNode,
+    depth: usize,
 ) -> DecodeResult<(serde_json::Value, &'a str)> {
+    if depth >= MAX_SETTING_DEPTH {
+        return Err(error(at, "setting value nesting too deep"));
+    }
     let text = text.trim_start();
     let first = text
         .chars()
@@ -1967,8 +1976,8 @@ fn parse_setting_prefix<'a>(
                 None => Err(error(at, "expected a setting value")),
             }
         }
-        '[' => parse_setting_list(text, at),
-        '{' => parse_setting_record(text, at),
+        '[' => parse_setting_list(text, at, depth),
+        '{' => parse_setting_record(text, at, depth),
         ch if ch.is_ascii_alphabetic() || ch == '_' => {
             let (ident, rest) = take_while(text, is_name_char);
             match ident {
@@ -1992,6 +2001,7 @@ fn parse_setting_prefix<'a>(
 fn parse_setting_list<'a>(
     text: &'a str,
     at: &SyntaxNode,
+    depth: usize,
 ) -> DecodeResult<(serde_json::Value, &'a str)> {
     let mut tail = text
         .strip_prefix('[')
@@ -2002,7 +2012,7 @@ fn parse_setting_list<'a>(
         return Ok((serde_json::Value::Array(values), rest));
     }
     loop {
-        let (value, rest) = parse_setting_prefix(tail, at)?;
+        let (value, rest) = parse_setting_prefix(tail, at, depth + 1)?;
         values.push(value);
         let rest = rest.trim_start();
         if let Some(next) = rest.strip_prefix(',') {
@@ -2021,6 +2031,7 @@ fn parse_setting_list<'a>(
 fn parse_setting_record<'a>(
     text: &'a str,
     at: &SyntaxNode,
+    depth: usize,
 ) -> DecodeResult<(serde_json::Value, &'a str)> {
     let mut tail = text
         .strip_prefix('{')
@@ -2044,7 +2055,7 @@ fn parse_setting_record<'a>(
             .trim_start()
             .strip_prefix(':')
             .ok_or_else(|| error(at, format!("expected `:` after record key `{key}`")))?;
-        let (value, rest) = parse_setting_prefix(rest, at)?;
+        let (value, rest) = parse_setting_prefix(rest, at, depth + 1)?;
         values.insert(key, value);
         let rest = rest.trim_start();
         if let Some(next) = rest.strip_prefix(',') {
@@ -2117,6 +2128,7 @@ fn parse_limits(value: &serde_json::Value, at: &SyntaxNode) -> DecodeResult<Comp
             "dispatches" => limits.dispatches = Some(number),
             "timeout_ms" => limits.timeout_ms = Some(number),
             "context_chars" => limits.context_chars = Some(number),
+            "max_depth" => limits.max_depth = Some(number),
             other => return Err(error(at, format!("unknown limit `{other}`"))),
         }
     }

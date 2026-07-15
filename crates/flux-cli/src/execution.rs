@@ -42,6 +42,97 @@ pub(super) fn build_provider(spec: &str) -> Result<(NativeProvider, String, Stri
     Ok(flux_providers::spec::build(spec)?)
 }
 
+/// Whether a model spec selects the offline [`MockCliProvider`] — a bare `mock` or any `mock/…`
+/// form. The single predicate behind both the engine's [`resolve_cli_provider`] policy and the
+/// sub-agent factory [`provider_for`], so the two can't disagree on what counts as the mock.
+pub(super) fn is_mock_spec(spec: &str) -> bool {
+    spec == "mock" || spec.starts_with("mock/")
+}
+
+/// One boxed provider under the CLI's mock/lazy/eager policy, plus the resolved model name and the
+/// canonical `provider/model` spec (what cost/subscription detection reads).
+pub(super) struct ResolvedProvider {
+    pub(super) provider: Box<dyn Provider>,
+    pub(super) model: String,
+    pub(super) canonical_spec: String,
+}
+
+/// Resolve a provider for `model_spec` under the CLI's three-way policy, shared by the engine's
+/// primary provider and the cognition pack's sibling so the two can't drift:
+/// - `mock` / `mock/…` → the offline [`MockCliProvider`] (canonical spec is just `mock`).
+/// - lazy (`!eager`, C-11) → a [`LazyProvider`] that reads no credential until the first model call;
+///   `model` is the display part and `canonical_spec` is the raw input.
+/// - eager → the one provider factory ([`build_provider`]), materializing the credential chain now;
+///   the resolved `provider/model` becomes the canonical spec.
+///
+/// The eager branch PROPAGATES its construction error; a caller that prefers to degrade (the
+/// cognition sibling) catches it.
+pub(super) fn resolve_cli_provider(model_spec: &str, eager: bool) -> Result<ResolvedProvider> {
+    if is_mock_spec(model_spec) {
+        Ok(ResolvedProvider {
+            provider: Box::<MockCliProvider>::default(),
+            model: "mock".to_string(),
+            canonical_spec: "mock".to_string(),
+        })
+    } else if !eager {
+        // C-11 lazy: no credential read, no chain/model-id resolution — all deferred to
+        // `LazyProvider` on the first model call. The unresolved model part serves for display.
+        let display_model = model_spec
+            .split_once('/')
+            .map(|(_, m)| m.to_string())
+            .unwrap_or_else(|| model_spec.to_string());
+        Ok(ResolvedProvider {
+            provider: Box::new(LazyProvider::new(model_spec.to_string())),
+            model: display_model,
+            canonical_spec: model_spec.to_string(),
+        })
+    } else {
+        // The one provider factory (C-11): `build_provider` owns the whole construction, including
+        // the aws credential-chain materialization. The raw `model_spec` may be a bare alias
+        // (`codex`, `sonnet`) that cost detection can't decode, so surface the resolved form.
+        let (native, provider, m) = build_provider(model_spec)?;
+        let canonical_spec = format!("{provider}/{m}");
+        Ok(ResolvedProvider {
+            provider: Box::new(native),
+            model: m,
+            canonical_spec,
+        })
+    }
+}
+
+/// Walk `base` (guarded, capped at 4000 entries) and collect `(path, text)` for documentation files
+/// (markdown/text, by extension), stopping at `max_docs` and skipping any file whose metadata size
+/// exceeds `max_bytes`. The size check reads metadata BEFORE the file so a stray 500 MB `notes.txt`
+/// never costs a whole-file read just to be discarded. A walk error yields an empty vec (an empty
+/// index just means "no matches"). Shared by [`build_doc_index`] and the `markdown` datasource arm.
+async fn walk_docs(
+    system: &System,
+    base: &str,
+    max_docs: usize,
+    max_bytes: usize,
+) -> Vec<(String, String)> {
+    const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
+    let Ok(files) = system.walk_files(base, 4000).await else {
+        return Vec::new();
+    };
+    let mut docs: Vec<(String, String)> = Vec::new();
+    for f in files {
+        if docs.len() >= max_docs {
+            break;
+        }
+        if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
+            continue;
+        }
+        if !matches!(system.file_size(&f).await, Ok(n) if n as usize <= max_bytes) {
+            continue;
+        }
+        if let Ok(text) = system.read_file(&f).await {
+            docs.push((f, text));
+        }
+    }
+    docs
+}
+
 /// Build the knowledge datasource from the workspace's documentation files (markdown/text), indexed as
 /// `file.document` records under the `local` source. Deliberately cheap: doc extensions only, capped file
 /// count and size — code search is served by `grep`, not this. Errors are swallowed (an empty index just
@@ -49,33 +140,11 @@ pub(super) fn build_provider(spec: &str) -> Result<(NativeProvider, String, Stri
 pub(super) async fn build_doc_index(
     system: &System,
 ) -> Arc<dyn flux_capabilities::DatasourceBackend> {
-    const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
-    const MAX_DOCS: usize = 200;
-    const MAX_BYTES: usize = 100_000;
     // Wrap the keyword backend in the semantic (embeddings) backend *before* ingest — when built with
     // `--features embeddings` and an embeddings key resolves — so records are embedded as they're indexed.
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
-    let Ok(files) = system.walk_files(".", 4000).await else {
-        return backend;
-    };
-    let mut docs: Vec<(String, String)> = Vec::new();
-    for f in files {
-        if docs.len() >= MAX_DOCS {
-            break;
-        }
-        if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
-            continue;
-        }
-        // Size-check via metadata BEFORE reading: this runs on every agent construction, and a
-        // stray 500 MB `notes.txt` must not cost a whole-file read+alloc just to be discarded.
-        if !matches!(system.file_size(&f).await, Ok(n) if n as usize <= MAX_BYTES) {
-            continue;
-        }
-        if let Ok(text) = system.read_file(&f).await {
-            docs.push((f, text));
-        }
-    }
+    let docs = walk_docs(system, ".", 200, 100_000).await;
     // Index under the `local` source as `file.document` records via the markdown ingester.
     let _ = flux_capabilities::ingest_markdown(&*backend, "local", &docs);
     backend
@@ -91,9 +160,6 @@ pub(super) async fn build_datasources(
     program_dir: &std::path::Path,
     system: &System,
 ) -> Result<Arc<dyn flux_capabilities::DatasourceBackend>> {
-    const DOC_EXTS: &[&str] = &[".md", ".txt", ".rst", ".adoc", ".mdx"];
-    const MAX_DOCS: usize = 1000;
-    const MAX_BYTES: usize = 200_000;
     // A datasource path is relative to the PROGRAM FILE's directory (absolute paths pass through), so
     // `path "./docs"` means "beside the .flux file" regardless of the launch cwd. `program_dir` is a
     // read-only root of `system`, so the resulting absolute path is walkable/readable.
@@ -111,23 +177,7 @@ pub(super) async fn build_datasources(
         match d.kind.as_str() {
             "markdown" => {
                 let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
-                let files = system.walk_files(&base, 4000).await.unwrap_or_default();
-                let mut docs: Vec<(String, String)> = Vec::new();
-                for f in files {
-                    if docs.len() >= MAX_DOCS {
-                        break;
-                    }
-                    if !DOC_EXTS.iter().any(|e| f.ends_with(e)) {
-                        continue;
-                    }
-                    // Metadata size-check before the read, as in `build_doc_index`.
-                    if !matches!(system.file_size(&f).await, Ok(n) if n as usize <= MAX_BYTES) {
-                        continue;
-                    }
-                    if let Ok(text) = system.read_file(&f).await {
-                        docs.push((f, text));
-                    }
-                }
+                let docs = walk_docs(system, &base, 1000, 200_000).await;
                 flux_capabilities::ingest_markdown(&*backend, &d.name, &docs)
                     .map_err(|e| anyhow::anyhow!("datasource `{}` (markdown): {e}", d.name))?;
             }
@@ -428,7 +478,7 @@ impl flux_capabilities::CrossPluginAudit for EventStoreCrossPluginAudit {
 
 /// Build a fresh boxed provider for a model spec (used by the sub-agent factory).
 pub(super) fn provider_for(spec: &str) -> Result<Box<dyn Provider>> {
-    if spec == "mock" || spec.starts_with("mock/") {
+    if is_mock_spec(spec) {
         Ok(Box::<MockCliProvider>::default())
     } else {
         let (native, _provider, _model) = build_provider(spec).map_err(|e| {
@@ -763,6 +813,163 @@ pub(super) async fn resolve_agent_loop(
     AgentLoopSpec::parse(&source).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
+/// Register the model-facing operation packs onto the top-level registry, in the order that lets the
+/// name-collision checks fire deterministically: the cognition pack (when a sibling provider was
+/// built), then eval/self-improvement, the reflect stages, flow discovery/run, and render. These are
+/// registered on the top-level registry ONLY — never on a worker sub-agent's scoped toolset, so a
+/// child can't run eval/git ops or the model-facing cognition ops.
+fn register_tool_packs(
+    registry: &mut ToolRegistry,
+    cog_provider: Option<Box<dyn Provider>>,
+    model: &str,
+    flags: &AgentFlags,
+) -> Result<()> {
+    if let Some(cog_provider) = cog_provider {
+        flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.to_string())
+            .with_reasoning(flags.think, flags.effort.map(Into::into))
+            .try_register_from("flux-cli cognition pack", registry)?;
+    }
+    // Eval / self-improvement ops (the ones the improve flows orchestrate).
+    flux_eval::try_register_eval_ops(registry)?;
+    // Authored-loop stages are registered for `agent-loop.flux` but tagged to the never-surfaced
+    // `reflect` group, so they stay OUT of native model catalogs. `op.register` remains model-facing
+    // and delegates to the engine-installed composite registrar.
+    flux_tools::try_register_reflect(registry)?;
+    // Flow discovery/run: `flow_list` (enumerate .flux/flows + ~/.flux/flows) and `flow_run`
+    // (run a stored flow by name in the current session). Model-facing.
+    flux_tools::try_register_flows(registry)?;
+    // `flow_render`: Flux-Lang source/plan → syntax-highlighted SVG (source + tree views), for
+    // surfaces that can't highlight .flux themselves (READMEs, Slack, docs, chat panels).
+    flux_tools::try_register_render(registry)?;
+    Ok(())
+}
+
+/// The permission floor, approver, and JS pre-tool hooks for the CLI executor.
+struct ResolvedPermissions {
+    perms: PermissionManager,
+    approver: Arc<dyn Approver>,
+    hooks: Vec<Arc<dyn flux_runtime::PreToolHook>>,
+}
+
+/// Resolve the permission floor, approver, and pre-tool hooks. Read-only tools are pre-allowed by
+/// default (empty allow-list) so the common case needs no config; network/mutating tools still gate.
+/// A configured allow-list replaces the [`DEFAULT_ALLOW`] default entirely. `--yes` swaps the
+/// interactive approver for auto-allow. Hooks are the observe/modify/deny JS scripts under the
+/// project and user `.flux/hooks/*.js`.
+fn resolve_permissions(
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    flags: &AgentFlags,
+) -> ResolvedPermissions {
+    let mut allow = cfg.permissions.allow.clone();
+    if allow.is_empty() {
+        allow.extend(DEFAULT_ALLOW.iter().map(|s| s.to_string()));
+    }
+    let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
+    let approver: Arc<dyn Approver> = if flags.yes {
+        Arc::new(AllowApprover)
+    } else {
+        Arc::new(StdinApprover)
+    };
+    let mut hook_dirs = vec![cwd.join(".flux").join("hooks")];
+    if let Some(home) = std::env::var_os("HOME") {
+        hook_dirs.push(std::path::PathBuf::from(home).join(".flux").join("hooks"));
+    }
+    let js_hooks = flux_plugin::hooks::JsHookEngine::load(&hook_dirs);
+    let mut hooks: Vec<Arc<dyn flux_runtime::PreToolHook>> = Vec::new();
+    if !js_hooks.is_empty() {
+        hooks.push(Arc::new(js_hooks));
+    }
+    ResolvedPermissions {
+        perms,
+        approver,
+        hooks,
+    }
+}
+
+/// The engine-assembly inputs produced by the middle of [`build_agent_with`]: the provider +
+/// executor + event store, plus the resolved model, prompt, evidence-gated groups, ambient signals,
+/// config-authored model stages, and the validated iteration cap.
+struct EngineParts {
+    provider: Box<dyn Provider>,
+    executor: flux_runtime::Executor,
+    events: Arc<EventStore>,
+    model: String,
+    system_prompt: String,
+    groups: Vec<flux_evidence::ToolGroup>,
+    ambient_signals: Vec<String>,
+    model_stages: std::collections::BTreeMap<String, flux_flow::ModelStageDefinition>,
+    max_iterations: usize,
+}
+
+/// Assemble the [`FlowEngine`] from the resolved parts: install the authored-loop host, load the
+/// selected Flux-Lang outer loop, register the config-authored model stages, and apply the per-turn
+/// token ceiling (A-10, default OFF; precedence `--turn-budget` > `FLUX_TURN_TOKEN_BUDGET` >
+/// `[limits] turn_token_budget`). A malformed env budget is a hard error, not a silent fall-through —
+/// this is a spend/safety ceiling and running unbounded is exactly the failure it prevents.
+async fn assemble_engine(
+    parts: EngineParts,
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    flags: &AgentFlags,
+    system: &System,
+) -> Result<FlowEngine> {
+    let EngineParts {
+        provider,
+        executor,
+        events,
+        model,
+        system_prompt,
+        groups,
+        ambient_signals,
+        model_stages,
+        max_iterations,
+    } = parts;
+    let flow = open_flow_store(events.clone())?;
+    let spec = AgentSpec {
+        model,
+        system_prompt,
+        skills: load_skills(cwd, cfg, &flags.skill_dirs, &flags.skills)?,
+        max_tokens: flags.max_tokens,
+        max_iterations,
+        thinking: flags.think,
+        effort: flags.effort.map(Into::into),
+        agent_loop: resolve_agent_loop(
+            flags
+                .agent_loop
+                .as_deref()
+                .or(cfg.agent.loop_spec.as_deref()),
+            system,
+        )
+        .await?,
+        groups,
+        adaptive_policy: adaptive_loop_policy(flags, &cfg.agent)?,
+        ambient_signals,
+        compact_threshold_chars: compact_threshold(),
+        cwd: cwd.to_path_buf(),
+        // The CLI builds its own richly-configured executor (perms/approver/hooks/policy/identity)
+        // above, so `tools`/`permissions` are already applied there — `into_engine` consumes only the
+        // engine-identity fields.
+        ..AgentSpec::default()
+    };
+    let agent = spec
+        .into_engine(Arc::from(provider), executor, events, flow)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    agent.loop_host.set_model_stages(model_stages);
+    let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
+        Ok(v) => Some(v.trim().parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("FLUX_TURN_TOKEN_BUDGET is not a token count ({v:?}): {e}")
+        })?),
+        Err(_) => None,
+    };
+    let turn_budget = flags
+        .turn_budget
+        .or(env_budget)
+        .or(cfg.limits.turn_token_budget);
+    agent.loop_host.set_token_budget(turn_budget);
+    Ok(agent)
+}
+
 pub(super) async fn build_agent_with(
     flags: &AgentFlags,
     eager_provider: bool,
@@ -786,37 +993,13 @@ pub(super) async fn build_agent_with(
     }
     let model_spec = resolve_model_spec(&flags.model, &cfg);
 
-    // The built-in `mock` provider lets the full agentic loop be exercised offline via the CLI.
-    let (provider, model, canonical_spec): (Box<dyn Provider>, String, String) =
-        if model_spec == "mock" || model_spec.starts_with("mock/") {
-            (
-                Box::<MockCliProvider>::default(),
-                "mock".to_string(),
-                "mock".to_string(),
-            )
-        } else if !eager_provider {
-            // C-11 lazy: no credential read, no chain resolution, no model-id resolution — all of
-            // it happens inside `LazyProvider` on the first model call. The unresolved model part
-            // serves for display; `LazyProvider` swaps the resolved id onto the wire.
-            let display_model = model_spec
-                .split_once('/')
-                .map(|(_, m)| m.to_string())
-                .unwrap_or_else(|| model_spec.clone());
-            (
-                Box::new(LazyProvider::new(model_spec.clone())),
-                display_model,
-                model_spec.clone(),
-            )
-        } else {
-            // The one provider factory (C-11): `build_provider` owns the whole construction,
-            // including the aws credential-chain materialization — no per-caller special cases.
-            let (native, provider, m) = build_provider(&model_spec)?;
-            // The canonical `provider/model` spec (resolved) — what cost/subscription detection
-            // reads. The raw `model_spec` input may be a bare alias (`codex`, `sonnet`) that neither
-            // `is_subscription` nor `rates_for` can decode, so surface the resolved form.
-            let canonical_spec = format!("{provider}/{m}");
-            (Box::new(native), m, canonical_spec)
-        };
+    // The engine's primary provider under the mock/lazy/eager policy (the `mock` provider lets the
+    // full agentic loop be exercised offline via the CLI).
+    let ResolvedProvider {
+        provider,
+        model,
+        canonical_spec,
+    } = resolve_cli_provider(&model_spec, eager_provider)?;
 
     // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
     // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
@@ -885,57 +1068,21 @@ pub(super) async fn build_agent_with(
 
     // Model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite): the L3
     // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
-    // `CognitionPack` needs an `Arc<dyn Provider>`, but `provider` is moved into the `FlowEngine`
-    // below, so build a sibling provider instance from the same spec for the pack to own (for
-    // `mock` this is a fresh, hermetic `MockCliProvider`).
+    // `CognitionPack` needs its own `Arc<dyn Provider>` (the engine's `provider` is moved below), so
+    // build a sibling instance under the SAME mock/lazy/eager policy. Only the eager path can fail;
+    // when it does we skip the pack rather than fail startup — the rest of the agent is unaffected.
     let cog_provider: Option<Box<dyn Provider>> =
-        if model_spec == "mock" || model_spec.starts_with("mock/") {
-            Some(Box::<MockCliProvider>::default())
-        } else if !eager_provider {
-            // C-11: the lazy path must honor its "no credential read, no chain resolution at
-            // startup" guarantee for the sibling too — an eager `provider_for` here made
-            // `flux replay` (which advertises "no model call, no live IO") run the aws
-            // credential chain over the network. Deferred like the engine's own provider; the
-            // construction error, when a flow DOES call an ai.* op, is the same one the eager
-            // path raises.
-            Some(Box::new(LazyProvider::new(model_spec.clone())))
-        } else {
-            // Eager path: if the sibling can't be built we skip the pack rather than fail
-            // startup — the rest of the agent is unaffected.
-            match provider_for(&model_spec) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        style::dim(&format!("(cognition pack not wired: {e})"))
-                    );
-                    None
-                }
+        match resolve_cli_provider(&model_spec, eager_provider) {
+            Ok(resolved) => Some(resolved.provider),
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    style::dim(&format!("(cognition pack not wired: {e})"))
+                );
+                None
             }
         };
-    if let Some(cog_provider) = cog_provider {
-        flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.clone())
-            .with_reasoning(flags.think, flags.effort.map(Into::into))
-            .try_register_from("flux-cli cognition pack", &mut registry)?;
-    }
-
-    // Eval / self-improvement ops (the ones the improve flows orchestrate). Registered on the
-    // top-level registry only — never on `sub_registry`, so worker sub-agents can't run eval/git ops.
-    flux_eval::try_register_eval_ops(&mut registry)?;
-
-    // Authored-loop stages are registered for `agent-loop.flux` but tagged to the never-surfaced
-    // `reflect` group, so they stay OUT of native model catalogs. `op.register` remains model-facing
-    // and delegates to the engine-installed composite registrar.
-    flux_tools::try_register_reflect(&mut registry)?;
-
-    // Flow discovery/run: `flow_list` (enumerate .flux/flows + ~/.flux/flows) and `flow_run`
-    // (run a stored flow by name in the current session). Model-facing, so the agent can
-    // discover and run authored flows.
-    flux_tools::try_register_flows(&mut registry)?;
-
-    // `flow_render`: Flux-Lang source/plan → syntax-highlighted SVG (source + tree views), for
-    // surfaces that can't highlight .flux themselves (READMEs, Slack, docs, chat panels).
-    flux_tools::try_register_render(&mut registry)?;
+    register_tool_packs(&mut registry, cog_provider, &model, flags)?;
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
@@ -987,6 +1134,7 @@ pub(super) async fn build_agent_with(
                     backend: backend.clone(),
                 })),
                 browser_bin: cfg.browser_bin.clone(),
+                allowed_secrets: None,
             },
         )?;
     }
@@ -1059,28 +1207,11 @@ pub(super) async fn build_agent_with(
         );
     }
 
-    // Read-only tools are pre-allowed by default so the common case needs no config; network/
-    // mutating tools still gate. See [`DEFAULT_ALLOW`]. A configured allow-list replaces it entirely.
-    let mut allow = cfg.permissions.allow.clone();
-    if allow.is_empty() {
-        allow.extend(DEFAULT_ALLOW.iter().map(|s| s.to_string()));
-    }
-    let perms = PermissionManager::from_rules(&allow, &cfg.permissions.deny);
-    let approver: Arc<dyn Approver> = if flags.yes {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(StdinApprover)
-    };
-    // JS pre-tool hooks (observe/modify/deny) from `.flux/hooks/*.js`.
-    let mut hook_dirs = vec![cwd.join(".flux").join("hooks")];
-    if let Some(home) = std::env::var_os("HOME") {
-        hook_dirs.push(std::path::PathBuf::from(home).join(".flux").join("hooks"));
-    }
-    let js_hooks = flux_plugin::hooks::JsHookEngine::load(&hook_dirs);
-    let mut hook_vec: Vec<Arc<dyn flux_runtime::PreToolHook>> = Vec::new();
-    if !js_hooks.is_empty() {
-        hook_vec.push(Arc::new(js_hooks));
-    }
+    let ResolvedPermissions {
+        perms,
+        approver,
+        hooks,
+    } = resolve_permissions(&cwd, &cfg, flags);
 
     let executor = assemble_cli_execution_environment(
         system.clone(),
@@ -1090,7 +1221,7 @@ pub(super) async fn build_agent_with(
         ExecutionAuthorization::with_identity_cell(policy, identity),
         redactor,
         Some(spawner.clone()),
-        hook_vec,
+        hooks,
     )
     .into_executor();
     // Record the available toolchain as a startup observation (audit backbone).
@@ -1131,54 +1262,27 @@ pub(super) async fn build_agent_with(
         serde_json::json!({ "signals": signals, "ambient": &ambient_signals }),
     ));
 
-    let flow = open_flow_store(events.clone())?;
-    // Assemble the engine: this installs the authored-loop host and loads the selected Flux-Lang
-    // outer loop (the turn loop is Flux-Lang, not Rust).
-    let spec = AgentSpec {
-        model,
-        system_prompt,
-        skills: load_skills(&cwd, &cfg, &flags.skill_dirs, &flags.skills)?,
-        max_tokens: flags.max_tokens,
-        max_iterations,
-        thinking: flags.think,
-        effort: flags.effort.map(Into::into),
-        agent_loop: resolve_agent_loop(
-            flags
-                .agent_loop
-                .as_deref()
-                .or(cfg.agent.loop_spec.as_deref()),
-            system.as_ref(),
-        )
-        .await?,
-        groups,
-        adaptive_policy: adaptive_loop_policy(flags, &cfg.agent)?,
-        ambient_signals,
-        compact_threshold_chars: compact_threshold(),
-        cwd: cwd.clone(),
-        // The CLI builds its own richly-configured executor (perms/approver/hooks/policy/identity)
-        // above, so `tools`/`permissions` are already applied there — `into_engine` consumes only the
-        // engine-identity fields.
-        ..AgentSpec::default()
-    };
-    let agent = spec
-        .into_engine(Arc::from(provider), executor, events, flow)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    agent.loop_host.set_model_stages(model_stages);
-    // Per-turn token ceiling (A-10), default OFF. Precedence: --turn-budget > FLUX_TURN_TOKEN_BUDGET
-    // > config [limits] turn_token_budget. A malformed env value is a hard error, not a silent
-    // fall-through: this is a spend/safety ceiling, and `FLUX_TURN_TOKEN_BUDGET=1_000_000` quietly
-    // running unbounded is exactly the failure the ceiling exists to prevent.
-    let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
-        Ok(v) => Some(v.trim().parse::<u64>().map_err(|e| {
-            anyhow::anyhow!("FLUX_TURN_TOKEN_BUDGET is not a token count ({v:?}): {e}")
-        })?),
-        Err(_) => None,
-    };
-    let turn_budget = flags
-        .turn_budget
-        .or(env_budget)
-        .or(cfg.limits.turn_token_budget);
-    agent.loop_host.set_token_budget(turn_budget);
+    // Assemble the engine from the resolved parts: this installs the authored-loop host, loads the
+    // selected Flux-Lang outer loop (the turn loop is Flux-Lang, not Rust), registers the
+    // config-authored model stages, and applies the per-turn token ceiling.
+    let agent = assemble_engine(
+        EngineParts {
+            provider,
+            executor,
+            events,
+            model,
+            system_prompt,
+            groups,
+            ambient_signals,
+            model_stages,
+            max_iterations,
+        },
+        &cwd,
+        &cfg,
+        flags,
+        system.as_ref(),
+    )
+    .await?;
     Ok((agent, session_id, canonical_spec, spawner))
 }
 

@@ -17,6 +17,19 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use flux_core::{Error, Result};
 
+/// Hard cap on a single `\0`-framed message the reader will buffer. A hostile page drives the CDP
+/// stream (event params, `Runtime.evaluate` return values, AX trees), so a frame with no terminator
+/// would otherwise grow the reader's accumulation buffer without bound and OOM the host. Frames past
+/// this cap are dropped and the stream resynchronises to the next `\0` — bounding memory to one cap.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bound on the buffered-event channel. The event stream is drained by the browser pump, but a page
+/// can emit events (console/log/lifecycle/fetch) far faster than the pump consumes them; an unbounded
+/// channel would let a hostile page OOM the host through the queue. When the channel is full the
+/// reader drops the event rather than blocking — blocking here would wedge response correlation (the
+/// pump awaits CDP responses that flow through this same reader), so drop-on-full is the safe bound.
+const EVENT_CHANNEL_CAP: usize = 4096;
+
 /// A protocol event: a `method` (e.g. `"Page.loadEventFired"`), its `params`, and the `sessionId` it
 /// arrived on (empty for browser-level events under CDP's flattened session mode).
 #[derive(Debug, Clone)]
@@ -42,13 +55,13 @@ impl CdpClient {
     /// responses to their calls and forwards events to the returned receiver. The reader task (and
     /// the event stream) end when the transport reaches EOF; any in-flight calls then resolve to an
     /// error rather than hanging.
-    pub fn connect<R, W>(reader: R, writer: W) -> (Arc<Self>, mpsc::UnboundedReceiver<CdpEvent>)
+    pub fn connect<R, W>(reader: R, writer: W) -> (Arc<Self>, mpsc::Receiver<CdpEvent>)
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let client = Arc::new(Self {
             next_id: AtomicI64::new(1),
             pending: pending.clone(),
@@ -104,10 +117,17 @@ impl CdpClient {
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: R,
     pending: Pending,
-    ev_tx: mpsc::UnboundedSender<CdpEvent>,
+    ev_tx: mpsc::Sender<CdpEvent>,
 ) {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
+    // Leading bytes of `buf` already scanned and known to contain no terminator. Scanning only the
+    // freshly-read tail keeps framing O(total bytes) instead of O(n²) rescans as one frame grows —
+    // which for a large frame is itself a CPU-DoS on a hostile stream.
+    let mut scanned = 0usize;
+    // When a frame exceeds `MAX_FRAME_BYTES` we drop it and skip bytes until the next `\0` so the
+    // stream re-synchronises on the following frame instead of the reader OOMing on one huge message.
+    let mut resyncing = false;
     loop {
         let n = match reader.read(&mut chunk).await {
             Ok(0) => break, // EOF — Chrome closed the pipe
@@ -115,23 +135,57 @@ async fn read_loop<R: AsyncRead + Unpin>(
             Err(_) => break,
         };
         buf.extend_from_slice(&chunk[..n]);
-        while let Some(pos) = buf.iter().position(|&b| b == 0) {
-            let frame: Vec<u8> = buf.drain(..=pos).collect();
-            let frame = &frame[..frame.len() - 1]; // strip the NUL
-            if frame.is_empty() {
-                continue;
+        loop {
+            // Search only the not-yet-scanned tail for the next terminator.
+            let found = buf[scanned..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| scanned + p);
+            match found {
+                Some(pos) => {
+                    if resyncing {
+                        // Drop the abandoned over-cap frame up to and including this terminator.
+                        buf.drain(..=pos);
+                        resyncing = false;
+                        scanned = 0;
+                        continue;
+                    }
+                    let frame: Vec<u8> = buf.drain(..=pos).collect();
+                    scanned = 0;
+                    let frame = &frame[..frame.len() - 1]; // strip the NUL
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_slice::<Value>(frame) {
+                        dispatch(v, &pending, &ev_tx).await;
+                    }
+                    // Unparseable frames are skipped, not fatal (the stream-resilience discipline).
+                }
+                None => {
+                    // No terminator in what we've read. Everything buffered is now scanned; if the
+                    // partial frame already blew the cap it can never be a frame we accept — drop it
+                    // and resync to the next terminator so the reader can't be driven to OOM.
+                    scanned = buf.len();
+                    if buf.len() > MAX_FRAME_BYTES {
+                        if !resyncing {
+                            eprintln!(
+                                "cdp: dropping over-cap frame (> {MAX_FRAME_BYTES} bytes) and resyncing"
+                            );
+                        }
+                        buf.clear();
+                        scanned = 0;
+                        resyncing = true;
+                    }
+                    break;
+                }
             }
-            if let Ok(v) = serde_json::from_slice::<Value>(frame) {
-                dispatch(v, &pending, &ev_tx).await;
-            }
-            // Unparseable frames are skipped, not fatal (the stream-resilience discipline).
         }
     }
     // Transport gone: fail every in-flight call so no caller hangs.
     pending.lock().await.clear();
 }
 
-async fn dispatch(v: Value, pending: &Pending, ev_tx: &mpsc::UnboundedSender<CdpEvent>) {
+async fn dispatch(v: Value, pending: &Pending, ev_tx: &mpsc::Sender<CdpEvent>) {
     if let Some(id) = v.get("id").and_then(Value::as_i64) {
         if let Some(tx) = pending.lock().await.remove(&id) {
             let result = if let Some(err) = v.get("error") {
@@ -146,7 +200,10 @@ async fn dispatch(v: Value, pending: &Pending, ev_tx: &mpsc::UnboundedSender<Cdp
             let _ = tx.send(result);
         }
     } else if let Some(method) = v.get("method").and_then(Value::as_str) {
-        let _ = ev_tx.send(CdpEvent {
+        // Non-blocking send: blocking here would wedge response correlation, since the pump that
+        // drains this channel awaits CDP responses that flow through this same reader. A full or
+        // closed channel drops the event (the bound that keeps a chatty/hostile page from OOMing us).
+        let ev = CdpEvent {
             method: method.to_string(),
             params: v.get("params").cloned().unwrap_or(Value::Null),
             session_id: v
@@ -154,7 +211,10 @@ async fn dispatch(v: Value, pending: &Pending, ev_tx: &mpsc::UnboundedSender<Cdp
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-        });
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = ev_tx.try_send(ev) {
+            eprintln!("cdp: event channel full ({EVENT_CHANNEL_CAP}) — dropping {method}");
+        }
     }
 }
 
@@ -191,7 +251,7 @@ mod tests {
     /// and the "fake Chrome" read/write halves.
     fn wired() -> (
         Arc<CdpClient>,
-        mpsc::UnboundedReceiver<CdpEvent>,
+        mpsc::Receiver<CdpEvent>,
         ReadHalf<tokio::io::DuplexStream>,
         WriteHalf<tokio::io::DuplexStream>,
     ) {
@@ -270,6 +330,77 @@ mod tests {
             .call_on("Page.enable", json!({}), Some("S1"))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn over_cap_frame_is_dropped_and_stream_resyncs() {
+        // A hostile page can drive an unterminated (or absurdly large) frame at the reader. The cap
+        // must drop it and resync to the next `\0` so a following well-formed frame is still handled
+        // — the reader never buffers the whole over-cap frame (bounding memory to one cap).
+        let (client, _events, mut chrome_r, mut chrome_w) = wired();
+        tokio::spawn(async move {
+            // An over-cap run of bytes with NO terminator — the reader must abandon it at the cap
+            // rather than buffer it whole. Then a terminator closes the dropped frame out.
+            let junk = vec![b'x'; MAX_FRAME_BYTES + 64 * 1024];
+            chrome_w.write_all(&junk).await.unwrap();
+            chrome_w.write_all(&[0u8]).await.unwrap();
+            chrome_w.flush().await.unwrap();
+            // Then a valid response to the pending call — must survive the drop + resync.
+            let req = read_frame(&mut chrome_r).await;
+            let id = req["id"].as_i64().unwrap();
+            write_frame(
+                &mut chrome_w,
+                &json!({ "id": id, "result": { "ok": true } }),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.call("Target.getTargets", json!({})),
+        )
+        .await
+        .expect("call must not hang after an over-cap frame")
+        .unwrap();
+        assert_eq!(
+            result["ok"],
+            json!(true),
+            "the frame after the dropped over-cap frame is still delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_event_channel_does_not_wedge_response_correlation() {
+        // The event channel is bounded. The reader must DROP events when it is full, never block —
+        // blocking would wedge response correlation (the pump awaits CDP responses that flow through
+        // this same reader). We never drain `events`, flood past the cap, then require a call to
+        // still resolve. A naive back-pressure (blocking `send().await`) bound would deadlock here.
+        let (client, _events, mut chrome_r, mut chrome_w) = wired();
+        tokio::spawn(async move {
+            for i in 0..(EVENT_CHANNEL_CAP + 500) {
+                write_frame(
+                    &mut chrome_w,
+                    &json!({ "method": "Runtime.consoleAPICalled", "params": { "i": i } }),
+                )
+                .await;
+            }
+            let req = read_frame(&mut chrome_r).await;
+            let id = req["id"].as_i64().unwrap();
+            write_frame(
+                &mut chrome_w,
+                &json!({ "id": id, "result": { "ok": true } }),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.call("Target.getTargets", json!({})),
+        )
+        .await
+        .expect("a full event channel must not block response correlation")
+        .unwrap();
+        assert_eq!(result["ok"], json!(true));
     }
 
     #[tokio::test]

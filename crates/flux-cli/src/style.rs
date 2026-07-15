@@ -94,31 +94,9 @@ pub fn plan_palette() -> flux_flow::render::Palette {
     }
 }
 
-/// Format a token count compactly: `940` / `5.4k` / `1.2M`. Rounds to the display precision
-/// BEFORE picking the unit, so the boundary hands off cleanly: `999_950` reads `1.0M`, never
-/// `1000.0k`.
-pub fn fmt_tokens(n: u64) -> String {
-    let tenths_of_k = (n as f64 / 100.0).round();
-    if tenths_of_k >= 10_000.0 {
-        format!("{:.1}M", tenths_of_k / 10_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", tenths_of_k / 10.0)
-    } else {
-        n.to_string()
-    }
-}
-
-/// Format an elapsed duration compactly: `820µs` / `12ms` / `1.4s`.
-pub fn fmt_elapsed(d: std::time::Duration) -> String {
-    let ms = d.as_millis();
-    if ms == 0 {
-        format!("{}µs", d.as_micros())
-    } else if ms < 1000 {
-        format!("{ms}ms")
-    } else {
-        format!("{:.1}s", d.as_secs_f64())
-    }
-}
+// The token/duration humanizers live at L0 (`flux_core::humanize`) so the CLI and TUI share ONE
+// implementation. `fmt_tokens` keeps its CLI-local name (a token count) via a rename re-export.
+pub use flux_core::humanize::{fmt_count as fmt_tokens, fmt_elapsed};
 
 #[cfg(test)]
 mod tests {
@@ -144,26 +122,5 @@ mod tests {
         assert!(plan_palette().op.0.contains("36"));
 
         COLOR.store(false, Ordering::Relaxed); // reset the global for color-reading code elsewhere
-    }
-
-    #[test]
-    fn fmt_elapsed_scales() {
-        use std::time::Duration;
-        assert_eq!(fmt_elapsed(Duration::from_millis(12)), "12ms");
-        assert_eq!(fmt_elapsed(Duration::from_millis(1400)), "1.4s");
-    }
-
-    #[test]
-    fn fmt_tokens_scales() {
-        assert_eq!(fmt_tokens(940), "940");
-        assert_eq!(fmt_tokens(5_400), "5.4k");
-        assert_eq!(fmt_tokens(1_200_000), "1.2M");
-    }
-
-    #[test]
-    fn fmt_tokens_hands_off_units_at_the_boundary() {
-        assert_eq!(fmt_tokens(999_949), "999.9k");
-        assert_eq!(fmt_tokens(999_999), "1.0M", "never `1000.0k`");
-        assert_eq!(fmt_tokens(1_000), "1.0k");
     }
 }

@@ -474,8 +474,14 @@ impl EventBackend for SqliteEvents {
         let conn = self.conn.lock().unwrap();
         let tx = begin_write(&conn)?;
         let mut empty: Vec<i64> = {
+            // C-87: gate on `last_seq <= 0` (only the seq-0 `SessionStarted` was ever appended), NOT
+            // `msg_count = 0`. A session can carry durable facts — a run trace, observations,
+            // `CallUsage`, or app-defined `Custom` events — with zero `Message`s; `msg_count` counts
+            // only Message/Compacted, so the old predicate deleted those otherwise-nonempty streams.
+            // `last_seq` advances on EVERY append, so it is 0 iff the stream holds nothing but its
+            // creation event.
             let mut stmt = tx
-                .prepare("SELECT n FROM streams WHERE msg_count = 0")
+                .prepare("SELECT n FROM streams WHERE last_seq <= 0")
                 .map_err(map_sql)?;
             let rows = stmt
                 .query_map([], |r| r.get::<_, i64>(0))
@@ -605,7 +611,25 @@ impl EventBackend for SqliteEvents {
             .map_err(map_sql)?
             .query_row([stream], |r| r.get(0))
             .map_err(map_sql)?;
-        let stored = insert_event(&tx, stream, &ev, next_seq, &ctx)?;
+        let stored = match insert_event(&tx, stream, &ev, next_seq, &ctx) {
+            Ok(stored) => stored,
+            Err(e) => {
+                // C-87: caller-id idempotency is a check-then-insert — the `load_by_id` pre-check
+                // above and this INSERT are not atomic, so two writers on the shared file (a
+                // `serve` daemon + a CLI turn) can both miss the pre-check and race the INSERT. The
+                // loser trips `UNIQUE(id)`. Instead of surfacing that as an append error, roll back
+                // and re-read: if the id now resolves, the winner already stored this exact event, so
+                // return it (a no-op idempotent retry). Any other failure re-reads as absent and
+                // propagates unchanged.
+                if let Some(id) = &ev.id {
+                    drop(tx); // release the aborted write transaction before the follow-up read
+                    if let Some(existing) = load_by_id(&conn, id)? {
+                        return Ok(existing);
+                    }
+                }
+                return Err(e);
+            }
+        };
         // Maintain the session registry — but only for real `s_<n>` sessions. The log itself accepts
         // any stream string (the interpreter writes run events under ad-hoc ids like `"sess"`), so a
         // non-session stream simply has no registry row to update.

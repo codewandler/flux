@@ -186,10 +186,18 @@ struct LiveTask {
 /// `agent_id` on a multi-agent mount — so two agents' identical `s_<n>` ids never collide.
 pub struct TaskRegistry {
     live: std::sync::Mutex<HashMap<(String, String), LiveTask>>,
-    /// Push configs live beside (not inside) the live map so a config set while running is still
-    /// readable after the task finishes. In-process only, like the live map: a restart drops
-    /// them, and delivery only happens for in-process runs anyway.
+    /// Push configs live beside (not inside) the live map so a config can be set/read against a
+    /// retained terminal task between turns of a reused context. In-process only, like the live
+    /// map: a restart drops them, and delivery only happens for in-process runs anyway. Bounded
+    /// over the session lifecycle (C-83): [`TaskRegistry::finish`] drops a finished task's config,
+    /// and the mint-time sweep ([`sweep_orphaned_push_configs`]) drops configs whose session has
+    /// been TTL-pruned — neither can ever fire a webhook again.
     push: std::sync::Mutex<HashMap<(String, String), Vec<Value>>>,
+    /// Serializes the mint critical section (C-83). This is an **async** gate, distinct from the
+    /// `live` std mutex: the sweep + find-or-mint DB I/O runs while this is held (never while the
+    /// `live` std mutex is), so the resolve→register window stays atomic (the C-29 orphan
+    /// invariant) without a `std::sync::Mutex` ever being held across a `block_on` DB round-trip.
+    mint_gate: tokio::sync::Mutex<()>,
     /// One pooled, redirect-disabled HTTP client for webhook delivery (A-57/C-59).
     http: reqwest::Client,
     /// The one A2A-push egress scope. Registration and delivery both evaluate URLs against this
@@ -228,7 +236,49 @@ enum MintError {
     /// The resolved session already has a live in-process task. One session runs one task at a
     /// time (task-id = session id); the caller reports it and the client polls `tasks/get`.
     AlreadyRunning(String),
+    /// The caller's realm already has the maximum number of in-flight A2A tasks (C-83). Rejecting
+    /// here bounds the non-blocking turn queue + session minting instead of letting a flood
+    /// accumulate unbounded spawned tasks and minted sessions.
+    RealmBusy {
+        in_flight: usize,
+        cap: usize,
+    },
     Store(flux_core::Error),
+}
+
+/// Default per-realm in-flight A2A task cap. Bounds spawned background turns + minted sessions per
+/// caller realm; override with `FLUX_A2A_MAX_INFLIGHT_PER_REALM` (a positive integer).
+const DEFAULT_MAX_INFLIGHT_PER_REALM: usize = 64;
+
+/// The per-realm in-flight cap in force (C-83). Read per mint so an operator can retune it without
+/// a rebuild; a missing/zero/unparseable value falls back to [`DEFAULT_MAX_INFLIGHT_PER_REALM`].
+fn max_inflight_per_realm() -> usize {
+    std::env::var("FLUX_A2A_MAX_INFLIGHT_PER_REALM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_INFLIGHT_PER_REALM)
+}
+
+/// Drop retained push-notification configs whose session no longer exists in the store (C-83).
+/// Once a session is TTL-pruned it can never host another live run, so its webhook config can
+/// never fire again — keeping it would leak the push map across the session lifecycle. Runs off
+/// the async workers (inside the mint's `spawn_blocking`) because the existence probe is DB I/O.
+fn sweep_orphaned_push_configs(registry: &TaskRegistry, events: &flux_events::EventStore) {
+    let keys: Vec<(String, String)> = registry.push.lock().unwrap().keys().cloned().collect();
+    // `info` errors (not-found) once a stream is gone; a live task's session always exists, so a
+    // missing session is unambiguously a prunable orphan.
+    let gone: Vec<(String, String)> = keys
+        .into_iter()
+        .filter(|(_, session_id)| events.info(session_id).is_err())
+        .collect();
+    if gone.is_empty() {
+        return;
+    }
+    let mut push = registry.push.lock().unwrap();
+    for key in gone {
+        push.remove(&key);
+    }
 }
 
 impl TaskRegistry {
@@ -243,6 +293,7 @@ impl TaskRegistry {
         Self {
             live: std::sync::Mutex::new(HashMap::new()),
             push: std::sync::Mutex::new(HashMap::new()),
+            mint_gate: tokio::sync::Mutex::new(()),
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -312,11 +363,16 @@ impl TaskRegistry {
 
     /// Remove a finished run's entry. Call *before* releasing the turn gate, so a follow-up send
     /// on the same context (queued at the gate) never collides with a completed run's entry.
+    ///
+    /// Also drops the task's push-notification config (C-83): a webhook fires only for a *live*
+    /// in-process run, so a finished task's config can never fire again — sweeping it on finish
+    /// (alongside the mint-time sweep of TTL-pruned sessions) bounds the push map to live tasks
+    /// over the session lifecycle rather than letting it grow one entry per completed task. The
+    /// terminal transition's own delivery already snapshotted the config before this runs.
     fn finish(&self, scope: &str, id: &str) {
-        self.live
-            .lock()
-            .unwrap()
-            .remove(&(scope.to_string(), id.to_string()));
+        let key = (scope.to_string(), id.to_string());
+        self.live.lock().unwrap().remove(&key);
+        self.push.lock().unwrap().remove(&key);
     }
 
     /// Publish one update frame to a live task's subscribers (send errors — no subscriber — are
@@ -348,11 +404,21 @@ impl TaskRegistry {
 /// run mid-turn, now a non-blocking mint's sweep can), which is also what makes them cancelable
 /// and resubscribable (A-55/A-56).
 ///
-/// The DB work under the lock is the same few indexed statements the mint always ran; contention
-/// is per-request, not per-token.
+/// The DB work is the same few indexed statements the mint always ran; contention is per-request,
+/// not per-token.
+///
+/// **C-83 lock discipline.** The atomicity above is preserved by an async `mint_gate`, NOT by
+/// holding the `live` `std::sync::Mutex` across the DB round-trip. Pre-C-83 the `live` mutex was
+/// held across `find_or_mint_session`, whose PG backend blocks a tokio worker inside flux-pg's
+/// `block_on` *while serializing every mint process-wide on that std mutex*. Now: `mint_gate`
+/// (async — it yields, never parks a worker) serializes mints; the sweep + find-or-mint run on the
+/// blocking pool via `spawn_blocking`; and the `live` std mutex is taken only for the two brief
+/// in-memory phases (the keep-list/cap snapshot and the registration). No concurrent sweep can
+/// observe a live task's session without its keep-list entry, because `mint_gate` admits exactly
+/// one mint (hence one sweep) at a time.
 #[allow(clippy::too_many_arguments)]
-fn mint_and_register(
-    registry: &TaskRegistry,
+async fn mint_and_register(
+    registry: &Arc<TaskRegistry>,
     scope: &str,
     engine: &Shared,
     ttl: A2aTtl,
@@ -361,18 +427,52 @@ fn mint_and_register(
     initial: TaskState,
     cancel: CancellationToken,
 ) -> Result<RegisteredTask, MintError> {
-    let mut live = registry.live.lock().unwrap();
-    let keep: Vec<String> = live.keys().map(|(_, id)| id.clone()).collect();
-    let pruned = prune_expired_a2a_sessions_at(&engine.events, ttl.0, now_ms(), &keep);
-    if pruned > 0 {
-        eprintln!(
-            "(a2a: pruned {pruned} expired session(s) past the {}s TTL)",
-            ttl.0
-        );
-    }
-    let session_id =
-        find_or_mint_session(engine, requested_context, realm).map_err(MintError::Store)?;
+    // Serialize the mint critical section on the async gate — no std mutex is held across the DB
+    // I/O below, and no other mint/sweep interleaves with this resolve→register window.
+    let _mint = registry.mint_gate.lock().await;
+
+    // Phase 1 (brief `live` lock, in-memory): enforce the per-realm in-flight cap *before* any DB
+    // work — so a flood is rejected without minting throwaway sessions — and snapshot the keep-list.
+    let cap = max_inflight_per_realm();
+    let keep: Vec<String> = {
+        let live = registry.live.lock().unwrap();
+        let in_flight = live
+            .values()
+            .filter(|t| t.realm.as_deref() == realm)
+            .count();
+        if in_flight >= cap {
+            return Err(MintError::RealmBusy { in_flight, cap });
+        }
+        live.keys().map(|(_, id)| id.clone()).collect()
+    };
+
+    // Phase 2 (blocking pool, no std mutex held): prune + find-or-mint. The PG backend blocks a
+    // thread inside `block_on`; running it here keeps the async workers free.
+    let engine_bg = engine.clone();
+    let registry_bg = registry.clone();
+    let ttl_secs = ttl.0;
+    let requested = requested_context.map(str::to_string);
+    let realm_owned = realm.map(str::to_string);
+    let session_id = tokio::task::spawn_blocking(move || {
+        let pruned = prune_expired_a2a_sessions_at(&engine_bg.events, ttl_secs, now_ms(), &keep);
+        if pruned > 0 {
+            eprintln!("(a2a: pruned {pruned} expired session(s) past the {ttl_secs}s TTL)");
+            // A TTL-pruned session can never fire a webhook again — drop its retained push config.
+            sweep_orphaned_push_configs(&registry_bg, &engine_bg.events);
+        }
+        find_or_mint_session(&engine_bg, requested.as_deref(), realm_owned.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        MintError::Store(flux_core::Error::Other(format!(
+            "a2a mint task failed: {e}"
+        )))
+    })?
+    .map_err(MintError::Store)?;
+
+    // Phase 3 (brief `live` lock, in-memory): register the live task.
     let key = (scope.to_string(), session_id.clone());
+    let mut live = registry.live.lock().unwrap();
     if live.contains_key(&key) {
         return Err(MintError::AlreadyRunning(session_id));
     }
@@ -560,6 +660,12 @@ async fn dispatch_rpc(
     ctx: Option<flux_auth::request::AuthContext>,
     req: JsonRpcRequest,
 ) -> Response {
+    // Bound/normalize the attacker-controlled id once, at the single dispatch chokepoint, so every
+    // echo path (plain responses and per-frame SSE) inherits the capped value (C-83).
+    let req = JsonRpcRequest {
+        id: normalize_rpc_id(req.id),
+        ..req
+    };
     match req.method.as_str() {
         "message/send" => send(
             engine, auth, turn_gate, registry, scope, a2a_ttl, ctx, req.id, req.params,
@@ -637,6 +743,30 @@ pub struct JsonRpcRequest {
     pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,
+}
+
+/// Capacity of the per-stream SSE frame channel (C-83). A stalled consumer can buffer at most this
+/// many frames before back-pressure kicks in (the spawner awaits capacity; `StreamSink` cancels).
+const SSE_CHANNEL_CAPACITY: usize = 256;
+
+/// Longest client-supplied JSON-RPC `id` (in chars) echoed back verbatim (C-83).
+const MAX_RPC_ID_LEN: usize = 128;
+
+/// Normalize a client-supplied JSON-RPC `id` before it is echoed into responses — and, for the SSE
+/// surfaces, into *every* streamed frame (C-83). Per JSON-RPC 2.0 an `id` is a string, number, or
+/// null; an attacker could otherwise submit a multi-megabyte string or a deeply nested structure
+/// that this server re-serializes once per generated token (an amplification vector). Overlong
+/// strings are truncated; numbers and null pass through; any other shape (bool/array/object)
+/// collapses to null.
+fn normalize_rpc_id(id: Option<Value>) -> Option<Value> {
+    match id {
+        Some(Value::String(s)) if s.chars().count() > MAX_RPC_ID_LEN => {
+            Some(Value::String(s.chars().take(MAX_RPC_ID_LEN).collect()))
+        }
+        Some(v @ (Value::String(_) | Value::Number(_) | Value::Null)) => Some(v),
+        Some(_) => Some(Value::Null),
+        None => None,
+    }
 }
 
 fn rpc_json(id: Option<Value>, result: Value) -> Json<Value> {
@@ -748,6 +878,14 @@ fn mint_err(id: Option<Value>, e: MintError) -> Json<Value> {
             -32603,
             format!("a task is already running in this context (task {sid}); poll tasks/get"),
         ),
+        MintError::RealmBusy { in_flight, cap } => rpc_err(
+            id,
+            -32603,
+            format!(
+                "too many in-flight A2A tasks ({in_flight}/{cap}); retry once an earlier task \
+                 finishes"
+            ),
+        ),
         MintError::Store(e) => rpc_err(id, -32603, format!("Session error: {e}")),
     }
 }
@@ -788,7 +926,9 @@ async fn send_blocking(
         turn.realm.as_deref(),
         TaskState::Working,
         CancellationToken::new(),
-    ) {
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => return mint_err(id, e),
     };
@@ -860,7 +1000,9 @@ async fn send_nonblocking(
         realm.as_deref(),
         TaskState::Submitted,
         CancellationToken::new(),
-    ) {
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => return mint_err(id, e),
     };
@@ -1556,7 +1698,11 @@ async fn subscribe(
         return Err((-32603, crate::UNAUTHORIZED_BODY.to_string()));
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    // Bounded, back-pressured channel (C-83): an unbounded channel let a client that never drains
+    // its SSE stream accumulate one frame per generated token without limit. With a bounded buffer,
+    // the async spawner's frame sends (below) await capacity, and the synchronous `StreamSink`
+    // treats a full buffer as a stalled/absent consumer and cancels the run (see its `text_delta`).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(SSE_CHANNEL_CAPACITY);
     // `drop_guard` cancels `cancel` when the SSE stream is dropped (client disconnect), which
     // propagates through `cancel_task` into `run_turn_cancellable`.
     let cancel = CancellationToken::new();
@@ -1574,16 +1720,18 @@ async fn subscribe(
         let turn = match crate::server_turn_context(&auth, ctx.as_ref()) {
             Ok(turn) => turn,
             Err(_) => {
-                let _ = tx.send(
-                    Event::default().data(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": -32603, "message": crate::UNAUTHORIZED_BODY },
-                        })
-                        .to_string(),
-                    ),
-                );
+                let _ = tx
+                    .send(
+                        Event::default().data(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32603, "message": crate::UNAUTHORIZED_BODY },
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await;
                 return;
             }
         };
@@ -1598,7 +1746,9 @@ async fn subscribe(
             turn.realm.as_deref(),
             TaskState::Working,
             cancel_task.clone(),
-        ) {
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 // The SSE response is already established by the time minting can fail here, so
@@ -1608,18 +1758,24 @@ async fn subscribe(
                     MintError::AlreadyRunning(sid) => format!(
                         "a task is already running in this context (task {sid}); poll tasks/get"
                     ),
+                    MintError::RealmBusy { in_flight, cap } => format!(
+                        "too many in-flight A2A tasks ({in_flight}/{cap}); retry once an earlier \
+                         task finishes"
+                    ),
                     MintError::Store(e) => format!("Session error: {e}"),
                 };
-                let _ = tx.send(
-                    Event::default().data(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": -32603, "message": msg },
-                        })
-                        .to_string(),
-                    ),
-                );
+                let _ = tx
+                    .send(
+                        Event::default().data(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32603, "message": msg },
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await;
                 return;
             }
         };
@@ -1630,14 +1786,16 @@ async fn subscribe(
 
         // Initial "working" update so the caller knows the task started (the transition also
         // reaches resubscribers/webhooks).
-        let _ = tx.send(status_frame(
-            &id,
-            &task_id,
-            &context_id,
-            TaskState::Working,
-            None,
-            false,
-        ));
+        let _ = tx
+            .send(status_frame(
+                &id,
+                &task_id,
+                &context_id,
+                TaskState::Working,
+                None,
+                false,
+            ))
+            .await;
         run.start_working();
         let mut sink = StreamSink {
             tx: tx.clone(),
@@ -1664,14 +1822,16 @@ async fn subscribe(
         // If the client disconnected mid-stream, skip its final event — nobody is listening —
         // but the transition still reaches resubscribers and webhooks.
         if !cancel_task.is_cancelled() {
-            let _ = tx.send(status_frame(
-                &id,
-                &task_id,
-                &context_id,
-                terminal.state,
-                terminal.response_message.clone(),
-                true,
-            ));
+            let _ = tx
+                .send(status_frame(
+                    &id,
+                    &task_id,
+                    &context_id,
+                    terminal.state,
+                    terminal.response_message.clone(),
+                    true,
+                ))
+                .await;
         }
         // Publish for resubscribers/webhooks and release before the gate drops (a queued follow-up
         // must not collide with it).
@@ -1695,7 +1855,7 @@ async fn subscribe(
 /// Deltas also broadcast to the task's registry entry (A-56), so a resubscriber of a streaming
 /// task observes the same frames as the owning stream.
 struct StreamSink {
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    tx: tokio::sync::mpsc::Sender<Event>,
     /// The originating JSON-RPC request id, echoed in every frame.
     id: Option<Value>,
     task_id: String,
@@ -1723,8 +1883,12 @@ impl AgentSink for StreamSink {
             .broadcast(&self.scope, &self.task_id, result.clone());
         let frame = Event::default()
             .data(json!({ "jsonrpc": "2.0", "id": self.id, "result": result }).to_string());
-        if self.tx.send(frame).is_err() {
-            // Receiver gone — client disconnected; stop doing work as soon as possible.
+        // `text_delta` is a synchronous trait method, so it cannot await channel capacity. On a
+        // bounded channel `try_send` fails either because the receiver is gone (client
+        // disconnected) or because the buffer is full — a consumer that has stopped draining its
+        // own SSE stream. Both mean nobody is keeping up, so cancel the run rather than keep
+        // generating frames into a full or dead channel (the C-83 back-pressure bound).
+        if self.tx.try_send(frame).is_err() {
             self.cancel.cancel();
         }
     }
@@ -2128,6 +2292,7 @@ mod tests {
             TaskState::Submitted,
             CancellationToken::new(),
         )
+        .await
         .map_err(|_| "mint failed")
         .unwrap();
 
@@ -2146,5 +2311,152 @@ mod tests {
             "a session queued behind the turn gate must survive a concurrent request's sweep",
         );
         assert_eq!(info.context.agent_id.as_deref(), Some(A2A_AGENT_ID));
+    }
+
+    /// Register a bare live-task entry (no real session/turn) so a test can saturate the registry.
+    fn insert_dummy_live(registry: &TaskRegistry, scope: &str, id: &str, realm: Option<&str>) {
+        let (updates, _) = tokio::sync::broadcast::channel(4);
+        registry.live.lock().unwrap().insert(
+            (scope.to_string(), id.to_string()),
+            LiveTask {
+                state: TaskState::Working,
+                realm: realm.map(str::to_string),
+                context_id: id.to_string(),
+                cancel: CancellationToken::new(),
+                updates,
+            },
+        );
+    }
+
+    /// C-83 failing-first: once a realm holds the maximum in-flight A2A tasks, the next turn is
+    /// rejected as `-32603` *without* minting a throwaway session — instead of accumulating
+    /// unbounded spawned tasks + sessions. The cap is per-realm, so a different realm is unaffected.
+    #[tokio::test]
+    async fn per_realm_in_flight_cap_rejects_excess_turns() {
+        let (engine, _events) = test_engine();
+        let registry = Arc::new(TaskRegistry::default());
+        let limit = max_inflight_per_realm();
+
+        // Saturate realm "acme" to exactly the cap.
+        for i in 0..limit {
+            insert_dummy_live(&registry, "", &format!("acme-{i}"), Some("acme"));
+        }
+
+        // The excess "acme" turn is refused (TTL 0 disables pruning; this returns before any DB I/O).
+        let err = mint_and_register(
+            &registry,
+            "",
+            &engine,
+            A2aTtl(0),
+            None,
+            Some("acme"),
+            TaskState::Submitted,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(&err, Err(MintError::RealmBusy { in_flight, cap }) if *in_flight == limit && *cap == limit),
+            "excess turn must report the per-realm cap"
+        );
+        // …and it surfaces as JSON-RPC -32603.
+        let resp = mint_err(
+            Some(json!(1)),
+            MintError::RealmBusy {
+                in_flight: limit,
+                cap: limit,
+            },
+        );
+        assert_eq!(resp.0["error"]["code"], -32603, "{}", resp.0);
+
+        // A different realm has its own budget and still mints.
+        let ok = mint_and_register(
+            &registry,
+            "",
+            &engine,
+            A2aTtl(0),
+            None,
+            Some("other"),
+            TaskState::Submitted,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(ok.is_ok(), "the cap is per-realm, not process-global");
+    }
+
+    #[test]
+    fn normalize_rpc_id_bounds_and_shapes_the_echoed_id() {
+        assert_eq!(normalize_rpc_id(None), None);
+        assert_eq!(normalize_rpc_id(Some(json!(7))), Some(json!(7)));
+        assert_eq!(normalize_rpc_id(Some(Value::Null)), Some(Value::Null));
+        assert_eq!(normalize_rpc_id(Some(json!("req-1"))), Some(json!("req-1")));
+        // Invalid id shapes (and amplification vectors) collapse to null.
+        assert_eq!(normalize_rpc_id(Some(json!([1, 2, 3]))), Some(Value::Null));
+        assert_eq!(
+            normalize_rpc_id(Some(json!({ "a": "b" }))),
+            Some(Value::Null)
+        );
+        assert_eq!(normalize_rpc_id(Some(json!(true))), Some(Value::Null));
+        // Overlong strings are truncated to the cap.
+        let long = "x".repeat(MAX_RPC_ID_LEN * 4);
+        let normalized = normalize_rpc_id(Some(Value::String(long))).unwrap();
+        assert_eq!(normalized.as_str().unwrap().chars().count(), MAX_RPC_ID_LEN);
+    }
+
+    /// C-83: a finished task's push-notification config is swept — a webhook only fires for a live
+    /// in-process run, so retaining it would leak the push map one entry per completed task.
+    #[tokio::test]
+    async fn finish_sweeps_the_push_config() {
+        let registry = Arc::new(TaskRegistry::with_private_net(PrivateNetAllow::None));
+        insert_dummy_live(&registry, "", "task", None);
+        registry.push.lock().unwrap().insert(
+            (String::new(), "task".to_string()),
+            vec![json!({ "url": "https://hook.example.invalid/x", "id": "cfg" })],
+        );
+
+        registry.finish("", "task");
+
+        assert!(
+            registry
+                .push
+                .lock()
+                .unwrap()
+                .get(&(String::new(), "task".to_string()))
+                .is_none(),
+            "finish must drop the task's push config"
+        );
+        assert!(
+            registry.live.lock().unwrap().is_empty(),
+            "finish must drop the live entry"
+        );
+    }
+
+    /// C-83: `StreamSink` runs a synchronous `text_delta`, so it cannot await channel capacity — a
+    /// full bounded buffer (a consumer that stopped draining its SSE stream) cancels the run.
+    #[tokio::test]
+    async fn stream_sink_cancels_when_the_consumer_stalls() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
+        // Fill the one-slot buffer so the sink's own send finds it full.
+        tx.try_send(Event::default().data("prefill")).unwrap();
+
+        let cancel = CancellationToken::new();
+        let registry = Arc::new(TaskRegistry::with_private_net(PrivateNetAllow::None));
+        let mut sink = StreamSink {
+            tx,
+            id: None,
+            task_id: "t".into(),
+            context_id: "c".into(),
+            cancel: cancel.clone(),
+            registry,
+            scope: String::new(),
+        };
+
+        assert!(!cancel.is_cancelled());
+        sink.text_delta("hello");
+        assert!(
+            cancel.is_cancelled(),
+            "a stalled consumer must cancel the run rather than buffer without bound"
+        );
+        // Keep the receiver alive so the failure above is Full, not Closed.
+        drop(_rx);
     }
 }

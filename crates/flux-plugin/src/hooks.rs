@@ -71,6 +71,14 @@ fn eval_pre(src: &str, tool: &str, input: &Value) -> Result<PreResult, String> {
     let ctx_json = json!({ "tool": tool, "input": input }).to_string();
 
     let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
+    // Bound the engine's resources so a hostile hook fails closed instead of taking the host down
+    // (C-84). The 1s CPU interrupt below stops a busy loop, but a single doubling allocation
+    // (`s = s + s`) OOMs the *host* before any interrupt fires — so cap heap and JS stack too. An
+    // over-budget allocation raises a QuickJS exception, surfaced as an eval error → deny.
+    const HOOK_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+    const HOOK_MAX_STACK_BYTES: usize = 512 * 1024;
+    rt.set_memory_limit(HOOK_MEMORY_LIMIT_BYTES);
+    rt.set_max_stack_size(HOOK_MAX_STACK_BYTES);
     // Kill a runaway hook (`while(true){}`, a huge allocation loop, …): interrupt evaluation once a
     // wall-clock deadline passes. The interrupt surfaces as an eval error → the hook fails closed
     // (denied by the caller) rather than hanging the agent.
@@ -150,6 +158,17 @@ mod tests {
         match e.pre_tool("bash", &json!({})) {
             HookOutcome::Deny(r) => assert!(r.contains("hook error"), "got: {r}"),
             _ => panic!("expected a deny on hook timeout"),
+        }
+    }
+
+    #[test]
+    fn memory_bomb_hook_is_killed_not_ooming_the_host() {
+        // A doubling allocation exhausts the runtime's memory limit long before the 1s CPU interrupt
+        // and, without the cap, would OOM the whole host. It must fail closed (deny), not crash.
+        let e = engine("function preToolUse(ctx){ var s = 'xxxxxxxx'; for(;;){ s = s + s; } }");
+        match e.pre_tool("bash", &json!({})) {
+            HookOutcome::Deny(r) => assert!(r.contains("hook error"), "got: {r}"),
+            _ => panic!("expected a deny when the memory limit is hit"),
         }
     }
 

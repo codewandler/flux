@@ -139,7 +139,27 @@ impl DynamicComposites {
     }
 
     pub fn clear_turn(&self, session_id: &str) {
-        self.state.lock().unwrap().turns.remove(session_id);
+        let mut st = self.state.lock().unwrap();
+        st.turns.remove(session_id);
+        // C-87: bound the per-session composite caches. On a long-lived engine shared across
+        // conversations (the A2A server) `sessions`/`loaded_sessions` would otherwise accumulate one
+        // entry per session_id ever seen and never shrink. At the turn boundary, retain only the
+        // just-active session's loaded definitions; any other session reloads lazily (from the durable
+        // store) on its next turn via `ensure_session_loaded`. A single-conversation engine (the CLI)
+        // only ever holds one session, so this is a no-op there.
+        st.sessions.retain(|k, _| k == session_id);
+        st.loaded_sessions.retain(|k| k == session_id);
+    }
+
+    /// Drop every cached composite definition for a session — its session- and turn-scoped ops and the
+    /// "already loaded" marker — so a genuinely finished session leaves nothing behind. Called by a
+    /// host on session close (the counterpart to [`ensure_session_loaded`](Self::ensure_session_loaded));
+    /// `clear_turn` already bounds growth at the turn boundary, but this reclaims immediately.
+    pub fn clear_session(&self, session_id: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.turns.remove(session_id);
+        st.sessions.remove(session_id);
+        st.loaded_sessions.remove(session_id);
     }
 
     pub fn validate_registration(
@@ -344,5 +364,57 @@ fn target_map_mut<'a>(
         CompositeScope::Project => &mut st.project,
         CompositeScope::Session => st.sessions.entry(session_id.to_string()).or_default(),
         CompositeScope::Turn => st.turns.entry(session_id.to_string()).or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decl(name: &str) -> CompositeOpDecl {
+        CompositeOpDecl {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// C-87: `clear_turn` bounds the per-session composite caches on a long-lived shared engine — it
+    /// retains only the just-active session's loaded definitions and evicts every other session's, so
+    /// the maps can't grow one-entry-per-session-forever.
+    #[test]
+    fn clear_turn_bounds_session_caches_to_active() {
+        let dc = DynamicComposites::default();
+        dc.install(CompositeScope::Session, "a", decl("op_a"), false)
+            .unwrap();
+        dc.install(CompositeScope::Session, "b", decl("op_b"), false)
+            .unwrap();
+        assert!(!dc.active_for_session("a").is_empty());
+        assert!(!dc.active_for_session("b").is_empty());
+
+        dc.clear_turn("a");
+        assert!(
+            !dc.active_for_session("a").is_empty(),
+            "the just-active session's composites survive the turn boundary"
+        );
+        assert!(
+            dc.active_for_session("b").is_empty(),
+            "another session's cached composites are evicted (bounded growth)"
+        );
+    }
+
+    /// C-87: `clear_session` reclaims a finished session's composite caches immediately.
+    #[test]
+    fn clear_session_drops_the_entry() {
+        let dc = DynamicComposites::default();
+        dc.install(CompositeScope::Session, "a", decl("op_a"), false)
+            .unwrap();
+        dc.install(CompositeScope::Turn, "a", decl("op_turn"), false)
+            .unwrap();
+        assert_eq!(dc.active_for_session("a").len(), 2);
+        dc.clear_session("a");
+        assert!(
+            dc.active_for_session("a").is_empty(),
+            "session and turn scoped composites are both dropped on session end"
+        );
     }
 }

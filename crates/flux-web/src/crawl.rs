@@ -95,17 +95,22 @@ impl WebCrawlTool {
     /// content-type, and capped body bytes. A network/read error is `Err` so the caller can skip the
     /// page without failing the whole crawl.
     async fn fetch_page(&self, url: Url) -> Result<(reqwest::StatusCode, String, Vec<u8>)> {
+        // Re-vet and capture the addresses to pin the connection to (C-77). This resolve is the one
+        // the connection uses, so there is no rebinding gap between vetting and connect.
+        let (url, pinned) =
+            flux_system::net::guard_url_scoped_pinned(url.as_str(), &self.private_net)?;
         let response = egress::send_guarded(
             &self.http,
             egress::GuardedRequest {
                 url,
+                pinned,
                 method: reqwest::Method::GET,
                 headers: HeaderMap::new(),
                 body: None,
                 timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
             },
             "web.crawl",
-            |raw| flux_system::net::guard_url_scoped(raw, &self.private_net),
+            |raw| flux_system::net::guard_url_scoped_pinned(raw, &self.private_net),
             |url| {
                 if let Some(host) = url.host_str() {
                     self.audit_admit(host);

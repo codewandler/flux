@@ -49,10 +49,35 @@ type RawEvent = (i64, i64, String, u32, i64, String, Option<i64>);
 
 /// Decode a batch of raw rows (all from `stream`, all sharing its run `ctx`) into [`StoredEvent`]s.
 /// The single serde-decode point, shared by every backend.
+///
+/// C-81 (upgrade/forward-compat): a single **undecodable** row — an event variant written by a
+/// newer build ([`EventKind`] is a deliberately *closed* enum, so an unknown `kind` tag has no
+/// arm), or a payload that got corrupted on disk — is **skipped and logged**, never
+/// `?`-propagated. Aborting the whole batch would make `conversation`/`turns`/`observations`/
+/// `load_stream` fail for the *entire* stream (conversations unreadable, turns aborting) through a
+/// rolling-upgrade window or on any single corrupt byte. Skipping keeps every good event readable.
+///
+/// Why skip-and-log rather than an inert `#[serde(other)] Unknown` variant: (1) it also covers a
+/// *corrupt* payload (a known tag with malformed data — which `#[serde(other)]` would still fail
+/// to decode), not just unknown variants; (2) it keeps [`EventKind`] closed, preserving the
+/// exhaustive-match guarantee every projection relies on (see the `kind` module header) — an
+/// `Unknown` variant would force a new arm onto every match and defeat that guarantee. The
+/// trade-off: a skipped row is invisible to readers until the reader is upgraded to a build that
+/// understands it (it stays on disk, append-only — nothing is deleted), and the drop is surfaced
+/// only to stderr, not through the `Result`.
 fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
     let mut out = Vec::with_capacity(raw.len());
     for (global_seq, stream_seq, id, schema_version, ts, payload, turn_id) in raw {
-        let kind: EventKind = serde_json::from_str(&payload)?;
+        let kind: EventKind = match serde_json::from_str(&payload) {
+            Ok(kind) => kind,
+            Err(e) => {
+                eprintln!(
+                    "flux-events: skipping undecodable event row (unknown variant or corrupt \
+                     payload) in stream {stream} at global_seq {global_seq} (id {id}): {e}"
+                );
+                continue;
+            }
+        };
         out.push(StoredEvent {
             global_seq,
             stream: stream.to_string(),
@@ -553,8 +578,15 @@ impl EventStore {
     }
 
     /// The durable evidence trail for `stream` — see [`projection::observations`].
+    ///
+    /// C-87: backed by a `kind = 'observation'` load (served by `idx_events_stream_kind`) rather
+    /// than materializing + JSON-decoding the whole stream — the fold only reads `Observation`
+    /// events, so the plan/run/usage/message payloads are never fetched or decoded. Byte-identical
+    /// output to folding the full stream (the projection already discards every other kind).
     pub fn observations(&self, stream: &str) -> Result<Vec<flux_evidence::Observation>> {
-        Ok(projection::observations(&self.load_stream(stream, None)?))
+        Ok(projection::observations(
+            &self.load_by_kind(stream, "observation")?,
+        ))
     }
 
     /// Record one provider call's usage, attributed to the `model` that was active for that call —
@@ -611,8 +643,16 @@ impl EventStore {
     // --- projections (load + fold) ------------------------------------------
 
     /// The conversation for a session (replaces `SessionStore::load_messages`).
+    ///
+    /// C-87: backed by the `kind IN ('message','compacted')` load (`conversation_delta` with
+    /// `after_seq = -1` yields the full message/compacted history, served by
+    /// `idx_events_stream_kind`) rather than materializing + JSON-decoding the whole stream — the
+    /// conversation fold only ever reads those two kinds, so the bulky plan/run/usage payloads are
+    /// never fetched or decoded. Byte-identical to folding the full stream.
     pub fn conversation(&self, stream: &str) -> Result<Vec<Message>> {
-        Ok(projection::conversation(&self.load_stream(stream, None)?))
+        Ok(projection::conversation(
+            &self.conversation_delta(stream, -1)?,
+        ))
     }
 
     /// The flow run-trace for a session (replaces `FlowStore::events`).
@@ -757,6 +797,49 @@ impl EventStore {
 mod tests {
     use super::*;
     use flux_core::Message;
+
+    /// C-81: the single serde-decode point must survive an undecodable row — an unknown event
+    /// variant written by a newer build, or a corrupt payload — by skipping it, not aborting the
+    /// whole batch. This is what keeps every read method (`conversation`/`turns`/`observations`/
+    /// `load_stream`) working across a rolling upgrade or a single corrupt byte.
+    #[test]
+    fn decode_all_skips_undecodable_rows_instead_of_aborting_the_read() {
+        let ctx = EventContext::default();
+        let good_user =
+            serde_json::to_string(&EventKind::Message(Message::user_text("hello"))).unwrap();
+        let good_assistant =
+            serde_json::to_string(&EventKind::Message(Message::assistant_text("hi"))).unwrap();
+        let raw: Vec<RawEvent> = vec![
+            (1, 0, "e1".into(), 1, 1000, good_user, None),
+            // A row written by a NEWER build: a `kind` tag this (closed) enum has no arm for.
+            (
+                2,
+                1,
+                "e2".into(),
+                1,
+                1001,
+                r#"{"kind":"from_the_future","data":{"x":1}}"#.into(),
+                None,
+            ),
+            // A genuinely corrupt payload (a known-shaped row whose JSON got mangled on disk).
+            (3, 2, "e3".into(), 1, 1002, "{ not valid json".into(), None),
+            (4, 3, "e4".into(), 1, 1003, good_assistant, None),
+        ];
+        let decoded =
+            decode_all("s_1", &ctx, raw).expect("one bad row must not abort the whole read");
+        // Only the two decodable rows survive; the unknown-variant and corrupt rows are skipped.
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].global_seq, 1);
+        assert_eq!(decoded[1].global_seq, 4);
+        // The conversation still projects from the survivors.
+        assert_eq!(
+            projection::conversation(&decoded)
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>(),
+            vec!["hello", "hi"]
+        );
+    }
 
     // --- conformance: ported from flux-session's test module, adapted to the event API ---
 
@@ -1386,6 +1469,119 @@ mod tests {
         );
     }
 
+    /// C-87: `prune_empty` must gate on `last_seq <= 0`, NOT `msg_count == 0`. A session that
+    /// recorded durable facts other than `Message`s — a run trace, an observation, a `CallUsage`,
+    /// an app `Custom` event — has `msg_count == 0` but real history worth keeping; only a session
+    /// holding nothing but its seq-0 `SessionStarted` is truly empty.
+    fn prune_empty_keeps_sessions_with_durable_nonmessage_facts(store: &EventStore) {
+        // A session whose only content is one durable observation (no Message) — msg_count stays 0
+        // but last_seq advances to 1, so it is NOT empty.
+        let with_obs = store.create_session("m").unwrap();
+        store
+            .record_observation(
+                &with_obs,
+                -1,
+                &flux_evidence::Observation::new(
+                    "tool_call",
+                    flux_evidence::Phase::Turn,
+                    serde_json::json!({ "tool": "read" }),
+                ),
+            )
+            .unwrap();
+        // A session with a run-trace fact but no Message — likewise non-empty.
+        let with_run = store.create_session("m").unwrap();
+        store
+            .record_run_event(
+                &with_run,
+                &RunEvent::StepSucceeded {
+                    step: "s1".into(),
+                    output: "v_1".into(),
+                },
+            )
+            .unwrap();
+        // A genuinely empty session (only its SessionStarted) — must be pruned.
+        let empty = store.create_session("m").unwrap();
+
+        assert_eq!(
+            store.prune_empty().unwrap(),
+            1,
+            "only the truly empty session is pruned"
+        );
+        assert!(
+            store.info(&with_obs).is_ok(),
+            "a session with an observation but no message survives prune"
+        );
+        assert_eq!(store.observations(&with_obs).unwrap().len(), 1);
+        assert!(
+            store.info(&with_run).is_ok(),
+            "a session with a run-trace fact but no message survives prune"
+        );
+        assert!(store.info(&empty).is_err(), "the empty session is pruned");
+    }
+
+    /// C-87: `observations()` is backed by a `kind = 'observation'` load, and `conversation()` by a
+    /// `kind IN ('message','compacted')` load — each must still return exactly its own kind and
+    /// nothing else, even when the stream interleaves messages, run events, turn telemetry, and
+    /// observations. This guards the kind-filtered read against dropping needed rows or leaking
+    /// others.
+    fn projections_read_only_their_kinds_from_a_mixed_stream(store: &EventStore) {
+        let id = store.create_session("m").unwrap();
+        let turn = store.begin_turn(&id, "go", "m").unwrap();
+        store
+            .record_message(&id, &Message::user_text("u1"))
+            .unwrap();
+        store
+            .record_run_event(
+                &id,
+                &RunEvent::StepSucceeded {
+                    step: "s1".into(),
+                    output: "v_1".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record_observation(
+                &id,
+                turn,
+                &flux_evidence::Observation::new(
+                    "tool_call",
+                    flux_evidence::Phase::Turn,
+                    serde_json::json!({ "tool": "read" }),
+                ),
+            )
+            .unwrap();
+        store
+            .record_call_usage(
+                &id,
+                turn,
+                "m",
+                Usage {
+                    input_tokens: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_message(&id, &Message::assistant_text("a1"))
+            .unwrap();
+
+        // conversation() sees only the two messages, in order — not the run/turn/usage/observation
+        // events also on the stream.
+        assert_eq!(
+            store
+                .conversation(&id)
+                .unwrap()
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+        // observations() sees only the one observation.
+        let obs = store.observations(&id).unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].kind, "tool_call");
+    }
+
     fn roles_round_trip_through_the_conversation(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         store.record_message(&id, &Message::user_text("q")).unwrap();
@@ -1922,6 +2118,8 @@ mod tests {
         sqlite_case!(prune_empty_excluding_preserves_active_empty_sessions);
         sqlite_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
         sqlite_case!(prune_inactive_excluding_protects_the_keep_list);
+        sqlite_case!(prune_empty_keeps_sessions_with_durable_nonmessage_facts);
+        sqlite_case!(projections_read_only_their_kinds_from_a_mixed_stream);
         sqlite_case!(roles_round_trip_through_the_conversation);
         sqlite_case!(append_is_transactional_and_sequences_monotonically);
         sqlite_case!(run_events_and_turn_telemetry_share_the_log);
@@ -2057,6 +2255,8 @@ mod tests {
         pg_case!(prune_empty_excluding_preserves_active_empty_sessions);
         pg_case!(prune_inactive_deletes_only_expired_streams_with_the_tag);
         pg_case!(prune_inactive_excluding_protects_the_keep_list);
+        pg_case!(prune_empty_keeps_sessions_with_durable_nonmessage_facts);
+        pg_case!(projections_read_only_their_kinds_from_a_mixed_stream);
         pg_case!(roles_round_trip_through_the_conversation);
         pg_case!(append_is_transactional_and_sequences_monotonically);
         pg_case!(run_events_and_turn_telemetry_share_the_log);

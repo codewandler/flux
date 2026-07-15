@@ -8,7 +8,7 @@
 //! (a different answer at connect time) is still possible; this is defense-in-depth, not a
 //! complete TOCTOU fix.
 
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 use flux_core::{Error, Result};
 
@@ -90,16 +90,56 @@ pub fn guard_url_scoped_with_resolver(
     allow: &PrivateNetAllow,
     resolver: &dyn HostResolver,
 ) -> Result<url::Url> {
+    guard_and_pin(raw, allow, resolver).map(|(url, _)| url)
+}
+
+/// Like [`guard_url_scoped`], but also returns the exact socket addresses the guard vetted so the
+/// caller can **pin** the connection to them. Without pinning, reqwest re-resolves the hostname at
+/// connect time, and a low-TTL attacker host can answer a public address to this guard and an
+/// internal one (`169.254.169.254`, RFC1918, …) at connect — a DNS-rebinding SSRF that reaches cloud
+/// metadata. Pinning the connection to the vetted set closes that TOCTOU. An IP-literal URL pins to
+/// that literal; an unresolvable host yields an empty set (resolution deferred to the client — safe,
+/// as it never reached an internal target here). See story C-77.
+pub fn guard_url_scoped_pinned(
+    raw: &str,
+    allow: &PrivateNetAllow,
+) -> Result<(url::Url, Vec<SocketAddr>)> {
+    guard_and_pin(raw, allow, &SystemHostResolver)
+}
+
+/// [`guard_url_scoped_pinned`] with an injectable resolver — tests inject a rebinding resolver to
+/// prove the connection pins to the vetted answer rather than a later, internal one.
+pub fn guard_url_scoped_pinned_with_resolver(
+    raw: &str,
+    allow: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> Result<(url::Url, Vec<SocketAddr>)> {
+    guard_and_pin(raw, allow, resolver)
+}
+
+/// Shared core: parse + scheme-check + SSRF-vet, returning the URL and the vetted socket addresses.
+fn guard_and_pin(
+    raw: &str,
+    allow: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> Result<(url::Url, Vec<SocketAddr>)> {
     let url = url::Url::parse(raw).map_err(|e| Error::Other(format!("invalid url: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
         other => return Err(Error::Other(format!("unsupported url scheme: {other}"))),
     }
+    let port = url.port_or_known_default().unwrap_or(80);
     // `Host` parses literal IPs into typed addresses (so an IPv6 literal isn't a bracketed string).
     match url.host() {
         None => Err(Error::Other("url has no host".into())),
-        Some(url::Host::Ipv4(v4)) => block_if(IpAddr::V4(v4), &v4.to_string(), allow).map(|()| url),
-        Some(url::Host::Ipv6(v6)) => block_if(IpAddr::V6(v6), &v6.to_string(), allow).map(|()| url),
+        Some(url::Host::Ipv4(v4)) => {
+            block_if(IpAddr::V4(v4), &v4.to_string(), allow)?;
+            Ok((url, vec![SocketAddr::new(IpAddr::V4(v4), port)]))
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            block_if(IpAddr::V6(v6), &v6.to_string(), allow)?;
+            Ok((url, vec![SocketAddr::new(IpAddr::V6(v6), port)]))
+        }
         Some(url::Host::Domain(domain)) => {
             // Block internal hostnames outright (these often front link-local metadata services).
             let lower = domain.to_ascii_lowercase();
@@ -108,15 +148,17 @@ pub fn guard_url_scoped_with_resolver(
                     "refusing to fetch internal host {domain}"
                 )));
             }
-            // Resolve to IPs and reject if ANY resolved address is in a blocked range. An
-            // unresolvable host is left to fail at connect time (it's not an SSRF).
-            let port = url.port_or_known_default().unwrap_or(80);
+            // Resolve to IPs and reject if ANY resolved address is in a blocked range. Collect the
+            // vetted addresses so the caller can pin to exactly them. An unresolvable host is left to
+            // fail at connect time (it's not an SSRF) with an empty pin set.
+            let mut pinned = Vec::new();
             if let Ok(addresses) = resolver.resolve(domain, port) {
                 for address in addresses {
                     block_if(address, domain, allow)?;
+                    pinned.push(SocketAddr::new(address, port));
                 }
             }
-            Ok(url)
+            Ok((url, pinned))
         }
     }
 }
@@ -403,6 +445,43 @@ mod tests {
         fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
             Ok(self.0.clone())
         }
+    }
+
+    /// C-77: the pinned guard returns the exact vetted socket address, so the egress layer connects
+    /// to *it* rather than a value re-resolved at connect. A rebinding host that answers a public IP
+    /// here therefore has its connection pinned to that public IP — a later internal answer at
+    /// connect never gets a chance to be dialed.
+    #[test]
+    fn pinned_guard_returns_the_vetted_address_to_pin_the_connection() {
+        let vetted: IpAddr = "93.184.216.34".parse().unwrap();
+        let (url, pinned) = guard_url_scoped_pinned_with_resolver(
+            "https://rebinding.example/hook",
+            &PrivateNetAllow::None,
+            &FixedResolver(vec![vetted]),
+        )
+        .expect("a public answer is admitted");
+        assert_eq!(url.host_str(), Some("rebinding.example"));
+        assert_eq!(
+            pinned,
+            vec![SocketAddr::new(vetted, 443)],
+            "the connection must be pinned to the vetted address and port"
+        );
+
+        // An IP-literal URL pins to that literal, at its explicit port.
+        let (_u, literal) =
+            guard_url_scoped_pinned("http://93.184.216.34:8080/", &PrivateNetAllow::None).unwrap();
+        assert_eq!(
+            literal,
+            vec![SocketAddr::new("93.184.216.34".parse().unwrap(), 8080)]
+        );
+
+        // Pinning does not weaken the vet: a blocked resolved address still rejects the destination.
+        assert!(guard_url_scoped_pinned_with_resolver(
+            "https://rebinding.example/hook",
+            &PrivateNetAllow::None,
+            &FixedResolver(vec!["169.254.169.254".parse().unwrap()]),
+        )
+        .is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! URL admission remains owned by `flux-system`; this module only makes sure that admission is
 //! repeated for every redirect hop and that reqwest never follows a hop behind the guard's back.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use flux_core::{Error, Result};
@@ -31,6 +32,10 @@ pub(crate) fn redirect_disabled_client() -> Client {
 #[allow(clippy::too_many_arguments)]
 pub(crate) struct GuardedRequest {
     pub(crate) url: Url,
+    /// The socket addresses the guard vetted for `url`'s host — the connection is pinned to exactly
+    /// these so reqwest cannot re-resolve to a different (internal) address at connect (C-77). Empty
+    /// means "host unresolvable at guard time"; the shared client resolves it normally.
+    pub(crate) pinned: Vec<SocketAddr>,
     pub(crate) method: Method,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Option<Vec<u8>>,
@@ -45,13 +50,14 @@ pub(crate) async fn send_guarded<G, A>(
     mut on_admit: A,
 ) -> Result<Response>
 where
-    G: FnMut(&str) -> Result<Url>,
+    G: FnMut(&str) -> Result<(Url, Vec<SocketAddr>)>,
     A: FnMut(&Url),
 {
     let deadline = tokio::time::Instant::now() + request.timeout;
     let follows_redirects = request.method == Method::GET || request.method == Method::HEAD;
     let method = request.method;
     let mut url = request.url;
+    let mut pinned = request.pinned;
     let mut headers = request.headers;
     let mut body = request.body;
     let mut redirects = 0usize;
@@ -62,7 +68,10 @@ where
             return Err(Error::Http(format!("{op}: request timed out")));
         }
 
-        let mut request = client
+        // Pin this hop to the guard's vetted addresses so the connection can't be rebound to an
+        // internal host between admission and connect.
+        let hop = pinned_client(client, &url, &pinned, op)?;
+        let mut request = hop
             .request(method.clone(), url.clone())
             .headers(headers.clone())
             .timeout(remaining);
@@ -92,7 +101,7 @@ where
         let joined = url
             .join(location)
             .map_err(|e| Error::Http(format!("{op}: invalid redirect Location: {e}")))?;
-        let next = guard(joined.as_str())?;
+        let (next, next_pinned) = guard(joined.as_str())?;
         if url.scheme() == "https" && next.scheme() == "http" {
             return Err(Error::Http(format!(
                 "{op}: refusing HTTPS-to-HTTP redirect to {next}"
@@ -106,8 +115,26 @@ where
         // never replayed by redirect handling.
         body = None;
         url = next;
+        pinned = next_pinned;
         redirects += 1;
     }
+}
+
+/// Build the client for one redirect hop. When the guard vetted concrete addresses, pin the URL's
+/// host to exactly them via [`reqwest::ClientBuilder::resolve_to_addrs`] so reqwest connects only
+/// there — no connect-time re-resolution, closing the DNS-rebinding TOCTOU (C-77). With no vetted
+/// addresses (host unresolvable at guard time) fall back to the shared client (which would just fail
+/// to connect to a bogus host anyway). The shared client's redirect policy is inert, so the fresh
+/// per-hop client mirrors it.
+fn pinned_client(shared: &Client, url: &Url, pinned: &[SocketAddr], op: &str) -> Result<Client> {
+    let (Some(host), false) = (url.host_str(), pinned.is_empty()) else {
+        return Ok(shared.clone());
+    };
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, pinned)
+        .build()
+        .map_err(|e| Error::Http(format!("{op}: building a pinned client failed: {e}")))
 }
 
 fn is_followed_redirect(status: StatusCode) -> bool {

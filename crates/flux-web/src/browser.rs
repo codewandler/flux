@@ -155,7 +155,7 @@ impl BrowserSession {
     /// `launch_session` and, directly, by tests (no Chrome).
     pub async fn from_client(
         client: Arc<CdpClient>,
-        events: tokio::sync::mpsc::UnboundedReceiver<CdpEvent>,
+        events: tokio::sync::mpsc::Receiver<CdpEvent>,
         page_session: String,
         private_net: PrivateNetAllow,
         audit: Option<Arc<dyn flux_plugin::EgressAudit>>,
@@ -581,10 +581,7 @@ fn sorted(mut v: Vec<u32>) -> Vec<u32> {
 }
 
 /// The event pump: routes Fetch interception through the egress guard and tracks load/console/dialogs.
-async fn pump_loop(
-    inner: Arc<SessionInner>,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<CdpEvent>,
-) {
+async fn pump_loop(inner: Arc<SessionInner>, mut events: tokio::sync::mpsc::Receiver<CdpEvent>) {
     while let Some(ev) = events.recv().await {
         match ev.method.as_str() {
             "Fetch.requestPaused" => handle_fetch(&inner, &ev).await,
@@ -1289,7 +1286,7 @@ mod tests {
         responder: F,
     ) -> (
         Arc<CdpClient>,
-        tokio::sync::mpsc::UnboundedReceiver<CdpEvent>,
+        tokio::sync::mpsc::Receiver<CdpEvent>,
         Arc<Scripted>,
     )
     where

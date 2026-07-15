@@ -332,8 +332,7 @@ mod tests {
         // yielded [], and the loop proceeded on "0 improvement candidate(s)" styled as success — the
         // reviewer's six real findings vanished. Non-trivial input that contributes nothing must be
         // NAMED in the view so a null round is diagnosable from the op line alone.
-        let dir = std::env::temp_dir().join(format!("agg-op-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::util::unique_temp_dir("agg-op").unwrap();
         let ctx = ToolContext::new(std::sync::Arc::new(flux_system::System::new(
             flux_system::Workspace::new(&dir).unwrap(),
         )));

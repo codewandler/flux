@@ -91,6 +91,16 @@ pub trait ValueStore: Send + Sync {
     fn as_durable(&self) -> Option<&dyn DurableStore> {
         None
     }
+
+    /// L-81: the composite-call nesting depth this store represents. A base (durable/in-memory)
+    /// store is depth `0`; the interpreter's per-composite scope wraps its parent and reports one
+    /// deeper. `execute_composite_call` reads this off the caller's store to enforce a call-depth
+    /// ceiling, so a recursive composite op returns a bounded error instead of overflowing the stack.
+    /// Because it rides on the store object (already threaded through every execution path), the count
+    /// is correct across `await` and thread migration — unlike a thread-local.
+    fn call_depth(&self) -> usize {
+        0
+    }
 }
 
 /// A completed `once` (effect-level memo) record: the value the body bound (if any) plus a one-line

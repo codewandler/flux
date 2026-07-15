@@ -78,6 +78,11 @@ impl AgentLoopSpec {
     }
 }
 
+/// C-87: the hard cap on distinct sessions the per-session `sticky_groups` map retains on a
+/// long-lived shared engine. Generous — realistic interleaving stays well under it, so the
+/// cross-session cache-stability invariant holds — while still turning unbounded growth into a bound.
+const MAX_STICKY_SESSIONS: usize = 1024;
+
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
 /// (conversation + run trace + turn telemetry), and flux-flow's own value/symbol/suspension store.
 pub struct FlowEngine {
@@ -392,8 +397,8 @@ impl FlowEngine {
                 "trust": identity.trust(),
             }),
         ));
-        let iteration_base = self.executor.evidence().by_kind("turn.iteration").count();
-        let subagent_base = self.executor.evidence().by_kind("subagent.usage").count();
+        let iteration_base = self.evidence_kind_count("turn.iteration");
+        let subagent_base = self.evidence_kind_count("subagent.usage");
         let base_system = self.base_system_with_skills(skill_input, sink);
         let advertised = self.surfaced_for_turn(session_id, skill_input, sink);
         let (sender, receiver) =
@@ -775,10 +780,7 @@ impl FlowEngine {
                 } => (flow_name.clone(), body.clone()),
             };
             let steps = if kind == TurnProgramKind::Adaptive {
-                self.executor
-                    .evidence()
-                    .by_kind("turn.iteration")
-                    .count()
+                self.evidence_kind_count("turn.iteration")
                     .saturating_sub(iteration_base) as u32
             } else {
                 outcome.steps as u32
@@ -815,10 +817,7 @@ impl FlowEngine {
                 TurnTerminal {
                     outcome: status,
                     steps: self
-                        .executor
-                        .evidence()
-                        .by_kind("turn.iteration")
-                        .count()
+                        .evidence_kind_count("turn.iteration")
                         .saturating_sub(iteration_base) as u32,
                     answer,
                     cancelled: false,
@@ -859,6 +858,27 @@ impl FlowEngine {
         user_input: &str,
         sink: &mut dyn AgentSink,
     ) -> std::collections::HashSet<String> {
+        // C-87: bound the per-session sticky-group map so a long-lived engine shared across
+        // conversations (the A2A server) can't accumulate one entry per session forever. Unlike the
+        // composite caches this has no durable reload path — the accumulated groups ARE the
+        // cache-stability state — so a session's entry must survive OTHER sessions' turns (an invariant
+        // the shared-engine tests pin). We therefore keep a generous cap and only evict OTHER sessions'
+        // entries once it is exceeded, never the active one. Serialised by `turn_gate`.
+        {
+            let mut sticky = self.sticky_groups.lock().unwrap();
+            if sticky.len() > MAX_STICKY_SESSIONS {
+                let overflow = sticky.len() - MAX_STICKY_SESSIONS;
+                let victims: Vec<String> = sticky
+                    .keys()
+                    .filter(|k| k.as_str() != session_id)
+                    .take(overflow)
+                    .cloned()
+                    .collect();
+                for victim in victims {
+                    sticky.remove(&victim);
+                }
+            }
+        }
         let (advertised, surfaced) = surfaced_op_names(
             self.executor.registry(),
             &self.groups,
@@ -964,23 +984,43 @@ impl FlowEngine {
     /// in-memory log (which is process-local and already gated behind `/evidence`).
     fn flush_observations(&self, session_id: &str, turn_id: i64) {
         let redactor = &self.executor.context().redactor;
-        let log = self.executor.evidence();
-        let all = log.all();
+        // C-87: snapshot ONLY the unflushed tail under the evidence lock — not a deep clone of the
+        // whole (never-trimmed) log — and release the lock before the per-observation DB writes below,
+        // so this never holds a std mutex across store I/O.
         let start = self
             .evidence_flushed
-            .load(std::sync::atomic::Ordering::SeqCst)
-            .min(all.len());
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (tail, start) = {
+            let log = self.executor.context().evidence.lock().unwrap();
+            let all = log.all();
+            let start = start.min(all.len());
+            (all[start..].to_vec(), start)
+        };
         // C-24: advance the watermark only past observations whose write returned `Ok` — a transient
         // `record_observation` failure (WAL `BUSY`, disk-full) leaves the unwritten tail behind the
         // watermark to be retried next flush, instead of being lost forever behind an
         // unconditionally-advanced mark.
-        let written = flush_tail(&all[start..], |obs| {
+        let written = flush_tail(&tail, |obs| {
             let redacted = redact_observation(redactor, obs);
             self.events
                 .record_observation(session_id, turn_id, &redacted)
         });
         self.evidence_flushed
             .store(start + written, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// C-87: the number of recorded observations of a given kind, read directly under the shared
+    /// evidence lock (the log field is public [`Arc<Mutex<EvidenceLog>>`]) instead of via
+    /// `Executor::evidence()`, which deep-clones the entire never-trimmed log on every call. Used for
+    /// the per-turn `turn.iteration` / `subagent.usage` snapshot bases, several times per turn.
+    fn evidence_kind_count(&self, kind: &str) -> usize {
+        self.executor
+            .context()
+            .evidence
+            .lock()
+            .unwrap()
+            .by_kind(kind)
+            .count()
     }
 
     /// This turn's token tally, as an `Option` for the sink: `None` when nothing was billed (e.g. an
@@ -1001,8 +1041,14 @@ impl FlowEngine {
     /// into `(model, usage)` pairs. A malformed/missing field is skipped rather than panicking — this
     /// reads a cross-crate string-keyed contract (`flux-orchestrate`'s `TaskTool`), not a typed one.
     fn subagent_calls_since(&self, base: usize) -> Vec<(String, Usage)> {
+        // C-87: collect owned `(model, usage)` pairs directly under the evidence lock — the collected
+        // tuples own their data, so nothing borrows past the guard — instead of deep-cloning the whole
+        // log via `Executor::evidence()`.
         self.executor
-            .evidence()
+            .context()
+            .evidence
+            .lock()
+            .unwrap()
             .by_kind("subagent.usage")
             .skip(base)
             .filter_map(|o| {

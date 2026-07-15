@@ -10,6 +10,7 @@ mod content;
 mod context;
 mod error;
 mod event;
+pub mod humanize;
 mod message;
 pub mod pricing;
 mod stream;
@@ -22,6 +23,7 @@ pub use content::{
 pub use context::{render_knowledge_blocks, ContextBlock};
 pub use error::{Error, Result};
 pub use event::Event;
+pub use humanize::{fmt_count, fmt_elapsed};
 pub use message::Message;
 pub use pricing::{
     canonical_model_parts, canonical_model_spec, is_metered_cloud_spec, is_subscription,

@@ -34,6 +34,13 @@ type HmacSha256 = Hmac<Sha256>;
 /// handshake's socket-read `timeout` never covers this — it's pure computation, not I/O.
 pub(crate) const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 
+/// Upper bound on a single backend message body, enforced *before* buffering it (C-84). The wire
+/// length is a server-declared int32 the host has not yet validated; a hostile/MITM'd endpoint can
+/// declare `~2 GB` and drive an unbounded `read_exact` allocation. Auth-phase messages
+/// (Authentication*, ParameterStatus, BackendKeyData, ErrorResponse) are kilobytes at most, so a
+/// few-MB ceiling is orders of magnitude above anything legitimate yet refuses the DoS.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Connection parameters the host puts in the StartupMessage. All non-secret metadata the plugin
 /// already holds (from a discovered endpoint's bare URL or the config DSN) — never the credential.
 pub(crate) struct HandshakeParams {
@@ -311,6 +318,12 @@ impl Handshake<'_> {
             return Err(format!("pg: invalid message length {len}"));
         }
         let body_len = (len - 4) as usize;
+        if body_len > MAX_MESSAGE_BYTES {
+            return Err(format!(
+                "pg: server-declared message length {body_len} exceeds the {MAX_MESSAGE_BYTES}-byte \
+                 cap (refusing to buffer a hostile/absurd frame)"
+            ));
+        }
         let body = if body_len > 0 {
             self.read_exact(body_len).await?
         } else {
@@ -579,5 +592,45 @@ pub(crate) async fn terminate_handshake(
              (postgres only for now — mysql/AMI are follow-ons); the gated `credential` capability \
              remains for those"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// A backend that declares an absurd (~2 GB) message body must be refused at the length check,
+    /// before any `read_exact` allocation (C-84) — not trusted into an unbounded buffer.
+    #[tokio::test]
+    async fn read_message_refuses_an_oversized_declared_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Server: send a message header claiming a body length of i32::MAX, then nothing more.
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // tag 'R' + int32 length = 0x7FFFFFFF (declares ~2 GiB of body).
+                let _ = sock.write_all(&[b'R', 0x7F, 0xFF, 0xFF, 0xFF]).await;
+                let _ = sock.flush().await;
+                // Hold the connection so the client's error is the cap, not an EOF.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = DialStream::Tcp(tcp);
+        let mut hs = Handshake {
+            stream: &mut stream,
+            timeout: Some(Duration::from_secs(5)),
+            buf: Vec::new(),
+        };
+        let err = hs
+            .read_message()
+            .await
+            .expect_err("an oversized declared length must be refused, not buffered");
+        assert!(
+            err.contains("exceeds") && err.contains("cap"),
+            "names the length cap: {err}"
+        );
     }
 }

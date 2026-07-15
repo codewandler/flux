@@ -82,6 +82,25 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### Harness hardening — guard the untrusted-input surface (epic) — 🔎 **OPEN (filed from the 2026-07-15 full code review; C-76…C-87 + quality C-88)**
+
+A full-workspace review found the codebase mature and well-gated (CI enforces `fmt`/`clippy -D
+warnings`/the `flux-codegate` L0–L6 layering lint/the raw-spawn scanner; `cargo audit` clean; provider
+codecs, the spawn seam, A2A isolation, and the DAG optimizer all verified solid). The residual gaps
+cluster into two root causes. **(1) A model-reachable exfiltration surface** — since `network.fetch` is
+a default grant, a prompt-injected model can move a secret off-box in one unapproved call: `http.request`
+resolving any `$secret` env var to any URL and then *scrubbing it from the transcript* (**C-76**, verified),
+the egress guard vetting a resolved IP while reqwest re-resolves at connect (DNS-rebinding → cloud metadata,
+**C-77**), and `sqlite_query` reading any on-disk DB outside the jail at `Risk::Low` (**C-78**), plus
+credential-leak vectors (**C-82**). **(2) No resource governor at the execution boundary** — safety caps
+live only in the analyzer, so untrusted `.flux`/LLM plans reach uncatchable stack-overflow aborts (**L-81**),
+CPU-pin + OOM (**L-82**), and host OOM in tool/network/plugin paths (**C-79**, **C-80**, **C-83**, **C-84**);
+plus upgrade-safety (**C-81**), correctness/growth (**C-85**, **C-86**, **L-83**, **C-87**), and a
+code-quality standalone (**C-88**). **C-76/C-77** are `ready` (verified, single-call-reachable secret
+exfiltration); the rest are `backlog` pending triage against the async-live-datasource focus, with
+**C-78** and **L-81** the strongest to promote next. Design:
+[designs/harness-hardening.md](designs/harness-hardening.md).
+
 ### Async live systems-of-record datasources — ✅ **DONE 2026-07-15 (unreleased; D-62, D-168…D-173)**
 
 Added a first-class seam for remote systems of record without turning the synchronous indexed

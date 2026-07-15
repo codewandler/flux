@@ -132,6 +132,12 @@ pub struct CompositeLimits {
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_chars: Option<u64>,
+    /// L-81: the maximum recursive-call depth this composite op may reach. `None` uses the
+    /// interpreter's default ceiling. Enforced at the execution boundary (`execute_composite_call`)
+    /// so a self-recursive op (`op f() { call f() }`) returns a bounded error instead of overflowing
+    /// the stack and aborting the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u64>,
 }
 
 /// Metadata that makes a Flux-Lang composite op look like a normal operation to analysis and the

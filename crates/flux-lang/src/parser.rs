@@ -64,7 +64,18 @@ struct Parser<'s> {
     pos: usize,
     builder: GreenNodeBuilder<'static>,
     errors: Vec<ParseError>,
+    /// L-81: current expression/type recursion depth. The recursive-descent expression and type
+    /// grammars have no natural bound, so deeply nested `(((…`, `!!!…`, or `List<List<…>>` input
+    /// (reachable from any `.flux` source or LLM plan) would overflow the stack and `SIGABRT`.
+    /// Threaded through the recursion entry points and capped at [`MAX_PARSE_DEPTH`], turning an
+    /// abort into a recoverable `ParseError`.
+    depth: usize,
 }
+
+/// L-81: the recursion-depth ceiling for the expression/type parsers. Each nested syntactic level
+/// costs a handful of `enter()` frames, so this admits tens of real nesting levels — far more than
+/// any hand-written program needs — while stopping the thousands-deep adversarial input that aborts.
+const MAX_PARSE_DEPTH: usize = 256;
 
 fn to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
     FluxLang::kind_to_raw(kind)
@@ -78,7 +89,24 @@ impl<'s> Parser<'s> {
             pos: 0,
             builder: GreenNodeBuilder::new(),
             errors: Vec::new(),
+            depth: 0,
         }
+    }
+
+    /// L-81: enter one recursion level, returning `false` when [`MAX_PARSE_DEPTH`] is already
+    /// reached (in which case the depth is *not* incremented, so no matching [`leave`](Self::leave)
+    /// is owed). A caller that gets `false` must bail without recursing — recording an error and
+    /// consuming a token so the parse still makes forward progress.
+    fn enter(&mut self) -> bool {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn finish(mut self) -> (GreenNode, Vec<ParseError>) {
@@ -532,6 +560,11 @@ impl<'s> Parser<'s> {
     /// A type reference: `Any`/`Bool`/`Number`/`String`, `List<T>`, or a named type. Tokenized as an
     /// IDENT possibly followed by `< … >`; captured as a TYPE reference span for now.
     fn type_ref(&mut self) {
+        // L-81: `List<List<…>>` nests unboundedly; stop before the stack overflows.
+        if !self.enter() {
+            self.error("type nesting too deep");
+            return;
+        }
         self.start(SyntaxKind::NAME);
         if !self.decl_name() {
             self.error("expected a type name");
@@ -541,6 +574,7 @@ impl<'s> Parser<'s> {
             self.expect(SyntaxKind::GT, "`>` to close the `List<…>` type");
         }
         self.finish_node();
+        self.leave();
     }
 
     /// Consume one declaration-name token run. Flux declaration names allow ASCII letters, digits,
@@ -1059,6 +1093,12 @@ impl<'s> Parser<'s> {
     // ------------------------------------------------------------------
 
     fn expr(&mut self, min_bp: u8) {
+        // L-81: recursion cap — nested parens / operands re-enter here; bail with a recoverable
+        // error instead of overflowing the stack.
+        if !self.enter() {
+            self.err_and_bump("expression nesting too deep");
+            return;
+        }
         let cp = self.checkpoint();
         self.prefix();
         while let Some((lbp, _rbp)) = infix_bp(self.nth(0)) {
@@ -1069,9 +1109,15 @@ impl<'s> Parser<'s> {
             self.expr(lbp + 1);
             self.wrap(cp, SyntaxKind::BIN_EXPR);
         }
+        self.leave();
     }
 
     fn prefix(&mut self) {
+        // L-81: `!!!…` / `---…` chains recurse here directly (not via `expr`), so guard it too.
+        if !self.enter() {
+            self.err_and_bump("expression nesting too deep");
+            return;
+        }
         match self.nth(0) {
             SyntaxKind::BANG | SyntaxKind::MINUS => {
                 let cp = self.checkpoint();
@@ -1081,6 +1127,7 @@ impl<'s> Parser<'s> {
             }
             _ => self.postfix(),
         }
+        self.leave();
     }
 
     fn postfix(&mut self) {
@@ -1100,6 +1147,17 @@ impl<'s> Parser<'s> {
     }
 
     fn primary(&mut self) {
+        // L-81: `primary` dispatches into `obj_expr`/`list_expr`/parenthesised `expr`, each of which
+        // re-enters the expression grammar; cap here so a deep `((({[…` chain fails recoverably.
+        if !self.enter() {
+            self.err_and_bump("expression nesting too deep");
+            return;
+        }
+        self.primary_inner();
+        self.leave();
+    }
+
+    fn primary_inner(&mut self) {
         match self.nth(0) {
             SyntaxKind::VAR => {
                 self.start(SyntaxKind::VAR_EXPR);
@@ -1224,6 +1282,12 @@ impl<'s> Parser<'s> {
     }
 
     fn obj_expr(&mut self) {
+        // L-81: nested `{k:{k:{…}}}` recurses through each field's value `expr`; cap before `start`
+        // so the tree stays balanced on the recoverable-error path.
+        if !self.enter() {
+            self.err_and_bump("object nesting too deep");
+            return;
+        }
         self.start(SyntaxKind::OBJ_EXPR);
         self.bump(); // {
         while !self.at(SyntaxKind::R_BRACE) && !self.at_eof() && !self.at_newline() {
@@ -1244,9 +1308,15 @@ impl<'s> Parser<'s> {
         }
         self.expect(SyntaxKind::R_BRACE, "`}` to close the object");
         self.finish_node();
+        self.leave();
     }
 
     fn list_expr(&mut self) {
+        // L-81: nested `[[[…]]]` recurses through each element `expr`; cap before `start`.
+        if !self.enter() {
+            self.err_and_bump("list nesting too deep");
+            return;
+        }
         self.start(SyntaxKind::LIST_EXPR);
         self.bump(); // [
         while !self.at(SyntaxKind::R_BRACK) && !self.at_eof() && !self.at_newline() {
@@ -1257,6 +1327,7 @@ impl<'s> Parser<'s> {
         }
         self.expect(SyntaxKind::R_BRACK, "`]` to close the list");
         self.finish_node();
+        self.leave();
     }
 
     /// A JSON value for the `@json` escape: a balanced object/array/string/number/keyword.
@@ -1357,6 +1428,53 @@ mod tests {
         assert!(
             has_bind,
             "later good statements should still parse after recovery"
+        );
+    }
+
+    /// L-81 (failing-first): deeply nested expression, list, object, and type input must parse to a
+    /// bounded `ParseError` instead of overflowing the stack and aborting the process. The depth here
+    /// (many thousands of levels) is well past the ~60–80k-token empirical crash threshold; before the
+    /// depth guard each of these `SIGABRT`ed. Reaching the assertions at all proves no abort occurred.
+    #[test]
+    fn deeply_nested_input_is_bounded_not_aborting() {
+        let depth = 20_000;
+        // Nested parentheses in an expression position.
+        let parens = format!(
+            "flow f\n  $x = {}1{}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let p = parse_cst(&parens);
+        assert!(
+            !p.errors.is_empty(),
+            "deep parens must yield a bounded parse error, not a crash"
+        );
+
+        // Nested list and object literals.
+        let lists = format!(
+            "flow f\n  $x = {}1{}\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(!parse_cst(&lists).errors.is_empty(), "deep lists bounded");
+
+        // Nested `List<List<…>>` in a parameter type.
+        let ty = format!(
+            "flow f(x: {}Number{})\n  return null\n",
+            "List<".repeat(depth),
+            ">".repeat(depth)
+        );
+        assert!(
+            !parse_cst(&ty).errors.is_empty(),
+            "deep type nesting bounded"
+        );
+
+        // A well-formed shallow program is unaffected by the guard.
+        let ok = parse_cst("flow f\n  $x = (((1 + 2)))\n  return $x\n");
+        assert!(
+            ok.errors.is_empty(),
+            "shallow nesting still parses: {:?}",
+            ok.errors
         );
     }
 }

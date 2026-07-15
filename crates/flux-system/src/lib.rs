@@ -1156,6 +1156,29 @@ impl System {
         Ok(tokio::fs::read(&p).await?)
     }
 
+    /// Read at most `max` bytes of a **regular** file (jailed). Returns `(bytes, truncated)` where
+    /// `truncated` is true when the file is larger than `max`. Rejects non-regular files — a FIFO or
+    /// device would otherwise block or stream endlessly and hang the caller. Use this instead of
+    /// [`read_file_bytes`](Self::read_file_bytes) on any path whose size is attacker-influenced, to
+    /// bound memory instead of slurping the whole file before a size check (C-79).
+    pub async fn read_file_bytes_capped(&self, path: &str, max: usize) -> Result<(Vec<u8>, bool)> {
+        use tokio::io::AsyncReadExt as _;
+        let p = self.workspace.resolve_read(path)?;
+        let file = tokio::fs::File::open(&p).await?;
+        let meta = file.metadata().await?;
+        if !meta.is_file() {
+            return Err(Error::Other(format!(
+                "{path}: not a regular file (refusing to read a directory, FIFO, or device)"
+            )));
+        }
+        // Read one byte past the cap so we can report truncation, then trim back to `max`.
+        let mut buf = Vec::new();
+        file.take(max as u64 + 1).read_to_end(&mut buf).await?;
+        let truncated = buf.len() > max;
+        buf.truncate(max);
+        Ok((buf, truncated))
+    }
+
     /// Byte size of a file within the workspace/read-roots — a metadata call, so a caller
     /// enforcing a size cap can skip an oversized file WITHOUT paying a whole-file read first.
     pub async fn file_size(&self, path: &str) -> Result<u64> {

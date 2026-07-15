@@ -190,6 +190,12 @@ impl PgHandle {
     ///
     /// The future must be `Send + 'static` because it is spawned onto this handle's runtime; clone
     /// the [`PgHandle::pool`] into the async block to satisfy `'static` (the pool is `Clone`).
+    ///
+    /// **Caller caution.** This blocks the *calling* thread on a channel `recv` until the query
+    /// completes. Calling it directly from an outer async runtime's worker parks that worker for
+    /// the whole DB round-trip (and, if a lock is held across the call, serializes every caller on
+    /// it) — a runtime-starvation hazard. Callers on an async worker should wrap the call in
+    /// `tokio::task::spawn_blocking` so the block lands on the blocking pool, never an async worker.
     pub fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: Future + Send + 'static,

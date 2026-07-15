@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **harness-hardening (BREAKING): the `flux-web` CDP event stream is now bounded.** To close a
+  browser-driven memory DoS (C-84), `CdpClient::connect` and `BrowserSession::from_client` switch
+  their event channel from `UnboundedReceiver<CdpEvent>` to a bounded `mpsc::Receiver<CdpEvent>` — a
+  breaking signature change on two public `flux-web` items (the reason this is a MINOR).
+- **C-88: the CLI agent-assembly god-function is decomposed and duplicated helpers unified.**
+  `build_agent_with` now composes named steps (`resolve_cli_provider`/`register_tool_packs`/
+  `resolve_permissions`/`assemble_engine`); token/duration humanizers are hoisted to `flux-core`
+  (fixing a latent TUI boundary bug), and provider dispatch, the doc-walk, and eval temp-dir creation
+  each collapse to a single implementation. No behavior change.
 - **D-173: the live-datasource seam now ships with an executable adoption proof.** A hermetic
   support backend exercises multiple entities, typed filters, backend-owned cursor paging,
   get/not-found, catalog surfacing, exact datasource authority, and policy denial before backend
@@ -49,9 +58,54 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **C-79: `read` stats a file before materializing it.** An unbounded read of an over-cap file now
+  returns paging guidance without slurping it, a bounded `System::read_file_bytes_capped` caps memory,
+  and non-regular files (FIFO/device) are refused so they can't hang the tool.
+- **C-80: the default provider HTTP client has connect/read timeouts.** A stalled connection now fails
+  within a bounded time instead of hanging the turn — and every turn behind the client-wide mutex.
+- **C-81: the event store decodes forward-compatibly.** One unknown/corrupt row no longer aborts the
+  whole stream read, so an older reader survives meeting a newer log.
+- **C-83: the authenticated A2A surface is resource-bounded.** A per-realm in-flight cap rejects floods
+  with `-32603`, the echoed JSON-RPC id is normalized, the SSE channel is back-pressured, the
+  push-config map is swept on prune/finish, and session minting no longer holds a std mutex across DB I/O.
+- **C-84: plugin and web DoS vectors are capped.** The QuickJS hook runtime gets memory + stack limits,
+  plugin PG-auth rejects an oversized declared message length, the CDP read loop caps per-frame size and
+  bounds its event channel, and `looks_like_html` slices on a char boundary (no UTF-8 panic).
+- **C-85: model-driven tool mutations are guarded.** `git_checkout` uses `git switch` and rejects
+  path/option-shaped refs (a `.` can no longer discard uncommitted work), and `edit` refuses an empty
+  `old_string` (which would splice text between every character).
+- **C-86: typo'd security/budget config keys fail closed.** `[server]`, `[limits]`, `[workspace]`, and
+  related tables now `deny_unknown_fields`, so a mistyped introspection or budget key is a parse error
+  instead of a silently-dropped (fail-open) control.
+- **C-87: event-store and shared-engine growth/correctness.** `prune_empty` keeps sessions with durable
+  non-message facts, caller-id append is idempotent under a `UNIQUE` race, conversation/observation
+  projections read only their kinds via the stream-kind index, and per-session engine caches are evicted
+  on session close.
+- **L-81: the flux-lang parser, expr evaluator, and composite calls are depth-guarded.** Deeply nested
+  input returns a bounded error instead of an uncatchable stack-overflow abort.
+- **L-82: the interpreter enforces a default execution budget.** A hot `loop` or oversized `each`
+  terminates under a default step/wall-clock budget (overridable by `Budget`), with `yield_now` per loop
+  iteration and bounded transcript growth.
+- **L-83: `memo`/`once` key on op + input provenance.** A cache hit is no longer decided by "the name is
+  bound", so `memo` re-runs when the op or inputs change and same-label `once` blocks don't collide.
 - **C-72: the published runtime dependency graph is registry-resolvable again.** `flux-config` now
   ships as `codewandler-flux-config` before `codewandler-flux-runtime`, while retaining the
   `flux_config` Rust import path.
+
+### Security
+
+- **C-76: `http.request` can no longer exfiltrate arbitrary environment variables.** A `{"$secret":
+  "NAME"}` header reference resolves only for env-var names on an operator allowlist
+  (`FLUX_WEB_SECRET_ALLOW` / `WebOptions.allowed_secrets`), fail-closed by default — a prompt-injected
+  model can no longer name `AWS_SECRET_ACCESS_KEY` (or any var) and send it to an attacker host.
+- **C-77: egress connections are pinned to the guard-vetted IP (DNS-rebinding closed).** `web.fetch`,
+  `web.crawl`, and `http.request` connect only to the addresses the SSRF guard vetted, so a low-TTL host
+  can't answer public to the guard and internal (`169.254.169.254`, RFC1918) at connect.
+- **C-78: `sqlite_query` is jailed to the workspace and `~/.flux`.** It can no longer open an arbitrary
+  on-disk database (browser cookie stores, credential DBs) as a read-exfiltration primitive at Risk::Low.
+- **C-82: OAuth-token and inline-URL credential leaks are closed.** `OAuthToken`/`Refreshed` redact their
+  secret material in `Debug`, and inline `user:pass@` URL credentials route through the same
+  deny-by-default cross-plugin gate and are redacted from endpoint listings.
 
 ## [0.25.0] - 2026-07-14
 

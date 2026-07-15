@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -277,6 +277,36 @@ pub trait TokenSource: Send + Sync {
 /// Default number of retries on transient transport/server errors.
 pub const DEFAULT_MAX_RETRIES: u32 = 6;
 
+/// Connect-phase timeout for the default HTTP client (C-80). Bounds the TCP+TLS handshake so a
+/// dead/filtered endpoint fails fast instead of pending. Matches the introspection client's budget.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle read timeout for the default HTTP client (C-80). Applied to each read, so it bounds the
+/// wait for response headers *and* the gap between stream chunks — a proxy that completes the TCP
+/// handshake then stalls before headers (or mid-stream) fails within this window rather than
+/// hanging the turn (and, via the client-wide turn guard, every subsequent turn). Deliberately
+/// generous to cover a slow-starting reasoning turn's time-to-first-token, but bounded. This is an
+/// inactivity timeout, **not** a total-request `.timeout()`, so a long legitimate stream that keeps
+/// delivering bytes is never truncated.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Build the generic-HTTP-path client with the given connect and idle-read timeouts (C-80). Both
+/// `NativeProvider::new` (production defaults) and the timeout tests go through here so the stall
+/// behaviour they exercise is exactly the one production ships. Falls back to a plain client if the
+/// builder somehow fails, so construction is infallible.
+fn build_http_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The default generic-HTTP-path client: [`build_http_client`] with the production timeout budget.
+fn default_http_client() -> reqwest::Client {
+    build_http_client(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+}
+
 /// True if an HTTP status warrants a retry: rate limiting (429) or any server error (5xx).
 pub fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
@@ -340,7 +370,7 @@ impl NativeProvider {
     ) -> Self {
         Self {
             name: name.into(),
-            http: reqwest::Client::new(),
+            http: default_http_client(),
             codec,
             cred,
             max_retries: DEFAULT_MAX_RETRIES,
@@ -1022,6 +1052,58 @@ mod tests {
         };
         assert_eq!(status, 503);
         assert_eq!(count.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
+        handle.abort();
+    }
+
+    /// A server that accepts the connection, drains the request, then holds the socket open
+    /// **without ever responding** (no headers, no close) — the "completes the TCP handshake then
+    /// stalls before headers" case from C-80. Without an idle read timeout, `send().await` pends
+    /// here forever.
+    async fn stall_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await; // drain the request, then never respond
+                held.push(sock); // keep the socket open and silent
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    #[tokio::test]
+    async fn stalled_response_fails_within_bounded_time_instead_of_hanging() {
+        // C-80: a proxy that finishes the TCP handshake then stalls before sending any bytes must
+        // not pend the turn forever. The default client's idle read timeout (short here) bounds the
+        // wait so the turn fails instead of wedging the client-wide turn guard. Pre-fix (a client
+        // with no read timeout) this hangs and the outer guard fires, failing the test.
+        let (url, handle) = stall_server().await;
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_max_retries(0)
+        .with_http_client(build_http_client(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        ));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.stream(Request::new("m", "hi")),
+        )
+        .await
+        .expect("a stalled response must time out and error, not hang the turn");
+        assert!(
+            outcome.is_err(),
+            "a stalled/blackholed response must surface as a bounded transport error"
+        );
         handle.abort();
     }
 

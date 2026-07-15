@@ -949,8 +949,7 @@ mod tests {
         use flux_system::{System, Workspace};
         use std::sync::Arc;
 
-        let dir = std::env::temp_dir().join(format!("flux-grade-op-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::util::unique_temp_dir("flux-grade-op").unwrap();
         std::fs::write(dir.join("out.txt"), "hello world").unwrap();
         let ctx = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
 

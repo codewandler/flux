@@ -94,10 +94,17 @@ fn endpoint_subject(params: &Value) -> String {
         .to_string()
 }
 
+/// A URL safe to render to the model: any inline userinfo (`user:pass@`) is stripped (C-82). A
+/// discovered/imported record may carry credentials in its URL; those must never reach model-visible
+/// output. Reuses the broker's bare-URL derivation so the two can't drift.
+fn display_url(url: &str) -> String {
+    super::broker::split_inline_credential(url).0
+}
+
 /// `[product] @endpoint/id url (protocol) [owner/health] labels` — a one-line weak-ref summary.
 fn render_record(r: &EndpointRecord) -> String {
     let ep = &r.endpoint;
-    let mut out = format!("[{}] {} {}", ep.product, ep.id, ep.url);
+    let mut out = format!("[{}] {} {}", ep.product, ep.id, display_url(&ep.url));
     if let Some(proto) = &ep.protocol {
         out.push_str(&format!(" ({proto})"));
     }
@@ -207,7 +214,10 @@ impl Tool for DiscoverOp {
                 let ep = &c.endpoint;
                 let mut line = format!(
                     "[{}] {} {} (score {:.2})",
-                    ep.product, ep.id, ep.url, c.score
+                    ep.product,
+                    ep.id,
+                    display_url(&ep.url),
+                    c.score
                 );
                 if let Some(proto) = &ep.protocol {
                     line.push_str(&format!(" {proto}"));
@@ -597,6 +607,29 @@ mod tests {
             .await
             .is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_record_redacts_inline_url_credentials() {
+        // C-82: a record whose URL carries inline userinfo must never render the credential to the
+        // model — `endpoint.list`/`info` go through `render_record`.
+        let rec = EndpointRecord {
+            owner: "k8s".into(),
+            ..EndpointRecord::config(EndpointRef::discovered(
+                "svc-1",
+                "https://user:sup3rsecret@svc.internal/base",
+                "service",
+            ))
+        };
+        let rendered = render_record(&rec);
+        assert!(
+            !rendered.contains("sup3rsecret") && !rendered.contains("user:"),
+            "inline credential must be stripped from the rendered record: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://svc.internal/base"),
+            "the bare URL should still be shown: {rendered}"
+        );
     }
 
     #[test]

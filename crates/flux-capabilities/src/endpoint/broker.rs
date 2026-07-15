@@ -699,7 +699,9 @@ impl EndpointRunner {
 
 /// Strip inline userinfo (`scheme://user:pass@host`) out of a URL so a credential-bearing URL is
 /// never surfaced: returns the bare URL plus the extracted `(user, password)` when present.
-fn split_inline_credential(raw: &str) -> (String, Option<(String, Option<String>)>) {
+/// `pub(crate)` so the endpoint ops reuse the exact same bare-URL derivation when rendering records
+/// to the model (C-82) — a URL with inline credentials must never be shown verbatim.
+pub(crate) fn split_inline_credential(raw: &str) -> (String, Option<(String, Option<String>)>) {
     let Ok(mut url) = url::Url::parse(raw) else {
         return (raw.to_string(), None);
     };
@@ -745,11 +747,21 @@ impl ReferenceResolver for EndpointBroker {
             .resolve(reference)
             .ok_or_else(|| format!("no discovered endpoint record for `{reference}`"))?;
         // Inline-credential URL splitting: a credential-bearing URL is never surfaced — strip the
-        // userinfo into an injected header, keep the bare URL in `ResolvedEndpoint.url`. This carries
-        // no cross-plugin hop (the credential is in the record's own URL).
+        // userinfo into an injected header, keep the bare URL in `ResolvedEndpoint.url`.
         let (bare_url, inline) = split_inline_credential(&record.endpoint.url);
         let mut resolved = ResolvedEndpoint::new(reference, bare_url);
         if let Some((user, pass)) = inline {
+            // The inline userinfo is a credential OWNED by the record's owner (the discovering
+            // plugin). Host-injecting it for a *different* consumer is a cross-plugin credential use
+            // — route it through the same deny-by-default gate + audit as `credential_ref` (C-82).
+            // A config-bound record (owner `"config"`) is operator-provided / host-local (like the
+            // `Env` scheme) → no gate; the owner using its own inline credential is not a
+            // cross-plugin hop → no gate. `reference` is a secret-free location (the `@endpoint/<id>`
+            // ref, userinfo already stripped) — never the value.
+            if record.owner != "config" && record.owner != consumer {
+                self.authorize_cross_plugin(consumer, &record.owner, reference)
+                    .await?;
+            }
             let token = match pass {
                 Some(p) => format!("{user}:{p}"),
                 None => user,
@@ -1458,11 +1470,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_endpoint_strips_inline_credential_into_header() {
-        // A discovered record whose URL carries inline userinfo must surface a bare URL + a Basic
-        // header — the credential-bearing URL is never exposed.
+        // A config-bound record whose URL carries inline userinfo is operator-provided (host-local,
+        // like the `Env` scheme): it surfaces a bare URL + a Basic header ungated — the
+        // credential-bearing URL is never exposed.
         let endpoints = Arc::new(EndpointRegistry::new());
         endpoints.put(EndpointRecord {
-            owner: "k8s".into(),
+            owner: "config".into(),
             ..EndpointRecord::config(EndpointRef::discovered(
                 "svc-1",
                 "https://user:p%40ss@svc.internal/base",
@@ -1490,6 +1503,122 @@ mod tests {
         assert!(
             value.starts_with("Basic "),
             "inline cred becomes a Basic header: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_credential_denied_cross_plugin_without_grant() {
+        // C-82: a discovered record OWNED by a plugin (`k8s`) whose URL carries inline userinfo is a
+        // cross-plugin credential. Injecting its Basic header for a different consumer (or the
+        // consumer-agnostic path) must fire the same deny-by-default gate as `credential_ref`, not be
+        // surfaced unconditionally.
+        let endpoints = Arc::new(EndpointRegistry::new());
+        endpoints.put(EndpointRecord {
+            owner: "k8s".into(),
+            ..EndpointRecord::config(EndpointRef::discovered(
+                "svc-1",
+                "https://user:p%40ss@svc.internal/base",
+                "service",
+            ))
+        });
+        let broker = EndpointBroker::new(
+            Arc::new(FakeInvoker {
+                by_provider: HashMap::new(),
+            }),
+            Arc::new(PluginRegistry::new()),
+            endpoints,
+        );
+        // No grant for `sql:k8s` → denied.
+        let err = broker
+            .resolve_endpoint_for("sql", "@endpoint/svc-1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("denied"),
+            "inline cross-plugin credential must be gated: {err}"
+        );
+        // The consumer-agnostic path can never match a grant → also denied.
+        assert!(
+            broker.resolve_endpoint("@endpoint/svc-1").await.is_err(),
+            "consumer-agnostic resolution must not inject a cross-plugin inline credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_credential_gated_and_audited_with_grant() {
+        // C-82: with an operator grant, the inline cross-plugin credential resolves — and the
+        // resolution is audited by LOCATION (the ref), never the credential value.
+        let endpoints = Arc::new(EndpointRegistry::new());
+        endpoints.put(EndpointRecord {
+            owner: "k8s".into(),
+            ..EndpointRecord::config(EndpointRef::discovered(
+                "svc-1",
+                "https://user:p%40ss@svc.internal/base",
+                "service",
+            ))
+        });
+        let audit = Arc::new(RecordingAudit::default());
+        let broker = EndpointBroker::new(
+            Arc::new(FakeInvoker {
+                by_provider: HashMap::new(),
+            }),
+            Arc::new(PluginRegistry::new()),
+            endpoints,
+        )
+        .with_cross_plugin_grants(CrossPluginGrants::new(vec!["sql:k8s".into()]))
+        .with_cross_plugin_audit(audit.clone());
+        let resolved = broker
+            .resolve_endpoint_for("sql", "@endpoint/svc-1")
+            .await
+            .unwrap();
+        let (name, value) = &resolved.injected_headers[0];
+        assert_eq!(name, "Authorization");
+        assert!(value.starts_with("Basic "), "granted inline cred injected");
+        let records = audit.records.lock().unwrap();
+        assert_eq!(records.len(), 1, "one gated resolution audited");
+        let (consumer, provider, location) = &records[0];
+        assert_eq!(consumer, "sql");
+        assert_eq!(provider, "k8s");
+        assert_eq!(
+            location, "@endpoint/svc-1",
+            "audit records the ref location"
+        );
+        assert!(
+            !location.contains("p@ss") && !location.contains("p%40ss"),
+            "audit must never carry the inline credential value: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_credential_own_owner_not_gated() {
+        // The owner consuming its OWN inline credential (consumer == owner) is not a cross-plugin hop
+        // — it injects with no grant and no audit.
+        let endpoints = Arc::new(EndpointRegistry::new());
+        endpoints.put(EndpointRecord {
+            owner: "k8s".into(),
+            ..EndpointRecord::config(EndpointRef::discovered(
+                "svc-1",
+                "https://user:p%40ss@svc.internal/base",
+                "service",
+            ))
+        });
+        let audit = Arc::new(RecordingAudit::default());
+        let broker = EndpointBroker::new(
+            Arc::new(FakeInvoker {
+                by_provider: HashMap::new(),
+            }),
+            Arc::new(PluginRegistry::new()),
+            endpoints,
+        )
+        .with_cross_plugin_audit(audit.clone());
+        let resolved = broker
+            .resolve_endpoint_for("k8s", "@endpoint/svc-1")
+            .await
+            .unwrap();
+        assert!(resolved.injected_headers[0].1.starts_with("Basic "));
+        assert!(
+            audit.records.lock().unwrap().is_empty(),
+            "own inline credential is not a gated cross-plugin resolution"
         );
     }
 

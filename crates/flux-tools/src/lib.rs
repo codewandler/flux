@@ -50,6 +50,10 @@ const GREP_FILE_BYTE_CAP: usize = 2 * 1024 * 1024;
 /// An unbounded `read` (no explicit offset/limit) over these caps returns guidance instead of dumping.
 const READ_LINE_CAP: usize = 2000;
 const READ_BYTE_CAP: usize = 256 * 1024;
+/// Hard ceiling on bytes any single `read` will materialize, even for an explicit offset/limit
+/// window — far above `READ_BYTE_CAP` so legitimate large source/log files still page, but bounded so
+/// a multi-GB file (or an endless FIFO) can't OOM/hang the host (C-79).
+const MAX_READ_FILE_BYTES: usize = 16 * 1024 * 1024;
 /// Bytes sniffed for a NUL when detecting a binary file.
 const BINARY_SNIFF: usize = 8192;
 /// Cap on the number of unified-diff lines surfaced in an edit/write view.
@@ -541,7 +545,26 @@ impl Tool for ReadTool {
         if ctx.system.is_dir(path).await? {
             return Ok(ToolResult::error(directory_read_guidance(path)));
         }
-        let bytes = ctx.system.read_file_bytes(path).await?;
+        let offset = u64_arg(&params, "offset").unwrap_or(0) as usize;
+        let limit = u64_arg(&params, "limit").map(|n| n as usize);
+
+        // Stat BEFORE materializing: an unbounded read of an over-cap file returns guidance without
+        // ever slurping it, so a multi-GB file can't OOM the host (C-79). The windowed branch below
+        // streams within `READ_BYTE_CAP`, and the bounded read guards the rest.
+        let stat_size = ctx.system.file_size(path).await?;
+        if offset == 0 && limit.is_none() && stat_size > READ_BYTE_CAP as u64 {
+            return Ok(ToolResult::ok(format!(
+                "{path} is {stat_size} bytes (over the {READ_BYTE_CAP}-byte read cap); read a range \
+                 with offset/limit (e.g. offset:0, limit:{READ_LINE_CAP})"
+            )));
+        }
+
+        // Bounded read: never materialize more than `MAX_READ_FILE_BYTES`, and reject non-regular
+        // files (a FIFO/device would otherwise stream forever and hang the tool).
+        let (bytes, _over_cap) = ctx
+            .system
+            .read_file_bytes_capped(path, MAX_READ_FILE_BYTES)
+            .await?;
         let total_bytes = bytes.len();
         let content = match decode_text(path, bytes) {
             Decoded::Text(s) => s,
@@ -553,8 +576,6 @@ impl Tool for ReadTool {
                 });
             }
         };
-        let offset = u64_arg(&params, "offset").unwrap_or(0) as usize;
-        let limit = u64_arg(&params, "limit").map(|n| n as usize);
 
         // Unbounded read: refuse to dump an over-cap file — return guidance (NOT an error) so the
         // planner re-reads a window. The model picked no window, so there's no clean value to bind.
@@ -727,6 +748,16 @@ impl Tool for EditTool {
         let old = args.old_string.as_str();
         let new = args.new_string.as_str();
         let replace_all = args.replace_all.unwrap_or(false);
+
+        // An empty `old_string` matches at every position: `content.replace("", new)` would splice
+        // `new_string` between every character and destroy the file. Refuse it outright (C-85). To
+        // create a file or replace its whole contents, `write` is the right tool.
+        if old.is_empty() {
+            return Err(Error::Other(format!(
+                "edit: `old_string` must not be empty (that would insert `new_string` between every \
+                 character of {path}); use `write` to create or fully replace a file"
+            )));
+        }
 
         // Must have read (or written) this file this session, and it must not have changed since.
         guard_unchanged(ctx, path, true).await?;
@@ -2385,16 +2416,34 @@ impl Tool for GitCheckoutTool {
         let args: GitCheckoutInput = parse_params(params, "git_checkout")?;
         let branch = args.branch;
         let create = args.create.unwrap_or(false);
-        let mut argv = vec!["git".to_string(), "checkout".to_string()];
+
+        // A model-chosen ref must never be interpretable as a pathspec: `git checkout .` (or `..`)
+        // silently discards ALL uncommitted work. Reject path-shaped and option-shaped values, and
+        // use `git switch`, which only ever changes branches — it never treats its argument as a
+        // pathspec the way `git checkout` does (C-85).
+        let trimmed = branch.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.starts_with('-')
+            || trimmed.contains("..")
+        {
+            return Ok(ToolResult::error(format!(
+                "git_checkout: refusing branch name {branch:?} — it looks like a path or an option, \
+                 not a branch (a value like `.` would discard uncommitted changes)"
+            )));
+        }
+
+        let mut argv = vec!["git".to_string(), "switch".to_string()];
         if create {
-            argv.push("-b".to_string());
+            argv.push("-c".to_string());
         }
         argv.push(branch.clone());
         let out = ctx.system.run(&argv, Duration::from_secs(30)).await?;
         let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         if out.exit_code != 0 {
             return Ok(ToolResult::error(format!(
-                "git checkout failed [exit {}]: {body}",
+                "git switch failed [exit {}]: {body}",
                 out.exit_code
             )));
         }
@@ -2626,6 +2675,74 @@ mod tests {
         assert!(
             !desc.contains("hot-reload") && !desc.contains("replaces the current process"),
             "flux_reload must no longer advertise replacing the running process: {desc}"
+        );
+    }
+
+    /// C-85: an empty `old_string` matches everywhere; without this guard `replace_all` would splice
+    /// `new_string` between every character and corrupt the file. It must be refused up front.
+    #[tokio::test]
+    async fn edit_rejects_empty_old_string() {
+        let (_dir, c) = ctx();
+        WriteTool
+            .execute(&c, json!({"path": "a.rs", "content": "hello\n"}))
+            .await
+            .unwrap();
+        let err = EditTool
+            .execute(
+                &c,
+                json!({"path": "a.rs", "old_string": "", "new_string": "X", "replace_all": true}),
+            )
+            .await
+            .expect_err("an empty old_string must be refused, not applied");
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "explains the empty-old_string refusal: {err}"
+        );
+    }
+
+    /// C-85: a model-chosen ref must never be interpretable as a pathspec — `git checkout .` discards
+    /// uncommitted work. `.` (and other path/option-shaped values) is refused before git ever runs.
+    #[tokio::test]
+    async fn git_checkout_refuses_pathspec_like_ref() {
+        let (_dir, c) = ctx();
+        for bad in [".", "..", "-f", "../evil", "a..b"] {
+            let r = GitCheckoutTool
+                .execute(&c, json!({"branch": bad}))
+                .await
+                .expect("a refusal is a tool result, not an Err");
+            assert!(
+                r.is_error,
+                "branch {bad:?} must be refused before git runs, got: {}",
+                r.content
+            );
+            assert!(
+                r.content.contains("refusing"),
+                "names the refusal for {bad:?}: {}",
+                r.content
+            );
+        }
+    }
+
+    /// C-79: an unbounded read of an over-cap file returns paging guidance. The guard now stats the
+    /// file first, so the guidance is produced without materializing the whole file.
+    #[tokio::test]
+    async fn read_over_cap_file_returns_guidance_without_slurping() {
+        let (dir, c) = ctx();
+        // Comfortably over READ_BYTE_CAP (256 KiB), written directly to avoid any WriteTool cap.
+        std::fs::write(dir.join("big.txt"), "x".repeat(300 * 1024)).unwrap();
+        let r = ReadTool
+            .execute(&c, json!({"path": "big.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            !r.is_error,
+            "over-cap read is guidance, not an error: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("read cap") && r.content.contains("offset/limit"),
+            "over-cap unbounded read returns paging guidance: {}",
+            r.content
         );
     }
 

@@ -316,11 +316,8 @@ impl Tool for GuardProtectedTool {
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use flux_system::{System, Workspace};
-
-    static N: AtomicU64 = AtomicU64::new(0);
 
     fn sh(dir: &std::path::Path, args: &[&str]) {
         let ok = Command::new(args[0])
@@ -334,9 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn guard_protected_restores_grader_and_loop_tampering() {
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("flux-guard-test-{}-{n}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::util::unique_temp_dir("flux-guard-test").unwrap();
         std::fs::create_dir_all(dir.join("crates/flux-eval/src")).unwrap();
         std::fs::create_dir_all(dir.join("bench")).unwrap();
         // A committed grader file + loop-harness file + an unrelated source file.

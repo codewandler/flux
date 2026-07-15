@@ -149,18 +149,19 @@ impl Tool for WebFetchTool {
             .ok_or_else(|| Error::Other("web.fetch: `url` required".into()))?;
         let raw_body = params.get("raw").and_then(Value::as_bool).unwrap_or(false);
 
-        let url = flux_system::net::guard_url_scoped(raw_url, &self.private_net)?;
+        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(raw_url, &self.private_net)?;
         let response = egress::send_guarded(
             &self.http,
             egress::GuardedRequest {
                 url,
+                pinned,
                 method: reqwest::Method::GET,
                 headers: HeaderMap::new(),
                 body: None,
                 timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
             },
             "web.fetch",
-            |raw| flux_system::net::guard_url_scoped(raw, &self.private_net),
+            |raw| flux_system::net::guard_url_scoped_pinned(raw, &self.private_net),
             |url| {
                 if let Some(host) = url.host_str() {
                     self.audit_admit(host);
@@ -275,7 +276,14 @@ impl Tool for HtmlToMarkdownTool {
 /// Sniff a body that lacks a helpful `content-type` for an HTML shape.
 pub(crate) fn looks_like_html(body: &str) -> bool {
     let head = body.trim_start();
-    let lower = head[..head.len().min(512)].to_ascii_lowercase();
+    // Slice the leading sniff window on a char boundary: attacker-supplied content can place a
+    // multibyte UTF-8 char straddling byte 512, and a raw `head[..512]` panics off that boundary
+    // (C-84). Floor to the nearest boundary at or below 512.
+    let mut end = head.len().min(512);
+    while end > 0 && !head.is_char_boundary(end) {
+        end -= 1;
+    }
+    let lower = head[..end].to_ascii_lowercase();
     lower.starts_with("<!doctype html")
         || lower.starts_with("<html")
         || lower.contains("<head")
@@ -340,6 +348,24 @@ mod tests {
         ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())))
     }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    fn looks_like_html_does_not_panic_on_utf8_boundary() {
+        // A multibyte char ('€' = 3 bytes) straddling byte 512 makes a raw `head[..512]` slice off a
+        // char boundary → panic. The sniffer must floor to a boundary instead (C-84).
+        let mut body = String::from("<html>");
+        body.push_str(&"a".repeat(504)); // pushes the euro's bytes across the 512 mark
+        body.push('€');
+        body.push_str(&"z".repeat(200));
+        assert_eq!(body.len(), 6 + 504 + 3 + 200);
+        // Would panic before the fix; must return a bool now.
+        assert!(looks_like_html(&body), "an <html> prefix is still detected");
+
+        // And a euro exactly at the window that is pure non-HTML must not panic either.
+        let mut plain = "x".repeat(511);
+        plain.push('€');
+        assert!(!looks_like_html(&plain));
+    }
 
     async fn one_shot(
         status_line: &'static str,

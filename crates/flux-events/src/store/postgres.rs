@@ -489,7 +489,13 @@ impl EventBackend for PgEvents {
             .collect();
         let pool = self.handle.pool().clone();
         self.handle.block_on(async move {
-            let mut ns: Vec<i64> = sqlx::query_scalar("SELECT n FROM streams WHERE msg_count = 0")
+            // C-87: gate on `last_seq <= 0` (only the seq-0 `SessionStarted` was ever appended), NOT
+            // `msg_count = 0`. A session can carry durable facts — a run trace, observations,
+            // `CallUsage`, or app-defined `Custom` events — with zero `Message`s; `msg_count` counts
+            // only Message/Compacted, so the old predicate deleted those otherwise-nonempty streams.
+            // `last_seq` advances on EVERY append, so it is 0 iff the stream holds nothing but its
+            // creation event. (Mirrors the SQLite backend.)
+            let mut ns: Vec<i64> = sqlx::query_scalar("SELECT n FROM streams WHERE last_seq <= 0")
                 .fetch_all(&pool)
                 .await
                 .map_err(map_sql)?;
@@ -597,7 +603,25 @@ impl EventBackend for PgEvents {
             .fetch_one(&mut *tx)
             .await
             .map_err(map_sql)?;
-            let stored = insert_event(&mut tx, &stream, &ev, next_seq, &ctx).await?;
+            let stored = match insert_event(&mut tx, &stream, &ev, next_seq, &ctx).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    // C-87: caller-id idempotency is a check-then-insert — the `load_by_id`
+                    // pre-check above and this INSERT are not atomic. The per-stream advisory lock
+                    // serializes appends to ONE stream, but the pre-check runs before it, so two
+                    // writers can still both miss and race the INSERT; the loser trips `UNIQUE(id)`.
+                    // Roll back and re-read: if the id now resolves, the winner already stored this
+                    // exact event, so return it (a no-op idempotent retry) rather than erroring. Any
+                    // other failure re-reads as absent and propagates unchanged.
+                    if let Some(id) = &ev.id {
+                        let _ = tx.rollback().await; // clear the aborted transaction first
+                        if let Some(existing) = load_by_id(&pool, id).await? {
+                            return Ok(existing);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             // Maintain the session registry — but only for real `s_<n>` sessions. The log accepts
             // any stream string (the interpreter writes run events under ad-hoc ids), so a
             // non-session stream simply has no registry row to update.

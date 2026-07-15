@@ -79,7 +79,11 @@ fn home() -> Result<std::path::PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// An OAuth token set for a provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (not derived) to redact the bearer + refresh material: a single
+/// `tracing::debug!(?token)` / `?err` would otherwise dump live tokens into logs, traces, and the
+/// event store (C-82).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthToken {
     pub access: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +93,20 @@ pub struct OAuthToken {
     pub expires_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthToken {
+    /// Redact `access`/`refresh`; the non-secret `expires_at_ms`/`account_id` stay for diagnostics.
+    /// Present-but-redacted secrets still show `Some("<redacted>")` so "a refresh token exists" is
+    /// observable without leaking its value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthToken")
+            .field("access", &"<redacted>")
+            .field("refresh", &self.refresh.as_ref().map(|_| "<redacted>"))
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 /// Decode a JWT's payload (the middle `header.PAYLOAD.sig` segment) into a JSON value. Returns
@@ -351,12 +369,25 @@ pub fn import_codex() -> Option<OAuthToken> {
 
 /// The result of a refresh: a new access token + (possibly rotated) refresh token + expiry.
 /// `id_token` is only present on codex responses; its claims carry the ChatGPT account id.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written to redact `access`/`refresh`/`id_token` — a refresh error path that
+/// logs `?refreshed` must not spill the freshly-minted bearer or the id_token's claims (C-82).
 struct Refreshed {
     access: String,
     refresh: Option<String>,
     expires_at_ms: Option<i64>,
     id_token: Option<String>,
+}
+
+impl std::fmt::Debug for Refreshed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Refreshed")
+            .field("access", &"<redacted>")
+            .field("refresh", &self.refresh.as_ref().map(|_| "<redacted>"))
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[async_trait]
@@ -1458,6 +1489,56 @@ mod tests {
     /// Serializes the tests that repoint `HOME` — the process env is shared across the parallel
     /// test threads, so two concurrent `set_var("HOME", …)` tests race and flake.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn oauth_token_debug_redacts_secrets() {
+        // C-82: `Debug` is exactly where a `tracing::debug!(?token)` would spill live bearer +
+        // refresh material into logs/traces/events. It must render neither verbatim.
+        let token = OAuthToken {
+            access: "SECRET_ACCESS_abc123".to_string(),
+            refresh: Some("SECRET_REFRESH_def456".to_string()),
+            expires_at_ms: Some(1_700_000_000_000),
+            account_id: Some("acct_visible".to_string()),
+        };
+        let dbg = format!("{token:?}");
+        assert!(
+            !dbg.contains("SECRET_ACCESS_abc123"),
+            "access token must not appear in Debug output: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET_REFRESH_def456"),
+            "refresh token must not appear in Debug output: {dbg}"
+        );
+        // The non-secret fields (and the "a refresh exists" signal) remain observable.
+        assert!(
+            dbg.contains("acct_visible"),
+            "account_id should stay: {dbg}"
+        );
+        assert!(dbg.contains("expires_at_ms"), "expiry should stay: {dbg}");
+    }
+
+    #[test]
+    fn refreshed_debug_redacts_secrets() {
+        // C-82: the refresh result carries a fresh bearer + rotated refresh token + an id_token
+        // whose claims are PII — none may reach `Debug`.
+        let refreshed = Refreshed {
+            access: "SECRET_ACCESS_ghi".to_string(),
+            refresh: Some("SECRET_REFRESH_jkl".to_string()),
+            expires_at_ms: Some(1_700_000_000_000),
+            id_token: Some("SECRET_IDTOKEN_mno".to_string()),
+        };
+        let dbg = format!("{refreshed:?}");
+        for secret in [
+            "SECRET_ACCESS_ghi",
+            "SECRET_REFRESH_jkl",
+            "SECRET_IDTOKEN_mno",
+        ] {
+            assert!(
+                !dbg.contains(secret),
+                "{secret} must not appear in Debug output: {dbg}"
+            );
+        }
+    }
 
     #[test]
     fn jwt_expiry_decodes_exp() {

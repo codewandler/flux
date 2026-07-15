@@ -40,6 +40,10 @@ pub struct HttpRequestTool {
     private_net: PrivateNetAllow,
     audit: Option<Arc<dyn flux_plugin::EgressAudit>>,
     grant_source: String,
+    /// Env-var names this tool may resolve via `{"$secret": "NAME"}`. Fail-closed: a name not on
+    /// this list is refused before its value is read (C-76). Resolved once at construction from
+    /// `WebOptions.allowed_secrets`, else the `FLUX_WEB_SECRET_ALLOW` env var.
+    allowed_secrets: Vec<String>,
 }
 
 impl HttpRequestTool {
@@ -52,6 +56,10 @@ impl HttpRequestTool {
                 .grant_source
                 .clone()
                 .unwrap_or_else(|| "config:web".to_string()),
+            allowed_secrets: opts
+                .allowed_secrets
+                .clone()
+                .unwrap_or_else(secret_allowlist_from_env),
         }
     }
 
@@ -78,7 +86,8 @@ impl Tool for HttpRequestTool {
                 access; to read a web page as a readable document prefer `web.fetch`. \
                 Private/loopback addresses are blocked unless the `web` egress scope grants them. A \
                 header value may be a secret reference `{\"$secret\": \"ENV_NAME\"}`, resolved from \
-                the environment and never shown."
+                the environment and never shown — but only for env-var names the operator has \
+                allowlisted; any other name is refused."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -143,8 +152,9 @@ impl Tool for HttpRequestTool {
             .map_err(|_| Error::Other(format!("http.request: invalid method {method_str:?}")))?;
 
         // Guard egress (SSRF): resolve the host + block private ranges unless the `web` scope grants
-        // them. Runs before any bytes leave the process.
-        let url = flux_system::net::guard_url_scoped(raw, &self.private_net)?;
+        // them, and capture the vetted addresses so the connection is pinned to them (no rebinding).
+        // Runs before any bytes leave the process.
+        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(raw, &self.private_net)?;
 
         let timeout = params
             .get("timeout")
@@ -158,7 +168,7 @@ impl Tool for HttpRequestTool {
         let mut request_headers = HeaderMap::new();
         if let Some(headers) = params.get("headers").and_then(Value::as_object) {
             for (name, val) in headers {
-                let resolved = resolve_header_value(val, ctx)?;
+                let resolved = resolve_header_value(val, ctx, &self.allowed_secrets)?;
                 let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                     Error::Other(format!("http.request: invalid header name `{name}`: {e}"))
                 })?;
@@ -179,13 +189,14 @@ impl Tool for HttpRequestTool {
             &self.http,
             egress::GuardedRequest {
                 url,
+                pinned,
                 method,
                 headers: request_headers,
                 body,
                 timeout: Duration::from_secs(timeout),
             },
             "http.request",
-            |raw| flux_system::net::guard_url_scoped(raw, &self.private_net),
+            |raw| flux_system::net::guard_url_scoped_pinned(raw, &self.private_net),
             |url| {
                 if let Some(host) = url.host_str() {
                     self.audit_admit(host);
@@ -215,10 +226,20 @@ impl Tool for HttpRequestTool {
     }
 }
 
-/// A header value: a plain string, or the secret marker `{"$secret": "ENV_NAME"}` resolved from the
-/// environment (and seeded into the redactor). Any other shape is a caller error.
-fn resolve_header_value(val: &Value, ctx: &ToolContext) -> Result<String> {
+/// A header value: a plain string, or the secret marker `{"$secret": "ENV_NAME"}`. A secret
+/// reference is resolved from the environment (and seeded into the redactor) **only if `NAME` is on
+/// the caller-configured allowlist** — otherwise it is refused before the value is read, so a
+/// prompt-injected model cannot name an arbitrary env var (`AWS_SECRET_ACCESS_KEY`, …) and exfiltrate
+/// it to an attacker host in one call (C-76). Any other shape is a caller error.
+fn resolve_header_value(val: &Value, ctx: &ToolContext, allowed: &[String]) -> Result<String> {
     if let Some(name) = as_secret_ref(val) {
+        if !allowed.iter().any(|a| a == name) {
+            return Err(Error::Other(format!(
+                "http.request: secret env var `{name}` is not on the allowlist and will not be \
+                 resolved. Add it to `[web] allowed_secrets` (or the FLUX_WEB_SECRET_ALLOW env var) \
+                 to permit `{{\"$secret\": \"{name}\"}}`."
+            )));
+        }
         let resolved = std::env::var(name).map_err(|_| {
             Error::Other(format!(
                 "http.request: secret env var `{name}` is not set (referenced via {{\"$secret\": \"{name}\"}})"
@@ -234,6 +255,19 @@ fn resolve_header_value(val: &Value, ctx: &ToolContext) -> Result<String> {
                 .into(),
         )),
     }
+}
+
+/// Parse the `FLUX_WEB_SECRET_ALLOW` env var into a list of permitted secret env-var names
+/// (comma- or whitespace-separated). Unset/empty ⇒ deny-all — the correct fail-closed default so a
+/// `$secret` header reference is inert until an operator opts specific names in (C-76).
+fn secret_allowlist_from_env() -> Vec<String> {
+    std::env::var("FLUX_WEB_SECRET_ALLOW")
+        .unwrap_or_default()
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// If `v` is exactly the secret marker `{"$secret": "NAME"}`, return `NAME` (mirrors
@@ -473,11 +507,21 @@ mod tests {
         assert_eq!(calls[0].2, "cli:--allow-private-net", "grant source label");
     }
 
+    /// Build a tool with an explicit secret allowlist (bypasses the `FLUX_WEB_SECRET_ALLOW` env
+    /// fallback so these tests never race on a process-global var).
+    fn tool_allowing(private_net: PrivateNetAllow, secrets: &[&str]) -> HttpRequestTool {
+        HttpRequestTool::new(&WebOptions {
+            private_net,
+            allowed_secrets: Some(secrets.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        })
+    }
+
     #[tokio::test]
     async fn secret_header_is_resolved_and_seeded_into_the_redactor() {
         std::env::set_var("FLUX_WEB_TEST_TOKEN", "super-secret-42");
         let base = one_shot("200 OK", "ok").await;
-        let t = tool(PrivateNetAllow::Any);
+        let t = tool_allowing(PrivateNetAllow::Any, &["FLUX_WEB_TEST_TOKEN"]);
         let c = ctx();
         t.execute(
             &c,
@@ -500,7 +544,9 @@ mod tests {
     #[tokio::test]
     async fn missing_secret_header_env_is_a_clean_error() {
         let base = one_shot("200 OK", "ok").await;
-        let t = tool(PrivateNetAllow::Any);
+        // Allowlisted but unset: the request passes the allowlist gate and then fails cleanly on
+        // the missing value (not the allowlist refusal).
+        let t = tool_allowing(PrivateNetAllow::Any, &["FLUX_WEB_DEFINITELY_UNSET"]);
         let err = t
             .execute(
                 &ctx(),
@@ -513,8 +559,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("FLUX_WEB_DEFINITELY_UNSET"),
+            err.contains("FLUX_WEB_DEFINITELY_UNSET") && err.contains("not set"),
             "names the missing var: {err}"
+        );
+    }
+
+    /// C-76: a `$secret` naming an env var that is NOT on the allowlist must be refused — even when
+    /// the var is set in the environment — and its value must never be read or sent. This is the
+    /// single-call exfiltration primitive the story closes.
+    #[tokio::test]
+    async fn secret_ref_to_non_allowlisted_env_var_is_refused() {
+        std::env::set_var("FLUX_WEB_STOLEN_TOKEN", "exfiltrate-me");
+        let base = one_shot("200 OK", "ok").await;
+        // Deny-all allowlist, though the classic exfil target is present in the environment.
+        let t = tool_allowing(PrivateNetAllow::Any, &[]);
+        let err = t
+            .execute(
+                &ctx(),
+                json!({
+                    "url": base,
+                    "headers": { "x-api-key": { "$secret": "FLUX_WEB_STOLEN_TOKEN" } }
+                }),
+            )
+            .await
+            .expect_err("a non-allowlisted secret ref must be refused, not sent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allowlist") && !msg.contains("exfiltrate-me"),
+            "refusal must name the allowlist and never leak the value: {msg}"
         );
     }
 

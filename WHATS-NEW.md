@@ -21,6 +21,25 @@
   pair.** Flux generates each entity's visible filter schema and renders rows and continuation
   cursors consistently, while the backend retains ownership of its async fetches.
 
+### Hardened
+
+- **The web and HTTP tools can no longer be tricked into leaking your secrets.** A prompt-injected
+  agent can't read an arbitrary environment variable into a request header — only operator-allowlisted
+  names resolve — and every outbound request is pinned to the address the egress guard vetted, closing
+  a DNS-rebinding path to cloud-metadata credentials.
+- **The SQLite tool is confined to your workspace and `~/.flux`.** It can no longer be steered into
+  reading browser cookie stores or credential databases elsewhere on disk.
+- **Untrusted programs and plans can't exhaust the host.** The language interpreter now bounds
+  recursion depth (no crash from deeply nested input) and enforces a default step/time budget on loops;
+  file reads check size before loading (no out-of-memory on a giant file, no hang on a named pipe); and
+  the browser, plugin, and agent-to-agent surfaces cap their buffers and queues.
+- **Credentials stay out of logs and listings.** OAuth tokens redact themselves in debug output, and
+  inline URL credentials are gated and hidden from endpoint listings.
+- **Mistyped security or budget settings now fail loudly.** A typo in a `[server]` or `[limits]` key is
+  a clear error instead of a silently ignored — and therefore disabled — control.
+- **Safer file and branch edits.** `git_checkout` can no longer discard uncommitted work through a
+  path-like branch name, and an empty search string in `edit` is refused instead of corrupting the file.
+
 ### Improved
 
 - **The Rust SDK now includes a runnable live-system reference integration.** It demonstrates

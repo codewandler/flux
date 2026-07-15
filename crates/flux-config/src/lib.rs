@@ -24,6 +24,7 @@ use flux_policy::AuthorizationPolicy;
 
 /// Coder-style permission rules (`read`, `Bash(git:*)`, …): deny wins, then allow, else prompt.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Permissions {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -64,6 +65,7 @@ impl PrivateNetGrant {
 /// Scoped private-network egress grants. Plugin grants are keyed by plugin manifest name;
 /// per-endpoint grants are keyed by `"<plugin>:<endpoint_name>"` (finer than a whole plugin).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivateNetConfig {
     /// The family-wide `web` egress scope: grants private-network access to every native `flux-web`
     /// op (`http.request`, `web.fetch`, `browser.*`) — the one policy the whole web family answers
@@ -91,6 +93,7 @@ impl PrivateNetConfig {
 /// if an operator listed the `(consumer, provider)` pair here — exactly like the `process`/`conn`/
 /// `secrets` allow-lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// Cross-plugin credential grants, each `"<consumer>:<provider>"` (or `"<consumer>:*"` to let a
     /// consumer use any provider's credentials). No matching entry → no cross-plugin resolution.
@@ -138,6 +141,7 @@ impl EndpointConfig {
 
 /// The `[skills]` table — skill-discovery settings (L-02).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Custom skill directories, layered **above** the built-in well-known set (`.flux/skills`,
     /// `.claude/skills`, `~/.flux/skills`, …). Unlike the permission lists, order here is semantic
@@ -275,6 +279,7 @@ impl SkillsConfig {
 
 /// The `[workspace]` table — filesystem access widening (C-21).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Additional **read-only** roots the CLI may read/glob/grep under, beyond the cwd. A leading `~/`
     /// expands to the home directory; relative paths resolve against the cwd. Writes stay confined to the
@@ -389,6 +394,7 @@ pub const DEFAULT_A2A_SESSION_TTL_SECS: u64 = 3600;
 
 /// The `[server]` table — settings for the HTTP/A2A surface.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// TTL in seconds for sessions minted by the A2A surface (C-18). Absent means the default
     /// [`DEFAULT_A2A_SESSION_TTL_SECS`] (1h); `0` means never prune. Age is measured from a
@@ -436,6 +442,7 @@ impl ServerConfig {
 
 /// Resource ceilings for the agent loop. Everything here is opt-in — absent means no ceiling.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Per-turn token budget: once the turn's accumulated model usage (all tiers) crosses this,
     /// the loop ends the turn honestly instead of consulting the model again. Overridden by
@@ -1697,6 +1704,47 @@ gitlab = ["gitlab.internal"]
         write_project(&dir, "[sandbox]\nrequre = true\n");
         assert!(load(&dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-86: a typo'd `[server]` introspection key (e.g. `introspction_require_account`) must be a
+    /// hard parse error, not a silently dropped setting — otherwise the intended auth check stays
+    /// *off* (fails open on a security control).
+    #[test]
+    fn unknown_server_key_is_rejected() {
+        let err = toml::from_str::<Config>("[server]\nintrospction_require_account = true\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+        // A malformed `[server]` table fails the whole load.
+        let dir = temp_dir();
+        write_project(&dir, "[server]\nintrospction_require_account = true\n");
+        assert!(load(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-86: a typo'd `[limits]` budget key (`turn_tokn_budget`) must be rejected — otherwise the
+    /// turn runs *unbounded* (fails open on a spend control).
+    #[test]
+    fn unknown_limits_key_is_rejected() {
+        let err = toml::from_str::<Config>("[limits]\nturn_tokn_budget = 50000\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// C-86: the remaining security/scope tables also fail closed on an unknown key.
+    #[test]
+    fn unknown_keys_in_scope_tables_are_rejected() {
+        for body in [
+            "[workspace]\nallw_all = true\n",
+            "[skills]\ndir = []\n",
+            "[endpoint]\ncros_plugin_credentials = []\n",
+            "[private_net]\nweb2 = true\n",
+            "[permissions]\nalow = []\n",
+        ] {
+            let err = toml::from_str::<Config>(body).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "table body `{body}` should reject the unknown key: {err}"
+            );
+        }
     }
 
     #[test]

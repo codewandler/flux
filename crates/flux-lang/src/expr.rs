@@ -380,7 +380,48 @@ fn arith_num(v: &ExprVal) -> Option<f64> {
     }
 }
 
+// L-81: an `expr` formula is an opaque string that bypasses serde's recursion cap and reaches this
+// recursive-descent evaluator directly (from `.flux` source AND from LLM plans). Deeply nested
+// `(((…` (through `expr_or`) or `!!!…` / `---…` (through `expr_unary`) would overflow the stack and
+// `SIGABRT`. A shared depth counter — reset per evaluation via the RAII guard's decrement — caps the
+// recursion; the two recursion entry points check it and return `None` (a bounded "invalid formula"
+// error) instead of recursing further. Sync-only path, so a thread-local counter is sound.
+const MAX_EXPR_DEPTH: usize = 256;
+
+thread_local! {
+    static EXPR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the shared expr recursion depth for its lifetime; decrement on drop (even on an early
+/// `?`/`return`), so the counter can never leak across evaluations on the same thread.
+struct DepthGuard {
+    over: bool,
+}
+
+impl DepthGuard {
+    fn enter() -> Self {
+        let n = EXPR_DEPTH.with(|c| {
+            let n = c.get() + 1;
+            c.set(n);
+            n
+        });
+        DepthGuard {
+            over: n > MAX_EXPR_DEPTH,
+        }
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        EXPR_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 fn expr_or(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<ExprVal> {
+    let _guard = DepthGuard::enter();
+    if _guard.over {
+        return None;
+    }
     let mut lhs = expr_and(t, v)?;
     while peek_op(t) == Some("||") {
         t.pop_front();
@@ -490,6 +531,10 @@ fn expr_mul(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<Expr
 }
 
 fn expr_unary(t: &mut VecDeque<Tok>, v: &BTreeMap<String, ExprVal>) -> Option<ExprVal> {
+    let _guard = DepthGuard::enter();
+    if _guard.over {
+        return None;
+    }
     match peek_op(t) {
         Some("-") => {
             t.pop_front();
@@ -1011,6 +1056,32 @@ mod tests {
         // Can use len() on the result
         let result = eval_expr_value("len(split(s, ','))", &vars).unwrap();
         assert_eq!(result, ExprVal::Num(3.0));
+    }
+
+    /// L-81 (failing-first): a deeply nested `expr` formula (parens or unary chains) must return a
+    /// bounded error, not overflow the stack and abort the test process. Before the depth guard both
+    /// of these `SIGABRT`ed. The decrement-on-drop must also leave the counter clean for a subsequent
+    /// normal evaluation on the same thread.
+    #[test]
+    fn deeply_nested_formula_is_bounded_not_aborting() {
+        let vars = BTreeMap::new();
+        let depth = 50_000;
+        let parens = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(
+            eval_expr_value(&parens, &vars).is_err(),
+            "deep parens must be a bounded error, not a crash"
+        );
+        let unary = format!("{}1", "!".repeat(depth));
+        assert!(
+            eval_expr_value(&unary, &vars).is_err(),
+            "deep unary chain must be a bounded error, not a crash"
+        );
+        // The depth counter did not leak: a normal shallow formula still evaluates on this thread.
+        assert_eq!(
+            eval_expr_value("1 + 2", &vars).unwrap(),
+            ExprVal::Num(3.0),
+            "the depth guard must not leak across evaluations"
+        );
     }
 
     #[test]

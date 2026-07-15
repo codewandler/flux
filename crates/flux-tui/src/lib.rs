@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use flux_core::humanize::{fmt_count, fmt_elapsed};
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
 use flux_flow::AgentSink;
@@ -1443,17 +1444,6 @@ fn bar_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> 
     Line::from(spans)
 }
 
-/// Format a token count compactly: `840`, `1.2k`, `3.4M`.
-fn fmt_count(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
-}
-
 /// Truncate `s` to `max` display columns (approximated by char count), appending `…` when cut.
 fn truncate(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
@@ -1543,18 +1533,6 @@ fn flag_on(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
-}
-
-/// Format an elapsed duration compactly: `820µs` / `12ms` / `1.4s` (mirrors `flux-cli`'s helper).
-fn fmt_elapsed(d: Duration) -> String {
-    let ms = d.as_millis();
-    if ms == 0 {
-        format!("{}µs", d.as_micros())
-    } else if ms < 1000 {
-        format!("{ms}ms")
-    } else {
-        format!("{:.1}s", d.as_secs_f64())
-    }
 }
 
 fn fmt_tool_timing(outcome: &ToolOutcome) -> String {
@@ -3188,6 +3166,13 @@ mod tests {
         assert_eq!(fmt_count(840), "840");
         assert_eq!(fmt_count(12_300), "12.3k");
         assert_eq!(fmt_count(3_400_000), "3.4M");
+    }
+
+    #[test]
+    fn fmt_count_hands_off_units_at_the_boundary() {
+        // The private `fmt_count` used to render `999_999` as `1000.0k` (rounding after choosing the
+        // unit). Now it shares the L0 humanizer, which rounds first and hands off cleanly to `1.0M`.
+        assert_eq!(fmt_count(999_999), "1.0M", "never `1000.0k`");
     }
 
     #[test]
