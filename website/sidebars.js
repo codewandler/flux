@@ -97,6 +97,7 @@ const sidebars = {
       label: 'Security',
       items: [
         'security/overview',
+        'security/plain-terms',
         'security/credentials',
         'security/plugin-sandbox',
         'security/os-sandbox',

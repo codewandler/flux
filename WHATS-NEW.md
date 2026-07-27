@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### New
+
+- **A plain-language security page.** The docs now open the Security section with "Security in
+  plain terms" — what flux does to protect you, your files, and your passwords, written for people
+  who use flux rather than build it. The deeper, developer-facing pages are unchanged and now link
+  to it from the Security overview.
+
 ### Fixed
 
 - **Approval prompts no longer vanish behind the spinner.** Running without `--yes` in the plain

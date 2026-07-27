@@ -11,6 +11,9 @@ the model.
 
 There are three directions of trust to keep separate in your head:
 
+> **New here, or not an engineer?** Read [Security in plain terms](./plain-terms.md) first — the
+> same guarantees without the jargon — then come back for the mechanics.
+
 - **Local** — the agent reaching your filesystem, processes, and network. Governed by the one
   [safety envelope](../agent/safety.md): every operation lowers onto a single
   authorization → approval → guarded-IO chain. Nothing has a side door.
@@ -31,6 +34,25 @@ There are three directions of trust to keep separate in your head:
 | OS process sandbox | What a spawned process's raw syscalls can reach (opt-in) | [OS process sandboxing](./os-sandbox.md) |
 | Plugin trust & signing | *Which* plugin code runs — supply-chain integrity | [Plugin trust & signing](./plugin-trust.md) |
 | Server auth & tenancy | Who may drive a networked flux, and tenant isolation | [Server authentication & tenancy](./server-auth.md) |
+
+## Also enforced by the runtime
+
+Beyond the six pillars, the runtime holds a set of smaller guarantees by construction rather than
+by convention. Each is covered by a test:
+
+- **Egress / SSRF guard** — every URL flux fetches (a built-in op, a plugin callback, a browser
+  fetch) is resolved and blocked when it points at a private, loopback, link-local, unique-local,
+  CGNAT, or IPv4-mapped address, or an internal hostname, unless the caller holds a scoped
+  private-network grant. After vetting, the connection is **pinned to the exact validated
+  addresses**, closing the DNS-rebinding gap between the guard and the connect. This is the one
+  guard — there is no second, hand-rolled URL check. See [Safety & approvals](../agent/safety.md).
+- **Session integrity** — a turn always ends with a valid conversation, even on cancel, compaction,
+  or an iteration cap: no empty assistant turn, no orphaned tool call, no two user messages in a
+  row. Providers reject malformed histories, so flux never produces one.
+- **Immutable caller identity** — within a live turn, *who* is acting is fixed at the start and
+  can't be swapped mid-turn by the model or a sub-agent.
+- **Audit trail** — flux records an append-only event log of tool calls, approvals, and destructive
+  markers, so an action can be traced after the fact.
 
 ## An honest posture
 
@@ -59,6 +81,7 @@ Everything below is enforced in the runtime, not asked of you as convention.
 
 ## Related docs
 
+- [Security in plain terms](./plain-terms.md) — the same guarantees for non-developers.
 - [Safety & approvals](../agent/safety.md) — local filesystem/process/network access.
 - [Credentials and secrets](./credentials.md) — outbound tokens and redaction.
 - [OS process sandboxing](./os-sandbox.md) — opt-in confinement of spawned processes' raw syscalls.
