@@ -24,7 +24,8 @@ exposes a fraction; this closes the depth gap so each integration is actually us
 - [x] **confluence** 3 → **15**: page create/update/delete, comments, attachments (blob), user.search,
       `index.build` — hand-rolled base64 dropped (D-12 `AuthMethod::basic`).
 - [x] **kubernetes** 5 → **24**: node/service/ingress/container list+show, deployment scale/restart/history,
-      secret.read, port-forward start/stop/list, endpoint.discover — **kubectl-CLI** (decision below).
+      secret.read, port-forward start/stop/list, endpoint.discover — **kubectl-CLI** (decision recorded in
+      [integration-plugins.md](../designs/integration-plugins.md#decision-record--kubernetes-drives-kubectl-not-the-api-server-d-14)).
 - [x] **loki** 3 → **5** (`test`, `recent_logs`, `metric`; non-Bearer Basic + `X-Scope-OrgID` tenant header);
       **prometheus** 4 → **8** (`series`, `targets`, `rules`, `alerts`); **websearch** confirmed (added
       `provider.list` + a provider selector).

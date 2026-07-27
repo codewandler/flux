@@ -435,6 +435,39 @@ code) from `~/projects/fluxplane/fluxplane-plugins/<plugin>/manifest.go`. Each s
 `plugins/`, a smoke entry in `scripts/smoke-plugins.sh`, and `flux plugin skill refresh` to regenerate the
 catalog.
 
+## Decision record — kubernetes drives `kubectl`, not the API server (D-14)
+
+`docs/stories/D-14-deepen-native-plugins.md` marks the kubernetes plugin "kubectl-CLI (decision below)" without
+recording the decision. It is written down here because the question recurs (most recently 2026-07-27, when the
+typed-authority validator rejected the resulting declaration — see [C-89](../stories/C-89-process-authority-carrier.md)).
+
+**Decision.** The plugin declares `process: ["kubectl"]` and shells the CLI, rather than speaking HTTP to the
+API server the way fluxplane's Go plugin uses client-go. Recorded as a *do-not-port architectural split* during
+the parity audit, alongside the `endpoint_ref`-per-call split (flux uses the ambient kubeconfig + `--context`).
+
+**Why.**
+- **Auth.** Kubeconfig auth is not a bearer token. EKS/GKE/AKS use exec-credential plugins (`aws eks get-token`,
+  `gke-gcloud-auth-plugin`) and client-certificate mTLS with rotation. Speaking HTTP means reimplementing
+  kubeconfig parsing, running those credential helpers (process access again), and client-cert TLS — which
+  `http.do` does not support. The HTTP path would *add* a capability, not remove one.
+- **Dependency weight.** The nested `plugins/` workspace exists so heavy integration deps stay out of the main
+  flux gate (D-08); `kube`/`k8s-openapi` is exactly the dependency that motivated the split, and the pack ships
+  "no vendor SDKs in-tree".
+- **Egress.** API servers are private addresses. Every HTTP call would meet the egress guard, so the plugin
+  would be unusable out of the box without scoped private-net entries per cluster.
+- **Streaming.** `pod.exec` and `portforward` need SPDY/WebSocket upgrades; `http.do` is request/response.
+  Those two ops are process-bound under any transport.
+
+**Cost, stated plainly.** The process capability is the least legible one in the model: the host gate matches
+`argv[0]` only, so granting `kubectl` grants everything the kubeconfig allows, and an op's `Risk` label is
+descriptive rather than enforced. The HTTP path by contrast shows the host a method and a URL, resolves the base
+URL from a reference the plugin never sees, injects the secret itself, and runs the egress guard.
+
+**Consequence, not a reversal.** The answer is to narrow the process gate
+([C-90](../stories/C-90-process-capability-argument-constraints.md)), not to rewrite the transport. A native HTTP
+path stays open for the in-cluster service-account-token case, as a hybrid beside `kubectl` — never as a second
+way to do the same thing.
+
 ## Accepted residuals
 
 - **Docker streaming/hijack ops** (`exec`, `stats`, log follow, image build/push, event stream) are not faked:
