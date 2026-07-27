@@ -1532,9 +1532,10 @@ pub trait Approver: Send + Sync {
     async fn request(&self, tool: &str, subjects: &[String], intents: &IntentSet)
         -> ApprovalChoice;
 
-    /// Approve a whole compiled plan as one unit (the "approve the graph, not each node" path). The
-    /// plan itself has already been rendered for the user (the `flow.plan` observation); this is just
-    /// the single confirm. `AllowAlways` here means "trust every plan for the rest of the session".
+    /// Approve a whole compiled plan as one unit (the "approve the graph, not each node" path).
+    /// Surfaces are not guaranteed to have rendered the plan beforehand — an interactive approver
+    /// should present the request's own content (ops, requirements, intents) in its prompt.
+    /// `AllowAlways` here means "trust every plan for the rest of the session".
     /// The default delegates to [`request`](Self::request) with the plan's REAL aggregate intents —
     /// so a single-method approver applies its per-op policy (e.g. deny-destructive) to the plan too.
     async fn request_plan(&self, plan: &PlanApprovalRequest) -> ApprovalChoice {
@@ -2445,7 +2446,7 @@ impl Executor {
     /// Approve a whole plan once, then keep it pre-approved while the returned guard is held. If already
     /// inside an approved scope (a nested authored flow) or the user trusts all plans, returns a guard
     /// without prompting. `None` means the approver rejected the plan. The request comes from the plan's
-    /// risk preview — the plan tree itself was already rendered (the `flow.plan` observation). The
+    /// risk preview and carries the content an interactive approver needs to present it. The
     /// scope's destructive disclosure follows the request's `destructive` flag on every arm: whoever
     /// approved (or pre-trusted) the plan did so against a preview that carried that badge.
     pub async fn approve_plan(&self, plan: &PlanApprovalRequest) -> Option<PlanScopeGuard<'_>> {

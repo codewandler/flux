@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **C-91: approval prompts are now visible in the plain (non-TUI) CLI.** Without `--yes`, the
+  interactive approval prompt was printed to stderr and then erased within one 80 ms tick by the
+  spinner's `\r\x1b[K` repaint (and by a `planning(false)` line-clear drained mid-approval), leaving
+  a spinner that looked hung while `y` still answered. A process-wide `PromptGate` now gives the
+  prompt exclusive ownership of the stderr line: the ticker skips frames and `stop_spinner` skips
+  its clear while a prompt is open, resuming on release. The whole-plan prompt additionally shows
+  *what* is being approved — op names, resource targets from the typed authority requirements,
+  process commands from the statically-visible intents, and the destructive badge — since the plain
+  CLI renders no plan tree before the confirm. The piped-stdin answer path now also closes the
+  prompt line. Covered by `PromptGate`/`plan_prompt` unit tests and an end-to-end
+  `tests/approval_prompt.rs` (approve and deny via piped stdin, no `--yes`).
+
 ## [0.26.0] - 2026-07-15
 
 ### Changed

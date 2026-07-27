@@ -3148,6 +3148,100 @@ mod tests {
         );
     }
 
+    /// C-91: while a prompt holds the gate the spinner ticker gets no paint permit — the prompt
+    /// owns the stderr line; painting resumes once the guard drops.
+    #[test]
+    fn prompt_gate_blocks_painting_while_held() {
+        let gate = super::PromptGate::new();
+        assert!(gate.begin_paint().is_some(), "free gate paints");
+        let guard = gate.acquire();
+        assert!(gate.begin_paint().is_none(), "held gate must not paint");
+        drop(guard);
+        assert!(gate.begin_paint().is_some(), "released gate paints again");
+    }
+
+    /// C-91: `stop_spinner`'s line clear is suppressed while a prompt holds the gate — a
+    /// `planning(false)` drained during the approval wait must not wipe the prompt line.
+    #[test]
+    fn prompt_gate_suppresses_clear_only_while_held() {
+        let gate = super::PromptGate::new();
+        gate.painter_started();
+        let guard = gate.acquire();
+        assert!(
+            !gate.painter_stopped(),
+            "clear suppressed while the prompt owns the line"
+        );
+        drop(guard);
+        gate.painter_started();
+        assert!(
+            gate.painter_stopped(),
+            "no holder -> caller clears normally"
+        );
+    }
+
+    /// C-91: the whole-plan prompt carries the batch content — the plain CLI renders no plan tree
+    /// before the confirm, so this prompt is the only place the user sees what they approve.
+    #[test]
+    fn plan_prompt_lists_ops_subjects_and_answer_line() {
+        use flux_policy::ResourceRef;
+        use flux_runtime::AuthorityRequirement;
+
+        let plan = flux_runtime::PlanApprovalRequest {
+            summary: "medium".to_string(),
+            ops: vec!["write".to_string(), "bash".to_string()],
+            destructive: false,
+            mutating: true,
+            intents: flux_spec::IntentSet {
+                intents: vec![flux_spec::Intent {
+                    behavior: flux_spec::IntentBehavior::CommandExecution,
+                    target: flux_spec::IntentTarget::Process {
+                        command: "cargo test".to_string(),
+                    },
+                    role: flux_spec::IntentRole::ProcessCommand,
+                    certainty: flux_spec::IntentCertainty::Certain,
+                }],
+            },
+            requirements: vec![
+                AuthorityRequirement::new(
+                    "workspace.write",
+                    ResourceRef::path("/home/user/notes/flux-mock.txt"),
+                ),
+                // Operation requirements only repeat the ops line — skipped.
+                AuthorityRequirement::new(
+                    "op.invoke",
+                    ResourceRef::named(flux_policy::ResourceKind::Operation, "write"),
+                ),
+            ],
+        };
+
+        let prompt = super::plan_prompt(&plan);
+        assert!(
+            prompt.contains("run this plan? (2 op(s) · medium)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("ops: write, bash"), "{prompt}");
+        assert!(
+            prompt.contains("workspace.write → notes/flux-mock.txt"),
+            "paths are trimmed to the last two components: {prompt}"
+        );
+        assert!(prompt.contains("process.exec → $ cargo test"), "{prompt}");
+        assert!(
+            !prompt.contains("op.invoke"),
+            "operation requirements are skipped: {prompt}"
+        );
+        assert!(
+            !prompt.contains("destructive"),
+            "no destructive warning unless flagged: {prompt}"
+        );
+        assert!(prompt.ends_with("\n[y]es / [a]lways / [N]o: "), "{prompt}");
+
+        let destructive = flux_runtime::PlanApprovalRequest {
+            destructive: true,
+            ..plan
+        };
+        assert!(super::plan_prompt(&destructive).contains("⚠ contains a destructive operation"),);
+    }
+
     #[test]
     fn staged_intent_summary_is_concise_and_verbose_is_explicit() {
         let data = serde_json::json!({

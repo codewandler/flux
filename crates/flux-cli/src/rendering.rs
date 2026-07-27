@@ -62,6 +62,97 @@ pub(super) struct SpinnerState {
     pub(super) frame: usize,
 }
 
+/// Coordinates exclusive ownership of the current stderr line between the animated spinner ticker
+/// and interactive prompts (approvals, confirms). While a prompt holds the gate the ticker must not
+/// repaint and `stop_spinner` must not clear — the prompt owns the line; without this, the 80 ms
+/// `\r\x1b[K` repaint (or a `planning(false)` drained mid-approval) erases the prompt within one
+/// tick, leaving a spinner that looks hung while `y` still answers. Process-global because stderr
+/// is process-global: the approver sits behind `Arc<dyn Approver>` and sinks are built per turn,
+/// so no shared construction scope exists to thread an instance through.
+pub(super) struct PromptGate {
+    state: std::sync::Mutex<GateState>,
+}
+
+struct GateState {
+    /// Prompt-hold depth. Plain-CLI prompts are strictly sequential; depth keeps even an
+    /// unexpected overlap safe.
+    holders: usize,
+    /// Live spinner tickers (0 or 1 in practice) — lets `acquire` know whether there is a painted
+    /// line to clear, so piped stderr stays free of control bytes.
+    painters: usize,
+}
+
+/// Held by the ticker for the duration of one frame draw. Holding it keeps the gate locked, so
+/// `acquire` cannot interleave a clear mid-paint — once `acquire` returns, no paint lands after it.
+pub(super) struct PaintPermit<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, GateState>);
+
+/// Releases the prompt's hold on drop — including when the turn future is cancelled mid-approval.
+pub(super) struct PromptGuard {
+    gate: Arc<PromptGate>,
+}
+
+impl PromptGate {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(PromptGate {
+            state: std::sync::Mutex::new(GateState {
+                holders: 0,
+                painters: 0,
+            }),
+        })
+    }
+
+    /// The process-wide instance shared by every sink and prompt. Tests use [`PromptGate::new`]
+    /// for isolated instances.
+    pub(super) fn global() -> Arc<Self> {
+        static GATE: std::sync::OnceLock<Arc<PromptGate>> = std::sync::OnceLock::new();
+        GATE.get_or_init(PromptGate::new).clone()
+    }
+
+    /// Ticker entry point: paint only while the returned permit is alive. `None` while a prompt
+    /// holds the gate — skip the frame (the ticker idles and resumes on release).
+    pub(super) fn begin_paint(&self) -> Option<PaintPermit<'_>> {
+        let st = self.state.lock().unwrap();
+        (st.holders == 0).then_some(PaintPermit(st))
+    }
+
+    /// Bookkeeping from `start_spinner`.
+    pub(super) fn painter_started(&self) {
+        self.state.lock().unwrap().painters += 1;
+    }
+
+    /// Bookkeeping from `stop_spinner`. Returns whether the caller should clear the line — false
+    /// while a prompt holds the gate (the acquire already cleared it; wiping now would erase the
+    /// prompt).
+    pub(super) fn painter_stopped(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        st.painters = st.painters.saturating_sub(1);
+        st.holders == 0
+    }
+
+    /// Take the stderr line for a prompt: clears the live spinner line once (only when a painter
+    /// is registered — nothing is emitted on piped stderr), then blocks all repainting and clearing
+    /// until the guard drops.
+    pub(super) fn acquire(self: &Arc<Self>) -> PromptGuard {
+        let mut st = self.state.lock().unwrap();
+        st.holders += 1;
+        if st.painters > 0 {
+            eprint!("\r\x1b[K");
+            let _ = std::io::stderr().flush();
+        }
+        drop(st);
+        PromptGuard {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        let mut st = self.gate.state.lock().unwrap();
+        st.holders = st.holders.saturating_sub(1);
+    }
+}
+
 /// Render an op call as a concise, colored *semantic* label: the cyan op name padded to a gutter, then
 /// a readable argument — `bash → $ cargo test`, `read → foo.rs:100-180`, `grep → "needle" in src/`. The
 /// arg is capped unless `-v`; the full plan is always shown separately (the `flow.plan` tree).
@@ -338,6 +429,8 @@ pub(super) struct CliSink {
     /// itself carries no `gather` flag (that lives on `Compiled`/the host, not the observation), so
     /// this is the cheapest surface-side derivation available without new flux-flow plumbing.
     pub(super) gather_mode: bool,
+    /// Stderr-line ownership coordinator shared with interactive prompts — see [`PromptGate`].
+    pub(super) gate: Arc<PromptGate>,
 }
 
 impl CliSink {
@@ -369,6 +462,7 @@ impl CliSink {
             phase: None,
             execute_rounds: 0,
             gather_mode: false,
+            gate: PromptGate::global(),
         }
     }
 
@@ -413,6 +507,8 @@ impl CliSink {
         }));
         let s = state.clone();
         let start = std::time::Instant::now();
+        self.gate.painter_started();
+        let gate = self.gate.clone();
         let task = tokio::spawn(async move {
             const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             loop {
@@ -422,16 +518,20 @@ impl CliSink {
                     if !st.active {
                         break;
                     }
-                    let frame = FRAMES[st.frame % FRAMES.len()];
-                    st.frame += 1;
-                    let elapsed = style::fmt_elapsed(start.elapsed());
-                    eprint!(
-                        "\r\x1b[K{} {}  {}",
-                        style::cyan(&frame.to_string()),
-                        st.label,
-                        style::dim(&elapsed)
-                    );
-                    let _ = std::io::stderr().flush();
+                    // Skip the frame while a prompt owns the stderr line (lock order is
+                    // spinner-state → gate everywhere; `acquire` takes only the gate).
+                    if let Some(_line) = gate.begin_paint() {
+                        let frame = FRAMES[st.frame % FRAMES.len()];
+                        st.frame += 1;
+                        let elapsed = style::fmt_elapsed(start.elapsed());
+                        eprint!(
+                            "\r\x1b[K{} {}  {}",
+                            style::cyan(&frame.to_string()),
+                            st.label,
+                            style::dim(&elapsed)
+                        );
+                        let _ = std::io::stderr().flush();
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             }
@@ -439,12 +539,16 @@ impl CliSink {
         self.spinner = Some((state, task));
     }
 
-    /// Stop a running spinner and clear its line. Returns true if one was active.
+    /// Stop a running spinner and clear its line. Returns true if one was active. The clear is
+    /// skipped while a prompt holds the [`PromptGate`] — this call may be a `planning(false)` or
+    /// `turn_end` drained during an approval wait, and the line it would wipe is the prompt.
     fn stop_spinner(&mut self) -> bool {
         if let Some((state, task)) = self.spinner.take() {
             state.lock().unwrap().active = false;
-            eprint!("\r\x1b[K");
-            std::io::stderr().flush().ok();
+            if self.gate.painter_stopped() {
+                eprint!("\r\x1b[K");
+                std::io::stderr().flush().ok();
+            }
             task.abort();
             true
         } else {
@@ -533,6 +637,11 @@ impl AgentSink for CliSink {
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.commit();
+        // `action_batch.proposed` / `approval.requested` are deliberately unrendered here: sink
+        // events are drained only when the turn future yields, which during an approval is AFTER
+        // the prompt line is already open — printing them would garble it. The approval prompt
+        // itself (`plan_prompt`, built from the same risk data) carries the batch content with
+        // correct ordering.
         if o.kind == flux_evidence::KIND_DESTRUCTIVE {
             eprintln!(
                 "{}",

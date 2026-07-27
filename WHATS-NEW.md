@@ -15,6 +15,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Approval prompts no longer vanish behind the spinner.** Running without `--yes` in the plain
+  terminal, the confirmation prompt was being overwritten by the progress spinner within a fraction
+  of a second — the run looked stuck even though pressing `y` quietly approved it. The prompt now
+  stays on screen until you answer, and it tells you what you are approving: the operations, the
+  files and commands they touch, and a warning when something destructive is in the batch.
+
 ## [0.26.0] - 2026-07-15
 
 ### New

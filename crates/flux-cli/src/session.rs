@@ -1020,18 +1020,7 @@ impl Approver for StdinApprover {
         } else {
             let formatted: Vec<String> = subjects
                 .iter()
-                .map(|s| {
-                    let p = std::path::Path::new(s);
-                    let trimmed = p
-                        .components()
-                        .rev()
-                        .take(2)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<std::path::PathBuf>();
-                    style::yellow(&trimmed.display().to_string())
-                })
+                .map(|s| style::yellow(&trim_subject(s)))
                 .collect();
             format!(" {}", formatted.join(", "))
         };
@@ -1044,16 +1033,92 @@ impl Approver for StdinApprover {
         read_choice(prompt, ApprovalChoice::AllowAlways(tool.to_string())).await
     }
 
-    /// The whole-plan confirm. The plan tree + risk were already rendered (the `flow.plan` observation),
-    /// so this is one line. `always` here trusts every plan for the rest of the session.
+    /// The whole-plan confirm. `always` here trusts every plan for the rest of the session.
     async fn request_plan(&self, plan: &flux_runtime::PlanApprovalRequest) -> ApprovalChoice {
-        let prompt = format!(
-            "\n{} this plan? ({})  [y]es / [a]lways / [N]o: ",
-            style::yellow("run"),
-            plan.subject(),
-        );
-        read_choice(prompt, ApprovalChoice::AllowAlways("*plans*".to_string())).await
+        read_choice(
+            plan_prompt(plan),
+            ApprovalChoice::AllowAlways("*plans*".to_string()),
+        )
+        .await
     }
+}
+
+/// Trim a path-like subject to its last two components so long absolute paths don't swamp a prompt.
+pub(super) fn trim_subject(s: &str) -> String {
+    std::path::Path::new(s)
+        .components()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<std::path::PathBuf>()
+        .display()
+        .to_string()
+}
+
+/// The whole-plan confirm prompt. The plain CLI renders no plan tree before the confirm (the batch
+/// observations are deliberately unrendered — see `CliSink::observation`), so this prompt is the one
+/// place the user sees WHAT they are approving: the op names, the concrete resources and commands
+/// statically visible at approval time, and the destructive flag. Ends with the answer line and no
+/// trailing newline — the cursor waits on it.
+pub(super) fn plan_prompt(plan: &flux_runtime::PlanApprovalRequest) -> String {
+    let mut out = format!("\n{} this plan? ({})", style::yellow("run"), plan.subject());
+    if plan.destructive {
+        out.push_str(&format!(
+            "\n  {}",
+            style::yellow("⚠ contains a destructive operation")
+        ));
+    }
+    if !plan.ops.is_empty() {
+        let ops: Vec<String> = plan.ops.iter().map(|o| style::bold(o)).collect();
+        out.push_str(&format!("\n  ops: {}", ops.join(", ")));
+    }
+    // Concrete targets: typed authority requirements (paths / named resources) plus process
+    // commands from the statically-visible intents. Only literal args are known at approval time —
+    // dispatch re-derives and enforces the real set, and an undisclosed destructive op still
+    // re-fires the per-op gate inside the approved scope.
+    let mut lines: Vec<String> = Vec::new();
+    for req in &plan.requirements {
+        // Operation requirements only repeat the ops line above.
+        if req.resource.kind == flux_policy::ResourceKind::Operation {
+            continue;
+        }
+        let subject = req
+            .resource
+            .path
+            .as_deref()
+            .or(req.resource.name.as_deref())
+            .unwrap_or(&req.resource.id);
+        if subject == "*" {
+            continue;
+        }
+        lines.push(format!(
+            "{} → {}",
+            req.action.0,
+            style::yellow(&trim_subject(subject))
+        ));
+    }
+    for intent in &plan.intents.intents {
+        if let flux_spec::IntentTarget::Process { command } = &intent.target {
+            lines.push(format!(
+                "process.exec → $ {}",
+                style::yellow(&truncate(command, 80))
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    lines.retain(|l| seen.insert(l.clone()));
+    const MAX_LINES: usize = 8;
+    let extra = lines.len().saturating_sub(MAX_LINES);
+    for line in lines.iter().take(MAX_LINES) {
+        out.push_str(&format!("\n  {line}"));
+    }
+    if extra > 0 {
+        out.push_str(&format!("\n  {}", style::dim(&format!("+{extra} more"))));
+    }
+    out.push_str("\n[y]es / [a]lways / [N]o: ");
+    out
 }
 
 /// Print `prompt`, then read a y/a/N answer **off the async runtime** so the turn's future YIELDS while
@@ -1063,13 +1128,20 @@ impl Approver for StdinApprover {
 /// all decline. Off a terminal (pipes, eval) we read a line — EOF ends it and there's no prompt to
 /// corrupt. `always` is returned for `a`/`always`.
 pub(super) async fn read_choice(prompt: String, always: ApprovalChoice) -> ApprovalChoice {
+    // Own the stderr line for the whole prompt: clears a live spinner line once and blocks every
+    // repaint/clear until the answer is read — including sink events (`planning(false)`, spinner
+    // ticks) drained while the turn future waits here. Without this the prompt is erased within
+    // one 80 ms tick and the user sees only a spinner that looks hung.
+    let _line = PromptGate::global().acquire();
     eprint!("{prompt}");
     std::io::stderr().flush().ok();
     if !std::io::stdin().is_terminal() {
-        return match read_stdin_line().await {
+        let choice = match read_stdin_line().await {
             Some(line) => parse_choice(&line, always),
             None => ApprovalChoice::Deny,
         };
+        eprintln!(); // piped answers echo nothing on stderr — close the prompt line
+        return choice;
     }
     let choice = tokio::task::spawn_blocking(move || read_key_choice(always))
         .await
