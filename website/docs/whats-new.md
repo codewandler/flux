@@ -19,6 +19,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   of a second — the run looked stuck even though pressing `y` quietly approved it. The prompt now
   stays on screen until you answer, and it tells you what you are approving: the operations, the
   files and commands they touch, and a warning when something destructive is in the batch.
+- **Agents start again when a command-line integration is installed.** Integrations that work by
+  running a tool you already have — the Kubernetes one drives `kubectl`, the AWS one drives `aws` —
+  were rejected at startup for reaching a cluster or cloud account through that command, and a single
+  rejected operation stopped the whole session before the agent ran. Such operations are now accepted
+  and remain restricted to the program the integration declares, so approval prompts and audit records
+  still name exactly what runs.
 
 ## [0.26.0] - 2026-07-15
 

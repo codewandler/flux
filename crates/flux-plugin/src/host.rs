@@ -2001,6 +2001,50 @@ mod tests {
         assert!(!op.internal);
     }
 
+    /// Every projected plugin op must survive the registry's authority-contract validation, or the
+    /// plugin cannot load at all — registration is all-or-nothing, so one invalid op takes down the
+    /// whole session. The CLI-driven plugins (`kubernetes` via `kubectl`, `aws` via `aws`) declare
+    /// process capability only, and their ops legitimately reach the network and mutate remote
+    /// state; the effect-less default projection is `[Process, Network]` for the same reason. All
+    /// three shapes must be valid contracts against process-only capabilities.
+    #[test]
+    fn process_only_capabilities_project_valid_authority_contracts() {
+        let caps = PluginCapabilities {
+            process: vec!["kubectl".into()],
+            ..Default::default()
+        };
+        let cases = [
+            // The declared shapes in `plugins/kubernetes`.
+            vec![Effect::Read, Effect::Network],
+            vec![Effect::Write, Effect::Network],
+            vec![Effect::Process, Effect::Network],
+            // The conservative fallback `plugin_tool_spec` applies when an op declares none.
+            vec![],
+        ];
+
+        for effects in cases {
+            let op = OperationSpec {
+                name: "kubernetes.deployment.scale".into(),
+                description: "scale a deployment".into(),
+                effects: effects.clone(),
+                ..Default::default()
+            };
+            let (_, spec) = plugin_tool_spec("kubernetes", &op, &caps);
+            let requirements = flux_runtime::authority_requirements_from_declaration(
+                &spec,
+                &["kubectl".into()],
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("effects {effects:?} must be a valid contract: {err}"));
+            assert!(
+                requirements
+                    .iter()
+                    .any(|req| req.action.0 == "process.exec"),
+                "effects {effects:?} must be gated by the named program",
+            );
+        }
+    }
+
     #[test]
     fn plugin_operation_group_projects_to_tool_spec() {
         let op = OperationSpec {

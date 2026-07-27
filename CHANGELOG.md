@@ -19,6 +19,21 @@ All notable changes to this project are documented in this file. The format is b
   CLI renders no plan tree before the confirm. The piped-stdin answer path now also closes the
   prompt line. Covered by `PromptGate`/`plan_prompt` unit tests and an end-to-end
   `tests/approval_prompt.rs` (approve and deny via piped stdin, no `--yes`).
+- **C-89: process-mediated operations can state their reach again.** The typed authority validator
+  accepted network and write effects only from network-family or filesystem-family access, so every
+  CLI-driven plugin op was an invalid declaration — and because registration is all-or-nothing, a
+  single one aborted the session (`invalid authority contract for kubernetes.secret.read from
+  plugin:kubernetes`). `AccessKind::Process` now carries `Effect::Network` and `Effect::Write`,
+  still gated by the `process.exec` requirement on the allow-listed program, with `operation.mutate`
+  pinned to the operation for the write case. The plugin host's manifest→spec projection is now
+  checked against the same validator, so a capability shape that cannot load fails in the gate
+  rather than in the field.
+
+### Documentation
+
+- The kubernetes plugin's kubectl-versus-API-server decision is recorded in
+  `docs/designs/integration-plugins.md`, including its cost, and D-14's dangling "(decision below)"
+  pointer now resolves.
 
 ## [0.26.0] - 2026-07-15
 

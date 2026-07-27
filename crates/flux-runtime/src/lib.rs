@@ -2068,14 +2068,20 @@ pub fn authority_requirements_from_declaration(
             spec.name
         )));
     }
+    // `Process` is a carrier here because a subprocess reaches the network on the tool's behalf —
+    // `git_push` shells `git`, the kubernetes plugin shells `kubectl`. The gate is the
+    // `process.exec` requirement on the named program pushed above, not a network resource, so the
+    // envelope still names something concrete. Without this an integration whose only capability is
+    // an allow-listed CLI would have to claim network access it never uses in order to register.
     if has_effect(Effect::Network)
         && !has_access(AccessKind::Network)
         && !has_access(AccessKind::Connection)
         && !has_access(AccessKind::Browser)
         && !has_access(AccessKind::Provider)
+        && !has_access(AccessKind::Process)
     {
         return Err(Error::Other(format!(
-            "tool `{}` declares a network effect without network, browser, or provider access",
+            "tool `{}` declares a network effect without network, process, browser, or provider access",
             spec.name
         )));
     }
@@ -2092,9 +2098,13 @@ pub fn authority_requirements_from_declaration(
         && !has_access(AccessKind::Filesystem)
         && !has_access(AccessKind::LocalSystem)
     {
+        // Same reasoning as the network carrier above: a subprocess mutates remote state the tool
+        // has no typed resource for (a cluster deployment, a cloud resource). The mutation is
+        // pinned to the operation itself, on top of the `process.exec` gate on the program.
         if has_access(AccessKind::Network)
             || has_access(AccessKind::Connection)
             || has_access(AccessKind::Browser)
+            || has_access(AccessKind::Process)
         {
             push_requirement(
                 &mut requirements,
@@ -4669,6 +4679,38 @@ mod tests {
         assert_eq!(
             authority_requirements_from_declaration(&auth, &[], &[]).unwrap(),
             vec![AuthorityRequirement::host_read("auth")]
+        );
+    }
+
+    /// A subprocess is a legitimate carrier for reach and for mutation: the CLI it runs is what
+    /// touches the remote API and what changes the world. The authority gate is the
+    /// `process.exec` requirement on the named program, so the declaration must be expressible
+    /// instead of being rejected as inconsistent — otherwise a process-mediated integration has
+    /// to claim network or filesystem access it never uses just to register.
+    #[test]
+    fn process_access_carries_network_and_write_effects() {
+        let schema = json!({"type": "object"});
+
+        // `kubernetes.secret.read` — reads a remote cluster through `kubectl`.
+        let read = ToolSpec::read_only("kubernetes.secret.read", "read a secret", schema.clone())
+            .with_effects(vec![Effect::Read, Effect::Network])
+            .with_access(vec![AccessKind::Process]);
+        assert_eq!(
+            authority_requirements_from_declaration(&read, &["kubectl".into()], &[]).unwrap(),
+            vec![AuthorityRequirement::process_exec("kubectl")]
+        );
+
+        // `kubernetes.deployment.scale` — mutates a remote cluster through `kubectl`. The write
+        // is not a file and not a datasource, so it lands on the operation itself.
+        let write = ToolSpec::read_only("kubernetes.deployment.scale", "scale", schema)
+            .with_effects(vec![Effect::Write, Effect::Network])
+            .with_access(vec![AccessKind::Process]);
+        assert_eq!(
+            authority_requirements_from_declaration(&write, &["kubectl".into()], &[]).unwrap(),
+            vec![
+                AuthorityRequirement::process_exec("kubectl"),
+                AuthorityRequirement::operation("operation.mutate", "kubernetes.deployment.scale"),
+            ]
         );
     }
 
