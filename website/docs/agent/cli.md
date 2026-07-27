@@ -62,6 +62,17 @@ flux sessions --store tests/scenarios/refund-flow
 A scenario fixture written by `flux record` **is** an ordinary store in that layout, so the existing
 Time Machine tools open one directly — there is no fixture-specific inspection path to learn.
 
+## Crash recovery and resurrection
+
+With durable session storage, a CLI turn on a conversation that was killed mid-turn first finishes the
+interrupted predecessor from its recorded plan, then runs the new input. Completed statements are
+fast-forwarded, recorded op results are served from the cassette, and only the remaining live tail runs
+through the normal approval envelope. Set `FLUX_AUTO_RESURRECT=0` to opt out.
+
+`flux sessions` is intentionally read-only: it marks interrupted sessions in the listing and explains
+that the next turn will resume them, but it never resurrects a turn as a side effect of listing
+sessions.
+
 ## Turn controls
 
 ```bash

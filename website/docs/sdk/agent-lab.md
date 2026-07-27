@@ -235,9 +235,14 @@ let client = Client::builder()
     .auto_resurrect(true)   // the default for Storage::dir
     .build(provider, ".")?;
 
-// Opening a session with an interrupted turn resumes it transparently —
-// reported through the sink, never silent.
 let session = client.open_session(&id)?;
+
+// A later turn on a session with an interrupted predecessor resumes that
+// predecessor first — reported through TurnOutput::resurrected, never silent.
+let out = session.send("continue").await?;
+if let Some(report) = out.resurrected.as_deref() {
+    println!("resurrected: {}", report.outcome);
+}
 ```
 
 Or drive it explicitly:

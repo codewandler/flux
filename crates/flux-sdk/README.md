@@ -37,6 +37,12 @@ cargo run -p codewandler-flux-sdk --example client_basic   # the self-hosted Flu
 cargo run -p codewandler-flux-sdk --example parameterized_flow # parse authored Flux → execute
 ```
 
+A fourth SDK product area builds on the same engine instead of introducing a parallel test harness:
+**Agent Lab** records real agent runs as deterministic fixtures, replays them offline in tests, runs
+world-pinned what-if experiments, and resurrects interrupted durable turns. See
+[`examples/agent_lab.rs`](examples/agent_lab.rs) and the public
+[Agent Lab guide](https://codewandler.github.io/flux/docs/sdk/agent-lab).
+
 Additional hermetic examples cover domain flows and both datasource shapes, with no API key:
 
 ```sh
@@ -113,6 +119,13 @@ let client = Client::builder()
     ))
     .build(provider, ".")?;
 ```
+
+Because a flux run is durable plan source plus redacted cassette cells, the SDK also gives embedders
+an Agent Lab instead of a mock-only test story: record a live turn once, replay it offline in
+`cargo test`, run controlled what-if changes against the frozen world, and finish an interrupted
+turn without re-calling the model or re-firing recorded side effects. The Lab is documented in the
+[Agent Lab guide](https://codewandler.github.io/flux/docs/sdk/agent-lab) and exercised by
+`examples/agent_lab.rs`.
 
 ## Datasources: indexed knowledge and live systems
 
