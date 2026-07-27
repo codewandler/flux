@@ -33,15 +33,43 @@ pub(super) fn run_sessions(prune: bool) -> Result<()> {
         eprintln!("no sessions yet — start one with `flux` or `flux run`");
         return Ok(());
     }
+    let mut interrupted = 0usize;
     for s in &sessions {
         let active_ts = if s.updated_at_ms > s.created_at_ms {
             format!("active {}", fmt_age(s.updated_at_ms))
         } else {
             fmt_age(s.created_at_ms)
         };
+        // D-179: flag a session a crash killed mid-turn. Listing REPORTS; it never resurrects —
+        // finishing a turn (which runs the live tail through the approval envelope) must not be a
+        // side effect of asking what sessions exist. The next turn on that session does it.
+        let crashed = matches!(
+            flux_flow::resurrect::interrupted(&store, &s.id),
+            Ok(Some(_))
+        );
+        if crashed {
+            interrupted += 1;
+        }
         println!(
-            "{}  {:>3} msg  {:<22} {}",
-            s.id, s.messages, s.model, active_ts
+            "{}  {:>3} msg  {:<22} {}{}",
+            s.id,
+            s.messages,
+            s.model,
+            active_ts,
+            if crashed {
+                style::red("  ⚠ interrupted")
+            } else {
+                String::new()
+            }
+        );
+    }
+    if interrupted > 0 {
+        eprintln!(
+            "{}",
+            style::dim(&format!(
+                "{interrupted} interrupted session(s) — the next turn on one finishes its killed \
+                 turn from the crash point (no model call). `FLUX_AUTO_RESURRECT=0` disables that."
+            ))
         );
     }
     Ok(())

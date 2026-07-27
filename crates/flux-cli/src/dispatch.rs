@@ -329,6 +329,12 @@ pub(super) fn run() -> Result<()> {
     // posture and let spawn-capable commands such as `plugin status` execute native code
     // unconfined. Clap handles `--help`/`--version` before this point, so those remain available even
     // when the project config needs repair.
+    // D-179: `--store <DIR>` redirects the session store for this invocation. Exported here,
+    // pre-runtime, for the same single-thread reason as the agent env signals below (`set_var` must
+    // not race worker-thread `getenv`s).
+    if let Some(dir) = cli.store.as_ref() {
+        std::env::set_var("FLUX_STORE_DIR", dir);
+    }
     let cwd = std::env::current_dir().context("resolve current directory")?;
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
     apply_workspace_access_env(&cli, &cfg);
@@ -444,6 +450,13 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 sub_agents,
                 json,
             }) => run_replay(&session, turn.map(|t| t as usize), sub_agents, json).await,
+            Some(Commands::Record {
+                name,
+                prompt,
+                dir,
+                agent,
+            }) => run_record(&name, prompt, dir, &agent).await,
+            Some(Commands::Test { name, dir, json }) => run_test(name, dir, json).await,
             Some(Commands::Diff { a, b, json }) => run_diff_cmd(&a, &b, json),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,

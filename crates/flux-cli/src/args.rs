@@ -23,6 +23,13 @@ pub(super) struct Cli {
     #[arg(long, value_enum, default_value_t, global = true)]
     pub(super) color: style::ColorChoice,
 
+    /// Read and write sessions in DIR (`<DIR>/events.db` + `<DIR>/flow.db`) instead of the default
+    /// `~/.flux`. This is the same layout `Storage::dir` writes and `flux record` produces, so
+    /// `flux replay|fork|diff|sessions --store tests/scenarios/<name>` inspects a committed fixture
+    /// with the ordinary session tools. Exported as `FLUX_STORE_DIR` so subprocess paths inherit it.
+    #[arg(long = "store", value_name = "DIR", global = true)]
+    pub(super) store: Option<std::path::PathBuf>,
+
     /// Grant READ access to an additional directory outside the workspace (repeatable). Reads, `glob`,
     /// and `grep` may reach under it; writes stay confined to the current directory. Layers over
     /// `[workspace] add_dirs` in .flux/config.toml (exported as `FLUX_ADD_DIRS` so `app run` inherits it).
@@ -398,6 +405,36 @@ pub(super) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Record one live turn as a committed-safe scenario fixture (D-174): the run's events, flow
+    /// state, redacted model cassette, and canonical plan snapshot land in
+    /// `tests/scenarios/<name>/`. Replay it offline — for $0, with no key and no network — with
+    /// `flux test`.
+    Record {
+        /// Fixture name; becomes the directory `<--dir>/<name>/`.
+        name: String,
+        /// The prompt to record, as words.
+        #[arg(required = true)]
+        prompt: Vec<String>,
+        /// Where fixtures live (default `tests/scenarios`).
+        #[arg(long, value_name = "DIR", default_value = "tests/scenarios")]
+        dir: std::path::PathBuf,
+        #[command(flatten)]
+        agent: AgentFlags,
+    },
+    /// Replay recorded scenario fixtures offline as a test gate (D-174): the REAL agent re-runs
+    /// against the recorded world under a deny-all approver and a never-called provider — $0, no
+    /// key, no network. Exit code 1 if any fixture diverges from its recording, so it can be a CI
+    /// gate; a regression prints the plan source and the world diff.
+    Test {
+        /// One fixture name. Omit to run every fixture under `--dir`.
+        name: Option<String>,
+        /// Where fixtures live (default `tests/scenarios`).
+        #[arg(long, value_name = "DIR", default_value = "tests/scenarios")]
+        dir: std::path::PathBuf,
+        /// Emit a machine-readable JSON report instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Diff two recorded runs (C-44): align their executed statements and show exactly where the
     /// FLOW changed (differing statement content) vs where the same flow hit a DIFFERENT WORLD
     /// (differing recorded op output). Exit code 1 when the runs diverge, `diff`-style.
@@ -478,6 +515,7 @@ impl Commands {
             Self::Run { agent, .. }
             | Self::Tui { agent }
             | Self::Fork { agent, .. }
+            | Self::Record { agent, .. }
             | Self::App {
                 action: AppAction::Run { agent, .. },
             } => Some(agent),

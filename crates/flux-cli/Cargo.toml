@@ -42,7 +42,7 @@ flux-web.workspace = true
 flux-datasource.workspace = true
 flux-plugin.workspace = true
 flux-skill.workspace = true
-flux-sdk.workspace = true
+flux-sdk = { workspace = true, features = ["test-kit"] }
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

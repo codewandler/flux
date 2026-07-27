@@ -341,21 +341,34 @@ where
 
 /// Open the unified event store under `~/.flux/events.db` (conversation + run trace + turn telemetry).
 pub(super) fn open_event_store() -> Result<EventStore> {
+    let dir = flux_store_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    EventStore::open(dir.join("events.db")).context("open event store")
+}
+
+/// Where this invocation's sessions live: `--store <DIR>` (exported as `FLUX_STORE_DIR` in
+/// `dispatch::run`, so subprocess paths inherit it) if given, else the default `~/.flux`.
+///
+/// D-179: a scenario fixture written by `flux record` is an ordinary `Storage::dir` store, so
+/// pointing `--store` at one makes every existing session tool (`replay`, `fork`, `diff`,
+/// `sessions`, `usage`) work against a committed fixture with no fixture-specific code path.
+pub(super) fn flux_store_dir() -> Result<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("FLUX_STORE_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() {
+            return Ok(dir);
+        }
+    }
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let dir = home.join(".flux");
-    std::fs::create_dir_all(&dir)?;
-    EventStore::open(dir.join("events.db")).context("open event store")
+    Ok(home.join(".flux"))
 }
 
 /// Open flux-flow's own store under `~/.flux/flow.db` (values, symbols, suspensions). Run-trace
 /// events are forwarded to the shared `events` log.
 pub(super) fn open_flow_store(events: Arc<EventStore>) -> Result<FlowStore> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let dir = home.join(".flux");
+    let dir = flux_store_dir()?;
     std::fs::create_dir_all(&dir)?;
     FlowStore::open(dir.join("flow.db"), events).context("open flow store")
 }
@@ -1286,6 +1299,69 @@ pub(super) async fn build_agent_with(
     Ok((agent, session_id, canonical_spec, spawner))
 }
 
+/// D-178/D-179 resurrect-on-open: if this session was killed mid-turn (a crash, OOM, or `kill -9`
+/// left a `TurnStarted` with no `TurnEnded`), finish that turn from its crash point BEFORE the new
+/// input runs — the plan is durable source, so no model call is made and no op with a recorded
+/// cassette cell re-fires. Always reported on stderr; never silent.
+///
+/// Never fatal. A session with nothing to resurrect is the overwhelmingly common case and stays
+/// quiet, and a session that CAN'T be resurrected (a crash during planning, before any plan was
+/// accepted — there is no durable plan to finish) must not stop the user from working: it is
+/// reported and the new turn proceeds. `FLUX_AUTO_RESURRECT=0` turns the whole step off.
+pub(super) async fn resurrect_on_open(
+    agent: &FlowEngine,
+    session_id: &str,
+    sink: &mut dyn AgentSink,
+) {
+    if std::env::var("FLUX_AUTO_RESURRECT").as_deref() == Ok("0") {
+        return;
+    }
+    match flux_flow::resurrect::interrupted(&agent.events, session_id) {
+        Ok(None) => return,
+        Ok(Some(it)) => eprintln!(
+            "{}",
+            style::dim(&format!(
+                "resurrect · session {session_id} · turn {} was interrupted after {} statement(s) \
+                 — finishing it offline (no model call)",
+                it.turn_id, it.completed
+            ))
+        ),
+        Err(e) => {
+            eprintln!("{} {e}", style::red("resurrect:"));
+            return;
+        }
+    }
+    match flux_flow::resurrect::resurrect(
+        &agent.events,
+        &agent.flow,
+        &agent.executor,
+        session_id,
+        &agent.composites.active_for_session(session_id),
+        sink,
+    )
+    .await
+    {
+        Ok(Some(report)) => {
+            eprintln!(
+                "{}",
+                style::dim(&format!(
+                    "resurrect · {} · {} statement(s) fast-forwarded, {} op(s) served from the \
+                     cassette, {} run live",
+                    report.outcome,
+                    report.statements_fast_forwarded,
+                    report.ops_served_from_cassette,
+                    report.ops_run_live
+                ))
+            );
+            if let Some(diverged) = &report.diverged {
+                eprintln!("{} {diverged}", style::red("resurrect diverged:"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("{} {e}", style::red("resurrect:")),
+    }
+}
+
 /// One-shot agentic turn.
 pub(super) async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()> {
     let (agent, session_id, model_spec, _spawner) = build_agent(flags).await?;
@@ -1296,6 +1372,7 @@ pub(super) async fn run_agentic(flags: &AgentFlags, prompt: String) -> Result<()
     let initial_rules = agent.executor.allow_rules();
     let pricing = flux_credentials::load_pricing_table();
     let mut sink = CliSink::new(agent.max_iterations).with_cost(model_spec, pricing);
+    resurrect_on_open(&agent, &session_id, &mut sink).await;
     let outcome = agent.run_turn(&session_id, &prompt, &mut sink).await;
     // Persist "always allow" choices made DURING the turn even when the turn itself later fails —
     // the user answered the prompt either way, and losing the choice means re-prompting next run.
