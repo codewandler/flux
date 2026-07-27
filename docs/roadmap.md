@@ -191,7 +191,7 @@ JS-initiated) run through the scoped guard via CDP interception — required for
 D-98 (first drafted as plugins; revised native the same day, user call). Design:
 [designs/web-capabilities.md](designs/web-capabilities.md).
 
-### flux-render — `flow_render`: flux source/plan → SVG (epic) — ✅ **SHIPPED 2026-07-09 (v0.13.2; L-74…L-77; L-78 PNG backlog)**
+### flux-render — `flow_render`: flux source/plan → SVG (+ PNG) (epic) — ✅ **SHIPPED 2026-07-09 (v0.13.2; L-74…L-77) + L-78 PNG**
 
 A model-facing built-in tool `flow_render` (beside `flow_list`/`flow_run`) that turns Flux-Lang into
 a syntax-highlighted image — the highlighted **source** or the **execution-path tree** — rendered
@@ -203,10 +203,11 @@ own doc images, retiring the brittle Node script in `flux-tree-sitter`. Layered 
 base flux-lsp L-69 semantic tokens will adapt), a span form of the plan renderer
 ([L-75](stories/L-75-render-styled-spans.md)), the SVG tool itself
 ([L-76](stories/L-76-flow-render-tool-svg.md)), a `flux render` CLI subcommand that replaces the
-Node doc-image script ([L-77](stories/L-77-flux-render-cli-subcommand.md)), and deferred opt-in PNG
-rasterization ([L-78](stories/L-78-flux-render-png.md), backlog — the only story that adds deps).
-Phase 1 is SVG-only by constraint and by design: `ToolResult` is text-only, so the model-facing tool
-stays read-only string generation. Design: [designs/flux-render.md](designs/flux-render.md).
+Node doc-image script ([L-77](stories/L-77-flux-render-cli-subcommand.md)), and opt-in PNG
+rasterization ([L-78](stories/L-78-flux-render-png.md) — feature-gated resvg/usvg stack with an
+embedded JetBrains Mono; `flux render -o out.png`; the only story that adds deps). The model-facing
+tool stays SVG-only by constraint and by design: `ToolResult` is text-only, so PNG is a CLI surface.
+Design: [designs/flux-render.md](designs/flux-render.md).
 
 ### Datasource & endpoint discoverability (epic) — ✅ **SHIPPED 2026-07-09…10 (v0.13.0–v0.14.6; D-114…D-117)**
 

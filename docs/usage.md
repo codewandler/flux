@@ -183,9 +183,10 @@ flux flow run <name|file>        # run a saved flow by filename stem/declared na
                                  #                        (values rehydrated), and execute from the first changed
                                  #                        statement; `last` needs the flow to declare a name
                                  #                        (`flow <name> -> …`) to find its session unambiguously
-flux render <file.flux>          # render a .flux file as a syntax-highlighted SVG (One Dark):
-                                 #   --view source (default) | tree; -o out.svg writes (workspace-
-                                 #   confined), stdout otherwise; the doc-image generator
+flux render <file.flux>          # render a .flux file as a syntax-highlighted image (One Dark):
+                                 #   --view source (default) | tree; -o out.svg writes SVG, -o
+                                 #   out.png rasterizes PNG (embedded font); both workspace-
+                                 #   confined, stdout (SVG) otherwise; the doc-image generator
 flux sessions                    # list recent sessions
 flux usage                       # aligned token/cost dashboard for flux + detected Codex,
                                  #   Claude Code, and opencode stores. Shows period/session/time

@@ -21,6 +21,10 @@
   plain terms" — what flux does to protect you, your files, and your passwords, written for people
   who use flux rather than build it. The deeper, developer-facing pages are unchanged and now link
   to it from the Security overview.
+- **`flux render` can save the highlighted image as a PNG.** `flux render my.flux -o out.png`
+  produces a PNG with the same syntax colours as the SVG, and text renders identically on every
+  machine — the font is built in, so there is nothing to install. Any other output extension
+  keeps producing SVG.
 
 ### Fixed
 

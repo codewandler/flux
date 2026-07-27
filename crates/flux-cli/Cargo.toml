@@ -71,8 +71,12 @@ rustls = { version = "0.23", optional = true }
 # The Slack channel adapter is compiled in by default so `channel slack` programs run on the stock
 # binary. It pulls the slack-morphism socket-mode dep (and, via `dep:rustls`, a process-level crypto
 # provider — see the `rustls` dep note above). Drop it with `cargo build -p flux-cli --no-default-features`.
-default = ["slack"]
+default = ["slack", "png"]
 slack = ["flux-channels/slack", "dep:rustls"]
+# PNG output for `flux render -o out.png` (L-78) — the resvg/usvg rasterizer stack behind
+# flux-tools' `png` feature. Default-on so the stock binary (and `task install`, which is
+# `cargo install --path crates/flux-cli`) renders PNGs; drop with --no-default-features.
+png = ["flux-tools/png"]
 # Wire the semantic/embeddings datasource backend (the agent's `search` blends keyword + embeddings).
 # Off by default; needs an embeddings API key at runtime (see flux-capabilities `OpenAiEmbedder`).
 embeddings = ["flux-capabilities/embeddings"]

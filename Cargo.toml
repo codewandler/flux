@@ -49,7 +49,8 @@ version = "0.26.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codewandler/flux"
 homepage = "https://github.com/codewandler/flux"
-rust-version = "1.85"
+# 1.87: required by the resvg/usvg 0.47 rasterizer stack (flux-tools `png` feature, L-78).
+rust-version = "1.87"
 
 [workspace.dependencies]
 # internal
