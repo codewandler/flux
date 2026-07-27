@@ -26,11 +26,22 @@
 //! ```
 #![warn(missing_docs)]
 
+mod assembly;
 mod envelope;
 pub mod events;
 pub mod flow;
 pub mod session;
 pub mod storage;
+/// The Deterministic Agent Test Kit (feature `test-kit`, default off): record a run once, commit
+/// it as a redacted golden fixture, and re-run the REAL agent offline in `cargo test` for $0 —
+/// asserting on the canonical Flux-Lang plan (not a transcript). See [`test::Scenario`].
+#[cfg(feature = "test-kit")]
+pub mod test;
+/// Counterfactual session comparison (D-174 slice; grows in D-176's Tune). Wraps
+/// [`Session::fork`]/[`Fork::inject`]/[`Fork::diff`] into a small assertion surface —
+/// [`whatif::Counterfactual`]. Not feature-gated: it only ever touches shipped, always-available
+/// primitives.
+pub mod whatif;
 
 pub use events::{AgentEvent, FlowStream, TurnStream};
 pub use flow::{assemble_registry, ExecutionResult, FlowClient, FlowClientBuilder};
@@ -341,6 +352,14 @@ pub struct TurnOutput {
     /// `await`. Resume by sending the awaited input with [`Session::send`]. Always `false` for an
     /// ordinary conversational turn and for a flow that ran to completion.
     pub suspended: bool,
+    /// D-178: set when this turn first had to **resurrect** an interrupted predecessor — a turn on
+    /// this session that a crash, OOM, or redeploy killed mid-execution, which
+    /// [`ClientBuilder::auto_resurrect`] finished (from the crash point, with no model re-spend)
+    /// before the new input ran. `None` on the overwhelmingly common clean path.
+    ///
+    /// Boxed because the report is large and almost always absent — the common `TurnOutput` stays
+    /// one pointer wider, not several hundred bytes.
+    pub resurrected: Option<Box<flux_flow::resurrect::ResurrectReport>>,
 }
 
 /// A deferred registry installer (the `register_*` pack convention), applied at `build`.
@@ -359,6 +378,8 @@ pub struct ClientBuilder {
     live_surfaces: Vec<flux_capabilities::LiveDatasourceSurface>,
     sub_agents: Option<SubAgents>,
     sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
+    // D-178: `None` ⇒ derive from the storage's durability at `build` (on for durable stores).
+    auto_resurrect: Option<bool>,
 }
 
 impl Default for ClientBuilder {
@@ -375,6 +396,7 @@ impl Default for ClientBuilder {
             live_surfaces: Vec::new(),
             // Unset ⇒ no `task` tool, no spawner (children off by default).
             sub_agents: None,
+            auto_resurrect: None,
             sub_agent_adaptive_policy: None,
         }
     }
@@ -399,6 +421,7 @@ impl ClientBuilder {
             live_surfaces: Vec::new(),
             sub_agents: None,
             sub_agent_adaptive_policy: None,
+            auto_resurrect: None,
         }
     }
     /// Set the model id every turn uses.
@@ -637,6 +660,19 @@ impl ClientBuilder {
         self.storage = Some(storage);
         self
     }
+    /// D-178: whether a turn entry first **resurrects** an interrupted turn on the same session —
+    /// one a crash, OOM, or redeploy killed mid-execution — finishing it from the crash point with
+    /// **no model re-spend** before the new input runs. Defaults to on for durable storage
+    /// ([`Storage::dir`] and [`Storage::custom`], where a killed turn can outlive the process) and
+    /// off for [`Storage::in_memory`], where nothing survives a crash to resurrect.
+    ///
+    /// Never silent: the recovery is streamed to the turn's own sink and reported on
+    /// [`TurnOutput::resurrected`]. Turn it off to take manual control via
+    /// [`Session::interrupted`]/[`Session::resurrect`] — the same driver, explicitly invoked.
+    pub fn auto_resurrect(mut self, on: bool) -> Self {
+        self.auto_resurrect = Some(on);
+        self
+    }
     /// Inject a knowledge block into the agent's system prompt as a `<knowledge-base>` section (A-19):
     /// grounds the agent on a small KB inline, with no retrieval round-trip. Chainable.
     pub fn add_context(
@@ -736,7 +772,10 @@ impl ClientBuilder {
             .collect();
         let approver = self.envelope.resolve_approver();
 
-        let (events, flow) = self.storage.unwrap_or_default().resolve()?;
+        let storage = self.storage.unwrap_or_default();
+        // D-178: default auto-resurrect on exactly where a crashed turn can survive the process.
+        let auto_resurrect = self.auto_resurrect.unwrap_or_else(|| storage.is_durable());
+        let (events, flow) = storage.resolve()?;
 
         // The agent's definition; `assemble` selects the tool subset, applies the permissions,
         // registers the authored-loop stages, and ties the engine⇄loop-host cycle. Builder rules are
@@ -803,15 +842,27 @@ impl ClientBuilder {
             environment = environment.with_spawner(spawner);
         }
         let model = spec.model.clone();
+        // D-174: retain the assembly pieces BEFORE `assemble_in` consumes `spec`/`environment`, so a
+        // later `EngineAssembly::variant` can re-assemble a throwaway engine (the Test Kit's
+        // `check()`/`inject_at`) without re-running the whole builder. `AgentSpec`/`ExecutionEnvironment`
+        // are both cheap clones (mostly `Arc` bumps).
+        let assembly = Arc::new(assembly::EngineAssembly {
+            spec: spec.clone(),
+            environment: environment.clone(),
+            provider: provider.clone(),
+            events: events.clone(),
+        });
         let engine = spec.assemble_in(provider, environment, events, flow)?;
         Ok(Client {
             engine: Arc::new(engine),
             model,
+            assembly,
             // The default session is created lazily (on first use), so building a client — e.g. a
             // service restarting against a persistent `Storage::dir` — never leaves an empty
             // session behind, and `latest_session()` still points at the real prior conversation.
             default_session: std::sync::Mutex::new(None),
             turn_guard: Arc::new(tokio::sync::Mutex::new(())),
+            auto_resurrect,
         })
     }
 }
@@ -824,6 +875,9 @@ impl ClientBuilder {
 pub struct Client {
     engine: Arc<FlowEngine>,
     model: String,
+    // D-174: retained so a variant (throwaway) engine can be re-assembled later — see
+    // `assembly::EngineAssembly`. Not part of the public API.
+    assembly: Arc<assembly::EngineAssembly>,
     // The default session's id, created lazily on first use (see `default_id`). Kept behind a
     // std mutex so two concurrent first-uses can't each mint (and leak) a session.
     default_session: std::sync::Mutex<Option<String>>,
@@ -831,6 +885,8 @@ pub struct Client {
     // operation guard so turns remain ordered with replay/fork/divergence paths that intentionally
     // execute against the same stores or executor outside FlowEngine's public turn lifecycle.
     turn_guard: Arc<tokio::sync::Mutex<()>>,
+    // D-178: handed to every `Session` this client mints — see `ClientBuilder::auto_resurrect`.
+    auto_resurrect: bool,
 }
 
 impl Client {
@@ -913,7 +969,9 @@ impl Client {
         Session {
             engine: self.engine.clone(),
             id,
+            assembly: self.assembly.clone(),
             turn_guard: self.turn_guard.clone(),
+            auto_resurrect: self.auto_resurrect,
         }
     }
 }

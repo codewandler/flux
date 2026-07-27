@@ -1,0 +1,3 @@
+flow
+  $adaptive_batch_ae51354e0a259cd3c68b_action_1 = append({"content":"""created by flux mock
+""","path":"flux-mock.txt"})

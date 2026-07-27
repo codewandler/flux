@@ -16,6 +16,7 @@ use flux_flow::ast::RunEvent;
 use flux_flow::engine::FlowEngine;
 use flux_flow::fork::ForkPrefix;
 use flux_flow::replay::ReplayReport;
+use flux_flow::resurrect::{InterruptedTurn, ResurrectReport};
 use flux_flow::voice::{EngineVoiceHandler, VoiceSessionDriver, VoiceSink};
 use flux_flow::AgentSink;
 use flux_provider::{RealtimeConfig, RealtimeProvider};
@@ -23,6 +24,7 @@ use flux_runtime::ToolResult;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::assembly::EngineAssembly;
 use crate::events::{ChannelSink, TeeSink, TurnStream};
 use crate::TurnOutput;
 
@@ -39,7 +41,15 @@ use crate::TurnOutput;
 pub struct Session {
     pub(crate) engine: Arc<FlowEngine>,
     pub(crate) id: String,
+    // D-174: retained so the Test Kit's `Scenario` machinery can build a variant engine off this
+    // session's client without a `Client` handle. Not part of the public API.
+    pub(crate) assembly: Arc<EngineAssembly>,
     pub(crate) turn_guard: Arc<Mutex<()>>,
+    /// D-178: whether a turn entry first finishes an interrupted turn on this session. Set from
+    /// [`ClientBuilder::auto_resurrect`](crate::ClientBuilder::auto_resurrect) (default on for a
+    /// persistent [`Storage::dir`](crate::Storage::dir), where a crashed turn can actually outlive
+    /// the process).
+    pub(crate) auto_resurrect: bool,
 }
 
 impl Session {
@@ -55,9 +65,12 @@ impl Session {
     /// `await` and the flow resumes — same engine behavior the CLI has.
     pub async fn send(&self, input: &str) -> Result<TurnOutput> {
         let _turn = self.turn_guard.lock().await;
+        // The resurrected turn's own text and tool calls belong to its report, not to this turn's
+        // output — so it collects into its own throwaway sink.
+        let resurrected = self.auto_resurrect_step(&mut Collector::default()).await?;
         let mut sink = Collector::default();
         self.engine.run_turn(&self.id, input, &mut sink).await?;
-        self.finalize(sink.0)
+        self.finalize_resumed(sink.0, resurrected)
     }
 
     /// Drive an authored flow as this session's conversation (D-131). Runs the flow to its first
@@ -96,6 +109,18 @@ impl Session {
         Ok(out)
     }
 
+    /// [`finalize`](Self::finalize) plus D-178's `auto_resurrect` report, so a turn that first had
+    /// to finish an interrupted predecessor says so on its way out.
+    fn finalize_resumed(
+        &self,
+        out: TurnOutput,
+        resurrected: Option<ResurrectReport>,
+    ) -> Result<TurnOutput> {
+        let mut out = self.finalize(out)?;
+        out.resurrected = resurrected.map(Box::new);
+        Ok(out)
+    }
+
     /// Run one turn, streaming every event to your own [`AgentSink`] as it happens — text and
     /// thinking deltas, plan progress, tool calls **and tool results** — while still returning the
     /// collected [`TurnOutput`]. Cancel via the token: the engine drops the in-flight op and
@@ -112,10 +137,19 @@ impl Session {
             consumer: sink,
             collect: Collector::default(),
         };
+        // Streamed live to the caller's own sink (a resurrection is never silent), but collected
+        // separately so it doesn't bleed into this turn's `TurnOutput`.
+        let resurrected = {
+            let mut pre = TeeSink {
+                consumer: tee.consumer,
+                collect: Collector::default(),
+            };
+            self.auto_resurrect_step(&mut pre).await?
+        };
         self.engine
             .run_turn_cancellable(&self.id, input, &mut tee, cancel)
             .await?;
-        self.finalize(tee.collect.0)
+        self.finalize_resumed(tee.collect.0, resurrected)
     }
 
     /// Run one turn as a [`TurnStream`] — a stream of owned
@@ -250,6 +284,81 @@ impl Session {
         .map_err(|e| flux_core::Error::Other(e.to_string()))
     }
 
+    /// The turn this session was killed in the middle of, if any (D-178) — a `TurnStarted` with no
+    /// `TurnEnded`, together with the durable plan [`resurrect`](Self::resurrect) would finish and
+    /// how many of its top-level statements already completed. A cheap, read-only projection over
+    /// the event log: no store is opened, nothing is dispatched.
+    ///
+    /// `Ok(None)` means every turn on this session closed cleanly. A crash during *planning* — the
+    /// turn opened but no plan was ever accepted, so there is no durable source to resume from — is a
+    /// loud `Err`, never a silent `None`.
+    pub fn interrupted(&self) -> Result<Option<InterruptedTurn>> {
+        flux_flow::resurrect::interrupted(&self.engine.events, &self.id)
+            .map_err(|e| flux_core::Error::Other(e.to_string()))
+    }
+
+    /// **Resurrect** the turn this session was killed in the middle of (D-178): finish it in place,
+    /// from the crash point, on this same session — `Ok(None)` if there is nothing to resurrect.
+    ///
+    /// The plan is durable source, so **the model is never called** — zero re-spend. Every top-level
+    /// statement that already completed is fast-forwarded without re-dispatching, and every op that
+    /// got as far as recording a cassette cell is served from that cell exactly once. The rest of the
+    /// plan runs live, through the same authorization → approval → guarded-IO envelope as any other
+    /// turn: the tail still gates through the **real** approver.
+    ///
+    /// # Honest exactly-once
+    /// Exactly-once holds for every op with a recorded cell. An op interrupted *during* dispatch —
+    /// its side effect fired, the process died before the cell was appended — has no cell and
+    /// re-fires live on resume. That is at-least-once for that one op, and it is the same contract
+    /// Temporal gives an activity; the alternative (skipping it) would silently drop work. A served
+    /// cell whose re-derived `input_hash` doesn't match latches a divergence and surfaces it in
+    /// [`ResurrectReport::diverged`] rather than serving a stale answer.
+    pub async fn resurrect(&self, sink: &mut dyn AgentSink) -> Result<Option<ResurrectReport>> {
+        let _turn = self.turn_guard.lock().await;
+        self.resurrect_unguarded(sink).await
+    }
+
+    /// [`resurrect`](Self::resurrect) without taking the operation guard — for callers that already
+    /// hold it (the `auto_resurrect` pre-step inside `send`/`send_with`, which must not deadlock
+    /// against its own turn lock).
+    async fn resurrect_unguarded(
+        &self,
+        sink: &mut dyn AgentSink,
+    ) -> Result<Option<ResurrectReport>> {
+        flux_flow::resurrect::resurrect(
+            &self.engine.events,
+            &self.engine.flow,
+            &self.engine.executor,
+            &self.id,
+            &self.engine.composites.active_for_session(&self.id),
+            sink,
+        )
+        .await
+        .map_err(|e| flux_core::Error::Other(e.to_string()))
+    }
+
+    /// The `auto_resurrect` pre-step every turn entry runs: if the client enabled it AND this
+    /// session has an open turn, finish that turn first and hand the report back so the turn's
+    /// [`TurnOutput::resurrected`] can surface it. Callers already hold the operation guard.
+    ///
+    /// Deliberately quiet about a session that has nothing to resurrect (the overwhelmingly common
+    /// case) — but never quiet about one that does: the report always rides out on the `TurnOutput`.
+    /// An `interrupted()` error (a crash during planning, with no durable plan) is NOT fatal here —
+    /// there is nothing to finish, and refusing to accept new input because of an old unfinishable
+    /// turn would be worse than the crash. Explicit [`resurrect`](Self::resurrect) still reports it.
+    async fn auto_resurrect_step(
+        &self,
+        sink: &mut dyn AgentSink,
+    ) -> Result<Option<ResurrectReport>> {
+        if !self.auto_resurrect {
+            return Ok(None);
+        }
+        match self.interrupted() {
+            Ok(Some(_)) => self.resurrect_unguarded(sink).await,
+            Ok(None) | Err(_) => Ok(None),
+        }
+    }
+
     /// **Fork** this session at statement `at` of its recorded final plan (the time machine's
     /// counterfactual door): mint a fresh session correlated to this one, copy its conversation, and
     /// hermetically replay the prefix (statements `0..at`) into it — leaving **this** session
@@ -289,6 +398,7 @@ impl Session {
             engine: self.engine.clone(),
             id: fork_id,
             prefix,
+            assembly: self.assembly.clone(),
             turn_guard: self.turn_guard.clone(),
         })
     }
@@ -303,6 +413,7 @@ pub struct Fork {
     engine: Arc<FlowEngine>,
     id: String,
     prefix: ForkPrefix,
+    assembly: Arc<EngineAssembly>,
     turn_guard: Arc<Mutex<()>>,
 }
 
@@ -317,7 +428,10 @@ impl Fork {
         Session {
             engine: self.engine.clone(),
             id: self.id.clone(),
+            assembly: self.assembly.clone(),
             turn_guard: self.turn_guard.clone(),
+            // A fork is a throwaway counterfactual branch, never a crashed production session.
+            auto_resurrect: false,
         }
     }
 

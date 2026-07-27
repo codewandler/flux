@@ -73,6 +73,10 @@ flux-providers = { workspace = true, optional = true }
 # Optional (feature `plugins`): subprocess plugin tools behind `flux_sdk::plugins`, so an installed
 # plugin's operations become policy-gated tools inside an embedded agent. Off by default.
 flux-plugin = { workspace = true, optional = true }
+# Optional (feature `test-kit`): the Deterministic Agent Test Kit's fixture manifest
+# (`scenario.toml`) behind `flux_sdk::test`. Off by default — the default build stays
+# dependency-free.
+toml = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -85,6 +89,10 @@ providers = ["dep:flux-providers"]
 # `flux_sdk::plugins` + `FlowClient::register_plugin`/`ClientBuilder::with_plugin_tools` — load an
 # installed subprocess plugin's operations as policy-gated tools.
 plugins = ["dep:flux-plugin"]
+# `flux_sdk::test` (D-174) — record a run once as a redacted golden fixture, then replay the REAL
+# agent offline in `cargo test` for $0, asserting on the canonical Flux-Lang plan. Off by default —
+# the default build stays dependency-free.
+test-kit = ["dep:toml"]
 
 # A minimal fixture plugin (echo/`upper`) for the `plugins` integration test — a real subprocess so
 # `tests/plugins.rs` can exercise `register_plugin` end-to-end. `required-features` keeps it out of
@@ -94,3 +102,9 @@ plugins = ["dep:flux-plugin"]
 name = "flux_sdk_plugin_fixture"
 path = "fixtures/plugin_fixture.rs"
 required-features = ["plugins"]
+
+# D-180: the Agent Lab walkthrough (record → test → tune → resurrect). Needs the `test-kit` feature
+# for `Scenario`, so `required-features` keeps it out of a default `cargo build --examples`.
+[[example]]
+name = "agent_lab"
+required-features = ["test-kit"]

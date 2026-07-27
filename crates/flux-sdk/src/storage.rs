@@ -49,6 +49,16 @@ impl Storage {
         Storage(StorageInner::Custom { events, flow })
     }
 
+    /// Whether sessions written here can outlive the process — the D-178 default for
+    /// [`ClientBuilder::auto_resurrect`](crate::ClientBuilder::auto_resurrect). `true` for
+    /// [`dir`](Self::dir) and [`custom`](Self::custom) (a caller-supplied store is assumed durable —
+    /// the reason to bring your own is usually Postgres); `false` for
+    /// [`in_memory`](Self::in_memory), where a turn interrupted by a crash dies with the store it
+    /// was recorded in and there is nothing left to resurrect.
+    pub(crate) fn is_durable(&self) -> bool {
+        !matches!(self.0, StorageInner::InMemory)
+    }
+
     /// Open/instantiate the stores this configuration describes — used by the agentic `Client`,
     /// which needs both the event store (sessions, history, projections) and the flow store.
     pub(crate) fn resolve(self) -> Result<(Arc<EventStore>, FlowStore)> {

@@ -1,0 +1,9 @@
+schema = 1
+name = "coding-agent-note"
+flux_version = "0.26.0"
+recorded_at_ms = 1785193560598
+session = "s_1"
+input = "write a quick note"
+model = "mock"
+cassette_max_bytes = 1048576
+redaction_marker = "[redacted]"
