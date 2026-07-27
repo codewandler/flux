@@ -28,6 +28,7 @@ pub mod loop_host;
 mod model;
 pub mod registry;
 pub mod replay;
+pub mod resurrect;
 pub mod runtime;
 mod staged;
 pub use staged::{
@@ -36,6 +37,7 @@ pub use staged::{
 };
 pub mod state;
 pub mod voice;
+pub mod whatif;
 
 pub use agent_sink::AgentSink;
 pub use engine::{DEFAULT_AGENT_LOOP_ITERATIONS, MAX_AGENT_LOOP_ITERATIONS};

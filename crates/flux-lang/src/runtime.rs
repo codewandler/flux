@@ -805,6 +805,58 @@ impl ResumeLedger {
             prior_plan: plan,
         })
     }
+
+    /// Fold a session's run-event log for an **interrupted** execution of `plan` — mid-turn crash
+    /// recovery's (D-178) ledger, which has no open halt latch to key off: the process died
+    /// mid-dispatch, before any [`RunEvent::PlanHalted`] could be appended. Unlike [`fold`](Self::fold),
+    /// this does NOT require an open `PlanHalted` — it simply gathers `plan`'s
+    /// [`RunEvent::StatementCompleted`] rows in stream order, resetting the collected prefix whenever:
+    /// - the top-level node index fails to strictly increase (a same-plan restart: a later execution
+    ///   of the identical plan key always starts a fresh statement run — the same rule
+    ///   `execution_keys` uses to segment executions), or
+    /// - a [`RunEvent::PlanResumed`] with `prior == plan` appears (that halted execution's ledger was
+    ///   already consumed by a resume; anything gathered for it before this point is stale).
+    ///
+    /// `None` when nothing was gathered — the caller then knows the crashed turn's accepted plan never
+    /// completed even its first top-level statement (a legitimate, fully-live resume).
+    pub fn from_interrupted(events: &[RunEvent], plan: &str) -> Option<Self> {
+        let mut completed: Vec<LedgerEntry> = Vec::new();
+        let mut last_node: Option<u32> = None;
+        for ev in events {
+            match ev {
+                RunEvent::StatementCompleted {
+                    plan: p,
+                    node,
+                    stmt,
+                    value,
+                    ..
+                } if p == plan => {
+                    if last_node.is_some_and(|last| node.0 <= last) {
+                        completed.clear();
+                    }
+                    completed.push(LedgerEntry {
+                        node: *node,
+                        stmt: stmt.clone(),
+                        value: value.clone(),
+                    });
+                    last_node = Some(node.0);
+                }
+                RunEvent::PlanResumed { prior, .. } if prior == plan => {
+                    completed.clear();
+                    last_node = None;
+                }
+                _ => {}
+            }
+        }
+        if completed.is_empty() {
+            None
+        } else {
+            Some(ResumeLedger {
+                completed,
+                prior_plan: plan.to_string(),
+            })
+        }
+    }
 }
 
 impl FailureKind {
@@ -6959,6 +7011,106 @@ mod tests {
             "the latch must be consumed by the resume even though the new plan shares nothing with \
              the one that halted"
         );
+    }
+
+    /// D-178: a mid-dispatch crash never gets to append `PlanHalted` — `fold`'s open-latch
+    /// requirement makes it (correctly) return `None` for that log, which is exactly the case
+    /// `from_interrupted` exists to handle instead.
+    #[test]
+    fn from_interrupted_gathers_without_an_open_halt_latch_where_fold_returns_none() {
+        let events = vec![
+            RunEvent::StatementCompleted {
+                plan: "p".into(),
+                node: NodeId(0),
+                stmt: "h0".into(),
+                value: None,
+                skipped: false,
+            },
+            RunEvent::StatementCompleted {
+                plan: "p".into(),
+                node: NodeId(1),
+                stmt: "h1".into(),
+                value: None,
+                skipped: false,
+            },
+            // crash here — statement 2 was in flight; no `PlanHalted` was ever appended.
+        ];
+        assert!(
+            ResumeLedger::fold(&events).is_none(),
+            "regression pin: fold requires an open halt latch, and a crash leaves none"
+        );
+        let ledger =
+            ResumeLedger::from_interrupted(&events, "p").expect("gathered without a latch");
+        assert_eq!(ledger.completed.len(), 2);
+        assert_eq!(ledger.completed[0].stmt, "h0");
+        assert_eq!(ledger.completed[1].stmt, "h1");
+        assert_eq!(ledger.prior_plan, "p");
+    }
+
+    /// A restart of the same plan (node index resets to a non-increasing position) starts a fresh
+    /// execution — only the LAST execution's completed prefix is the crash-recovery driver's memory;
+    /// stale entries from an earlier abandoned execution of the identical plan key must not leak in.
+    #[test]
+    fn from_interrupted_keeps_only_the_last_execution_on_restart() {
+        let events = vec![
+            RunEvent::StatementCompleted {
+                plan: "p".into(),
+                node: NodeId(0),
+                stmt: "a0".into(),
+                value: None,
+                skipped: false,
+            },
+            RunEvent::StatementCompleted {
+                plan: "p".into(),
+                node: NodeId(1),
+                stmt: "a1".into(),
+                value: None,
+                skipped: false,
+            },
+            // the same plan key restarts at node 0 — a non-increasing index resets the collection.
+            RunEvent::StatementCompleted {
+                plan: "p".into(),
+                node: NodeId(0),
+                stmt: "b0".into(),
+                value: None,
+                skipped: false,
+            },
+        ];
+        let ledger = ResumeLedger::from_interrupted(&events, "p").expect("gathered a ledger");
+        assert_eq!(
+            ledger.completed.len(),
+            1,
+            "only the restarted execution's statement survives"
+        );
+        assert_eq!(ledger.completed[0].stmt, "b0");
+    }
+
+    /// When the halt latch IS open (the common case `fold` was built for), `from_interrupted` must
+    /// gather the identical completed prefix — it is a strict superset of what `fold` can find, not a
+    /// different algorithm.
+    #[tokio::test]
+    async fn from_interrupted_matches_fold_when_the_halt_latch_is_open() {
+        let host = CfHost::new();
+        let store = MemStore::new();
+        let halted_ast = DraftAst {
+            body: vec![
+                flow_bind("a", echo("hello")),
+                flow_bind("b", echo("world")),
+                call("boom", vec![]),
+            ],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow_resumable(&store, &host, "s", &halted_ast, &mut sink, None)
+            .await
+            .unwrap();
+
+        let events = store.events("s");
+        let fold_ledger = ResumeLedger::fold(&events).expect("an open halt latch exists");
+        let interrupted_ledger = ResumeLedger::from_interrupted(&events, &fold_ledger.prior_plan)
+            .expect("gathered the same completed prefix");
+        assert_eq!(interrupted_ledger.completed, fold_ledger.completed);
+        assert_eq!(interrupted_ledger.prior_plan, fold_ledger.prior_plan);
     }
 
     #[tokio::test]

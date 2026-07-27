@@ -349,6 +349,13 @@ impl FlowEngine {
         self
     }
 
+    /// Update the reasoning effort for every model call this agent makes, mid-session. Takes effect
+    /// from the next turn; effort is ephemeral session state (not persisted like the model name).
+    pub fn set_effort(&mut self, effort: Option<Effort>) {
+        self.effort = effort;
+        self.loop_host.set_reasoning(self.thinking, effort);
+    }
+
     /// Atomically switch the live model and the session's durable model attribution. Persistence
     /// happens first; if it fails, the in-memory engine remains unchanged.
     pub fn switch_model_for_session(
@@ -364,6 +371,7 @@ impl FlowEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn begin_turn_lifecycle(
         &self,
         session_id: &str,
@@ -372,6 +380,7 @@ impl FlowEngine {
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
         identity: &TurnIdentity,
+        scope_override: Option<Arc<crate::cassette::CassetteScope>>,
     ) -> Result<TurnLifecycle> {
         let skill_input = user_message.unwrap_or_default();
         // The cache boundary precedes every execution flavor, including a persisted continuation.
@@ -420,13 +429,21 @@ impl FlowEngine {
             .with_spawn_activity_sink(activity)
             .with_spawn_supervisor(spawn_supervisor.clone())
             .with_identity(identity.clone());
-        if crate::cassette::enabled() {
-            self.flow
-                .set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
-                    crate::cassette::RecordScope::new(self.events.clone(), session_id),
-                ))));
-        } else {
-            self.flow.set_cassette(None);
+        // D-175: `run_turn_pinned` supplies the WHOLE cassette scope for this turn — explicitly
+        // WINNING over `FLUX_CASSETTE=0`. The kill switch governs only whether an ordinary turn
+        // defaults to `Record` capture; it says nothing about a caller that deliberately pinned a
+        // `Frozen`/`Resume`/`Replay` scope (Tune/Resurrect/Test Kit dispatch through it, kill switch
+        // or not — there would be nothing to serve from otherwise). This install is the ONLY code
+        // this story swaps; every other line of the turn lifecycle is unchanged.
+        match scope_override {
+            Some(scope) => self.flow.set_cassette(Some(scope)),
+            None if crate::cassette::enabled() => {
+                self.flow
+                    .set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
+                        crate::cassette::RecordScope::new(self.events.clone(), session_id),
+                    ))));
+            }
+            None => self.flow.set_cassette(None),
         }
         Ok(TurnLifecycle {
             accounting: TurnAccounting {
@@ -556,8 +573,39 @@ impl FlowEngine {
     ) -> Result<()> {
         let _turn = self.turn_gate.lock().await;
         let identity = self.executor.identity().snapshot();
-        self.run_turn_locked(session_id, user_input, sink, cancel, identity)
+        self.run_turn_locked(session_id, user_input, sink, cancel, identity, None)
             .await
+    }
+
+    /// Run one user turn against a PINNED cassette scope instead of the default per-turn `Record`
+    /// capture — the one primitive Tune (D-176) and Resurrect (D-178) both build on. Mirrors
+    /// [`Self::run_turn`]'s body exactly (turn-gate lock, identity snapshot, a fresh
+    /// [`CancellationToken`]) and swaps ONLY the cassette install in `begin_turn_lifecycle` — there is
+    /// no parallel turn path (no-fallbacks rule): this still runs through the SAME `run_turn_locked` →
+    /// `run_turn_lifecycle` → `begin_turn_lifecycle` chain every other turn entry point uses.
+    ///
+    /// `scope` explicitly WINS over `FLUX_CASSETTE=0`: the kill switch governs only whether an
+    /// ordinary turn defaults to `Record` capture, never an explicitly pinned scope — a caller who
+    /// pins `Frozen`/`Resume`/`Replay` needs it installed regardless, or there is nothing to serve
+    /// dispatches from.
+    pub async fn run_turn_pinned(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        scope: Arc<crate::cassette::CassetteScope>,
+        sink: &mut dyn AgentSink,
+    ) -> Result<()> {
+        let _turn = self.turn_gate.lock().await;
+        let identity = self.executor.identity().snapshot();
+        self.run_turn_locked(
+            session_id,
+            user_input,
+            sink,
+            &CancellationToken::new(),
+            identity,
+            Some(scope),
+        )
+        .await
     }
 
     /// Run one user turn under an explicit immutable caller identity. The identity is installed
@@ -589,11 +637,13 @@ impl FlowEngine {
         identity: TurnIdentity,
     ) -> Result<()> {
         let _turn = self.turn_gate.lock().await;
-        self.run_turn_locked(session_id, user_input, sink, cancel, identity)
+        self.run_turn_locked(session_id, user_input, sink, cancel, identity, None)
             .await
     }
 
     /// Run one user turn after the engine-level single-active-turn gate has been acquired.
+    /// `scope_override` is `Some` only from [`Self::run_turn_pinned`]; every other caller passes
+    /// `None` and gets the default per-turn `Record`/kill-switch behavior unchanged.
     async fn run_turn_locked(
         &self,
         session_id: &str,
@@ -601,6 +651,7 @@ impl FlowEngine {
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
         identity: TurnIdentity,
+        scope_override: Option<Arc<crate::cassette::CassetteScope>>,
     ) -> Result<()> {
         let program = match self.flow.load_suspension(session_id)? {
             Some((flow_name, body, node, _source)) => TurnProgram::Resume {
@@ -617,10 +668,12 @@ impl FlowEngine {
             sink,
             cancel,
             identity,
+            scope_override,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn_lifecycle(
         &self,
         session_id: &str,
@@ -629,6 +682,7 @@ impl FlowEngine {
         sink: &mut dyn AgentSink,
         cancel: &CancellationToken,
         identity: TurnIdentity,
+        scope_override: Option<Arc<crate::cassette::CassetteScope>>,
     ) -> Result<()> {
         let lifecycle = self.begin_turn_lifecycle(
             session_id,
@@ -637,6 +691,7 @@ impl FlowEngine {
             sink,
             cancel,
             &identity,
+            scope_override,
         )?;
         let future = self.execute_turn_program(
             session_id,
@@ -1176,6 +1231,7 @@ impl FlowEngine {
             sink,
             cancel,
             identity,
+            None,
         )
         .await
     }
@@ -1765,7 +1821,9 @@ pub fn model_error(e: &flux_core::Error) -> String {
 /// flow's own last-emitted view (`outcome.result`) — its **authored prompt** — falling back to the
 /// generic hint only when the author emitted nothing before the `await`. Shared by the fresh
 /// [`FlowEngine::start_flow_turn`] and the resume path so both surface the same authored text.
-fn suspension_prompt(outcome: &FlowOutcome) -> String {
+/// `pub(crate)`: the Resurrect driver (`resurrect.rs`, D-178) reuses this so a crash-resumed
+/// suspension surfaces the identical authored prompt a live suspension would.
+pub(crate) fn suspension_prompt(outcome: &FlowOutcome) -> String {
     let prompt = outcome.result.trim();
     if prompt.is_empty() {
         "(awaiting your input — reply to continue the flow)".to_string()
@@ -3364,5 +3422,201 @@ mod tests {
         assert_eq!(conversation[0].text(), "wait forever");
         assert_eq!(conversation[1].text(), "(turn cancelled)");
         assert_eq!(sink.ended, 1);
+    }
+
+    // ---- D-175: run_turn_pinned ----
+
+    #[tokio::test]
+    async fn run_turn_pinned_produces_a_normal_turn_and_resets_the_cassette() {
+        let loop_spec = AgentLoopSpec::parse("flow custom -> string\n  return \"pinned answer\"")
+            .expect("custom loop parses");
+        let (engine, events, requests) = scripted_engine(Vec::new(), loop_spec);
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+        let scope = Arc::new(crate::cassette::CassetteScope::Record(
+            crate::cassette::RecordScope::new(events.clone(), session.clone()),
+        ));
+
+        engine
+            .run_turn_pinned(&session, "hello", scope, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(sink.text, "pinned answer");
+        assert_eq!(sink.ended, 1);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a custom loop with no stage calls needs no model round-trip"
+        );
+        let turns = events.turns(&session).unwrap();
+        assert_eq!(
+            turns.len(),
+            1,
+            "one TurnStarted/TurnEnded pair, like any other turn"
+        );
+        assert!(turns[0].ended_at_ms.is_some());
+        assert_eq!(turns[0].outcome, "ok");
+        assert!(
+            engine.flow.cassette().is_none(),
+            "the pinned scope is reset on finish, exactly like the default `Record` scope"
+        );
+    }
+
+    /// Serializes tests that mutate the process-global `FLUX_CASSETTE` env var (mirrors the
+    /// `SANDBOX_ENV_LOCK`/`HOME_LOCK` guards elsewhere in the repo).
+    static CASSETTE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CassetteEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl CassetteEnvGuard {
+        fn set(value: &str) -> Self {
+            let lock = CASSETTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = std::env::var_os("FLUX_CASSETTE");
+            std::env::set_var("FLUX_CASSETTE", value);
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for CassetteEnvGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("FLUX_CASSETTE", v),
+                None => std::env::remove_var("FLUX_CASSETTE"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_pinned_scope_wins_over_the_flux_cassette_kill_switch() {
+        // A counting `echo` — same spec/name as `EchoTool`, so the SAME scripted
+        // declare_intent → echo → prose shape `default_turn_routes_intent_then_uses_exact_native_tool_schema`
+        // uses also drives it through the built-in adaptive loop's action-batch executor, which is the
+        // path that actually self-wires the store's cassette (the outer loop's OWN stage dispatches
+        // never do — only nested authored/action-batch execution does).
+        struct CountingEcho(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Tool for CountingEcho {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(
+                    "echo",
+                    "Return the supplied text.",
+                    json!({
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                        "additionalProperties": false
+                    }),
+                )
+            }
+            async fn execute(&self, _ctx: &ToolContext, input: Value) -> Result<ToolResult> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResult::ok(
+                    input
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ))
+            }
+        }
+
+        fn script() -> Vec<Vec<Chunk>> {
+            vec![
+                native_call(
+                    "intent-1",
+                    "declare_intent",
+                    json!({"intent": "echo it", "capability_families": ["core"]}),
+                ),
+                native_call("echo-1", "echo", json!({"text": "live-value"})),
+                prose("live-value"),
+            ]
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider {
+            responses: Mutex::new(script().into()),
+            requests: requests.clone(),
+        });
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "flux-run-turn-pinned-cassette-override-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingEcho(calls.clone())));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap()))),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble_with_loop(
+            provider_dyn,
+            executor,
+            events.clone(),
+            flow,
+            "test-model".into(),
+            "Use only observed evidence.".into(),
+            2_048,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            root.clone(),
+            AgentLoopSpec::default(),
+        )
+        .unwrap();
+
+        // Record once, live, to get one real `echo` cell.
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn(&session, "echo it", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the first turn dispatched echo live once"
+        );
+
+        // Pin a hermetic `Frozen` scope over that recording, force the kill switch OFF, and re-drive
+        // the SAME script (the model still runs — only leaf-op dispatch is pinned): `run_turn_pinned`
+        // must still install the scope despite `FLUX_CASSETTE=0`, so `echo` is served from tape and
+        // never touches the live tool again.
+        let trace = events.run_trace(&session).unwrap();
+        let tape = crate::cassette::ReplayTape::from_trace(&trace);
+        let scope = Arc::new(crate::cassette::CassetteScope::Frozen(
+            crate::cassette::FrozenTape::hermetic(tape),
+        ));
+        provider.responses.lock().unwrap().extend(script());
+        let _guard = CassetteEnvGuard::set("0");
+        assert!(
+            !crate::cassette::enabled(),
+            "the kill switch is off for this test"
+        );
+
+        let mut sink2 = CollectSink::default();
+        engine
+            .run_turn_pinned(&session, "echo it again", scope, &mut sink2)
+            .await
+            .unwrap();
+
+        assert_eq!(sink2.text, "live-value");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the pinned scope must win over FLUX_CASSETTE=0 — a live re-dispatch would bump this to 2"
+        );
+        assert!(engine.flow.cassette().is_none(), "still reset on finish");
     }
 }

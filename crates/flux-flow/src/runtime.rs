@@ -80,15 +80,43 @@ impl<'a> ExecutorHost<'a> {
         }
     }
 
-    /// C-43: append the cell for one completed dispatch when a `Record` scope is active. Both
-    /// return path of [`dispatch`](OpHost::dispatch) records the exact redacted outcome replay
-    /// expects.
-    fn record_cell(&self, op: &str, input_json: &str, out: &OpOutcome) {
-        if let Some(scope) = &self.cassette {
-            if let crate::cassette::CassetteScope::Record(rec) = scope.as_ref() {
-                rec.record(&self.executor.context().redactor, op, input_json, out);
+    /// D-175: append the cell for one completed **live** dispatch — `Record` records unconditionally,
+    /// `Frozen(Live)`/`Resume` record only the tail a `Miss` fell through to (the bridge/tail target
+    /// each scope carries), `Replay`/`Frozen(Halt)` never reach here (they never fall through to a
+    /// live dispatch at all). Generalizes the old `record_cell` so every scope's tail-recording lives
+    /// in one place, matching `dispatch`'s single live path.
+    fn tail_record(&self, op: &str, input_json: &str, out: &OpOutcome) {
+        let Some(scope) = &self.cassette else {
+            return;
+        };
+        let redactor = &self.executor.context().redactor;
+        match scope.as_ref() {
+            crate::cassette::CassetteScope::Record(rec) => {
+                rec.record(redactor, op, input_json, out)
             }
+            crate::cassette::CassetteScope::Frozen(frozen) => {
+                frozen.record_tail(redactor, op, input_json, out)
+            }
+            crate::cassette::CassetteScope::Resume(resume) => {
+                resume.record_tail(redactor, op, input_json, out)
+            }
+            // `Replay` and `Frozen(Halt)` never fall through to the live path this is called from.
+            crate::cassette::CassetteScope::Replay(_) => {}
         }
+    }
+}
+
+/// Shape a `Frozen`/`Resume` refusal as the same in-band, fatal, non-silent error
+/// [`ReplayTape`](crate::cassette::ReplayTape) divergence already is: `is_error: true`, `denied:
+/// false` (a scope refusal is a divergence, not an authorization denial — `Executor::dispatch_outcome`
+/// still owns `denied`).
+fn cassette_refused(reason: &str) -> OpOutcome {
+    OpOutcome {
+        denied: false,
+        timing: None,
+        content: format!("cassette diverged: {reason}"),
+        view: None,
+        is_error: true,
     }
 }
 
@@ -103,25 +131,71 @@ impl OpHost for ExecutorHost<'_> {
         } else {
             String::new()
         };
-        // C-43 replay: serve from the tape and never touch the live executor — no side effect can
-        // re-fire. A miss is a latched divergence surfaced as an in-band op error (the statement
-        // halts; the driver reports `ReplayTape::diverged`), never silent continuation.
+        // D-175: every cassette-scope arm is matched BEFORE the one live path below — `Served`/
+        // `Refused` return immediately (no side effect can re-fire); every `Miss` (including
+        // `Record`'s scope, which never serves at all) falls into the SAME live path, so there is
+        // exactly one dispatch site no matter which scope is active (no-fallbacks rule).
         if let Some(scope) = &self.cassette {
-            if let crate::cassette::CassetteScope::Replay(tape) = scope.as_ref() {
-                return match tape.serve(op, &input_json) {
-                    Some(out) => out,
-                    None => OpOutcome {
-                        denied: false,
-                        timing: None,
-                        content: format!(
-                            "replay diverged: {}",
-                            tape.diverged()
-                                .unwrap_or_else(|| "unknown divergence".into())
-                        ),
-                        view: None,
-                        is_error: true,
-                    },
-                };
+            match scope.as_ref() {
+                // C-43 replay: serve from the tape and never touch the live executor — no side
+                // effect can re-fire. A miss is a latched divergence surfaced as an in-band op error
+                // (the statement halts; the driver reports `ReplayTape::diverged`), never silent
+                // continuation.
+                crate::cassette::CassetteScope::Replay(tape) => {
+                    return match tape.serve(op, &input_json) {
+                        Some(out) => out,
+                        None => OpOutcome {
+                            denied: false,
+                            timing: None,
+                            content: format!(
+                                "replay diverged: {}",
+                                tape.diverged()
+                                    .unwrap_or_else(|| "unknown divergence".into())
+                            ),
+                            view: None,
+                            is_error: true,
+                        },
+                    };
+                }
+                crate::cassette::CassetteScope::Frozen(frozen) => {
+                    // D-177 policy mode: re-decide admissibility against THIS executor's policy and
+                    // permission rules before the frozen world answers. Without this, a `what_if`
+                    // that tightened the policy would still be served the recorded output and report
+                    // no change at all — the taped answer would mask the very denial the caller is
+                    // asking about. `Executor::authorize` is the deterministic-gates-only entry: it
+                    // cannot execute (it isn't `async`), never prompts, and records nothing.
+                    if frozen.reauthorize() {
+                        let verdict = self.executor.authorize(op, &input);
+                        if let Some(reason) = verdict.reason() {
+                            frozen.note_policy_denial(reason);
+                            return OpOutcome {
+                                denied: true,
+                                timing: None,
+                                content: reason.to_string(),
+                                view: None,
+                                is_error: true,
+                            };
+                        }
+                    }
+                    match frozen.serve(op, &input_json) {
+                        crate::cassette::ScopeServe::Served(out) => return out,
+                        crate::cassette::ScopeServe::Refused(reason) => {
+                            return cassette_refused(&reason)
+                        }
+                        crate::cassette::ScopeServe::Miss => {}
+                    }
+                }
+                crate::cassette::CassetteScope::Resume(resume) => {
+                    match resume.serve(op, &input_json) {
+                        crate::cassette::ScopeServe::Served(out) => return out,
+                        crate::cassette::ScopeServe::Refused(reason) => {
+                            return cassette_refused(&reason)
+                        }
+                        crate::cassette::ScopeServe::Miss => {}
+                    }
+                }
+                // `Record` never serves — every dispatch is live, recorded on the way out.
+                crate::cassette::CassetteScope::Record(_) => {}
             }
         }
         // L-32: `denied` is read straight off the envelope's own structural flag
@@ -139,7 +213,7 @@ impl OpHost for ExecutorHost<'_> {
             view: outcome.result.view,
             is_error: outcome.result.is_error,
         };
-        self.record_cell(op, &input_json, &out);
+        self.tail_record(op, &input_json, &out);
         out
     }
 
@@ -152,11 +226,22 @@ impl OpHost for ExecutorHost<'_> {
         label: &str,
         intents: &IntentSet,
     ) -> flux_lang::host::ApprovalChoice {
-        // C-43 replay: the recorded run already passed its `confirm` gates, and no op can execute
-        // from tape — auto-allow so hermetic replay needs no interactive approver. Record and live
-        // paths fall through to the real approver unchanged.
+        // D-175 per-arm table: `Replay` and `Frozen(Halt)` never dispatch anything live — their
+        // recorded run (or the frozen world) already passed its `confirm` gates, so hermetic replay
+        // needs no interactive approver. `Record`, `Frozen(Live)`, and `Resume` can all reach a real
+        // live dispatch (the bridge/tail), so they MUST gate through the real approver — an adversarial
+        // deny-approver has to be able to deny a live-bridge or crash-tail call exactly like a normal
+        // live turn would.
         if let Some(scope) = &self.cassette {
-            if matches!(scope.as_ref(), crate::cassette::CassetteScope::Replay(_)) {
+            let auto_allow = match scope.as_ref() {
+                crate::cassette::CassetteScope::Replay(_) => true,
+                crate::cassette::CassetteScope::Frozen(frozen) => {
+                    matches!(frozen.off_tape(), crate::cassette::OffTape::Halt)
+                }
+                crate::cassette::CassetteScope::Record(_)
+                | crate::cassette::CassetteScope::Resume(_) => false,
+            };
+            if auto_allow {
                 return flux_lang::host::ApprovalChoice::Allow;
             }
         }
@@ -3408,5 +3493,438 @@ mod tests {
             "the whole saga re-runs wholly (step1 dispatches again) and, since it now succeeds, \
              fires NO extra compensation — `r1` appears exactly once, from the first genuine failure"
         );
+    }
+
+    // ---- D-175: cassette-scope family at the ONE dispatch chokepoint ----
+
+    /// A tool that counts real executions — proves a served (tape) dispatch never touches the live
+    /// executor, and a missed one runs it exactly once.
+    struct CountingTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only(
+                "counted",
+                "count real executions",
+                json!({"type": "object", "additionalProperties": false}),
+            )
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> flux_core::Result<ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::ok("live-value"))
+        }
+    }
+
+    /// An approver that counts every consultation and always returns `choice` — pins the D-175
+    /// per-arm `request_approval` table: `Replay`/`Frozen(Halt)` must auto-allow WITHOUT ever
+    /// reaching here; `Record`/`Frozen(Live)`/`Resume` must consult it for real.
+    struct ScriptedApprover {
+        calls: std::sync::atomic::AtomicUsize,
+        choice: ApprovalChoice,
+    }
+
+    #[async_trait]
+    impl Approver for ScriptedApprover {
+        async fn request(
+            &self,
+            _tool: &str,
+            _subjects: &[String],
+            _intents: &IntentSet,
+        ) -> ApprovalChoice {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.choice.clone()
+        }
+    }
+
+    fn counting_tool_executor(
+        approver: Arc<dyn Approver>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Executor {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-cassette-scope-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(CountingTool(calls)));
+        Executor::new(
+            reg,
+            PermissionManager::from_rules(&["counted".into()], &[]),
+            approver,
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        )
+    }
+
+    /// `$x = counted(); return $x`.
+    fn counted_ast() -> DraftAst {
+        DraftAst {
+            body: vec![
+                flow_bind("x", "counted", vec![]),
+                Node::Return {
+                    value: Box::new(flow_var("x")),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// `confirm "run counted" { $x = counted() }; return $x` — a `confirm` gate wraps the dispatch so
+    /// the adversarial approver tests can pin `request_approval`'s per-arm decision independently of
+    /// `dispatch`'s.
+    fn confirm_counted_ast() -> DraftAst {
+        DraftAst {
+            body: vec![
+                Node::Confirm {
+                    message: "run counted".into(),
+                    risk: None,
+                    body: vec![flow_bind("x", "counted", vec![])],
+                },
+                Node::Return {
+                    value: Box::new(flow_var("x")),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_halt_serves_from_tape_and_never_touches_the_executor() {
+        // Record once, live, to get one real `counted` cell.
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let record_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        record_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
+            crate::cassette::RecordScope::new(events.clone(), "sess"),
+        ))));
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), live_calls.clone());
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow_with_composites(
+            &record_store,
+            &ex,
+            "sess",
+            &counted_ast(),
+            &[],
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.result, "live-value");
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Serve the SAME flow from a `Frozen(Halt)` scope over the recorded tape.
+        let trace = events.run_trace("sess").unwrap();
+        let tape = crate::cassette::ReplayTape::from_trace(&trace);
+        let store = FlowStore::in_memory().unwrap();
+        store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Frozen(
+            crate::cassette::FrozenTape::hermetic(tape),
+        ))));
+        let tape_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tape_ex = counting_tool_executor(Arc::new(AllowApprover), tape_calls.clone());
+        let mut sink2 = CollectSink::default();
+        let outcome2 =
+            execute_flow_with_composites(&store, &tape_ex, "sess", &counted_ast(), &[], &mut sink2)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome2.result, "live-value", "served the recorded content");
+        assert_eq!(
+            tape_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Frozen(Halt) must never touch the live executor for a matched cell"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_live_dispatches_live_exactly_once_and_records_the_bridge_tail() {
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        // An empty tape: every dispatch is a miss, so a `Frozen(Live)` scope must bridge to the
+        // live executor exactly once and record the tail cell.
+        let bridge = crate::cassette::RecordScope::new(events.clone(), "sess");
+        store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Frozen(
+            crate::cassette::FrozenTape::live_bridge(
+                crate::cassette::ReplayTape::from_cells(vec![]),
+                bridge,
+            ),
+        ))));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), calls.clone());
+        let mut sink = CollectSink::default();
+        let outcome =
+            execute_flow_with_composites(&store, &ex, "sess", &counted_ast(), &[], &mut sink)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.result, "live-value");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the miss must fall through to the ONE live path exactly once"
+        );
+        let trace = events.run_trace("sess").unwrap();
+        assert!(
+            trace
+                .iter()
+                .any(|e| matches!(e, RunEvent::OpRecorded { op, .. } if op == "counted")),
+            "the live-bridge dispatch must be recorded into the tail, just like `Record`"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_serves_the_completed_op_without_refiring() {
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let record_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        record_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
+            crate::cassette::RecordScope::new(events.clone(), "sess"),
+        ))));
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), live_calls.clone());
+        let mut sink = CollectSink::default();
+        execute_flow_with_composites(&record_store, &ex, "sess", &counted_ast(), &[], &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let trace = events.run_trace("sess").unwrap();
+        let cells: Vec<crate::cassette::Cell> = trace
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::OpRecorded {
+                    op,
+                    input_hash,
+                    input_hash_redacted,
+                    content,
+                    view,
+                    is_error,
+                    denied,
+                    truncated,
+                    ..
+                } => Some(crate::cassette::Cell {
+                    op: op.clone(),
+                    input_hash: input_hash.clone(),
+                    input_hash_redacted: input_hash_redacted.clone(),
+                    content: content.clone(),
+                    view: view.clone(),
+                    is_error: *is_error,
+                    denied: *denied,
+                    truncated: *truncated,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 1, "one crash-tail cell for the completed op");
+
+        let resume_store = FlowStore::in_memory().unwrap();
+        let resume_events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let tail = crate::cassette::RecordScope::new(resume_events.clone(), "sess");
+        resume_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Resume(
+            crate::cassette::ResumeTape::new(cells, tail),
+        ))));
+        let resume_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resume_ex = counting_tool_executor(Arc::new(AllowApprover), resume_calls.clone());
+        let mut sink2 = CollectSink::default();
+        let outcome = execute_flow_with_composites(
+            &resume_store,
+            &resume_ex,
+            "sess",
+            &counted_ast(),
+            &[],
+            &mut sink2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.result, "live-value", "served from the crash tail");
+        assert_eq!(
+            resume_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a completed op must never re-fire on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_miss_runs_the_op_live_and_records_the_tail() {
+        let store = FlowStore::in_memory().unwrap();
+        let tail_events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let tail = crate::cassette::RecordScope::new(tail_events.clone(), "sess");
+        // No crash-tail cells at all — every dispatch is the honest at-least-once window.
+        store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Resume(
+            crate::cassette::ResumeTape::new(vec![], tail),
+        ))));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), calls.clone());
+        let mut sink = CollectSink::default();
+        let outcome =
+            execute_flow_with_composites(&store, &ex, "sess", &counted_ast(), &[], &mut sink)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.result, "live-value");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let trace = tail_events.run_trace("sess").unwrap();
+        assert!(
+            trace
+                .iter()
+                .any(|e| matches!(e, RunEvent::OpRecorded { op, .. } if op == "counted")),
+            "the live tail dispatch must be recorded, exactly like a normal `Record` scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_and_frozen_halt_auto_allow_a_confirm_without_consulting_the_approver() {
+        // `Replay`: a recorded run already passed its `confirm` gate.
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let record_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        record_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Record(
+            crate::cassette::RecordScope::new(events.clone(), "sess"),
+        ))));
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), live_calls.clone());
+        let mut sink = CollectSink::default();
+        execute_flow_with_composites(
+            &record_store,
+            &ex,
+            "sess",
+            &confirm_counted_ast(),
+            &[],
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        let trace = events.run_trace("sess").unwrap();
+
+        let deny = Arc::new(ScriptedApprover {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            choice: ApprovalChoice::Deny,
+        });
+        let replay_store = FlowStore::in_memory().unwrap();
+        replay_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Replay(
+            crate::cassette::ReplayTape::from_trace(&trace),
+        ))));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let replay_ex = counting_tool_executor(deny.clone(), calls);
+        let mut sink2 = CollectSink::default();
+        execute_flow_with_composites(
+            &replay_store,
+            &replay_ex,
+            "sess",
+            &confirm_counted_ast(),
+            &[],
+            &mut sink2,
+        )
+        .await
+        .expect("Replay auto-allows the confirm gate even with a deny approver installed");
+        assert_eq!(
+            deny.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the deny approver must never be consulted under Replay"
+        );
+
+        // `Frozen(Halt)`: the frozen world already passed its gates too.
+        let deny2 = Arc::new(ScriptedApprover {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            choice: ApprovalChoice::Deny,
+        });
+        let frozen_store = FlowStore::in_memory().unwrap();
+        frozen_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Frozen(
+            crate::cassette::FrozenTape::hermetic(crate::cassette::ReplayTape::from_trace(&trace)),
+        ))));
+        let calls2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frozen_ex = counting_tool_executor(deny2.clone(), calls2);
+        let mut sink3 = CollectSink::default();
+        execute_flow_with_composites(
+            &frozen_store,
+            &frozen_ex,
+            "sess",
+            &confirm_counted_ast(),
+            &[],
+            &mut sink3,
+        )
+        .await
+        .expect("Frozen(Halt) auto-allows the confirm gate even with a deny approver installed");
+        assert_eq!(
+            deny2.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the deny approver must never be consulted under Frozen(Halt)"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_live_and_resume_gate_a_confirm_through_the_real_deny_approver() {
+        // `Frozen(Live)`: a miss can reach a real live dispatch, so the confirm gate MUST be real.
+        let events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let bridge = crate::cassette::RecordScope::new(events.clone(), "sess");
+        let frozen_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        frozen_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Frozen(
+            crate::cassette::FrozenTape::live_bridge(
+                crate::cassette::ReplayTape::from_cells(vec![]),
+                bridge,
+            ),
+        ))));
+        let deny = Arc::new(ScriptedApprover {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            choice: ApprovalChoice::Deny,
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ex = counting_tool_executor(deny.clone(), calls.clone());
+        let mut sink = CollectSink::default();
+        let err = execute_flow_with_composites(
+            &frozen_store,
+            &ex,
+            "sess",
+            &confirm_counted_ast(),
+            &[],
+            &mut sink,
+        )
+        .await
+        .expect_err("a deny approver must deny the confirm gate under Frozen(Live)");
+        assert!(err.to_string().to_lowercase().contains("confirm"), "{err}");
+        assert_eq!(
+            deny.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Frozen(Live) must consult the real approver — the :158 auto-allow must not leak here"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a denied confirm gate must never let the guarded op dispatch"
+        );
+
+        // `Resume`: the crash tail is live too — same posture.
+        let tail_events = Arc::new(flux_events::EventStore::in_memory().unwrap());
+        let tail = crate::cassette::RecordScope::new(tail_events.clone(), "sess");
+        let resume_store = FlowStore::in_memory().unwrap();
+        resume_store.set_cassette(Some(Arc::new(crate::cassette::CassetteScope::Resume(
+            crate::cassette::ResumeTape::new(vec![], tail),
+        ))));
+        let deny2 = Arc::new(ScriptedApprover {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            choice: ApprovalChoice::Deny,
+        });
+        let calls2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resume_ex = counting_tool_executor(deny2.clone(), calls2.clone());
+        let mut sink2 = CollectSink::default();
+        execute_flow_with_composites(
+            &resume_store,
+            &resume_ex,
+            "sess",
+            &confirm_counted_ast(),
+            &[],
+            &mut sink2,
+        )
+        .await
+        .expect_err("a deny approver must deny the confirm gate under Resume");
+        assert_eq!(
+            deny2.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Resume must consult the real approver too"
+        );
+        assert_eq!(calls2.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

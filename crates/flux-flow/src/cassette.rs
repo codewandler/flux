@@ -17,8 +17,15 @@
 //!   `input_hash_redacted` and the matcher accepts either hash (sound because
 //!   [`Redactor::redact`] is deterministic longest-first containment replacement, so redaction
 //!   commutes with `{{symbol}}` interpolation).
+//!
+//! D-175 generalizes the two-mode scope into a small family sharing the same dual-hash matcher:
+//! [`FrozenTape`] serves a byte-frozen recorded world (with optional substitutions), off a miss
+//! either halting or bridging to a live [`RecordScope`]; [`ResumeTape`] serves *completed* ops
+//! exactly-once and records a live tail. Both power Tune (D-176) and Resurrect (D-178) without a
+//! second dispatch chokepoint — see `runtime.rs`'s `ExecutorHost::dispatch`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flux_events::{EventStore, NewEvent};
@@ -115,10 +122,33 @@ fn collect_json_redactions(
 }
 
 /// The active cassette mode, installed on the `FlowStore` by the engine (record, every turn), the
-/// replay driver (replay), or the fork engine (replay for the prefix, then record for the tail).
+/// replay driver (replay), the fork engine (replay for the prefix, then record for the tail), or a
+/// `run_turn_pinned` caller (`Frozen`/`Resume`, D-175). `#[non_exhaustive]`: this enum is public
+/// (SemVer-breaking to grow), and every future scope is meant to be additive — the ONE dispatch
+/// chokepoint (`runtime.rs`'s `ExecutorHost::dispatch`) matches it exhaustively, so a new arm forces
+/// a decision there rather than silently falling through to the live path.
+#[non_exhaustive]
 pub enum CassetteScope {
     Record(RecordScope),
     Replay(ReplayTape),
+    /// Serve from a byte-frozen recorded world, with optional substitutions; a miss either halts or
+    /// bridges to live IO, per [`OffTape`]. Tune's world-pinned re-plan, the Test Kit's `check()`.
+    Frozen(FrozenTape),
+    /// Serve *completed* ops exactly-once from a crash-tail slice, falling through to a live tail
+    /// dispatch (recorded for the ledger). Resurrect's crash-resume.
+    Resume(ResumeTape),
+}
+
+/// How a [`FrozenTape`] behaves when a dispatch has no matching recorded cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffTape {
+    /// Latch a divergence and refuse — the frozen world IS the whole world (Tune's default, the
+    /// Test Kit's `check()`). Hermetic by construction: no live IO can ever happen.
+    Halt,
+    /// Fall through to a live [`RecordScope`] bridge and record the tail — the frozen world is a
+    /// PREFIX a re-plan may legitimately read past (world-pinned re-plan under a changed
+    /// model/prompt/policy).
+    Live,
 }
 
 /// Record mode: after every real dispatch, append one redacted [`RunEvent::OpRecorded`] cell to
@@ -203,19 +233,12 @@ pub struct Cell {
     pub truncated: bool,
 }
 
-/// Replay mode: serve cells by `(op, hash)` lookup — the inner executor is never touched for a
-/// served op, so no side effect can re-fire. A dispatch with no matching unconsumed cell latches
-/// [`ReplayTape::diverged`] and surfaces as a hard in-band error, never silent continuation.
-pub struct ReplayTape {
-    cells: Vec<Cell>,
-    consumed: Mutex<Vec<bool>>,
-    diverged: Mutex<Option<String>>,
-}
-
-impl ReplayTape {
-    /// Collect a recorded trace's cassette cells, in stream order.
-    pub fn from_trace(trace: &[RunEvent]) -> Self {
-        let cells: Vec<Cell> = trace
+impl Cell {
+    /// Collect every [`RunEvent::OpRecorded`] cell in a trace slice, in stream order — the shared
+    /// extraction [`ReplayTape::from_trace`] and the Resurrect driver's crash-tail slice
+    /// (`resurrect.rs`, D-178) both build on, so this shape is derived exactly once.
+    pub(crate) fn collect(trace: &[RunEvent]) -> Vec<Cell> {
+        trace
             .iter()
             .filter_map(|ev| match ev {
                 RunEvent::OpRecorded {
@@ -240,7 +263,23 @@ impl ReplayTape {
                 }),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+}
+
+/// Replay mode: serve cells by `(op, hash)` lookup — the inner executor is never touched for a
+/// served op, so no side effect can re-fire. A dispatch with no matching unconsumed cell latches
+/// [`ReplayTape::diverged`] and surfaces as a hard in-band error, never silent continuation.
+pub struct ReplayTape {
+    cells: Vec<Cell>,
+    consumed: Mutex<Vec<bool>>,
+    diverged: Mutex<Option<String>>,
+}
+
+impl ReplayTape {
+    /// Collect a recorded trace's cassette cells, in stream order.
+    pub fn from_trace(trace: &[RunEvent]) -> Self {
+        let cells = Cell::collect(trace);
         let n = cells.len();
         Self {
             cells,
@@ -282,9 +321,13 @@ impl ReplayTape {
         self.diverged.lock().unwrap().clone()
     }
 
-    /// Serve the recorded outcome for `(op, input)` — the out-of-order-tolerant matcher. `None`
-    /// means divergence (already latched with a diagnostic).
-    pub fn serve(&self, op: &str, input_json: &str) -> Option<OpOutcome> {
+    /// The dual-hash matcher core, shared by [`serve`](Self::serve),
+    /// [`serve_nonlatching`](Self::serve_nonlatching), [`FrozenTape`], and [`ResumeTape`] — scans
+    /// forward for the first **unconsumed** cell matching `(op, hash)` and, for a live match,
+    /// atomically marks it consumed in the same lock acquisition (so two concurrent `parallel`
+    /// dispatches can never both claim the same cell). A truncated match is NOT marked consumed —
+    /// callers latch and refuse instead of serving partial bytes.
+    fn serve_result(&self, op: &str, input_json: &str) -> ServeResult {
         let h = sha256_hex(input_json);
         let mut consumed = self.consumed.lock().unwrap();
         for (i, cell) in self.cells.iter().enumerate() {
@@ -293,34 +336,358 @@ impl ReplayTape {
             }
             if cell.input_hash == h || cell.input_hash_redacted.as_deref() == Some(h.as_str()) {
                 if cell.truncated {
-                    let msg = format!(
-                        "recorded cell {i} for op `{op}` was truncated at the capture cap — this \
-                         run is not hermetically replayable past it (re-record with a larger \
-                         FLUX_CASSETTE_MAX_BYTES)"
-                    );
-                    *self.diverged.lock().unwrap() = Some(msg);
-                    return None;
+                    return ServeResult::Truncated { index: i };
                 }
                 consumed[i] = true;
-                return Some(OpOutcome {
-                    denied: cell.denied,
-                    timing: None,
-                    content: cell.content.clone(),
-                    view: cell.view.clone(),
-                    is_error: cell.is_error,
-                });
+                return ServeResult::Served {
+                    index: i,
+                    outcome: OpOutcome {
+                        denied: cell.denied,
+                        timing: None,
+                        content: cell.content.clone(),
+                        view: cell.view.clone(),
+                        is_error: cell.is_error,
+                    },
+                };
             }
         }
-        let msg = format!(
-            "op `{op}` (input hash {}…) has no matching unconsumed recorded cell — the plan's \
-             dataflow diverged from the recording",
-            &h[..16.min(h.len())]
-        );
+        ServeResult::Miss
+    }
+
+    /// Overwrite the divergence latch unconditionally — used for a truncated match, which always
+    /// reports the exact cell that blocked replay even if an earlier miss already latched a
+    /// different (less specific) message.
+    fn latch(&self, msg: String) {
+        *self.diverged.lock().unwrap() = Some(msg);
+    }
+
+    /// Latch only if nothing has latched yet — used for a plain miss, so `diverged()` keeps
+    /// reporting the FIRST divergence (the most useful one for diagnosis) rather than the last.
+    fn latch_first(&self, msg: String) {
         let mut d = self.diverged.lock().unwrap();
         if d.is_none() {
             *d = Some(msg);
         }
-        None
+    }
+
+    /// Serve the recorded outcome for `(op, input)` — the out-of-order-tolerant matcher. `None`
+    /// means divergence (already latched with a diagnostic).
+    pub fn serve(&self, op: &str, input_json: &str) -> Option<OpOutcome> {
+        match self.serve_result(op, input_json) {
+            ServeResult::Served { outcome, .. } => Some(outcome),
+            ServeResult::Truncated { index } => {
+                self.latch(truncated_divergence(op, index));
+                None
+            }
+            ServeResult::Miss => {
+                let h = sha256_hex(input_json);
+                self.latch_first(format!(
+                    "op `{op}` (input hash {}…) has no matching unconsumed recorded cell — the \
+                     plan's dataflow diverged from the recording",
+                    &h[..16.min(h.len())]
+                ));
+                None
+            }
+        }
+    }
+
+    /// The same dual-hash matcher as [`serve`](Self::serve), but a **plain** miss returns `None`
+    /// WITHOUT latching divergence — for a caller that falls through to a live dispatch on a miss
+    /// (`Frozen`'s live-bridge, `Resume`'s tail), a miss is not itself a divergence. A truncated
+    /// match still latches loudly: the recorded side effect already fired, so re-serving stale bytes
+    /// or re-firing it live are both unsafe — that stays a hard, latched refusal in every mode.
+    pub fn serve_nonlatching(&self, op: &str, input_json: &str) -> Option<OpOutcome> {
+        match self.serve_result(op, input_json) {
+            ServeResult::Served { outcome, .. } => Some(outcome),
+            ServeResult::Truncated { index } => {
+                self.latch(truncated_divergence(op, index));
+                None
+            }
+            ServeResult::Miss => None,
+        }
+    }
+}
+
+/// The truncated-cell divergence message — worded once, shared by every scope that refuses to serve
+/// a capped cell (`ReplayTape`, `FrozenTape`, `ResumeTape`).
+fn truncated_divergence(op: &str, index: usize) -> String {
+    format!(
+        "recorded cell {index} for op `{op}` was truncated at the capture cap — this run is not \
+         hermetically replayable past it (re-record with a larger FLUX_CASSETTE_MAX_BYTES)"
+    )
+}
+
+/// The result of matching one dispatch against a tape's unconsumed cells — the shared core
+/// [`ReplayTape::serve`] and [`ReplayTape::serve_nonlatching`] both build on (and that `FrozenTape`/
+/// `ResumeTape` reuse via their inner `ReplayTape`), so the dual-hash matcher exists exactly once.
+enum ServeResult {
+    /// A live, unconsumed cell matched by `(op, hash)` — already marked consumed.
+    Served { index: usize, outcome: OpOutcome },
+    /// A matching cell exists but was capped at capture time — never served.
+    Truncated { index: usize },
+    /// No unconsumed cell matches `(op, hash)`.
+    Miss,
+}
+
+/// What a [`FrozenTape`] or [`ResumeTape`] dispatch resolved to — consumed by the ONE dispatch
+/// chokepoint in `runtime.rs`'s `ExecutorHost::dispatch`. Distinguishes a scope-local refusal
+/// (latched, shaped into an in-band error, never a silent continuation) from a pass-through miss
+/// (falls into the SAME live-dispatch path every other scope uses — no second dispatch site).
+pub enum ScopeServe {
+    /// Served from tape (substituted or recorded) — the live executor is never touched.
+    Served(OpOutcome),
+    /// This scope refuses to serve (and refuses to fall through) — carries the human-readable
+    /// divergence/refusal reason.
+    Refused(String),
+    /// No matching cell, and this scope allows falling through to a live dispatch.
+    Miss,
+}
+
+/// `Frozen` mode (D-175): serve every op from a recorded [`ReplayTape`] — the byte-frozen world —
+/// with optional per-op/per-cell substitutions applied before falling back to the recorded outcome.
+/// A miss either halts (hermetic, [`OffTape::Halt`]) or bridges to a live [`RecordScope`]
+/// ([`OffTape::Live`]). Powers Tune (`Session::what_if`, D-176) and the Test Kit's world-pinned
+/// re-plan (`Scenario::check`, D-174).
+#[non_exhaustive]
+pub struct FrozenTape {
+    tape: ReplayTape,
+    off_tape: OffTape,
+    /// Substitute a recorded op's outcome by op name — checked AFTER `subs_by_cell`, so pinning one
+    /// exact call site always wins over a blanket by-op substitution.
+    subs_by_op: HashMap<String, OpOutcome>,
+    /// Substitute by the recorded cell's index in the tape (the caller maps a target node to a cell
+    /// index at construction time; this type only indexes on it).
+    subs_by_cell: HashMap<usize, OpOutcome>,
+    /// The live-bridge target when `off_tape == Live`; always `None` under `Halt`.
+    bridge: Option<RecordScope>,
+    went_live: AtomicUsize,
+    substituted: AtomicUsize,
+    /// D-177: when set, the Frozen dispatch arm re-authorizes a served cell against the CURRENT
+    /// executor's policy before serving it. Inert until D-177 wires the check — the field, its
+    /// accessor, and this builder exist now so wiring it later is additive, not another breaking
+    /// `CassetteScope` change.
+    reauthorize: bool,
+    policy_denials: Mutex<Vec<String>>,
+}
+
+impl FrozenTape {
+    /// Hermetic: a miss halts and latches — the frozen world is the ENTIRE world. Tune's default and
+    /// the Test Kit's `check()`. Build `tape` with [`ReplayTape::from_trace`] or
+    /// [`ReplayTape::from_cells`].
+    pub fn hermetic(tape: ReplayTape) -> Self {
+        Self {
+            tape,
+            off_tape: OffTape::Halt,
+            subs_by_op: HashMap::new(),
+            subs_by_cell: HashMap::new(),
+            bridge: None,
+            went_live: AtomicUsize::new(0),
+            substituted: AtomicUsize::new(0),
+            reauthorize: false,
+            policy_denials: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Live-bridge: a miss falls through to `bridge`'s live `RecordScope` and is recorded into its
+    /// tail — the frozen world is a PREFIX a re-plan may legitimately read past.
+    pub fn live_bridge(tape: ReplayTape, bridge: RecordScope) -> Self {
+        Self {
+            tape,
+            off_tape: OffTape::Live,
+            subs_by_op: HashMap::new(),
+            subs_by_cell: HashMap::new(),
+            bridge: Some(bridge),
+            went_live: AtomicUsize::new(0),
+            substituted: AtomicUsize::new(0),
+            reauthorize: false,
+            policy_denials: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Substitute the outcome of every recorded call to `op` (unless a more specific
+    /// [`substitute_cell`](Self::substitute_cell) also matches).
+    pub fn substitute_op(mut self, op: impl Into<String>, outcome: OpOutcome) -> Self {
+        self.subs_by_op.insert(op.into(), outcome);
+        self
+    }
+
+    /// Substitute the outcome of the recorded cell at `index` specifically (wins over
+    /// [`substitute_op`](Self::substitute_op)).
+    pub fn substitute_cell(mut self, index: usize, outcome: OpOutcome) -> Self {
+        self.subs_by_cell.insert(index, outcome);
+        self
+    }
+
+    /// D-177: opt this scope into re-authorization of served cells. Default `false` (inert).
+    pub fn with_reauthorize(mut self, on: bool) -> Self {
+        self.reauthorize = on;
+        self
+    }
+
+    /// Whether re-authorization is enabled (D-177 reads this before serving a matched cell).
+    pub fn reauthorize(&self) -> bool {
+        self.reauthorize
+    }
+
+    /// Which mode a miss falls into.
+    pub fn off_tape(&self) -> OffTape {
+        self.off_tape
+    }
+
+    /// How many dispatches fell through to a live bridge dispatch.
+    pub fn went_live(&self) -> usize {
+        self.went_live.load(Ordering::SeqCst)
+    }
+
+    /// How many served cells were substituted rather than served as recorded.
+    pub fn substituted(&self) -> usize {
+        self.substituted.load(Ordering::SeqCst)
+    }
+
+    /// The first latched divergence, if any.
+    pub fn diverged(&self) -> Option<String> {
+        self.tape.diverged()
+    }
+
+    /// Unconsumed cells remaining on the inner tape.
+    pub fn remaining(&self) -> usize {
+        self.tape.remaining()
+    }
+
+    /// Record a policy denial (D-177: a stricter policy refusing a served cell) so `hermetic()`
+    /// reflects it — a denial must surface as a real divergence, never be masked by tape service.
+    pub fn note_policy_denial(&self, reason: impl Into<String>) {
+        self.policy_denials.lock().unwrap().push(reason.into());
+    }
+
+    /// Every policy denial recorded so far.
+    pub fn policy_denials(&self) -> Vec<String> {
+        self.policy_denials.lock().unwrap().clone()
+    }
+
+    /// True iff this run never touched live IO, never latched a divergence, and never hit a policy
+    /// denial — the honesty gate `Counterfactual`/`Report` surfaces (D-176/D-174) rely on to decide
+    /// whether a diff is complete or must localize a divergence instead.
+    pub fn is_hermetic(&self) -> bool {
+        self.went_live() == 0 && self.diverged().is_none() && self.policy_denials().is_empty()
+    }
+
+    /// Serve one dispatch: a matched cell is substituted (by cell index, then by op name) if a
+    /// substitution was registered, else served as recorded. A truncated match NEVER falls through
+    /// to live in either mode (the recorded side effect already fired) — always `Refused`. A miss is
+    /// `OffTape::Halt`'s latch-and-refuse or `OffTape::Live`'s pass-through `Miss`.
+    pub fn serve(&self, op: &str, input_json: &str) -> ScopeServe {
+        match self.tape.serve_result(op, input_json) {
+            ServeResult::Served { index, outcome } => {
+                let served = if let Some(sub) = self.subs_by_cell.get(&index) {
+                    self.substituted.fetch_add(1, Ordering::SeqCst);
+                    sub.clone()
+                } else if let Some(sub) = self.subs_by_op.get(op) {
+                    self.substituted.fetch_add(1, Ordering::SeqCst);
+                    sub.clone()
+                } else {
+                    outcome
+                };
+                ScopeServe::Served(served)
+            }
+            ServeResult::Truncated { index } => {
+                let msg = truncated_divergence(op, index);
+                self.tape.latch(msg.clone());
+                ScopeServe::Refused(msg)
+            }
+            ServeResult::Miss => match self.off_tape {
+                OffTape::Halt => {
+                    let msg = format!(
+                        "op `{op}` has no matching unconsumed recorded cell and this Frozen scope \
+                         is `OffTape::Halt` — the frozen world is the whole world here, so a miss \
+                         is a divergence, not a cue to run live"
+                    );
+                    self.tape.latch_first(msg.clone());
+                    ScopeServe::Refused(msg)
+                }
+                OffTape::Live => ScopeServe::Miss,
+            },
+        }
+    }
+
+    /// Record one live-bridge dispatch's outcome into the tail (`OffTape::Live` only — the runtime
+    /// only calls this after a `Miss`, which only `Live` mode ever returns).
+    pub fn record_tail(&self, redactor: &Redactor, op: &str, input_json: &str, out: &OpOutcome) {
+        if let Some(bridge) = &self.bridge {
+            bridge.record(redactor, op, input_json, out);
+        }
+        self.went_live.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// `Resume` mode (D-175): serve *completed* ops from the crash-tail cell slice — exactly-once, since
+/// a served cell is consumed like [`ReplayTape`]'s. A miss falls through to a live dispatch recorded
+/// into `tail` for the ledger; a truncated matched cell refuses rather than re-firing a side effect
+/// whose bytes were capped at capture. Powers Resurrect (D-178).
+#[non_exhaustive]
+pub struct ResumeTape {
+    tape: ReplayTape,
+    tail: RecordScope,
+    served: AtomicUsize,
+    ran_live: AtomicUsize,
+}
+
+impl ResumeTape {
+    /// `cells` is the crash-tail slice (driver-built — `OpRecorded` cells strictly after the last
+    /// completed statement), `tail` is where a live fallback dispatch gets recorded.
+    pub fn new(cells: Vec<Cell>, tail: RecordScope) -> Self {
+        Self {
+            tape: ReplayTape::from_cells(cells),
+            tail,
+            served: AtomicUsize::new(0),
+            ran_live: AtomicUsize::new(0),
+        }
+    }
+
+    /// Serve one dispatch: a hit is served exactly-once (consumed, never re-fired); a truncated
+    /// match refuses rather than re-firing a side effect whose recorded bytes were capped; a plain
+    /// miss is `Miss` and NEVER latches — an unrecorded op is the expected, documented at-least-once
+    /// window (the op fired before its cell was appended), not a divergence.
+    pub fn serve(&self, op: &str, input_json: &str) -> ScopeServe {
+        match self.tape.serve_result(op, input_json) {
+            ServeResult::Served { outcome, .. } => {
+                self.served.fetch_add(1, Ordering::SeqCst);
+                ScopeServe::Served(outcome)
+            }
+            ServeResult::Truncated { index } => {
+                let msg = truncated_divergence(op, index);
+                self.tape.latch(msg.clone());
+                ScopeServe::Refused(msg)
+            }
+            ServeResult::Miss => ScopeServe::Miss,
+        }
+    }
+
+    /// Record one live-tail dispatch's outcome — called after a `Miss` falls through to the real
+    /// executor, so the ledger sees the crash tail's new cells exactly like any other recording.
+    pub fn record_tail(&self, redactor: &Redactor, op: &str, input_json: &str, out: &OpOutcome) {
+        self.tail.record(redactor, op, input_json, out);
+        self.ran_live.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many cells were served exactly-once from the crash-tail slice.
+    pub fn served(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+
+    /// How many ops fell through and ran live (the honest at-least-once window).
+    pub fn ran_live(&self) -> usize {
+        self.ran_live.load(Ordering::SeqCst)
+    }
+
+    /// Unconsumed cells remaining on the crash-tail slice (a clean resume ends at 0).
+    pub fn remaining(&self) -> usize {
+        self.tape.remaining()
+    }
+
+    /// The first latched divergence, if any (a truncated served cell — never a plain miss).
+    pub fn diverged(&self) -> Option<String> {
+        self.tape.diverged()
     }
 }
 
@@ -472,5 +839,214 @@ mod tests {
         let (t, tr) = truncate_chars("héllo", 2);
         assert!(tr);
         assert_eq!(t, "h"); // é is 2 bytes starting at 1; boundary walk lands at 1
+    }
+
+    // ---- D-175: serve_nonlatching ----
+
+    #[test]
+    fn serve_nonlatching_plain_miss_returns_none_without_latching() {
+        let tape = ReplayTape::from_cells(vec![cell("read", "{\"a\":1}", "one")]);
+        assert!(tape.serve_nonlatching("read", "{\"a\":999}").is_none());
+        assert!(
+            tape.diverged().is_none(),
+            "a plain miss must not latch — the caller is expected to fall through to live"
+        );
+    }
+
+    #[test]
+    fn serve_nonlatching_truncated_cell_still_latches_loudly() {
+        let mut c = cell("read", "{\"a\":1}", "partial");
+        c.truncated = true;
+        let tape = ReplayTape::from_cells(vec![c]);
+        assert!(tape.serve_nonlatching("read", "{\"a\":1}").is_none());
+        assert!(
+            tape.diverged().unwrap().contains("truncated"),
+            "a truncated match is a hard refusal in every mode, latched exactly like `serve`"
+        );
+    }
+
+    #[test]
+    fn serve_nonlatching_hit_consumes_exactly_like_serve() {
+        let tape = ReplayTape::from_cells(vec![cell("read", "{\"a\":1}", "one")]);
+        assert_eq!(
+            tape.serve_nonlatching("read", "{\"a\":1}").unwrap().content,
+            "one"
+        );
+        assert_eq!(tape.remaining(), 0);
+        // The cell was consumed — a second serve is a miss (still non-latching).
+        assert!(tape.serve_nonlatching("read", "{\"a\":1}").is_none());
+        assert!(tape.diverged().is_none());
+    }
+
+    // ---- D-175: FrozenTape ----
+
+    #[test]
+    fn frozen_substitute_by_cell_index_wins_over_substitute_by_op() {
+        let tape = ReplayTape::from_cells(vec![cell("read", "{\"a\":1}", "recorded")]);
+        let frozen = FrozenTape::hermetic(tape)
+            .substitute_op("read", OpOutcome::ok("by-op"))
+            .substitute_cell(0, OpOutcome::ok("by-cell"));
+        match frozen.serve("read", "{\"a\":1}") {
+            ScopeServe::Served(out) => assert_eq!(out.content, "by-cell"),
+            _ => panic!("expected Served"),
+        }
+        assert_eq!(frozen.substituted(), 1);
+    }
+
+    #[test]
+    fn frozen_substitute_by_op_applies_when_no_cell_override() {
+        let tape = ReplayTape::from_cells(vec![cell("read", "{\"a\":1}", "recorded")]);
+        let frozen = FrozenTape::hermetic(tape).substitute_op("read", OpOutcome::ok("by-op"));
+        match frozen.serve("read", "{\"a\":1}") {
+            ScopeServe::Served(out) => assert_eq!(out.content, "by-op"),
+            _ => panic!("expected Served"),
+        }
+        assert_eq!(frozen.substituted(), 1);
+    }
+
+    #[test]
+    fn frozen_serves_the_recorded_outcome_when_unsubstituted() {
+        let tape = ReplayTape::from_cells(vec![cell("read", "{\"a\":1}", "recorded")]);
+        let frozen = FrozenTape::hermetic(tape);
+        match frozen.serve("read", "{\"a\":1}") {
+            ScopeServe::Served(out) => assert_eq!(out.content, "recorded"),
+            _ => panic!("expected Served"),
+        }
+        assert_eq!(frozen.substituted(), 0);
+        assert!(frozen.is_hermetic());
+    }
+
+    #[test]
+    fn frozen_halt_miss_latches_and_refuses() {
+        let frozen = FrozenTape::hermetic(ReplayTape::from_cells(vec![]));
+        match frozen.serve("read", "{\"a\":1}") {
+            ScopeServe::Refused(msg) => assert!(msg.contains("OffTape::Halt")),
+            _ => panic!("expected Refused"),
+        }
+        assert!(frozen.diverged().is_some());
+        assert!(!frozen.is_hermetic());
+    }
+
+    #[test]
+    fn frozen_live_miss_is_a_passthrough_not_a_divergence() {
+        let root = std::env::temp_dir().join(format!("flux-cassette-frozen-live-{}", line!()));
+        std::fs::create_dir_all(&root).ok();
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let bridge = RecordScope::new(events.clone(), session);
+        let frozen = FrozenTape::live_bridge(ReplayTape::from_cells(vec![]), bridge);
+        match frozen.serve("read", "{\"a\":1}") {
+            ScopeServe::Miss => {}
+            _ => panic!("expected Miss — a live-bridge miss is not itself a divergence"),
+        }
+        assert!(frozen.diverged().is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn frozen_truncated_cell_never_falls_through_to_live_even_in_live_mode() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let bridge = RecordScope::new(events.clone(), session);
+        let mut c = cell("read", "{\"a\":1}", "partial");
+        c.truncated = true;
+        let frozen = FrozenTape::live_bridge(ReplayTape::from_cells(vec![c]), bridge);
+        match frozen.serve("read", "{\"a\":1}") {
+            ScopeServe::Refused(msg) => assert!(msg.contains("truncated")),
+            _ => panic!(
+                "a truncated matched cell must refuse, never fall through to live — the recorded \
+                 side effect already fired"
+            ),
+        }
+        assert_eq!(frozen.went_live(), 0);
+    }
+
+    #[test]
+    fn frozen_hermetic_reflects_live_and_denial_state() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let bridge = RecordScope::new(events.clone(), session);
+        let frozen = FrozenTape::live_bridge(ReplayTape::from_cells(vec![]), bridge);
+        assert!(frozen.is_hermetic(), "no dispatch has happened yet");
+        frozen.record_tail(&Redactor::new(), "read", "{}", &OpOutcome::ok("live"));
+        assert_eq!(frozen.went_live(), 1);
+        assert!(!frozen.is_hermetic(), "went_live must break hermeticity");
+
+        let clean = FrozenTape::hermetic(ReplayTape::from_cells(vec![]));
+        clean.note_policy_denial("D-177 policy floor refused it");
+        assert!(
+            !clean.is_hermetic(),
+            "a policy denial must break hermeticity too"
+        );
+        assert_eq!(clean.policy_denials().len(), 1);
+    }
+
+    #[test]
+    fn frozen_reauthorize_defaults_off_and_the_builder_flips_it() {
+        let frozen = FrozenTape::hermetic(ReplayTape::from_cells(vec![]));
+        assert!(!frozen.reauthorize(), "inert until D-177");
+        let frozen = frozen.with_reauthorize(true);
+        assert!(frozen.reauthorize());
+    }
+
+    // ---- D-175: ResumeTape ----
+
+    #[test]
+    fn resume_serves_a_hit_exactly_once_then_misses() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let tail = RecordScope::new(events.clone(), session);
+        let resume = ResumeTape::new(vec![cell("read", "{\"a\":1}", "one")], tail);
+        match resume.serve("read", "{\"a\":1}") {
+            ScopeServe::Served(out) => assert_eq!(out.content, "one"),
+            _ => panic!("expected Served"),
+        }
+        assert_eq!(resume.served(), 1);
+        assert_eq!(resume.remaining(), 0);
+        // Exactly-once: the same call now misses (never re-served).
+        match resume.serve("read", "{\"a\":1}") {
+            ScopeServe::Miss => {}
+            _ => panic!("expected Miss on the second call — exactly-once service"),
+        }
+        assert!(resume.diverged().is_none(), "a plain miss never latches");
+    }
+
+    #[test]
+    fn resume_truncated_cell_refuses_without_refiring() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let tail = RecordScope::new(events.clone(), session);
+        let mut c = cell("read", "{\"a\":1}", "partial");
+        c.truncated = true;
+        let resume = ResumeTape::new(vec![c], tail);
+        match resume.serve("read", "{\"a\":1}") {
+            ScopeServe::Refused(msg) => assert!(msg.contains("truncated")),
+            _ => panic!("expected Refused"),
+        }
+        assert_eq!(resume.served(), 0);
+        assert!(resume.diverged().is_some());
+    }
+
+    #[test]
+    fn resume_plain_miss_never_latches_the_honest_at_least_once_window() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let session = events.create_session("mock").unwrap();
+        let tail = RecordScope::new(events.clone(), session);
+        let resume = ResumeTape::new(vec![], tail);
+        match resume.serve("read", "{\"a\":1}") {
+            ScopeServe::Miss => {}
+            _ => panic!("expected Miss"),
+        }
+        assert!(
+            resume.diverged().is_none(),
+            "an unrecorded op is the documented at-least-once window, not a divergence"
+        );
+        resume.record_tail(
+            &Redactor::new(),
+            "read",
+            "{\"a\":1}",
+            &OpOutcome::ok("live"),
+        );
+        assert_eq!(resume.ran_live(), 1);
     }
 }
