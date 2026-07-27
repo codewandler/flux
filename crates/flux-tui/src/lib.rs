@@ -160,6 +160,10 @@ const COMMANDS: &[SlashCmd] = &[
         desc: "show or switch model",
     },
     SlashCmd {
+        name: "effort",
+        desc: "show or set reasoning effort",
+    },
+    SlashCmd {
         name: "quit",
         desc: "exit flux",
     },
@@ -215,7 +219,7 @@ fn slash_matches(query: &str) -> Vec<&'static SlashCmd> {
 const HELP_TEXT: &str = "keys: ↵ send/queue · Ctrl-J or Alt-↵ newline · ↑/↓ history\n\
     PgUp/PgDn or wheel scroll · Ctrl-End latest · Ctrl-E details\n\
     Ctrl-C interrupt/clear/quit · Ctrl-D quit · Esc close panel\n\
-commands: /model /shell /tools /evidence /session /sessions /resume\n\
+commands: /model /effort /shell /tools /evidence /session /sessions /resume\n\
     /new /clear /compact /queue /quit";
 
 /// One item in the transcript. Each renders to one or more styled [`Line`]s at a given width.
@@ -2288,6 +2292,46 @@ async fn handle_command(
                 sev: Sev::Info,
             });
         }
+        "effort" if args.is_empty() => {
+            let engine = agent.read().await;
+            let current = engine
+                .effort
+                .map(|e| e.as_str())
+                .unwrap_or("(provider default)");
+            state.push(Entry::Notice {
+                text: format!(
+                    "effort: {current} · usage: /effort <low|medium|high|xhigh|max|off>"
+                ),
+                sev: Sev::Info,
+            });
+        }
+        "effort" => {
+            let effort = match args.to_ascii_lowercase().as_str() {
+                "off" | "none" | "default" => Some(None),
+                "low" => Some(Some(flux_provider::Effort::Low)),
+                "medium" => Some(Some(flux_provider::Effort::Medium)),
+                "high" => Some(Some(flux_provider::Effort::High)),
+                "xhigh" => Some(Some(flux_provider::Effort::Xhigh)),
+                "max" => Some(Some(flux_provider::Effort::Max)),
+                _ => None,
+            };
+            match effort {
+                Some(effort) => {
+                    agent.write().await.set_effort(effort);
+                    let shown = effort.map(|e| e.as_str()).unwrap_or("(provider default)");
+                    state.push(Entry::Notice {
+                        text: format!("effort: {shown} — takes effect from the next turn"),
+                        sev: Sev::Info,
+                    });
+                }
+                None => state.push(Entry::Notice {
+                    text: format!(
+                        "effort: expected low, medium, high, xhigh, max, or off; got {args:?}"
+                    ),
+                    sev: Sev::Err,
+                }),
+            }
+        }
         other => state.push(Entry::Notice {
             text: format!("unknown command /{other} · try /help"),
             sev: Sev::Warn,
@@ -2299,6 +2343,7 @@ async fn handle_command(
 fn command_is_read_only(name: &str, args: &str) -> bool {
     matches!(name, "help" | "tools" | "evidence" | "session" | "queue")
         || (name == "sessions" && args != "--prune")
+        || (name == "effort" && args.is_empty())
 }
 
 fn start_compaction(

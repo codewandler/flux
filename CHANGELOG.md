@@ -8,6 +8,44 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`/effort` REPL and TUI slash command.** View the active reasoning effort (`/effort`) or set it
+  mid-session (`/effort low|medium|high|xhigh|max`, or `/effort off` for the provider default). The
+  new level applies from the next turn and is ephemeral session state (not persisted like the
+  model). `flux-flow`'s `FlowEngine` gains `set_effort(Option<Effort>)` for mid-session mutation,
+  mirroring `switch_model_for_session`. Bare `/effort` is treated as read-only, so it works while a
+  turn is running.
+
+- **D-175: the engine's cassette scope is now a family — `Frozen` and `Resume` join
+  `Record`/`Replay`.** `CassetteScope` (now `#[non_exhaustive]`; growing the public enum is the
+  0.y-breaking change behind the next MINOR) gains `Frozen(FrozenTape)` — serve every op from a
+  byte-frozen recorded world with optional per-op/per-cell output substitutions, and on a miss
+  either latch-and-halt (hermetic) or bridge to live IO (`OffTape::{Halt,Live}`) — and
+  `Resume(ResumeTape)` — serve already-completed ops exactly-once from the crash tail's cells and
+  fall through to live dispatch for the rest. Both arms are consulted at the single existing
+  dispatch chokepoint; every miss falls into the one live path, and the approval gate stays honest
+  per arm (hermetic arms auto-allow like `Replay`; `Frozen(Live)` and `Resume` gate through the
+  real approver — adversarially tested). `ReplayTape::serve_nonlatching` offers the same dual-hash
+  matcher without latching divergence on a plain miss, and `FlowEngine::run_turn_pinned` runs a
+  normal turn with a caller-pinned scope (reusing the entire `run_turn` body; a pinned scope wins
+  over the `FLUX_CASSETTE=0` kill switch). The shared spine under the Deterministic Agent Lab's
+  Tune (D-176) and Resurrect (D-178) doors; no user-visible surface on its own.
+- **D-174: the Deterministic Agent Test Kit — record once, test the real agent offline for $0.**
+  New `flux_sdk::test` module behind a default-off `test-kit` feature: `Scenario::record` runs one
+  live turn and writes a committed-safe fixture directory (`events.db` + `flow.db` — a plain
+  `Storage::dir` store — plus a redacted `model.jsonl` model cassette, a `plan.flux.snap` canonical
+  plan snapshot, and a `scenario.toml` manifest; everything is scrubbed through the session
+  redactor before hashing or writing). `Scenario::load(...).replay(&client)` then re-runs the
+  *real* agent hermetically in `cargo test` — deny-all approver, never-called provider, zero
+  network — and `Outcome` asserts on how it reasoned: `assert_plan_snapshot` (re-baseline with
+  `FLUX_GOLDEN=update`), `assert_calls`/`assert_never_calls`, `assert_text_contains`,
+  `assert_cost_under`, `assert_faithful` (a truncated cassette cell reports the actionable
+  "re-record with a larger `FLUX_CASSETTE_MAX_BYTES`" diagnostic, never a silent pass).
+  `Scenario::inject_at` turns a recorded run into a fault-injection counterfactual over the shipped
+  fork machinery (`flux_sdk::whatif::Counterfactual` with `assert_compensated_with` /
+  `assert_diverges_at`). Underneath: `EventStore::copy_session_to` (order- and
+  timestamp-preserving, turn-linkage-remapping session export — the fixture round-trip is
+  property-tested), shared `stmt_texts`/`render_run_diff` diff rendering in flux-events, and
+  serde on `flux_core::Chunk`.
 - **L-78: `flux render -o out.png` rasterizes the highlighted image to PNG.** The render
   subcommand branches on the `-o` extension: `.png` (case-insensitive) rasterizes the SVG through
   a new feature-gated `png` stack on flux-tools (`resvg`/`usvg`/`tiny-skia`/`fontdb`, with an

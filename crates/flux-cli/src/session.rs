@@ -642,6 +642,10 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                             "/model <spec>",
                             "switch model (e.g. opus, sonnet, openai/gpt-4o)",
                         ),
+                        (
+                            "/effort [level]",
+                            "show or set reasoning effort (low/medium/high/xhigh/max, or off)",
+                        ),
                         ("/session", "show current session id and model"),
                         (
                             "/sessions",
@@ -700,6 +704,35 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                                 }
                             }
                             Err(e) => eprintln!("cannot switch model: {e}"),
+                        }
+                    }
+                }
+                "effort" => {
+                    let level = rest.strip_prefix("effort").unwrap_or("").trim();
+                    if level.is_empty() {
+                        let current = agent
+                            .effort
+                            .map(|e| e.as_str())
+                            .unwrap_or("(provider default)");
+                        eprintln!(
+                            "effort: {current} · usage: /effort <low|medium|high|xhigh|max|off>"
+                        );
+                    } else if matches!(
+                        level.to_ascii_lowercase().as_str(),
+                        "off" | "none" | "default"
+                    ) {
+                        agent.set_effort(None);
+                        eprintln!("effort: (provider default) — takes effect from the next turn");
+                    } else {
+                        match parse_effort(level) {
+                            Ok(effort) => {
+                                agent.set_effort(Some(effort));
+                                eprintln!(
+                                    "effort: {} — takes effect from the next turn (ignored by models without effort control)",
+                                    effort.as_str()
+                                );
+                            }
+                            Err(error) => eprintln!("cannot set effort: {error}"),
                         }
                     }
                 }

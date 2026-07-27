@@ -17,6 +17,10 @@
 
 ### New
 
+- **Set reasoning effort mid-session with `/effort`.** In the REPL or TUI, run `/effort` to see the
+  current reasoning effort, or `/effort high` (also `low`, `medium`, `xhigh`, `max`, or `off`) to
+  change it. The new level takes effect from your next message. Models that don't support effort
+  control simply ignore it.
 - **A plain-language security page.** The docs now open the Security section with "Security in
   plain terms" — what flux does to protect you, your files, and your passwords, written for people
   who use flux rather than build it. The deeper, developer-facing pages are unchanged and now link
