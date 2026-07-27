@@ -164,7 +164,7 @@ pub fn claude_oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
 pub fn resolve_model(alias: &str) -> String {
     match alias {
         "sonnet" => "claude-sonnet-5",
-        "opus" => "claude-opus-4-8",
+        "opus" => "claude-opus-5",
         "haiku" => "claude-haiku-4-5",
         "fable" => "claude-fable-5",
         other => other,
@@ -181,7 +181,7 @@ mod tests {
     fn resolve_model_maps_short_aliases_to_canonical_ids() {
         // Keep in lock-step with the layer-forced mirror in `flux_core::pricing::resolve_alias`.
         assert_eq!(resolve_model("sonnet"), "claude-sonnet-5");
-        assert_eq!(resolve_model("opus"), "claude-opus-4-8");
+        assert_eq!(resolve_model("opus"), "claude-opus-5");
         assert_eq!(resolve_model("haiku"), "claude-haiku-4-5");
         assert_eq!(resolve_model("fable"), "claude-fable-5");
     }

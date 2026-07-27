@@ -157,7 +157,7 @@ fn split_provider(spec: &str) -> (Option<&str>, &str) {
 fn resolve_alias(model: &str) -> &str {
     match model {
         "sonnet" => "claude-sonnet-5",
-        "opus" => "claude-opus-4-8",
+        "opus" => "claude-opus-5",
         "haiku" => "claude-haiku-4-5",
         "fable" => "claude-fable-5",
         other => other,
@@ -323,6 +323,7 @@ impl PricingTable {
         let fable = text(10.0, 50.0, 12.50, 1.00);
         rates.insert("claude-fable-5".to_string(), fable);
         let opus = text(5.0, 25.0, 6.25, 0.50);
+        rates.insert("claude-opus-5".to_string(), opus);
         rates.insert("claude-opus-4-8".to_string(), opus);
         rates.insert("claude-opus-4-7".to_string(), opus);
         rates.insert("claude-opus-4-6".to_string(), opus);
@@ -353,6 +354,7 @@ impl PricingTable {
             "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
             sonnet,
         );
+        rates.insert("anthropic.claude-opus-5".to_string(), opus);
         rates.insert("anthropic.claude-opus-4-8".to_string(), opus);
         rates.insert("anthropic.claude-opus-4-7".to_string(), opus);
         rates.insert("anthropic.claude-opus-4-6".to_string(), opus);
@@ -765,6 +767,7 @@ mod tests {
 
         // Anthropic (5-minute ephemeral cache: write = 1.25x input, read = 0.1x input).
         pin("claude-fable-5", 10.0, 50.0, 12.50, 1.00);
+        pin("claude-opus-5", 5.0, 25.0, 6.25, 0.50);
         pin("claude-opus-4-8", 5.0, 25.0, 6.25, 0.50);
         pin("claude-opus-4-7", 5.0, 25.0, 6.25, 0.50);
         pin("claude-opus-4-6", 5.0, 25.0, 6.25, 0.50);
@@ -796,6 +799,11 @@ mod tests {
             t.rates_for("anthropic.claude-sonnet-5"),
             t.rates_for("claude-sonnet-5"),
             "Bedrock Sonnet 5 must match the direct Anthropic rates"
+        );
+        assert_eq!(
+            t.rates_for("anthropic.claude-opus-5"),
+            t.rates_for("claude-opus-5"),
+            "Bedrock Opus 5 must match the direct Anthropic rates"
         );
 
         // OpenRouter passthrough + listed route prices as of 2026-07-09.
