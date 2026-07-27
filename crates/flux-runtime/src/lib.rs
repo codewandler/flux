@@ -2309,6 +2309,61 @@ pub struct DispatchOutcome {
     pub timing: OperationTiming,
 }
 
+/// The verdict of [`Executor::authorize`] (D-177) — an authorization **decision**, taken without
+/// dispatching anything.
+///
+/// `#[non_exhaustive]`: a new gate that can refuse a call for a new reason lands as a new variant
+/// (or a new refusal message), and a caller must not assume today's three are all there will be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthorizeVerdict {
+    /// Admissible under the current capability scope, authorization policy, and permission rules —
+    /// and the envelope would not prompt for it.
+    Allow,
+    /// Admissible, but the envelope would gate it through the approver before running it: a
+    /// destructive op, an effect the policy marked `requires_approval`, an unscoped write, or a call
+    /// the permission rules only "ask" for.
+    ApprovalRequired,
+    /// Refused, carrying the same message the live envelope returns for this refusal.
+    Deny(String),
+}
+
+impl AuthorizeVerdict {
+    /// Whether the envelope refused the call outright.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, AuthorizeVerdict::Deny(_))
+    }
+
+    /// The refusal message, if this is a [`Deny`](Self::Deny).
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            AuthorizeVerdict::Deny(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Whether [`Executor::gate`] is running on the live dispatch path (which records its audit
+/// observations) or serving an authorize-only decision (which records nothing — a hypothetical call
+/// has no business writing to the audit log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAudit {
+    Live,
+    DecisionOnly,
+}
+
+/// Everything the deterministic gates computed for a call that passed them — handed back to the
+/// live path so it doesn't recompute any of it, and read by [`Executor::authorize`] to classify the
+/// verdict.
+struct GatedCall {
+    spec: flux_spec::ToolSpec,
+    subjects: Vec<String>,
+    intents: IntentSet,
+    perm: PermDecision,
+    policy_requires_approval: bool,
+    identity: TurnIdentity,
+}
+
 impl Drop for CapScopeGuard<'_> {
     fn drop(&mut self) {
         let popped = self.cap_scopes.lock().unwrap().pop();
@@ -2693,6 +2748,176 @@ impl Executor {
         self.dispatch_outcome(name, params).await.result
     }
 
+    /// **Authorize-only** (D-177): would this call be admissible right now — and if not, why?
+    ///
+    /// Runs exactly the deterministic gates of [`dispatch_outcome`](Self::dispatch_outcome) — the
+    /// capability-scope floor, filesystem subject normalization, the authority contract, the
+    /// mandatory authorization-policy floor, and the permission rules — and **stops there**. It
+    /// shares one implementation with the live path (`gate`), so the two can't drift; drift here
+    /// would be a safety bug, not a cosmetic one.
+    ///
+    /// This is a *decision*, not a dispatch. It is deliberately **synchronous**, which is what makes
+    /// the "no execution side effect" property structural rather than a promise: `Tool::execute` and
+    /// `Approver::request` are both `async`, so neither is reachable from a non-`async` function.
+    /// Nothing else is touched either — no evidence observation is recorded, no permission rule is
+    /// added, no cache generation is bumped, the approver is never consulted.
+    ///
+    /// **Not a bypass, and not a substitute for dispatching.** A verdict here grants nothing: the
+    /// real call still goes through the full envelope, which re-decides everything from scratch and
+    /// additionally runs the pre-tool hooks (skipped here — a hook may rewrite `params`, and running
+    /// hooks for a hypothetical call would be a real side effect) and the approval gate. `Allow` from
+    /// this function means "the deterministic gates admit it", never "it may now run unchecked".
+    pub fn authorize(&self, name: &str, params: &Value) -> AuthorizeVerdict {
+        let Some(tool) = self.registry.get(name) else {
+            return AuthorizeVerdict::Deny(format!("unknown tool: {name}"));
+        };
+        match self.gate(name, params, tool.as_ref(), GateAudit::DecisionOnly) {
+            Err(reason) => AuthorizeVerdict::Deny(reason),
+            Ok(call) => {
+                // Mirrors `dispatch_outcome`'s `approval_sensitive`, minus the evidence-driven
+                // destructive escalation (recording evidence is a side effect) — a destructive op is
+                // reported as approval-gated on its own `Risk`/intent, which is the same conclusion
+                // the escalation reaction reaches for it.
+                let unscoped_write =
+                    call.spec.effects.contains(&Effect::Write) && call.subjects.is_empty();
+                if call.policy_requires_approval
+                    || call.spec.risk == Risk::Destructive
+                    || call.intents.is_destructive()
+                    || unscoped_write
+                    || call.perm != PermDecision::Allow
+                {
+                    AuthorizeVerdict::ApprovalRequired
+                } else {
+                    AuthorizeVerdict::Allow
+                }
+            }
+        }
+    }
+
+    /// The deterministic authorization gates shared by [`dispatch_outcome`](Self::dispatch_outcome)
+    /// (which then goes on to evidence, approval, and execution) and
+    /// [`authorize`](Self::authorize) (which stops here). `Err` is the refusal message the live path
+    /// returns verbatim, so the two surfaces always agree on *why*, not just *whether*.
+    ///
+    /// `audit` exists only because the live path records a `cap_scope_denied` observation that an
+    /// authorize-only decision must not: a hypothetical call has no business writing to the audit
+    /// log.
+    ///
+    /// The capability-scope floor is factored out into [`cap_scope_gate`](Self::cap_scope_gate)
+    /// because the live path must check it BEFORE the pre-tool hooks run (a hook must not observe —
+    /// or rewrite the input of — a call the scope already forbids), while everything below needs the
+    /// hooks' possibly-rewritten `params`. Checking it twice on the live path is harmless: it is a
+    /// pure read of the scope stack, and a denial returns before the second check.
+    fn gate(
+        &self,
+        name: &str,
+        params: &Value,
+        tool: &dyn Tool,
+        audit: GateAudit,
+    ) -> std::result::Result<GatedCall, String> {
+        self.cap_scope_gate(name, audit)?;
+
+        let spec = tool.spec();
+        let subjects = tool.permission_subjects(params);
+        // Filesystem grants bind to the physical target, not the caller's lexical alias. Without
+        // this normalization an allow like `read(allowed/**)` could reach `secret/**` through an
+        // in-workspace symlink even though guarded IO correctly kept both paths inside the workspace.
+        let subjects = if spec.access.contains(&AccessKind::Filesystem) {
+            let access = if spec.effects.contains(&Effect::Write) {
+                PathAccess::Write
+            } else {
+                PathAccess::Read
+            };
+            let mut physical = Vec::with_capacity(subjects.len());
+            for subject in subjects {
+                match self.ctx.system.path_identity(&subject, access) {
+                    Ok(subject) => physical.push(subject),
+                    Err(err) => {
+                        return Err(format!("`{name}` denied by filesystem path guard: {err}"));
+                    }
+                }
+            }
+            physical
+        } else {
+            subjects
+        };
+        let intents = tool.intents(params);
+
+        let requirements = tool
+            .authority_requirements(params, &subjects)
+            .map_err(|err| format!("`{name}` denied by invalid authority contract: {err}"))?;
+
+        // 1. Mandatory authorization-policy floor: default-deny on any ungranted requirement. A
+        //    `Deny` short-circuits; an `ApprovalRequired` (e.g. a grant marked `requires_approval`,
+        //    like the default `process.exec`) forces the approval gate below even if a permissive
+        //    allow-rule would otherwise satisfy it — the policy is the floor, rules can't widen it.
+        let mut policy_requires_approval = false;
+        // Snapshot once per dispatch from the immutable lexical turn identity. The engine installs
+        // it only after acquiring its single-active-turn gate.
+        let identity = self.effective_identity();
+        for requirement in &requirements {
+            let req = PolicyRequest {
+                caller: identity.caller(),
+                trust: identity.trust(),
+                action: &requirement.action,
+                resource: &requirement.resource,
+            };
+            match evaluate(&self.policy, &req).decision {
+                Decision::Deny => {
+                    return Err(format!(
+                        "`{name}` denied by policy ({} on {:?})",
+                        requirement.action.0, requirement.resource.kind
+                    ));
+                }
+                Decision::ApprovalRequired => policy_requires_approval = true,
+                Decision::Allow => {}
+            }
+        }
+
+        // 2. Permission rules (coder-style): deny wins; otherwise allow/ask for tool + subjects.
+        let perm = self.perms.lock().unwrap().check(name, &subjects);
+        if perm == PermDecision::Deny {
+            return Err(format!("`{name}` denied by permission rules"));
+        }
+
+        Ok(GatedCall {
+            spec,
+            subjects,
+            intents,
+            perm,
+            policy_requires_approval,
+            identity,
+        })
+    }
+
+    /// The capability-scope floor (step 0) — see [`gate`](Self::gate). A pure read of the scope
+    /// stack; the only effect is the `cap_scope_denied` audit observation, recorded on the live path
+    /// and deliberately not on an authorize-only decision.
+    fn cap_scope_gate(&self, name: &str, audit: GateAudit) -> std::result::Result<(), String> {
+        // Checked FIRST, before pre-tool hooks or the policy/permission layers, and on EVERY dispatch
+        // (there is no other path to a tool's `execute`), so a composite op, a sub-agent's inner
+        // call, or any nested reentry that eventually calls `dispatch` again is caught exactly like a
+        // direct call. An empty stack (no `with_tools` scope active) is a strict no-op — every
+        // existing flow that never opens a scope is unaffected. A denial here can never be a false
+        // negative: the top of stack is always the *narrowed* effective set (see `push_cap_scope`),
+        // so this can only ever be as strict as, or stricter than, the outer session policy.
+        if let Some(scope) = self.active_cap_scope() {
+            if !scope.iter().any(|t| t == name) {
+                if matches!(audit, GateAudit::Live) {
+                    self.ctx.evidence.lock().unwrap().record(Observation::new(
+                        "cap_scope_denied",
+                        Phase::Turn,
+                        json!({ "tool": name, "scope": scope }),
+                    ));
+                }
+                return Err(format!(
+                    "`{name}` denied by capability scope (not in the active with_tools allowlist)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Like [`dispatch`](Self::dispatch), but also reports — structurally, not by inference —
     /// whether the envelope itself denied the call. See [`DispatchOutcome`].
     pub async fn dispatch_outcome(&self, name: &str, params: Value) -> DispatchOutcome {
@@ -2710,32 +2935,17 @@ impl Executor {
             );
         };
 
-        // 0. Capability-scope floor — checked FIRST, before pre-tool hooks or the policy/permission
-        //    layers below, and on EVERY dispatch (there is no other path to a tool's `execute`), so a
-        //    composite op, a sub-agent's inner call, or any nested reentry that eventually calls
-        //    `dispatch` again is caught exactly like a direct call. An empty stack (no `with_tools`
-        //    scope active) is a strict no-op — every existing flow that never opens a scope is
-        //    unaffected. A denial here can never be a false negative: the top of stack is always the
-        //    *narrowed* effective set (see `push_cap_scope`), so this can only ever be as strict as, or
-        //    stricter than, the outer session policy — never looser.
-        if let Some(scope) = self.active_cap_scope() {
-            if !scope.iter().any(|t| t == name) {
-                self.ctx.evidence.lock().unwrap().record(Observation::new(
-                    "cap_scope_denied",
-                    Phase::Turn,
-                    json!({ "tool": name, "scope": scope }),
-                ));
-                return self.finish_dispatch(
-                    name,
-                    started,
-                    approval_wait,
-                    None,
-                    ToolResult::error(format!(
-                        "`{name}` denied by capability scope (not in the active with_tools allowlist)"
-                    )),
-                    true,
-                );
-            }
+        // 0. Capability-scope floor — checked before the pre-tool hooks, so a hook never observes
+        //    (or rewrites the input of) a call the active `with_tools` scope already forbids.
+        if let Err(reason) = self.cap_scope_gate(name, GateAudit::Live) {
+            return self.finish_dispatch(
+                name,
+                started,
+                approval_wait,
+                None,
+                ToolResult::error(reason),
+                true,
+            );
         }
 
         // Pre-tool hooks (system-priority first): may modify the input or deny the call.
@@ -2759,103 +2969,30 @@ impl Executor {
             }
         }
 
-        let spec = tool.spec();
-        let subjects = tool.permission_subjects(&params);
-        // Filesystem grants bind to the physical target, not the caller's lexical alias. Without
-        // this normalization an allow like `read(allowed/**)` could reach `secret/**` through an
-        // in-workspace symlink even though guarded IO correctly kept both paths inside the workspace.
-        let subjects = if spec.access.contains(&AccessKind::Filesystem) {
-            let access = if spec.effects.contains(&Effect::Write) {
-                PathAccess::Write
-            } else {
-                PathAccess::Read
-            };
-            let mut physical = Vec::with_capacity(subjects.len());
-            for subject in subjects {
-                match self.ctx.system.path_identity(&subject, access) {
-                    Ok(subject) => physical.push(subject),
-                    Err(err) => {
-                        return self.finish_dispatch(
-                            name,
-                            started,
-                            approval_wait,
-                            None,
-                            ToolResult::error(format!(
-                                "`{name}` denied by filesystem path guard: {err}"
-                            )),
-                            true,
-                        );
-                    }
-                }
-            }
-            physical
-        } else {
-            subjects
-        };
-        let intents = tool.intents(&params);
-
-        let requirements = match tool.authority_requirements(&params, &subjects) {
-            Ok(requirements) => requirements,
-            Err(err) => {
+        // 1-2. The deterministic authorization gates — filesystem subject normalization, the
+        //    authority contract, the mandatory policy floor, and the permission rules — shared
+        //    verbatim with the authorize-only `Executor::authorize` (D-177) so the two can never
+        //    disagree about whether, or why, a call is admissible.
+        let GatedCall {
+            spec,
+            subjects,
+            intents,
+            perm,
+            policy_requires_approval,
+            identity,
+        } = match self.gate(name, &params, tool.as_ref(), GateAudit::Live) {
+            Ok(call) => call,
+            Err(reason) => {
                 return self.finish_dispatch(
                     name,
                     started,
                     approval_wait,
                     None,
-                    ToolResult::error(format!(
-                        "`{name}` denied by invalid authority contract: {err}"
-                    )),
+                    ToolResult::error(reason),
                     true,
                 );
             }
         };
-
-        // 1. Mandatory authorization-policy floor: default-deny on any ungranted requirement. A
-        //    `Deny` short-circuits; an `ApprovalRequired` (e.g. a grant marked `requires_approval`,
-        //    like the default `process.exec`) forces the approval gate below even if a permissive
-        //    allow-rule would otherwise satisfy it — the policy is the floor, rules can't widen it.
-        let mut policy_requires_approval = false;
-        // Snapshot once per dispatch from the immutable lexical turn identity. The engine installs
-        // it only after acquiring its single-active-turn gate.
-        let identity = self.effective_identity();
-        for requirement in &requirements {
-            let req = PolicyRequest {
-                caller: identity.caller(),
-                trust: identity.trust(),
-                action: &requirement.action,
-                resource: &requirement.resource,
-            };
-            match evaluate(&self.policy, &req).decision {
-                Decision::Deny => {
-                    return self.finish_dispatch(
-                        name,
-                        started,
-                        approval_wait,
-                        None,
-                        ToolResult::error(format!(
-                            "`{name}` denied by policy ({} on {:?})",
-                            requirement.action.0, requirement.resource.kind
-                        )),
-                        true,
-                    );
-                }
-                Decision::ApprovalRequired => policy_requires_approval = true,
-                Decision::Allow => {}
-            }
-        }
-
-        // 2. Permission rules (coder-style): deny wins; otherwise allow/ask for tool + subjects.
-        let perm = self.perms.lock().unwrap().check(name, &subjects);
-        if perm == PermDecision::Deny {
-            return self.finish_dispatch(
-                name,
-                started,
-                approval_wait,
-                None,
-                ToolResult::error(format!("`{name}` denied by permission rules")),
-                true,
-            );
-        }
 
         // 3. Evidence + reactions: record this call (and a destructive marker when matched), then
         //    let the built-in escalation reaction decide whether approval must be forced.
@@ -5221,6 +5358,138 @@ mod tests {
         assert!(has("git_repo") && has("go"));
         assert!(!has("python"));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // --- D-177: the authorize-only split ------------------------------------
+
+    /// A tool that records every `execute` — the counter that must NEVER move for an authorize-only
+    /// decision, no matter how many times it is asked.
+    struct SideEffectTool(Arc<AtomicU64>);
+
+    #[async_trait]
+    impl Tool for SideEffectTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("boom", "has a side effect", json!({"type": "object"}))
+        }
+        async fn execute(&self, _ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok("fired"))
+        }
+    }
+
+    struct DenyApprover;
+
+    #[async_trait]
+    impl Approver for DenyApprover {
+        async fn request(&self, _t: &str, _s: &[String], _i: &IntentSet) -> ApprovalChoice {
+            ApprovalChoice::Deny
+        }
+    }
+
+    fn authorize_executor(
+        fired: Arc<AtomicU64>,
+        allow: &[String],
+        deny: &[String],
+        approver: Arc<dyn Approver>,
+    ) -> Executor {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SideEffectTool(fired)));
+        Executor::new(
+            registry,
+            PermissionManager::from_rules(allow, deny),
+            approver,
+            test_ctx(),
+        )
+    }
+
+    /// **Adversarial**: `authorize` is a decision, not a dispatch. Asking it repeatedly — including
+    /// for a call it ALLOWS — never runs the op, never records an audit observation, and never
+    /// mutates the permission rules. (It is also structurally impossible for it to execute: it is a
+    /// synchronous fn, and `Tool::execute`/`Approver::request` are both `async`.)
+    #[tokio::test]
+    async fn authorize_decides_without_any_execution_side_effect() {
+        let fired = Arc::new(AtomicU64::new(0));
+        let executor =
+            authorize_executor(fired.clone(), &["boom".into()], &[], Arc::new(DenyApprover));
+
+        for _ in 0..5 {
+            assert_eq!(
+                executor.authorize("boom", &json!({})),
+                AuthorizeVerdict::Allow
+            );
+        }
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "an authorization DECISION must never run the op"
+        );
+        assert!(
+            executor.evidence().all().is_empty(),
+            "a hypothetical call must not write to the audit log: {:?}",
+            executor.evidence().all()
+        );
+    }
+
+    /// **Adversarial**: an `Allow` verdict opens no bypass. The same call, actually dispatched, still
+    /// goes through the whole envelope — here the approver's `Deny` refuses it, and the op never runs.
+    #[tokio::test]
+    async fn an_allow_verdict_is_not_a_bypass_of_the_real_envelope() {
+        let fired = Arc::new(AtomicU64::new(0));
+        // "ask" (no allow rule) + a policy that needs no approval ⇒ authorize reports the gate...
+        let executor = authorize_executor(fired.clone(), &[], &[], Arc::new(DenyApprover));
+        assert_eq!(
+            executor.authorize("boom", &json!({})),
+            AuthorizeVerdict::ApprovalRequired,
+            "the rules only ask for this op — the envelope would prompt"
+        );
+
+        // ...and the real dispatch still asks, and is still refused.
+        let outcome = executor.dispatch_outcome("boom", json!({})).await;
+        assert!(outcome.denied, "the approver's Deny must still refuse");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "a denied dispatch never reaches the op"
+        );
+    }
+
+    /// `authorize` and the live envelope agree on WHY, not just whether: a permission-rule deny
+    /// reports the same refusal message through both surfaces (they share one implementation).
+    #[tokio::test]
+    async fn authorize_and_dispatch_report_the_same_refusal() {
+        let fired = Arc::new(AtomicU64::new(0));
+        let executor = authorize_executor(
+            fired.clone(),
+            &[],
+            &["boom".into()],
+            Arc::new(DelayedAllowApprover),
+        );
+
+        let verdict = executor.authorize("boom", &json!({}));
+        assert!(verdict.is_denied(), "{verdict:?}");
+
+        let outcome = executor.dispatch_outcome("boom", json!({})).await;
+        assert!(outcome.denied);
+        assert_eq!(
+            verdict.reason().unwrap(),
+            outcome.result.content,
+            "the two surfaces must not drift apart on the refusal wording"
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+    }
+
+    /// An unknown op is refused by both surfaces rather than silently admitted.
+    #[test]
+    fn authorize_denies_an_unknown_op() {
+        let executor = authorize_executor(
+            Arc::new(AtomicU64::new(0)),
+            &["boom".into()],
+            &[],
+            Arc::new(DenyApprover),
+        );
+        let verdict = executor.authorize("no-such-op", &json!({}));
+        assert!(verdict.is_denied(), "{verdict:?}");
     }
 
     #[test]
