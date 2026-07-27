@@ -2,7 +2,7 @@
 id: L-78
 title: flux render PNG output — resvg rasterization + embedded font + write_file_bytes
 pillar: Language
-status: backlog
+status: in-progress
 priority:
 epic: flux-render
 design: docs/designs/flux-render.md
