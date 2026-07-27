@@ -2299,9 +2299,7 @@ async fn handle_command(
                 .map(|e| e.as_str())
                 .unwrap_or("(provider default)");
             state.push(Entry::Notice {
-                text: format!(
-                    "effort: {current} · usage: /effort <low|medium|high|xhigh|max|off>"
-                ),
+                text: format!("effort: {current} · usage: /effort <low|medium|high|xhigh|max|off>"),
                 sev: Sev::Info,
             });
         }

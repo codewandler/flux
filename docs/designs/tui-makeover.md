@@ -56,7 +56,7 @@ and loop/composite presentation wrappers. Those are UI state rather than executi
 
 ## Commands and safety
 
-The TUI owns `/help`, `/quit`, `/plan`, `/run`, `/model`, `/shell`, `/tools`, `/evidence`,
+The TUI owns `/help`, `/quit`, `/plan`, `/run`, `/model`, `/effort`, `/shell`, `/tools`, `/evidence`,
 `/session`, `/sessions`, `/resume`, `/new`, `/clear`, `/compact`, and `/queue`. `/new` and `/clear`
 both mint a real session; `/sessions` is a dense keyboard picker. State-changing commands require an
 idle action; quitting denies a pending approval, cancels, clears queued work, joins, then restores the
