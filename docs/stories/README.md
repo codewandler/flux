@@ -31,6 +31,14 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Next (ready — take the top one unless the user named a story)
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 
+### Deterministic Agent Lab — Test · Tune · Resurrect
+_flux's founding thesis is *the LLM is not the runtime*. Every turn's plan is persisted as_
+- [D-181 — Scope the resurrect ledger and crash tail to the interrupted turn, not the session](D-181-turn-scoped-resurrect-ledger.md) · Agent · review finding (2026-07-28): session-wide fold can fast-forward on a PREVIOUS turn's progress or serve a previous turn's cells
+- [D-182 — Record served cells on the what-if re-plan path so its diffs are never vacuous](D-182-whatif-replan-self-recording.md) · Agent · review finding (2026-07-28): re-plan path drives run_turn_pinned with a bare NullSink — a fully tape-served re-plan diffs as total divergence
+- [D-183 — Run the auto-resurrect step on every turn entry — SDK stream/start_flow and the CLI REPL/TUI](D-183-auto-resurrect-every-turn-entry.md) · Agent · review finding (2026-07-28): only send/send_with (SDK) and one-shot flux run (CLI) resurrect; stream/start_flow/REPL/TUI turns run on top of a crashed turn
+- [D-184 — Close the Lab's honesty gaps — is_clean vs live calls, golden-update reports, silent no-op substitutions](D-184-lab-honesty-gaps.md) · Agent · review finding (2026-07-28): three spots report cleaner than reality — the opposite of the Lab's stated honesty contract
+- [D-185 — Fixture and Lab-CLI hygiene — record/test name validation, atomic session copy, diff rendering](D-185-fixture-and-lab-cli-hygiene.md) · Agent · review finding (2026-07-28): minor hygiene batch across flux record/test, copy_session_to, and the run-diff fallback renderer
+
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
