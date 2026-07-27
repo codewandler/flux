@@ -26,6 +26,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Standalone numeric answers no longer disappear in Markdown rendering.** An answer consisting
+  only of an ordered-list marker such as `2.` parsed as a valid empty list item, but the shared
+  terminal/TUI layout dropped empty items—including their visible marker—so the turn appeared
+  blank even though its answer was persisted. Empty list items now render their marker, with a
+  regression covering every standalone digit from `0.` through `9.`.
 - **C-91: approval prompts are now visible in the plain (non-TUI) CLI.** Without `--yes`, the
   interactive approval prompt was printed to stderr and then erased within one 80 ms tick by the
   spinner's `\r\x1b[K` repaint (and by a `planning(false)` line-clear drained mid-approval), leaving

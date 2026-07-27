@@ -197,6 +197,18 @@ mod tests {
     }
 
     #[test]
+    fn standalone_single_digit_answers_remain_visible() {
+        for digit in 0..=9 {
+            let source = format!("{digit}.");
+            assert_eq!(
+                render_ansi(&source, &Theme::no_color(), 80),
+                format!("{digit}.\n"),
+                "standalone numeric answer {source:?} must not disappear as an empty list item"
+            );
+        }
+    }
+
+    #[test]
     fn tty_mode_redraws_in_place() {
         let mut live = LiveRenderer::new(Theme::no_color(), 80, true);
         let mut out = Vec::new();

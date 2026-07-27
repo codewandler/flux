@@ -195,9 +195,14 @@ impl Layouter {
     fn list(&mut self, l: &List) {
         for (n, item) in l.items.iter().enumerate() {
             let marker = if l.ordered {
-                format!("{}{} ", l.start + n as u64, marker_sep(l.marker))
+                format!("{}{}", l.start + n as u64, marker_sep(l.marker))
             } else {
-                "• ".to_string()
+                "•".to_string()
+            };
+            let marker = if item.blocks.is_empty() {
+                marker
+            } else {
+                format!("{marker} ")
             };
             let pad = " ".repeat(UnicodeWidthStr::width(marker.as_str()));
             self.prefixes.push(Prefix {
@@ -205,7 +210,17 @@ impl Layouter {
                 cont: Seg::plain(pad),
                 emitted: false,
             });
-            self.blocks(&item.blocks, l.tight);
+            if item.blocks.is_empty() {
+                // Empty Markdown list items still have visible syntax. In particular, a terse
+                // model answer such as `2.` parses as an empty ordered item; dropping its marker
+                // here made the entire assistant response disappear in both terminal renderers.
+                self.gap();
+                let prefix = self.indent_first();
+                self.cur.extend(prefix);
+                self.newline();
+            } else {
+                self.blocks(&item.blocks, l.tight);
+            }
             self.prefixes.pop();
         }
     }

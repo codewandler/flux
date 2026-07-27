@@ -28,6 +28,9 @@
 
 ### Fixed
 
+- **Short numeric answers stay visible.** A response consisting only of a number and period, such
+  as `2.`, could disappear because it looked like an empty numbered list. It now displays normally
+  in both the terminal and TUI.
 - **Approval prompts no longer vanish behind the spinner.** Running without `--yes` in the plain
   terminal, the confirmation prompt was being overwritten by the progress spinner within a fraction
   of a second — the run looked stuck even though pressing `y` quietly approved it. The prompt now
