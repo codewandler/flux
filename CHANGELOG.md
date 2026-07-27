@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **L-78: `flux render -o out.png` rasterizes the highlighted image to PNG.** The render
+  subcommand branches on the `-o` extension: `.png` (case-insensitive) rasterizes the SVG through
+  a new feature-gated `png` stack on flux-tools (`resvg`/`usvg`/`tiny-skia`/`fontdb`, with an
+  embedded JetBrains Mono v2.304 as the only font — hermetic, no system-font dependency) and
+  writes bytes through flux-system's new `System::write_file_bytes` (write-jailed exactly like
+  the text path, parents created). Any other extension keeps writing SVG text, stdout stays
+  SVG-only, and the model-facing `flow_render` tool is unchanged (`ToolResult` is text-only). A
+  ~16.7M-pixel canvas budget rejects oversized renders before allocation. flux-cli enables `png`
+  in its default features, so the stock binary and `task install` include it, while the eight
+  library consumers of flux-tools never build the rasterizer.
+
+### Changed
+
+- **Workspace MSRV is now Rust 1.87** (was 1.85): the `resvg`/`usvg` 0.47 rasterizer stack
+  declares it. CI already pins 1.97.0, so only contributor toolchains on 1.85/1.86 are affected.
+
 ## [0.26.0] - 2026-07-15
 
 ### Changed

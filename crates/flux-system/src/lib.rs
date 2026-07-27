@@ -1097,6 +1097,18 @@ impl System {
         Ok(())
     }
 
+    /// Write raw bytes within the workspace, creating parent directories (also confined) — the
+    /// binary counterpart to [`read_file_bytes`](Self::read_file_bytes), for payloads that are
+    /// not UTF-8 text (rendered images, archives; L-78).
+    pub async fn write_file_bytes(&self, path: &str, contents: &[u8]) -> Result<()> {
+        let p = self.workspace.resolve(path)?;
+        if let Some(parent) = p.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&p, contents).await?;
+        Ok(())
+    }
+
     /// Atomically replace a UTF-8 workspace file from a create-new sibling. Both the destination
     /// and its parent are resolved through the write guard before any open, so file and directory
     /// symlinks cannot redirect project control-plane persistence outside the workspace.
@@ -2010,6 +2022,64 @@ mod tests {
         // The UTF-8 read path, by contrast, rejects it.
         assert!(sys.read_file("b.bin").await.is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_file_bytes_roundtrips_raw_including_nul() {
+        let (dir, sys) = temp_workspace();
+        // Bytes with an embedded NUL and invalid UTF-8 — this payload cannot ride the &str
+        // write_file path at all; write_file_bytes must persist it byte-exact (L-78).
+        let raw = [b'h', b'i', 0u8, 0xFF, b'!'];
+        sys.write_file_bytes("b.bin", &raw).await.unwrap();
+        assert_eq!(sys.read_file_bytes("b.bin").await.unwrap(), raw);
+        assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), raw);
+        // And the UTF-8 read path still rejects what landed.
+        assert!(sys.read_file("b.bin").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_file_bytes_creates_nested_parents() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file_bytes("sub/dir/b.bin", &[1u8, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(
+            sys.read_file_bytes("sub/dir/b.bin").await.unwrap(),
+            [1u8, 2, 3]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_file_bytes_rejects_escape() {
+        let (dir, sys) = temp_workspace();
+        assert!(sys.write_file_bytes("../escape.bin", b"x").await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_file_bytes_rejects_read_only_root() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ws_dir = std::env::temp_dir().join(format!("flux-sys-wsb-{}-{n}", std::process::id()));
+        let ext_dir =
+            std::env::temp_dir().join(format!("flux-sys-extb-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&ext_dir).unwrap();
+
+        let mut ws = Workspace::new(&ws_dir).unwrap();
+        ws.add_read_root(&ext_dir).unwrap();
+        let sys = System::new(ws);
+
+        let ext_file = ext_dir.join("out.bin");
+        // Writes stay confined to the primary root — a read-only root is never a write target.
+        assert!(sys
+            .write_file_bytes(ext_file.to_str().unwrap(), b"x")
+            .await
+            .is_err());
+
+        std::fs::remove_dir_all(&ws_dir).ok();
+        std::fs::remove_dir_all(&ext_dir).ok();
     }
 
     #[tokio::test]

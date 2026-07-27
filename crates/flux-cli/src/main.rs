@@ -316,7 +316,7 @@ mod tests {
     }
 
     /// L-77: `flux render` is an explicit subcommand — positional `.flux` file, `--view
-    /// source|tree` (default `source`), `-o <out.svg>`.
+    /// source|tree` (default `source`), `-o <out>` (a `.png` suffix rasterizes, L-78).
     #[test]
     fn render_subcommand_parses() {
         use super::{Cli, Commands, RenderView};
@@ -347,6 +347,13 @@ mod tests {
                 assert_eq!(view, RenderView::Source);
                 assert_eq!(out, None);
             }
+            other => panic!("expected Render, got {other:?}"),
+        }
+        // `-o` takes any path — a `.png` suffix selects rasterization downstream (L-78).
+        let cli3 = Cli::try_parse_from(["flux", "render", "greet.flux", "-o", "out.png"])
+            .expect("render with png out parses");
+        match cli3.command {
+            Some(Commands::Render { out, .. }) => assert_eq!(out.as_deref(), Some("out.png")),
             other => panic!("expected Render, got {other:?}"),
         }
     }
@@ -684,6 +691,81 @@ mod tests {
         assert!(std::fs::read_to_string(ws.join("broken.svg"))
             .unwrap()
             .starts_with("<svg"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// L-78: `-o out.png` (any case) rasterizes through `render_flux_png` and writes BYTES
+    /// through the workspace-confined `System::write_file_bytes`; a non-png extension stays SVG
+    /// text, and the jail rejects a PNG escape exactly like a text escape. Stdout stays SVG.
+    #[cfg(feature = "png")]
+    #[tokio::test]
+    async fn run_render_writes_png_bytes_and_keeps_the_jail() {
+        use super::{run_render_in, RenderView};
+        let base = std::env::temp_dir().join(format!("flux-render-png-cli-{}", std::process::id()));
+        let ws = base.join("ws");
+        let srcdir = base.join("elsewhere");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&srcdir).unwrap();
+        let greet = srcdir.join("greet.flux");
+        let src = "flow greet(name: String)\n  do notify \"hi\"\n";
+        std::fs::write(&greet, src).unwrap();
+        let system = super::System::new(super::Workspace::new(&ws).unwrap());
+
+        run_render_in(
+            &system,
+            greet.to_str().unwrap(),
+            RenderView::Tree,
+            Some("img/out.png"),
+        )
+        .await
+        .expect("png render of a valid flow succeeds");
+        let on_disk = std::fs::read(ws.join("img/out.png")).unwrap();
+        assert_eq!(&on_disk[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
+        // The file is byte-identical to what the rasterizer produces for the same source, and
+        // the IHDR dims match the reported canvas.
+        let expected = flux_tools::render::render_flux_png(src, flux_tools::render::View::Tree)
+            .expect("rasterize");
+        assert_eq!(on_disk, expected.bytes);
+        let w = u32::from_be_bytes(on_disk[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(on_disk[20..24].try_into().unwrap());
+        assert_eq!((w, h), (expected.width, expected.height));
+
+        // The extension match is case-insensitive…
+        run_render_in(
+            &system,
+            greet.to_str().unwrap(),
+            RenderView::Source,
+            Some("UP.PNG"),
+        )
+        .await
+        .expect("case-insensitive .png");
+        assert_eq!(
+            &std::fs::read(ws.join("UP.PNG")).unwrap()[..8],
+            b"\x89PNG\r\n\x1a\n"
+        );
+        // …and any other extension writes SVG text like before.
+        run_render_in(
+            &system,
+            greet.to_str().unwrap(),
+            RenderView::Source,
+            Some("out.txt"),
+        )
+        .await
+        .expect("other extension writes svg text");
+        assert!(std::fs::read_to_string(ws.join("out.txt"))
+            .unwrap()
+            .starts_with("<svg"));
+
+        // The byte writer keeps the workspace jail.
+        let err = run_render_in(
+            &system,
+            greet.to_str().unwrap(),
+            RenderView::Source,
+            Some("../escape.png"),
+        )
+        .await
+        .expect_err("png escape is jailed");
+        assert!(err.to_string().contains("../escape.png"), "got: {err:#}");
         std::fs::remove_dir_all(&base).ok();
     }
 

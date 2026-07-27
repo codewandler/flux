@@ -27,6 +27,26 @@ similar.workspace = true
 futures.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
+# Optional rasterizer stack for the `png` feature (L-78, `flux render -o out.png`). The four
+# versions are COUPLED (resvg 0.47 ↔ usvg 0.47 ↔ tiny-skia 0.12 ↔ fontdb 0.23): bump them
+# together — a fontdb/tiny-skia mismatch surfaces as cryptic two-type errors, not a version
+# error. `default-features = false` + `text` keeps system fonts and the raster-image decoders
+# out: the embedded JetBrains Mono (assets/fonts/) is the only face the rasterizer sees, so
+# PNG output is hermetic (no host font dependency). `png-format` enables Pixmap::encode_png.
+resvg = { version = "0.47", optional = true, default-features = false, features = ["text"] }
+usvg = { version = "0.47", optional = true, default-features = false, features = ["text"] }
+tiny-skia = { version = "0.12", optional = true, features = ["png-format"] }
+fontdb = { version = "0.23", optional = true }
+
+[features]
+# png (L-78): SVG → PNG rasterization for `flux render -o out.png`. Off by default so the eight
+# crates that depend on flux-tools (flux-sdk, flux-server, …) never build the rasterizer;
+# flux-cli's default build enables it. The model-facing `flow_render` tool stays SVG-only
+# either way (ToolResult is text-only).
+png = ["dep:resvg", "dep:usvg", "dep:tiny-skia", "dep:fontdb"]
 
 [dev-dependencies]
 tokio.workspace = true
+# cmap glyph-coverage pin for the embedded font (the `png` tests; cargo forbids optional
+# dev-deps, so this is unconditional — a tiny leaf crate).
+ttf-parser = "0.25"

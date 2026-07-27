@@ -7,6 +7,12 @@
 //! [`flux_lang::render::render_styled_spans`]. [`render_flux_svg`] is the pure core (no
 //! [`ToolContext`]) shared by the model-facing tool, the `flux render` CLI (L-77), and doc-image
 //! regeneration. [`ToolResult`] is text-only, so the tool stays read-only and SVG-only.
+//!
+//! With the `png` feature (L-78), [`render_flux_png`] rasterizes the same SVG to PNG bytes for
+//! the CLI's `-o out.png`, using an embedded JetBrains Mono as the only font (hermetic — no
+//! system-font dependency). Its tests run under `cargo test -p flux-tools --features png`; a
+//! plain `-p flux-tools` run compiles them out (workspace-level `cargo test` covers them via
+//! flux-cli's default features).
 
 use std::sync::Arc;
 
@@ -78,6 +84,85 @@ fn render(src: &str, view: View) -> Result<Rendered> {
         View::Tree => tree_lines(src)?,
     };
     Ok(svg_of(&lines))
+}
+
+// ---------------------------------------------------------------------------
+// PNG rasterization (L-78) — behind the `png` feature; the CLI's `-o out.png` is the only
+// caller. The model-facing tool above stays SVG-only (ToolResult is text-only).
+// ---------------------------------------------------------------------------
+
+/// The embedded face — the ONLY font the rasterizer sees (assets/README.md records provenance).
+/// Hermetic by construction: no `load_system_fonts`, so a bare CI container and a desktop
+/// produce the same pixels. "JetBrains Mono" is the third family in [`FONT`], so usvg resolves
+/// it from the SVG's own stack; the db's generic families are pinned to it as a fallback.
+#[cfg(feature = "png")]
+static FONT_TTF: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+
+/// Rasterization refuses canvases past this many pixels (~64 MiB of RGBA, 4096²): the CLI takes
+/// arbitrary files, and canvas dims scale with source size, so an unbounded pixmap is a memory
+/// DoS the pure-text SVG path never had.
+#[cfg(feature = "png")]
+const MAX_PIXELS: u64 = 16_777_216;
+
+/// A rasterized PNG plus the canvas facts the CLI's status line reports (pixel dims equal the
+/// SVG's `width`/`height` — the viewBox is 1:1).
+#[cfg(feature = "png")]
+#[derive(Debug)]
+pub struct RenderedPng {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Render Flux-Lang `src` like [`render_flux_svg`], then rasterize the SVG to PNG bytes with the
+/// embedded font. Same totality contract: `Source` never fails on malformed input, `Tree` needs
+/// parseable source. Errors when the canvas exceeds [`MAX_PIXELS`].
+#[cfg(feature = "png")]
+pub fn render_flux_png(src: &str, view: View) -> Result<RenderedPng> {
+    let rendered = render(src, view)?;
+    let pixels = rendered.width as u64 * rendered.height as u64;
+    if pixels > MAX_PIXELS {
+        return Err(Error::Other(format!(
+            "refusing to rasterize {}x{} canvas ({pixels} px > {MAX_PIXELS} px budget) — \
+             render to SVG instead (`-o out.svg`)",
+            rendered.width, rendered.height
+        )));
+    }
+    let bytes = rasterize(&rendered.svg)?;
+    Ok(RenderedPng {
+        bytes,
+        width: rendered.width as u32,
+        height: rendered.height as u32,
+    })
+}
+
+/// SVG → PNG bytes via usvg/resvg over a fontdb containing exactly the embedded JetBrains Mono.
+#[cfg(feature = "png")]
+fn rasterize(svg: &str) -> Result<Vec<u8>> {
+    let mut db = fontdb::Database::new();
+    db.load_font_data(FONT_TTF.to_vec());
+    db.set_monospace_family("JetBrains Mono");
+    db.set_sans_serif_family("JetBrains Mono");
+    db.set_serif_family("JetBrains Mono");
+    let opt = usvg::Options {
+        fontdb: Arc::new(db),
+        font_family: "JetBrains Mono".to_string(),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_str(svg, &opt)
+        .map_err(|e| Error::Other(format!("parse SVG for rasterization: {e}")))?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height()).ok_or_else(|| {
+        Error::Other(format!(
+            "allocate {}x{} pixmap",
+            size.width(),
+            size.height()
+        ))
+    })?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    pixmap
+        .encode_png()
+        .map_err(|e| Error::Other(format!("encode PNG: {e}")))
 }
 
 /// The token's fill colour. Brackets keep the foreground colour (the JS theme's
@@ -556,5 +641,109 @@ mod tests {
             .unwrap();
         assert!(r.is_error, "tree view of junk must be an error result");
         assert!(r.content.contains("tree view needs parseable source"));
+    }
+}
+
+/// PNG rasterization tests (L-78). Compiled only with the `png` feature — run via
+/// `cargo test -p flux-tools --features png`; workspace-level `cargo test` covers them through
+/// flux-cli's default features.
+#[cfg(all(test, feature = "png"))]
+mod png_tests {
+    use super::*;
+
+    /// Decode our own output back to pixels (tiny-skia's decoder, the crate that encoded it).
+    fn decode(bytes: &[u8]) -> tiny_skia::Pixmap {
+        tiny_skia::Pixmap::decode_png(bytes).expect("our PNG decodes")
+    }
+
+    /// Count pixels exactly matching an opaque theme colour. Glyph CORES are the pure fill;
+    /// anti-aliased edges blend toward the background, so exact matches undercount and the
+    /// thresholds below stay deliberately conservative.
+    fn count_rgb(px: &tiny_skia::Pixmap, r: u8, g: u8, b: u8) -> usize {
+        px.pixels()
+            .iter()
+            .filter(|p| p.alpha() == 255 && p.red() == r && p.green() == g && p.blue() == b)
+            .count()
+    }
+
+    #[test]
+    fn png_has_magic_and_canvas_dims() {
+        // The same fixture as the SVG geometry pin (`canvas_scales_with_longest_line_and_line_
+        // count`): the PNG's pixel dims must equal the SVG canvas 214x106.
+        let png = render_flux_png("flow f_much_longer\n  $x = 1\n", View::Source).unwrap();
+        assert_eq!((png.width, png.height), (214, 106));
+        assert_eq!(&png.bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
+        // IHDR width/height are big-endian u32s at bytes 16..24 — ties the PNG to the SVG
+        // geometry pin without trusting our own struct.
+        let w = u32::from_be_bytes(png.bytes[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(png.bytes[20..24].try_into().unwrap());
+        assert_eq!((w, h), (214, 106));
+        let decoded = decode(&png.bytes);
+        assert_eq!((decoded.width(), decoded.height()), (214, 106));
+    }
+
+    #[test]
+    fn png_paints_theme_colors() {
+        let png = render_flux_png(
+            "flow greet(name: String)\n  do notify \"hi\"  # say hi\n",
+            View::Source,
+        )
+        .unwrap();
+        let px = decode(&png.bytes);
+        let total = (px.width() * px.height()) as usize;
+        let bg = count_rgb(&px, 0x28, 0x2c, 0x34);
+        assert!(bg > total / 2, "background dominates: {bg}/{total}");
+        let keyword = count_rgb(&px, 0xc6, 0x78, 0xdd);
+        assert!(
+            keyword > 20,
+            "keyword-purple glyph cores painted: {keyword}"
+        );
+        let string = count_rgb(&px, 0x98, 0xc3, 0x79);
+        assert!(string > 20, "string-green glyph cores painted: {string}");
+    }
+
+    #[test]
+    fn png_tree_view_paints_connectors() {
+        let png = render_flux_png("flow f\n  $x = 1\n  return $x\n", View::Tree).unwrap();
+        let px = decode(&png.bytes);
+        let connector = count_rgb(&px, 0x5c, 0x63, 0x70);
+        assert!(
+            connector > 20,
+            "box-drawing connectors painted from the embedded font: {connector}"
+        );
+    }
+
+    #[test]
+    fn png_is_deterministic() {
+        // Same process only — never a cross-machine golden hash (SIMD rasterization variance).
+        let a = render_flux_png("flow f\n  $x = 1\n  return $x\n", View::Tree).unwrap();
+        let b = render_flux_png("flow f\n  $x = 1\n  return $x\n", View::Tree).unwrap();
+        assert_eq!(
+            a.bytes, b.bytes,
+            "same input, same process → identical bytes"
+        );
+    }
+
+    #[test]
+    fn embedded_font_covers_rendered_glyphs() {
+        // Colour-count tests can't tell a real glyph from a .notdef box (tofu paints with the
+        // text fill too) — pin cmap coverage directly so a wrong/corrupt font file fails here.
+        let face = ttf_parser::Face::parse(FONT_TTF, 0).expect("embedded TTF parses");
+        for c in ['├', '─', '└', '│', 'é', '—', '€'] {
+            assert!(
+                face.glyph_index(c).is_some(),
+                "embedded font lacks {c:?} (U+{:04X})",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn png_rejects_oversized_canvas() {
+        // One very long line: width ≈ 44 + 30_000·9.4 ≈ 282k px → ~30M px canvas, over budget.
+        // Must fail BEFORE any pixmap allocation.
+        let src = format!("flow f\n  $x = \"{}\"\n", "a".repeat(30_000));
+        let err = render_flux_png(&src, View::Source).unwrap_err();
+        assert!(err.to_string().contains("budget"), "got: {err}");
     }
 }

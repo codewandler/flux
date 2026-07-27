@@ -341,8 +341,10 @@ pub(super) enum Commands {
         /// renders) or `tree` (execution-path plan tree; a hard parse error exits non-zero).
         #[arg(long, value_enum, default_value_t)]
         view: RenderView,
-        /// Write the SVG to this path (workspace-confined, parents created) instead of stdout.
-        #[arg(short = 'o', long, value_name = "OUT.svg")]
+        /// Write to this path (workspace-confined, parents created) instead of stdout. A `.png`
+        /// extension rasterizes to PNG with the embedded font; anything else writes the SVG
+        /// text. Stdout is always SVG.
+        #[arg(short = 'o', long, value_name = "OUT")]
         out: Option<String>,
     },
     /// Run the strict-review protocol over `--files` and print a `ReviewReport` (flux L-13; design

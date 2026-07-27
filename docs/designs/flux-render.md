@@ -50,12 +50,14 @@ real grammar. It also lets flux **regenerate its own doc images**, retiring the 
 - `ToolResult` is **text-only**: `{ content: String, view: Option<String>, is_error }`
   (`crates/flux-runtime/src/lib.rs:49`; `ok_view` at :65 splits the canonical value from the
   model-facing rendering). There is no binary/artifact channel.
-- `system.write_file(path, &str)` is **`&str`-only** (`crates/flux-system/src/lib.rs:470`); there is
-  **no bytes writer**.
+- `system.write_file(path, &str)` is **`&str`-only** (`crates/flux-system/src/lib.rs:1091`); the
+  bytes writer is the L-78 addition `write_file_bytes(path, &[u8])` (:1103), confined to the
+  write jail exactly like the text path.
 
 Consequences: SVG is just text — return it inline (canonical `content`) with a compact `view`
-summary. Binary PNG can't inline and can't go through `write_file`, so **the model-facing tool stays
-read-only and SVG-only**; file output and PNG live in the CLI subcommand / Phase 2.
+summary. Binary PNG can't inline, so **the model-facing tool stays read-only and SVG-only**; PNG
+lives in the CLI subcommand (`-o out.png` → rasterize → `write_file_bytes`), shipped in Phase 2
+(L-78).
 
 ## Architecture — layered for reuse
 
@@ -157,12 +159,23 @@ from being flooded with markup.
   `render_flux_svg` and writing via `system.write_file` (SVG is text). Non-gated way to use/verify it;
   **replaces** `flux-tree-sitter/scripts/render-example.mjs` for regenerating doc images.
 
-**Phase 2 — PNG (opt-in, adds deps):**
-- `crates/flux-system/src/lib.rs` — add `write_file_bytes(path, &[u8])` (parallels `read_file_bytes`
-  at :481).
-- `crates/flux-tools/Cargo.toml` — `resvg` + `usvg` + `tiny-skia` + `fontdb`, embed a monospace font
-  (e.g. JetBrains Mono) so text lays out headlessly; rasterize SVG → PNG bytes → the CLI's `-o
-  out.png`. ⚠️ Confirm `flux-codegate` accepts the new external deps on `flux-tools`.
+**Phase 2 — PNG (opt-in, adds deps) — SHIPPED (L-78):**
+- `crates/flux-system/src/lib.rs` — `write_file_bytes(path, &[u8])` (:1103, parallels
+  `read_file_bytes` at :1166), with roundtrip/jail unit tests.
+- `crates/flux-tools/Cargo.toml` — `resvg` + `usvg` + `tiny-skia` + `fontdb` behind a **`png`
+  cargo feature** (off by default, so the eight flux-tools consumers never build the rasterizer;
+  flux-cli enables it in its default features, so the stock binary and `task install` render
+  PNGs). `default-features = false` + `text` keeps system fonts and raster-image decoders out.
+- `crates/flux-tools/assets/fonts/` — embedded JetBrains Mono v2.304 (OFL-1.1; provenance +
+  sha256 in `assets/README.md`); the rasterizer's fontdb sees only this face, so text lays out
+  identically headless.
+- `crates/flux-tools/src/render.rs` — `render_flux_png(src, view) -> RenderedPng` (reuses the
+  private `render()`; pixel budget of ~16.7M px guards against oversized canvases).
+- `crates/flux-cli` — `-o out.png` (case-insensitive extension) rasterizes and writes through
+  `write_file_bytes`; any other extension stays SVG text; stdout stays SVG-only.
+- ✅ `flux-codegate` needed no change: its layering lint only sees workspace crates, so external
+  deps pass trivially. The `png` feature required the workspace `rust-version` bump 1.85 → 1.87
+  (resvg/usvg 0.47 declare it).
 
 ## Stories (filed 2026-07-09)
 
@@ -177,8 +190,8 @@ from being flooded with markup.
 4. **[L-77](../stories/L-77-flux-render-cli-subcommand.md) — `flux render` CLI** — subcommand +
    retire the tree-sitter Node script (update `flux-tree-sitter` README/AGENTS to point at
    `flux render`).
-5. **[L-78](../stories/L-78-flux-render-png.md) — PNG (opt-in, backlog)** — `write_file_bytes` +
-   resvg rasterization + embedded font.
+5. **[L-78](../stories/L-78-flux-render-png.md) — PNG (opt-in)** — `write_file_bytes` +
+   resvg rasterization + embedded font. **Shipped** (feature-gated `png`; `-o out.png`).
 
 ## Verification
 
@@ -194,7 +207,9 @@ from being flooded with markup.
   --workspace --all-targets -- -D warnings` · `cargo fmt --all` · `cargo test -p flux-codegate`.
 - **End-to-end:** `flux render examples/*.flux --view tree -o /tmp/x.svg` then open it; `--view
   source` to eyeball highlighting. Model-facing path: an agent in a session invokes `flow_render`.
-- *(Phase 2)* rasterize to PNG, open it, confirm the embedded font renders text (not tofu).
+- *(Phase 2, shipped)* `flux render x.flux -o out.png` → open it: the embedded font renders text
+  (not tofu); `cargo test -p codewandler-flux-tools --features png` pins magic/dims/theme-colour
+  pixels/font cmap/pixel budget/determinism.
 
 ## Scope & non-goals
 
@@ -204,5 +219,5 @@ from being flooded with markup.
   Prism (website), TextMate/IntelliJ remain the in-editor stories. `flow_render` serves the surfaces
   that can't run a grammar (GitHub, Slack, docs, chat), and shares the `flux_lang::highlight`
   substrate with L-69.
-- **PNG** is deferred to Phase 2 (rasterizer deps + embedded font + a `flux-system` bytes writer);
-  Phase 1 SVG is self-contained string generation.
+- **PNG for the model-facing tool** stays out of scope even after Phase 2: `ToolResult` is
+  text-only, so PNG is a CLI surface (`-o out.png`) by design; `flow_render` remains SVG-only.

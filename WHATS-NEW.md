@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### New
+
+- **`flux render` can save the highlighted image as a PNG.** `flux render my.flux -o out.png`
+  produces a PNG with the same syntax colours as the SVG, and text renders identically on every
+  machine — the font is built in, so there is nothing to install. Any other output extension
+  keeps producing SVG.
+
 ## [0.26.0] - 2026-07-15
 
 ### New

@@ -1,9 +1,9 @@
 use super::*;
 
-/// `flux render <file.flux> [--view source|tree] [-o out.svg]` (L-77) — the non-gated entry point
-/// to the L-76 renderer, and the generator for flux's own doc images (replaces the
-/// flux-tree-sitter repo's `scripts/render-example.mjs`). Builds the workspace from the
-/// environment like every production construction site, then delegates to [`run_render_in`].
+/// `flux render <file.flux> [--view source|tree] [-o out.svg|out.png]` (L-77, PNG in L-78) — the
+/// non-gated entry point to the L-76 renderer, and the generator for flux's own doc images
+/// (replaces the flux-tree-sitter repo's `scripts/render-example.mjs`). Builds the workspace from
+/// the environment like every production construction site, then delegates to [`run_render_in`].
 pub(super) async fn run_render(file: &str, view: RenderView, out: Option<&str>) -> Result<()> {
     let system = System::from_env(std::env::current_dir()?).map_err(|e| anyhow::anyhow!("{e}"))?;
     run_render_in(&system, file, view, out).await
@@ -11,14 +11,16 @@ pub(super) async fn run_render(file: &str, view: RenderView, out: Option<&str>) 
 
 /// The testable core of `flux render`. The INPUT is read like the sibling file-input subcommands
 /// (`flow run`, `app run`): a plain filesystem read relative to the invocation cwd, so `../` and
-/// absolute paths work — only the `-o` WRITE is workspace-confined (through `System::write_file`;
-/// SVG is text, parents are created). A UTF-8 BOM is stripped before parsing (a PowerShell/
-/// Notepad-authored file would otherwise fail the parser with an invisible U+FEFF in the first
-/// token). Without `out` the SVG streams to stdout; an early-closing consumer (`flux render
-/// x.flux | head`) never panics — on Unix the process ends with the conventional SIGPIPE exit
-/// (`main` resets `SIG_DFL`, A-61), on Windows the `BrokenPipe` write error is treated as
-/// success. A hard parse error in `tree` view propagates — the CLI exits non-zero with the
-/// parser's message — while `source` view is total.
+/// absolute paths work — only the `-o` WRITE is workspace-confined (through `System::write_file`
+/// for SVG text, `System::write_file_bytes` for PNG bytes; parents are created). A UTF-8 BOM is
+/// stripped before parsing (a PowerShell/Notepad-authored file would otherwise fail the parser
+/// with an invisible U+FEFF in the first token). An `out` path ending in `.png`
+/// (case-insensitive) rasterizes via [`flux_tools::render::render_flux_png`]; every other
+/// extension writes the SVG text. Without `out` the SVG streams to stdout; an early-closing
+/// consumer (`flux render x.flux | head`) never panics — on Unix the process ends with the
+/// conventional SIGPIPE exit (`main` resets `SIG_DFL`, A-61), on Windows the `BrokenPipe` write
+/// error is treated as success. A hard parse error in `tree` view propagates — the CLI exits
+/// non-zero with the parser's message — while `source` view is total.
 pub(super) async fn run_render_in(
     system: &System,
     file: &str,
@@ -27,6 +29,37 @@ pub(super) async fn run_render_in(
 ) -> Result<()> {
     let source = std::fs::read_to_string(file).with_context(|| format!("read {file}"))?;
     let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
+    let view_word = match view {
+        RenderView::Source => "source",
+        RenderView::Tree => "tree",
+    };
+    // PNG arm (L-78): rasterize once and write bytes — never touches the SVG text path. Without
+    // the `png` cargo feature the arm stays reachable but fails with guidance, never a silent
+    // SVG-in-a-.png-file.
+    let wants_png = out
+        .and_then(|p| std::path::Path::new(p).extension())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+    if let (Some(path), true) = (out, wants_png) {
+        #[cfg(feature = "png")]
+        {
+            let png = flux_tools::render::render_flux_png(source, view.into())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            system
+                .write_file_bytes(path, &png.bytes)
+                .await
+                .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+            eprintln!(
+                "rendered {file} ({view_word} view) → {path} ({}x{} PNG)",
+                png.width, png.height
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "png"))]
+        anyhow::bail!(
+            "cannot write {path}: PNG output is compiled out of this build (the `png` cargo \
+             feature is off) — use an `.svg` output path or rebuild with default features"
+        );
+    }
     let svg = flux_tools::render::render_flux_svg(source, view.into())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     match out {
@@ -35,10 +68,6 @@ pub(super) async fn run_render_in(
                 .write_file(path, &svg)
                 .await
                 .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-            let view_word = match view {
-                RenderView::Source => "source",
-                RenderView::Tree => "tree",
-            };
             eprintln!("rendered {file} ({view_word} view) → {path}");
         }
         None => {
