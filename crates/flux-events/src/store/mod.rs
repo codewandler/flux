@@ -161,6 +161,13 @@ trait EventBackend: Send + Sync {
         keep: &[String],
     ) -> Result<usize>;
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent>;
+    /// D-174: append preserving an EXPLICIT `ts_ms` instead of stamping `now()` — the event-export
+    /// primitive ([`EventStore::copy_session_to`]) re-appends a source log into a fresh store and
+    /// must keep every event's recorded wall-clock time, or a re-imported run's `turns()`/timeline
+    /// projections would show the moment of the *copy*, not the moment of the *recording*. Otherwise
+    /// identical semantics to [`append`](Self::append) (idempotent-id retry, registry touch).
+    /// `pub(crate)`-only via the trait's own crate-private visibility — not a public API surface.
+    fn append_at(&self, stream: &str, ev: NewEvent, ts_ms: i64) -> Result<StoredEvent>;
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>>;
     fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>>;
     fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>>;
@@ -464,6 +471,57 @@ impl EventStore {
             out.push(self.append(stream, ev)?);
         }
         Ok(out)
+    }
+
+    /// Copy one session's full event log, in order, into a fresh session on `dst` — a **different**
+    /// [`EventStore`] (a different file or an in-memory scratch), not a copy within the same store.
+    /// The event-export primitive behind the Test Kit's `Scenario::record` (D-174): a recorded run
+    /// exports into a portable fixture directory, redacted-by-construction, safe to `git commit`.
+    ///
+    /// The destination session is minted via
+    /// [`create_session_with_context`](Self::create_session_with_context) (which already appends its
+    /// own `SessionStarted`), so the source's own `SessionStarted` (always `stream_seq` 0) is
+    /// skipped — copying it too would duplicate the marker with a stale model/timestamp. Every other
+    /// event re-appends in its **original order**, keeping its original `ts_ms` (via the
+    /// crate-private [`EventBackend::append_at`]) so a re-imported run still projects the same
+    /// `turns()` timeline instead of collapsing to "now".
+    ///
+    /// A `turn_id` (the `global_seq` of that turn's own `TurnStarted`) is backend-assigned and
+    /// differs between the source and destination stores, so every turn-scoped event's `turn_id` is
+    /// rewritten through a map built as `TurnStarted` rows are copied. A turn-scoped event whose
+    /// `turn_id` cannot be resolved (a malformed or truncated source log) is a loud error — never
+    /// silently dropped or left dangling on a turn that doesn't exist in `dst`.
+    ///
+    /// Returns the new session's id.
+    pub fn copy_session_to(&self, session: &str, dst: &EventStore) -> Result<String> {
+        let info = self.info(session)?;
+        let new_id = dst.create_session_with_context(&info.model, &info.context)?;
+        let mut turn_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for ev in self.load_stream(session, None)? {
+            if matches!(ev.kind, EventKind::SessionStarted { .. }) {
+                continue;
+            }
+            let turn_id = match ev.turn_id {
+                Some(old) => Some(turn_map.get(&old).copied().ok_or_else(|| {
+                    Error::Other(format!(
+                        "copy_session_to: event {} in session {session} references turn {old}, \
+                         which was never copied (its TurnStarted must precede every event it scopes)",
+                        ev.id
+                    ))
+                })?),
+                None => None,
+            };
+            let mut new_ev = NewEvent::new(ev.kind.clone());
+            new_ev.schema_version = ev.schema_version;
+            if let Some(turn_id) = turn_id {
+                new_ev = new_ev.in_turn(turn_id);
+            }
+            let stored = dst.backend().append_at(&new_id, new_ev, ev.ts_ms)?;
+            if matches!(ev.kind, EventKind::TurnStarted { .. }) {
+                turn_map.insert(ev.global_seq, stored.global_seq);
+            }
+        }
+        Ok(new_id)
     }
 
     // --- load ---------------------------------------------------------------
@@ -2079,6 +2137,219 @@ mod tests {
 
         // A second sweep at the same cutoff is a no-op (idempotent).
         assert_eq!(store.prune_adhoc_older_than(cutoff).unwrap(), 0);
+    }
+
+    // --- D-174: copy_session_to (event-export) ------------------------------
+
+    /// `copy_session_to` must reproduce every projection byte-for-byte: `conversation`, `turns`
+    /// (including the ORIGINAL `started_at_ms`/`ended_at_ms`, preserved via `append_at`), `run_trace`
+    /// (cell order intact), and `cost_summary`. No duplicated `SessionStarted` (the destination's own
+    /// `create_session_with_context` already mints one), so the total event count matches exactly.
+    #[test]
+    fn copy_session_to_reproduces_every_projection() {
+        let src = EventStore::in_memory().unwrap();
+        let ctx = EventContext {
+            account: Some("acct-1".into()),
+            agent_id: Some("agent-1".into()),
+            ..Default::default()
+        };
+        let sid = src.create_session_with_context("model-a", &ctx).unwrap();
+
+        let t1 = src.begin_turn(&sid, "hello", "model-a").unwrap();
+        src.record_message(&sid, &Message::user_text("hello"))
+            .unwrap();
+        src.record_run_event(
+            &sid,
+            &RunEvent::OpRecorded {
+                seq: 0,
+                step: "s1".into(),
+                op: "read".into(),
+                input_hash: "h1".into(),
+                input_hash_redacted: None,
+                input_view: None,
+                input_view_truncated: false,
+                content: "file contents".into(),
+                view: None,
+                is_error: false,
+                denied: false,
+                redacted: false,
+                truncated: false,
+            },
+        )
+        .unwrap();
+        src.record_call_usage(
+            &sid,
+            t1,
+            "model-a",
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        src.record_message(&sid, &Message::assistant_text("hi"))
+            .unwrap();
+        src.end_turn(&sid, t1, "answered", 1, "hi", None).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let t2 = src.begin_turn(&sid, "again", "model-a").unwrap();
+        src.record_message(&sid, &Message::user_text("again"))
+            .unwrap();
+        src.record_run_event(
+            &sid,
+            &RunEvent::OpRecorded {
+                seq: 1,
+                step: "s2".into(),
+                op: "write".into(),
+                input_hash: "h2".into(),
+                input_hash_redacted: None,
+                input_view: None,
+                input_view_truncated: false,
+                content: "wrote".into(),
+                view: None,
+                is_error: false,
+                denied: false,
+                redacted: false,
+                truncated: false,
+            },
+        )
+        .unwrap();
+        src.record_call_usage(
+            &sid,
+            t2,
+            "model-a",
+            Usage {
+                input_tokens: 20,
+                output_tokens: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        src.record_message(&sid, &Message::assistant_text("again reply"))
+            .unwrap();
+        src.end_turn(&sid, t2, "answered", 1, "again reply", None)
+            .unwrap();
+
+        let dst = EventStore::in_memory().unwrap();
+        let new_id = src.copy_session_to(&sid, &dst).unwrap();
+
+        assert_eq!(
+            src.conversation(&sid).unwrap(),
+            dst.conversation(&new_id).unwrap(),
+            "conversation projection"
+        );
+        assert_eq!(
+            src.run_trace(&sid).unwrap(),
+            dst.run_trace(&new_id).unwrap(),
+            "run_trace (cell order) projection"
+        );
+
+        let src_turns = src.turns(&sid).unwrap();
+        let dst_turns = dst.turns(&new_id).unwrap();
+        assert_eq!(src_turns.len(), 2);
+        assert_eq!(dst_turns.len(), 2);
+        for (s, d) in src_turns.iter().zip(dst_turns.iter()) {
+            assert_eq!(s.user_input, d.user_input);
+            assert_eq!(s.outcome, d.outcome);
+            assert_eq!(s.answer, d.answer);
+            assert_eq!(s.call_usage, d.call_usage);
+            assert_eq!(
+                s.started_at_ms, d.started_at_ms,
+                "ts_ms preserved (started)"
+            );
+            assert_eq!(s.ended_at_ms, d.ended_at_ms, "ts_ms preserved (ended)");
+        }
+
+        let pricing = flux_core::PricingTable::builtin();
+        assert_eq!(
+            src.cost_summary(&sid, &pricing).unwrap(),
+            dst.cost_summary(&new_id, &pricing).unwrap(),
+            "cost_summary projection"
+        );
+
+        // No duplicated SessionStarted: destination's own (from create_session_with_context)
+        // replaces the source's, so the total event count matches exactly.
+        assert_eq!(
+            src.load_stream(&sid, None).unwrap().len(),
+            dst.load_stream(&new_id, None).unwrap().len(),
+            "no duplicated SessionStarted"
+        );
+
+        let info = dst.info(&new_id).unwrap();
+        assert_eq!(info.model, "model-a");
+        assert_eq!(info.context.account.as_deref(), Some("acct-1"));
+    }
+
+    /// The destination's `TurnStarted` global_seqs are backend-assigned afresh (a fresh session in a
+    /// fresh — or merely different — store), so every turn-scoped event's `turn_id` must be rewritten
+    /// through the copy's own map, never left pointing at the SOURCE's turn ids.
+    #[test]
+    fn copy_session_to_remaps_turn_ids_to_the_destination_session() {
+        let src = EventStore::in_memory().unwrap();
+        let sid = src.create_session("model-a").unwrap();
+        let t1 = src.begin_turn(&sid, "one", "model-a").unwrap();
+        src.record_call_usage(&sid, t1, "model-a", Usage::default())
+            .unwrap();
+        src.end_turn(&sid, t1, "answered", 1, "ok", None).unwrap();
+        let t2 = src.begin_turn(&sid, "two", "model-a").unwrap();
+        src.record_call_usage(&sid, t2, "model-a", Usage::default())
+            .unwrap();
+        src.end_turn(&sid, t2, "answered", 1, "ok", None).unwrap();
+
+        let dst = EventStore::in_memory().unwrap();
+        let new_id = dst.create_session("occupy-earlier-ids").unwrap();
+        // Give `dst` some unrelated prior history so its next-minted global_seqs are guaranteed to
+        // differ from the source's — the remap must not accidentally "work" only because both
+        // stores' sequences happen to line up.
+        dst.record_message(&new_id, &Message::user_text("unrelated"))
+            .unwrap();
+
+        let copied_id = src.copy_session_to(&sid, &dst).unwrap();
+        let dst_events = dst.load_stream(&copied_id, None).unwrap();
+        let dst_turn_starts: std::collections::HashSet<i64> = dst_events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TurnStarted { .. }))
+            .map(|e| e.global_seq)
+            .collect();
+        assert_eq!(dst_turn_starts.len(), 2);
+        // Not the source's own turn ids (proves this is a real remap, not a passthrough).
+        assert!(!dst_turn_starts.contains(&t1));
+        assert!(!dst_turn_starts.contains(&t2));
+        for e in &dst_events {
+            if let Some(turn_id) = e.turn_id {
+                assert!(
+                    dst_turn_starts.contains(&turn_id),
+                    "every scoped event's turn_id must resolve to a copied TurnStarted in dst, \
+                     got {turn_id} not in {dst_turn_starts:?}"
+                );
+            }
+        }
+    }
+
+    /// A turn-scoped event whose `turn_id` doesn't correspond to any `TurnStarted` copied so far (a
+    /// malformed/partial source log) is a loud error — never silently dropped or left dangling.
+    #[test]
+    fn copy_session_to_errors_loudly_on_an_unmappable_turn_id() {
+        let src = EventStore::in_memory().unwrap();
+        let sid = src.create_session("model-a").unwrap();
+        src.append(
+            &sid,
+            NewEvent::new(EventKind::CallUsage {
+                model: "model-a".into(),
+                usage: Usage::default(),
+            })
+            .in_turn(999_999),
+        )
+        .unwrap();
+
+        let dst = EventStore::in_memory().unwrap();
+        let err = src.copy_session_to(&sid, &dst).unwrap_err();
+        assert!(
+            err.to_string().contains("999999"),
+            "expected the unmappable turn_id in the diagnostic, got: {err}"
+        );
     }
 
     /// The SQLite backend: every backend-agnostic conformance body against a fresh in-memory store

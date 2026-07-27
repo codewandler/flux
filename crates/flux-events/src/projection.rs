@@ -5,7 +5,7 @@
 //! sites. The conversation projection is the headline: the "conversations view" we mainly
 //! used the session store for is now *derived* from the log rather than stored directly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use flux_core::{is_subscription, CostSource, Message, Money, PricingTable, Usage};
 use flux_lang::ast::RunEvent;
@@ -629,13 +629,52 @@ pub fn stmt_rows(trace: &[RunEvent]) -> Vec<StmtRow> {
     rows
 }
 
+/// Fold a trace into one synthetic row per recorded dispatch — the fallback diff unit for a
+/// **natively dispatched** turn, which appends no `StatementCompleted`/`PlanHalted` boundary at all
+/// (the adaptive loop dispatches native tool calls directly and records the equivalent Flux-Lang
+/// program as replay metadata only, see `flux_flow::staged::record_host_flow`). Content identity is
+/// the dispatch itself — `op` plus its recorded `input_hash` — so the same call in the same position
+/// compares equal, and a different call reads as a plan divergence exactly like a differing
+/// `stmt_hash16` does.
+fn cell_rows(trace: &[RunEvent]) -> Vec<StmtRow> {
+    trace
+        .iter()
+        .filter_map(|ev| match ev {
+            RunEvent::OpRecorded {
+                op,
+                content,
+                input_hash,
+                ..
+            } => Some((op.clone(), content.clone(), input_hash.clone())),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(i, (op, content, hash))| StmtRow {
+            node: i as u32,
+            stmt: format!("call:{op}:{}", &hash[..hash.len().min(16)]),
+            halted: false,
+            cells: vec![(op, content)],
+        })
+        .collect()
+}
+
 /// Diff two run traces (C-44): positional alignment over the executed-statement sequence — the
 /// natural shape for "a run and its fork" (shared prefix, then divergence). Classification:
 /// differing `stmt_hash16` → the plan changed (`DiffRow::Plan`); same statement but differing
 /// recorded op output → the world changed (`DiffRow::Output`); else `Same`.
+///
+/// When either side has no statement ledger — a natively dispatched turn (see [`cell_rows`]) — BOTH
+/// sides fall back to their flat dispatch sequence, so a natively dispatched recording still aligns
+/// against an interpreter-executed rerun of the same plan (D-176's Tune door) instead of reading as
+/// a wholesale plan rewrite. Two natively dispatched runs likewise compare on their real dispatches
+/// rather than vacuously reporting "identical" because neither has statements.
 pub fn run_diff(a: &[RunEvent], b: &[RunEvent]) -> RunDiff {
-    let ra = stmt_rows(a);
-    let rb = stmt_rows(b);
+    let mut ra = stmt_rows(a);
+    let mut rb = stmt_rows(b);
+    if ra.is_empty() || rb.is_empty() {
+        ra = cell_rows(a);
+        rb = cell_rows(b);
+    }
     let mut rows = Vec::new();
     let n = ra.len().max(rb.len());
     for i in 0..n {
@@ -693,6 +732,108 @@ pub fn run_diff(a: &[RunEvent], b: &[RunEvent]) -> RunDiff {
     }
     let identical = rows.iter().all(|r| matches!(r, DiffRow::Same { .. }));
     RunDiff { rows, identical }
+}
+
+/// Humanize every `stmt_hash16` a [`RunDiff`] row can reference: every accepted plan attempt across
+/// `turns` is re-parsed and its top-level statements re-formatted individually, keyed by the SAME
+/// `stmt_hash16` the trace rows carry (D-174, hoisted from the `flux diff` CLI command so both the
+/// CLI and the SDK's Test Kit render the same human-readable diff). Pass the union of every session
+/// involved in the diff — a statement introduced by only one side must still resolve.
+pub fn stmt_texts(turns: &[TurnSummary]) -> HashMap<String, String> {
+    let mut texts = HashMap::new();
+    for turn in turns {
+        for attempt in &turn.plan_attempts {
+            let Some(src) = &attempt.plan_source else {
+                continue;
+            };
+            let Ok(ast) = flux_lang::parse::parse(src) else {
+                continue;
+            };
+            for node in &ast.body {
+                let hash = flux_lang::runtime::stmt_hash16(node);
+                let one = flux_lang::format::format(&flux_lang::ast::DraftAst {
+                    name: None,
+                    params: vec![],
+                    returns: None,
+                    body: vec![node.clone()],
+                });
+                texts.insert(hash, one.trim().replace('\n', " ⏎ "));
+            }
+        }
+    }
+    texts
+}
+
+/// The rendering style of one [`render_run_diff`] line — lets a caller color/tag lines without
+/// re-deriving the classification from the text (the `flux diff` CLI dims `Same`, for instance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiffLineKind {
+    /// A `DiffRow::Same` line.
+    Same,
+    /// A `DiffRow::Plan` divergence line (or its `-`/`+` detail lines).
+    Plan,
+    /// A `DiffRow::Output` divergence line (or its `-`/`+`/op detail lines).
+    Output,
+}
+
+/// Render a [`RunDiff`] into human-readable lines (D-174, hoisted from `flux diff`'s
+/// `run_diff_cmd`): `= <stmt>` for a same row, `~ plan diverges:` + a `-`/`+` pair for a plan
+/// divergence, `≠ same statement, different world — <stmt>` + the differing op's `-`/`+` excerpt for
+/// an output divergence. `texts` resolves a row's `stmt_hash16`-keyed statement — build it with
+/// [`stmt_texts`] over every session the diff spans. A hash absent from `texts` (a truncated/dropped
+/// `plan_source`) renders as `<hash>` rather than panicking or silently blanking the line.
+pub fn render_run_diff(
+    diff: &RunDiff,
+    texts: &HashMap<String, String>,
+) -> Vec<(DiffLineKind, String)> {
+    let text = |stmt: &Option<String>| -> String {
+        match stmt {
+            Some(h) => texts.get(h).cloned().unwrap_or_else(|| format!("<{h}>")),
+            None => "∅ (no statement at this position)".into(),
+        }
+    };
+    let excerpt = |s: &str| -> String {
+        let mut end = 96.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < s.len() {
+            format!("{}…", s[..end].replace('\n', " "))
+        } else {
+            s.replace('\n', " ")
+        }
+    };
+
+    let mut out = Vec::new();
+    for row in &diff.rows {
+        match row {
+            DiffRow::Same { stmt, .. } => {
+                out.push((
+                    DiffLineKind::Same,
+                    format!("  = {}", text(&Some(stmt.clone()))),
+                ));
+            }
+            DiffRow::Plan { a_stmt, b_stmt, .. } => {
+                out.push((DiffLineKind::Plan, "  ~ plan diverges:".to_string()));
+                out.push((DiffLineKind::Plan, format!("    - {}", text(a_stmt))));
+                out.push((DiffLineKind::Plan, format!("    + {}", text(b_stmt))));
+            }
+            DiffRow::Output { stmt, op, a, b, .. } => {
+                out.push((
+                    DiffLineKind::Output,
+                    format!(
+                        "  ≠ same statement, different world — {}",
+                        text(&Some(stmt.clone()))
+                    ),
+                ));
+                out.push((DiffLineKind::Output, format!("    op `{op}`:")));
+                out.push((DiffLineKind::Output, format!("    - {}", excerpt(a))));
+                out.push((DiffLineKind::Output, format!("    + {}", excerpt(b))));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1862,5 +2003,95 @@ mod tests {
         // Identical traces.
         let d = run_diff(&a, &a);
         assert!(d.identical, "{:?}", d.rows);
+    }
+
+    /// D-174: `stmt_texts` humanizes every top-level statement of every accepted plan attempt,
+    /// keyed by the SAME `stmt_hash16` a run-trace's `DiffRow`s carry, and `render_run_diff` renders
+    /// a `RunDiff` through that map into the CLI's exact `= `/`~ plan diverges:`/`≠ same statement,
+    /// different world` shape (hoisted from `flux diff`).
+    #[test]
+    fn stmt_texts_and_render_run_diff_match_the_cli_shape() {
+        let src = "flow\n  $x = 1\n";
+        let ast = flux_lang::parse::parse(src).unwrap();
+        let hash = flux_lang::runtime::stmt_hash16(&ast.body[0]);
+
+        let turn = TurnSummary {
+            turn_id: 1,
+            user_input: "go".into(),
+            model: "m".into(),
+            outcome: "answered".into(),
+            iterations: 1,
+            answer: Some("ok".into()),
+            plan_attempts: vec![PlanAttempt {
+                step: 0,
+                outcome: "accepted".into(),
+                error: None,
+                fingerprint: None,
+                plan_text: None,
+                phase: None,
+                plan_source: Some(src.to_string()),
+                delta_source: None,
+            }],
+            started_at_ms: 0,
+            ended_at_ms: None,
+            usage: None,
+            calls: 0,
+            call_usage: Usage::default(),
+        };
+        let texts = stmt_texts(std::slice::from_ref(&turn));
+        assert_eq!(
+            texts.get(&hash).map(|s| s.as_str()),
+            Some("flow ⏎   $x = 1")
+        );
+
+        // A same row and a plan-divergence row exercise every DiffLineKind.
+        let diff = RunDiff {
+            rows: vec![
+                DiffRow::Same {
+                    node: 0,
+                    stmt: hash.clone(),
+                },
+                DiffRow::Plan {
+                    node: 1,
+                    a_stmt: Some(hash.clone()),
+                    b_stmt: None,
+                },
+                DiffRow::Output {
+                    node: 2,
+                    stmt: hash.clone(),
+                    op: "read".into(),
+                    a: "alpha".into(),
+                    b: "beta".into(),
+                },
+            ],
+            identical: false,
+        };
+        let lines = render_run_diff(&diff, &texts);
+        assert_eq!(
+            lines[0],
+            (DiffLineKind::Same, "  = flow ⏎   $x = 1".to_string())
+        );
+        assert_eq!(
+            lines[1],
+            (DiffLineKind::Plan, "  ~ plan diverges:".to_string())
+        );
+        assert_eq!(lines[2].0, DiffLineKind::Plan);
+        assert!(lines[2].1.contains("$x = 1"), "{:?}", lines[2]);
+        assert_eq!(lines[3].0, DiffLineKind::Plan);
+        assert!(
+            lines[3].1.contains("no statement"),
+            "b_stmt=None renders the ∅ placeholder: {:?}",
+            lines[3]
+        );
+        assert!(lines
+            .iter()
+            .any(|(k, l)| *k == DiffLineKind::Output
+                && l.contains("same statement, different world")));
+        assert!(lines
+            .iter()
+            .any(|(k, l)| *k == DiffLineKind::Output && l.contains("alpha")));
+        assert!(lines
+            .iter()
+            .any(|(k, l)| *k == DiffLineKind::Output && l.contains("beta")));
     }
 }

@@ -126,7 +126,15 @@ pub enum StopReason {
 }
 
 /// One unit of a streamed provider response.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Adjacently tagged (`{"t": "...", "c": ...}`) rather than externally tagged, so a unit-like
+/// variant such as [`Chunk::Usage`] wrapping a single field still round-trips unambiguously and a
+/// struct variant's fields sit under one `c` key instead of being spliced into the tag object. Added
+/// (D-174) so a recorded model call's chunk stream can be persisted verbatim in a test-kit cassette
+/// (`model.jsonl`) and replayed byte-for-byte — `serde_json::to_value`/`from_value` round-trips every
+/// variant (see the `chunk_serde_round_trips_every_variant` test below).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", content = "c", rename_all = "snake_case")]
 pub enum Chunk {
     /// The turn has started; carries the resolved model id.
     MessageStart { model: String },
@@ -333,5 +341,49 @@ mod tests {
             acc.audio_input_tokens, 60,
             "usage-less call must not zero it"
         );
+    }
+
+    /// D-174: every [`Chunk`] variant round-trips through `serde_json` byte-for-byte — the test
+    /// kit's model cassette (`model.jsonl`) persists a recorded call's raw chunk stream and must
+    /// replay it exactly, so a variant this misses would silently corrupt a fixture.
+    #[test]
+    fn chunk_serde_round_trips_every_variant() {
+        let samples = vec![
+            Chunk::MessageStart {
+                model: "claude-sonnet".into(),
+            },
+            Chunk::TextDelta("hello".into()),
+            Chunk::ThinkingDelta("pondering".into()),
+            Chunk::Block(ContentBlock::Text {
+                text: "hello".into(),
+            }),
+            Chunk::Block(ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "a.txt"}),
+            }),
+            Chunk::ToolInputDelta {
+                name: "read".into(),
+                partial_json: "{\"path\":".into(),
+            },
+            Chunk::Usage(Usage {
+                input_tokens: 12,
+                output_tokens: 3,
+                ..Default::default()
+            }),
+            Chunk::Done {
+                stop_reason: Some(StopReason::EndTurn),
+            },
+            Chunk::Done { stop_reason: None },
+            Chunk::StreamDiagnostic {
+                dropped_frames: 2,
+                detail: "unparseable SSE frame".into(),
+            },
+        ];
+        for chunk in samples {
+            let json = serde_json::to_string(&chunk).expect("chunk serializes");
+            let back: Chunk = serde_json::from_str(&json).expect("chunk deserializes");
+            assert_eq!(chunk, back, "round-trip mismatch via {json}");
+        }
     }
 }

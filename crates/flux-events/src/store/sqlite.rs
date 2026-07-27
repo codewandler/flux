@@ -150,19 +150,21 @@ fn collect_raw(
 /// Insert one event row (no registry update — callers handle that). Mints a ULID id when
 /// the event has none. `conn` is the active transaction (a `Transaction` derefs here). `ctx` is
 /// the stream's run context, stamped onto the returned [`StoredEvent`] (it lives on the registry,
-/// not the event row, so it is not persisted here — only surfaced).
+/// not the event row, so it is not persisted here — only surfaced). `ts` is the caller-chosen
+/// timestamp — ordinary appends pass `now_ms()`, [`SqliteEvents::append_at`] preserves an explicit
+/// one (D-174's event-export primitive).
 fn insert_event(
     conn: &Connection,
     stream: &str,
     ev: &NewEvent,
     stream_seq: i64,
     ctx: &EventContext,
+    ts: i64,
 ) -> Result<StoredEvent> {
     let id = ev
         .id
         .clone()
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
-    let ts = now_ms();
     let kind_tag = ev.kind.kind_tag();
     let payload = serde_json::to_string(&ev.kind)?;
     conn.prepare_cached(
@@ -304,6 +306,84 @@ impl SqliteEvents {
     }
 }
 
+impl SqliteEvents {
+    /// The shared body of `append`/`append_at` — differ only in whether `ts` is `now_ms()` or a
+    /// caller-preserved timestamp (D-174's `copy_session_to`).
+    fn append_with_ts(&self, stream: &str, ev: NewEvent, ts: i64) -> Result<StoredEvent> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(id) = &ev.id {
+            if let Some(existing) = load_by_id(&conn, id)? {
+                return Ok(existing);
+            }
+        }
+        let tx = begin_write(&conn)?;
+        // All events in a stream share its run context; read it once and stamp the stored event.
+        let ctx = read_context(&tx, stream)?;
+        let next_seq: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1",
+            )
+            .map_err(map_sql)?
+            .query_row([stream], |r| r.get(0))
+            .map_err(map_sql)?;
+        let stored = match insert_event(&tx, stream, &ev, next_seq, &ctx, ts) {
+            Ok(stored) => stored,
+            Err(e) => {
+                // C-87: caller-id idempotency is a check-then-insert — the `load_by_id` pre-check
+                // above and this INSERT are not atomic, so two writers on the shared file (a
+                // `serve` daemon + a CLI turn) can both miss the pre-check and race the INSERT. The
+                // loser trips `UNIQUE(id)`. Instead of surfacing that as an append error, roll back
+                // and re-read: if the id now resolves, the winner already stored this exact event, so
+                // return it (a no-op idempotent retry). Any other failure re-reads as absent and
+                // propagates unchanged.
+                if let Some(id) = &ev.id {
+                    drop(tx); // release the aborted write transaction before the follow-up read
+                    if let Some(existing) = load_by_id(&conn, id)? {
+                        return Ok(existing);
+                    }
+                }
+                return Err(e);
+            }
+        };
+        // Maintain the session registry — but only for real `s_<n>` sessions. The log itself accepts
+        // any stream string (the interpreter writes run events under ad-hoc ids like `"sess"`), so a
+        // non-session stream simply has no registry row to update.
+        if let Ok(n) = parse_id(stream) {
+            let model_opt = match &ev.kind {
+                EventKind::SessionStarted { model } | EventKind::ModelChanged { model } => {
+                    Some(model.as_str())
+                }
+                _ => None,
+            };
+            tx.prepare_cached(
+                "UPDATE streams SET updated_at = ?1, last_seq = ?2, model = COALESCE(?3, model) \
+                 WHERE n = ?4",
+            )
+            .map_err(map_sql)?
+            .execute(rusqlite::params![stored.ts_ms, next_seq, model_opt, n])
+            .map_err(map_sql)?;
+            // Keep msg_count equal to the live conversation length (so `list` matches a replay).
+            match &ev.kind {
+                EventKind::Message(_) => {
+                    tx.prepare_cached("UPDATE streams SET msg_count = msg_count + 1 WHERE n = ?1")
+                        .map_err(map_sql)?
+                        .execute([n])
+                        .map_err(map_sql)?;
+                }
+                EventKind::Compacted { messages } => {
+                    tx.prepare_cached("UPDATE streams SET msg_count = ?1 WHERE n = ?2")
+                        .map_err(map_sql)?
+                        .execute(rusqlite::params![messages.len() as i64, n])
+                        .map_err(map_sql)?;
+                }
+                _ => {}
+            }
+        }
+        tx.commit().map_err(map_sql)?;
+        Ok(stored)
+    }
+}
+
 impl EventBackend for SqliteEvents {
     fn create_session_with_context(&self, model: &str, ctx: &EventContext) -> Result<String> {
         let ts = now_ms();
@@ -329,7 +409,7 @@ impl EventBackend for SqliteEvents {
         let ev = NewEvent::new(EventKind::SessionStarted {
             model: model.to_string(),
         });
-        insert_event(&tx, &stream, &ev, 0, ctx)?;
+        insert_event(&tx, &stream, &ev, 0, ctx, now_ms())?;
         tx.commit().map_err(map_sql)?;
         Ok(stream)
     }
@@ -595,77 +675,11 @@ impl EventBackend for SqliteEvents {
     }
 
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
-        let conn = self.conn.lock().unwrap();
-        if let Some(id) = &ev.id {
-            if let Some(existing) = load_by_id(&conn, id)? {
-                return Ok(existing);
-            }
-        }
-        let tx = begin_write(&conn)?;
-        // All events in a stream share its run context; read it once and stamp the stored event.
-        let ctx = read_context(&tx, stream)?;
-        let next_seq: i64 = tx
-            .prepare_cached(
-                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = ?1",
-            )
-            .map_err(map_sql)?
-            .query_row([stream], |r| r.get(0))
-            .map_err(map_sql)?;
-        let stored = match insert_event(&tx, stream, &ev, next_seq, &ctx) {
-            Ok(stored) => stored,
-            Err(e) => {
-                // C-87: caller-id idempotency is a check-then-insert — the `load_by_id` pre-check
-                // above and this INSERT are not atomic, so two writers on the shared file (a
-                // `serve` daemon + a CLI turn) can both miss the pre-check and race the INSERT. The
-                // loser trips `UNIQUE(id)`. Instead of surfacing that as an append error, roll back
-                // and re-read: if the id now resolves, the winner already stored this exact event, so
-                // return it (a no-op idempotent retry). Any other failure re-reads as absent and
-                // propagates unchanged.
-                if let Some(id) = &ev.id {
-                    drop(tx); // release the aborted write transaction before the follow-up read
-                    if let Some(existing) = load_by_id(&conn, id)? {
-                        return Ok(existing);
-                    }
-                }
-                return Err(e);
-            }
-        };
-        // Maintain the session registry — but only for real `s_<n>` sessions. The log itself accepts
-        // any stream string (the interpreter writes run events under ad-hoc ids like `"sess"`), so a
-        // non-session stream simply has no registry row to update.
-        if let Ok(n) = parse_id(stream) {
-            let model_opt = match &ev.kind {
-                EventKind::SessionStarted { model } | EventKind::ModelChanged { model } => {
-                    Some(model.as_str())
-                }
-                _ => None,
-            };
-            tx.prepare_cached(
-                "UPDATE streams SET updated_at = ?1, last_seq = ?2, model = COALESCE(?3, model) \
-                 WHERE n = ?4",
-            )
-            .map_err(map_sql)?
-            .execute(rusqlite::params![stored.ts_ms, next_seq, model_opt, n])
-            .map_err(map_sql)?;
-            // Keep msg_count equal to the live conversation length (so `list` matches a replay).
-            match &ev.kind {
-                EventKind::Message(_) => {
-                    tx.prepare_cached("UPDATE streams SET msg_count = msg_count + 1 WHERE n = ?1")
-                        .map_err(map_sql)?
-                        .execute([n])
-                        .map_err(map_sql)?;
-                }
-                EventKind::Compacted { messages } => {
-                    tx.prepare_cached("UPDATE streams SET msg_count = ?1 WHERE n = ?2")
-                        .map_err(map_sql)?
-                        .execute(rusqlite::params![messages.len() as i64, n])
-                        .map_err(map_sql)?;
-                }
-                _ => {}
-            }
-        }
-        tx.commit().map_err(map_sql)?;
-        Ok(stored)
+        self.append_with_ts(stream, ev, now_ms())
+    }
+
+    fn append_at(&self, stream: &str, ev: NewEvent, ts_ms: i64) -> Result<StoredEvent> {
+        self.append_with_ts(stream, ev, ts_ms)
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

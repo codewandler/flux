@@ -116,6 +116,104 @@ impl PgEvents {
         })?;
         Ok(Self { handle })
     }
+
+    /// The shared body of `append`/`append_at` — differ only in whether `ts` is `now_ms()` or a
+    /// caller-preserved timestamp (D-174's `copy_session_to`). Mirrors `sqlite.rs`'s
+    /// `append_with_ts` (same idempotent-id / registry-touch semantics, Postgres's advisory-lock
+    /// serialization instead of the in-process `Mutex`).
+    fn append_with_ts(&self, stream: &str, ev: NewEvent, ts: i64) -> Result<StoredEvent> {
+        let pool = self.handle.pool().clone();
+        let stream = stream.to_string();
+        self.handle.block_on(async move {
+            // Idempotent retry: a caller-supplied id that already exists is a no-op returning the
+            // prior event. `UNIQUE(id)` is the durable backstop if two appenders race this window.
+            if let Some(id) = &ev.id {
+                if let Some(existing) = load_by_id(&pool, id).await? {
+                    return Ok(existing);
+                }
+            }
+            // The run context is immutable session metadata; read it once (a committed, separate
+            // read) and stamp the stored event.
+            let ctx = read_context(&pool, &stream).await?;
+            let mut tx = pool.begin().await.map_err(map_sql)?;
+            // Serialize appends to this stream — across processes/replicas, and for ad-hoc streams
+            // that never touch the registry too. Transaction-scoped: released at commit/rollback.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(stream.clone())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sql)?;
+            let next_seq: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = $1",
+            )
+            .bind(stream.clone())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sql)?;
+            let stored = match insert_event(&mut tx, &stream, &ev, next_seq, &ctx, ts).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    // C-87: caller-id idempotency is a check-then-insert — the `load_by_id`
+                    // pre-check above and this INSERT are not atomic. The per-stream advisory lock
+                    // serializes appends to ONE stream, but the pre-check runs before it, so two
+                    // writers can still both miss and race the INSERT; the loser trips `UNIQUE(id)`.
+                    // Roll back and re-read: if the id now resolves, the winner already stored this
+                    // exact event, so return it (a no-op idempotent retry) rather than erroring. Any
+                    // other failure re-reads as absent and propagates unchanged.
+                    if let Some(id) = &ev.id {
+                        let _ = tx.rollback().await; // clear the aborted transaction first
+                        if let Some(existing) = load_by_id(&pool, id).await? {
+                            return Ok(existing);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            // Maintain the session registry — but only for real `s_<n>` sessions. The log accepts
+            // any stream string (the interpreter writes run events under ad-hoc ids), so a
+            // non-session stream simply has no registry row to update.
+            if let Ok(n) = parse_id(&stream) {
+                let model_opt = match &ev.kind {
+                    EventKind::SessionStarted { model } | EventKind::ModelChanged { model } => {
+                        Some(model.clone())
+                    }
+                    _ => None,
+                };
+                sqlx::query(
+                    "UPDATE streams SET updated_at = $1, last_seq = $2, \
+                     model = COALESCE($3, model) WHERE n = $4",
+                )
+                .bind(stored.ts_ms)
+                .bind(next_seq)
+                .bind(model_opt)
+                .bind(n)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sql)?;
+                // Keep msg_count equal to the live conversation length (so `list` matches a replay).
+                match &ev.kind {
+                    EventKind::Message(_) => {
+                        sqlx::query("UPDATE streams SET msg_count = msg_count + 1 WHERE n = $1")
+                            .bind(n)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(map_sql)?;
+                    }
+                    EventKind::Compacted { messages } => {
+                        sqlx::query("UPDATE streams SET msg_count = $1 WHERE n = $2")
+                            .bind(messages.len() as i64)
+                            .bind(n)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(map_sql)?;
+                    }
+                    _ => {}
+                }
+            }
+            tx.commit().await.map_err(map_sql)?;
+            Ok(stored)
+        })
+    }
 }
 
 /// Run the multi-statement [`SCHEMA_DDL`] batch on the bootstrap transaction's connection.
@@ -203,12 +301,12 @@ async fn insert_event(
     ev: &NewEvent,
     stream_seq: i64,
     ctx: &EventContext,
+    ts: i64,
 ) -> Result<StoredEvent> {
     let id = ev
         .id
         .clone()
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
-    let ts = now_ms();
     let kind_tag = ev.kind.kind_tag().to_string();
     let payload = serde_json::to_string(&ev.kind)?;
     let global_seq: i64 = sqlx::query_scalar(
@@ -327,7 +425,7 @@ impl EventBackend for PgEvents {
             let ev = NewEvent::new(EventKind::SessionStarted {
                 model: model.clone(),
             });
-            insert_event(&mut tx, &stream, &ev, 0, &ctx).await?;
+            insert_event(&mut tx, &stream, &ev, 0, &ctx, now_ms()).await?;
             tx.commit().await.map_err(map_sql)?;
             Ok(stream)
         })
@@ -575,97 +673,11 @@ impl EventBackend for PgEvents {
     }
 
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
-        let pool = self.handle.pool().clone();
-        let stream = stream.to_string();
-        self.handle.block_on(async move {
-            // Idempotent retry: a caller-supplied id that already exists is a no-op returning the
-            // prior event. `UNIQUE(id)` is the durable backstop if two appenders race this window.
-            if let Some(id) = &ev.id {
-                if let Some(existing) = load_by_id(&pool, id).await? {
-                    return Ok(existing);
-                }
-            }
-            // The run context is immutable session metadata; read it once (a committed, separate
-            // read) and stamp the stored event.
-            let ctx = read_context(&pool, &stream).await?;
-            let mut tx = pool.begin().await.map_err(map_sql)?;
-            // Serialize appends to this stream — across processes/replicas, and for ad-hoc streams
-            // that never touch the registry too. Transaction-scoped: released at commit/rollback.
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(stream.clone())
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sql)?;
-            let next_seq: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = $1",
-            )
-            .bind(stream.clone())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(map_sql)?;
-            let stored = match insert_event(&mut tx, &stream, &ev, next_seq, &ctx).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    // C-87: caller-id idempotency is a check-then-insert — the `load_by_id`
-                    // pre-check above and this INSERT are not atomic. The per-stream advisory lock
-                    // serializes appends to ONE stream, but the pre-check runs before it, so two
-                    // writers can still both miss and race the INSERT; the loser trips `UNIQUE(id)`.
-                    // Roll back and re-read: if the id now resolves, the winner already stored this
-                    // exact event, so return it (a no-op idempotent retry) rather than erroring. Any
-                    // other failure re-reads as absent and propagates unchanged.
-                    if let Some(id) = &ev.id {
-                        let _ = tx.rollback().await; // clear the aborted transaction first
-                        if let Some(existing) = load_by_id(&pool, id).await? {
-                            return Ok(existing);
-                        }
-                    }
-                    return Err(e);
-                }
-            };
-            // Maintain the session registry — but only for real `s_<n>` sessions. The log accepts
-            // any stream string (the interpreter writes run events under ad-hoc ids), so a
-            // non-session stream simply has no registry row to update.
-            if let Ok(n) = parse_id(&stream) {
-                let model_opt = match &ev.kind {
-                    EventKind::SessionStarted { model } | EventKind::ModelChanged { model } => {
-                        Some(model.clone())
-                    }
-                    _ => None,
-                };
-                sqlx::query(
-                    "UPDATE streams SET updated_at = $1, last_seq = $2, \
-                     model = COALESCE($3, model) WHERE n = $4",
-                )
-                .bind(stored.ts_ms)
-                .bind(next_seq)
-                .bind(model_opt)
-                .bind(n)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sql)?;
-                // Keep msg_count equal to the live conversation length (so `list` matches a replay).
-                match &ev.kind {
-                    EventKind::Message(_) => {
-                        sqlx::query("UPDATE streams SET msg_count = msg_count + 1 WHERE n = $1")
-                            .bind(n)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(map_sql)?;
-                    }
-                    EventKind::Compacted { messages } => {
-                        sqlx::query("UPDATE streams SET msg_count = $1 WHERE n = $2")
-                            .bind(messages.len() as i64)
-                            .bind(n)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(map_sql)?;
-                    }
-                    _ => {}
-                }
-            }
-            tx.commit().await.map_err(map_sql)?;
-            Ok(stored)
-        })
+        self.append_with_ts(stream, ev, now_ms())
+    }
+
+    fn append_at(&self, stream: &str, ev: NewEvent, ts_ms: i64) -> Result<StoredEvent> {
+        self.append_with_ts(stream, ev, ts_ms)
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

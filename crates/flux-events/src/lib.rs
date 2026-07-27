@@ -29,7 +29,8 @@ mod store;
 pub use context::EventContext;
 pub use kind::{EventKind, NewEvent, StoredEvent};
 pub use projection::{
-    conversation, cost_summary, efficiency_summary, observations, run_diff, run_trace, stmt_rows,
-    turns, DiffRow, EfficiencySummary, ModelCost, PlanAttempt, RunDiff, StmtRow, TurnSummary,
+    conversation, cost_summary, efficiency_summary, observations, render_run_diff, run_diff,
+    run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow, EfficiencySummary, ModelCost,
+    PlanAttempt, RunDiff, StmtRow, TurnSummary,
 };
 pub use store::{EventStore, SessionInfo, SessionSummary};
