@@ -35,18 +35,10 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
 ## Backlog
+- [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
+- [C-93 — Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable](C-93-agent-invoke-commands-skills.md) · Core · commands/skills exist only for the human at the REPL/TUI; an agent can't invoke one even when policy would allow it
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
-
-### Deterministic Agent Lab — Test · Tune · Resurrect
-_flux's founding thesis is *the LLM is not the runtime*. Every turn's plan is persisted as_
-- [D-174 — Deterministic Agent Test Kit — hermetic core](D-174-agent-test-kit-hermetic-core.md) · Agent · Phase 1 — ships the headline on shipped primitives; no engine surgery
-- [D-175 — Cassette-scope family — Frozen, Resume, and world-pinned re-plan](D-175-cassette-scope-family.md) · Agent · Phase 2 — the shared engine spine; MINOR (public CassetteScope grows)
-- [D-176 — Tune — world-pinned re-plan and counterfactual A/B](D-176-tune-world-pinned-replan.md) · Agent · Phase 3 — Session::what_if + Scenario::check; depends on D-175
-- [D-177 — Tune policy mode — authorize-only split](D-177-tune-policy-mode-authorize-split.md) · Agent · Phase 3b — deferred; the hardest surgery; depends on D-176
-- [D-178 — Resurrect — transparent mid-turn crash recovery](D-178-resurrect-durable-execution.md) · Agent · Phase 4 — 'Temporal for agents'; depends on D-175 (Resume scope)
-- [D-179 — Agent Lab CLI — flux record / flux test / resurrect-on-open](D-179-agent-lab-cli-surface.md) · Agent · Phase 5 — CLI as the reference app on the SDK; depends on D-174/D-178
-- [D-180 — Agent Lab — cookbook recipe and dogfood golden suite](D-180-agent-lab-docs-dogfood.md) · Agent · Phase 6 — adoption proof; the flux coding agent gets its own golden tests
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
@@ -390,6 +382,13 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-171 — Enforce live-datasource filters limits and cursors](D-171-live-datasource-validation.md) · Agent · D-62 phase 4; depends on D-170
 - [D-172 — Wire live datasources through surfacing and typed authority](D-172-live-datasource-safety-surfacing.md) · Agent · D-62 phase 5; depends on D-171
 - [D-173 — Prove and document live-datasource adoption](D-173-live-datasource-adoption-proof.md) · Agent · D-62 phase 6; depends on D-172
+- [D-174 — Deterministic Agent Test Kit — hermetic core](D-174-agent-test-kit-hermetic-core.md) · Agent · Phase 1 — ships the headline on shipped primitives; no engine surgery
+- [D-175 — Cassette-scope family — Frozen, Resume, and world-pinned re-plan](D-175-cassette-scope-family.md) · Agent · Phase 2 — the shared engine spine; MINOR (public CassetteScope grows)
+- [D-176 — Tune — world-pinned re-plan and counterfactual A/B](D-176-tune-world-pinned-replan.md) · Agent · Phase 3 — Session::what_if + Scenario::check; depends on D-175
+- [D-177 — Tune policy mode — authorize-only split](D-177-tune-policy-mode-authorize-split.md) · Agent · Phase 3b — deferred; the hardest surgery; depends on D-176
+- [D-178 — Resurrect — transparent mid-turn crash recovery](D-178-resurrect-durable-execution.md) · Agent · Phase 4 — 'Temporal for agents'; depends on D-175 (Resume scope)
+- [D-179 — Agent Lab CLI — flux record / flux test / resurrect-on-open](D-179-agent-lab-cli-surface.md) · Agent · Phase 5 — CLI as the reference app on the SDK; depends on D-174/D-178
+- [D-180 — Agent Lab — cookbook recipe and dogfood golden suite](D-180-agent-lab-docs-dogfood.md) · Agent · Phase 6 — adoption proof; the flux coding agent gets its own golden tests
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this

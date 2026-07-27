@@ -82,6 +82,22 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### Deterministic Agent Lab — Test · Tune · Resurrect (epic) — ✅ **COMPLETE (2026-07-28; D-174…D-180, all seven stories)**
+
+Turns the deterministic-run substrate (canonical `plan_source` + the redacted op cassette) from
+debugging verbs into a product for SDK embedders — the three doors no LLM-as-runtime SDK can open:
+**Test** (`flux_sdk::test::Scenario`, feature `test-kit`: record a run once, commit it as a redacted
+`Storage::dir` fixture, re-run the *real* agent offline in `cargo test` for $0 and assert on the
+canonical Flux-Lang plan), **Tune** (`Session::what_if()` / `Client::what_if_over`: re-run a recorded
+session under exactly one changed variable — model, prompt, policy, or a substituted tool output —
+against a byte-frozen world, with an honest `hermetic()` readout), and **Resurrect**
+(`Session::resurrect()`: finish a turn killed mid-execution with zero model re-spend and exactly-once
+semantics for every op with a recorded cassette cell). One engine spine underneath: the
+`CassetteScope` family grows `Frozen`/`Resume` arms at the single dispatch chokepoint, plus
+`run_turn_pinned` (breaking → MINOR). CLI surface: `flux record` / `flux test` / `--store` /
+resurrect-on-open. Design:
+[designs/deterministic-agent-lab.md](designs/deterministic-agent-lab.md).
+
 ### Harness hardening — guard the untrusted-input surface (epic) — 🔎 **OPEN (filed from the 2026-07-15 full code review; C-76…C-87 + quality C-88)**
 
 A full-workspace review found the codebase mature and well-gated (CI enforces `fmt`/`clippy -D

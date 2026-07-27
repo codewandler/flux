@@ -36,6 +36,8 @@ and [Safety & approvals](./safety.md).
 | `flux review --files …` | run the embedded read-only multi-reviewer protocol; Markdown or JSON output |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
 | `flux fork …` / `flux replay …` / `flux diff …` | branch, replay, and compare recorded runs with [Time Machine](./time-machine.md) |
+| `flux record <name> "…"` | record one live turn as a committed-safe scenario fixture — see the [Agent Lab](../sdk/agent-lab.md) |
+| `flux test [name]` | replay recorded fixtures offline as a test gate ($0, no key, no network; exit 1 on a regression) |
 | `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
@@ -45,6 +47,20 @@ and [Safety & approvals](./safety.md).
 | `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
 | `flux changelog [version]` | read the embedded customer changelog (`--all` / `--unreleased`) |
 | `flux completion [shell]` | generate a completion script (fish by default) |
+
+### `--store <DIR>` — point the session tools at another store
+
+Sessions normally live in `~/.flux` (`events.db` + `flow.db`). `--store` is a global flag that
+redirects that for one invocation:
+
+```bash
+flux replay --store tests/scenarios/refund-flow last
+flux diff --store tests/scenarios/refund-flow s_1 s_2
+flux sessions --store tests/scenarios/refund-flow
+```
+
+A scenario fixture written by `flux record` **is** an ordinary store in that layout, so the existing
+Time Machine tools open one directly — there is no fixture-specific inspection path to learn.
 
 ## Turn controls
 

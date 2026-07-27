@@ -17,6 +17,32 @@
 
 ### New
 
+- **Test your agent offline, for free — record a run once, replay it forever.**
+  `flux record my-scenario "the thing your agent does"` runs the task once and saves everything
+  about it — what the agent planned, what its tools answered, what the model said — into a folder
+  you commit alongside your code. From then on, `flux test` re-runs the real agent against that
+  recording: no API key, no network, no cost, no flaky results. If your agent starts doing
+  something different, `flux test` fails and shows you exactly what changed — and whether the
+  *reasoning* changed or the *world* did. Secrets are stripped before anything is written, so the
+  recording is safe to check in. Building on flux as a library? The same thing lives in
+  `cargo test`, where you can assert things like "this agent never runs a shell command" as a real,
+  offline regression test. `FLUX_GOLDEN=update` re-records when a change was intentional.
+- **Ask "what if?" about a run that already happened.** Re-run a recorded session with exactly one
+  thing changed — a different model, a different prompt, a different answer from one of your tools,
+  or a stricter permission policy — while everything else stays frozen exactly as it was. The
+  result is a straight answer about what that one change caused, not two noisy live samples you have
+  to squint at. Swapping a tool's answer costs nothing at all, because the model is never called.
+  Run the same question across a whole batch of past sessions to see how many of them would change.
+  Crucially, flux tells you the truth about its own limits: if the change made the agent go
+  somewhere the recording can't explain, it says so and points at exactly where, instead of
+  presenting a confident, incomplete answer.
+- **A crashed run finishes itself.** If flux is killed mid-task — an out-of-memory kill, a
+  redeploy, a closed laptop — the next run on that conversation picks the task up from exactly where
+  it stopped. It does not ask the model again (so there is nothing to pay for a second time), and
+  anything already done is not done twice. flux is honest about the one unavoidable edge: an
+  operation interrupted *while it was happening* runs again, because the alternative would be
+  silently dropping work. Turn it off with `FLUX_AUTO_RESURRECT=0`. `flux sessions` marks any
+  conversation that was interrupted.
 - **Set reasoning effort mid-session with `/effort`.** In the REPL or TUI, run `/effort` to see the
   current reasoning effort, or `/effort high` (also `low`, `medium`, `xhigh`, `max`, or `off`) to
   change it. The new level takes effect from your next message. Models that don't support effort

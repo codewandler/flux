@@ -15,6 +15,85 @@ All notable changes to this project are documented in this file. The format is b
   mirroring `switch_model_for_session`. Bare `/effort` is treated as read-only, so it works while a
   turn is running.
 
+- **D-180: the Agent Lab, dogfooded and documented.** flux's own coding agent now ships a
+  **committed** golden fixture (`crates/flux-sdk/tests/scenarios/coding-agent-note/`) that
+  `cargo test -p codewandler-flux-sdk --features test-kit` re-runs hermetically under a deny-all
+  approver and a never-called provider — faithful, plan-snapshot-identical, and `$0`. Two companion
+  tests demonstrate the distinction the Lab exists to make: an edited system prompt is a REASONING
+  regression (`check` falls through to the live provider and counts it), while a substituted tool
+  output is a WORLD regression (exactly one `DiffRow::Output`, zero `DiffRow::Plan`, still
+  hermetic). New runnable walkthrough `examples/agent_lab.rs` covers record → test → tune →
+  resurrect, and `website/docs/sdk/agent-lab.md` documents all three doors.
+- **D-179: `flux record` and `flux test` — the Agent Lab from the command line.**
+  `flux record <name> "<prompt>"` runs one live turn and writes `tests/scenarios/<name>/` as a
+  committed-safe fixture; `flux test [<name>]` replays every fixture offline — no key, no network,
+  $0, under a deny-all approver and a provider that refuses to answer — and exits 1 if any of them
+  regressed, so it drops straight into CI (`--json` for a machine-readable report,
+  `FLUX_GOLDEN=update` to re-baseline, and a regression prints both the world divergence and the
+  plan snapshot's unified diff). `flux test` with no fixtures is an error, never a green gate.
+  A new global **`--store <DIR>`** points the session tools at any store directory, so
+  `flux replay|fork|diff|sessions --store tests/scenarios/<name>` inspects a fixture with the
+  shipped Time Machine commands — a fixture is an ordinary `Storage::dir` store, and there is no
+  fixture-specific inspection path. Finally, **resurrect-on-open**: a CLI turn on a session a crash
+  killed mid-turn finishes that turn first, reporting what was fast-forwarded, served from the
+  cassette, and re-run live (`FLUX_AUTO_RESURRECT=0` opts out); `flux sessions` flags such a session
+  rather than resurrecting it — running a live tail must not be a side effect of a listing.
+- **D-177: Tune policy mode — "would the tightened policy have blocked that?"**
+  `Session::what_if().policy(permissions)` re-runs a recorded session against its byte-frozen world
+  but re-decides every dispatch under a different permission rule set (replacing the recording's
+  rules wholesale, not merging — the question is about the policy as given). An op the recording ran
+  and the new rules refuse records the envelope's **real refusal** and halts the plan as a denial,
+  instead of being handed the taped output; an equally permissive policy changes nothing and stays
+  hermetic. No model call either way. Powered by a new authorize-only entry,
+  `flux_runtime::Executor::authorize(op, params) -> AuthorizeVerdict`
+  (`Allow`/`ApprovalRequired`/`Deny(reason)`), which was **extracted from** `dispatch_outcome` rather
+  than written beside it — both surfaces now run the same gate code, so they can't drift on whether,
+  or why, a call is admissible. It is a decision, never a dispatch: synchronous by design (so
+  `Tool::execute` and `Approver::request`, both `async`, are structurally unreachable from it), it
+  records no audit observation, adds no permission rule, and skips the pre-tool hooks. It opens no
+  bypass — a real call still goes through the entire envelope, including the approval gate.
+  Adversarially tested.
+- **D-178: Resurrect — finish a turn a crash killed mid-execution, with zero model re-spend.**
+  `Session::interrupted()` reports a turn that opened and never ended (a `kill -9`, an OOM, a
+  redeploy) together with the durable plan that would finish it; `Session::resurrect(sink)` finishes
+  it **in place on the same session**: the plan is durable source, so the model is never called, every
+  top-level statement that already completed is fast-forwarded without re-dispatching, and every op
+  that got as far as recording a cassette cell is served from that cell exactly once. The tail runs
+  live through the same authorization → approval → guarded-IO envelope — the real approver still
+  gates. `ClientBuilder::auto_resurrect(bool)` makes this transparent: on by default for durable
+  storage (`Storage::dir`/`Storage::custom`; off for `Storage::in_memory`, where a crash takes the
+  store with it), the next turn finishes the interrupted one first and reports it on the new
+  `TurnOutput::resurrected` — never silently. **Exactly-once is honest, not absolute** (documented,
+  and the same contract Temporal gives an activity): an op interrupted *during* dispatch — the side
+  effect fired, the process died before its cell was appended — has no cell and re-fires live on
+  resume; a served cell whose re-derived `input_hash` doesn't match latches a divergence and surfaces
+  it in `ResurrectReport::diverged` rather than serving a stale answer.
+- **D-176: Tune — re-run a recorded session under exactly one changed variable.**
+  `Session::what_if()` builds a world-pinned counterfactual: `.substitute(op, output)` /
+  `.substitute_at(node, output)` swap a recorded tool outcome and re-execute the identical recorded
+  plan **with no model call at all** (~$0, fully offline, by construction — the driver only replays
+  already-accepted plan sources); `.model(...)` / `.system_prompt(...)` instead re-plan for real,
+  hermetically rebuilding every earlier turn before driving exactly one live turn under the pinned
+  scope; `.turn(n)` narrows to one turn and `.off_tape(Halt|Live)` chooses whether a dispatch that
+  misses the frozen world latches or bridges to live IO. The resulting `Counterfactual` exposes
+  `session()` (a real, replayable, forkable session), `diff()`, `first_divergence()`, `cost()`, and
+  — the honesty guard — `hermetic()`, which is `false` the moment the pinned world is left, so a
+  re-plan that reads something the recording never covered is reported as such instead of returning
+  a faked complete diff. `Client::what_if_over(sessions, WhatIfSpec)` applies one spec across a
+  whole corpus and returns a `SweepReport` (per-session outcome, how many diverged, total offline
+  spend); a session that can't be opened lands as an isolated `Err` row rather than aborting the
+  sweep. On the Test Kit side, `Scenario::check(&client)` re-drives a golden fixture with BOTH the
+  world (`Frozen`, `OffTape::Halt`) and the model (the fixture's `model.jsonl`) pinned, returning a
+  classified `Report { diff, plan_changed, left_world, model_served, model_live }` — so a config
+  edit reads differently from a behavior regression, and any model call the golden doesn't cover is
+  counted rather than silently served.
+- **`flux diff` now compares natively dispatched runs instead of vacuously reporting "identical".**
+  `flux_events::run_diff` aligns on the executed-statement ledger, which a natively dispatched turn
+  never writes (the adaptive loop dispatches tool calls directly and records the equivalent
+  Flux-Lang program as replay metadata only). Two such runs therefore always compared equal, and
+  one compared against an interpreter-executed rerun read as a wholesale plan rewrite. When either
+  side has no statement ledger, both now fall back to their flat dispatch sequence — same
+  classification (`Plan` vs `Output` vs `Same`), real answers.
 - **D-175: the engine's cassette scope is now a family — `Frozen` and `Resume` join
   `Record`/`Replay`.** `CassetteScope` (now `#[non_exhaustive]`; growing the public enum is the
   0.y-breaking change behind the next MINOR) gains `Frozen(FrozenTape)` — serve every op from a

@@ -154,6 +154,8 @@ durability markers that pair with this (`await`, `checkpoint`, `once`), see
 
 ## Related docs
 
+- [Agent Lab](../sdk/agent-lab.md) — the SDK product built on these recordings: golden scenario
+  tests, counterfactual what-ifs, and crash resurrection.
 - [CLI](./cli.md) — the full command surface, including `flux sessions` and `flux flow run`.
 - [Durability](../language/durability.md) — `await`, `checkpoint`, `once`, `saga`.
 - [Execution model](../language/execution-model.md) — why flux runs are deterministic.
