@@ -213,8 +213,9 @@ cell. Guard: a served cell whose re-derived `input_hash` mismatches latches `Rep
 Per the vision (the CLI is the reference app built on the SDK): `flux record <name> "<prompt>"`
 (writes a `tests/scenarios/<name>/` fixture), `flux test [<name>]` (runs `Scenario::replay` +
 assertions, offline, $0), and a global `--store <DIR>` for opening any `Storage::dir` store with
-`flux replay`/`fork`/`diff`/`sessions`. A CLI turn on a session with an interrupted predecessor
-finishes that predecessor first when `auto_resurrect` is enabled, then runs the new input;
+`flux replay`/`fork`/`diff`/`sessions`. A one-shot `flux run` turn on a session with an interrupted
+predecessor finishes that predecessor first when `auto_resurrect` is enabled, then runs the new
+input (the interactive REPL/TUI do not yet run this step);
 `flux sessions` only flags interrupted sessions and never resumes them as a listing side effect.
 `FLUX_AUTO_RESURRECT=0` opts out.
 

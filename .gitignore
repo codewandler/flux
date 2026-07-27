@@ -23,6 +23,8 @@
 # `tests/scenarios/<name>/` directory are the artifact, not build droppings, so they are checked in
 # on purpose. (Only files are ignored above, never a parent directory, so this negation applies.)
 !**/tests/scenarios/*/*.db
+!**/tests/scenarios/*/*.db-wal
+!**/tests/scenarios/*/*.db-shm
 .env
 
 # Node / Docusaurus

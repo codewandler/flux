@@ -54,7 +54,7 @@ use flux_sdk::{Client, test::Scenario};
 #[tokio::test]
 async fn triage_agent_stays_on_rails() -> anyhow::Result<()> {
     // No auto_approve: the default approver denies everything. The provider is never called.
-    let client = Client::builder().build(NullProvider, ".")?;
+    let client = Client::builder().build(Box::new(NullProvider), ".")?;
 
     let scenario = Scenario::load("tests/scenarios/triage")?;
     let outcome = scenario.replay(&client).await?;
@@ -197,7 +197,7 @@ permissive policy changes nothing and stays on tape. No model call either way.
 
 The result is a `Counterfactual`: `session()` (the counterfactual run is itself a real session —
 replayable, forkable, diffable), `diff()` against the original, `first_divergence()`, `hermetic()`,
-and `cost()`.
+and `cost(&pricing)`.
 
 ### The honesty contract
 
@@ -301,8 +301,10 @@ flux sessions --store ./agent-state             # interrupted turns are marked i
 
 `--store` is a global flag, so it may appear before or after the subcommand.
 
-A CLI turn on a session a crash killed mid-turn finishes that turn first, printing what was
-fast-forwarded, served from the cassette, and re-run live (`FLUX_AUTO_RESURRECT=0` opts out).
+A one-shot `flux run` turn on a session a crash killed mid-turn finishes that turn first, printing
+what was fast-forwarded, served from the cassette, and re-run live (`FLUX_AUTO_RESURRECT=0` opts
+out). The interactive REPL and TUI do not yet run this step — use a one-shot turn (or
+`Session::send` via the SDK) to finish an interrupted session.
 `flux sessions` *flags* an interrupted session rather than resurrecting it — finishing a turn runs
 its live tail through the approval envelope, which must not be a side effect of asking what sessions
 exist. See the [CLI reference](../agent/cli.md) for the full flag surface.

@@ -67,8 +67,9 @@ pub(super) fn run_sessions(prune: bool) -> Result<()> {
         eprintln!(
             "{}",
             style::dim(&format!(
-                "{interrupted} interrupted session(s) — the next turn on one finishes its killed \
-                 turn from the crash point (no model call). `FLUX_AUTO_RESURRECT=0` disables that."
+                "{interrupted} interrupted session(s) — the next one-shot `flux run` turn on one \
+                 finishes its killed turn from the crash point (no model call). \
+                 `FLUX_AUTO_RESURRECT=0` disables that."
             ))
         );
     }

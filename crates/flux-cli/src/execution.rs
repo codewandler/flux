@@ -350,8 +350,9 @@ pub(super) fn open_event_store() -> Result<EventStore> {
 /// `dispatch::run`, so subprocess paths inherit it) if given, else the default `~/.flux`.
 ///
 /// D-179: a scenario fixture written by `flux record` is an ordinary `Storage::dir` store, so
-/// pointing `--store` at one makes every existing session tool (`replay`, `fork`, `diff`,
-/// `sessions`, `usage`) work against a committed fixture with no fixture-specific code path.
+/// pointing `--store` at one makes the session tools (`replay`, `fork`, `diff`, `sessions`) work
+/// against a committed fixture with no fixture-specific code path. (`usage` reads the global
+/// `FLUX_HOME` events store and does not consult `--store`.)
 pub(super) fn flux_store_dir() -> Result<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("FLUX_STORE_DIR") {
         let dir = std::path::PathBuf::from(dir);
