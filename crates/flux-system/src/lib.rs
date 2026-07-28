@@ -2162,8 +2162,7 @@ mod tests {
         // real ~/.flux/worktrees and stays hermetic under parallel test threads.
         let _env = sandbox::EnvGuard::new(&["FLUX_WORKTREE_DIR"]);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("flux-wt-base-{}-{n}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("flux-wt-base-{}-{n}", std::process::id()));
         std::env::set_var("FLUX_WORKTREE_DIR", &base);
 
         let dir = allocate_worktree_dir().unwrap();

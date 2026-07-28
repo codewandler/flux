@@ -49,5 +49,5 @@ host-kit = { package = "codewandler-flux-host-kit", version = "0.27.0", path = "
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
-base64 = "0.22"
-schemars = "1.2.1"
+base64 = "0.23"
+schemars = "1.2.2"

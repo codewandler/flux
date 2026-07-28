@@ -308,7 +308,7 @@ async fn insert_event(
     let id = ev
         .id
         .clone()
-        .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        .unwrap_or_else(|| ulid::Ulid::generate().to_string());
     let kind_tag = ev.kind.kind_tag().to_string();
     let payload = serde_json::to_string(&ev.kind)?;
     let global_seq: i64 = sqlx::query_scalar(

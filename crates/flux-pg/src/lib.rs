@@ -575,7 +575,7 @@ mod tests {
         // pools, as eight cold-booting replicas) all fire `after_connect` against a schema that
         // does not exist yet; every one must succeed because the bootstrap runs under the global
         // flux DDL advisory lock.
-        let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let schema = format!("t_{}", ulid::Ulid::generate().to_string().to_lowercase());
         let Some(url) = test_url_with_schema(&schema) else {
             eprintln!(
                 "skipping concurrent_first_boot_bootstrap_is_serialized: TEST_POSTGRES_URL unset"
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn live_roundtrip_and_schema_isolation() {
-        let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let schema = format!("t_{}", ulid::Ulid::generate().to_string().to_lowercase());
         let Some(url) = test_url_with_schema(&schema) else {
             eprintln!("skipping live_roundtrip_and_schema_isolation: TEST_POSTGRES_URL unset");
             return;

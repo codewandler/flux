@@ -96,6 +96,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Dependency refresh across both workspaces.** All compatible bumps plus the incompatible
+  majors: `jsonschema` 0.47→0.49, `tokio-tungstenite` 0.29→0.30, `syn` 2→3, `base64` 0.22→0.23,
+  `ulid` 1→3 (`Ulid::new()` → `Ulid::generate()` at the call sites), `slack-morphism` 2.22→2.24,
+  `lopdf` 0.42→0.44. The ratatui/crossterm/ansi-to-tui pins tracking the git markdown-* crates
+  are unchanged.
 - **C-97: the guarded system is now context-local and swappable (breaking for embedders).**
   `ToolContext`'s public `system` field is replaced by a `system()` accessor over a per-context
   `WorkspaceContext` (active `Arc<System>` + optional worktree session state); `flux-system` gains

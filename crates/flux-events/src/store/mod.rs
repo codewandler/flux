@@ -2536,7 +2536,7 @@ mod tests {
         /// A fresh `EventStore` in a throwaway schema, or `None` when `TEST_POSTGRES_URL` is unset.
         fn pg_store() -> Option<EventStore> {
             let base = std::env::var("TEST_POSTGRES_URL").ok()?;
-            let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+            let schema = format!("t_{}", ulid::Ulid::generate().to_string().to_lowercase());
             let sep = if base.contains('?') { '&' } else { '?' };
             let url = format!("{base}{sep}schema={schema}");
             Some(EventStore::open_postgres(PgHandle::connect(&url).unwrap()).unwrap())
@@ -2609,7 +2609,7 @@ mod tests {
                 );
                 return;
             };
-            let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+            let schema = format!("t_{}", ulid::Ulid::generate().to_string().to_lowercase());
             let sep = if base.contains('?') { '&' } else { '?' };
             let url = format!("{base}{sep}schema={schema}");
 

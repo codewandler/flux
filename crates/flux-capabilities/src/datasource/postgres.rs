@@ -566,7 +566,7 @@ mod tests {
     /// `TEST_POSTGRES_URL` is unset (tests then skip rather than fail).
     fn test_env() -> Option<(String, String)> {
         let base = std::env::var("TEST_POSTGRES_URL").ok()?;
-        let schema = format!("t_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let schema = format!("t_{}", ulid::Ulid::generate().to_string().to_lowercase());
         let sep = if base.contains('?') { '&' } else { '?' };
         Some((format!("{base}{sep}schema={schema}"), schema))
     }

@@ -99,16 +99,16 @@ serde_json = "1"
 # Provider-native calls are validated against the exact operation schema before a staged gather
 # dispatch or action proposal can enter a Flux plan. Remote schema retrieval is deliberately off:
 # operation schemas must be self-contained, deterministic contracts.
-jsonschema = { version = "0.47", default-features = false }
+jsonschema = { version = "0.49", default-features = false }
 serde_norway = "0.9"
-schemars = "1.2.1"
+schemars = "1.2.2"
 rowan = "0.16.1"
 text-size = "1.1"
 thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 futures-util = "0.3"
 bytes = "1"
@@ -134,9 +134,9 @@ ratatui = ">=0.29, <0.30"
 crossterm = ">=0.28, <0.29"
 toml = "1.1"
 cargo_metadata = "0.23.1"
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
@@ -144,7 +144,7 @@ regex = "1"
 similar = "3"
 rand = "0.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
-ulid = "1"
+ulid = "3"
 # Postgres backend (`flux-pg`, opt-in behind `postgres` features): the default build stays
 # rusqlite-only and DB-free. `default-features = false` + no sqlx macros so a build never needs a
 # live database; `tls-rustls` avoids an OpenSSL system dep. `percent-encoding` decodes DSN userinfo.
@@ -156,7 +156,7 @@ cron = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # The historical `<2.18` cap (2.18+ needed a then-unpublished `signal-hook-tokio ^0.4`) is lifted:
 # signal-hook-tokio 0.4.0 shipped, so the socket-mode (`hyper`) feature resolves again on latest.
-slack-morphism = "2.22"
+slack-morphism = "2.24"
 url = "2"
 tracing = "0.1"
 # Language server (flux-lsp): tower-lsp bundles lsp-types + the async JSON-RPC stdio loop.
