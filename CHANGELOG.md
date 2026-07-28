@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-101: animated boot splash for the interactive surfaces.** Bare `flux` (and prompt-less
+  `flux run`) and `flux tui` now open with an animated FLUX splash — matrix rain dissolving into
+  the block logo, then a pulsing glow with the `[ deterministic agent platform ]` tagline. Any key
+  skips; it auto-dismisses after ~2 s of glow, and is fully suppressed under `NO_COLOR` /
+  `--color never`, piped streams, `FLUX_NO_SPLASH=1`, or terminals smaller than 64×14. Frames are
+  a deterministic function of a seed (embedded PCG32), pinned by tests (`flux_tui::splash`).
+- **C-101: truecolor spinner effects during model waits.** On terminals advertising 24-bit color
+  (`COLORTERM`), the CLI's thinking spinner and the TUI footer replace the braille glyph with a
+  full-width animated effect bar — Knight Rider, Comet, Tidal Wave, Matrix, Equalizer, Aurora,
+  Thunderstrike, Binary Rain (`flux_tui::spinners`, ported from the codewandler/spinners Go
+  catalog) — cycling one effect per model round. Non-truecolor terminals keep the braille spinner
+  unchanged. Showcase: `cargo run -p flux-tui --example spinners`.
+
 ## [0.27.0] - 2026-07-28
 
 ### Fixed
