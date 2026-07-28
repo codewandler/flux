@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **A-97: path-scoped guidance fragments — `.flux/context.d/*.md`.** Project guidance was
+  all-or-nothing: `ProjectFiles` reads `CLAUDE.md`/`AGENTS.md`/`.flux/context.md` whole on every
+  session, so a large repo either keeps its conventions thin and loses subsystem detail, or keeps
+  them complete and buries the relevant rule. A fragment is a Markdown file whose optional `globs:`
+  frontmatter names the paths it applies to; it contributes its body only when the repository's
+  **working set** contains a matching path, and a fragment declaring no globs always contributes.
+  New `ContextFragments` provider in `flux_runtime::context`, registered after `ProjectFiles` in the
+  CLI projector. Notes on the design: scoping resolves against `git status --short
+  --untracked-files=all` **once, at context-assembly time** — the story was originally filed against
+  a *per-turn* path set, which reading the code showed to be both unimplementable (the system prompt
+  is a `String` built once at startup, not per turn) and actively harmful (it would move guidance
+  from frozen-per-session to variable-per-turn and churn the cache prefix the C-133…C-140 work just
+  stabilized); `--untracked-files=all` is required because the default collapses an untracked
+  directory to a bare `crates/` entry that no subsystem glob matches; globs go through
+  `flux_policy::wildcard_match`, the same matcher policy path grants use, so a guidance glob and a
+  policy glob cannot disagree; fragments load in filename order because an unstable order would
+  reshuffle the prompt between runs; and an unreadable fragment or malformed frontmatter fails
+  startup by name rather than silently vanishing. The module docs now state that context assembly
+  happens once per session, correcting a "per-turn" claim that had been wrong since the crate fold.
+
 ## [0.30.0] - 2026-07-28
 
 **Breaking (pub surface, embedders only).** `flux_core::Usage` gained

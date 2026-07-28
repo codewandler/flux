@@ -1194,11 +1194,14 @@ pub(super) async fn build_agent_with(
 
     // Project context folded into the system prompt: environment, git working-tree state, repo
     // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
+    // `ContextFragments` comes last so the always-loaded conventions land before the guidance that
+    // only applies to what the working set is actually touching (A-97).
     let system_prompt = Projector::new()
         .with(Box::new(EnvContext::new(cwd.clone())))
         .with(Box::new(GitContext::new(cwd.clone())))
         .with(Box::new(RepoSignal::new(cwd.clone())))
         .with(Box::new(ProjectFiles::new(cwd.clone())))
+        .with(Box::new(ContextFragments::new(cwd.clone())))
         .try_system_prompt(DEFAULT_SYSTEM_PROMPT)
         .await
         .context("load guarded project context")?;

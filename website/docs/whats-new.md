@@ -12,6 +12,17 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Project guidance that only shows up when it applies.** Conventions files like `AGENTS.md` are
+  read in full every session, so in a big repository you either keep them short and lose the
+  subsystem detail, or keep them complete and pay for all of it on every message. You can now put a
+  Markdown file in `.flux/context.d/` and give it a `globs:` list — it reaches the agent only when
+  the files you are actually working on match. Parser conventions when you're editing the parser,
+  UI conventions when you're editing the UI, neither when you're doing something else. A fragment
+  with no `globs:` always loads, so it doubles as a way to split a long conventions file into
+  readable pieces.
+
 ## [0.30.0] - 2026-07-28
 
 ### Improved

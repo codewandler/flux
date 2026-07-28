@@ -60,7 +60,9 @@ use flux_flow::state::FlowStore;
 use flux_flow::AgentSink;
 use flux_orchestrate::{ProviderFactory, Role, RoleRegistry, SubAgents, TaskTool};
 use flux_provider::{ChunkStream, Effort, NativeProvider, Provider, Request};
-use flux_runtime::context::{EnvContext, GitContext, ProjectFiles, Projector, RepoSignal};
+use flux_runtime::context::{
+    ContextFragments, EnvContext, GitContext, ProjectFiles, Projector, RepoSignal,
+};
 use flux_runtime::{
     scope_runtime_turn, AllowApprover, ApprovalChoice, Approver, ExecutionAuthorization,
     ExecutionEnvironment, PermissionManager, RuntimeTurnContext, SpawnActivitySink, ToolRegistry,

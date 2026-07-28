@@ -1,16 +1,28 @@
-//! `context` — assembles per-turn context from an ordered chain of providers (the `context` module
+//! `context` — assembles project context from an ordered chain of providers (the `context` module
 //! of `flux-runtime`, folded in from the former `flux-context` crate).
 //!
 //! Each [`ContextProvider`] contributes an optional block; [`Projector::system_prompt`] appends
-//! them to a base prompt wrapped in `<context source="...">` tags. v1 ships project-file context
-//! (`CLAUDE.md`/`AGENTS.md`/`.flux/context.md`) and an environment summary; more providers (files,
-//! memory, skills, datasource) plug in here later.
+//! them to a base prompt wrapped in `<context source="...">` tags. It ships project-file context
+//! (`CLAUDE.md`/`AGENTS.md`/`.flux/context.md`), an environment summary, git working-tree state,
+//! repo shape, and path-scoped guidance fragments ([`ContextFragments`]).
+//!
+//! **Assembly happens once, at surface startup — not per turn.** The result is a `String` on
+//! `AgentSpec`, so every provider here runs exactly once per session and the whole block sits in
+//! the cache-stable prompt prefix. A provider that varied its output within a session would
+//! invalidate that prefix; scope any relevance filtering against a session-stable signal (as
+//! [`ContextFragments`] does with the git working set), never against per-turn state.
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
 use flux_core::{Error, Result};
+use flux_policy::wildcard_match;
+
+/// Where path-scoped guidance fragments live, relative to the project root (A-97). A flat
+/// directory, matching how `.flux` already houses skills, agents, and flows — so what can load is
+/// auditable with one `ls`, without a tree walk or a mention syntax.
+const FRAGMENT_DIR: &str = ".flux/context.d";
 
 /// A source of context for a turn.
 #[async_trait]
@@ -260,6 +272,134 @@ impl ContextProvider for RepoSignal {
     }
 }
 
+/// How many entries under `.flux/context.d` are scanned before the walk stops. Guidance is
+/// hand-authored, so this is a runaway guard, not a working limit.
+const FRAGMENT_SCAN_CAP: usize = 256;
+
+/// Path-scoped guidance fragments from `.flux/context.d/*.md` (A-97).
+///
+/// A fragment is a markdown file whose optional `globs:` frontmatter names the paths it applies to.
+/// It contributes its body only when the repository's **working set** — what `git status --short`
+/// reports as changed — contains a matching path; a fragment declaring no `globs` always
+/// contributes. That lets a large repo carry per-subsystem conventions without paying for all of
+/// them on every turn, the gap [`ProjectFiles`] leaves (it reads its whole fixed file list
+/// unconditionally).
+///
+/// **The working set is resolved exactly once, here, at context-assembly time.** Guidance lands in
+/// the cache-stable system prompt, so a fragment set that varied within a session would invalidate
+/// the prompt prefix on every change — the failure mode A-95 was filed for. Scoping against the
+/// working set (rather than per-turn paths) keeps the prefix frozen for the session by construction.
+pub struct ContextFragments {
+    root: PathBuf,
+}
+
+impl ContextFragments {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+/// Frontmatter a fragment may declare. Every field is optional: a bare markdown file with no
+/// frontmatter at all is a valid, always-loaded fragment.
+#[derive(Debug, Default, serde::Deserialize)]
+struct FragmentMeta {
+    /// Paths this fragment applies to, in [`flux_policy::wildcard_match`] syntax (`*` spans `/`, so
+    /// `crates/flux-lang/**` matches `crates/flux-lang/src/parse.rs`). Empty = always applies.
+    #[serde(default)]
+    globs: Vec<String>,
+}
+
+/// Extract the changed paths from `git status --short` output.
+///
+/// Each line is `XY <path>`: two status columns, a space, then the path. Rename/copy entries read
+/// `old -> new` and the new name is the one that exists on disk. git quotes paths containing
+/// spaces or specials when `core.quotepath` is set. The two status columns are always ASCII, so
+/// slicing at byte 3 is safe for UTF-8 paths.
+fn changed_paths_from_status(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let path = &line[3..];
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            let path = path.trim().trim_matches('"');
+            (!path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
+}
+
+#[async_trait]
+impl ContextProvider for ContextFragments {
+    fn name(&self) -> &str {
+        "context-fragments"
+    }
+
+    async fn render(&self) -> Result<Option<String>> {
+        // Same confinement stance as `ProjectFiles`: fragments are repository-controlled inputs, so
+        // read them through a workspace pinned to the project root rather than the agent's possibly
+        // widened (`--add-dir`/`--allow-all-paths`) tool workspace.
+        let system = flux_system::System::new(flux_system::Workspace::new(&self.root)?);
+        // An absent fragment directory is the overwhelmingly common case, not a misconfiguration —
+        // unlike `ProjectFiles`' explicitly-named files, whose absence it also tolerates.
+        let Ok(found) = system.walk_files(FRAGMENT_DIR, FRAGMENT_SCAN_CAP).await else {
+            return Ok(None);
+        };
+
+        // Sort: the walk order is filesystem-dependent, and an unstable fragment order would
+        // reshuffle the system prompt between runs and cold-write the cache for nothing.
+        let mut files: Vec<String> = found
+            .into_iter()
+            .filter(|f| f.ends_with(".md"))
+            .collect::<Vec<_>>();
+        files.sort();
+
+        // No working set (clean tree, or not a repo at all) leaves `changed` empty, so scoped
+        // fragments simply don't match while unscoped ones still load.
+        // `--untracked-files=all` matters: the default collapses an untracked directory to a bare
+        // `crates/` entry, which no subsystem glob would match — so a brand-new file would silently
+        // fail to pull in its own subsystem's guidance.
+        let changed = match git(&self.root, &["status", "--short", "--untracked-files=all"]).await {
+            Some(status) => changed_paths_from_status(&status),
+            None => Vec::new(),
+        };
+
+        let mut out = String::new();
+        for file in &files {
+            let content = system.read_file(file).await.map_err(|error| {
+                Error::Config(format!("guidance fragment `{file}` is unreadable: {error}"))
+            })?;
+            let doc = flux_markdown::parse_frontmatter::<FragmentMeta>(&content).map_err(|e| {
+                // Loud, not silent: a fragment whose frontmatter doesn't parse would otherwise
+                // vanish from the prompt, and missing guidance is invisible at the point of use.
+                Error::Config(format!(
+                    "guidance fragment `{file}` has malformed frontmatter: {e}"
+                ))
+            })?;
+            let applies = doc.meta.globs.is_empty()
+                || doc
+                    .meta
+                    .globs
+                    .iter()
+                    .any(|g| changed.iter().any(|c| wildcard_match(g, c)));
+            if !applies {
+                continue;
+            }
+            let body = doc.body.trim_end();
+            if body.trim().is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            let name = file.rsplit('/').next().unwrap_or(file);
+            out.push_str(&format!("## {name}\n{body}"));
+        }
+        Ok((!out.is_empty()).then_some(out))
+    }
+}
+
 /// Orders providers and projects them into a system prompt.
 #[derive(Default)]
 pub struct Projector {
@@ -380,6 +520,126 @@ mod tests {
         assert!(block.contains("Cargo.toml"));
         assert!(block.contains("src/"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A-97 (failing-first): a fragment declaring `globs` contributes its body only when the git
+    /// working set contains a matching path; an unscoped fragment always contributes. Drives a
+    /// REAL repo because `git status --short` output is the contract being parsed.
+    #[tokio::test]
+    async fn fragments_load_only_when_globs_match_the_working_set() {
+        let dir = temp_dir();
+        git(&dir, &["init", "-q"]).await.expect("git init");
+        std::fs::create_dir_all(dir.join("crates/flux-lang/src")).unwrap();
+        std::fs::write(dir.join("crates/flux-lang/src/parse.rs"), "fn main() {}").unwrap();
+
+        let frags = dir.join(".flux/context.d");
+        std::fs::create_dir_all(&frags).unwrap();
+        std::fs::write(
+            frags.join("lang.md"),
+            "---\nglobs: [\"crates/flux-lang/**\"]\n---\nLANG RULES",
+        )
+        .unwrap();
+        std::fs::write(
+            frags.join("tui.md"),
+            "---\nglobs: [\"crates/flux-tui/**\"]\n---\nTUI RULES",
+        )
+        .unwrap();
+        std::fs::write(frags.join("always.md"), "ALWAYS RULES").unwrap();
+
+        let block = ContextFragments::new(&dir).render().await.unwrap().unwrap();
+        assert!(
+            block.contains("LANG RULES"),
+            "matching fragment missing: {block}"
+        );
+        assert!(
+            !block.contains("TUI RULES"),
+            "non-matching fragment leaked: {block}"
+        );
+        assert!(
+            block.contains("ALWAYS RULES"),
+            "unscoped fragment missing: {block}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No fragment directory at all is silence, not an error — the overwhelmingly common case.
+    #[tokio::test]
+    async fn fragments_none_when_directory_absent() {
+        let dir = temp_dir();
+        assert!(ContextFragments::new(&dir)
+            .render()
+            .await
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Outside a repo there is no working set, so scoped fragments cannot match — but unscoped
+    /// ones must still load, otherwise guidance silently vanishes in a non-git directory.
+    #[tokio::test]
+    async fn unscoped_fragments_survive_outside_a_repo() {
+        let dir = temp_dir();
+        let frags = dir.join(".flux/context.d");
+        std::fs::create_dir_all(&frags).unwrap();
+        std::fs::write(frags.join("always.md"), "ALWAYS RULES").unwrap();
+        std::fs::write(
+            frags.join("scoped.md"),
+            "---\nglobs: [\"src/**\"]\n---\nSCOPED RULES",
+        )
+        .unwrap();
+
+        let block = ContextFragments::new(&dir).render().await.unwrap().unwrap();
+        assert!(block.contains("ALWAYS RULES"), "{block}");
+        assert!(!block.contains("SCOPED RULES"), "{block}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fragment is a repository-controlled input, so content from outside the workspace must
+    /// never reach the prompt through one. The escape is structurally impossible rather than
+    /// rejected: `System::walk_files` skips symlinks outright ("never follow symlinks (could escape
+    /// a root)"), so a symlinked fragment is never even read — inside the workspace or out. That
+    /// makes this quieter than the `ProjectFiles` symlink guard, which errors by name; the
+    /// invariant worth pinning here is the leak, not the diagnostic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fragments_never_read_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_dir();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE SECRET").unwrap();
+        let dir = temp_dir();
+        let frags = dir.join(".flux/context.d");
+        std::fs::create_dir_all(&frags).unwrap();
+        symlink(outside.join("secret.md"), frags.join("evil.md")).unwrap();
+        std::fs::write(frags.join("real.md"), "REAL RULES").unwrap();
+
+        let rendered = ContextFragments::new(&dir).render().await.unwrap();
+        let block = rendered.unwrap_or_default();
+        assert!(!block.contains("OUTSIDE SECRET"), "escaped: {block}");
+        // The regular sibling still loads, so the skip is scoped to the symlink itself.
+        assert!(block.contains("REAL RULES"), "{block}");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn status_short_parses_renames_and_quotes() {
+        let paths = changed_paths_from_status(
+            " M crates/flux-lang/src/parse.rs\n\
+             ?? new.rs\n\
+             R  old/a.rs -> new/b.rs\n\
+             A  \"quoted path.rs\"\n\
+             x\n",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "crates/flux-lang/src/parse.rs",
+                "new.rs",
+                "new/b.rs",
+                "quoted path.rs",
+            ]
+        );
     }
 
     #[tokio::test]
