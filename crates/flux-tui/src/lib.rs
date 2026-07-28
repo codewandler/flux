@@ -5446,6 +5446,32 @@ mod tests {
         assert!(content.contains("session Σ"), "{content}");
     }
 
+    /// C-140: `/usage` is a registered built-in and the command path opens the overlay — the wiring
+    /// between the slash table, the dispatcher, and the renderer, not just the state flag.
+    #[test]
+    fn slash_usage_command_opens_the_overlay() {
+        assert!(
+            all_slash_commands(&[]).iter().any(|c| c.name == "usage"),
+            "/usage must be listed in the slash menu"
+        );
+        let mut state = ChatState::new("claude/claude-sonnet-5".into());
+        state.record_call_usage(
+            "claude/claude-sonnet-5",
+            "explore",
+            12,
+            &Usage {
+                input_tokens: 1_000,
+                cache_read_input_tokens: 3_000,
+                ..Default::default()
+            },
+        );
+        assert!(!state.usage_open);
+        state.usage_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("this turn"), "overlay rendered");
+    }
+
     /// C-140: a session with no model calls yet renders an empty state, not a bare frame or a
     /// division by zero.
     #[test]
