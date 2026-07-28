@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A-94: mid-turn steering — talk to the agent while it runs.** Text submitted while a turn is
+  executing no longer waits for the turn to finish: the TUI's follow-up queue is shared with the
+  engine (`FlowEngine::set_steering` + the new `flux_flow::SteeringQueue`), which drains it at
+  the head of the next planner-consultation round and injects the messages — in submission
+  order, as one attributed `<user-steering>` block — into the adaptive conversation. In-flight
+  operations and pending approvals are never disturbed (injection happens only at the round
+  head), and consumed steering persists as a durable, redacted `turn.steering` observation —
+  deliberately not a `Message` event, so the session log keeps its strict user → assistant
+  alternation. Queued items stay editable/retractable in the `/queue` overlay until the engine
+  consumes them; consumption empties the strip and leaves a `↪ steering delivered` transcript
+  notice, and leftovers at turn end still become ordinary follow-up turns. Plain-CLI REPL turns
+  remain blocking — steering is TUI-only in v1 (SDK embedders can attach their own queue via
+  `FlowEngine::set_steering`).
 - **C-111…C-116: TUI polish wave 2** (epic [tui-polish](docs/designs/tui-polish.md)):
   - **Transcript entry focus + per-card expansion + OSC 52 yank (C-111):** Shift-↑/↓ move a focus
     cursor through the transcript (selection background, centers the entry, Esc clears); Enter

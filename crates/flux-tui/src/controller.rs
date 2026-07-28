@@ -43,6 +43,8 @@ pub(super) enum UiEvent {
         subjects: Vec<String>,
         reply: oneshot::Sender<ApprovalChoice>,
     },
+    /// Queued steering messages the engine consumed and injected into the running turn (A-94).
+    Steered(Vec<String>),
     Finished,
 }
 
@@ -228,6 +230,21 @@ impl AgentSink for ChannelSink {
                 text: halt_line(&observation.data),
                 sev: Sev::Err,
             });
+        } else if observation.kind == "turn.steering" {
+            let messages = observation
+                .data
+                .get("messages")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !messages.is_empty() {
+                self.send(UiEvent::Steered(messages));
+            }
         }
     }
 }

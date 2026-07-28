@@ -63,6 +63,9 @@ pub struct EngineLoopHost {
     /// explicitly `--skill`-activated one gets — so activation has one consistent semantics
     /// regardless of how it happened.
     loaded_skills: Mutex<HashMap<String, HashSet<String>>>,
+    /// A-94: the surface-shared mid-turn steering queue, drained by the adaptive loop at each
+    /// planner-consultation round head. `None` (every non-interactive caller) is a no-op.
+    steering: Mutex<Option<Arc<crate::steering::SteeringQueue>>>,
 }
 
 /// Hard cap on authored-flow reentry (`run_authored_flow`). A stored flow that calls `flow_run` on
@@ -121,6 +124,7 @@ impl EngineLoopHost {
                 authored_depth: AtomicU32::new(0),
                 skill_catalog: Mutex::new(Vec::new()),
                 loaded_skills: Mutex::new(HashMap::new()),
+                steering: Mutex::new(None),
             });
             *captured.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
@@ -180,6 +184,13 @@ impl EngineLoopHost {
 
     pub fn set_adaptive_policy(&self, policy: crate::staged::AdaptiveLoopPolicy) {
         *self.adaptive_policy.lock().unwrap() = policy;
+    }
+
+    /// A-94: install (or remove) the surface-shared mid-turn steering queue. The adaptive loop
+    /// drains it at the head of every planner-consultation round; the same queue instance stays
+    /// attached across turns so a message queued at a turn boundary is never lost.
+    pub fn set_steering(&self, queue: Option<Arc<crate::steering::SteeringQueue>>) {
+        *self.steering.lock().unwrap() = queue;
     }
 
     /// Point the long-lived host at the active turn and reset every turn-scoped capability.
@@ -321,6 +332,7 @@ impl EngineLoopHost {
                 opts: options,
                 remaining_token_budget,
                 adaptive_policy,
+                steering: self.steering.lock().unwrap().clone(),
             },
             provider_name,
             model,

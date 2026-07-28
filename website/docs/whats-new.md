@@ -14,6 +14,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **You can talk to the agent while it's working.** In the TUI, type while a turn is running and
+  press Enter: your guidance is picked up at the agent's next planning step and folded into the
+  work in progress — no need to interrupt and start over. Queued messages show above the composer
+  and stay editable (open them with `/queue`) until the agent picks them up; the transcript notes
+  the moment each one is delivered, and anything the agent didn't get to simply becomes your next
+  turn. The plain REPL still waits for the turn to finish.
 - **The agent can now do risky work in an isolated git worktree — and merge it back when it's
   done.** Ask the agent to enter a worktree and it moves itself (and only itself — other agents
   and your own shell are untouched) into a temporary copy of your repository on a scratch branch.
@@ -39,6 +45,9 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **The project vision now matches what flux actually ships.** The vision document now calls out
+  replay, fork, run diff, offline agent tests, editor tooling, multi-user deployment foundations,
+  and the current on-hold status of the self-improvement work more clearly.
 - **The terminal UI got a major polish pass.** Pick a theme with `/theme` (`dark`, `light`,
   `mono`) and it sticks across sessions; press Ctrl-T to release the mouse so your terminal's
   native text selection and copy work; Ctrl-R searches your prompt history as you type; Ctrl-F

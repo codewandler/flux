@@ -37,10 +37,16 @@ pub struct ChatState {
     pub(super) history: Vec<String>,
     pub(super) history_pos: Option<usize>,
     pub(super) history_draft: String,
-    pub(super) queue: VecDeque<String>,
+    /// The mid-turn steering queue (A-94), shared with the engine via
+    /// [`flux_flow::FlowEngine::set_steering`]: while a turn runs, the engine drains it at the
+    /// next planner consultation; while idle, leftovers start ordinary follow-up turns. Items
+    /// stay editable/retractable here until the engine consumes them.
+    pub(super) queue: Arc<SteeringQueue>,
     pub(super) queue_open: bool,
     pub(super) queue_sel: usize,
-    pub(super) queue_edit_index: Option<usize>,
+    /// Id of the queued item being edited in the composer (id-based so a concurrent engine
+    /// drain invalidates the edit instead of retargeting a neighbour).
+    pub(super) queue_edit: Option<u64>,
     pub(super) session_picker: Option<Vec<flux_events::SessionSummary>>,
     pub(super) session_sel: usize,
     pub(super) scroll: u16,

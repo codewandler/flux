@@ -43,10 +43,12 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         Vec::new()
     };
     let menu_h = slash.len().max(paths.len()).min(6) as u16;
-    let queue_h = if state.queue.is_empty() {
+    // A point-in-time copy: the engine may drain the shared steering queue mid-render (A-94).
+    let queued = state.queue_texts();
+    let queue_h = if queued.is_empty() {
         0
     } else {
-        state.queue.len().min(3) as u16
+        queued.len().min(3) as u16
     };
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -86,9 +88,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         );
     }
 
-    if !state.queue.is_empty() {
-        let mut rows: Vec<Line> = state
-            .queue
+    if !queued.is_empty() {
+        let mut rows: Vec<Line> = queued
             .iter()
             .take(3)
             .enumerate()
@@ -102,9 +103,9 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 ])
             })
             .collect();
-        if state.queue.len() > 3 {
+        if queued.len() > 3 {
             rows[2] = Line::styled(
-                format!(" +{} more queued", state.queue.len() - 2),
+                format!(" +{} more queued", queued.len() - 2),
                 state.theme.muted_style(),
             );
         }
@@ -182,22 +183,21 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         footer_area,
     );
 
-    if state.queue_open && !state.queue.is_empty() {
-        let visible = state.queue.len().min(10);
+    if state.queue_open && !queued.is_empty() {
+        let visible = queued.len().min(10);
         let height = (visible as u16 + 2).min(frame.area().height);
         let area = centered(frame.area(), frame.area().width.min(76), height);
         frame.render_widget(Clear, area);
-        let selected = state.queue_sel.min(state.queue.len() - 1);
+        let selected = state.queue_sel.min(queued.len() - 1);
         let start = selected
             .saturating_sub(visible.saturating_sub(1))
-            .min(state.queue.len().saturating_sub(visible));
+            .min(queued.len().saturating_sub(visible));
         let mut rows = vec![Line::styled(
             " queued · Enter edit · Delete remove · Alt-↑/↓ reorder · Esc close ",
             state.theme.accent_style().bg(state.theme.panel_bg),
         )];
         rows.extend(
-            state
-                .queue
+            queued
                 .iter()
                 .skip(start)
                 .take(visible)
@@ -221,9 +221,9 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                     )
                 }),
         );
-        if state.queue.len() > visible {
+        if queued.len() > visible {
             rows.push(Line::styled(
-                format!(" {}/{} ", selected + 1, state.queue.len()),
+                format!(" {}/{} ", selected + 1, queued.len()),
                 state.theme.muted_style().bg(state.theme.panel_bg),
             ));
         }
