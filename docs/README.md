@@ -38,6 +38,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | **Language pillar** (essence) | [language.md](language.md) — Flux-Lang semantics in one place |
 | **Language pillar** (deep) | [../crates/flux-lang/docs/](../crates/flux-lang/docs/) — PRD, reference, syntax, STATUS |
 | Generated agent skills | [designs/generated-flux-skills.md](designs/generated-flux-skills.md) — `flux skill` root/section skills grounded in live catalogs |
+| Claude Code interop (commands + skills compatibility) | [designs/claude-interop.md](designs/claude-interop.md) — audit + epic D-186…D-192 |
 | **Improvement pillar** (deep) | [self-improvement/](self-improvement/) |
 | Public docs site source | [../website](../website) — Docusaurus docs for users and integrators |
 | Design records — active work **and** shipped-epic references (the design of a shipped epic stays here as its record) | [designs/](designs/) |

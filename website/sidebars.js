@@ -36,6 +36,7 @@ const sidebars = {
         'agent/endpoints',
         'agent/saved-flows',
         'agent/skills-and-roles',
+        'agent/claude-compat',
         'agent/time-machine',
         'agent/cost',
         'agent/realtime',

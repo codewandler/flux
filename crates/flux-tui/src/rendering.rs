@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     let input_h = state.input_rows();
     let slash = state
         .slash_query()
-        .map(|q| slash_matches(&q))
+        .map(|q| slash_matches(&q, &state.file_commands))
         .unwrap_or_default();
     let menu_h = (slash.len().min(6)) as u16;
     let queue_h = if state.queue.is_empty() {
@@ -243,7 +243,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
     }
 
-    // C-110: help overlay — keys from HELP_KEYS, commands iterated from COMMANDS (no drift).
+    // C-110: help overlay — keys from HELP_KEYS, commands iterated from the merged built-in +
+    // command-file table (no drift).
     if state.help_open {
         let t = &state.theme;
         let width = frame.area().width.min(76);
@@ -263,7 +264,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             ]));
         }
         rows.push(Line::styled(" commands", t.muted_style().bg(t.panel_bg)));
-        for chunk in COMMANDS.chunks(2) {
+        let commands = all_slash_commands(&state.file_commands);
+        for chunk in commands.chunks(2) {
             let mut spans = Vec::new();
             for c in chunk {
                 spans.push(Span::styled(

@@ -654,6 +654,27 @@ pub trait CompositeRegistrar: Send + Sync {
     ) -> flux_core::Result<serde_json::Value>;
 }
 
+/// The result of loading one skill's body on demand (D-188: opt-in model-invoked progressive skill
+/// disclosure). `name` is the catalog entry's canonical name (the caller's request may have been
+/// resolved case-sensitively against it); `body` is the full skill markdown body — nothing more is
+/// injected than what this call returns.
+#[derive(Debug, Clone)]
+pub struct SkillLoadOutcome {
+    pub name: String,
+    pub body: String,
+}
+
+/// Host capability for on-demand skill body loading (D-188). Implemented by the flow engine and
+/// injected into [`ToolContext`] when a session's skill catalog is non-empty (the opt-in
+/// model-invoked mode); `skill.load` fails clearly when absent. A successful load is expected to
+/// make the skill behave like an explicitly `--skill`-activated one for the rest of the session —
+/// the host, not this trait, owns that persistence.
+#[async_trait]
+pub trait SkillLoader: Send + Sync {
+    async fn load_skill(&self, session_id: &str, name: &str)
+        -> flux_core::Result<SkillLoadOutcome>;
+}
+
 /// The lifecycle phase of an active worktree session (C-97). `Merged` exists so a `leave` retry
 /// after a partial cleanup never re-merges: the merge commit landed, only worktree/branch removal
 /// remains.
@@ -773,6 +794,10 @@ pub struct ToolContext {
     workspace: WorkspaceContext,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
+    /// D-188: on-demand skill-body loader, installed by the flow engine when the opt-in
+    /// model-invoked skill catalog is non-empty for this session. `None` means the mode is off (or
+    /// this dispatch context has no engine behind it) — `skill.load` then fails clearly.
+    pub skill_loader: Option<Arc<dyn SkillLoader>>,
     /// The authored outer-loop capability, installed per turn by the engine. `None` outside a
     /// model-in-the-loop run — adaptive stage ops then return a clear error rather than silently
     /// doing nothing.
@@ -820,6 +845,7 @@ impl ToolContext {
             workspace: WorkspaceContext::new(system),
             redactor: Redactor::new(),
             spawner: None,
+            skill_loader: None,
             loop_host: None,
             composite_registrar: None,
             read_times: Arc::new(Mutex::new(HashMap::new())),
@@ -952,6 +978,12 @@ impl ToolContext {
     /// Install the composite-op registration capability.
     pub fn with_composite_registrar(mut self, registrar: Arc<dyn CompositeRegistrar>) -> Self {
         self.composite_registrar = Some(registrar);
+        self
+    }
+
+    /// Install the on-demand skill-body loading capability (D-188).
+    pub fn with_skill_loader(mut self, loader: Arc<dyn SkillLoader>) -> Self {
+        self.skill_loader = Some(loader);
         self
     }
 
@@ -1553,7 +1585,32 @@ pub fn detect_signals(cwd: &std::path::Path) -> Vec<Observation> {
     if chromium_present() {
         push("browser");
     }
+    // `agent_triggerable` (D-187): at least one discovered command file or skill in this session
+    // opts into agent invocation (`agent-triggerable: true`, default false). Unlike the marker
+    // checks above this parses frontmatter, not just `exists()` — bounded by the same discovery
+    // dirs `command.invoke` itself re-reads at call time, so the signal and the op's own
+    // "accessible" gate can never disagree about what is discoverable. Discovery failures (a
+    // symlink escape, an unreadable dir) degrade to "no signal" rather than surfacing the op on an
+    // error path.
+    if agent_triggerable_target_present(cwd) {
+        push("agent_triggerable");
+    }
     out
+}
+
+/// Whether `cwd`'s discoverable command files or skills include at least one marked
+/// `agent-triggerable: true`. Lenient: any discovery error is treated as "none found".
+fn agent_triggerable_target_present(cwd: &std::path::Path) -> bool {
+    let commands = metadata::discover_commands(cwd)
+        .map(|d| d.commands)
+        .unwrap_or_default();
+    if commands.iter().any(|c| c.agent_triggerable) {
+        return true;
+    }
+    metadata::discover_skills(cwd, &[])
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.agent_triggerable)
 }
 
 /// Whether a kubeconfig is reachable: `KUBECONFIG` is set (non-empty) OR `~/.kube/config` exists. This
@@ -2772,6 +2829,11 @@ impl Executor {
     /// Install the composite registration capability onto this executor's context.
     pub fn set_composite_registrar(&mut self, registrar: Arc<dyn CompositeRegistrar>) {
         self.ctx.composite_registrar = Some(registrar);
+    }
+
+    /// Install the on-demand skill-body loading capability (D-188) onto this executor's context.
+    pub fn set_skill_loader(&mut self, loader: Arc<dyn SkillLoader>) {
+        self.ctx.skill_loader = Some(loader);
     }
 
     /// Pre-allow these op names (they dispatch without an approval prompt). The engine uses this to
@@ -5592,6 +5654,54 @@ mod tests {
         assert!(has("git_repo") && has("go"));
         assert!(!has("python"));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// D-187: the `agent_triggerable` signal fires only when a discovered command or skill opts in
+    /// via `agent-triggerable: true` — an ordinary command/skill (flag absent/false) leaves the
+    /// signal off, so `command.invoke`'s owning group stays hidden for ordinary turns.
+    #[test]
+    fn detect_signals_surfaces_agent_triggerable_only_when_a_target_opts_in() {
+        let _home_guard = crate::metadata::HOME_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "flux-detect-agent-triggerable-{}",
+            std::process::id()
+        ));
+        let home = std::env::temp_dir().join(format!(
+            "flux-detect-agent-triggerable-home-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(base.join(".flux/commands")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            base.join(".flux/commands/human-only.md"),
+            "---\ndescription: human only\n---\nbody",
+        )
+        .unwrap();
+
+        std::env::set_var("HOME", &home);
+        let has_signal = |cwd: &std::path::Path| {
+            detect_signals(cwd)
+                .iter()
+                .any(|o| o.data.get("signal").and_then(|v| v.as_str()) == Some("agent_triggerable"))
+        };
+        assert!(
+            !has_signal(&base),
+            "a command without agent-triggerable: true must not surface the signal"
+        );
+
+        std::fs::write(
+            base.join(".flux/commands/triggerable.md"),
+            "---\ndescription: agent ok\nagent-triggerable: true\n---\nbody",
+        )
+        .unwrap();
+        assert!(
+            has_signal(&base),
+            "a discovered agent-triggerable command must surface the signal"
+        );
+        std::env::remove_var("HOME");
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     // --- D-177: the authorize-only split ------------------------------------

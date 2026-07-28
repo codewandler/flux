@@ -56,7 +56,7 @@ shared machinery beneath them. "Disposition" flags a planned move; see
 | `flux-secret` | L0 | secret refs + redaction | — |
 | `flux-evidence` | L0 | observations / evidence log | — |
 | `flux-config` | L0 | `.flux/config.toml` loading + precedence | — |
-| `flux-skill` | L0 | multi-format skill defs + discovery/merge + activation (triggers or name/description fallback) | — |
+| `flux-skill` | L0 | multi-format (flux-native + Agent Skills/Claude) skill frontmatter parsing + naming lint (`validate`); filesystem discovery lives in `flux-runtime::metadata`, not here | — |
 | `flux-markdown` | L0 | frontmatter parse/validate (`serde_norway`) + feature-gated render wrappers over `codewandler/markdown` | — |
 | `flux-datasource` | L0 | pure indexed-record/retrieval contracts plus live rows, typed filters, cursor pages, entity schemas, and weak references | — |
 | `flux-audio` | L0 | PCM16 LE/BE codecs, stateless + streaming resampling (phase carried across packets), `Framer` re-chunking — the sample-math layer for realtime-voice consumers | — |

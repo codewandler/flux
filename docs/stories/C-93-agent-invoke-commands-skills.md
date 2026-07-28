@@ -2,9 +2,9 @@
 id: C-93
 title: Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable
 pillar: Core
-status: backlog
+status: done
 priority:
-note: "commands/skills exist only for the human at the REPL/TUI; an agent can't invoke one even when policy would allow it"
+note: "SUPERSEDED by D-187 (claude-interop epic) — contract carried over unchanged, extended to file-based commands"
 ---
 
 # Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable
@@ -42,7 +42,10 @@ guarded IO like any other effect, never a bypass path.
       that must mention the agent-triggerable flag.
 
 ## Progress
-- (not started)
+- 2026-07-28 — superseded by [D-187](D-187-agent-invocable-commands-skills.md) in the
+  `claude-interop` epic ([design](../designs/claude-interop.md)): the three-gate contract here
+  carries over verbatim and gains file-based commands (D-186) as targets. No work happened under
+  this ID; closed to avoid a duplicate backlog row.
 
 ## Notes
 - Distinguish the three concepts precisely: **slash commands** are surface-level REPL/TUI entries

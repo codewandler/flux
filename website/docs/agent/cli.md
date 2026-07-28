@@ -125,6 +125,33 @@ only parameters not already supplied deterministically.
 | `/compact` | compact older conversation history now |
 | `/help` | show the complete current command list |
 
+## Command files
+
+Beyond the built-ins above, `/name args…` also dispatches a **command file**: a Markdown file
+discovered from project `.flux/commands` or `.claude/commands`, or user-global `~/.flux/commands` or
+`~/.claude/commands` (first-wins in that order; a file named after a built-in is dropped at load —
+built-ins always win). `/help` and the TUI slash menu list discovered command files with their
+`description` and `argument-hint` frontmatter.
+
+```markdown title=".flux/commands/review.md"
+---
+description: Review a PR for style and correctness
+argument-hint: <pr-number>
+---
+Review PR #$1 for style and correctness issues.
+```
+
+`/review 42` substitutes `$1` → `42` (and `$ARGUMENTS` → the full trailing text, `$2`..`$9` for
+further positionals; a missing positional substitutes empty) into the body, then runs the result as
+the turn's prompt — exactly as if you had typed it. See
+[Claude Code compatibility](./claude-compat.md#slash-commands) for the full precedence rules and
+what is deliberately not interpreted (`!`-inline-bash, `@file` refs).
+
+A command file is human-only by default. Adding `agent-triggerable: true` to its frontmatter lets
+the *agent* invoke it too, mid-turn, via the guarded `command.invoke` op — subject to policy and
+session-discovery gates on top of the flag. See
+[Agent-side invocation](./claude-compat.md#agent-side-invocation).
+
 ## Inspect and customize the loop
 
 ```bash

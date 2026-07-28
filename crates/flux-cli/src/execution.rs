@@ -14,6 +14,26 @@ pub(super) fn resolve_model_spec(cli_model: &Option<String>, cfg: &flux_config::
         .unwrap_or_else(|| "sonnet".to_string())
 }
 
+/// Resolve the model spec with an enabled skill's `model` frontmatter (D-189) layered in: `--model`
+/// flag > skill `model` > config `model` > `sonnet`. An explicit CLI/SDK model always wins — the
+/// same precedence a role's `model` uses against its `default_model` (`Role::to_spec`), just with
+/// the skill sitting one tier below the caller's own explicit choice instead of above it. When
+/// several enabled skills declare a `model`, the first (highest-precedence `--skill` order) wins;
+/// this is a corner case worth naming rather than silently picking one — see
+/// `docs/designs/claude-interop.md`'s Risks section.
+pub(super) fn resolve_model_spec_with_skill(
+    cli_model: &Option<String>,
+    cfg: &flux_config::Config,
+    skills: &[flux_skill::Skill],
+) -> String {
+    let skill_model = skills.iter().find_map(|s| s.model.clone());
+    cli_model
+        .clone()
+        .or(skill_model)
+        .or_else(|| cfg.model.clone())
+        .unwrap_or_else(|| "sonnet".to_string())
+}
+
 /// Persist newly "always-allow"ed permission rules back to the project config, if any changed.
 pub(super) fn persist_new_rules(initial: &[String], current: &[String]) {
     if current == initial {
@@ -247,23 +267,16 @@ pub(super) fn compact_threshold() -> usize {
     }
 }
 
-/// Discover skills from the project's `.flux/skills` and `.claude/skills` plus the user/global dirs
-/// (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`), with custom dirs layered above the
-/// well-known set: `--skill-dir` flags first, then `[skills] dirs` from the layered config (project
-/// before user) — earlier dirs win a name clash (L-02). Discovery reads metadata only. `enabled`
-/// is the explicit `--skill NAME` allowlist; prompt text never activates a skill automatically.
-pub(super) fn load_skills(
+/// Walk `.flux/skills` and `.claude/skills` plus the user/global dirs (`~/.flux/skills`,
+/// `~/.agents/skills`, `~/.claude/skills`), with `cli_dirs` layered above `[skills] dirs` from the
+/// layered config (project before user) above the well-known set — earlier dirs win a name clash
+/// (L-02). Metadata only (no bodies read). Shared by [`load_skills`] and
+/// [`load_model_invoked_skill_catalog`] so the two callers can't drift on directory precedence.
+fn discover_skills(
     cwd: &std::path::Path,
     cfg: &flux_config::Config,
     cli_dirs: &[std::path::PathBuf],
-    enabled: &[String],
-) -> Result<Vec<flux_skill::Skill>> {
-    // Manual-only means more than "discover everything, then select nothing": an ordinary turn
-    // must not pay to walk every project and global skill directory. Discovery is only useful once
-    // the caller has explicitly named at least one skill.
-    if enabled.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<flux_runtime::metadata::SkillDiscovery> {
     let mut extra = cli_dirs
         .iter()
         .cloned()
@@ -276,8 +289,36 @@ pub(super) fn load_skills(
         })
         .collect::<Vec<_>>();
     extra.extend(flux_runtime::metadata::configured_skill_roots(cfg));
-    let discovered = flux_runtime::metadata::discover_skills_from(cwd, &extra)
-        .map_err(|error| anyhow::anyhow!("discover skills: {error}"))?;
+    flux_runtime::metadata::discover_skills_from(cwd, &extra)
+        .map_err(|error| anyhow::anyhow!("discover skills: {error}"))
+}
+
+/// D-189: load-time frontmatter honesty — a recognized-but-unsupported field, an unmappable
+/// `allowed-tools` entry, or a `flux_skill::validate` naming/description issue. Data, not a
+/// silent drop; printed the same way `load_command_files` reports its own warnings.
+fn print_skill_warnings(discovery: &flux_runtime::metadata::SkillDiscovery) {
+    for warning in &discovery.warnings {
+        eprintln!("{} {warning}", style::yellow("warning:"));
+    }
+}
+
+/// Explicitly enable named skills. `enabled` is the `--skill NAME` allowlist; prompt text never
+/// activates a skill automatically.
+pub(super) fn load_skills(
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    cli_dirs: &[std::path::PathBuf],
+    enabled: &[String],
+) -> Result<Vec<flux_skill::Skill>> {
+    // Manual-only means more than "discover everything, then select nothing": an ordinary turn
+    // must not pay to walk every project and global skill directory. Discovery is only useful once
+    // the caller has explicitly named at least one skill.
+    if enabled.is_empty() {
+        return Ok(Vec::new());
+    }
+    let discovery = discover_skills(cwd, cfg, cli_dirs)?;
+    print_skill_warnings(&discovery);
+    let discovered = discovery.skills;
     let mut selected = Vec::new();
     for name in enabled {
         let skill = discovered
@@ -304,6 +345,111 @@ pub(super) fn load_skills(
         }
     }
     Ok(selected)
+}
+
+/// D-188: discover the opt-in model-invoked skill catalog — every discovered skill except those
+/// declaring `disable-model-invocation: true`. Unlike [`load_skills`], this runs the directory walk
+/// unconditionally when `model_invoked` is set, since the whole point of the opt-in is to surface
+/// what's discoverable rather than wait for an explicit `--skill` name.
+pub(super) fn load_model_invoked_skill_catalog(
+    cwd: &std::path::Path,
+    cfg: &flux_config::Config,
+    cli_dirs: &[std::path::PathBuf],
+    model_invoked: bool,
+) -> Result<Vec<flux_skill::Skill>> {
+    if !model_invoked {
+        return Ok(Vec::new());
+    }
+    let discovery = discover_skills(cwd, cfg, cli_dirs)?;
+    print_skill_warnings(&discovery);
+    Ok(discovery
+        .skills
+        .into_iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect())
+}
+
+/// Discover command files (D-186) eagerly — unlike skills, they populate `/help` and the slash
+/// menu on every run rather than only once explicitly enabled. Built-ins always win a name clash:
+/// a shadowed file command is dropped (not dispatched) with a load-time warning naming both the
+/// clashing file and the built-in it lost to, rather than silently masking either one.
+pub(super) fn load_command_files(
+    cwd: &std::path::Path,
+    builtin_names: &[&str],
+) -> Vec<flux_runtime::metadata::CommandFile> {
+    let discovery = match flux_runtime::metadata::discover_commands(cwd) {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            eprintln!("{} discover commands: {error}", style::yellow("warning:"));
+            return Vec::new();
+        }
+    };
+    for warning in &discovery.warnings {
+        eprintln!("{} {warning}", style::yellow("warning:"));
+    }
+    discovery
+        .commands
+        .into_iter()
+        .filter(|command| {
+            let shadowed = builtin_names.contains(&command.name.as_str());
+            if shadowed {
+                eprintln!(
+                    "{} command file `{}` names the built-in `/{}` — the built-in wins; rename \
+                     the file to use it",
+                    style::yellow("warning:"),
+                    command.source.display(),
+                    command.name
+                );
+            }
+            !shadowed
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod command_file_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "flux-cli-cmdfiles-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_builtin_named_file_command_is_dropped_not_dispatched() {
+        let root = temp_dir("shadow");
+        std::fs::create_dir_all(root.join(".flux/commands")).unwrap();
+        std::fs::write(root.join(".flux/commands/help.md"), "not the real help").unwrap();
+        std::fs::write(
+            root.join(".flux/commands/review.md"),
+            "---\ndescription: Review a PR\n---\nReview $1",
+        )
+        .unwrap();
+
+        let loaded = load_command_files(&root, &["help", "clear"]);
+        assert!(
+            !loaded.iter().any(|c| c.name == "help"),
+            "a command file named `help` must not shadow the built-in: {loaded:?}"
+        );
+        assert!(loaded.iter().any(|c| c.name == "review"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn no_command_dirs_yields_an_empty_list() {
+        let root = temp_dir("empty");
+        assert!(load_command_files(&root, &["help"]).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 /// The plugin descriptor directory `~/.flux/plugins` (None if `HOME` is unset).
@@ -914,6 +1060,13 @@ struct EngineParts {
     ambient_signals: Vec<String>,
     model_stages: std::collections::BTreeMap<String, flux_flow::ModelStageDefinition>,
     max_iterations: usize,
+    /// Explicitly enabled skills (D-189: loaded up front, before model resolution, so a skill's
+    /// `model` frontmatter can take part in the precedence chain) — carried through rather than
+    /// re-discovered here.
+    skills: Vec<flux_skill::Skill>,
+    /// D-188: the opt-in model-invoked skill catalog, empty unless `--skills-model-invoked` /
+    /// `[skills] model_invoked` is set — carried through rather than re-discovered here.
+    model_invoked_skills: Vec<flux_skill::Skill>,
 }
 
 /// Assemble the [`FlowEngine`] from the resolved parts: install the authored-loop host, load the
@@ -938,12 +1091,15 @@ async fn assemble_engine(
         ambient_signals,
         model_stages,
         max_iterations,
+        skills,
+        model_invoked_skills,
     } = parts;
     let flow = open_flow_store(events.clone())?;
     let spec = AgentSpec {
         model,
         system_prompt,
-        skills: load_skills(cwd, cfg, &flags.skill_dirs, &flags.skills)?,
+        skills,
+        model_invoked_skills,
         max_tokens: flags.max_tokens,
         max_iterations,
         thinking: flags.think,
@@ -1005,7 +1161,21 @@ pub(super) async fn build_agent_with(
     if cfg.enable_shell {
         flux_runtime::set_shell_opt_in(true);
     }
-    let model_spec = resolve_model_spec(&flags.model, &cfg);
+    // Skills load before model resolution (D-189): an enabled skill's `model` frontmatter is a
+    // precedence tier between the explicit `--model` flag and config/default, so it must be known
+    // before the primary provider is resolved. Loaded once here and threaded through
+    // `EngineParts` into `assemble_engine` so the directory walk doesn't happen twice.
+    let skills = load_skills(&cwd, &cfg, &flags.skill_dirs, &flags.skills)?;
+    let model_spec = resolve_model_spec_with_skill(&flags.model, &cfg, &skills);
+    // D-188: opt-in model-invoked skill catalog, `--skills-model-invoked` flag OR `[skills]
+    // model_invoked` config. Loaded here (not in `assemble_engine`) for the same reason `skills`
+    // is: one directory walk, threaded through `EngineParts`.
+    let model_invoked_skills = load_model_invoked_skill_catalog(
+        &cwd,
+        &cfg,
+        &flags.skill_dirs,
+        flags.skills_model_invoked || cfg.skills.model_invoked,
+    )?;
 
     // The engine's primary provider under the mock/lazy/eager policy (the `mock` provider lets the
     // full agentic loop be exercised offline via the CLI).
@@ -1290,6 +1460,8 @@ pub(super) async fn build_agent_with(
             ambient_signals,
             model_stages,
             max_iterations,
+            skills,
+            model_invoked_skills,
         },
         &cwd,
         &cfg,

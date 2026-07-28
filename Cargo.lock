@@ -1084,6 +1084,7 @@ dependencies = [
  "codewandler-flux-config",
  "codewandler-flux-core",
  "codewandler-flux-evidence",
+ "codewandler-flux-markdown",
  "codewandler-flux-policy",
  "codewandler-flux-secret",
  "codewandler-flux-skill",
@@ -1091,8 +1092,10 @@ dependencies = [
  "codewandler-flux-system",
  "serde",
  "serde_json",
+ "serde_norway",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

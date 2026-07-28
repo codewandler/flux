@@ -150,6 +150,14 @@ pub struct SkillsConfig {
     /// against the workspace root; a leading `~/` expands to the home directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<String>,
+    /// Opt into Claude-style progressive skill disclosure (D-188): every discovered,
+    /// non-`disable-model-invocation` skill's name+description is surfaced to the model, and it
+    /// can pull a skill's full body into context on demand via `skill.load`. Off by default —
+    /// manual `--skill` activation stays the measured-cheaper default path
+    /// (`docs/designs/manual-skill-activation.md`); this is additive, not a replacement. Mirrors
+    /// the CLI's `--skills-model-invoked` flag.
+    #[serde(default)]
+    pub model_invoked: bool,
 }
 
 /// Provenance of one configured skill root after user/project layering.
@@ -273,7 +281,7 @@ fn default_stage_max_tokens() -> u32 {
 
 impl SkillsConfig {
     fn is_default(&self) -> bool {
-        self.dirs.is_empty()
+        self.dirs.is_empty() && !self.model_invoked
     }
 }
 
@@ -522,7 +530,8 @@ impl Config {
 
     /// The configured custom skill directories as paths, in precedence order, with a leading `~/`
     /// expanded to the home directory. Relative paths are left relative — the skill-discovery
-    /// composer (`flux_skill::skill_dirs`) resolves them against the workspace root.
+    /// composer (`flux_runtime::metadata::discover_skills_from`) resolves them against the
+    /// workspace root.
     pub fn skill_dir_paths(&self) -> Vec<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         self.skills
@@ -831,6 +840,7 @@ fn merge(user: Config, project: Config) -> Config {
         // order carries no meaning.
         skills: SkillsConfig {
             dirs: dedupe([project.skills.dirs, user.skills.dirs].concat()),
+            model_invoked: user.skills.model_invoked || project.skills.model_invoked,
         },
         configured_skill_dirs,
         // Extra read-only roots concatenate (project first); the unconfined hatch is true if either sets it.

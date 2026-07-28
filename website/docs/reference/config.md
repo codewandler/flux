@@ -46,6 +46,7 @@ turn_token_budget = 120000
 
 [skills]
 dirs = ["team/skills"]
+model_invoked = false
 
 [workspace]
 add_dirs = ["../shared-docs"]
@@ -194,7 +195,13 @@ access. Every admitted private request is audited.
 `[skills] dirs` adds skill directories above the well-known project/global set. Relative paths are
 resolved from the workspace; `~/` expands to the home directory. Earlier directories win a name
 collision. CLI `--skill-dir` entries have the highest precedence. Directories only affect discovery;
-skills remain inactive until selected with `--skill <name>` or an explicit `AgentSpec`. See
+skills remain inactive until selected with `--skill <name>` or an explicit `AgentSpec`.
+
+`[skills] model_invoked` (default `false`) opts into Claude-style progressive skill disclosure:
+every discovered skill's name+description is surfaced to the model, which can pull a body into
+context on demand via `skill.load` — see
+[Model-invoked skills (opt-in)](../agent/skills-and-roles.md#model-invoked-skills-opt-in). Mirrors
+`--skills-model-invoked`; either the project or user config setting it turns it on. See
 [Skills & roles](../agent/skills-and-roles.md).
 
 `[workspace] add_dirs` grants extra **read-only** roots outside the workspace; writes remain confined

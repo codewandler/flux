@@ -177,6 +177,15 @@ pub(super) struct AgentFlags {
     #[arg(long = "skill", value_name = "NAME")]
     pub(super) skills: Vec<String>,
 
+    /// Opt into Claude-style progressive skill disclosure (D-188): surface every discovered,
+    /// non-`disable-model-invocation` skill's name+description to the model, and let it pull a
+    /// skill's full body into context on demand via `skill.load`. Off by default — manual
+    /// `--skill` activation stays the measured-cheaper default path
+    /// (`docs/designs/manual-skill-activation.md`); this is additive, not a replacement. Also
+    /// settable via `[skills] model_invoked` in `.flux/config.toml`.
+    #[arg(long = "skills-model-invoked")]
+    pub(super) skills_model_invoked: bool,
+
     /// Continue the most recent session instead of starting a new one.
     #[arg(short = 'c', long)]
     pub(super) continue_: bool,

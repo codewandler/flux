@@ -95,6 +95,21 @@ cache untouched. Done means all nine stories' acceptance green under the standar
 pub-surface breaks (`TuiRunOptions.theme`, `ChatState.modal` → `approval`) ride the next MINOR.
 Design: [designs/tui-polish.md](designs/tui-polish.md).
 
+### Claude interop — commands + skills that load from both worlds (epic) — ✅ **COMPLETE (2026-07-28; D-186…D-192, all seven stories; supersedes C-93; unreleased)**
+
+A compatibility audit found flux half-speaks Claude Code's dialect: skills already load from
+`.claude/skills`/`~/.claude/skills` with `name`/`description` frontmatter, but command files
+(`.claude/commands/*.md`, `$ARGUMENTS`) don't exist at all, every other frontmatter field
+(`allowed-tools`, `model`, `disable-model-invocation`, …) is silently dropped, supporting files
+(`references/`) are unreachable, nested skill trees are invisible, and half of `flux-skill` is dead
+code. The epic's stance: compatible where Claude's semantics are good, deliberately divergent where
+ours are better (manual `--skill` activation stays the default; model-invoked disclosure becomes an
+opt-in), and loud about the difference — no silently dropped fields, and a dedicated
+`website/docs/agent/claude-compat.md` page whose claims track what actually ships. Done looks like: a
+real `.claude` directory (commands + nested multi-file skills) works in place, agent invocation is
+triple-gated (permitted ∧ accessible ∧ agent-triggerable, absorbing C-93), and one honest discovery
+implementation remains. Design: [designs/claude-interop.md](designs/claude-interop.md).
+
 ### Context-local Git worktrees (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-97…C-100, merged to main, unreleased; next MINOR — `ToolContext.system` field → accessor is breaking)**
 
 > Follow-ups: C-120 (disk-backed worktree allocation — `/tmp` tmpfs hazard) and C-121

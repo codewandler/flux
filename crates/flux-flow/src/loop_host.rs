@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use flux_core::{Error, Message, Result, Usage};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
-    CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SpawnActivity,
-    SpawnActivitySink, ToolResult,
+    CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SkillLoadOutcome,
+    SkillLoader, SpawnActivity, SpawnActivitySink, ToolResult,
 };
 
 use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
@@ -53,6 +53,16 @@ pub struct EngineLoopHost {
     /// Active `run_authored_flow` reentry depth, guarding against runaway `flow_run` recursion
     /// (flow → `flow_run` → flow → …). Mirrors the reentry cap the retired `run_plan` host held.
     authored_depth: AtomicU32,
+    /// D-188: the opt-in model-invoked skill catalog (discovered, non-`disable-model-invocation`
+    /// skills) — empty means the mode is off for this engine. Set once via
+    /// [`Self::set_skill_catalog`], read by both `skill.load` (through the [`SkillLoader`]
+    /// capability) and the engine's per-turn prompt/surfacing assembly.
+    skill_catalog: Mutex<Vec<flux_skill::Skill>>,
+    /// D-188: names loaded via `skill.load` this session, keyed by session id. A loaded skill's
+    /// full body is injected on every subsequent turn of that session — the same treatment an
+    /// explicitly `--skill`-activated one gets — so activation has one consistent semantics
+    /// regardless of how it happened.
+    loaded_skills: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 /// Hard cap on authored-flow reentry (`run_authored_flow`). A stored flow that calls `flow_run` on
@@ -109,10 +119,13 @@ impl EngineLoopHost {
                 groups: Mutex::new(Vec::new()),
                 model_stages: Mutex::new(BTreeMap::new()),
                 authored_depth: AtomicU32::new(0),
+                skill_catalog: Mutex::new(Vec::new()),
+                loaded_skills: Mutex::new(HashMap::new()),
             });
             *captured.lock().unwrap() = Some(host.clone());
             executor.set_loop_host(host.clone());
-            executor.set_composite_registrar(host);
+            executor.set_composite_registrar(host.clone());
+            executor.set_skill_loader(host);
             executor
         });
         let host = slot.lock().unwrap().take().expect("loop host captured");
@@ -127,6 +140,29 @@ impl EngineLoopHost {
 
     pub fn set_groups(&self, groups: Vec<flux_evidence::ToolGroup>) {
         *self.groups.lock().unwrap() = groups;
+    }
+
+    /// Set the opt-in model-invoked skill catalog (D-188). Empty (the default) means the mode is
+    /// off; a non-empty catalog is what makes `skill.load` surface and the compact name+description
+    /// listing appear in the system prompt.
+    pub fn set_skill_catalog(&self, catalog: Vec<flux_skill::Skill>) {
+        *self.skill_catalog.lock().unwrap() = catalog;
+    }
+
+    /// The current opt-in model-invoked skill catalog (a clone — callers read this once per turn).
+    pub fn skill_catalog(&self) -> Vec<flux_skill::Skill> {
+        self.skill_catalog.lock().unwrap().clone()
+    }
+
+    /// Names loaded via `skill.load` so far in `session_id` (D-188). Empty when the mode is off or
+    /// nothing has been loaded yet.
+    pub fn loaded_skill_names(&self, session_id: &str) -> HashSet<String> {
+        self.loaded_skills
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_model_stages(&self, stages: BTreeMap<String, crate::staged::ModelStageDefinition>) {
@@ -962,6 +998,36 @@ impl CompositeRegistrar for EngineLoopHost {
             ),
             "path": path,
         }))
+    }
+}
+
+#[async_trait]
+impl SkillLoader for EngineLoopHost {
+    /// Look `name` up in the opt-in catalog and record it loaded for `session_id`. Errors when the
+    /// catalog is empty (the mode is off) or `name` isn't in it — including a skill that declared
+    /// `disable-model-invocation: true`, which the caller never puts in the catalog in the first
+    /// place (D-189's `Skill::disable_model_invocation`).
+    async fn load_skill(&self, session_id: &str, name: &str) -> Result<SkillLoadOutcome> {
+        let catalog = self.skill_catalog.lock().unwrap().clone();
+        let skill = catalog
+            .into_iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "skill.load: `{name}` is not a model-invocable skill (unknown, or it declares \
+                 `disable-model-invocation: true`)"
+                ))
+            })?;
+        self.loaded_skills
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(skill.name.clone());
+        Ok(SkillLoadOutcome {
+            name: skill.name,
+            body: skill.body.text().to_string(),
+        })
     }
 }
 

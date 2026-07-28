@@ -126,6 +126,18 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             surface_when: when_any(&["kubernetes", "endpoint"]),
         },
         ToolGroup {
+            name: "agent_invoke".into(),
+            description: "Agent-side invocation of a discovered command file or skill (D-187, \
+                          absorbs C-93): `command.invoke` runs ONLY when the target is explicitly \
+                          marked `agent-triggerable: true` in its own frontmatter (default false \
+                          — most commands/skills stay human-only) AND your policy grants it AND \
+                          it is discovered in this session. Surfaced only when at least one such \
+                          target exists."
+                .into(),
+            tools: names(&["command.invoke"]),
+            surface_when: when("agent_triggerable"),
+        },
+        ToolGroup {
             name: "cognition".into(),
             description: "Pure cognition helpers: needs/gaps, list shaping (compare, dedupe, sort, \
                           top, merge, cite, len, first, last, filter), aggregation & predicates \

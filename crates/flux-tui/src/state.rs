@@ -17,6 +17,8 @@ pub struct ChatState {
     pub(super) session_id: String,
     pub(super) model: String,
     pub(super) model_spec: Option<String>,
+    /// Command files (D-186) discovered by the surface, already filtered against built-in names.
+    pub(super) file_commands: Vec<flux_runtime::metadata::CommandFile>,
     pub(super) theme: Theme,
     pub(super) theme_name: String,
     pub(super) expand_tools: bool,

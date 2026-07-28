@@ -1408,10 +1408,21 @@ impl System {
         Ok(out)
     }
 
-    /// Read text files directly under `dir` plus `nested_file` from each immediate child
-    /// directory. Every entry is resolved independently, so a symlinked file/directory is rejected
-    /// rather than silently omitted. This is the guarded discovery shape used by project skills
-    /// (`*.md` and `<name>/SKILL.md`).
+    /// Maximum directory levels [`System::read_dir_text_files_with_nested`] descends below a skill
+    /// root while searching for `nested_file` (e.g. `SKILL.md`). Depth 1 is the historical one-level
+    /// `<name>/SKILL.md` shape; this bound additionally covers Claude's namespaced trees
+    /// (`.claude/skills/<ns>/<name>/SKILL.md` is depth 2) plus headroom for a sub-namespace, while
+    /// keeping a pathological tree from turning discovery into an unbounded walk.
+    const NESTED_FILE_MAX_DEPTH: usize = 4;
+
+    /// Read text files directly under `dir` plus `nested_file` from each descendant directory,
+    /// bounded by [`System::NESTED_FILE_MAX_DEPTH`]. Every entry is resolved independently, so a symlinked
+    /// file/directory is rejected rather than silently omitted. This is the guarded discovery shape
+    /// used by project skills (`*.md` at the top level only, `SKILL.md` at any depth up to the
+    /// bound) — Claude namespaced trees (`skills/<ns>/<name>/SKILL.md`) resolve the same as a flat
+    /// `skills/<name>/SKILL.md` layout. A directory that directly contains `nested_file` claims its
+    /// whole subtree: traversal does not descend past it, so skill-internal directories (e.g. a
+    /// skill's own `references/`) never surface as separate entries.
     pub fn read_dir_text_files_with_nested(
         &self,
         dir: &str,
@@ -1441,14 +1452,7 @@ impl System {
             let resolved = self.workspace.resolve_read(&child)?;
             let metadata = std::fs::metadata(&resolved)?;
             if metadata.is_dir() {
-                let nested = format!("{child}/{nested_file}");
-                let nested_path = self.workspace.resolve_read(&nested)?;
-                match std::fs::metadata(&nested_path) {
-                    Ok(metadata) if metadata.is_file() => paths.push(nested),
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+                self.collect_nested_file(&child, nested_file, 1, &mut paths)?;
             } else if std::path::Path::new(&name)
                 .extension()
                 .and_then(|value| value.to_str())
@@ -1467,6 +1471,56 @@ impl System {
             out.push((path, content));
         }
         Ok(out)
+    }
+
+    /// Depth-first search for `nested_file` under `dir_path` (a workspace-relative directory
+    /// already known to exist), bounded by [`System::NESTED_FILE_MAX_DEPTH`] directory levels below the
+    /// skill root. If `dir_path` itself contains `nested_file`, that claims the whole subtree and
+    /// the search stops there (no further descent, so a skill's own supporting directories are
+    /// never mistaken for nested skills). Otherwise every subdirectory is searched in sorted order.
+    fn collect_nested_file(
+        &self,
+        dir_path: &str,
+        nested_file: &str,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) -> Result<()> {
+        let nested = format!("{dir_path}/{nested_file}");
+        let nested_resolved = self.workspace.resolve_read(&nested)?;
+        match std::fs::metadata(&nested_resolved) {
+            Ok(metadata) if metadata.is_file() => {
+                out.push(nested);
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if depth >= Self::NESTED_FILE_MAX_DEPTH {
+            return Ok(());
+        }
+
+        let resolved_dir = self.workspace.resolve_read(dir_path)?;
+        let entries = match std::fs::read_dir(&resolved_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+
+        for name in names {
+            let child = format!("{dir_path}/{name}");
+            let resolved = self.workspace.resolve_read(&child)?;
+            if std::fs::metadata(&resolved)?.is_dir() {
+                self.collect_nested_file(&child, nested_file, depth + 1, out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Recursively list files under a workspace-relative directory, returning workspace-relative
@@ -2513,6 +2567,107 @@ mod tests {
         assert!(sys
             .read_dir_text_files_with_nested(".flux/skills", "md", "SKILL.md")
             .is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn discovers_namespaced_skill_md_two_levels_deep() {
+        // Claude namespaced trees: `.claude/skills/<ns>/<name>/SKILL.md` — one level deeper than
+        // the historical `<name>/SKILL.md` shape.
+        let (dir, sys) = temp_workspace();
+        std::fs::create_dir_all(dir.join(".claude/skills/ns/foo")).unwrap();
+        std::fs::write(
+            dir.join(".claude/skills/ns/foo/SKILL.md"),
+            "---\nname: foo\n---\nbody",
+        )
+        .unwrap();
+
+        let files = sys
+            .read_dir_text_files_with_nested(".claude/skills", "md", "SKILL.md")
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![(
+                ".claude/skills/ns/foo/SKILL.md".to_string(),
+                "---\nname: foo\n---\nbody".to_string()
+            )]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nested_skill_md_beyond_max_depth_is_not_found() {
+        let (dir, sys) = temp_workspace();
+        // One level past `System::NESTED_FILE_MAX_DEPTH`: never reached.
+        let too_deep = dir.join(".claude/skills/a/b/c/d/e");
+        std::fs::create_dir_all(&too_deep).unwrap();
+        std::fs::write(too_deep.join("SKILL.md"), "---\nname: too-deep\n---\nx").unwrap();
+
+        let files = sys
+            .read_dir_text_files_with_nested(".claude/skills", "md", "SKILL.md")
+            .unwrap();
+        assert!(
+            files.is_empty(),
+            "SKILL.md beyond the max depth bound must not surface: {files:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_skill_directory_claims_its_subtree_so_references_is_not_a_separate_skill() {
+        // A skill's own `references/` directory (containing its own `.md` files) must not surface
+        // as a separate skill: the parent directory already claimed the subtree by having SKILL.md.
+        let (dir, sys) = temp_workspace();
+        std::fs::create_dir_all(dir.join(".claude/skills/foo/references")).unwrap();
+        std::fs::write(
+            dir.join(".claude/skills/foo/SKILL.md"),
+            "---\nname: foo\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".claude/skills/foo/references/notes.md"),
+            "internal notes, not a skill",
+        )
+        .unwrap();
+
+        let files = sys
+            .read_dir_text_files_with_nested(".claude/skills", "md", "SKILL.md")
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![(
+                ".claude/skills/foo/SKILL.md".to_string(),
+                "---\nname: foo\n---\nbody".to_string()
+            )]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nested_symlink_escape_below_the_top_level() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, sys) = temp_workspace();
+        let outside = std::env::temp_dir().join(format!(
+            "flux-sys-nested-outside-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("SKILL.md"), "OUTSIDE").unwrap();
+        std::fs::create_dir_all(dir.join(".claude/skills/ns")).unwrap();
+        symlink(&outside, dir.join(".claude/skills/ns/escaped")).unwrap();
+
+        let error = sys
+            .read_dir_text_files_with_nested(".claude/skills", "md", "SKILL.md")
+            .unwrap_err();
+        assert!(error.to_string().contains("outside"), "{error}");
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();

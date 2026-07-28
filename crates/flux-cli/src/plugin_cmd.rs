@@ -1992,3 +1992,80 @@ pub(super) fn warn_stale_plugins(stale: &[String]) {
         ))
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D-190: `write_generated_skill` is the only place `references/` are written for a `flux skill
+    /// … --install` skill. Prove the round trip end to end — generate a `flux-plugin` skill with a
+    /// real reference (mirroring `plugin_skill::tests::fixture`), install it into a project
+    /// `.flux/skills` root, discover it through the same production path the engine uses
+    /// (`flux_runtime::metadata::discover_skills`), and confirm the discovered skill's `source`
+    /// resolves to a directory whose `references/<plugin>.md` is the file just written — i.e. the
+    /// path D-190 discloses in the `<skill>` tag actually anchors a `read` of the generated
+    /// reference.
+    #[test]
+    fn installed_plugin_skill_references_are_reachable_from_its_discovered_source() {
+        let sequence = std::sync::atomic::AtomicU64::new(0);
+        let n = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let project = std::env::temp_dir().join(format!(
+            "flux-skill-round-trip-{}-{n}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+
+        let manifest = flux_plugin::PluginManifest {
+            name: "gitlab".into(),
+            version: "0.1.0".into(),
+            operations: vec![flux_plugin::OperationSpec {
+                name: "gitlab.project.list".into(),
+                description: "List projects".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rendered = skill_cmd::render_plugin_skill(&[("gitlab".into(), manifest)]);
+        assert!(
+            !rendered.references.is_empty(),
+            "fixture must actually exercise the references/ path"
+        );
+
+        let skills_root = project.join(".flux").join("skills");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        let installed_dir = write_generated_skill(&skills_root, &rendered).unwrap();
+
+        let discovered = flux_runtime::metadata::discover_skills(&project, &[]).unwrap();
+        let skill = discovered
+            .iter()
+            .find(|s| s.name == "flux-plugin")
+            .expect("the installed skill is discovered");
+        let source = skill.source.as_ref().expect("discovery captures `source`");
+        assert_eq!(
+            source,
+            &installed_dir.join("SKILL.md"),
+            "source must point at the installed SKILL.md"
+        );
+
+        // Mirror flux-flow's disclosure rule (D-190): a SKILL.md-backed skill discloses its
+        // directory, so `references/<name>.md` must be reachable directly beneath it.
+        let disclosed_dir = source.parent().expect("SKILL.md has a parent directory");
+        for (name, expected_md) in &rendered.references {
+            let reference_path = disclosed_dir.join("references").join(format!("{name}.md"));
+            let on_disk = std::fs::read_to_string(&reference_path).unwrap_or_else(|e| {
+                panic!(
+                    "reference {} not reachable at {reference_path:?}: {e}",
+                    name
+                )
+            });
+            assert_eq!(&on_disk, expected_md);
+        }
+
+        std::fs::remove_dir_all(&project).ok();
+    }
+}

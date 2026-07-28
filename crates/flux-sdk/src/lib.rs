@@ -373,6 +373,10 @@ pub struct ClientBuilder {
     envelope: envelope::Envelope,
     storage: Option<Storage>,
     cognition: bool,
+    /// D-188: opt into the model-invoked progressive skill disclosure catalog, discovered from the
+    /// workspace root at [`build`](Self::build) time (before it's known, so this stays a flag here
+    /// rather than an eagerly-populated field).
+    model_invoked_skills: bool,
     ops: Vec<(String, Arc<dyn Tool>)>,
     packs: Vec<RegistryPack>,
     live_surfaces: Vec<flux_capabilities::LiveDatasourceSurface>,
@@ -391,6 +395,7 @@ impl Default for ClientBuilder {
             // Unset ⇒ in-memory (ephemeral) stores, the pre-0.16 behavior.
             storage: None,
             cognition: false,
+            model_invoked_skills: false,
             ops: Vec::new(),
             packs: Vec::new(),
             live_surfaces: Vec::new(),
@@ -416,6 +421,7 @@ impl ClientBuilder {
             envelope: envelope::Envelope::bare(),
             storage: None,
             cognition: false,
+            model_invoked_skills: false,
             ops: Vec::new(),
             packs: Vec::new(),
             live_surfaces: Vec::new(),
@@ -725,11 +731,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Opt into Claude-style progressive skill disclosure (D-188): every skill discovered under
+    /// the workspace root (resolved at [`build`](Self::build)) gets its name+description surfaced
+    /// to the model, except those declaring `disable-model-invocation: true`; the model can pull a
+    /// body into context on demand via `skill.load`. Off by default — [`Self::from_spec`]'s
+    /// explicit `AgentSpec.skills` stays the always-injected activation surface this is additive
+    /// to, mirroring the CLI's `--skills-model-invoked` flag / `[skills] model_invoked` config.
+    pub fn model_invoked_skills(mut self) -> Self {
+        self.model_invoked_skills = true;
+        self
+    }
+
     /// Build the client with `provider` and a workspace rooted at `root`. Sessions live in the
     /// configured [`Storage`] (in-memory unless set). The turn runs on [`FlowEngine`] (the model
     /// plans, the runtime runs the flux-lang agent loop).
-    pub fn build(self, provider: Box<dyn Provider>, root: impl Into<PathBuf>) -> Result<Client> {
+    pub fn build(
+        mut self,
+        provider: Box<dyn Provider>,
+        root: impl Into<PathBuf>,
+    ) -> Result<Client> {
         let root = root.into();
+        if self.model_invoked_skills {
+            self.spec.cwd = root.clone();
+            self.spec = self.spec.try_with_model_invoked_skills()?;
+        }
         let provider: Arc<dyn Provider> = Arc::from(provider);
         // Attach the OS-sandbox posture so a consumer's `FLUX_SANDBOX=require` is honored on this
         // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
@@ -1159,7 +1184,10 @@ mod tests {
         client.run("an unrelated turn").await.unwrap();
         let sys = systems.lock().unwrap().join("\n---\n");
         assert!(
-            sys.contains("<skill name=\"greeting\">") && sys.contains("Always greet with ahoy."),
+            // D-190 (pre-existing, landed alongside this story): a disk-backed skill's injected
+            // tag carries its disclosed `path` attribute, so the substring check must include it.
+            sys.contains("<skill name=\"greeting\" path=")
+                && sys.contains("Always greet with ahoy."),
             "an explicitly populated AgentSpec injects the skill; got:\n{sys}"
         );
         std::fs::remove_dir_all(&dir).ok();
