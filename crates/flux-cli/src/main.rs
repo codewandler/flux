@@ -22,6 +22,7 @@ mod plugin_cmd;
 mod rendering;
 mod review;
 mod session;
+mod splash;
 
 use a2a_cmd::*;
 use app_cmd::*;

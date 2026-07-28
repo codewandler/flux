@@ -12,7 +12,7 @@
 //! BEFORE a re-plan target turn, so a model/prompt variant can then drive exactly one live turn with
 //! [`crate::engine::FlowEngine::run_turn_pinned`].
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use flux_events::EventStore;
@@ -49,10 +49,15 @@ fn whatif_err(msg: impl Into<String>) -> FlowError {
 /// `parallel` dispatches pair FIFO instead of a later `tool_call` silently clobbering an earlier
 /// one's still-unmatched input.
 ///
-/// `enabled` is `false` for a [`crate::cassette::OffTape::Live`] scope: a live-bridge miss is
-/// ALREADY recorded onto `dst` by [`crate::cassette::FrozenTape::record_tail`] (the bridge this
-/// sink's `record` would otherwise duplicate) — so this sink only self-records under `OffTape::Halt`,
-/// the one case with no other recorder at all.
+/// D-182: `enabled` alone used to be `false` for a [`crate::cassette::OffTape::Live`] scope on the
+/// theory that a live-bridge miss is ALREADY recorded onto `dst` by
+/// [`crate::cassette::FrozenTape::record_tail`], so self-recording would only ever duplicate it —
+/// but that reasoning silently swept up every SERVED hit too, so a `Live`-scoped rerun that served
+/// most of its dispatches from tape and only fell through to live on a few recorded NONE of the
+/// served ones. [`Self::defer_for_live_bridge`] + [`Self::finish`] fix this precisely: `enabled` now
+/// means "self-record every dispatch this sink sees", and deferred reconciliation (rather than a
+/// real-time check) distinguishes served from live without racing the dispatch itself — see
+/// [`Self::defer_for_live_bridge`]'s doc for why a real-time check does not work here.
 ///
 /// Public because every world-pinned driver needs it, not just this module's: the SDK's
 /// `Scenario::check` re-drives a golden through
@@ -64,13 +69,22 @@ pub struct RerunRecordingSink<'a> {
     record: RecordScope,
     redactor: Redactor,
     enabled: bool,
+    /// D-182: set via [`Self::defer_for_live_bridge`] whenever the pinned scope can possibly fall
+    /// through to a live dispatch — `false` when it cannot (`OffTape::Halt`, or a
+    /// [`crate::cassette::CassetteScope::Replay`] scope), in which case every dispatch this sink sees
+    /// is, by construction, served, and is recorded eagerly, exactly as it always has been.
+    defer: bool,
+    /// Buffered `(op, input_json, outcome)` triples awaiting [`Self::finish`]'s reconciliation —
+    /// populated only while `defer` is `true`.
+    captured: Vec<(String, String, OpOutcome)>,
     pending: std::collections::HashMap<String, VecDeque<String>>,
 }
 
 impl<'a> RerunRecordingSink<'a> {
     /// Wrap `inner`, self-recording every dispatch onto `record`'s session when `enabled` — pass
-    /// `enabled = false` whenever another recorder (a [`crate::cassette::OffTape::Live`] bridge, or
-    /// a plain [`CassetteScope::Record`]) already writes that same tail.
+    /// `enabled = false` whenever another recorder (a plain [`CassetteScope::Record`]) already writes
+    /// that same tail wholesale. Chain [`Self::defer_for_live_bridge`] when the pinned scope can go
+    /// live, and call [`Self::finish`] once the driven turn/plan has fully completed.
     pub fn new(
         inner: &'a mut dyn AgentSink,
         record: RecordScope,
@@ -82,7 +96,80 @@ impl<'a> RerunRecordingSink<'a> {
             record,
             redactor,
             enabled,
+            defer: false,
+            captured: Vec::new(),
             pending: std::collections::HashMap::new(),
+        }
+    }
+
+    /// D-182: opt into deferred, reconciled recording — required whenever the pinned scope can fall
+    /// through to a live dispatch (a [`crate::cassette::FrozenTape`] under `OffTape::Live`), so a
+    /// live fall-through's cell (already written by
+    /// [`crate::cassette::FrozenTape::record_tail`]) is never ALSO self-recorded here.
+    ///
+    /// A real-time check (comparing a live counter's value at `tool_call` against its value at
+    /// `tool_result`, for the SAME dispatch) looks obvious but is unsound in at least one real
+    /// caller: the SDK's `Session::what_if()` re-plan drives the FULL adaptive agent loop, not a raw
+    /// flow, and its native tool dispatches reach this sink through a composite op's own internal
+    /// channel relay (`crate::loop_host::ChannelSink`) — delivery preserves the original dispatch
+    /// ORDER but not its WALL-CLOCK timing relative to the live dispatch it describes, so a counter
+    /// snapshotted at `tool_call` time can no longer reflect "before this dispatch" by the time
+    /// `tool_result` fires. A live re-drive under this exact shape (one served + one live dispatch
+    /// behind the agent loop) was observed to silently double-record the live one under a real-time
+    /// delta check. [`Self::finish`] avoids the race by never comparing counters in real time at
+    /// all: it waits until the whole turn/plan has settled, then reconciles once.
+    ///
+    /// Trade-off, honestly kept rather than hidden: deferring means every self-recorded (served)
+    /// cell is appended to the underlying append-only stream AFTER whatever live cells
+    /// `record_tail` already wrote synchronously during the run — even a served dispatch that
+    /// happened FIRST in true execution order lands LAST in the persisted trace. This driver only
+    /// promises completeness (every dispatch recorded, exactly once) under `Live`, not position; see
+    /// [`Self::finish`] for the exact mechanism.
+    pub fn defer_for_live_bridge(mut self) -> Self {
+        self.defer = true;
+        self
+    }
+
+    /// Flush every buffered dispatch from [`Self::defer_for_live_bridge`] mode, skipping any that
+    /// [`crate::cassette::FrozenTape::record_tail`] already recorded onto the same `record` target —
+    /// a no-op if `defer_for_live_bridge` was never called (the eager path already wrote everything
+    /// per-dispatch, exactly as before D-182, in true position too — the ordering trade-off below is
+    /// specific to the deferred path).
+    ///
+    /// MUST be called only once the driven turn/plan has fully settled (after the
+    /// `run_turn_pinned`/`execute_flow_resumable_with_composites` future this sink was passed into
+    /// resolves) — calling it earlier could read `dst`'s trace before an in-flight async sink relay
+    /// has delivered every dispatch, under-counting the already-recorded cells and misclassifying a
+    /// live one as served.
+    ///
+    /// The merge walks `captured` (this sink's own dispatches, in real order) against `already`
+    /// (cells `record_tail` wrote, also in real order — a strict sub-sequence of `captured`, since
+    /// every live dispatch appears in both and nothing else ever writes to `record`'s target under a
+    /// deferred scope): whenever the next captured dispatch matches the next unconsumed `already`
+    /// cell (by op + input hash), it was the live one — skip it and advance; otherwise it was served —
+    /// record it now, which necessarily appends it AFTER every `already` cell present at this point
+    /// (an append-only log offers no other option) — the positional trade-off documented on
+    /// [`Self::defer_for_live_bridge`]. Misattribution is possible only if the identical `(op,
+    /// input)` pair is dispatched more than once with a MIX of served and live outcomes in one run —
+    /// narrow enough that no known caller hits it, and cheaper to document than to engineer around
+    /// with the AgentSink surface available here.
+    pub fn finish(self) {
+        if !self.defer || self.captured.is_empty() {
+            return;
+        }
+        let already = self.record.recorded_cells();
+        let mut idx = 0usize;
+        for (op, input_json, outcome) in self.captured {
+            let input_hash = flux_lang::runtime::sha256_hex(&input_json);
+            let matches_next_bridge_cell = already
+                .get(idx)
+                .is_some_and(|c| c.op == op && c.input_hash == input_hash);
+            if matches_next_bridge_cell {
+                idx += 1;
+                continue;
+            }
+            self.record
+                .record(&self.redactor, &op, &input_json, &outcome);
         }
     }
 }
@@ -114,6 +201,19 @@ impl AgentSink for RerunRecordingSink<'_> {
         if self.enabled {
             if let Some(queue) = self.pending.get_mut(name) {
                 if let Some(input_json) = queue.pop_front() {
+                    // D-182: `denied` is hardcoded `false` here, not carried through from the real
+                    // dispatch — `AgentSink::tool_result`'s `ToolResult` (the bridge every sink sees,
+                    // `flux_runtime::ToolResult`) has no `denied` field at all; it is dropped one
+                    // layer up, in `SinkBridge::tool_result` (`crates/flux-flow/src/runtime.rs`),
+                    // which rebuilds a `ToolResult` from the interpreter's own `OpOutcome` without
+                    // carrying `OpOutcome::denied` across. Widening `ToolResult` (a `flux_runtime`
+                    // type used far beyond this sink) or `SinkBridge` to carry it is out of this
+                    // pass's file-ownership scope — so a D-177 reauthorize denial served through this
+                    // recording sink is re-recorded as a plain `is_error` outcome, indistinguishable
+                    // here from an ordinary op failure. This is a real, narrow classification loss
+                    // (not a correctness bug in `hermetic()`/`diff()`, which both key off the LIVE
+                    // `FrozenTape` denial path, not off this recorded cell) — flagged in the D-182
+                    // story rather than silently accepted.
                     let outcome = OpOutcome {
                         denied: false,
                         timing: None,
@@ -121,8 +221,12 @@ impl AgentSink for RerunRecordingSink<'_> {
                         view: result.view.clone(),
                         is_error: result.is_error,
                     };
-                    self.record
-                        .record(&self.redactor, name, &input_json, &outcome);
+                    if self.defer {
+                        self.captured.push((name.to_string(), input_json, outcome));
+                    } else {
+                        self.record
+                            .record(&self.redactor, name, &input_json, &outcome);
+                    }
                 }
             }
         }
@@ -172,6 +276,14 @@ fn record_rerun_plan(
 /// [`crate::replay::execution_keys`], falling back to acceptance order for a non-resumable
 /// recording (mirrors `replay_session`/`replay_prefix`), optionally narrowed to one 1-based turn's
 /// accepted plans (mirrors `replay_session`'s `turn` filter).
+///
+/// D-181: the `turn` narrowing used to filter the WHOLE-SESSION `exec_keys` list by content-
+/// addressed `flow_key` **set membership** (`keys.contains(k)`) — sound only when a `flow_key`
+/// identifies at most one execution session-wide. A plan re-accepted byte-identical in a later (or
+/// earlier) turn shares its `flow_key` with the wanted turn's own execution, so set membership lets
+/// that OTHER turn's execution leak into the "one turn" selection too. Deriving `exec_keys` directly
+/// from the wanted turn's OWN turn-scoped trace ([`crate::cassette::turn_run_trace`]) instead avoids
+/// the ambiguity entirely — it never looks at another turn's events, so there is nothing to leak.
 fn selected_execution_keys(
     events: &EventStore,
     session: &str,
@@ -179,26 +291,40 @@ fn selected_execution_keys(
     accepted_order: Vec<String>,
     turn: Option<usize>,
 ) -> Result<Vec<String>> {
-    let mut exec_keys = crate::replay::execution_keys(trace);
+    let Some(t) = turn else {
+        let mut exec_keys = crate::replay::execution_keys(trace);
+        if exec_keys.is_empty() {
+            exec_keys = accepted_order;
+        }
+        return Ok(exec_keys);
+    };
+    let turns = events.turns(session)?;
+    let wanted = turns
+        .get(t.saturating_sub(1))
+        .ok_or_else(|| whatif_err(format!("turn {t} does not exist on session {session}")))?;
+    let turn_trace = crate::cassette::turn_run_trace(events, session, wanted.turn_id)?;
+    let mut exec_keys = crate::replay::execution_keys(&turn_trace);
     if exec_keys.is_empty() {
-        exec_keys = accepted_order;
-    }
-    if let Some(t) = turn {
-        let turns = events.turns(session)?;
-        let wanted = turns
-            .get(t.saturating_sub(1))
-            .ok_or_else(|| whatif_err(format!("turn {t} does not exist on session {session}")))?;
-        let keys: HashSet<String> = wanted
-            .plan_attempts
-            .iter()
-            .filter(|a| a.outcome == "accepted")
-            .filter_map(|a| a.plan_source.as_deref())
-            .filter_map(|src| flux_lang::parse::parse(src).ok())
-            .map(|ast| flow_key(ast.name.as_deref(), &ast.body))
-            .collect();
-        exec_keys.retain(|k| keys.contains(k));
+        // No resumable ledger markers within this turn's own window (a non-resumable recording) —
+        // fall back to THIS turn's own accepted order, not the whole session's.
+        exec_keys = accepted_plan_keys(std::iter::once(wanted));
     }
     Ok(exec_keys)
+}
+
+/// The `flow_key`s of every accepted plan attempt across the given turns, in order — the acceptance-
+/// order fallback used when a turn's own trace has no resumable ledger markers to derive
+/// `execution_keys` from.
+fn accepted_plan_keys<'a>(
+    turns: impl Iterator<Item = &'a flux_events::TurnSummary>,
+) -> Vec<String> {
+    turns
+        .flat_map(|t| t.plan_attempts.iter())
+        .filter(|a| a.outcome == "accepted")
+        .filter_map(|a| a.plan_source.as_deref())
+        .filter_map(|src| flux_lang::parse::parse(src).ok())
+        .map(|ast| flow_key(ast.name.as_deref(), &ast.body))
+        .collect()
 }
 
 /// The outcome of [`rerun_pinned`].
@@ -260,13 +386,23 @@ pub async fn rerun_pinned(
     let model = events.info(src).map(|i| i.model).unwrap_or_default();
     let turn_id = events.begin_turn(dst, &format!("<what-if {src}>"), &model)?;
 
-    let self_record = matches!(
+    // D-182: self-record every SERVED dispatch regardless of `off_tape` mode — under `Halt` nothing
+    // else ever records a served hit; under `Live` a served hit ALSO goes unrecorded by anything else
+    // (only a live fall-through's tail is caught by `FrozenTape::record_tail`), so `enabled` must be
+    // `true` for `Frozen` either way. `defer_for_live_bridge` is what keeps a `Live` fall-through from
+    // being double-recorded (once by `record_tail`'s bridge, once here) — only needed under `Live`
+    // (`Halt` never goes live, so the eager path is both correct and cheaper there).
+    let self_record = matches!(scope.as_ref(), CassetteScope::Frozen(_));
+    let live = matches!(
         scope.as_ref(),
-        CassetteScope::Frozen(f) if f.off_tape() == crate::cassette::OffTape::Halt
+        CassetteScope::Frozen(f) if f.off_tape() == crate::cassette::OffTape::Live
     );
     let redactor = executor.context().redactor.clone();
     let record = RecordScope::new(store.event_store(), dst);
     let mut rec_sink = RerunRecordingSink::new(sink, record, redactor, self_record);
+    if live {
+        rec_sink = rec_sink.defer_for_live_bridge();
+    }
     for key in &exec_keys {
         let Some(ast) = plans.get(key) else {
             continue;
@@ -285,6 +421,7 @@ pub async fn rerun_pinned(
         )
         .await?;
     }
+    rec_sink.finish();
     let _ = events.end_turn(dst, turn_id, "ok", exec_keys.len() as u32, "", None);
 
     let (left_world, cells_consumed) = match scope.as_ref() {
@@ -324,27 +461,35 @@ pub async fn replay_turns_prefix(
     if upto_turn <= 1 {
         return Ok(());
     }
-    let trace = events.run_trace(src)?;
+    // D-181: scoped to exactly the PREFIX turns' own window — the previous implementation built
+    // `exec_keys` from the WHOLE-SESSION trace and then filtered by `flow_key` set membership
+    // against the prefix turns' accepted plans. Set membership can't distinguish "this execution
+    // belongs to a prefix turn" from "some execution somewhere shares this turn's plan's content
+    // hash" — a plan re-accepted byte-identical in the TARGET turn (`upto_turn` itself, or a later
+    // one) leaks that target turn's own execution (and its cells, via `ReplayTape::from_trace`)
+    // into what is supposed to be a hermetic REPLAY of only what came before it. Deriving both
+    // `exec_keys` and the replay tape from `crate::cassette::turns_run_trace` over just the prefix
+    // turn ids avoids the ambiguity the same way `selected_execution_keys` now does.
+    let turns = events.turns(src)?;
+    let prefix_turn_ids: Vec<i64> = turns
+        .iter()
+        .take(upto_turn.saturating_sub(1))
+        .map(|t| t.turn_id)
+        .collect();
+    if prefix_turn_ids.is_empty() {
+        return Ok(());
+    }
+    let trace = crate::cassette::turns_run_trace(events, src, &prefix_turn_ids)?;
     if trace.is_empty() {
         return Ok(());
     }
-    let (plans, accepted_order) = crate::replay::plans_by_key(events, src)?;
+    let (plans, _accepted_order) = crate::replay::plans_by_key(events, src)?;
     let mut exec_keys = crate::replay::execution_keys(&trace);
     if exec_keys.is_empty() {
-        exec_keys = accepted_order;
+        // No resumable ledger markers within the prefix's own window — fall back to the prefix
+        // turns' own accepted order, not the whole session's.
+        exec_keys = accepted_plan_keys(turns.iter().take(upto_turn.saturating_sub(1)));
     }
-
-    let turns = events.turns(src)?;
-    let wanted: HashSet<String> = turns
-        .iter()
-        .take(upto_turn.saturating_sub(1))
-        .flat_map(|t| t.plan_attempts.iter())
-        .filter(|a| a.outcome == "accepted")
-        .filter_map(|a| a.plan_source.as_deref())
-        .filter_map(|src| flux_lang::parse::parse(src).ok())
-        .map(|ast| flow_key(ast.name.as_deref(), &ast.body))
-        .collect();
-    exec_keys.retain(|k| wanted.contains(k));
     if exec_keys.is_empty() {
         return Ok(());
     }
@@ -568,5 +713,270 @@ mod tests {
         if let CassetteScope::Frozen(frozen) = scope.as_ref() {
             assert!(frozen.diverged().is_some());
         }
+    }
+
+    /// Two turns on the same session run the BYTE-IDENTICAL plan (same `flow_key`) — records it
+    /// twice, back to back.
+    async fn record_two_identical_turns(events: &Arc<EventStore>, executor: &Executor) -> String {
+        let store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let session = events.create_session("mock").unwrap();
+        store.set_cassette(Some(Arc::new(CassetteScope::Record(RecordScope::new(
+            events.clone(),
+            session.clone(),
+        )))));
+        let ast = echo_ast();
+        for _ in 0..2 {
+            let turn_id = events.begin_turn(&session, "hi", "mock").unwrap();
+            record_rerun_plan(events, executor, &session, turn_id, &ast);
+            let mut sink = TestSink;
+            crate::runtime::execute_flow_resumable_with_composites(
+                &store,
+                executor,
+                &session,
+                &ast,
+                &[],
+                None,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+            let _ = events.end_turn(&session, turn_id, "ok", 1, "done", None);
+        }
+        session
+    }
+
+    /// D-181 (failing-first): `rerun_pinned`'s `turn` filter used to select executions by
+    /// content-addressed `flow_key` SET MEMBERSHIP against the wanted turn's accepted plans — sound
+    /// only when a `flow_key` identifies at most one execution session-wide. Here turn 2 re-accepts
+    /// and re-executes the BYTE-IDENTICAL plan turn 1 ran, so the old filter's `keys.contains(k)`
+    /// matches turn 2's execution too and replays it into `dst` even though only turn 1 was asked
+    /// for. Turn-scoping the execution-key derivation itself (not just the plan-key filter) must
+    /// replay ONLY turn 1's own execution.
+    #[tokio::test]
+    async fn rerun_pinned_turn_filter_does_not_leak_a_repeated_identical_plans_other_turn() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let executor = test_executor();
+        let src = record_two_identical_turns(&events, &executor).await;
+
+        let trace = events.run_trace(&src).unwrap();
+        let tape = ReplayTape::from_trace(&trace);
+        let frozen = FrozenTape::hermetic(tape);
+        let scope = Arc::new(CassetteScope::Frozen(frozen));
+
+        let dst_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let dst = events.create_session("mock").unwrap();
+        let mut sink = TestSink;
+
+        let report = rerun_pinned(
+            &events,
+            &dst_store,
+            &executor,
+            &src,
+            &dst,
+            Some(1),
+            scope,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report.left_world.is_none(),
+            "both turns' cells are on tape, hermetic replay of just one must never miss"
+        );
+        let dst_trace = events.run_trace(&dst).unwrap();
+        let cells = Cell::collect(&dst_trace);
+        assert_eq!(
+            cells.len(),
+            1,
+            "turn 1 selection must replay ONLY turn 1's own execution, not turn 2's identical-plan \
+             execution leaking in too"
+        );
+    }
+
+    /// D-181 (failing-first): the same content-vs-turn leak in `replay_turns_prefix` — turn 2 (the
+    /// prefix, `upto_turn = 3` wants turns 1..2 rebuilt) and turn 3 (the re-plan TARGET, must stay
+    /// untouched by the prefix step) both accept the byte-identical plan. The old whole-session
+    /// `exec_keys` filtered by `flow_key` set membership can't tell turn 3's execution apart from
+    /// turn 2's identical one, so it leaks turn 3's own execution into what should be a hermetic
+    /// rebuild of ONLY what came before it.
+    #[tokio::test]
+    async fn replay_turns_prefix_does_not_leak_the_target_turns_identical_plan() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let executor = test_executor();
+
+        // Turn 1: some other plan, distinguishable from the repeated one.
+        let src = record_one_op_session(&events, &executor).await;
+        let dst_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        dst_store.set_cassette(Some(Arc::new(CassetteScope::Record(RecordScope::new(
+            events.clone(),
+            src.clone(),
+        )))));
+
+        // Turn 2 and turn 3: the identical plan, executed twice more (turn 2 = the prefix's last
+        // turn, turn 3 = the re-plan target that must NOT be replayed by the prefix step).
+        let ast = echo_ast();
+        for _ in 0..2 {
+            let turn_id = events.begin_turn(&src, "hi", "mock").unwrap();
+            record_rerun_plan(&events, &executor, &src, turn_id, &ast);
+            let mut sink = TestSink;
+            crate::runtime::execute_flow_resumable_with_composites(
+                &dst_store,
+                &executor,
+                &src,
+                &ast,
+                &[],
+                None,
+                &mut sink,
+            )
+            .await
+            .unwrap();
+            let _ = events.end_turn(&src, turn_id, "ok", 1, "done", None);
+        }
+
+        let dst = events.create_session("mock").unwrap();
+        let dst_store2 = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let mut sink = TestSink;
+        replay_turns_prefix(&events, &dst_store2, &executor, &src, &dst, 3, &mut sink)
+            .await
+            .unwrap();
+
+        let dst_trace = events.run_trace(&dst).unwrap();
+        let cells = Cell::collect(&dst_trace);
+        assert_eq!(
+            cells.len(),
+            2,
+            "the prefix (turns 1 and 2) must replay exactly twice — turn 3's identical-plan \
+             execution must never leak into the prefix rebuild"
+        );
+    }
+
+    /// D-182: `rerun_pinned` under `OffTape::Live`, driving a plan with TWO statements — the first
+    /// matches a recorded cell (served from tape), the second does not (falls through live) — must
+    /// self-record the SERVED cell too, not just the live one. Completeness (both recorded, exactly
+    /// once), not position: `RerunRecordingSink::finish` deliberately defers every self-recorded
+    /// (served) cell until the whole plan has run, so it can reconcile against whatever
+    /// `FrozenTape::record_tail` already wrote for a live fall-through WITHOUT risking a real-time
+    /// mis-classification (see `finish`'s doc for the concrete case that ruled out a real-time
+    /// check) — the deferred cell therefore always lands AFTER any live cell in the underlying
+    /// append-only stream, even though it happened FIRST in true execution order. Documented, not
+    /// silently accepted: a follow-on story could recover exact position by teaching this
+    /// reconciliation to consult the plan's own step trace, out of this pass's scope.
+    #[tokio::test]
+    async fn rerun_pinned_off_tape_live_records_both_the_served_and_the_live_cell_completely() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let executor = test_executor();
+        let src = record_one_op_session(&events, &executor).await; // one recorded cell: echo("hi")
+
+        let trace = events.run_trace(&src).unwrap();
+        let tape = ReplayTape::from_trace(&trace);
+
+        let dst_store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let dst = events.create_session("mock").unwrap();
+        let bridge = RecordScope::new(events.clone(), dst.clone());
+        let frozen = FrozenTape::live_bridge(tape, bridge);
+        let scope = Arc::new(CassetteScope::Frozen(frozen));
+
+        // Two statements: the first calls `echo("hi")` — matches the recorded cell, served from
+        // tape; the second calls `echo("bye")` — no matching cell, falls through live.
+        let ast = DraftAst {
+            body: vec![
+                Node::Bind {
+                    name: SymbolName("x".into()),
+                    value: Box::new(Node::Call {
+                        op: "echo".into(),
+                        args: vec![Node::Lit { value: json!("hi") }],
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+                Node::Bind {
+                    name: SymbolName("y".into()),
+                    value: Box::new(Node::Call {
+                        op: "echo".into(),
+                        args: vec![Node::Lit {
+                            value: json!("bye"),
+                        }],
+                    }),
+                    ty: None,
+                    effect: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut sink = TestSink;
+        // Record the plan directly (bypassing the "plans_by_key" lookup rerun_pinned normally does
+        // from a source session's OWN accepted plans) so this test can drive a plan with a NEW
+        // statement shape the source session never actually executed.
+        store_and_run_pinned_plan(
+            &events,
+            &dst_store,
+            &executor,
+            &dst,
+            &ast,
+            scope.clone(),
+            &mut sink,
+        )
+        .await;
+
+        let dst_trace = events.run_trace(&dst).unwrap();
+        let cells = Cell::collect(&dst_trace);
+        assert_eq!(
+            cells.len(),
+            2,
+            "both the served cell (echo hi) and the live cell (echo bye) must be recorded, exactly \
+             once each: {dst_trace:?}"
+        );
+        let mut contents: Vec<_> = cells.iter().map(|c| c.content.as_str()).collect();
+        contents.sort();
+        assert_eq!(
+            contents,
+            vec!["bye", "hi"],
+            "no drop, no duplicate — position is a separate, documented limitation"
+        );
+        if let CassetteScope::Frozen(f) = scope.as_ref() {
+            assert_eq!(
+                f.went_live(),
+                1,
+                "exactly one dispatch fell through to live"
+            );
+        }
+    }
+
+    /// Drive one plan directly under a pinned `scope`, self-recording via `RerunRecordingSink`
+    /// exactly as `rerun_pinned`'s own inner loop does — a minimal stand-in so the ordering test
+    /// above can exercise an AST that the source session never actually executed (`rerun_pinned`
+    /// itself only ever replays a source session's OWN previously-accepted plans).
+    async fn store_and_run_pinned_plan(
+        events: &Arc<EventStore>,
+        store: &FlowStore,
+        executor: &Executor,
+        dst: &str,
+        ast: &DraftAst,
+        scope: Arc<CassetteScope>,
+        sink: &mut dyn AgentSink,
+    ) {
+        store.set_cassette(Some(scope.clone()));
+        let turn_id = events.begin_turn(dst, "hi", "mock").unwrap();
+        let redactor = executor.context().redactor.clone();
+        let record = RecordScope::new(store.event_store(), dst);
+        let mut rec_sink = RerunRecordingSink::new(sink, record, redactor, true);
+        if matches!(scope.as_ref(), CassetteScope::Frozen(f) if f.off_tape() == OffTape::Live) {
+            rec_sink = rec_sink.defer_for_live_bridge();
+        }
+        record_rerun_plan(events, executor, dst, turn_id, ast);
+        crate::runtime::execute_flow_resumable_with_composites(
+            store,
+            executor,
+            dst,
+            ast,
+            &[],
+            None,
+            &mut rec_sink,
+        )
+        .await
+        .unwrap();
+        rec_sink.finish();
+        let _ = events.end_turn(dst, turn_id, "ok", 1, "", None);
     }
 }

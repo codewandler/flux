@@ -301,13 +301,13 @@ flux sessions --store ./agent-state             # interrupted turns are marked i
 
 `--store` is a global flag, so it may appear before or after the subcommand.
 
-A one-shot `flux run` turn on a session a crash killed mid-turn finishes that turn first, printing
-what was fast-forwarded, served from the cassette, and re-run live (`FLUX_AUTO_RESURRECT=0` opts
-out). The interactive REPL and TUI do not yet run this step — use a one-shot turn (or
-`Session::send` via the SDK) to finish an interrupted session.
-`flux sessions` *flags* an interrupted session rather than resurrecting it — finishing a turn runs
-its live tail through the approval envelope, which must not be a side effect of asking what sessions
-exist. See the [CLI reference](../agent/cli.md) for the full flag surface.
+Entering a session a crash killed mid-turn — a one-shot `flux run` turn, the interactive REPL, or the
+TUI, and on the SDK side `Session::send`/`send_with`/`stream`/`start_flow` — finishes that turn
+first, printing (or reporting, for the SDK) what was fast-forwarded, served from the cassette, and
+re-run live (`FLUX_AUTO_RESURRECT=0` opts out). `flux sessions` *flags* an interrupted session
+rather than resurrecting it — finishing a turn runs its live tail through the approval envelope,
+which must not be a side effect of asking what sessions exist. See the
+[CLI reference](../agent/cli.md) for the full flag surface.
 
 ## Limits (v1)
 

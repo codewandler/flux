@@ -40,7 +40,9 @@ use flux_pg::{sqlx, PgHandle};
 use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool, Row};
 
-use super::{decode_all, now_ms, parse_id, EventBackend, RawEvent, SessionInfo, SessionSummary};
+use super::{
+    decode_all, now_ms, parse_id, CopyEvent, EventBackend, RawEvent, SessionInfo, SessionSummary,
+};
 use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
 
@@ -117,10 +119,10 @@ impl PgEvents {
         Ok(Self { handle })
     }
 
-    /// The shared body of `append`/`append_at` — differ only in whether `ts` is `now_ms()` or a
-    /// caller-preserved timestamp (D-174's `copy_session_to`). Mirrors `sqlite.rs`'s
-    /// `append_with_ts` (same idempotent-id / registry-touch semantics, Postgres's advisory-lock
-    /// serialization instead of the in-process `Mutex`).
+    /// The write body of ordinary `append` (`ts` is always `now_ms()` here — the atomic-copy path
+    /// used by `copy_session_to` (D-174/D-185) inserts directly on its own transaction instead).
+    /// Mirrors `sqlite.rs`'s `append_with_ts` (same idempotent-id / registry-touch semantics,
+    /// Postgres's advisory-lock serialization instead of the in-process `Mutex`).
     fn append_with_ts(&self, stream: &str, ev: NewEvent, ts: i64) -> Result<StoredEvent> {
         let pool = self.handle.pool().clone();
         let stream = stream.to_string();
@@ -672,12 +674,87 @@ impl EventBackend for PgEvents {
         })
     }
 
-    fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
-        self.append_with_ts(stream, ev, now_ms())
+    /// D-185: mint the destination session and append every copied event inside ONE transaction —
+    /// a failure (an unmappable `turn_id`, or any SQL error) rolls the whole thing back, so nothing
+    /// is ever committed to `streams` or `events` for a partial copy. Mirrors `sqlite.rs`'s
+    /// `copy_session_atomic`. `created_at`/`updated_at` are stamped from `info`/the events
+    /// themselves (never `now_ms()`), so a copied session never shows `created_at > updated_at`.
+    fn copy_session_atomic(&self, info: &SessionInfo, events: Vec<CopyEvent>) -> Result<String> {
+        let pool = self.handle.pool().clone();
+        let info = info.clone();
+        self.handle.block_on(async move {
+            let mut tx = pool.begin().await.map_err(map_sql)?;
+            let created_at = info.created_at_ms;
+            let updated_at = events.last().map(|e| e.ts_ms).unwrap_or(info.updated_at_ms);
+            let n: i64 = sqlx::query_scalar(
+                "INSERT INTO streams \
+                 (model, created_at, updated_at, last_seq, msg_count, \
+                  account, agent_id, agent_version, correlation_id) \
+                 VALUES ($1, $2, $3, 0, 0, $4, $5, $6, $7) RETURNING n",
+            )
+            .bind(info.model.clone())
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(info.context.account.clone())
+            .bind(info.context.agent_id.clone())
+            .bind(info.context.agent_version.clone())
+            .bind(info.context.correlation_id.clone())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sql)?;
+            let stream = format!("s_{n}");
+            let started = NewEvent::new(EventKind::SessionStarted {
+                model: info.model.clone(),
+            });
+            insert_event(&mut tx, &stream, &started, 0, &info.context, created_at).await?;
+
+            let mut turn_map: std::collections::HashMap<i64, i64> =
+                std::collections::HashMap::new();
+            let mut next_seq: i64 = 1;
+            let mut msg_count: i64 = 0;
+            for ev in events {
+                let turn_id = match ev.turn_id {
+                    Some(old) => Some(turn_map.get(&old).copied().ok_or_else(|| {
+                        Error::Other(format!(
+                            "copy_session_atomic: event {} references turn {old}, which was \
+                             never copied (its TurnStarted must precede every event it scopes)",
+                            ev.id
+                        ))
+                    })?),
+                    None => None,
+                };
+                let mut new_ev = NewEvent::new(ev.kind.clone());
+                new_ev.schema_version = ev.schema_version;
+                if let Some(turn_id) = turn_id {
+                    new_ev = new_ev.in_turn(turn_id);
+                }
+                let stored =
+                    insert_event(&mut tx, &stream, &new_ev, next_seq, &info.context, ev.ts_ms)
+                        .await?;
+                if matches!(ev.kind, EventKind::TurnStarted { .. }) {
+                    turn_map.insert(ev.old_global_seq, stored.global_seq);
+                }
+                match &ev.kind {
+                    EventKind::Message(_) => msg_count += 1,
+                    EventKind::Compacted { messages } => msg_count = messages.len() as i64,
+                    _ => {}
+                }
+                next_seq += 1;
+            }
+            sqlx::query("UPDATE streams SET last_seq = $1, msg_count = $2 WHERE n = $3")
+                .bind(next_seq - 1)
+                .bind(msg_count)
+                .bind(n)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sql)?;
+            tx.commit().await.map_err(map_sql)?;
+            Ok(stream)
+        })
     }
 
-    fn append_at(&self, stream: &str, ev: NewEvent, ts_ms: i64) -> Result<StoredEvent> {
-        self.append_with_ts(stream, ev, ts_ms)
+    fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
+        self.append_with_ts(stream, ev, now_ms())
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

@@ -789,6 +789,18 @@ pub fn render_run_diff(
 ) -> Vec<(DiffLineKind, String)> {
     let text = |stmt: &Option<String>| -> String {
         match stmt {
+            // A synthesized cell-row label from `cell_rows` (a natively dispatched turn — see its
+            // doc comment): `"call:{op}:{hash16}"` is never a key in `texts`, which is built by
+            // re-parsing accepted Flux-Lang plan sources ([`stmt_texts`]), so it would otherwise
+            // fall through to the unresolvable `<call:op:hash16>` placeholder below. Render a
+            // readable op-name + hash-prefix label instead.
+            Some(h) if h.starts_with("call:") => match h
+                .strip_prefix("call:")
+                .and_then(|rest| rest.rsplit_once(':'))
+            {
+                Some((op, hash16)) => format!("op `{op}` ({hash16}…)"),
+                None => format!("<{h}>"),
+            },
             Some(h) => texts.get(h).cloned().unwrap_or_else(|| format!("<{h}>")),
             None => "∅ (no statement at this position)".into(),
         }
@@ -2003,6 +2015,52 @@ mod tests {
         // Identical traces.
         let d = run_diff(&a, &a);
         assert!(d.identical, "{:?}", d.rows);
+    }
+
+    /// D-185: `cell_rows`' synthesized `"call:{op}:{hash16}"` label (the fallback diff unit for a
+    /// NATIVELY dispatched turn — see its doc comment) never resolves through `stmt_texts` (built
+    /// by re-parsing Flux-Lang plan sources, not native dispatches), so `render_run_diff` must
+    /// render a readable op-name + hash-prefix label instead of the raw `<call:op:hash16>`
+    /// placeholder every other unresolved hash falls back to.
+    #[test]
+    fn render_run_diff_renders_a_readable_label_for_synthesized_cell_rows() {
+        use flux_lang::ast::{RunEvent, StepId};
+        fn cell(op: &str, content: &str) -> RunEvent {
+            RunEvent::OpRecorded {
+                seq: 0,
+                step: StepId("s".into()),
+                op: op.into(),
+                input_hash: "deadbeef".into(),
+                input_hash_redacted: None,
+                input_view: None,
+                input_view_truncated: false,
+                content: content.into(),
+                view: None,
+                is_error: false,
+                denied: false,
+                redacted: false,
+                truncated: false,
+            }
+        }
+
+        // Two natively dispatched turns (no StatementCompleted at all) diverging on the op itself —
+        // run_diff must fall back to cell_rows, and the resulting Plan row's stmt labels must
+        // render readably instead of leaking the raw synthesized key.
+        let a = vec![cell("read", "alpha")];
+        let b = vec![cell("write", "beta")];
+        let diff = run_diff(&a, &b);
+        let lines = render_run_diff(&diff, &HashMap::new());
+        let rendered = lines
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("<call:"),
+            "raw synthesized key leaked into the diff: {rendered}"
+        );
+        assert!(rendered.contains("op `read`"), "{rendered}");
+        assert!(rendered.contains("op `write`"), "{rendered}");
     }
 
     /// D-174: `stmt_texts` humanizes every top-level statement of every accepted plan attempt,

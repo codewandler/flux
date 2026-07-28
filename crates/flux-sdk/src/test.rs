@@ -404,6 +404,19 @@ impl Scenario {
     /// convention, mirroring `cargo-insta`). Errors if the turn ends suspended — scenarios are
     /// single-turn only in this version.
     pub async fn record(client: &Client, input: &str, path: impl AsRef<Path>) -> Result<Scenario> {
+        Self::record_with_call_count(client, input, path)
+            .await
+            .map(|(scenario, _live_calls)| scenario)
+    }
+
+    /// Same as [`record`](Self::record), but also returns how many live model calls the recording
+    /// turn actually made — the honest count [`check`](Self::check) reports back in a
+    /// `FLUX_GOLDEN=update` [`Report`] instead of a fabricated one (D-184).
+    async fn record_with_call_count(
+        client: &Client,
+        input: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<(Scenario, usize)> {
         let path = path.as_ref();
         let updating = std::env::var("FLUX_GOLDEN").as_deref() == Ok("update");
         if path.join("scenario.toml").exists() && !updating {
@@ -459,6 +472,7 @@ impl Scenario {
             fixture_events.clone(),
         )?);
 
+        let live_calls = records.lock().unwrap().len();
         write_model_calls(path, &records.lock().unwrap())?;
         let plan_text = accepted_plan_text(&fixture_events, &new_session)?;
         std::fs::write(path.join("plan.flux.snap"), &plan_text)?;
@@ -479,7 +493,7 @@ impl Scenario {
         };
         write_manifest(path, &manifest)?;
 
-        Self::load(path)
+        Ok((Self::load(path)?, live_calls))
     }
 
     /// Load a fixture from `path`, copying its stores into an isolated temp work directory — $0,
@@ -601,20 +615,45 @@ impl Scenario {
     ///
     /// `FLUX_GOLDEN=update` re-records the fixture in place (delegating to
     /// [`record`](Self::record)) instead of checking it — the same re-baseline convention every
-    /// other Test Kit assertion follows.
+    /// other Test Kit assertion follows. This is a live re-baseline, never a pinned re-drive, so the
+    /// returned [`Report`] is **never** clean (D-184): it carries the honest diff between the
+    /// previous golden and the freshly-recorded one, and `model_live` counts the live calls the
+    /// re-recording turn actually made (never a fabricated `1`) — a guard that reads `is_clean()`
+    /// must reject a `FLUX_GOLDEN=update` run exactly as it would reject any other live fall-through.
     pub async fn check(&self, client: &Client) -> Result<Report> {
         if std::env::var("FLUX_GOLDEN").as_deref() == Ok("update") {
-            Self::record(client, &self.manifest.input, &self.source_dir).await?;
+            // Capture the outgoing golden's trace/text *before* `record` overwrites the fixture in
+            // place, so the report reflects a real diff instead of a hardcoded "nothing changed".
+            let previous_events = EventStore::open(self.source_dir.join("events.db"))?;
+            let previous_trace = previous_events.run_trace(&self.manifest.session)?;
+            let previous_turns = previous_events.turns(&self.manifest.session)?;
+            drop(previous_events);
+
+            let (updated, live_calls) =
+                Self::record_with_call_count(client, &self.manifest.input, &self.source_dir)
+                    .await?;
+
+            let new_events = EventStore::open(self.source_dir.join("events.db"))?;
+            let new_session = &updated.manifest.session;
+            let new_trace = new_events.run_trace(new_session)?;
+            let new_turns = new_events.turns(new_session)?;
+
+            let diff = flux_events::run_diff(&previous_trace, &new_trace);
+            let plan_changed = diff.rows.iter().any(|r| matches!(r, DiffRow::Plan { .. }));
+
+            let mut texts_turns = previous_turns;
+            texts_turns.extend(new_turns);
+            let texts = flux_events::stmt_texts(&texts_turns);
+
             return Ok(Report {
-                diff: RunDiff {
-                    rows: Vec::new(),
-                    identical: true,
-                },
-                plan_changed: false,
-                left_world: false,
+                diff,
+                plan_changed,
+                // A re-baseline never stays on a pinned, hermetic world — it is a live re-record by
+                // definition — so it must never read as a clean CI pass no matter what the diff says.
+                left_world: true,
                 model_served: 0,
-                model_live: 1,
-                texts: HashMap::new(),
+                model_live: live_calls,
+                texts,
             });
         }
 
@@ -704,7 +743,8 @@ impl Scenario {
 /// recorded golden. `is_clean()` is the whole-report pass/fail a CI guard reads; the individual
 /// fields tell a config edit (`plan_changed`, harmless — the model asked for something different on
 /// purpose) apart from an actual behavior regression (`left_world`, a different world served a
-/// different answer to the SAME plan).
+/// different answer to the SAME plan) apart from a plain honesty failure (`model_live > 0`, the
+/// golden cassette didn't cover a request and real money was spent — never reported clean, D-184).
 #[non_exhaustive]
 pub struct Report {
     /// The aligned per-statement diff between the golden run and this re-drive.
@@ -725,10 +765,13 @@ pub struct Report {
 }
 
 impl Report {
-    /// Whether this re-drive reproduced the golden exactly: no plan changed, and the world was never
-    /// left.
+    /// Whether this re-drive reproduced the golden exactly: no plan changed, the world was never
+    /// left, AND no call fell through to the real provider (`model_live == 0`, D-184). A re-drive
+    /// that quietly reached the live model — a golden that no longer covers every request — is a
+    /// hard fail here even when the plan and world otherwise line up: a CI guard reading this must
+    /// never let a real, spend-incurring model call pass as "clean".
     pub fn is_clean(&self) -> bool {
-        !self.plan_changed && !self.left_world
+        !self.plan_changed && !self.left_world && self.model_live == 0
     }
 
     /// Render [`Self::diff`] as human-readable lines (`flux_events::render_run_diff`, resolved
@@ -955,4 +998,77 @@ pub(crate) fn plain_diff_lines(diff: &RunDiff, texts: &HashMap<String, String>) 
             _ => line,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D-184: a plain unit fixture for `Report`, isolated from the async engine plumbing —
+    /// constructing every field directly (this module, unlike a downstream crate, isn't blocked by
+    /// `#[non_exhaustive]`) lets the `is_clean()` pinning test below vary exactly one field at a
+    /// time instead of relying on an end-to-end `check()` to happen to produce the right shape.
+    fn report(plan_changed: bool, left_world: bool, model_live: usize) -> Report {
+        Report {
+            diff: RunDiff {
+                rows: Vec::new(),
+                identical: true,
+            },
+            plan_changed,
+            left_world,
+            model_served: 0,
+            model_live,
+            texts: HashMap::new(),
+        }
+    }
+
+    /// The regression this story closes: before D-184, `is_clean()` was `!plan_changed &&
+    /// !left_world` — a `check()` re-drive that quietly fell through to the real provider
+    /// (`model_live > 0`) but otherwise reproduced the golden read as clean. A CI guard that gates
+    /// on `is_clean()` (the doc comment's own stated contract) must hard-fail that case.
+    #[test]
+    fn is_clean_hard_fails_on_any_live_model_fall_through() {
+        assert!(
+            report(false, false, 0).is_clean(),
+            "no plan drift, no world drift, no live calls — genuinely clean"
+        );
+        assert!(
+            !report(false, false, 1).is_clean(),
+            "a single live fall-through must never be reported clean, even with plan/world intact"
+        );
+        assert!(
+            !report(false, false, 7).is_clean(),
+            "many live fall-throughs must never be reported clean either"
+        );
+    }
+
+    /// `plan_changed`/`left_world` still independently fail the guard — D-184 adds a THIRD
+    /// condition, it doesn't relax the first two.
+    #[test]
+    fn is_clean_still_fails_on_plan_or_world_drift_alone() {
+        assert!(!report(true, false, 0).is_clean());
+        assert!(!report(false, true, 0).is_clean());
+        assert!(!report(true, true, 0).is_clean());
+    }
+
+    /// A `CI-style guard` reading only the boolean, exactly as the doc comment on `Report` promises
+    /// callers may — proves the fix is usable as a gate, not just an internal invariant.
+    #[test]
+    fn a_ci_style_guard_rejects_a_live_fall_through() {
+        fn ci_guard(report: &Report) -> Result<()> {
+            if report.is_clean() {
+                Ok(())
+            } else {
+                Err(flux_core::Error::Other(
+                    "check() drifted from its golden".into(),
+                ))
+            }
+        }
+
+        assert!(ci_guard(&report(false, false, 0)).is_ok());
+        assert!(
+            ci_guard(&report(false, false, 1)).is_err(),
+            "a guard built on is_clean() must reject a live fall-through"
+        );
+    }
 }

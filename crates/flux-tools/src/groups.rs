@@ -47,6 +47,8 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
                 "git_push",
                 "git_checkout",
                 "git_unstage",
+                "git_worktree_enter",
+                "git_worktree_leave",
             ]),
             surface_when: when("git_repo"),
         },
@@ -194,6 +196,9 @@ mod tests {
         let g = builtin_groups();
         let git = g.iter().find(|g| g.name == "git").unwrap();
         assert!(git.tools.contains(&"git_status".to_string()));
+        // C-98/C-99: the context-local worktree transition ops are Git-group members too.
+        assert!(git.tools.contains(&"git_worktree_enter".to_string()));
+        assert!(git.tools.contains(&"git_worktree_leave".to_string()));
         assert_eq!(git.surface_when[0].signal.as_deref(), Some("git_repo"));
     }
 

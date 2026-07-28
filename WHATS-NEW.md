@@ -17,6 +17,19 @@
 
 ### New
 
+- **The agent can now do risky work in an isolated git worktree — and merge it back when it's
+  done.** Ask the agent to enter a worktree and it moves itself (and only itself — other agents
+  and your own shell are untouched) into a temporary copy of your repository on a scratch branch.
+  Your checkout stays exactly as you left it. When the work is committed, leaving the worktree
+  first proves the merge is conflict-free, then merges it into `main`, cleans up the scratch
+  branch, and returns the agent to your project — and if anything goes wrong, your work and your
+  `main` branch are always left intact. Both steps ask for your approval like every other
+  high-risk operation.
+
+## [0.27.0] - 2026-07-28
+
+### New
+
 - **Test your agent offline, for free — record a run once, replay it forever.**
   `flux record my-scenario "the thing your agent does"` runs the task once and saves everything
   about it — what the agent planned, what its tools answered, what the model said — into a folder

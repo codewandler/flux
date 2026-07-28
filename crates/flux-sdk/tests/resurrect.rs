@@ -284,8 +284,13 @@ async fn auto_resurrect_is_on_by_default_for_durable_storage_and_is_reported() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `auto_resurrect(false)` leaves the killed turn alone — the interrupted turn is still there
-/// afterwards, for the embedder to handle explicitly.
+/// `auto_resurrect(false)` leaves the killed turn alone — `send` runs its own new turn without
+/// touching it. D-183: that is now the exact out-of-order shape `resurrect::interrupted`'s
+/// tail-guard exists to catch — the interrupted turn is no longer the session's most recent one
+/// (the new "what next?" turn ran and closed after it), so a later `interrupted()`/explicit
+/// `resurrect()` must refuse loudly rather than finish it out of conversational order. Turning
+/// auto-resurrect off is a deliberate opt into manual recovery, not an opt into silently corrupting
+/// the transcript order later.
 #[tokio::test]
 async fn auto_resurrect_off_leaves_the_interrupted_turn_for_the_embedder() {
     let dir = tmp_dir("auto-off");
@@ -309,9 +314,11 @@ async fn auto_resurrect_off_leaves_the_interrupted_turn_for_the_embedder() {
         0,
         "nothing from the killed plan ran"
     );
+    let err = session.interrupted().unwrap_err().to_string();
     assert!(
-        session.interrupted().unwrap().is_some(),
-        "the killed turn is still open, waiting for an explicit resurrect()"
+        err.contains("out of conversational order") || err.contains("ran and closed after it"),
+        "the tail-guard must refuse loudly now that a newer turn ran on top of the still-open \
+         crashed one, got: {err}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -337,7 +344,14 @@ async fn auto_resurrect_defaults_off_for_in_memory_storage() {
     let out = session.send("what next?").await.unwrap();
 
     assert!(out.resurrected.is_none());
-    assert!(session.interrupted().unwrap().is_some());
+    // D-183: same tail-guard as the durable `auto_resurrect(false)` case above — `send` ran its
+    // own new turn on top of the still-open (never-persisted-past-process, but still logically
+    // interrupted) turn, so `interrupted()` now refuses loudly instead of reporting it forever.
+    assert!(session
+        .interrupted()
+        .unwrap_err()
+        .to_string()
+        .contains("ran and closed after it"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -358,6 +372,112 @@ async fn interrupted_is_none_on_a_clean_session() {
     session.send("hi").await.unwrap();
 
     assert!(session.interrupted().unwrap().is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- D-183: every turn-entry point resurrects ---------------------------------------------
+
+/// D-183 failing-first: a durable session crashes mid-turn; the embedder resumes via `stream()`
+/// (not `send`) — the interrupted turn must be finished FIRST, before `stream()`'s own new turn
+/// runs, and reported on the returned `TurnOutput`. A LATER `send()` on the same session must then
+/// find nothing left to resurrect. Before D-183, `stream()` skipped `auto_resurrect_step`
+/// entirely: the new turn ran on top of the still-open crashed turn, and a later `send()` would
+/// resurrect it out of order (appending a stale assistant message after newer ones) — which is now
+/// also refused loudly by `resurrect::interrupted`'s tail-guard, so a regression here would fail
+/// hard instead of silently reordering the transcript.
+#[tokio::test]
+async fn stream_resurrects_an_interrupted_turn_before_its_own_new_turn_runs() {
+    let dir = tmp_dir("stream-resurrect");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let cl = client(
+        &dir,
+        Storage::dir(dir.join("store")),
+        counter.clone(),
+        Box::new(ProseProvider("streamed answer")),
+        None,
+    );
+    let session = cl.create_session().unwrap();
+    let ast = two_step_plan();
+    seed_crash(&cl, session.id(), &ast, 1);
+
+    let stream = session.stream("what next?");
+    let out = stream.finish().await.unwrap();
+
+    let report = out
+        .resurrected
+        .as_ref()
+        .expect("stream() must finish the interrupted turn first, and report it");
+    assert_eq!(report.outcome, "resurrected", "{report:?}");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "the crash-tail statement ran live, resurrecting the interrupted turn"
+    );
+    assert_eq!(
+        out.text, "streamed answer",
+        "the new turn's own output is not polluted by the resurrected one"
+    );
+    assert!(
+        session.interrupted().unwrap().is_none(),
+        "the interrupted turn is closed now, in order, before the new turn ran"
+    );
+
+    // A later `send()` must find nothing left to resurrect — no out-of-order resurrect.
+    let out2 = session.send("and then?").await.unwrap();
+    assert!(
+        out2.resurrected.is_none(),
+        "nothing is left to resurrect: stream() already finished the interrupted turn"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// D-183 coverage: `start_flow` also runs the `auto_resurrect` pre-step — a flow-driven turn must
+/// not start on top of a still-open crashed turn either.
+#[tokio::test]
+async fn start_flow_resurrects_an_interrupted_turn_first() {
+    let dir = tmp_dir("start-flow-resurrect");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let cl = client(
+        &dir,
+        Storage::dir(dir.join("store")),
+        counter.clone(),
+        Box::new(NeverProvider),
+        None,
+    );
+    let session = cl.create_session().unwrap();
+    let crashed = two_step_plan();
+    seed_crash(&cl, session.id(), &crashed, 1);
+
+    // The flow `start_flow` itself drives — deliberately distinct from the crashed turn's own
+    // plan, and dispatches no ops of its own so the counter's only increment is the resurrect.
+    let flow = DraftAst {
+        body: vec![Node::Return {
+            value: Box::new(Node::Lit {
+                value: serde_json::json!("flow started"),
+            }),
+        }],
+        ..Default::default()
+    };
+
+    let out = session.start_flow(&flow).await.unwrap();
+
+    let report = out
+        .resurrected
+        .as_ref()
+        .expect("start_flow must finish the interrupted turn first, and report it");
+    assert_eq!(report.outcome, "resurrected", "{report:?}");
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        out.text, "flow started",
+        "the started flow's own output is not polluted by the resurrected one"
+    );
+    assert!(!out.suspended, "the flow ran straight through, no await");
+    assert!(
+        session.interrupted().unwrap().is_none(),
+        "the interrupted turn is closed now"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

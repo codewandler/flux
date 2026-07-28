@@ -86,11 +86,14 @@ impl Session {
     /// authorization → approval → guarded-IO envelope.
     pub async fn start_flow(&self, flow: &DraftAst) -> Result<TurnOutput> {
         let _turn = self.turn_guard.lock().await;
+        // Same D-183 pre-step as `send`/`send_with`: finish an interrupted predecessor turn first,
+        // on its own throwaway sink, so this flow never starts on top of a still-open crashed turn.
+        let resurrected = self.auto_resurrect_step(&mut Collector::default()).await?;
         let mut sink = Collector::default();
         self.engine
             .start_flow_turn(&self.id, flow, &mut sink)
             .await?;
-        self.finalize(sink.0)
+        self.finalize_resumed(sink.0, resurrected)
     }
 
     /// Whether this session is currently parked on a top-level `await` — i.e. a flow started with
@@ -158,31 +161,49 @@ impl Session {
     /// arrive as they happen whether or not you are polling. Dropping the returned stream cancels
     /// the turn.
     ///
+    /// Runs the same D-183 `auto_resurrect` pre-step as [`send`](Self::send)/[`send_with`](Self::send_with):
+    /// if this session has an interrupted predecessor turn, it is finished FIRST, under the same
+    /// turn guard — never silently. Its own events stream out over this same [`TurnStream`] before
+    /// the new turn's, and [`TurnOutput::resurrected`](crate::TurnOutput::resurrected) on
+    /// [`finish`](TurnStream::finish)'s result carries the report.
+    ///
     /// # Panics
     /// Spawns the turn eagerly, so it must be called from within a Tokio runtime (like any
     /// `tokio::spawn`-based API); calling it outside one panics. Use [`send`](Self::send) or
     /// [`send_with`](Self::send_with) when you only have a future to `.await`.
     pub fn stream(&self, input: &str) -> TurnStream {
-        let engine = self.engine.clone();
-        let id = self.id.clone();
-        let guard = self.turn_guard.clone();
+        // A whole `Session` clone (cheap: `{engine, id}` plus shared `Arc`s) rather than picking
+        // apart its fields, so the spawned task runs the exact same `auto_resurrect_step` as
+        // `send`/`send_with` — not a re-derived copy of its logic.
+        let session = self.clone();
         let input = input.to_string();
         let cancel = CancellationToken::new();
         let child = cancel.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
-            let _turn = guard.lock().await;
+            let _turn = session.turn_guard.lock().await;
+            // D-183: resurrect an interrupted predecessor turn FIRST, same turn-guard, same step —
+            // and never silently: its events (text/tool activity) stream out on the same channel
+            // as the new turn's, so a listener sees it happen rather than finding out only from
+            // the returned `TurnOutput::resurrected` after `finish()`.
+            let mut resurrect_sink = ChannelSink {
+                tx: tx.clone(),
+                collect: Collector::default(),
+            };
+            let resurrected = session.auto_resurrect_step(&mut resurrect_sink).await?;
             let mut sink = ChannelSink {
                 tx,
                 collect: Collector::default(),
             };
-            engine
-                .run_turn_cancellable(&id, &input, &mut sink, &child)
+            session
+                .engine
+                .run_turn_cancellable(&session.id, &input, &mut sink, &child)
                 .await?;
             let mut out = sink.collect.0;
             // Stamp the post-turn suspension state, exactly as `finalize` does for the awaited
             // doors — a streamed flow-driven turn reports whether it re-parked or completed.
-            out.suspended = engine.flow.has_suspension(&id)?;
+            out.suspended = session.engine.flow.has_suspension(&session.id)?;
+            out.resurrected = resurrected.map(Box::new);
             Ok(out)
         });
         TurnStream {

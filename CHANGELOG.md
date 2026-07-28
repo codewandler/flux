@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+<<<<<<< HEAD
 - **Claude interop epic (D-186…D-192): commands + skills load from both `.flux` and `.claude`
   worlds** (design: `docs/designs/claude-interop.md`; user docs:
   `website/docs/agent/claude-compat.md`, new page):
@@ -39,6 +40,85 @@ All notable changes to this project are documented in this file. The format is b
     (`.claude/skills/<ns>/<name>/SKILL.md`), symlink jail enforced at every depth; a directory
     containing `SKILL.md` claims its subtree, so a skill's own `references/` never surfaces as a
     separate skill.
+=======
+- **C-101: animated boot splash for the interactive surfaces.** Bare `flux` (and prompt-less
+  `flux run`) and `flux tui` now open with an animated FLUX splash — matrix rain dissolving into
+  the block logo, then a pulsing glow with the `[ deterministic agent platform ]` tagline. Any key
+  skips; it auto-dismisses after ~2 s of glow, and is fully suppressed under `NO_COLOR` /
+  `--color never`, piped streams, `FLUX_NO_SPLASH=1`, or terminals smaller than 64×14. Frames are
+  a deterministic function of a seed (embedded PCG32), pinned by tests (`flux_tui::splash`).
+- **C-101: truecolor spinner effects during model waits.** On terminals advertising 24-bit color
+  (`COLORTERM`), the CLI's thinking spinner and the TUI footer replace the braille glyph with a
+  full-width animated effect bar — Knight Rider, Comet, Tidal Wave, Matrix, Equalizer, Aurora,
+  Thunderstrike, Binary Rain (`flux_tui::spinners`, ported from the codewandler/spinners Go
+  catalog) — cycling one effect per model round. Non-truecolor terminals keep the braille spinner
+  unchanged. Showcase: `cargo run -p flux-tui --example spinners`.
+
+- **C-98/C-99: `git_worktree_enter` / `git_worktree_leave` built-ins — context-local git
+  worktrees.** `enter` preflights a clean non-detached `main`, creates a generated
+  `flux/worktree/…` branch worktree under a private `/tmp/flux-worktree-*` directory, and
+  transitions only the calling agent context's guarded root into it. `leave` requires a clean
+  worktree and an unmoved clean `main`, proves mergeability with an aborted trial merge, merges
+  `--no-ff --no-edit`, removes the worktree and branch, and restores the context; merge failures
+  keep the agent in its worktree with `main` clean, and partial cleanup returns a retryable
+  "merged, cleanup required" state that never re-merges. Both ops are Git-group,
+  `Risk::High`/non-idempotent, argv-only through the guarded `System`.
+
+### Changed
+
+- **C-97: the guarded system is now context-local and swappable (breaking for embedders).**
+  `ToolContext`'s public `system` field is replaced by a `system()` accessor over a per-context
+  `WorkspaceContext` (active `Arc<System>` + optional worktree session state); `flux-system` gains
+  posture-preserving `Workspace::with_root` / `System::rerooted` derives and fail-closed
+  `allocate_worktree_dir`/`remove_worktree_dir` helpers. A worktree transition never touches
+  process-global cwd, and the sandbox's writable set follows the re-rooted workspace
+  automatically.
+- **C-100: per-turn op surfacing and sub-agent spawns follow the active root.** Evidence-gated
+  group surfacing probes the context's active root each turn (assembly-time config/skills/roles
+  stay fixed by design); `SpawnRequest` carries the parent's active-system snapshot so children
+  inherit the transitioned root with an independent workspace context (fixing the latent
+  child-`cwd = "."` probe bug), and nested spawners re-base on the child's snapshot.
+
+### Removed
+
+- **D-192: `codewandler-flux-skill` dead code reconciled away** (breaking → next MINOR): removed the
+  never-shipped lazy-body loader (`SkillBody::lazy`, `SkillBody::is_loaded`) and keyword
+  trigger-ranking (`Skill::matches`, `Skill::match_score`, `ActivationLimits`, `active_for`), plus
+  the legacy duplicate discovery (`discover`, `discover_merged`); the five-directory precedence list
+  now lives only in `flux_runtime::metadata::discover_skills_from`, and the crate docs/architecture
+  docs match the shipped eager, manual-first behavior.
+
+## [0.27.0] - 2026-07-28
+
+### Fixed
+
+- **D-181: Resurrect and what-if traces are now turn-scoped, not session-scoped.** The resume
+  ledger and crash-tail were folded from the whole session trace, so an identical plan re-accepted
+  in a later turn that crashed with zero progress silently fast-forwarded on the earlier turn's
+  completions, and a completed native turn's cells could be served into a later crashed turn.
+  `interrupted`/`resurrect` and the what-if turn filters now window the stream to the turn's own
+  events; purely native crash tails are reported honestly via `ResurrectReport::unanchored_cells`.
+- **D-182: what-if re-plan diffs are never vacuous.** The re-plan path (`.model()`/
+  `.system_prompt()`) now self-records served cells via `RerunRecordingSink` (as `Scenario::check`
+  already did), so a fully tape-served re-plan diffs as identical instead of fake total divergence;
+  `off_tape(Live)` runs record served hits too, and `substitute_at` on a node with no recorded
+  dispatch is now an error naming the node instead of a silent no-op.
+- **D-183: every turn entry resurrects.** `Session::stream` and `Session::start_flow` now run the
+  same auto-resurrect step as `send`/`send_with`, and the CLI REPL and TUI run resurrect-on-open —
+  previously only one-shot `flux run` did, so other entries ran new turns on top of a crashed one.
+  `resurrect::interrupted` also gained an out-of-order tail-guard refusing a stale non-latest turn.
+- **D-184: the Lab's honesty gaps are closed.** `Report::is_clean()` now fails on any live model
+  fall-through (`model_live > 0`); `FLUX_GOLDEN=update` reports the real live-call count and never
+  reads clean; and an unknown-tool refusal is classified `denied` on both `authorize` and
+  `dispatch_outcome`, so `retry`/`loop` no longer burn attempts on a typo'd op name.
+- **D-185: fixture and Lab-CLI hygiene.** `flux record`/`flux test` reject non-single-segment
+  names (`.`/`..`/separators); `EventStore::copy_session_to` is atomic per backend (a failed copy
+  leaves no listed session) with registry timestamps consistent with the copied events; run-diff
+  rows for natively dispatched runs render readable op labels; a relative `--store` is absolutized
+  before export.
+
+### Added
+>>>>>>> main
 
 - **`/effort` REPL and TUI slash command.** View the active reasoning effort (`/effort`) or set it
   mid-session (`/effort low|medium|high|xhigh|max`, or `/effort off` for the provider default). The
@@ -167,15 +247,6 @@ All notable changes to this project are documented in this file. The format is b
   ~16.7M-pixel canvas budget rejects oversized renders before allocation. flux-cli enables `png`
   in its default features, so the stock binary and `task install` include it, while the eight
   library consumers of flux-tools never build the rasterizer.
-
-### Removed
-
-- **D-192: `codewandler-flux-skill` dead code reconciled away** (breaking → next MINOR): removed the
-  never-shipped lazy-body loader (`SkillBody::lazy`, `SkillBody::is_loaded`) and keyword
-  trigger-ranking (`Skill::matches`, `Skill::match_score`, `ActivationLimits`, `active_for`), plus
-  the legacy duplicate discovery (`discover`, `discover_merged`); the five-directory precedence list
-  now lives only in `flux_runtime::metadata::discover_skills_from`, and the crate docs/architecture
-  docs match the shipped eager, manual-first behavior.
 
 ### Changed
 

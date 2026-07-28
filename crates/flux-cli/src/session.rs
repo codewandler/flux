@@ -67,9 +67,9 @@ pub(super) fn run_sessions(prune: bool) -> Result<()> {
         eprintln!(
             "{}",
             style::dim(&format!(
-                "{interrupted} interrupted session(s) — the next one-shot `flux run` turn on one \
-                 finishes its killed turn from the crash point (no model call). \
-                 `FLUX_AUTO_RESURRECT=0` disables that."
+                "{interrupted} interrupted session(s) — the next turn entered on one (`flux run`, \
+                 the REPL, or `flux tui`) finishes its killed turn from the crash point (no model \
+                 call). `FLUX_AUTO_RESURRECT=0` disables that."
             ))
         );
     }
@@ -625,6 +625,9 @@ const REPL_BUILTIN_COMMANDS: &[&str] = &[
 ];
 
 pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
+    // Decorative boot splash, before any other output. Blocks the runtime thread for a
+    // few seconds at most — nothing else is in flight this early in the REPL.
+    crate::splash::maybe_splash();
     let (mut agent, mut session_id, _spec, spawner) = build_agent(&flags).await?;
     let cost = TurnCost::load();
     let initial_rules = agent.executor.allow_rules();
@@ -639,6 +642,12 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
             agent.model
         ))
     );
+    // D-183: the REPL is a turn-entry point too — finish an interrupted turn from a prior crash
+    // BEFORE the first input runs, same step and same loud reporting as one-shot `flux run`.
+    {
+        let mut sink = cost.sink(&agent, 0);
+        resurrect_on_open(&agent, &session_id, &mut sink).await;
+    }
 
     // reedline gives line editing, persistent history, and reverse-search. Because it reads in raw
     // mode, a prompt-level Ctrl-C arrives as `Signal::CtrlC` (not a SIGINT), so it cleanly clears the
@@ -911,6 +920,11 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                                     "resumed {session_id} · created with model {} · {n} messages",
                                     info.model
                                 );
+                                // D-183: `/resume` opens a (possibly different) session — finish
+                                // an interrupted turn on it before the next input runs, same as
+                                // the REPL's own startup and one-shot `flux run`.
+                                let mut sink = cost.sink(&agent, 0);
+                                resurrect_on_open(&agent, &session_id, &mut sink).await;
                             }
                             Err(e) => eprintln!("cannot resume `{id}`: {e}"),
                         }

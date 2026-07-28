@@ -612,3 +612,236 @@ async fn an_equal_policy_stays_hermetic_and_serves_from_tape() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- D-182: re-plan path self-records served hits ----------------------------
+
+/// Failing-first (D-182): a `.system_prompt()` re-plan whose new plan happens to be BYTE-IDENTICAL
+/// to the original — same op, same input — must be fully served from the frozen tape and diff as
+/// `identical`, not as a fake total divergence. Before the fix, the re-plan path drove
+/// `run_turn_pinned` with a bare `NullSink`: a served (non-live) dispatch is never recorded by the
+/// cassette layer itself (nothing ran live, so there is no live tail to record), so the
+/// counterfactual session's own trace ended up with ZERO cells even though one statement executed —
+/// `run_diff` then reads "no cells on the b side" as every statement having vanished.
+#[tokio::test]
+async fn replan_with_an_identical_plan_is_fully_served_and_diffs_identical() {
+    let dir = tmp_dir("replan-identical");
+    let bump = Arc::new(AtomicUsize::new(0));
+    let audit = Arc::new(AtomicUsize::new(0));
+    // Any marker not present in either system prompt below keeps `AltPlanMock` on its "bump" branch
+    // for BOTH the original recording and the counterfactual re-plan.
+    let alt_marker = "NEVER_PRESENT_MARKER";
+    let client = Client::builder()
+        .model("mock")
+        .auto_approve(true)
+        .storage(Storage::in_memory())
+        .register_op(Arc::new(CounterTool {
+            name: "bump",
+            counter: bump,
+        }))
+        .register_op(Arc::new(CounterTool {
+            name: "auditlog",
+            counter: audit,
+        }))
+        .build(Box::new(AltPlanMock::new(alt_marker)), &dir)
+        .unwrap();
+
+    client.run("go").await.unwrap();
+    let src = client.session_id().unwrap();
+    let session = client.open_session(&src).unwrap();
+
+    let cf = session
+        .what_if()
+        .system_prompt("You are a differently-worded but non-alt agent.")
+        .run()
+        .await
+        .unwrap();
+
+    assert!(
+        cf.hermetic(),
+        "the re-plan called the identical op with the identical input — nothing left the tape"
+    );
+    let diff = cf.diff().unwrap();
+    assert!(
+        diff.identical,
+        "a fully-served, identical re-plan must diff as identical, not a fake divergence: {diff:?}"
+    );
+
+    // The counterfactual session's own trace must actually hold the served cell — the whole point
+    // of self-recording (an empty trace would ALSO make `diff.identical` look true by accident, if
+    // `run_diff` treated two empty sides as equal — assert directly that the cell exists).
+    let cf_trace = cf.session().run_trace().unwrap();
+    let recorded_ops: Vec<_> = cf_trace
+        .iter()
+        .filter_map(|ev| match ev {
+            flux_lang::ast::RunEvent::OpRecorded { op, .. } => Some(op.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded_ops,
+        vec!["bump"],
+        "the served dispatch must be self-recorded onto the counterfactual session: {cf_trace:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A re-plan whose new plan diverges — calling an EXTRA op the original recording never made — under
+/// `.off_tape(Live)` must record BOTH the served hit (the op the original plan also called) and the
+/// live fall-through (the new op) onto the counterfactual's own trace, not just the live tail.
+/// Before the D-182 fix, `off_tape(Live)`'s bridge only ever recorded the live-miss tail
+/// (`FrozenTape::record_tail`) — a served hit sitting right next to it went unrecorded, so the
+/// counterfactual's trace was missing statements the diff needed to align against.
+struct MixedReplanMock {
+    alt_marker: &'static str,
+    calls_by_system: Mutex<std::collections::HashMap<String, usize>>,
+}
+impl MixedReplanMock {
+    fn new(alt_marker: &'static str) -> Self {
+        Self {
+            alt_marker,
+            calls_by_system: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+#[async_trait]
+impl Provider for MixedReplanMock {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        if request_has_tool(&req, "declare_intent") {
+            return Ok(chunk_stream(intent_chunks("perform the ops", &["core"])));
+        }
+        let system = full_system_text(&req);
+        let alt = system.contains(self.alt_marker);
+        let call_index = {
+            let mut map = self.calls_by_system.lock().unwrap();
+            let n = map.entry(system).or_insert(0);
+            let idx = *n;
+            *n += 1;
+            idx
+        };
+        if alt {
+            // Same first op as the original (served from tape), PLUS a second op the original
+            // recording never called at all (a live miss under `OffTape::Live`).
+            match call_index {
+                0 => Ok(chunk_stream(native_call("call-0", "bump", json!({})))),
+                1 => Ok(chunk_stream(native_call(
+                    "call-1",
+                    "auditlog",
+                    json!({"note": "new"}),
+                ))),
+                _ => Ok(chunk_stream(prose_chunks("alt answer"))),
+            }
+        } else {
+            match call_index {
+                0 => Ok(chunk_stream(native_call("call-0", "bump", json!({})))),
+                _ => Ok(chunk_stream(prose_chunks("orig answer"))),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn off_tape_live_replan_records_both_served_and_live_cells() {
+    let dir = tmp_dir("replan-mixed-live");
+    let bump = Arc::new(AtomicUsize::new(0));
+    let audit = Arc::new(AtomicUsize::new(0));
+    let alt_marker = "MIXED_LIVE_MARKER";
+    let client = Client::builder()
+        .model("mock")
+        .auto_approve(true)
+        .storage(Storage::in_memory())
+        .register_op(Arc::new(CounterTool {
+            name: "bump",
+            counter: bump,
+        }))
+        .register_op(Arc::new(CounterTool {
+            name: "auditlog",
+            counter: audit,
+        }))
+        .build(Box::new(MixedReplanMock::new(alt_marker)), &dir)
+        .unwrap();
+
+    client.run("go").await.unwrap();
+    let src = client.session_id().unwrap();
+    let session = client.open_session(&src).unwrap();
+
+    let cf = session
+        .what_if()
+        .system_prompt(format!("You are a helpful agent. {alt_marker}"))
+        .off_tape(flux_sdk::whatif::OffTape::Live)
+        .run()
+        .await
+        .unwrap();
+
+    assert!(
+        !cf.hermetic(),
+        "the new plan's extra op has no matching recorded cell — it must go live"
+    );
+
+    let cf_trace = cf.session().run_trace().unwrap();
+    let mut recorded_ops: Vec<_> = cf_trace
+        .iter()
+        .filter_map(|ev| match ev {
+            flux_lang::ast::RunEvent::OpRecorded { op, .. } => Some(op.clone()),
+            _ => None,
+        })
+        .collect();
+    recorded_ops.sort();
+    // Completeness, not positional order: the re-plan drives the FULL adaptive agent loop (a
+    // composite, `explore`), whose own dispatch relay delivers this sink's `tool_call`/`tool_result`
+    // pairs asynchronously relative to `FrozenTape::record_tail`'s SYNCHRONOUS live-bridge write —
+    // so a self-recorded served cell can land at a different STREAM position than it would in true
+    // execution order (a known, narrower limitation than full positional `diff()` alignment,
+    // documented at `RerunRecordingSink::defer_for_live_bridge`/`finish`). What matters here is that
+    // NEITHER cell goes missing NOR gets duplicated.
+    assert_eq!(
+        recorded_ops,
+        vec!["auditlog".to_string(), "bump".to_string()],
+        "both the SERVED hit (bump) and the LIVE fall-through (auditlog) must be recorded onto the \
+         counterfactual's own trace, exactly once each — no drop, no duplicate: {cf_trace:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- D-182 (handed over from D-184): `substitute_at` on a dead node errors -----
+
+/// Failing-first: `.substitute_at(node, _)` where `node` maps to no recorded dispatch (a typo'd node
+/// id, or a node whose statement made no dispatch at all) must return an error naming the node,
+/// never silently drop the substitution and report an honest-looking identical run.
+#[tokio::test]
+async fn substitute_at_a_dead_node_errors_instead_of_silently_no_opping() {
+    let dir = tmp_dir("substitute-at-dead-node");
+    let record = record_client(
+        &dir,
+        vec![("bump", json!({}))],
+        "bumped",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    record.run("bump once").await.unwrap();
+    let src = record.session_id().unwrap();
+    let session = record.open_session(&src).unwrap();
+
+    // A node id nothing in the recorded plan ever bound to — no statement, no dispatch, nothing to
+    // substitute.
+    let no_such_node = 9_999u32;
+    let err = match session
+        .what_if()
+        .substitute_at(no_such_node, json!("should never be served"))
+        .run()
+        .await
+    {
+        Ok(_) => panic!("a dead node target must error, not silently run as if nothing changed"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains(&no_such_node.to_string()),
+        "the error must name the offending node: {err}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

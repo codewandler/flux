@@ -10,11 +10,12 @@
 >    `hermetic(tape)` constructor). The SDK-level `Counterfactual::hermetic()` keeps the name.
 > 2. `Scenario::replay`/`inject_at` take `&Client` — hermetic re-execution still needs the
 >    executor's op catalog, and the deny-all/never-provider posture IS client configuration.
-> 3. `auto_resurrect` fires at the turn entries (`Session::send`/`send_with`), not at
->    `open_session`/`latest_session`: both openers are sync and `resurrect` is async, so honoring
->    the sketch literally meant making the whole resume seam async (breaking) and dragging IO into a
->    documented-as-cheap handle mint. Same guarantee — an interrupted turn is always finished before
->    new input — with no API break, reported on `TurnOutput::resurrected`.
+> 3. `auto_resurrect` fires at the turn entries (`Session::send`/`send_with`/`stream`/`start_flow`,
+>    D-183), not at `open_session`/`latest_session`: both openers are sync and `resurrect` is async,
+>    so honoring the sketch literally meant making the whole resume seam async (breaking) and
+>    dragging IO into a documented-as-cheap handle mint. Same guarantee — an interrupted turn is
+>    always finished before new input, at every turn-entry point, CLI included (the REPL and TUI,
+>    D-183) — with no API break, reported on `TurnOutput::resurrected`.
 > 4. Two defects the failing-first tests surfaced were fixed at the root rather than worked around:
 >    `flux_events::run_diff` couldn't compare natively dispatched runs at all (no statement ledger),
 >    and a fully-served re-drive recorded no cells to diff. See D-176.
@@ -213,11 +214,15 @@ cell. Guard: a served cell whose re-derived `input_hash` mismatches latches `Rep
 Per the vision (the CLI is the reference app built on the SDK): `flux record <name> "<prompt>"`
 (writes a `tests/scenarios/<name>/` fixture), `flux test [<name>]` (runs `Scenario::replay` +
 assertions, offline, $0), and a global `--store <DIR>` for opening any `Storage::dir` store with
-`flux replay`/`fork`/`diff`/`sessions`. A one-shot `flux run` turn on a session with an interrupted
+`flux replay`/`fork`/`diff`/`sessions`. Every turn-entry point on a session with an interrupted
 predecessor finishes that predecessor first when `auto_resurrect` is enabled, then runs the new
-input (the interactive REPL/TUI do not yet run this step);
+input — the one-shot `flux run` turn, the interactive REPL (at startup and on `/resume`), and the
+TUI (D-183) all run the same shared `flux_flow::resurrect::resurrect_on_open` step, reported loudly
+(never silently) on stderr;
 `flux sessions` only flags interrupted sessions and never resumes them as a listing side effect.
-`FLUX_AUTO_RESURRECT=0` opts out.
+`FLUX_AUTO_RESURRECT=0` opts out. `flux_flow::resurrect::interrupted` also refuses loudly if the
+interrupted turn is no longer the session's most recent turn — the out-of-order tail-guard for a
+session that got a new turn without going through the resurrect-on-open step.
 
 ## Safety, invariants & layering
 

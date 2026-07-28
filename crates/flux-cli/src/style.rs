@@ -40,6 +40,15 @@ pub fn enabled() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
+/// Whether the terminal advertises 24-bit color (`COLORTERM`), on top of [`enabled`].
+/// Gates the truecolor spinner effects; plain-color terminals keep the braille glyph.
+pub fn truecolor() -> bool {
+    enabled()
+        && std::env::var("COLORTERM")
+            .map(|v| v.contains("truecolor") || v.contains("24bit"))
+            .unwrap_or(false)
+}
+
 fn wrap(code: &str, s: &str) -> String {
     if enabled() {
         format!("\x1b[{code}m{s}\x1b[0m")

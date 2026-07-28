@@ -2,7 +2,7 @@
 id: L-78
 title: flux render PNG output — resvg rasterization + embedded font + write_file_bytes
 pillar: Language
-status: in-progress
+status: done
 priority:
 epic: flux-render
 design: docs/designs/flux-render.md
@@ -48,6 +48,7 @@ new `flux-system` bytes writer.
   `cargo metadata --locked --offline`, so the regenerated `Cargo.lock` must be committed with
   this branch.
 - MSRV: workspace `rust-version` bumped 1.85 → **1.87** (resvg/usvg 0.47 declare it; user call).
+- 2026-07-28: merged to main (`2dac048`); plugins-workspace MSRV followed to 1.87 (`af3bf92`); post-merge review confirmed feature-gating, font licensing, jail + pixel-budget all sound. Closed.
 
 ## Notes
 - Design: [flux-render.md](../designs/flux-render.md) § "Phase 2 — PNG".

@@ -9,6 +9,8 @@
 mod controller;
 mod projection;
 mod rendering;
+pub mod spinners;
+pub mod splash;
 mod state;
 mod terminal_io;
 
@@ -91,8 +93,23 @@ impl TuiRunOptions {
     }
 }
 
-/// Braille spinner frames (shared idiom with the CLI).
+/// Braille spinner frames (shared idiom with the CLI); the fallback when the
+/// terminal lacks truecolor for the animated `spinners` footer bar.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Width of the animated footer effect bar.
+const FOOTER_BAR_WIDTH: usize = 12;
+
+/// Whether the terminal advertises 24-bit color and color isn't disabled — gates the
+/// truecolor footer effects (`Color::Rgb` would emit raw truecolor SGR regardless).
+fn terminal_truecolor() -> bool {
+    static TRUECOLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUECOLOR.get_or_init(|| {
+        std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("COLORTERM")
+                .map(|v| v.contains("truecolor") || v.contains("24bit"))
+                .unwrap_or(false)
+    })
+}
 /// Streaming cursor block appended to an in-progress assistant message.
 const CURSOR: &str = "▍";
 /// Max expanded-detail lines per tool card. Lifted entirely under verbose (`flux tui -v` /
@@ -1178,17 +1195,33 @@ impl ChatState {
             )],
             Phase::Thinking | Phase::Planning => {
                 let elapsed = self.turn_start.map(|s| s.elapsed()).unwrap_or_default();
-                let frame = SPINNER[(elapsed.as_millis() / 80) as usize % SPINNER.len()];
                 let label = if self.phase == Phase::Planning {
                     loop_phase_label(self.plan_phase.as_deref(), self.execute_rounds)
                 } else {
                     "thinking…"
                 };
-                vec![
-                    Span::styled(format!(" {frame} "), t.accent_style()),
-                    Span::raw(label.to_string()),
-                    Span::styled(format!("  · {}", fmt_elapsed(elapsed)), t.muted_style()),
-                ]
+                // Truecolor terminals get the animated effect bar, cycling one catalog
+                // entry per execute round; others keep the braille glyph.
+                let mut left = if terminal_truecolor() {
+                    let tick = (elapsed.as_millis() / spinners::FPS_MS as u128) as usize;
+                    let effect = spinners::by_round(self.execute_rounds);
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(spinners::cells_to_spans(&(effect.frame)(
+                        tick,
+                        FOOTER_BAR_WIDTH,
+                    )));
+                    spans.push(Span::raw(" "));
+                    spans
+                } else {
+                    let frame = SPINNER[(elapsed.as_millis() / 80) as usize % SPINNER.len()];
+                    vec![Span::styled(format!(" {frame} "), t.accent_style())]
+                };
+                left.push(Span::raw(label.to_string()));
+                left.push(Span::styled(
+                    format!("  · {}", fmt_elapsed(elapsed)),
+                    t.muted_style(),
+                ));
+                left
             }
         };
         let mut right = Vec::new();
@@ -1595,6 +1628,35 @@ pub async fn run(
     .await
 }
 
+/// A throwaway [`AgentSink`] that discards every event — the TUI's D-183 resurrect-on-open step
+/// runs before the terminal (and its live [`controller::ChannelSink`]) exist, and the resurrected
+/// turn's persisted result is picked up anyway once `project_session`/`load_history` project the
+/// session, so nothing needs to consume the stream here.
+struct DiscardSink;
+impl AgentSink for DiscardSink {}
+
+/// D-183: the shared [`flux_flow::resurrect::resurrect_on_open`] step, reported to plain stderr —
+/// the TUI has no `flux-cli`-style color chrome of its own, so every line (status or error) just
+/// prints as-is. Mirrors the CLI's own reporter over the same shared step
+/// (`flux-cli/src/execution.rs`'s `resurrect_on_open`) one-for-one, minus the coloring.
+async fn resurrect_on_open(agent: &FlowEngine, session_id: &str) {
+    let mut sink = DiscardSink;
+    flux_flow::resurrect::resurrect_on_open(
+        &agent.events,
+        &agent.flow,
+        &agent.executor,
+        session_id,
+        &agent.composites.active_for_session(session_id),
+        &mut sink,
+        |line| match line {
+            flux_flow::resurrect::OnOpenLine::Info(msg) => eprintln!("{msg}"),
+            flux_flow::resurrect::OnOpenLine::Error(msg) => eprintln!("{msg}"),
+            other => eprintln!("resurrect: {other:?}"),
+        },
+    )
+    .await;
+}
+
 /// Run the interactive TUI with optional surface capabilities such as live model resolution.
 pub async fn run_with_options(
     agent: FlowEngine,
@@ -1619,6 +1681,13 @@ pub async fn run_with_options(
         anyhow::bail!("flux tui requires a real terminal on stdin and stdout");
     }
 
+    // D-183: the TUI is a turn-entry point too — finish an interrupted turn from a prior crash
+    // BEFORE the terminal takes over the screen (a plain stderr line the user can actually read,
+    // same `FLUX_AUTO_RESURRECT=0` opt-out as the CLI's REPL and one-shot `flux run`) and before
+    // `project_session`/`load_history` project the session below, so the resurrected turn's own
+    // persisted messages show up in the transcript like any other turn's.
+    resurrect_on_open(&agent, &session_id).await;
+
     let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
     let mut state = ChatState::for_session(model, session_id.clone())
         .with_verbose(verbose)
@@ -1631,6 +1700,9 @@ pub async fn run_with_options(
     let agent = Arc::new(tokio::sync::RwLock::new(agent));
 
     let (mut terminal, mut guard) = TerminalGuard::enter(out)?;
+    // Decorative boot splash; any driver error just skips it. Runs before the
+    // EventStream below exists, so its blocking `event::poll` has no competitor.
+    let _ = splash::splash_intro(&mut terminal);
     let result = event_loop(
         &mut terminal,
         agent,
@@ -1774,7 +1846,8 @@ async fn event_loop(
                 if pending_ui.is_none() { break; }
                 continue;
             }
-            _ = tokio::time::sleep(Duration::from_millis(80)), if state.running() => continue,
+            // 62 ms lands redraws on the 16 fps boundaries of the animated footer bar.
+            _ = tokio::time::sleep(Duration::from_millis(spinners::FPS_MS)), if state.running() => continue,
         };
         match ev {
             Event::Resize(_, _) => continue,

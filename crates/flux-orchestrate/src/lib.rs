@@ -244,12 +244,19 @@ impl LocalSpawner {
     /// delegation: a grandchild role's `tools` allowlist is intersected against a pool that has already
     /// had everything the ancestor's ceiling excluded removed, so no descendant's own role declaration
     /// can resurrect a tool an ancestor narrowed away, no matter how many hops down.
-    fn at_depth(&self, depth: usize, base_registry: ToolRegistry) -> LocalSpawner {
+    /// `system` is the CHILD's own active-system snapshot (C-100), so grandchildren inherit the
+    /// root the child was spawned into, never the grandparent's assembly-time system.
+    fn at_depth(
+        &self,
+        depth: usize,
+        base_registry: ToolRegistry,
+        system: Arc<System>,
+    ) -> LocalSpawner {
         LocalSpawner {
             provider_factory: self.provider_factory.clone(),
             roles: self.roles.clone(),
             base_registry,
-            system: self.system.clone(),
+            system,
             default_model: self.default_model.clone(),
             default_thinking: self.default_thinking,
             default_effort: self.default_effort,
@@ -327,7 +334,16 @@ impl Spawner for LocalSpawner {
             .as_deref()
             .is_none_or(|tools| tools.iter().any(|t| t == "task"));
         let child_can_delegate = child_depth < self.max_depth && child_has_task;
-        let mut ctx = ToolContext::new(self.system.clone());
+        // C-100: seed the child's own independent WorkspaceContext from the parent's active-system
+        // snapshot when the request carries one (a parent inside a worktree session hands its
+        // children the transitioned root). Fall back to the spawner's assembly-time system for
+        // direct spawns that predate the snapshot (e.g. bare `SpawnRequest::new`). Either way the
+        // child gets a FRESH WorkspaceContext — its own enter/leave never touches the parent.
+        let child_system = request
+            .system
+            .clone()
+            .unwrap_or_else(|| self.system.clone());
+        let mut ctx = ToolContext::new(child_system.clone());
         if child_can_delegate {
             // Bounded nested delegation: the child keeps both halves of the delegation capability —
             // the `task` tool in its registry AND a depth-incremented spawner in its context. The
@@ -344,7 +360,11 @@ impl Spawner for LocalSpawner {
                 Arc::new(TaskTool),
             )?;
             let child_base = self.base_registry.subset(effective_tools.as_deref());
-            ctx = ctx.with_spawner(Arc::new(self.at_depth(child_depth, child_base)));
+            ctx = ctx.with_spawner(Arc::new(self.at_depth(
+                child_depth,
+                child_base,
+                child_system.clone(),
+            )));
         } else {
             // Leaf (depth bound hit, or this hop's own scope excludes `task`): never spawn further
             // sub-agents. Both guards apply — `task` is stripped from the registry and no spawner is
@@ -378,6 +398,13 @@ impl Spawner for LocalSpawner {
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
         let mut spec = role.to_spec(&self.default_model)?;
+        // C-100: `role.to_spec` leaves `AgentSpec::default().cwd == "."`, which made the child
+        // engine probe the PROCESS cwd for evidence surfacing — a latent bug even before
+        // worktrees. Root the child at its own system's workspace so per-turn surfacing probes the
+        // root it actually operates in (only when the spec still carries the "." default).
+        if spec.cwd == std::path::Path::new(".") {
+            spec.cwd = child_system.workspace().root().to_path_buf();
+        }
         spec.thinking = role.thinking.unwrap_or(self.default_thinking);
         spec.effort = role.effort.or(self.default_effort);
         spec.adaptive_policy = self.adaptive_policy.clone();
@@ -1103,6 +1130,10 @@ impl Tool for TaskTool {
             cap_scope: ctx.active_cap_scope(),
             parent_session: ctx.session_id(),
             activity: ctx.spawn_activity_sink(),
+            // C-100: snapshot the parent context's ACTIVE system at delegation time so a child
+            // spawned inside a worktree session inherits the transitioned root (with its own
+            // independent WorkspaceContext — a child transition never affects the parent).
+            system: Some(ctx.system()),
         };
         let spawned = if let Some(supervisor) = supervisor {
             let spawner = spawner.clone();
@@ -1508,7 +1539,7 @@ mod tests {
             ..flux_agent::AdaptiveLoopPolicy::default()
         };
         let spawner = spawner.with_adaptive_policy(policy.clone());
-        let nested = spawner.at_depth(1, ToolRegistry::new());
+        let nested = spawner.at_depth(1, ToolRegistry::new(), temp_system());
         assert_eq!(nested.adaptive_policy, policy);
     }
 
@@ -2751,7 +2782,7 @@ mod tests {
                 ToolSpec::read_only("ping", "p", json!({"type": "object"}))
             }
             async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
-                ctx.system.write_file("PINGED.marker", "1").await?;
+                ctx.system().write_file("PINGED.marker", "1").await?;
                 Ok(ToolResult::ok("pong"))
             }
         }
@@ -3248,7 +3279,7 @@ mod tests {
                 s
             }
             async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
-                ctx.system.write_file("EXECUTED.marker", "1").await?;
+                ctx.system().write_file("EXECUTED.marker", "1").await?;
                 Ok(ToolResult::ok("ran"))
             }
         }
@@ -3671,7 +3702,7 @@ mod tests {
             ToolSpec::read_only("ping", "p", json!({"type": "object"}))
         }
         async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
-            ctx.system.write_file("PINGED.marker", "1").await?;
+            ctx.system().write_file("PINGED.marker", "1").await?;
             Ok(ToolResult::ok("pong"))
         }
     }
@@ -3767,11 +3798,15 @@ mod tests {
             async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
                 // Record the actual outcome so the test can distinguish a *confinement* denial from a
                 // plain not-found (the error rendering carries the workspace-escape reason).
-                let outcome = match ctx.system.read_file("../../../../../../etc/hostname").await {
+                let outcome = match ctx
+                    .system()
+                    .read_file("../../../../../../etc/hostname")
+                    .await
+                {
                     Err(e) => format!("denied: {e}"),
                     Ok(_) => "LEAKED".to_string(),
                 };
-                ctx.system.write_file("PROBE.marker", &outcome).await?;
+                ctx.system().write_file("PROBE.marker", &outcome).await?;
                 Ok(ToolResult::ok("probed"))
             }
         }
@@ -4029,7 +4064,7 @@ mod tests {
                 ToolSpec::read_only("ping", "p", json!({"type": "object"}))
             }
             async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
-                ctx.system.write_file("GRANDCHILD.marker", "1").await?;
+                ctx.system().write_file("GRANDCHILD.marker", "1").await?;
                 Ok(ToolResult::ok("pong"))
             }
         }
@@ -4156,8 +4191,7 @@ mod tests {
                     role: "delegator".into(),
                     task: "go".into(),
                     cap_scope: Some(vec!["task".into(), "read".into()]),
-                    parent_session: None,
-                    activity: None,
+                    ..SpawnRequest::new("delegator", "go")
                 },
                 &CancellationToken::new(),
             )
@@ -4166,6 +4200,191 @@ mod tests {
         assert!(
             sys3.read_file("GRANDCHILD.marker").await.is_err(),
             "an active with_tools scope excluding `ping` must carry down to the grandchild two hops away"
+        );
+    }
+
+    /// A worktree session over `original`, transitioned to `target` (C-100 test fixture).
+    fn fake_worktree_session(
+        original: &Arc<System>,
+        target: &std::path::Path,
+    ) -> flux_runtime::WorktreeSession {
+        flux_runtime::WorktreeSession {
+            original: original.clone(),
+            base_commit: "deadbeef".into(),
+            branch: "flux/worktree/test".into(),
+            checkout: target.to_path_buf(),
+            parent_dir: target.to_path_buf(),
+            phase: flux_runtime::WorktreePhase::Active,
+        }
+    }
+
+    /// Records the root the child context actually observes, then transitions the CHILD's own
+    /// workspace context into a further worktree — so the parent-side test can assert both
+    /// inheritance (the recorded root) and isolation (the parent's root afterwards).
+    struct RootProbe {
+        seen: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+        transition_to: std::path::PathBuf,
+    }
+    #[async_trait]
+    impl Tool for RootProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("root_probe", "p", json!({"type": "object"}))
+        }
+        async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+            let system = ctx.system();
+            *self.seen.lock().unwrap() = Some(system.workspace().root().to_path_buf());
+            // The child transitions ITS OWN context — the parent must never observe this.
+            let rerooted = Arc::new(system.rerooted(&self.transition_to)?);
+            ctx.workspace_context().enter_worktree(
+                fake_worktree_session(&system, &self.transition_to),
+                rerooted,
+            )?;
+            Ok(ToolResult::ok("probed"))
+        }
+    }
+
+    /// A provider that selects and calls `root_probe`, then finishes with prose.
+    struct RootProbePlanMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for RootProbePlanMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            if request_has_tool(&request, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("probe the workspace root", &["core"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                native_call("probe-1", "root_probe", json!({}))
+            } else {
+                prose_chunks("done")
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// C-100: a spawned child inherits the PARENT context's transitioned root (the active-system
+    /// snapshot carried on `SpawnRequest.system`), not the spawner's assembly-time system — and the
+    /// child's own worktree transition never changes the parent's root (independent
+    /// `WorkspaceContext` per child).
+    #[tokio::test]
+    async fn spawned_child_inherits_transitioned_root_but_transitions_independently() {
+        let assembly = unique_system("c100-assembly");
+        let parent_worktree = unique_system("c100-parent-wt");
+        let child_worktree = unique_system("c100-child-wt");
+        let parent_worktree_root = parent_worktree.workspace().root().to_path_buf();
+        let child_worktree_root = child_worktree.workspace().root().to_path_buf();
+
+        // The parent context enters a worktree (rerooted system, session recorded).
+        let parent_ctx = ToolContext::new(assembly.clone());
+        let transitioned = Arc::new(assembly.rerooted(&parent_worktree_root).unwrap());
+        parent_ctx
+            .workspace_context()
+            .enter_worktree(
+                fake_worktree_session(&assembly, &parent_worktree_root),
+                transitioned,
+            )
+            .unwrap();
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(RootProbe {
+            seen: seen.clone(),
+            transition_to: child_worktree_root.clone(),
+        }));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [root_probe]\n---\nYou are a scout.",
+            "scout",
+        ));
+        // The spawner holds the ASSEMBLY-TIME system — exactly the bug surface: without the
+        // request snapshot the child would probe/operate from `assembly`, not the worktree.
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(RootProbePlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            assembly.clone(),
+            "mock",
+            1024,
+        );
+
+        // As `TaskTool` would: snapshot the parent context's ACTIVE system onto the request.
+        let request = SpawnRequest {
+            system: Some(parent_ctx.system()),
+            ..SpawnRequest::new("scout", "probe the root")
+        };
+        let out = spawner
+            .spawn(request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "done");
+
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap();
+        // Inheritance: the child observed the parent's TRANSITIONED root, not the assembly root.
+        assert_eq!(
+            seen.lock().unwrap().clone().expect("probe ran"),
+            canon(&parent_worktree_root),
+            "child context must be seeded from the parent's active-system snapshot"
+        );
+        // Isolation: the child's own transition (into `child_worktree_root`) never reached the
+        // parent — the parent still sits in ITS worktree, with its session intact.
+        assert_eq!(
+            parent_ctx.system().workspace().root(),
+            canon(&parent_worktree_root),
+            "a child transition must never change the parent's root"
+        );
+        assert_eq!(
+            parent_ctx
+                .workspace_context()
+                .worktree_session()
+                .expect("parent session intact")
+                .checkout,
+            parent_worktree_root
+        );
+        // And nothing dragged the child back through the parent's state: the child really did move.
+        assert_ne!(canon(&parent_worktree_root), canon(&child_worktree_root));
+    }
+
+    /// C-100: nested delegation re-bases the depth-incremented spawner on the CHILD's snapshot —
+    /// a grandchild inherits the root its parent (the child) was spawned into, never the
+    /// grandparent spawner's assembly-time system.
+    #[tokio::test]
+    async fn nested_spawner_rebases_on_the_child_snapshot() {
+        let assembly = unique_system("c100-nested-assembly");
+        let worktree = unique_system("c100-nested-wt");
+        let worktree_root = worktree.workspace().root().to_path_buf();
+        let snapshot = Arc::new(assembly.rerooted(&worktree_root).unwrap());
+
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(RootProbePlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            assembly.clone(),
+            "mock",
+            1024,
+        );
+        let nested = spawner.at_depth(1, ToolRegistry::new(), snapshot.clone());
+        assert_eq!(
+            nested.system.workspace().root(),
+            snapshot.workspace().root(),
+            "the re-based spawner must carry the child's snapshot, not the grandparent's system"
         );
     }
 }

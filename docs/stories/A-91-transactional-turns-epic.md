@@ -34,3 +34,9 @@ turn-level rollback of real effects.
 - Builds on the frozen `ActionBatch` invariant and the C-43 cassette capture (prior op outputs are
   already recorded — the raw material for restore-style compensators).
 - The most defensible headline of the six: "the only agent with undo for the real world."
+- Code-reading re-assessment: complementary to (not replaced by) forward atomicity — a batch that
+  fails at op 3 of 5 still leaves half-applied state today (`StagingDisposition` only routes
+  gather-vs-capture; no snapshot/rollback machinery exists in `crates/`). The worktree epic
+  (C-97..C-100) plus `flux-system`'s linked-worktree writable roots are plausible substrate for
+  staging a batch and making "atomic-or-rolled-back" an envelope guarantee, with compensators
+  covering the effects a shadow worktree can't (network, external services).

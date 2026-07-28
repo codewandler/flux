@@ -218,6 +218,17 @@ impl RecordScope {
         };
         let _ = self.events.append(&self.session, NewEvent::run(cell));
     }
+
+    /// D-182: every cell already recorded onto this scope's own session, in trace order —
+    /// [`crate::whatif::RerunRecordingSink::finish`]'s read-back for reconciling a deferred
+    /// self-recording pass against whatever a live bridge already wrote to the SAME target while the
+    /// turn/plan ran.
+    pub(crate) fn recorded_cells(&self) -> Vec<Cell> {
+        self.events
+            .run_trace(&self.session)
+            .map(|trace| Cell::collect(&trace))
+            .unwrap_or_default()
+    }
 }
 
 /// One recorded cell, hydrated from a session's run trace.
@@ -406,6 +417,56 @@ impl ReplayTape {
             ServeResult::Miss => None,
         }
     }
+}
+
+/// D-181: the turn-scoped run-trace window — `RunEvent`s belonging strictly to `turn_id`'s span
+/// (from its own `TurnStarted`, whose `global_seq` **is** `turn_id`, up to but excluding the next
+/// turn's `TurnStarted`, or the end of the stream for the session's most recent turn).
+///
+/// `RunEvent`s carry no `turn_id` of their own — [`EventStore::record_run_event`] never tags one
+/// (wiring that through the live dispatch/write path is a `FlowStore`/engine change, out of this
+/// crate's read-side fix) — so [`EventStore::load_turn`]'s `turn_id`-column filter can't be used
+/// here; it would return only the turn's `TurnStarted` anchor and none of its run events. This
+/// achieves the same partition positionally, using only the already-public read API
+/// ([`EventStore::turns`] for the turn boundaries, [`EventStore::load_stream`] for the events),
+/// which is exactly what a whole-session [`EventStore::run_trace`] fold was missing: without it, a
+/// later turn that re-accepts an identical (same [`flux_lang::runtime::flow_key`]) plan inherits an
+/// earlier turn's completed statements and cassette cells — see `resurrect.rs`'s and `whatif.rs`'s
+/// module docs.
+pub(crate) fn turn_run_trace(
+    events: &EventStore,
+    session: &str,
+    turn_id: i64,
+) -> crate::Result<Vec<RunEvent>> {
+    let turns = events.turns(session)?;
+    let upper = turns
+        .iter()
+        .map(|t| t.turn_id)
+        .filter(|&id| id > turn_id)
+        .min();
+    let window: Vec<_> = events
+        .load_stream(session, None)?
+        .into_iter()
+        .filter(|e| e.global_seq >= turn_id && upper.is_none_or(|u| e.global_seq < u))
+        .collect();
+    Ok(flux_events::run_trace(&window))
+}
+
+/// [`turn_run_trace`] concatenated over several turns, in ascending `turn_id` order — turns never
+/// interleave within one stream, so this is exactly the trace a contiguous multi-turn prefix would
+/// have produced, without pulling in anything from a turn NOT in `turn_ids` (unlike filtering a
+/// whole-session trace by content-addressed `flow_key` set membership, which a repeated identical
+/// plan can leak through — D-181).
+pub(crate) fn turns_run_trace(
+    events: &EventStore,
+    session: &str,
+    turn_ids: &[i64],
+) -> crate::Result<Vec<RunEvent>> {
+    let mut out = Vec::new();
+    for &turn_id in turn_ids {
+        out.extend(turn_run_trace(events, session, turn_id)?);
+    }
+    Ok(out)
 }
 
 /// The truncated-cell divergence message — worded once, shared by every scope that refuses to serve

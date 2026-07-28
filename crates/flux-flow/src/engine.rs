@@ -266,7 +266,9 @@ impl FlowEngine {
         agent_loop: AgentLoopSpec,
     ) -> Result<Self> {
         let flow = Arc::new(flow);
-        let composites = Arc::new(DynamicComposites::load(executor.context().system.as_ref())?);
+        let composites = Arc::new(DynamicComposites::load(
+            executor.context().system().as_ref(),
+        )?);
         let opts = StageOptions {
             max_tokens,
             ..Default::default()
@@ -947,10 +949,16 @@ impl FlowEngine {
                 }
             }
         }
+        // C-100: probe the executor context's ACTIVE root, not the assembly-time `cwd` — after a
+        // worktree transition (`git_worktree_enter`), evidence signals present only in the
+        // worktree (e.g. a worktree-local Cargo.toml) must surface their groups. Assembly-time
+        // config/skills/roles loading deliberately stays fixed to `self.cwd` (entering a worktree
+        // changes the working directory, not the agent's authority).
+        let active_system = self.executor.context().system();
         let (advertised, surfaced) = surfaced_op_names(
             self.executor.registry(),
             &self.groups,
-            &self.cwd,
+            active_system.workspace().root(),
             &self.sticky_groups,
             session_id,
             &self.ambient_signals,
@@ -2106,7 +2114,7 @@ mod tests {
 
         async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResult::ok(ctx.system.read_file("value.txt").await?))
+            Ok(ToolResult::ok(ctx.system().read_file("value.txt").await?))
         }
     }
 
@@ -3255,6 +3263,107 @@ mod tests {
         assert!(
             error.to_string().contains("nope"),
             "expected the unknown name in the error: {error}"
+        );
+    }
+
+    /// C-100: the per-turn surfacing probe follows the executor context's ACTIVE root, not the
+    /// engine's assembly-time `cwd`. Assemble over a root without a `rust` marker, transition the
+    /// context's `WorkspaceContext` into a worktree that has a `Cargo.toml`, and the gated group
+    /// must surface on the next turn probe.
+    #[test]
+    fn per_turn_surfacing_probe_follows_the_transitioned_root() {
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let origin = std::env::temp_dir().join(format!(
+            "flux-c100-origin-{}-{sequence}",
+            std::process::id()
+        ));
+        let worktree = std::env::temp_dir().join(format!(
+            "flux-c100-worktree-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        // The signal exists ONLY in the worktree.
+        std::fs::write(worktree.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "toolchain.rust".into(),
+            description: "Rust toolchain operations.".into(),
+            tools: vec!["echo".into()],
+            surface_when: vec![flux_evidence::SignalMatch {
+                kind: flux_evidence::KIND_SIGNAL.into(),
+                signal: Some("rust".into()),
+            }],
+        }];
+        let system = Arc::new(System::new(Workspace::new(&origin).unwrap()));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system.clone()),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(Vec::<Vec<Chunk>>::new().into()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let engine = FlowEngine::assemble_with_loop(
+            provider,
+            executor,
+            events,
+            flow,
+            "test-model".into(),
+            "Use only observed evidence.".into(),
+            2_048,
+            5,
+            Vec::new(),
+            0,
+            groups,
+            origin.clone(),
+            AgentLoopSpec::default(),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let before = engine.surfaced_for_turn("session-wt", "hello", &mut sink);
+        assert!(
+            !before.contains("echo"),
+            "the rust-gated group must not surface from the origin root (no Cargo.toml)"
+        );
+
+        // Transition the executor context into the worktree (as `git_worktree_enter` does).
+        let active = engine.executor.context().system();
+        let rerooted = Arc::new(active.rerooted(&worktree).unwrap());
+        engine
+            .executor
+            .context()
+            .workspace_context()
+            .enter_worktree(
+                flux_runtime::WorktreeSession {
+                    original: active,
+                    base_commit: "deadbeef".into(),
+                    branch: "flux/worktree/test".into(),
+                    checkout: worktree.clone(),
+                    parent_dir: worktree.clone(),
+                    phase: flux_runtime::WorktreePhase::Active,
+                },
+                rerooted,
+            )
+            .unwrap();
+
+        let after = engine.surfaced_for_turn("session-wt", "hello", &mut sink);
+        assert!(
+            after.contains("echo"),
+            "after the worktree transition the per-turn probe must detect the worktree-local Cargo.toml"
+        );
+        assert_eq!(
+            engine.cwd, origin,
+            "the assembly-time cwd stays fixed — only the surfacing probe follows the active root"
         );
     }
 

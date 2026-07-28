@@ -574,8 +574,7 @@ fn days_to_ymd(mut d: u64) -> (u64, u64, u64) {
     d -= c1 * 365;
     let year = c400 * 400 + c100 * 100 + c4 * 4 + c1 + 1970;
     // d is now the 0-based day within the year.
-    // `u64::is_multiple_of` is stable only since 1.87; the plugins workspace MSRV is 1.85.
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let month_days: [u64; 12] = [
         31,
         if leap { 29 } else { 28 },

@@ -63,6 +63,27 @@ fn offline_client() -> Result<flux_sdk::Client> {
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// A scenario/fixture name must be exactly one plain path segment (D-185): reject an empty name,
+/// any path separator, and the `.`/`..` special components. Without the dot check, `flux record ..
+/// "x"` resolves `dir.join("..")` to the PARENT of the scenarios root and — because no
+/// `scenario.toml` exists there — the clobber guard never trips, so fixture files land outside
+/// `--dir` entirely. Shared by `run_record` and `discover_fixtures` (`flux test <name>`) so both
+/// commands reject exactly the same names.
+fn validate_fixture_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains(std::path::MAIN_SEPARATOR)
+    {
+        bail!(
+            "scenario name must be a single plain path segment (no separators, not `.`/`..`), \
+             got `{name}`"
+        );
+    }
+    Ok(())
+}
+
 /// `flux record <name> "<prompt>"` — run one live turn and write `<dir>/<name>/` as a fixture.
 pub(super) async fn run_record(
     name: &str,
@@ -70,9 +91,7 @@ pub(super) async fn run_record(
     dir: std::path::PathBuf,
     flags: &AgentFlags,
 ) -> Result<()> {
-    if name.is_empty() || name.contains('/') || name.contains(std::path::MAIN_SEPARATOR) {
-        bail!("scenario name must be a single directory segment, got `{name}`");
-    }
+    validate_fixture_name(name)?;
     let prompt = prompt.join(" ");
     let path = dir.join(name);
     let client = record_client(flags)?;
@@ -192,6 +211,7 @@ async fn check_fixture(client: &flux_sdk::Client, path: &std::path::Path) -> Opt
 /// carries a `scenario.toml` (so unrelated files in the scenarios directory are simply skipped).
 fn discover_fixtures(dir: &std::path::Path, name: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
     if let Some(name) = name {
+        validate_fixture_name(name)?;
         let path = dir.join(name);
         if !path.join("scenario.toml").exists() {
             bail!("no scenario fixture at {}", path.display());

@@ -105,6 +105,21 @@ pub struct SessionInfo {
     pub context: EventContext,
 }
 
+/// One source event queued for atomic re-import by [`EventBackend::copy_session_atomic`] (D-185):
+/// the event's payload/timestamp plus enough of its ORIGINAL identity (`old_global_seq`, `id`) to
+/// remap turn scoping against the freshly-minted destination ids — `old_global_seq` is the key a
+/// copied `TurnStarted` populates in the map, `turn_id` (also an old-store global_seq) is looked up
+/// in it.
+pub(crate) struct CopyEvent {
+    pub kind: EventKind,
+    pub schema_version: u32,
+    pub ts_ms: i64,
+    pub turn_id: Option<i64>,
+    pub old_global_seq: i64,
+    /// The source event's stable id, for a readable diagnostic on an unmappable `turn_id`.
+    pub id: String,
+}
+
 /// A one-line session summary for listings (`flux sessions` / the REPL `/sessions`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
@@ -161,13 +176,6 @@ trait EventBackend: Send + Sync {
         keep: &[String],
     ) -> Result<usize>;
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent>;
-    /// D-174: append preserving an EXPLICIT `ts_ms` instead of stamping `now()` — the event-export
-    /// primitive ([`EventStore::copy_session_to`]) re-appends a source log into a fresh store and
-    /// must keep every event's recorded wall-clock time, or a re-imported run's `turns()`/timeline
-    /// projections would show the moment of the *copy*, not the moment of the *recording*. Otherwise
-    /// identical semantics to [`append`](Self::append) (idempotent-id retry, registry touch).
-    /// `pub(crate)`-only via the trait's own crate-private visibility — not a public API surface.
-    fn append_at(&self, stream: &str, ev: NewEvent, ts_ms: i64) -> Result<StoredEvent>;
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>>;
     fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>>;
     fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>>;
@@ -189,6 +197,16 @@ trait EventBackend: Send + Sync {
     /// still-active ad-hoc stream keeps its FULL history. The ad-hoc complement of
     /// [`prune_older_than`](Self::prune_older_than), which covers only registry-listed sessions.
     fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize>;
+    /// Atomic counterpart to minting a destination session via `create_session_with_context` and
+    /// then repeatedly appending events one at a time (D-185): creates the session and appends
+    /// every event in `events` inside ONE transaction, so a mid-copy failure (an unmappable
+    /// `turn_id`, or any I/O error) leaves NOTHING listed in the registry — no half-copied session
+    /// for a retry to trip over. `info` supplies the copied session's model/context and its
+    /// ORIGINAL `created_at_ms`, which stamps both the destination's own `SessionStarted` and its
+    /// `streams` row — so a copied fixture's registry timestamps stay consistent with its (older)
+    /// events instead of showing the moment of the copy (`created_at` would otherwise be "now"
+    /// while `updated_at` trails behind at the events' true, older timestamps).
+    fn copy_session_atomic(&self, info: &SessionInfo, events: Vec<CopyEvent>) -> Result<String>;
 }
 
 /// The concrete storage backend behind an [`EventStore`]. The default build carries only the
@@ -478,13 +496,15 @@ impl EventStore {
     /// The event-export primitive behind the Test Kit's `Scenario::record` (D-174): a recorded run
     /// exports into a portable fixture directory, redacted-by-construction, safe to `git commit`.
     ///
-    /// The destination session is minted via
-    /// [`create_session_with_context`](Self::create_session_with_context) (which already appends its
-    /// own `SessionStarted`), so the source's own `SessionStarted` (always `stream_seq` 0) is
-    /// skipped — copying it too would duplicate the marker with a stale model/timestamp. Every other
-    /// event re-appends in its **original order**, keeping its original `ts_ms` (via the
-    /// crate-private [`EventBackend::append_at`]) so a re-imported run still projects the same
-    /// `turns()` timeline instead of collapsing to "now".
+    /// The destination session (its `SessionStarted`, `streams` row, and every other copied event)
+    /// is minted in ONE transaction via the crate-private
+    /// [`EventBackend::copy_session_atomic`] (D-185), so a mid-copy failure never leaves a
+    /// half-copied session listed in `dst`'s registry — nothing to notice or clean up on a retry.
+    /// The source's own `SessionStarted` (always `stream_seq` 0) is skipped — the destination mints
+    /// its own — and every other event re-appends in its **original order**, keeping its original
+    /// `ts_ms` so a re-imported run still projects the same `turns()` timeline instead of collapsing
+    /// to "now". The destination's `streams.created_at`/`updated_at` are likewise stamped from the
+    /// source session's own timestamps, not the moment of the copy.
     ///
     /// A `turn_id` (the `global_seq` of that turn's own `TurnStarted`) is backend-assigned and
     /// differs between the source and destination stores, so every turn-scoped event's `turn_id` is
@@ -493,35 +513,27 @@ impl EventStore {
     /// silently dropped or left dangling on a turn that doesn't exist in `dst`.
     ///
     /// Returns the new session's id.
+    ///
+    /// D-185: the actual mint-and-append work happens in ONE transaction, per backend, via
+    /// [`EventBackend::copy_session_atomic`] — this wrapper only reads the source (never fails
+    /// partway through a write) and hands the whole event list to the destination backend, so a
+    /// mid-copy failure never leaves a half-copied session listed in `dst`'s registry.
     pub fn copy_session_to(&self, session: &str, dst: &EventStore) -> Result<String> {
         let info = self.info(session)?;
-        let new_id = dst.create_session_with_context(&info.model, &info.context)?;
-        let mut turn_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        for ev in self.load_stream(session, None)? {
-            if matches!(ev.kind, EventKind::SessionStarted { .. }) {
-                continue;
-            }
-            let turn_id = match ev.turn_id {
-                Some(old) => Some(turn_map.get(&old).copied().ok_or_else(|| {
-                    Error::Other(format!(
-                        "copy_session_to: event {} in session {session} references turn {old}, \
-                         which was never copied (its TurnStarted must precede every event it scopes)",
-                        ev.id
-                    ))
-                })?),
-                None => None,
-            };
-            let mut new_ev = NewEvent::new(ev.kind.clone());
-            new_ev.schema_version = ev.schema_version;
-            if let Some(turn_id) = turn_id {
-                new_ev = new_ev.in_turn(turn_id);
-            }
-            let stored = dst.backend().append_at(&new_id, new_ev, ev.ts_ms)?;
-            if matches!(ev.kind, EventKind::TurnStarted { .. }) {
-                turn_map.insert(ev.global_seq, stored.global_seq);
-            }
-        }
-        Ok(new_id)
+        let events: Vec<CopyEvent> = self
+            .load_stream(session, None)?
+            .into_iter()
+            .filter(|ev| !matches!(ev.kind, EventKind::SessionStarted { .. }))
+            .map(|ev| CopyEvent {
+                kind: ev.kind,
+                schema_version: ev.schema_version,
+                ts_ms: ev.ts_ms,
+                turn_id: ev.turn_id,
+                old_global_seq: ev.global_seq,
+                id: ev.id,
+            })
+            .collect();
+        dst.backend().copy_session_atomic(&info, events)
     }
 
     // --- load ---------------------------------------------------------------
@@ -2142,7 +2154,7 @@ mod tests {
     // --- D-174: copy_session_to (event-export) ------------------------------
 
     /// `copy_session_to` must reproduce every projection byte-for-byte: `conversation`, `turns`
-    /// (including the ORIGINAL `started_at_ms`/`ended_at_ms`, preserved via `append_at`), `run_trace`
+    /// (including the ORIGINAL `started_at_ms`/`ended_at_ms`, preserved by the atomic copy), `run_trace`
     /// (cell order intact), and `cost_summary`. No duplicated `SessionStarted` (the destination's own
     /// `create_session_with_context` already mints one), so the total event count matches exactly.
     #[test]
@@ -2350,6 +2362,49 @@ mod tests {
             err.to_string().contains("999999"),
             "expected the unmappable turn_id in the diagnostic, got: {err}"
         );
+
+        // D-185 item 3: a copy that fails partway (the unmappable turn_id above) must leave NO
+        // trace in `dst`'s registry — no half-copied session for a retry to trip over. Before the
+        // atomic rewrite, `create_session_with_context` had already minted and listed the
+        // destination session by the time the loop hit the unmappable turn_id.
+        assert_eq!(
+            dst.list(10).unwrap(),
+            Vec::new(),
+            "a failed copy_session_to must leave no listed session in dst"
+        );
+    }
+
+    /// D-185 item 4: a copied fixture's registry timestamps must stay consistent with its (older)
+    /// copied events — never `created_at > updated_at`, which is what a destination `SessionStarted`
+    /// stamped `now_ms()` alongside events keeping their original, older `ts_ms` would produce.
+    #[test]
+    fn copy_session_to_keeps_registry_timestamps_consistent_with_copied_events() {
+        let src = EventStore::in_memory().unwrap();
+        let sid = src.create_session("model-a").unwrap();
+        let t1 = src.begin_turn(&sid, "hi", "model-a").unwrap();
+        src.record_message(&sid, &Message::user_text("hi")).unwrap();
+        src.end_turn(&sid, t1, "answered", 1, "hi back", None)
+            .unwrap();
+
+        // Simulate a fixture recorded well in the past: real recordings/replays span real
+        // wall-clock time, so the destination `created_at` (source's original) is always <= every
+        // copied event's `ts_ms`. Sleeping a couple ms is enough to prove the destination isn't
+        // simply stamping "now" over old events.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let dst = EventStore::in_memory().unwrap();
+        let new_id = src.copy_session_to(&sid, &dst).unwrap();
+        let info = dst.info(&new_id).unwrap();
+        assert!(
+            info.created_at_ms <= info.updated_at_ms,
+            "copied session must not show created_at ({}) > updated_at ({})",
+            info.created_at_ms,
+            info.updated_at_ms
+        );
+        // And the copy must not have raced ahead to "now": both timestamps are pinned to the
+        // source session's own (older) history, not the moment `copy_session_to` ran.
+        let src_info = src.info(&sid).unwrap();
+        assert_eq!(info.created_at_ms, src_info.created_at_ms);
     }
 
     /// The SQLite backend: every backend-agnostic conformance body against a fresh in-memory store

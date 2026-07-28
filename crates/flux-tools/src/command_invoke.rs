@@ -130,7 +130,8 @@ impl Tool for CommandInvokeTool {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: CommandInvokeInput = crate::parse_params(params, "command.invoke")?;
-        let root = ctx.system.workspace().root();
+        let system = ctx.system();
+        let root = system.workspace().root();
         match args.kind {
             InvokeKind::Command => invoke_command(root, &args.name, &args.arguments),
             InvokeKind::Skill => invoke_skill(root, &args.name),
