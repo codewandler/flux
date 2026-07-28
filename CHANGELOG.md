@@ -101,7 +101,7 @@ All notable changes to this project are documented in this file. The format is b
   Resurrect are named as core payoffs, platform-tier substrates and shipped Flux-Lang editor
   tooling are called out accurately, and the safety principle includes the opt-in OS sandbox below
   the guarded envelope.
-- **Dependency refresh across both workspaces.** All compatible bumps plus the incompatible bumps plus the incompatible
+- **Dependency refresh across both workspaces.** All compatible bumps plus the incompatible
   majors: `jsonschema` 0.47→0.49, `tokio-tungstenite` 0.29→0.30, `syn` 2→3, `base64` 0.22→0.23,
   `ulid` 1→3 (`Ulid::new()` → `Ulid::generate()` at the call sites), `slack-morphism` 2.22→2.24,
   `lopdf` 0.42→0.44. The ratatui/crossterm/ansi-to-tui pins tracking the git markdown-* crates
