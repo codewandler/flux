@@ -20,6 +20,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   comes with a one-line hint for fixing it. `--json` for scripts; the exit code fails only on real
   failures, never on warnings.
 
+- **Grade your agent's answers, not just its actions.** The SDK test-kit can now assert that a
+  text output satisfies a written criterion, judged by a model you name explicitly. The judge's
+  verdict is recorded on first run and replayed from disk after that — so `cargo test` stays
+  offline and free — and any change to the output or the criterion demands a fresh grade instead
+  of silently passing against a stale one.
 - **Send your runs to Grafana.** Builds with the `otel` feature can export a recorded run as
   OpenTelemetry traces and metrics — the turn, its plans, and every operation as spans with real
   latency, retry, and cost numbers, plus token/spend/error-rate metrics — to any OTLP collector.

@@ -121,6 +121,39 @@ FLUX_GOLDEN=update cargo test --features test-kit
 overwrite an existing fixture (recording against a live client). Without it, snapshots fail loudly
 and `record` refuses to clobber a committed golden.
 
+### Judge assertions — grading text output
+
+`replay`'s other assertions are exact: the plan matched, or it didn't. Some outputs don't have one
+canonical answer — a summary, an explanation, an email draft — so the Test Kit's complementary axis
+grades them with an LLM judge against a plain-English criterion:
+
+```rust
+let outcome = scenario.replay(&client).await?;
+
+let rubric = flux_sdk::test::Rubric::model("anthropic/claude-haiku-4.6");
+let verdict = scenario
+    .judge(&client, "the answer cites the refund policy", outcome.text(), &rubric)
+    .await?;
+verdict.assert_pass(); // panics with the judge's own rationale on a FAIL
+```
+
+The judge's own model call is a cassette citizen, exactly like an agent model call: its canonical
+(redacted) request is hashed and looked up in the fixture's `judge.jsonl` first. A hit is served
+straight from disk — the judge provider is never touched, so a plain `cargo test` run costs
+nothing, the same hermeticity `replay` itself proves. A miss (the first time this exact call is
+made, or the judged text/criterion/model changed since the last recording) is a **hard error** —
+never a silent live fall-through, and never a silent pass against a stale grade: a regressed answer
+changes the hash. `FLUX_GOLDEN=update` records a fresh verdict against a live judge provider, the
+same re-baseline convention as everything else in this crate:
+
+```bash
+FLUX_GOLDEN=update cargo test --features test-kit
+```
+
+`rubric.model` is always explicit — there is no default judge model, so no assertion can spend
+without the caller naming a target for it. `Scenario::assert_judge` is the panicking one-liner
+(`judge` + `Verdict::assert_pass` in one call) for tests that don't need the raw verdict.
+
 ## The fixture format
 
 A scenario is a plain directory — `tests/scenarios/<name>/`:
@@ -131,6 +164,7 @@ A scenario is a plain directory — `tests/scenarios/<name>/`:
 | `flow.db` | Companion flow store (empty), making the directory a valid `Storage::dir` |
 | `model.jsonl` | The model cassette: one line per model call, keyed by a hash of the canonical **redacted** request, with the recorded response chunks |
 | `plan.flux.snap` | Canonical Flux-Lang of every accepted plan — the snapshot baseline |
+| `judge.jsonl` | Only present once a scenario uses `Scenario::judge`/`assert_judge` — one committed verdict per distinct (criterion, target, judge model), same keyed-by-hash shape as `model.jsonl`, accumulated additively |
 | `scenario.toml` | Manifest: scenario name, flux version, recording time, input, model, cassette cap, redaction marker — drift diagnostics and `check`'s re-drive input |
 
 Because it is a real `Storage::dir` store, the same directory opens in the
@@ -318,7 +352,9 @@ which must not be a side effect of asking what sessions exist. See the
 - **Redactor parity matters.** Fixtures record redacted cells; the fixture pins its redaction
   marker so a drifted redactor config is a loud diagnostic, not a silent mismatch.
 - **This is not an eval service.** The Lab tests *your* agent, local-first, no telemetry, no
-  LLM-judged scoring — and test doubles are ordinary registered ops, not a mocking framework.
+  multi-model bake-offs or dashboards — test doubles are ordinary registered ops, not a mocking
+  framework. `Scenario::judge` is a narrow, per-fixture rubric assertion, not a corpus-wide eval
+  harness (the internal `flux-eval` crate covers that ground for flux's own benchmark loop).
 
 ## Related docs
 

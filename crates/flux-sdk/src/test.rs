@@ -15,6 +15,12 @@
 //! MODEL too, so a clean run costs $0 and any drift — a different plan, or a different world —
 //! surfaces as a classified [`Report`]). [`Outcome`] carries `replay`'s assertions.
 //!
+//! (D-195) A fifth, complementary axis: [`Scenario::judge`]/[`Scenario::assert_judge`] grade a
+//! TEXT output against a natural-language [`Rubric`] with an LLM judge, for outputs that don't
+//! have one canonical answer the way a plan does. The judge's own model call flows through the
+//! SAME kind of cassette as an agent model call — see its doc comment for the record/replay
+//! contract.
+//!
 //! ## Fixture format
 //!
 //! `tests/scenarios/<name>/` is a plain [`Storage::dir`] (`events.db` + an empty `flow.db` — also
@@ -23,6 +29,10 @@
 //!   before it is ever written to disk.
 //! - `plan.flux.snap` — the canonical Flux-Lang text of every accepted plan in the recorded turn
 //!   (joined by a `---` marker; v1 scenarios are single-turn, so ordinarily just one).
+//! - `judge.jsonl` (D-195, only present once a scenario uses [`Scenario::judge`]) — one JSON line
+//!   per committed judge verdict, same [`ModelCallRecord`] shape as `model.jsonl`; accumulates
+//!   additively rather than being rewritten wholesale, since many distinct judge assertions across
+//!   many tests can share one fixture.
 //! - `scenario.toml` — a manifest (see [`Manifest`]): what was recorded, when, and with what
 //!   cassette settings — drift diagnostics, and (from D-176) `check()`'s re-drive input.
 //!
@@ -37,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use flux_core::{Chunk, PricingTable, Result};
+use flux_core::{Chunk, ContentBlock, PricingTable, Result};
 use flux_events::{DiffLineKind, DiffRow, EventContext, EventStore, RunDiff};
 use flux_flow::cassette::{CassetteScope, FrozenTape, RecordScope, ReplayTape};
 use flux_flow::state::FlowStore;
@@ -319,6 +329,42 @@ fn write_model_calls(dir: &Path, records: &[ModelCallRecord]) -> Result<()> {
     Ok(())
 }
 
+/// Read back a fixture's `judge.jsonl` (D-195) — every judge verdict ever committed for this
+/// fixture, keyed by the canonical request hash [`Scenario::judge`] looks a call up against.
+/// Reuses [`ModelCallRecord`] wholesale: an LLM-judge call IS a model call, recorded the same way.
+fn read_judge_calls(dir: &Path) -> Result<Vec<ModelCallRecord>> {
+    let path = dir.join("judge.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str(l)
+                .map_err(|e| flux_core::Error::Other(format!("judge.jsonl: invalid record: {e}")))
+        })
+        .collect()
+}
+
+/// Append one freshly-recorded judge call to `judge.jsonl` — additive by design: unlike
+/// `model.jsonl` (rewritten wholesale by one `Scenario::record`), a fixture's judge cassette
+/// accumulates one entry per DISTINCT (criterion, target, model) ever graded against it, since
+/// many different `assert_judge` calls across many tests can share one fixture. An entry
+/// superseded by an intentional re-grade (`FLUX_GOLDEN=update` against a changed target) is simply
+/// never looked up again — harmless clutter, not pruned.
+fn append_judge_call(dir: &Path, record: ModelCallRecord) -> Result<()> {
+    let mut records = read_judge_calls(dir)?;
+    records.push(record);
+    let mut text = String::new();
+    for r in &records {
+        text.push_str(&serde_json::to_string(r)?);
+        text.push('\n');
+    }
+    std::fs::write(dir.join("judge.jsonl"), text)?;
+    Ok(())
+}
+
 /// The canonical Flux-Lang text of every accepted plan attempt across `session`'s turns, joined by
 /// a `---` marker — the single source of truth `plan.flux.snap` is written from and compared
 /// against (used identically at record time and at replay/assertion time).
@@ -370,6 +416,109 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// --- judge assertions (D-195) -------------------------------------------------
+
+/// Explicit configuration for a [`Scenario::judge`]/[`Scenario::assert_judge`] call — the judge
+/// model is always named here, per assertion, so no call can spend without the caller choosing a
+/// target for it. `#[non_exhaustive]`: a future knob (temperature, a stricter system prompt, …)
+/// grows this struct, never a new constructor.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Rubric {
+    /// The `provider/model` spec the judge call is made against (e.g. `"mock"`,
+    /// `"anthropic/claude-haiku-4.6"`) — there is no default; every rubric names one.
+    pub model: String,
+}
+
+impl Rubric {
+    /// A rubric graded by `model` — the only field a judge call needs.
+    pub fn model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+}
+
+/// The graded result of a judge assertion: pass/fail plus the judge's own rationale — surfaced on
+/// failure so a red assertion says *why*, not just that it failed.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Verdict {
+    /// Whether the judged text satisfied the criterion.
+    pub passed: bool,
+    /// The judge's own explanation — shown in [`assert_pass`](Self::assert_pass)'s panic message.
+    pub rationale: String,
+}
+
+impl Verdict {
+    /// Panics with the judge's rationale if [`passed`](Self::passed) is false.
+    pub fn assert_pass(&self) {
+        assert!(self.passed, "judge verdict: FAIL — {}", self.rationale);
+    }
+}
+
+/// The judge's fixed system prompt — stable text keeps the canonical request (and therefore its
+/// hash) identical across runs, so a committed verdict matches on every replay of the same
+/// criterion/target/model.
+const JUDGE_SYSTEM_PROMPT: &str = "You are a strict grader for an automated test suite. You will \
+                                    be given one grading criterion and one piece of text. Decide \
+                                    whether the text satisfies the criterion. Respond with \
+                                    EXACTLY one JSON object and nothing else, of the shape \
+                                    {\"passed\": true|false, \"rationale\": \"<one short \
+                                    sentence>\"}.";
+
+/// Build the judge's request, deterministically, from `criterion` + `target` — the same shape
+/// every time, so the same call always hashes the same.
+fn judge_request(model: &str, criterion: &str, target: &str) -> Request {
+    let prompt = format!(
+        "Criterion:\n{criterion}\n\nText under test:\n{target}\n\nDoes the text satisfy the \
+         criterion? Reply with the JSON verdict only."
+    );
+    Request::new(model.to_string(), prompt)
+        .with_system(JUDGE_SYSTEM_PROMPT.to_string())
+        .with_max_tokens(512)
+}
+
+/// Concatenate every text-bearing chunk in a completed response. The judge's replies are plain
+/// text, never tool calls, but a codec may stream text as `TextDelta`s or as one assembled
+/// `Block(ContentBlock::Text)` — collect whichever form appears.
+fn chunks_to_text(chunks: &[Chunk]) -> String {
+    let mut out = String::new();
+    for chunk in chunks {
+        match chunk {
+            Chunk::TextDelta(t) => out.push_str(t),
+            Chunk::Block(ContentBlock::Text { text }) => out.push_str(text),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parse a judge's raw reply into a [`Verdict`] — lenient about surrounding prose (some models
+/// wrap the JSON in a code fence or a sentence despite the system prompt): scans for the first
+/// `{...}` object rather than requiring the whole reply to be bare JSON.
+fn parse_verdict(text: &str) -> Result<Verdict> {
+    #[derive(Deserialize)]
+    struct RawVerdict {
+        passed: bool,
+        #[serde(default)]
+        rationale: String,
+    }
+    let slice = match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if end >= start => &text[start..=end],
+        _ => text,
+    };
+    let raw: RawVerdict = serde_json::from_str(slice).map_err(|e| {
+        flux_core::Error::Other(format!(
+            "judge: could not parse a verdict JSON object from the reply: {e}\nreply: {text:?}"
+        ))
+    })?;
+    Ok(Verdict {
+        passed: raw.passed,
+        rationale: raw.rationale,
+    })
 }
 
 // --- Scenario ----------------------------------------------------------------
@@ -734,6 +883,98 @@ impl Scenario {
             model_live: serving.live(),
             texts,
         })
+    }
+
+    /// **Judge door (D-195).** Grade `target` against `criterion` with an LLM judge — the
+    /// complementary axis to [`replay`](Self::replay)'s exact/deterministic plan assertions, for
+    /// TEXT outputs that don't have one canonical answer.
+    ///
+    /// The judge's own model call flows through this fixture's cassette exactly like an agent
+    /// model call: its canonical (redacted) request is hashed and looked up in `judge.jsonl`
+    /// first. A HIT is served straight from disk — `client`'s provider is never touched, so a
+    /// plain `cargo test` replay costs nothing (the same hermeticity proof `replay` uses: pair
+    /// `client` with a provider that panics if ever invoked, and show it never panics). A MISS
+    /// (the first time this exact call is made, or `criterion`/`target`/`rubric.model` changed
+    /// since the last recording) is a **hard error** unless `FLUX_GOLDEN=update` is set — never a
+    /// silent live fall-through, and never a silent pass against a stale grade: a regressed agent
+    /// answer changes the hash, so the next plain call fails loudly demanding a re-record instead
+    /// of quietly reusing yesterday's verdict. With `FLUX_GOLDEN=update`, the call is made live
+    /// against `client`'s real provider (spends once) and the fresh verdict is committed to
+    /// `judge.jsonl`.
+    ///
+    /// `rubric.model` is always explicit — there is no default judge model, so no assertion can
+    /// spend without the caller naming a target for it.
+    pub async fn judge(
+        &self,
+        client: &Client,
+        criterion: &str,
+        target: &str,
+        rubric: &Rubric,
+    ) -> Result<Verdict> {
+        let redactor = client.engine.executor.context().redactor.clone();
+        let req = judge_request(&rubric.model, criterion, target);
+        let (canonical, hash) = redact_and_hash_request(&req, &redactor)?;
+
+        if let Some(record) = read_judge_calls(&self.source_dir)?
+            .into_iter()
+            .find(|r| r.hash == hash)
+        {
+            return parse_verdict(&chunks_to_text(&record.chunks));
+        }
+
+        let updating = std::env::var("FLUX_GOLDEN").as_deref() == Ok("update");
+        if !updating {
+            return Err(flux_core::Error::Other(format!(
+                "no recorded judge verdict for this call in {} — the judged text, criterion, or \
+                 rubric model changed (or this is the first run); set FLUX_GOLDEN=update to \
+                 record a fresh verdict against a live judge provider",
+                self.source_dir.join("judge.jsonl").display()
+            )));
+        }
+
+        use futures::stream::TryStreamExt;
+        let raw_chunks: Vec<Chunk> = client
+            .assembly
+            .provider
+            .stream(req)
+            .await?
+            .try_collect()
+            .await?;
+        let chunks = raw_chunks
+            .iter()
+            .map(|c| redact_chunk(c, &redactor))
+            .collect::<Result<Vec<_>>>()?;
+
+        append_judge_call(
+            &self.source_dir,
+            ModelCallRecord {
+                v: 1,
+                hash,
+                model: rubric.model.clone(),
+                request: canonical,
+                chunks: chunks.clone(),
+            },
+        )?;
+
+        parse_verdict(&chunks_to_text(&chunks))
+    }
+
+    /// Panicking convenience over [`judge`](Self::judge): panics on an IO/cache-miss error (with
+    /// the same re-record hint), and panics with the judge's own rationale if the verdict itself
+    /// is a FAIL ([`Verdict::assert_pass`]).
+    pub async fn assert_judge(
+        &self,
+        client: &Client,
+        criterion: &str,
+        target: &str,
+        rubric: &Rubric,
+    ) -> Verdict {
+        let verdict = self
+            .judge(client, criterion, target, rubric)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        verdict.assert_pass();
+        verdict
     }
 }
 

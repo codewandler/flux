@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **D-195: judge assertions in the SDK test-kit — semantic grading that stays hermetic.**
+  `Scenario` (feature `test-kit`) gains `judge`/`assert_judge`: rubric + target text → a graded
+  `Verdict` with its rationale surfaced on failure. The judge's own model call is deterministic
+  (fixed prompt template), hashed with the existing `redact_and_hash_request`, and served from a
+  new additive `judge.jsonl` fixture: a hash hit replays from disk without constructing a provider
+  (proven with a panicking `NeverProvider`), a miss is a hard error naming `FLUX_GOLDEN=update` —
+  under which the call spends once and commits. A changed target, criterion, or judge model
+  changes the hash, so a stale verdict can never silently pass — staleness is caught by
+  construction. `Rubric` requires an explicit `model` (no hidden default spend), is
+  `#[non_exhaustive]`. Failing-first landed as compile-first: the test file was written against
+  the not-yet-existing API. Docs: "Judge assertions" section in the agent-lab SDK docs, and the
+  v1 limits reworded honestly (scoped to "not a corpus-wide eval harness").
+
 - **C-129: OpenTelemetry export as a projection over the event log.** A new `otel` feature on
   `codewandler-flux-events` renders a recorded run as OTLP traces and metrics: turn → plan →
   per-op spans (plan windows from `PlanAttempted` boundaries; model-call spans carry the real
