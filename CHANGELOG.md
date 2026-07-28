@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-28
+
 ### Added
 
 - **C-160: an NDJSON protocol — drive and observe a turn over stdio without the SDK.**

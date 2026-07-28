@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-28
+
 ### New
 
 - **Pipe flux into anything.** `flux run --stream-json` turns a run into one JSON object per line
