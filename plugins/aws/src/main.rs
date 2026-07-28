@@ -1465,8 +1465,7 @@ fn parse_rfc3339_to_ms(v: &str) -> Result<u64, String> {
 
 fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
     // Cumulative days from Jan 1 1970.
-    // `u64::is_multiple_of` is stable only since 1.87; the plugins workspace MSRV is 1.85.
-    let leap = |y: u64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let days_in_year = |y: u64| if leap(y) { 366 } else { 365 };
     let days_in_month = |y: u64, m: u64| match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
