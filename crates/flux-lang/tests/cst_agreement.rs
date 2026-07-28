@@ -77,6 +77,13 @@ const LEGACY_FIXTURES: &[LegacyFixture] = &[
     },
 ];
 
+/// Shipped fixtures authored *after* the CST cutover (L-80). The legacy `parse_program` no longer
+/// exists, so there is no independent oracle to freeze an `ast_sha256` against — pinning one from
+/// the current parser would only assert that the parser agrees with itself. They are held to every
+/// other contract in this file (losslessness, no ERROR nodes, exact token/comment ranges, and
+/// format→parse survival of every executable AST).
+const POST_CUTOVER_FIXTURES: &[&str] = &["examples/bitcoin-price.flux"];
+
 fn ast_hash(module: &Module) -> String {
     let mut hash = Sha256::new();
     match module {
@@ -304,6 +311,7 @@ fn shipped_flux_corpus_agreement() {
     ];
     let mut scanned = Vec::new();
     let mut accepted = Vec::new();
+    let mut post_cutover = Vec::new();
     for dir in dirs {
         for entry in std::fs::read_dir(&dir).expect("Flux fixture directory") {
             let path = entry.expect("dir entry").path();
@@ -327,12 +335,25 @@ fn shipped_flux_corpus_agreement() {
             if path.file_name().and_then(|name| name.to_str()) == Some("call-routing.flux") {
                 continue;
             }
+            // Fixtures written after the CST cutover have no legacy `parse_program` to freeze
+            // evidence from, so they carry no `ast_sha256`. They still get the losslessness,
+            // ERROR-free, range and format→parse contracts below via `assert_agreement(_, None)`.
+            if POST_CUTOVER_FIXTURES.contains(&relative.as_str()) {
+                post_cutover.push(relative);
+                continue;
+            }
             accepted.push(relative);
         }
     }
     scanned.sort();
     accepted.sort();
-    assert_eq!(scanned.len(), 16, "the shipped Flux fixture census changed");
+    post_cutover.sort();
+    assert_eq!(scanned.len(), 17, "the shipped Flux fixture census changed");
+    assert_eq!(
+        post_cutover.len(),
+        POST_CUTOVER_FIXTURES.len(),
+        "a post-cutover fixture in the list is missing from the scanned directories"
+    );
     let mut frozen_paths: Vec<_> = LEGACY_FIXTURES
         .iter()
         .map(|fixture| fixture.path.to_string())
@@ -345,6 +366,10 @@ fn shipped_flux_corpus_agreement() {
     for fixture in LEGACY_FIXTURES {
         let src = std::fs::read_to_string(repo.join(fixture.path)).expect("read frozen fixture");
         assert_agreement(&src, fixture.path, Some(fixture));
+    }
+    for path in POST_CUTOVER_FIXTURES {
+        let src = std::fs::read_to_string(repo.join(path)).expect("read post-cutover fixture");
+        assert_agreement(&src, path, None);
     }
 }
 
