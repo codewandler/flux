@@ -464,9 +464,41 @@ descriptive rather than enforced. The HTTP path by contrast shows the host a met
 URL from a reference the plugin never sees, injects the secret itself, and runs the egress guard.
 
 **Consequence, not a reversal.** The answer is to narrow the process gate
-([C-90](../stories/C-90-process-capability-argument-constraints.md)), not to rewrite the transport. A native HTTP
-path stays open for the in-cluster service-account-token case, as a hybrid beside `kubectl` — never as a second
-way to do the same thing.
+([C-90](../stories/C-90-process-capability-argument-constraints.md), shipped — see the next record), not to
+rewrite the transport. A native HTTP path stays open for the in-cluster service-account-token case, as a hybrid
+beside `kubectl` — never as a second way to do the same thing.
+
+## Decision record — process grants are argv prefixes, per-capability and per-operation (C-90)
+
+The narrowing promised above. The `process` capability's entries are now whitespace-separated **argv
+prefixes** matched exactly, token by token, against the leading tokens of every `process.run`/`process.spawn`
+callback: a single-token entry (`"kubectl"`) keeps today's program-only behavior (existing manifests are wire-
+and semantics-compatible), while `"kubectl get"` or `"kubectl rollout restart"` pins the leading subcommand
+tokens. One matcher (`flux_plugin::process_grant_allows`) serves every enforcement point.
+
+- **Grammar: exact tokens, no globs.** A grant is an auditable literal that projects verbatim as the
+  `process.exec` authority resource, so the approval prompt shows exactly what was allowed
+  (`process.exec → kubectl get`, not `kubectl`). Trailing flags are deliberately unconstrained: subcommands are
+  where CLI semantics change (`kubectl get -o jsonpath` is still a get; `kubectl patch` is a different verb),
+  and a flag allow-list would ossify. Plugins must pass subcommand-first argv (both CLI plugins already do).
+- **Two levels, intersection applies.** The manifest-level grant gates in `SystemHostCaps`; an optional
+  additive `OperationSpec.process` narrows per operation, enforced at callback time by a wrapper in front of
+  the shared caps — so a per-op declaration can only subtract, never widen. Manifest validation rejects a
+  per-op entry outside the manifest grant at load time (a dead op is an authoring error, not a runtime
+  surprise). The op's projected authority names the per-op entries when present, keeping the disclosed and the
+  enforced authority one declaration.
+- **`kubernetes` declares exactly the verbs its handlers issue** — reads narrow to
+  `get`/`logs`/`config view`/`version`, mutations name `scale`/`rollout restart`/`exec`/`port-forward`
+  explicitly, and destructive verbs (`delete`/`apply`/`patch`) are simply absent from the manifest. (The story
+  sketched `describe`/`top` as read verbs; the plugin never runs them, and granting unused verbs would widen
+  the ceiling for nothing.) The portforward `list`/`stop` ops declare `kubectl port-forward` as their ceiling
+  even though they only drive the host's managed-process registry, which is not argv-gated.
+- **`aws` follows the same pattern** and comes out structurally read-only: its grant is the exact set of
+  `aws <service> <describe-*/list-*/get-*/filter-log-events/start-query>` pairs its handlers issue — no
+  mutation verb is granted at all.
+- **Threat model, stated plainly.** Plugin binaries remain trusted dependencies; this narrows blast radius and
+  makes the process capability as legible to the envelope (and the approver) as the HTTP one — an op declared
+  read-only is now structurally unable to mutate, instead of `Risk::Read` being advisory.
 
 ## Accepted residuals
 

@@ -104,7 +104,7 @@ All requested via the `host-kit` `Host`/`GuestHost`; serviced by `SystemHostCaps
 | `config` | `config` (declared names) | Resolve a declared **non-secret** config value (e.g. jira's `cloud_id`); a secret-classified env key is refused. |
 | `credential` | `credential: true` | Materialize a credential **reference** into its raw value for in-band-auth raw-socket protocols (e.g. Postgres SCRAM); redactor-registered, never returned via any discovery/endpoint path. |
 | `http.do` | `http: true` + `http_hosts` + SSRF guard | HTTP method/headers/body; **auth injected by the host** per `AuthScheme`; binary via `body_b64` (request) / `response_binary` → `body_b64` (response, 16 MiB cap). Private hosts require `private_hosts` plus config. |
-| `process.run` | `process` (argv[0] allow-list) | Run a subprocess to completion; captured, capped output. |
+| `process.run` | `process` (argv-**prefix** allow-list, C-90) | Run a subprocess to completion; captured, capped output. |
 | `process.spawn`/`read`/`status`/`kill` | `process` | Start/drain/poll/stop a long-lived host-managed child (e.g. `kubectl port-forward`). |
 | `conn.dial`/`read`/`write`/`close` | `conn` (`tcp:host:port` / `unix:/path` allow-list, SSRF-guarded) | A raw TCP/Unix byte stream for non-HTTP protocols (SQL wire, Docker socket, AMI). |
 | `conn.authenticate` | `conn` (an already-dialed `conn_id`) + a declared auth method or endpoint credential ref | **Host-terminated** in-band auth (D-31): the host speaks the startup + SCRAM/MD5 handshake itself and hands back a post-auth connection — the plugin never receives the password. |
@@ -112,6 +112,17 @@ All requested via the `host-kit` `Host`/`GuestHost`; serviced by `SystemHostCaps
 | `fs.read` | `fs` (`FsReadScope` path allow-list) | Read a **host** file outside the workspace jail matching a declared scope; `..` traversal rejected, size-capped; `secret: true` scopes are redactor-registered. |
 | `blob.put`/`get`/`info` | `blob: true` | A scratch blob store (SHA-256 ref) so file up/downloads aren't inlined as base64. |
 | `contribute` | (datasource declared) | Add `flux-datasource` `Record`s to the D-07 index from list ops. |
+
+**Process grants are argv prefixes (C-90).** Each `process` entry is a whitespace-separated token
+sequence matched exactly against the leading argv tokens of every `process.run`/`process.spawn`
+call: `"kubectl"` grants the program with any arguments, `"kubectl get"` pins the leading
+subcommand so a read-shaped grant is structurally unable to `kubectl delete`. Declare **exactly the
+verbs your handlers issue** (subcommand-first argv; trailing flags are unconstrained), and narrow
+each operation to its own verbs with the `with_process(op, &["kubectl get"])` combinator — the
+narrowing is enforced at callback time on top of the manifest gate (intersection; it can never
+widen) and becomes the op's disclosed `process.exec` authority in approval prompts and audit. A
+per-op entry outside the manifest grant is rejected at load time. See the C-90 decision record in
+`docs/designs/integration-plugins.md`; `kubernetes` and `aws` are the reference declarations.
 
 There is deliberately **no `endpoint` URL-handback capability** (retired, D-32): endpoints are
 declared in the manifest (`PluginBuilder::endpoint(EndpointSpec)`) and addressed **by reference** —

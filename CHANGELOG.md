@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-90: plugin process capabilities constrain arguments, not just the program.** A manifest's
+  `process` grant entries are now argv **prefixes** matched token-by-token
+  (`flux_plugin::process_grant_allows`): `"kubectl"` keeps today's program-only behavior,
+  `"kubectl get"` pins the leading subcommand so a read-shaped grant is structurally unable to
+  `kubectl delete` — enforced on both `process.run` and `process.spawn` in `SystemHostCaps`.
+  Additive per-operation narrowing via the new optional `OperationSpec.process` field (host-kit
+  combinator `with_process`): enforced at callback time in front of the shared caps (intersection
+  — it can never widen), validated against the manifest grant at load time, and projected as the
+  op's `process.exec` authority so approval prompts and audit show the narrowed resource
+  (`process.exec → kubectl get`). The `kubernetes` plugin now grants exactly the verbs its
+  handlers issue (reads: `get`/`logs`/`config view`/`version`; mutations named explicitly:
+  `scale`/`rollout restart`/`exec`/`port-forward`; no `delete`/`apply`/`patch` at all) and narrows
+  every op; `aws` follows and comes out structurally read-only. Wire-compatible: absent
+  constraints keep today's behavior, existing manifests load unchanged. Decision record in
+  [integration-plugins](docs/designs/integration-plugins.md).
+
 - **C-102…C-110: TUI polish — 5 UX + 5 UI improvements** (epic
   [tui-polish](docs/designs/tui-polish.md)):
   - **Ctrl-T mouse-capture toggle (C-105):** terminal-native text selection/copy works while

@@ -41,8 +41,28 @@ impl PluginHandler for Caps {
                     risk: None,
                     ..OperationSpec::default()
                 },
+                OperationSpec {
+                    name: "runproc".into(),
+                    description:
+                        "C-90 probe: pass caller argv straight to the host `process.run` capability"
+                            .into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"argv": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["argv"]
+                    }),
+                    effects: Vec::new(),
+                    risk: None,
+                    // Per-operation narrowing (C-90): THIS op may only run `printf ok …`, even
+                    // though the manifest-level grant below admits any `printf …`.
+                    process: vec!["printf ok".into()],
+                    ..OperationSpec::default()
+                },
             ],
-            capabilities: PluginCapabilities::default(),
+            capabilities: PluginCapabilities {
+                process: vec!["printf".into()],
+                ..PluginCapabilities::default()
+            },
             ..PluginManifest::default()
         }
     }
@@ -59,6 +79,10 @@ impl PluginHandler for Caps {
                 // Call back into the host; the host services `ping` and returns a result.
                 let reply = host.host_call("ping", json!({ "echo": msg }))?;
                 Ok(json!({ "host_said": reply }))
+            }
+            "runproc" => {
+                let argv = input.get("argv").cloned().unwrap_or(Value::Null);
+                host.host_call("process.run", json!({ "argv": argv }))
             }
             "readenv" => {
                 // Read this plugin process's OWN environment directly (NOT via the host). Under the

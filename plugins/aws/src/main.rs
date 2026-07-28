@@ -150,7 +150,25 @@ struct CloudWatchMetricsInput {
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("aws", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
-            process: vec!["aws".into()],
+            // C-90: argv-prefix grants — exactly the read-only `aws <service> <operation>`
+            // pairs this plugin's handlers issue, so the manifest is structurally unable to
+            // mutate (no create/delete/put/terminate verb is granted at all). Each op
+            // additionally narrows to its own pairs below (`with_process`).
+            process: vec![
+                "aws sts get-caller-identity".into(),
+                "aws ec2 describe-instances".into(),
+                "aws eks list-clusters".into(),
+                "aws eks describe-cluster".into(),
+                "aws rds describe-db-clusters".into(),
+                "aws rds describe-db-instances".into(),
+                "aws s3api list-buckets".into(),
+                "aws s3api list-objects-v2".into(),
+                "aws logs describe-log-groups".into(),
+                "aws logs filter-log-events".into(),
+                "aws logs start-query".into(),
+                "aws logs get-query-results".into(),
+                "aws cloudwatch get-metric-data".into(),
+            ],
             secrets: vec![
                 "AWS_ACCESS_KEY_ID".into(),
                 "AWS_SECRET_ACCESS_KEY".into(),
@@ -165,86 +183,121 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // --- connectivity / setup ---------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<TestInput>(
                 "aws.test",
                 "Verify AWS connectivity and credential validity via STS GetCallerIdentity.",
             ),
+                &["aws sts get-caller-identity"],
+            ),
             aws_test,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InspectInput>(
                 "aws.inspect",
                 "Inspect non-secret AWS environment configuration and credential presence \
                  (reports which credentials are set, effective region, no secret values returned).",
             ),
+                // `inspect` runs no CLI at all (it reports credential presence from host
+                // secrets); the narrowing is its disclosed ceiling, matching `aws.test`'s.
+                &["aws sts get-caller-identity"],
+            ),
             aws_inspect,
         )
         // --- EC2 ---------------------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<Ec2InstancesInput>(
                 "aws.ec2.instances",
                 "List EC2 instances with Name-tag wildcard and state filters.",
+            ),
+                &["aws ec2 describe-instances"],
             ),
             ec2_instances,
         )
         // --- EKS ---------------------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<EksClustersInput>(
                 "aws.eks.clusters",
                 "List and describe EKS clusters (version, status, endpoint, VPC).",
+            ),
+                &["aws eks list-clusters", "aws eks describe-cluster"],
             ),
             eks_clusters,
         )
         // --- RDS ---------------------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<RdsInstancesInput>(
                 "aws.rds.instances",
                 "List RDS/Aurora clusters (writer/reader endpoints, members) and database instances.",
+            ),
+                &["aws rds describe-db-clusters", "aws rds describe-db-instances"],
             ),
             rds_instances,
         )
         // --- S3 ----------------------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<S3BucketsInput>(
                 "aws.s3.buckets",
                 "List S3 buckets, optionally filtered by name prefix.",
             ),
+                &["aws s3api list-buckets"],
+            ),
             s3_buckets,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<S3ObjectsInput>(
                 "aws.s3.objects",
                 "List S3 objects under a prefix with continuation-token pagination.",
+            ),
+                &["aws s3api list-objects-v2"],
             ),
             s3_objects,
         )
         // --- CloudWatch Logs ---------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<LogsGroupsInput>(
                 "aws.logs.groups",
                 "List CloudWatch log groups with retention and size.",
             ),
+                &["aws logs describe-log-groups"],
+            ),
             logs_groups,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<LogsTailInput>(
                 "aws.logs.tail",
                 "Read recent events from a CloudWatch log group (FilterLogEvents over a time window).",
             ),
+                &["aws logs filter-log-events"],
+            ),
             logs_tail,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<LogsQueryInput>(
                 "aws.logs.query",
                 "Run a bounded CloudWatch Logs Insights query and wait for its results.",
+            ),
+                &["aws logs start-query", "aws logs get-query-results"],
             ),
             logs_query,
         )
         // --- CloudWatch Metrics ------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<CloudWatchMetricsInput>(
                 "aws.cloudwatch.metrics",
                 "Fetch one CloudWatch metric series (GetMetricData) over a time window.",
+            ),
+                &["aws cloudwatch get-metric-data"],
             ),
             cloudwatch_metrics,
         )
@@ -1865,7 +1918,39 @@ mod tests {
     fn manifest_declares_11_ops_and_aws_capability() {
         let m = manifest_builder().build().manifest();
         assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 11);
-        assert_eq!(m.capabilities.process, vec!["aws".to_string()]);
+        // C-90: the manifest grants read-only `aws <service> <operation>` argv prefixes, not a
+        // blanket `aws` — no mutation verb is granted, and every op narrows to its own pairs.
+        assert!(m
+            .capabilities
+            .process
+            .contains(&"aws sts get-caller-identity".to_string()));
+        assert!(
+            !m.capabilities.process.iter().any(|p| p == "aws"),
+            "the blanket `aws` grant must be gone"
+        );
+        for op in m.operations.iter().filter(|o| !o.internal) {
+            assert!(
+                !op.process.is_empty(),
+                "{} must declare a per-op process narrowing",
+                op.name
+            );
+            for prefix in &op.process {
+                assert!(
+                    m.capabilities.process.contains(prefix),
+                    "{}: `{prefix}` must sit inside the manifest grant",
+                    op.name
+                );
+                assert!(
+                    prefix.contains(" describe-")
+                        || prefix.contains(" list-")
+                        || prefix.contains(" get-")
+                        || prefix.contains(" filter-log-events")
+                        || prefix.contains(" start-query"),
+                    "{}: `{prefix}` must be a read-shaped verb",
+                    op.name
+                );
+            }
+        }
         assert!(m
             .capabilities
             .secrets

@@ -29,7 +29,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-- [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 - [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
 
 ### TUI polish — 5 UX + 5 UI improvements
@@ -265,6 +264,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-87 — Event-store & shared-engine growth/correctness (prune, idempotency, projections, eviction)](C-87-event-store-growth-correctness.md) · Core · Growth/correctness (Medium) — durable facts pruned, idempotency race, unbounded projections, per-turn evidence clone
 - [C-88 — Decompose god-functions and de-duplicate helpers trapped in binary crates](C-88-quality-godfunctions-dedup.md) · Core · Quality (Low) — build_agent_with (417 LOC) + exec_body (~1520 LOC); humanizers/dispatch/temp-dir duplicated; stringify error idiom
 - [C-89 — Let process access carry network and write effects in the authority contract](C-89-process-authority-carrier.md) · Core · the typed-authority validator rejected every process-mediated plugin op (kubernetes/aws), so `flux run` aborted at registration with "declares a network effect without network, browser, or provider access"
+- [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 - [C-91 — Make approval prompts visible in the plain CLI](C-91-visible-approval-prompts-plain-cli.md) · Core
 - [C-93 — Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable](C-93-agent-invoke-commands-skills.md) · Core · SUPERSEDED by D-187 (claude-interop epic) — contract carried over unchanged, extended to file-based commands
 - [C-97 — WorkspaceContext — a context-local, swappable active System](C-97-workspace-context-runtime-seam.md) · Core · runtime seam for the worktree ops: per-agent active-System accessor replaces direct ctx.system; no set_current_dir anywhere

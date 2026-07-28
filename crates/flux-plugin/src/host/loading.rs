@@ -275,6 +275,10 @@ pub struct PluginTool {
     semantic_effects: Vec<String>,
     capabilities: PluginCapabilities,
     secret_purposes: Vec<String>,
+    /// The op's declared per-operation `process` narrowing (C-90): argv prefixes this op may use,
+    /// enforced at callback time on top of the manifest-level gate and projected as the op's
+    /// `process.exec` authority instead of the manifest-wide grants. Empty = no narrowing.
+    op_process: Vec<String>,
     staging: StagingDisposition,
     /// The op's declared secret-like field names (GL-031); the op result is passed through
     /// [`redact_secret_fields`] with these before it is stringified into model-visible output.
@@ -299,6 +303,7 @@ impl PluginTool {
             semantic_effects,
             capabilities: manifest.capabilities.clone(),
             secret_purposes: op.secret_purposes.clone(),
+            op_process: op.process.clone(),
             staging: op.staging,
             redact_fields: op.redact_fields.clone(),
         }
@@ -436,9 +441,17 @@ impl Tool for PluginTool {
                 .iter()
                 .map(AuthorityRequirement::connection_dial),
         );
+        // An op with a per-operation `process` narrowing (C-90) carries THAT as its authority —
+        // the prompt/audit then shows `kubectl get` rather than every manifest-wide grant — and
+        // the callback-time wrapper in `execute` enforces the same list, so the disclosed
+        // authority and the enforced authority are one declaration.
+        let process_grants = if self.op_process.is_empty() {
+            &self.capabilities.process
+        } else {
+            &self.op_process
+        };
         requirements.extend(
-            self.capabilities
-                .process
+            process_grants
                 .iter()
                 .map(AuthorityRequirement::process_exec),
         );
@@ -492,10 +505,21 @@ impl Tool for PluginTool {
 
     async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let mut host = self.host.lock().await;
-        match host
-            .call_with_host(&self.operation, params, self.caps.as_ref())
-            .await
-        {
+        // Enforce the op's `process` narrowing (C-90) on every callback this call issues. The
+        // scoped view sits in FRONT of the shared caps, so the manifest-level gate still runs —
+        // a per-op declaration can only narrow the manifest grant, never widen it.
+        let scoped;
+        let caps: &dyn HostCapabilities = if self.op_process.is_empty() {
+            self.caps.as_ref()
+        } else {
+            scoped = OpScopedCaps {
+                inner: self.caps.as_ref(),
+                operation: &self.operation,
+                process: &self.op_process,
+            };
+            &scoped
+        };
+        match host.call_with_host(&self.operation, params, caps).await {
             Ok(mut v) => {
                 // Mask the op's declared secret-like fields (GL-031) before the result is
                 // stringified into model-visible output — a no-op unless the op declared any.
@@ -506,6 +530,42 @@ impl Tool for PluginTool {
             }
             Err(e) => Ok(ToolResult::error(e.to_string())),
         }
+    }
+}
+
+/// A per-call view over the shared [`HostCapabilities`] that enforces one operation's `process`
+/// narrowing (C-90) before delegating. Only `process.run`/`process.spawn` are pre-checked — every
+/// other callback, and the manifest-level argv gate itself, still runs in the wrapped caps, so
+/// this can only subtract authority. Empty argv is delegated untouched so the inner gate produces
+/// its canonical error.
+struct OpScopedCaps<'a> {
+    inner: &'a dyn HostCapabilities,
+    operation: &'a str,
+    process: &'a [String],
+}
+
+#[async_trait]
+impl HostCapabilities for OpScopedCaps<'_> {
+    async fn handle(&self, command: &str, payload: &Value) -> std::result::Result<Value, String> {
+        if matches!(command, "process.run" | "process.spawn") {
+            let argv: Vec<String> = payload
+                .get("argv")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !argv.is_empty() && !crate::protocol::process_grant_allows(self.process, &argv) {
+                return Err(format!(
+                    "{command}: `{}` is outside operation `{}`'s declared process constraints",
+                    argv.join(" "),
+                    self.operation
+                ));
+            }
+        }
+        self.inner.handle(command, payload).await
     }
 }
 
