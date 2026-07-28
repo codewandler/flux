@@ -14,6 +14,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use flux_core::{Chunk, ContentBlock, Error, Result, Role, StopReason, ToolResultContent, Usage};
 use flux_provider::{
@@ -826,9 +827,76 @@ fn map_effort_responses(e: Effort, codex: bool) -> &'static str {
 
 /// Build the Responses request body. Content blocks map to typed `input` items; tool results
 /// become `function_call_output`, assistant tool_use becomes `function_call`.
+/// The Responses prefix-cache routing key (C-136).
+///
+/// OpenAI combines `prompt_cache_key` with the prefix hash to route successive requests of one
+/// conversation to the same cache shard; without it, hits across a multi-round turn are
+/// load-balancer luck. Derived from the host's `RequestTrace.session_id` so every round of a session
+/// shares it and distinct sessions do not.
+///
+/// **Hashed, not passed through.** `RequestTrace` is documented as host-owned and never serialized
+/// onto the vendor wire; this is the one deliberate exception, and it sends an opaque digest rather
+/// than the id itself so no host-side identifier crosses the boundary even if session ids ever
+/// become user-derived.
+fn prompt_cache_key(req: &Request) -> Option<String> {
+    let trace = req.trace.as_ref()?;
+    if trace.session_id.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"flux-prompt-cache-v1:");
+    hasher.update(trace.session_id.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("flux-{hex}"))
+}
+
+/// Split a segmented system prompt for the Responses wire (C-137).
+///
+/// Returns `(instructions, leading_input)`: the **cached** segments build `instructions`, and the
+/// trailing uncached segment — the per-turn material the Anthropic path deliberately parks after the
+/// last cache breakpoint — becomes a leading `input` item instead.
+///
+/// `Request::system_text()` joins every segment, which on this wire hoists that volatile text to the
+/// very FRONT of the cacheable prefix, where it invalidates everything behind it on each change. The
+/// A-03 cache-first layout was built for Anthropic; flattened here it actively hurts.
+fn split_system_for_responses(req: &Request) -> (Option<String>, Option<String>) {
+    if req.system_segments.is_empty() {
+        return (req.system_text(), None);
+    }
+    let join = |parts: Vec<&str>| -> Option<String> {
+        let joined = parts.join("\n\n");
+        (!joined.trim().is_empty()).then_some(joined)
+    };
+    let stable = join(
+        req.system_segments
+            .iter()
+            .filter(|s| s.cache)
+            .map(|s| s.text.as_str())
+            .collect(),
+    );
+    let volatile = join(
+        req.system_segments
+            .iter()
+            .filter(|s| !s.cache)
+            .map(|s| s.text.as_str())
+            .collect(),
+    );
+    (stable, volatile)
+}
+
 fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
-    let mut instructions = req.system_text();
+    let (mut instructions, volatile_system) = split_system_for_responses(req);
     let mut input: Vec<Value> = Vec::new();
+    // The uncached per-turn system material leads `input`, so it sits BEHIND the stable
+    // `instructions` prefix instead of in front of it (C-137).
+    if let Some(text) = volatile_system {
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }],
+        }));
+    }
 
     for m in &req.messages {
         match m.role {
@@ -948,6 +1016,9 @@ fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
     if let Some(e) = req.effort {
         // Codex must be told to emit a reasoning summary to stream thinking text.
         body["reasoning"] = json!({ "effort": map_effort_responses(e, codex), "summary": "auto" });
+    }
+    if let Some(key) = prompt_cache_key(req) {
+        body["prompt_cache_key"] = json!(key);
     }
     if codex {
         body["store"] = json!(false);
@@ -2016,6 +2087,105 @@ mod tests {
 mod cache_tail_tests {
     use super::*;
     use flux_provider::Request;
+
+    /// C-136: successive rounds of one session must share a `prompt_cache_key`; distinct sessions
+    /// must not; a request with no host trace must omit the field entirely.
+    #[test]
+    fn prompt_cache_key_is_stable_per_session_and_absent_without_a_trace() {
+        use flux_provider::RequestTrace;
+        let with_session = |session: &str, round: usize| {
+            let mut req = Request::new("gpt-5.6-sol", "hi");
+            req.trace = Some(RequestTrace {
+                session_id: session.to_string(),
+                turn_id: 1,
+                stage: "explore".into(),
+                round,
+            });
+            build_responses_body(&req, true).unwrap()["prompt_cache_key"].clone()
+        };
+        let round1 = with_session("s_1499", 1);
+        let round2 = with_session("s_1499", 2);
+        assert_eq!(round1, round2, "one session, one key");
+        assert_ne!(
+            round1,
+            with_session("s_1500", 1),
+            "distinct sessions differ"
+        );
+
+        // Opaque: the host-side session id never reaches the wire (RequestTrace is host-owned).
+        let rendered = round1.as_str().unwrap();
+        assert!(rendered.starts_with("flux-"), "{rendered}");
+        assert!(
+            !rendered.contains("s_1499"),
+            "the raw id must not leak: {rendered}"
+        );
+
+        // No trace ⇒ no field, rather than a constant key shared by every caller.
+        let untraced = build_responses_body(&Request::new("gpt-5.6-sol", "hi"), true).unwrap();
+        assert!(untraced.get("prompt_cache_key").is_none(), "{untraced}");
+    }
+
+    /// C-137's named failing-first test: two requests differing ONLY in the trailing uncached system
+    /// segment must produce byte-identical `instructions`. `system_text()` joins every segment, so
+    /// that per-turn text used to be hoisted to the front of the cacheable prefix and invalidate it.
+    #[test]
+    fn volatile_system_segment_stays_out_of_the_cached_instructions_prefix() {
+        use flux_provider::SystemSegment;
+        let build = |turn_text: &str| {
+            let mut req = Request::new("gpt-5.6-sol", "hi");
+            req.system_segments = vec![
+                SystemSegment {
+                    text: "You are Flux's staged planning agent.".into(),
+                    cache: true,
+                },
+                SystemSegment {
+                    text: "base system prompt".into(),
+                    cache: true,
+                },
+                SystemSegment {
+                    text: turn_text.to_string(),
+                    cache: false,
+                },
+            ];
+            req.messages = vec![flux_core::Message::user_text("go")];
+            build_responses_body(&req, true).unwrap()
+        };
+        let a = build("Accepted intent: read a file\nSelected capability families: fs");
+        let b = build("Accepted intent: read a file\nSelected capability families: fs, net");
+
+        assert_eq!(
+            a["instructions"], b["instructions"],
+            "a capability signal must not rewrite the cached prefix"
+        );
+        assert_eq!(
+            a["instructions"],
+            json!("You are Flux's staged planning agent.\n\nbase system prompt"),
+            "instructions is exactly the cached segments, in order"
+        );
+        // The volatile text is still delivered — as the first `input` item, behind the prefix.
+        let first = &b["input"][0];
+        assert_eq!(first["type"], "message");
+        assert!(
+            first["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fs, net"),
+            "{b}"
+        );
+        // …and it precedes the conversation itself, so the model reads it as turn context.
+        assert_eq!(b["input"][1]["content"][0]["text"], "go");
+    }
+
+    /// The unsegmented path is untouched: a plain `system` still becomes `instructions` verbatim.
+    #[test]
+    fn unsegmented_system_still_becomes_instructions() {
+        let mut req = Request::new("gpt-5.6-sol", "hi");
+        req.system = Some("plain system prompt".into());
+        req.messages = vec![flux_core::Message::user_text("go")];
+        let body = build_responses_body(&req, true).unwrap();
+        assert_eq!(body["instructions"], json!("plain system prompt"));
+        assert_eq!(body["input"][0]["content"][0]["text"], "go");
+    }
 
     /// C-134: `cache_tail` is an Anthropic-wire concern. The Responses path shares `Request`, so it
     /// must ignore the flag entirely — same bytes with and without it.

@@ -2,8 +2,7 @@
 id: C-137
 title: Codex — keep volatile per-turn text out of `instructions`
 pillar: Core
-status: ready
-priority: 8
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "`instructions` is built from req.system_text() (flux-provider/src/lib.rs:147), which joins ALL segments including the trailing cache:false one — the segment the Anthropic path deliberately keeps after the last breakpoint lands at the very front of the Responses prefix"
@@ -42,7 +41,14 @@ A-03 layout should help every provider, not help Anthropic and hurt codex.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `split_system_for_responses` builds `instructions` from the cached segments only;
+  the trailing uncached segment becomes the first `input` item, behind the stable prefix.
+- `Request::system_text()` left alone — it is the documented fallback for codecs with no breakpoint
+  notion and has other callers.
+- Unsegmented path asserted byte-identical.
+- Not separately measured against a codex baseline: A-95's no-op-signal fix removes the most frequent
+  trigger for the trailing segment changing mid-turn, so the remaining delta is small. The body-level
+  behaviour is pinned by test.
 
 ## Notes
 - Interaction with A-95: freezing the tool set also stabilizes the trailing segment's *families*

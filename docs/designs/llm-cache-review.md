@@ -1,6 +1,6 @@
 # Design: LLM cache review — prompt-cache correctness for the `claude` and `codex` providers
 
-**Status:** proposed · **Pillar:** Core (one Agent story) · **Stories:** see it clearly first
+**Status:** implemented 2026-07-28 · **Pillar:** Core (one Agent story) · **Stories:** see it clearly first
 ([C-133](../stories/C-133-cache-efficiency-telemetry-and-harness.md),
 [C-139](../stories/C-139-tui-header-cache-tiers.md),
 [C-140](../stories/C-140-tui-usage-overlay.md)), then claude
@@ -54,6 +54,50 @@ Interpretation: the structural gap (no breakpoint in `messages`) is real and rea
 code, but its *size* is now bounded by data rather than asserted. The ceiling on any fix is the ~65%
 of tokens currently arriving fresh; the floor is whatever share of that is genuinely new content
 that no cache could have served.
+
+## Validation — live A/B, 2026-07-28
+
+Measured with `bench/cache-ab.sh` against `claude/claude-sonnet-5`, using the `FLUX_CACHE_TAIL=off`
+kill switch as the control arm. Anthropic's cache is content-addressed and org-scoped, so the second
+arm of a pair reads whatever the first wrote; arm order is noted per pair and the harness alternates
+it.
+
+**Short turns — no demonstrable win.** Two distinct prompts, both arms each (2–3 steps, 31–55k ctx):
+
+| prompt | arm | steps | hit | read | write |
+|---|---|---|---:|---:|---:|
+| X | off | 2 | 59% | 54.0k | 0 |
+| X | on | 3 | 66% | 72.5k | 37.2k |
+| Y | on | 3 | 84% | 72.5k | 13.3k |
+| Y | off | 2 | 84% | 71.9k | 0 |
+
++7pp on one prompt, 0pp on the other, and the step counts differ within each pair — so the arms did
+different work and neither pair is conclusive. This is the expected shape: on a 2–3 step turn the
+transcript is a rounding error next to the tools+system prefix, which **both** arms cache. An earlier
+naive pair appeared to show 47% → 97%; re-running with the arm order reversed produced 79% on both,
+i.e. that result was a warm-cache artifact, not the fix. Recorded because it is the trap this
+measurement exists to avoid.
+
+**Long turns — the fix works.** Same prompt (read five large source files), same 4 steps, comparable
+context, with the **tail arm running first** so ordering favoured the control:
+
+| arm | steps | ctx | hit | read | write | equivalent cost |
+|---|---:|---:|---:|---:|---:|---:|
+| tail **on** | 4 | 61.4k | **71%** | 108.5k | 43.7k | **~$0.0421** |
+| tail off | 4 | 62.3k | 47% | 71.9k | 0 | ~$0.1061 |
+
+**+24pp hit rate and 2.5× cheaper**, understated if anything by the ordering. The mechanism is
+visible in the columns: the tail arm converts ~80k of full-rate fresh input into 43.7k of cache
+writes plus a larger read, and reads bill at ~0.1×.
+
+Conclusion: the conversation-tail breakpoint pays exactly where the analysis predicted — turns whose
+transcript grows large — and is neutral-to-slightly-costly on short ones, where it buys writes that
+are never re-read. It ships on by default with `FLUX_CACHE_TAIL=off` as the escape hatch.
+
+**Codex.** `prompt_cache_key` was confirmed against current OpenAI documentation (Responses API,
+1024-token minimum) and then **live-verified accepted by the ChatGPT/codex backend** — the risk being
+that the backend rejects unknown parameters as it does `max_output_tokens` and the sampling params. A
+`codex/gpt-5.6-sol` turn carrying the key returned normally.
 
 ## Why
 

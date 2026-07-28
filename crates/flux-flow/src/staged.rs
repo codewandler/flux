@@ -2090,6 +2090,16 @@ fn apply_capability_signal(
             new_families.len()
         )));
     }
+    // A-95: a signal that widens nothing must change nothing. The model re-signalling a family it
+    // already holds used to still rewrite the declaration — appending to `intent` and so rewriting
+    // the trailing system segment — which churns the prompt prefix for no capability gain. On the
+    // Anthropic wire that segment rides after the last breakpoint so the damage is bounded, but on
+    // the Responses wire it is flattened into `instructions` at the very FRONT of the cached prefix
+    // (C-137), where it invalidates everything behind it. Either way it buys nothing: no new
+    // operation is surfaced, and `intent` grows without bound across a signal-heavy turn.
+    if new_families == state.declaration.families {
+        return Ok(Vec::new());
+    }
     let declaration = IntentDeclaration {
         intent: format!("{}; additional signal: {reason}", state.declaration.intent),
         families: new_families,
@@ -2181,8 +2191,22 @@ fn base_request(ctx: &StagedContext, messages: Vec<Message>, max_tokens: u32) ->
     req.effort = ctx.opts.effort;
     // C-134: every staged call re-sends the turn's growing transcript, so the conversation tail is
     // where the cache pays. Codecs without a breakpoint notion ignore the flag.
-    req.cache_tail = true;
+    //
+    // `FLUX_CACHE_TAIL=off` is the kill switch (mirrors `FLUX_OP_CACHE=off`): it is the A/B lever
+    // that measures what the tail breakpoint is worth, and the escape hatch if a provider ever
+    // rejects the extra breakpoint.
+    req.cache_tail = !cache_tail_disabled();
     req
+}
+
+/// Whether `FLUX_CACHE_TAIL=off` has switched the conversation-tail breakpoint off (C-134).
+fn cache_tail_disabled() -> bool {
+    std::env::var("FLUX_CACHE_TAIL").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
 }
 
 fn correlate_request(ctx: &StagedContext, request: &mut Request, stage: &str, round: usize) {
@@ -2989,6 +3013,157 @@ mod tests {
     fn adaptive_model_call_default_is_50() {
         assert_eq!(DEFAULT_ADAPTIVE_MODEL_CALLS, 50);
         assert_eq!(AdaptiveLoopPolicy::default().max_model_calls, 50);
+    }
+
+    /// A-95's named failing-first test: a capability signal that widens nothing must leave the
+    /// declaration — and therefore the advertised tool set and the rendered system segments —
+    /// byte-identical. Re-signalling a held family used to append to `intent` on every call, which
+    /// rewrites the trailing system segment and (on the Responses wire, where segments are flattened
+    /// into `instructions`) cold-writes the whole prompt prefix for zero capability gain.
+    #[test]
+    fn a_noop_capability_signal_does_not_churn_the_prompt() {
+        let ops = vec![spec(
+            "db.query",
+            vec![],
+            vec![AccessKind::Connection],
+            Some("db"),
+        )];
+        // A family is discoverable only when its ops are advertised (or its group manifest carries a
+        // turn-intent matcher); this fixture takes the advertised route.
+        let advertised: HashSet<String> = ["db.query".to_string()].into_iter().collect();
+        let families = build_families(&ops, &[], &advertised);
+        assert!(
+            families.contains_key("db"),
+            "fixture family resolves: {:?}",
+            families.keys()
+        );
+
+        let mut state = AdaptiveState {
+            version: 1,
+            declaration: IntentDeclaration {
+                intent: "inspect the database".into(),
+                families: vec!["db".into()],
+            },
+            selected: vec!["db.query".into()],
+            messages: Vec::new(),
+            proposed: Vec::new(),
+            gathered: Vec::new(),
+            native_step: 0,
+            last_error: String::new(),
+            pending: None,
+            intent_calls: 0,
+            explore_calls: 0,
+        };
+        let before = state.declaration.clone();
+
+        // Signal a family the state already holds.
+        let added = apply_capability_signal(
+            &mut state,
+            &json!({"capability_families": ["db"], "reason": "still need the database"}),
+            &families,
+            &[],
+        )
+        .expect("a redundant signal is accepted, not an error");
+
+        assert!(added.is_empty(), "nothing new was surfaced: {added:?}");
+        assert_eq!(
+            state.declaration.families, before.families,
+            "the family set is unchanged"
+        );
+        assert_eq!(
+            state.declaration.intent, before.intent,
+            "`intent` must NOT grow — it renders into the trailing system segment"
+        );
+        assert_eq!(state.selected, vec!["db.query".to_string()]);
+    }
+
+    /// A-95: absent a widening signal the advertised tool set must be byte-identical round to round.
+    /// Tools render BEFORE system on the Anthropic wire, so any membership or ordering wobble here
+    /// cold-writes every system breakpoint too. This pins the property the rest of the epic's
+    /// caching depends on.
+    #[test]
+    fn the_advertised_tool_set_is_byte_stable_across_rounds() {
+        let ops = vec![
+            spec("db.query", vec![], vec![AccessKind::Connection], Some("db")),
+            spec("db.exec", vec![], vec![AccessKind::Connection], Some("db")),
+            spec("fs.read", vec![], vec![AccessKind::Filesystem], Some("fs")),
+        ];
+        let advertised: HashSet<String> = ops.iter().map(|o| o.name.clone()).collect();
+        let families = build_families(&ops, &[], &advertised);
+        let declaration = IntentDeclaration {
+            intent: "look at the database".into(),
+            families: vec!["db".into()],
+        };
+
+        let render = || {
+            selected_specs(&declaration, &families, &[])
+                .expect("selection succeeds")
+                .iter()
+                .map(tool_def)
+                .map(|t| serde_json::to_string(&t).expect("tool serializes"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            render(),
+            render(),
+            "the same declaration must render the same tools"
+        );
+        // …and it is the family's ops, name-sorted, with nothing from the unselected family.
+        let names = selected_specs(&declaration, &families, &[])
+            .unwrap()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["db.exec".to_string(), "db.query".to_string()]);
+    }
+
+    /// A-95: a signal that genuinely widens still widens — the no-op guard must not disable
+    /// capability discovery, which is the one way this change could do real harm.
+    #[test]
+    fn a_widening_capability_signal_still_surfaces_new_operations() {
+        let ops = vec![
+            spec("db.query", vec![], vec![AccessKind::Connection], Some("db")),
+            spec("net.get", vec![], vec![AccessKind::Network], Some("net")),
+        ];
+        let advertised: HashSet<String> = ["db.query".to_string(), "net.get".to_string()]
+            .into_iter()
+            .collect();
+        let families = build_families(&ops, &[], &advertised);
+        let mut state = AdaptiveState {
+            version: 1,
+            declaration: IntentDeclaration {
+                intent: "inspect the database".into(),
+                families: vec!["db".into()],
+            },
+            selected: vec!["db.query".into()],
+            messages: Vec::new(),
+            proposed: Vec::new(),
+            gathered: Vec::new(),
+            native_step: 0,
+            last_error: String::new(),
+            pending: None,
+            intent_calls: 0,
+            explore_calls: 0,
+        };
+
+        let added = apply_capability_signal(
+            &mut state,
+            &json!({"capability_families": ["net"], "reason": "the record points at a URL"}),
+            &families,
+            &[],
+        )
+        .expect("a widening signal is accepted");
+
+        assert_eq!(added, vec!["net.get".to_string()], "the new op is surfaced");
+        assert_eq!(
+            state.declaration.families,
+            vec!["db".to_string(), "net".to_string()]
+        );
+        assert!(
+            state.declaration.intent.contains("additional signal"),
+            "a real widening still records why: {}",
+            state.declaration.intent
+        );
     }
 
     fn spec(

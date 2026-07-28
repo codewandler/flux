@@ -2,8 +2,7 @@
 id: C-136
 title: Codex — send a cache-routing key so Responses prefix caching actually hits
 pillar: Core
-status: ready
-priority: 7
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "build_responses_body (openai.rs:829) sends store:false and re-sends the full input array each round, so automatic prefix caching is the only mechanism available — and we send nothing to route successive requests of one session to the same cache shard"
@@ -41,7 +40,15 @@ the second-highest-traffic provider and currently gets no deliberate cache help 
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. Doc check first, as required: `prompt_cache_key` confirmed against current OpenAI
+  documentation — Responses API, combined with the prefix hash to influence routing, 1024-token
+  minimum cacheable prefix.
+- Derived from `RequestTrace.session_id` as a SHA-256 digest (`flux-<16 hex>`), not the raw id: the
+  trace is documented host-owned and never-on-the-wire, so this narrow exception sends an opaque
+  value. No trace ⇒ field omitted rather than a constant key shared by every caller.
+- **Live-verified on the ChatGPT backend**, which was the open risk — it rejects `max_output_tokens`
+  and the sampling params, so an unknown parameter could have 400'd every codex request. A
+  `codex/gpt-5.6-sol` turn carrying the key returned normally.
 
 ## Notes
 - The `store: false` posture is deliberate and stays: no conversation state is retained

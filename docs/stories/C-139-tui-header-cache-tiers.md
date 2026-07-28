@@ -2,8 +2,7 @@
 id: C-139
 title: TUI header cache figure — split the tiers and stop summing last rounds
 pillar: Core
-status: ready
-priority: 2
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "header shows `cache {read+write}` as ONE number summed from TurnEnded.usage — so a 12-round turn contributes round 12 only, and a session reading 3.2M from cache renders identically to one writing 3.2M into it; the per-call data is already persisted and already collected at lib.rs:2270, then ignored"
@@ -43,7 +42,15 @@ looks at all day, and today it is both under-counted and ambiguous.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. TUI header now reads per-call `model.call` observations instead of
+  `TurnEnded.usage`, and renders `cache <hit>% ↺<read> ✎<write>`; `↑` became total prompt tokens so
+  the percentage has a visible denominator.
+- The plain-CLI annotation got the same treatment (`usage_annotation_with_cache`), so the two
+  surfaces agree. First live run exposed a flaw in the naive split — `ctx 26.1k` beside
+  `cache write 44.4k` reads as a contradiction, since ctx is the last round's occupancy while the
+  tiers are summed — so the tiers were folded into one self-describing segment.
+- No `AgentSink` change was needed: the engine already emits per-call usage as a `model.call`
+  observation, and the TUI replay path was already collecting it and discarding it.
 
 ## Notes
 - Measured 2026-07-28: `flux usage` reports 32% cached across 813 calls, and it is *correct* — it

@@ -2930,7 +2930,7 @@ mod tests {
             ..Default::default()
         };
         let s = usage_annotation(&u);
-        assert_eq!(s, " · ctx 10.0k · out 500 · cache 9.0k (90% hit)");
+        assert_eq!(s, " · ctx 10.0k · out 500 · cache 90% ↺9.0k ✎0");
 
         // No cache → no cache segment, but context + output still show.
         let u = Usage {
@@ -2962,9 +2962,9 @@ mod tests {
             ..Default::default()
         };
         let s = usage_annotation(&u);
-        assert!(s.contains("cache 9.0k"), "cache-read still shown: {s}");
+        assert!(s.contains("↺9.0k"), "cache-read still shown: {s}");
         assert!(
-            s.contains("cache write 2.0k"),
+            s.contains("✎2.0k"),
             "cache-WRITE tokens must be surfaced too (previously dropped entirely): {s}"
         );
         assert!(
@@ -2981,7 +2981,10 @@ mod tests {
             ..Default::default()
         };
         let s2 = usage_annotation(&plain);
-        assert!(!s2.contains("cache write"));
+        assert!(
+            s2.contains("✎0"),
+            "the write tier renders as zero, not absent: {s2}"
+        );
         assert!(!s2.contains("reasoning"));
 
         // The dollar-cost suffix (rendered alongside, via `cost_annotation`) completes the picture:
@@ -3020,12 +3023,12 @@ mod tests {
 
         // The old shape: hit rate read straight off the turn snapshot ⇒ round three's 20%.
         let last_round = crate::rendering::usage_annotation(&turn);
-        assert!(last_round.contains("(20% hit)"), "{last_round}");
+        assert!(last_round.contains("cache 20%"), "{last_round}");
 
         // The fixed shape: 170k of 300k prompt tokens ⇒ 57%.
         let turn_level = crate::rendering::usage_annotation_with_cache(&turn, &cache);
-        assert!(turn_level.contains("(57% hit)"), "{turn_level}");
-        assert!(turn_level.contains("cache 170.0k"), "{turn_level}");
+        assert!(turn_level.contains("cache 57%"), "{turn_level}");
+        assert!(turn_level.contains("↺170.0k"), "{turn_level}");
         // `ctx` keeps its occupancy meaning — the last round's prompt size, not the sum.
         assert!(turn_level.contains("ctx 100.0k"), "{turn_level}");
     }

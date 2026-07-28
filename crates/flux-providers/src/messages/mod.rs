@@ -9,6 +9,26 @@
 //!
 //! `flux_core::ContentBlock` already serializes to the Messages content shape, so request content
 //! and streamed tool-use blocks round-trip through serde without a translation layer.
+//!
+//! # Cache layout (the invariant)
+//!
+//! Anthropic renders `tools` → `system` → `messages` and matches on an exact prefix, resuming only
+//! at a `cache_control` breakpoint. flux lays that out as:
+//!
+//! * **the stable prefix** — `tools` plus the `cache: true` system segments — carries breakpoints on
+//!   a **1-hour** TTL. It is byte-stable across the turns of a session, and interactive pauses
+//!   routinely outlive the 5-minute default (C-135).
+//! * **per-turn material** — the `cache: false` segment — rides *after* the last system breakpoint,
+//!   so changing it cannot invalidate the cached prefix (A-03).
+//! * **the conversation tail** — the last content block of the last message — carries the rolling
+//!   breakpoint on the **5-minute** default, because it moves every round (C-134).
+//! * **the union stays ≤ [`MAX_CACHE_BREAKPOINTS`]**. The tail claims its slot first; the system
+//!   side is then trimmed largest-first by [`cache_breakpoints`]. A fifth breakpoint is an HTTP 400,
+//!   not a degradation (A-23).
+//!
+//! `cache_layout_contract` in this module's tests pins all four. If you add a `cache: true` segment
+//! or change the tool set mid-turn, read `docs/designs/llm-cache-review.md` first — both cost cache,
+//! and tools changing invalidates the system breakpoints too because tools render before them.
 
 use std::collections::HashMap;
 
@@ -958,6 +978,119 @@ mod tests {
         let body = build_messages_body(&req, &MessagesQuirks::default()).unwrap();
         assert_eq!(count_cache_control(&body), 0, "{body}");
         assert!(!body.to_string().contains("1h"), "{body}");
+    }
+
+    /// C-138: the cache-layout **contract**, pinned end to end for both Anthropic-family transports.
+    ///
+    /// This is the guard that stops a future segment or tool-set change halving the cache in
+    /// silence. It asserts the realized LAYOUT, not just the count:
+    ///   * the union of breakpoints never exceeds Anthropic's hard maximum of four;
+    ///   * the stable tools+system prefix carries the 1h TTL;
+    ///   * the rolling conversation tail carries the 5m default;
+    ///   * the per-turn (cache:false) segment sits AFTER the last system breakpoint.
+    #[test]
+    fn cache_layout_contract() {
+        use flux_provider::SystemSegment;
+        let seg = |name: &str, chars: usize, cache: bool| SystemSegment {
+            text: format!("{name} {}", "x".repeat(chars)),
+            cache,
+        };
+
+        // `claude` (subscription OAuth) inserts its identity line as cached segment 0; `anthropic`
+        // does not. Both layouts must satisfy the contract.
+        for (transport, segments) in [
+            (
+                "claude",
+                vec![
+                    seg("identity-prefix", 8, true),
+                    seg("explore-system", 1_500, true),
+                    seg("base-system", 9_000, true),
+                    seg("per-turn-intent", 200, false),
+                ],
+            ),
+            (
+                "anthropic",
+                vec![
+                    seg("explore-system", 1_500, true),
+                    seg("base-system", 9_000, true),
+                    seg("per-turn-intent", 200, false),
+                ],
+            ),
+        ] {
+            let mut req = Request::new("claude-sonnet-5", "hi");
+            req.cache_tail = true;
+            req.system_segments = segments;
+            req.messages = vec![
+                Message::user_text("go"),
+                Message::assistant(vec![ContentBlock::text("working")]),
+                Message::user(vec![ContentBlock::tool_result_text("t1", "result", false)]),
+            ];
+            req.tools = vec![ToolDef {
+                name: "read".into(),
+                description: "read a file".into(),
+                input_schema: json!({"type": "object"}),
+            }];
+            let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+
+            let total = count_cache_control(&body);
+            assert!(
+                total <= MAX_CACHE_BREAKPOINTS,
+                "{transport}: the union of breakpoints must stay within Anthropic's ceiling of \
+                 {MAX_CACHE_BREAKPOINTS}; got {total}. See docs/designs/llm-cache-review.md — the \
+                 tail breakpoint shares this budget with the system segments: {body}"
+            );
+
+            // The rolling tail: present, on the 5-minute default.
+            assert_eq!(
+                count_cache_control(&body["messages"]),
+                1,
+                "{transport}: exactly one tail breakpoint: {body}"
+            );
+            let tail = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap();
+            assert_eq!(tail["cache_control"]["type"], "ephemeral", "{transport}");
+            assert!(
+                tail["cache_control"].get("ttl").is_none(),
+                "{transport}: the rolling tail must NOT take the 1h TTL: {body}"
+            );
+
+            // The stable prefix: on the 1-hour TTL, every one of them.
+            let sys = body["system"].as_array().unwrap();
+            let stamped: Vec<&Value> = sys
+                .iter()
+                .filter(|b| b.get("cache_control").is_some())
+                .collect();
+            assert!(!stamped.is_empty(), "{transport}: {body}");
+            for block in &stamped {
+                assert_eq!(
+                    block["cache_control"]["ttl"], "1h",
+                    "{transport}: the stable prefix takes the 1h TTL: {body}"
+                );
+            }
+
+            // The per-turn segment rides AFTER the last breakpoint, so changing it cannot
+            // invalidate the cached prefix.
+            let last_stamped = sys
+                .iter()
+                .rposition(|b| b.get("cache_control").is_some())
+                .expect("a stamped segment exists");
+            let per_turn = sys
+                .iter()
+                .position(|b| {
+                    b["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("per-turn-intent"))
+                })
+                .expect("the per-turn segment is present");
+            assert!(
+                per_turn > last_stamped,
+                "{transport}: per-turn material must follow the last breakpoint \
+                 (at {last_stamped}, found at {per_turn}): {body}"
+            );
+        }
     }
 
     /// C-134: a round that appends more than [`CACHE_LOOKBACK_BLOCKS`] content blocks leaves the

@@ -859,16 +859,15 @@ pub(super) fn usage_annotation_with_cache(u: &Usage, cache: &flux_core::CacheEff
         style::fmt_tokens(context),
         style::fmt_tokens(u.output_tokens)
     );
-    if cache.read > 0 {
-        let pct = (cache.hit_rate() * 100.0).round() as u64;
+    // One self-describing segment rather than two: `ctx` is the LAST round's occupancy while the
+    // cache tiers are summed across the turn's calls, so rendering them as peers (`ctx 26.1k …
+    // cache write 44.4k`) reads as a contradiction. The percentage is the turn's hit rate over its
+    // own prompt total, and the glyphs match the TUI header so the two surfaces agree on sight.
+    if cache.read > 0 || cache.write > 0 {
         s.push_str(&format!(
-            " · cache {} ({pct}% hit)",
-            style::fmt_tokens(cache.read)
-        ));
-    }
-    if cache.write > 0 {
-        s.push_str(&format!(
-            " · cache write {}",
+            " · cache {:.0}% ↺{} ✎{}",
+            cache.hit_rate() * 100.0,
+            style::fmt_tokens(cache.read),
             style::fmt_tokens(cache.write)
         ));
     }

@@ -8,6 +8,39 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **LLM cache review (epic [llm-cache-review](docs/designs/llm-cache-review.md); C-133…C-140 +
+  A-95): prompt caching now covers the conversation, and you can see it working.** A first
+  measurement over the local event log put flux at 32% of prompt tokens served from cache; reading
+  the request path found why — every `cache_control` flux emitted lived in the `system` array, so the
+  cached prefix stopped where the system prompt ended and the whole growing transcript was re-priced
+  at full input rate on every round.
+  - **The conversation tail is cached (C-134).** A rolling breakpoint on the last content block of
+    the last message. Anthropic's four-breakpoint ceiling became a *union* budget shared with the
+    system segments, so subscription-`claude` — which already stamped four — trims its smallest
+    system breakpoint instead of failing every planner call. On a long-transcript turn this takes
+    the hit rate from 47% to **71%** and equivalent cost from ~$0.106 to **~$0.042** (same prompt,
+    same step count, control arm favoured by ordering). On short turns it is neutral.
+    `FLUX_CACHE_TAIL=off` turns it off.
+  - **The stable prefix survives a coffee break (C-135).** Tools + the cached system segments now
+    carry a 1-hour TTL; nothing in flux set a TTL before, so every prefix expired after five minutes
+    and an interactive pause cold-started it. The rolling tail stays on the 5-minute default.
+  - **`/usage` overlay in the TUI (C-140).** This turn's hit rate and read/write/fresh split, a
+    per-round bar list that makes a mid-turn cache collapse visible as it happens (marking rounds
+    where the advertised tool set changed), and session totals.
+  - **The live token displays stopped under-reporting (C-139).** The TUI header and the CLI turn
+    annotation read `TurnEnded.usage` — which is the turn's *last round* — so a twelve-round turn
+    reported round twelve. Both now fold per-call usage, and read/write are separate figures: a
+    session reading 3.2M from cache used to render identically to one writing 3.2M into it.
+    `flux usage` was always correct and is unchanged.
+  - **Codex prefix caching (C-136/C-137).** `prompt_cache_key` (derived per session, hashed) so
+    successive rounds route to the same cache shard — verified accepted by the ChatGPT backend — and
+    the per-turn system segment no longer flattens into `instructions` at the front of the cacheable
+    prefix, where it invalidated everything behind it.
+  - **A no-op capability signal is now a no-op (A-95).** Re-signalling a family the turn already
+    held still rewrote the intent declaration, churning the prompt prefix for zero capability gain.
+  - `bench/cache-ab.sh` A/Bs the tail breakpoint against the kill switch, and the model trace reports
+    the realized breakpoint layout.
+
 - **A-94: mid-turn steering — talk to the agent while it runs.** Text submitted while a turn is
   executing no longer waits for the turn to finish: the TUI's follow-up queue is shared with the
   engine (`FlowEngine::set_steering` + the new `flux_flow::SteeringQueue`), which drains it at

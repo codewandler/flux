@@ -2,8 +2,7 @@
 id: C-140
 title: In-TUI `/usage` overlay — watch the cache work (or collapse) as the turn runs
 pillar: Core
-status: ready
-priority: 3
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "`flux usage` is offline, per-model, and whole-history; nothing shows the CURRENT session per round — which is where a mid-turn cache collapse from tool churn or TTL expiry is actually visible; per-round CallUsage data is already persisted"
@@ -59,7 +58,11 @@ turn caching, and where did it stop".
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `/usage` overlay implemented to the approved mockup; `esc`/`q`/`Enter` close.
+- The churn marker is derived, as required: the engine reports the advertised operation count per
+  call, so a round whose count differs from the previous one is marked `← tools N`. No guessing.
+- Rendered output eyeballed against the mockup during development, then the probe removed.
+- Narrow/short terminals shed oldest rounds with a `… N earlier` count; empty state covered.
 
 ## Notes
 - Layout chosen by the user 2026-07-28 from three options (richer `flux usage` render / in-TUI

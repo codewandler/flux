@@ -2,8 +2,7 @@
 id: C-135
 title: 1-hour TTL on the stable tools+system prefix — survive interactive pauses
 pillar: Core
-status: ready
-priority: 5
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "no `ttl` field is set anywhere in flux-providers — every breakpoint rides the 5-minute default, so a human reading output for six minutes cold-starts the whole prefix on the next turn; likely the entire claude-vs-anthropic delta for interactive subscription use"
@@ -35,7 +34,12 @@ time-to-first-token on the surface people actually sit in front of.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `stable_cache_control()` (1h) for the tools+system prefix,
+  `rolling_cache_control()` (5m default) for the conversation tail; both segmented and unsegmented
+  paths covered, `ollama-anthropic` verified to leak neither a breakpoint nor a TTL.
+- The >5-minute-pause scenario in Acceptance was **not** run as a timed live experiment — the
+  long-transcript A/B exercised the prefix within a session instead. The TTL change is pinned by
+  test at the body level; its cross-pause value is argued, not measured. Worth a follow-up.
 
 ## Notes
 - Economics: 5m write is ~1.25× base input, 1h write is ~2×, reads are ~0.1×. 1h break-even is three
