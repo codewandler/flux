@@ -54,6 +54,13 @@ All notable changes to this project are documented in this file. The format is b
   `ApprovalRequest { tool, subjects, summary, destructive }` instead of flat `tool`/`subjects`
   fields, so the sheet can carry a plan's risk summary and destructive disclosure (C-182).
 
+- **C-181 hardening (from the epic's code review):** `RetryEvent` and `RetryReason` are
+  `#[non_exhaustive]` before their first crates.io publication, with `RetryEvent::new` as the
+  construction path for external providers reporting through `report_retry`. A future recovery kind
+  or event field is now additive; without this, the first release would have frozen the shapes the
+  same way host-kit's `HandshakeInfo` froze at 1.0.0. Unknown reasons count as plain retries in the
+  metrics fold. (Not breaking for anyone: the types have never shipped.)
+
 - **C-168/C-169: one Anthropic Messages codec, and OpenRouter stops paying full price.**
   `openrouter/anthropic/*` ran at **literally 0% prompt cache** — 3.1M tokens and $24.86 of metered
   spend in 32 days — while the identical model family via `openrouter-anthropic` hit 69%. The cause

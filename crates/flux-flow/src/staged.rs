@@ -2747,14 +2747,16 @@ mod tests {
         }
 
         async fn stream(&self, request: Request) -> Result<ChunkStream> {
-            flux_provider::report_retry(flux_provider::RetryEvent {
-                provider: "retrying".into(),
-                model: request.model.clone(),
-                attempt: 1,
-                max_attempts: 6,
-                delay: std::time::Duration::from_millis(500),
-                reason: flux_provider::RetryReason::Status(429),
-            });
+            // Through the constructor, as an external provider must (`RetryEvent` is
+            // `#[non_exhaustive]`) — this test doubles as the downstream-usage proof.
+            flux_provider::report_retry(flux_provider::RetryEvent::new(
+                "retrying",
+                request.model.clone(),
+                1,
+                6,
+                std::time::Duration::from_millis(500),
+                flux_provider::RetryReason::Status(429),
+            ));
             if self.fail {
                 return Err(Error::Other("exhausted".into()));
             }

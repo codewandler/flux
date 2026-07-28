@@ -100,6 +100,9 @@ impl RetryObserver for RetryReporter {
             RetryReason::OauthRefresh => &self.oauth_refreshes,
             RetryReason::TransportFallback(_) => &self.transport_fallbacks,
             RetryReason::Status(_) | RetryReason::Transport(_) => &self.retries,
+            // `RetryReason` is `#[non_exhaustive]`: a recovery kind this build does not know is
+            // still a recovery — count it as a plain retry rather than dropping it on the floor.
+            _ => &self.retries,
         };
         counter.fetch_add(1, Ordering::Relaxed);
 

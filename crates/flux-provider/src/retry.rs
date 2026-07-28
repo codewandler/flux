@@ -21,7 +21,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Why a connect attempt is being recovered from.
+///
+/// `#[non_exhaustive]`: recovery kinds grow (a rate-limit-header-driven wait is a plausible next
+/// one), and this crate is published — without the attribute, every new variant would break every
+/// downstream exhaustive match, forcing a MINOR bump for an additive change. Downstream matches
+/// carry a wildcard arm instead. (The same trap froze host-kit's `HandshakeInfo` at 1.0.0.)
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetryReason {
     /// The provider answered with a retryable status — 429 or 5xx (see
     /// [`is_retryable_status`](crate::is_retryable_status)).
@@ -57,7 +63,13 @@ impl RetryReason {
 }
 
 /// One connect-phase recovery, reported before the wait it announces.
+///
+/// `#[non_exhaustive]` so a future field (e.g. elapsed time in the connect loop) stays additive for
+/// this published crate. Reads are unaffected — the fields stay `pub` — but downstream construction
+/// goes through [`RetryEvent::new`], which is the documented path for an external
+/// [`Provider`](crate::Provider) reporting its own recoveries via [`report_retry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RetryEvent {
     /// The provider name (`Provider::name`).
     pub provider: String,
@@ -71,6 +83,29 @@ pub struct RetryEvent {
     /// How long the caller is about to sleep before trying again. Zero when the retry is immediate.
     pub delay: Duration,
     pub reason: RetryReason,
+}
+
+impl RetryEvent {
+    /// Build an event for [`report_retry`]. The constructor exists because the struct is
+    /// `#[non_exhaustive]` — a literal would stop compiling downstream the first time a field is
+    /// added, which is exactly the churn the attribute is there to prevent.
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        attempt: u32,
+        max_attempts: u32,
+        delay: Duration,
+        reason: RetryReason,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            attempt,
+            max_attempts,
+            delay,
+            reason,
+        }
+    }
 }
 
 /// Receives [`RetryEvent`]s for the model call it is scoped around.
