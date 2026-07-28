@@ -32,13 +32,16 @@ members = [
     "pack-index",
 ]
 
+# The PACK version below is the plugin binaries' distribution version, independent of both flux and
+# the 1.x protocol line. 0.1.2 is the first pack built after the wire contract moved into its own
+# crate (C-141/C-142): plugins no longer compile flux-lang or flux's host half, and host-kit now
+# publishes from this release rather than the flux closure (C-146).
+#
+# Keep `version` within the first few lines of the section: release-plugins.yml reads it from a
+# bounded window after the section header, and a comment between the two hid it once already.
 [workspace.package]
 edition = "2021"
 rust-version = "1.87"
-# The PACK version — the plugin binaries' distribution version, independent of both flux and the
-# 1.x protocol line. 0.1.2 is the first pack built after the wire contract moved into its own crate
-# (C-141/C-142): plugins no longer compile flux-lang or flux's host half, and host-kit now publishes
-# from this release rather than the flux closure (C-146).
 version = "0.1.2"
 license = "MIT OR Apache-2.0"
 

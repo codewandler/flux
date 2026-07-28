@@ -62,7 +62,11 @@ jobs:
       - name: Verify version input matches the plugins workspace
         shell: bash
         run: |
-          ws_version="$(grep -A5 '^\[workspace\.package\]' plugins/Cargo.toml | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')"
+          # Read the whole [workspace.package] section, not a fixed-size window: `grep -A5` missed
+          # `version` the moment a comment was added above it, and the run failed on a manifest that
+          # was perfectly correct.
+          ws_version="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p' plugins/Cargo.toml \
+            | sed -nE 's/^version *= *"([^"]+)".*/\1/p' | head -1)"
           if [ "${ws_version}" != "${{ inputs.version }}" ]; then
             echo "::error::input version '${{ inputs.version }}' != plugins workspace.package.version '${ws_version}' — bump plugins/Cargo.toml first"
             exit 1
