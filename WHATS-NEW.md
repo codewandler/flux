@@ -17,6 +17,11 @@
 
 ### New
 
+- **Pipe flux into anything.** `flux run --stream-json` turns a run into one JSON object per line
+  — what started, what was planned, every operation and its result, approvals, cost — ready for
+  `jq`, CI logs, or another program, with secrets scrubbed from every line. Add
+  `--stream-json-input` and the same pipe drives flux: send follow-up messages, or steer a turn
+  that's still running. (Preview — the line format may still change.)
 - **Your agent can now say "wake me in ten minutes."** With `[wakeup] enabled` in config, an
   agent that kicked off something slow can schedule its own follow-up: the reminder survives
   restarts, fires as a normal turn in the same session the next time it opens, and counts toward

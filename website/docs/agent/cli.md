@@ -131,6 +131,56 @@ flux run --loop loops/support.flux "triage this request"
   (default: 50; accepted range: 1–1,000).
 - `--skill NAME` explicitly enables a discovered skill. Skills do not activate from prompt keywords.
 
+## Machine-readable output (`--stream-json`)
+
+:::caution
+`--stream-json` / `--stream-json-input` is a **preview surface** — the line shapes below are not
+yet a compatibility promise. Every line carries `"v": 1` today; a breaking revision bumps that.
+:::
+
+`--stream-json` emits one JSON object per line to stdout instead of human-rendered output —
+everything a CI job, an editor extension, or another harness needs to drive and observe one turn
+without linking `flux-sdk`. Diagnostics still go to stderr, so stdout is `jq`-parseable with no
+filtering:
+
+```bash
+flux run --stream-json --yes "fix the failing test" | jq -c 'select(.type == "tool_call")'
+```
+
+Every line is a projection of a fact the engine already reports through its internal streaming
+sink — the same one the plain terminal renders from — so the two never diverge in what they
+consider "the plan" or "the result". Line `type`s:
+
+| `type` | When | Key fields |
+|---|---|---|
+| `turn_start` | once, before the turn begins | `session`, `model`, `input` |
+| `plan` | the agent proposes an action batch | `session`, `data` (batch id, action count, risk, the redacted batch) |
+| `approval` | that batch is requested/approved/denied | `session`, `phase`, `data` |
+| `tool_call` | an operation is about to run | `session`, `name`, `input` |
+| `tool_result` | it finished | `session`, `name`, `is_error`, `content`, `view`, `duration_us` |
+| `steered` | mid-turn guidance was folded in (see below) | `session`, `messages` |
+| `turn_end` | once, at the end | `session`, `answer`, `usage`, `cost_usd` |
+| `error` | the turn itself failed to run | `session`, `message` |
+
+`--stream-json-input` additionally reads the same NDJSON framing on stdin, for a multi-message
+conversation in one process — requires `--yes` (there is no interactive-approval framing over the
+input stream in this preview). A plain line queues the next turn; a line with `"steer": true`
+injects into the turn **currently running** instead of waiting for it to finish:
+
+```bash
+flux run --stream-json-input --yes -m sonnet <<'EOF'
+{"text": "audit crates/flux-cli/src/args.rs for dead flags"}
+{"text": "actually, skip anything hidden — focus on the public ones", "steer": true}
+EOF
+```
+
+A `steer: true` line that arrives with no turn running has nothing to steer, so it becomes an
+ordinary next turn instead of being dropped.
+
+Every emitted line is redacted independently of the ordinary tool-result scrubbing — including a
+tool call's own input arguments, which the safety envelope's result redaction never touches. See
+[Safety and approvals](./safety.md) for the redaction model this builds on.
+
 ## Saved flow inputs
 
 Put reusable `.flux` files in `.flux/flows` (project) or `~/.flux/flows` (global). `flux flow list`

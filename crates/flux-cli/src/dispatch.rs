@@ -369,7 +369,36 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
     let run = async {
         match cli.command {
             // The agent-path subcommands.
-            Some(Commands::Run { agent, prompt }) => {
+            Some(Commands::Run {
+                agent,
+                stream_json,
+                stream_json_input,
+                prompt,
+            }) => {
+                // C-160: the machine-output modes are Run-only and don't compose with the
+                // multi-agent-program path — `flux app run` already has its own JSON-shaped
+                // surfaces (`--serve`); a single line protocol over one adaptive turn doesn't map
+                // onto a Program's event bus.
+                if stream_json_input {
+                    if prompt.first().is_some_and(|p| p.ends_with(".flux")) {
+                        bail!("`--stream-json-input` is not supported for `flux run <app.flux>` programs");
+                    }
+                    return run_stream_json_conversation(agent, prompt).await;
+                }
+                if stream_json {
+                    if prompt.first().is_some_and(|p| p.ends_with(".flux")) {
+                        bail!(
+                            "`--stream-json` is not supported for `flux run <app.flux>` programs"
+                        );
+                    }
+                    if prompt.is_empty() {
+                        bail!(
+                            "`--stream-json` needs a prompt (use `--stream-json-input` to read the \
+                             first turn from stdin instead)"
+                        );
+                    }
+                    return run_stream_json(agent, prompt).await;
+                }
                 // `flux run <app.flux>` runs a multi-agent program; `flux run <prompt…>` runs a turn.
                 // Program mode keys on the `.flux` extension ONLY — matching any existing file would
                 // hijack prompts that happen to start with a filename (`flux run Cargo.toml explain …`

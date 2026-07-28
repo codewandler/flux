@@ -8,6 +8,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-160: an NDJSON protocol — drive and observe a turn over stdio without the SDK.**
+  `flux run --stream-json` emits one JSON object per line (each `v:1` with a `type`
+  discriminator): turn start/end, plan, per-op dispatch/result, approval request/decision,
+  usage/cost, error. The vocabulary is a projection of the run's one observation stream (the same
+  channel the CLI renders and the durable `RunEvent` log flushes from — a protocol line cannot
+  exist without an upstream fact; the design doc corrects two stale assumptions found while
+  verifying that, e.g. the `plan` line's real source is `action_batch.proposed`). Redaction is
+  applied to every line's full serialized text via the executor's own `Redactor` — closing a real
+  gap (`tool_call.input` was never redacted on dispatch) — pinned by a subprocess test.
+  `--stream-json-input` reads the same framing on stdin for multi-turn conversations in one
+  process, and a `{"steer": ...}` line injects into the *running* turn through the A-94 steering
+  path (idle fallback: queued as the next message). Human rendering is suppressed on stdout
+  (diagnostics → stderr, `jq`-parseable); `--stream-json-input` requires `--yes` (v1 answers
+  approvals by policy, not over the wire — recorded in the design doc). Website: line table + two
+  worked `jq` examples. v1 is explicitly marked unstable. Design:
+  `docs/designs/ndjson-agent-protocol.md`.
+
 - **A-98: agent-set wake-up — a turn can schedule its own resumption.** (**breaking**, see below)
   A new `schedule_wakeup` op lets a live turn register a durable future continuation of its own
   session ("the deploy is running; wake me in ten minutes with this context"). Durability rides

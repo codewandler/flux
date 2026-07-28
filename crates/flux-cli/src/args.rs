@@ -254,8 +254,23 @@ pub(super) enum Commands {
     Run {
         #[command(flatten)]
         agent: AgentFlags,
+        /// (C-160, preview — unstable, see docs/designs/ndjson-agent-protocol.md) Emit one JSON
+        /// object per line to stdout instead of human-rendered output — turn start/end, plan,
+        /// per-op dispatch + result, approval request/decision, usage/cost, and error, each line
+        /// carrying a `type` + schema version `v`. Diagnostics still go to stderr, so the stream is
+        /// `jq`-parseable with no filtering. Not supported for `flux run <app.flux>`.
+        #[arg(long = "stream-json")]
+        stream_json: bool,
+        /// (C-160, preview) Also read the same NDJSON framing on stdin, for a multi-message
+        /// conversation in one process: a plain `{"text": "..."}` line queues the next turn, a
+        /// `{"text": "...", "steer": true}` line injects into the CURRENTLY RUNNING turn instead
+        /// (A-94). Requires `--yes` — v1 has no interactive-approval framing over the input stream,
+        /// since this reader and the interactive approval prompt would otherwise both read stdin.
+        #[arg(long = "stream-json-input")]
+        stream_json_input: bool,
         /// The prompt words, or a path to an `<app.flux>` multi-agent program. Agent flags
-        /// (`-m`, `--yes`, …) may appear before or after.
+        /// (`-m`, `--yes`, …) may appear before or after. With `--stream-json-input`, the prompt is
+        /// optional — the first turn's input can come from stdin's first line instead.
         prompt: Vec<String>,
     },
     /// Launch the ratatui chat TUI (requires a real terminal). Tool calls raise a y/a/N modal; pass

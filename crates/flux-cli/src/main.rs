@@ -24,6 +24,7 @@ mod rendering;
 mod review;
 mod session;
 mod splash;
+mod stream_json;
 mod wakeup_cmd;
 
 use a2a_cmd::*;
@@ -39,6 +40,7 @@ use plugin_cmd::*;
 use rendering::*;
 use review::*;
 use session::*;
+use stream_json::*;
 use wakeup_cmd::*;
 
 use std::future::Future;

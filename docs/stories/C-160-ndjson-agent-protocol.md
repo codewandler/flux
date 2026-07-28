@@ -2,10 +2,9 @@
 id: C-160
 title: NDJSON agent protocol — drive and observe a turn over stdio without the SDK
 pillar: Core
-status: backlog
-priority:
+status: done
 epic:
-design:
+design: docs/designs/ndjson-agent-protocol.md
 note: "AgentFlags carries no output-format flag (args.rs:77-250) — `--format json` exists only on `flux review` (args.rs:377-380), so a non-Rust caller can only scrape human prose; the event stream (RunEvent) and mid-turn steering (A-94) both already exist internally, this exposes them as one documented line protocol"
 ---
 
@@ -35,7 +34,53 @@ the HTTP server, and A2A — all heavier than "pipe a subprocess".
 - [ ] The schema is documented on the website with a worked `jq` example.
 
 ## Progress
-- (not started — filed from the 2026-07-28 Amp feature-mining pass)
+- 2026-07-28: Design doc written first ([docs/designs/ndjson-agent-protocol.md](../designs/ndjson-agent-protocol.md)),
+  `design:` frontmatter set, board regenerated. Implementation landed on top of it:
+  - New `crates/flux-cli/src/stream_json.rs`: `ProtocolLine` (8 variants — `turn_start`, `plan`,
+    `tool_call`, `tool_result`, `approval`, `steered`, `turn_end`, `error`, all `#[non_exhaustive]`,
+    each carrying `v: 1`), `StreamJsonSink` (an `AgentSink` impl that writes NDJSON instead of
+    rendering for a terminal — same real-time channel `CliSink` uses, no second source of truth),
+    the single-turn runner (`run_stream_json`), and the stdin-driven multi-turn runner
+    (`run_stream_json_conversation`) with its pure `route_input_line` routing function.
+  - `crates/flux-cli/src/args.rs`: `--stream-json` / `--stream-json-input` added directly on
+    `Commands::Run` (not the shared `AgentFlags`, to keep them off `tui`/`fork`/`app run --help`).
+  - `crates/flux-cli/src/dispatch.rs`: `Commands::Run` routes to the new runners; both flags reject
+    `flux run <app.flux>` (program mode) with a clear error; `--stream-json` alone still requires a
+    prompt; `--stream-json-input` requires `--yes` (checked in `stream_json.rs`, not just dispatch)
+    since v1 has no interactive-approval framing over the input stream.
+  - `--stream-json-input` reads NDJSON off stdin on a background task; a `steer: true` line pushes
+    onto the engine's A-94 `SteeringQueue` only while a turn is in flight, else falls back to
+    queuing as the next ordinary turn (documented + tested both ways).
+  - Redaction: the sink clones the SAME `Redactor` the executor dispatches through
+    (`Executor::context().redactor` — already a public accessor, the same one `loop_host.rs`'s
+    `approve_batch` uses), and redacts every line's full serialized JSON text before writing —
+    closing a real gap (`tool_call.input` is never redacted by `Executor::dispatch`, only
+    `ToolResult` content/view are).
+  - Website docs: new "Machine-readable output" section in `website/docs/agent/cli.md` (line-type
+    table + two worked `jq`/heredoc examples, explicitly marked preview/unstable). `npm run build`
+    passes (one pre-existing unrelated broken-anchor warning on `flow-client.md`, not touched here).
+  - Tests: 5 unit tests in `stream_json.rs` (routing × 3, redaction pass, type+version pinning) +
+    5 black-box subprocess tests in the new `crates/flux-cli/tests/stream_json_smoke.rs` (line
+    sequence for a `-m mock` run incl. `plan`/`approval`, two-turn stdin conversation, idle-steer
+    fallback, `--yes` requirement, secret-in-tool-input redaction). `cargo test -p flux-cli`: 218 +
+    all integration suites green. `cargo fmt --all --check` and
+    `cargo clippy -p flux-cli --all-targets -- -D warnings` clean.
+  - Two corrections made mid-implementation, both recorded in the design doc: (a) the `plan` line's
+    real source is `Observation{kind: "action_batch.proposed"}`, not `flow.plan` as first assumed —
+    `flow.plan` has renderer-side match arms but **no production emitter** anywhere in
+    `flux-flow`/`flux-runtime` today (confirmed by a full-tree grep and empirically against a live
+    `-m mock` run); (b) `flow.halt` is similarly renderer-only with no current emitter, so `error` is
+    sourced only from `run_turn`'s `Err(_)` in v1.
+  - Open nuance for whoever reviews this next: the acceptance's bullet 2 says "projection of the
+    existing `RunEvent` stream"; what's actually implemented projects from `AgentSink`/
+    `flux_evidence::Observation` — the live per-turn streaming channel `CliSink` already renders
+    from — not the persisted `flux-events` `RunEvent` log directly. Every kind used here is also
+    flushed to that durable log via the same observation (`flush_observations`), so the two aren't
+    in tension, but it's worth a second pair of eyes given how central that acceptance wording is.
+  - Status intentionally left `in-progress` and Acceptance boxes left unchecked per explicit
+    instruction from the orchestrating session, even though the gate above is green — a deliberate
+    checkpoint, not an oversight. `flux-lint`/`--stream-json-thinking` and projecting every other
+    `Observation` kind are out of scope for v1 (see the design doc's Non-goals).
 
 ## Notes
 - Source: [../research/amp.md](../research/amp.md) — Amp's `--stream-json` /
