@@ -82,6 +82,21 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### Context-local Git worktrees (epic) — 🔎 **OPEN (filed 2026-07-28; C-97…C-100, C-97 ready)**
+
+Agents that mutate a repo while the user or another agent works in the same checkout step on each
+other. This epic adds `git_worktree_enter {}` / `git_worktree_leave {}` as guarded Git built-ins:
+`enter` moves **only the calling agent context** into a temporary worktree under a private
+`/tmp/flux-worktree-*` directory (a generated `flux/worktree/…` branch off a clean `main`); `leave`
+trial-merges then `--no-ff`-merges the committed work back into `main`, restores that context's
+original root, and cleans up — with failure modes that never lose work or strand `main` conflicted.
+The enabler is a per-agent `WorkspaceContext` (a context-owned, swappable active `System` — never
+`set_current_dir`), which also makes `FlowEngine` group probing follow the active root and gives
+spawned sub-agents an independent snapshot. Done means the two-context isolation test, the full
+enter→commit→leave→merge round trip, and every rejection/recovery path are green under the standard
+gate. Distilled from a decision-complete plan session. Design:
+[designs/context-local-git-worktrees.md](designs/context-local-git-worktrees.md).
+
 ### Deterministic Agent Lab — Test · Tune · Resurrect (epic) — ✅ **COMPLETE (2026-07-28; D-174…D-180, all seven stories)**
 
 Turns the deterministic-run substrate (canonical `plan_source` + the redacted op cassette) from
