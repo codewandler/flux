@@ -258,7 +258,15 @@ provider is a small composition, never a fork of the loop. Streaming is a
   Seatbelt on macOS, D-134..D-136) layers underneath as defense-in-depth: it confines what a
   spawned process's raw syscalls can reach, whether or not the process honors the capability
   protocol at all. See [designs/process-sandboxing.md](designs/process-sandboxing.md).
-- **Roles & skills**: markdown with frontmatter, discovered from `.flux/`.
+- **Roles, skills & commands**: markdown with frontmatter. Roles come from `.flux/agents/`. Skills
+  and file-based slash commands load from both the `.flux/` and `.claude/` worlds: project dirs
+  (symlink-jailed) then user-global, first-wins by name — skills from `.flux/skills`,
+  `.claude/skills` (nested `SKILL.md` up to 4 levels), `~/.flux/skills`, `~/.agents/skills`,
+  `~/.claude/skills`; commands from `.flux/commands`, `.claude/commands`, `~/.flux/commands`,
+  `~/.claude/commands`, dispatched as `/name args…` with `$ARGUMENTS`/`$1..$9` substitution
+  (built-ins win a clash). The triple-gated `command.invoke` and opt-in model-invoked `skill.load`
+  ops let the agent pull them mid-turn through `Executor::dispatch`. See
+  [designs/claude-interop.md](designs/claude-interop.md).
 
 ## Surfaces
 
@@ -270,7 +278,7 @@ provider is a small composition, never a fork of the loop. Streaming is a
   deny-destructive by default.
 - **`flux-server`** — axum HTTP API + SSE streaming; bearer-token authenticated except `/health` and
   the A2A discovery card, and refuses unauthenticated non-loopback binds.
-- **`flux-tui`** — ratatui chat with live streaming + an in-TUI approval modal.
+- **`flux-tui`** — ratatui chat with live streaming + an in-TUI approval sheet.
 - **`flux-cli`** — the `flux` binary: REPL, `-p` one-shot, `--agent`, `--serve`, slash commands,
   `/pd` `/goal` `/loop` autopilot.
 
