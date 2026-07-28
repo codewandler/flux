@@ -214,6 +214,57 @@ fn record_client(
         .unwrap()
 }
 
+/// A [`ScriptedMock`] tee that also counts every provider round in `live_calls` — used (D-184) to
+/// prove `Scenario::check`'s `FLUX_GOLDEN=update` branch reports the re-baseline's ACTUAL live call
+/// count in `Report::model_live`, not a fabricated constant.
+struct CountingScriptedMock {
+    inner: ScriptedMock,
+    live_calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Provider for CountingScriptedMock {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    async fn stream(&self, req: Request) -> Result<ChunkStream> {
+        self.live_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.stream(req).await
+    }
+}
+
+fn record_client_counting(
+    dir: &std::path::Path,
+    ops: Vec<(&'static str, serde_json::Value)>,
+    answer: &'static str,
+    counter: Arc<AtomicUsize>,
+    live_calls: Arc<AtomicUsize>,
+) -> Client {
+    Client::builder()
+        .model("mock")
+        .auto_approve(true)
+        .storage(Storage::in_memory())
+        .register_op(Arc::new(CounterTool {
+            name: "bump",
+            counter,
+        }))
+        .register_op(Arc::new(CounterTool {
+            name: "auditlog",
+            counter: Arc::new(AtomicUsize::new(0)),
+        }))
+        .build(
+            Box::new(CountingScriptedMock {
+                inner: ScriptedMock {
+                    ops,
+                    answer,
+                    calls: AtomicUsize::new(0),
+                },
+                live_calls,
+            }),
+            dir,
+        )
+        .unwrap()
+}
+
 /// A hermetic offline client: deny-all approver (the builder default — no `auto_approve`), a
 /// never-called provider, and a counting op registered so the test can prove the counter never
 /// moves during replay (a stronger proof than "the op doesn't exist here at all").
@@ -507,6 +558,62 @@ async fn flux_golden_update_re_records_the_fixture() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// D-184: `Scenario::check` under `FLUX_GOLDEN=update` used to fabricate an unconditionally-clean
+/// `Report` (hardcoded `model_live: 1`, an empty "identical" diff, `plan_changed`/`left_world` both
+/// `false`) instead of reporting what the re-baseline actually did — so `FLUX_GOLDEN=update` leaking
+/// into a CI job silently converted every `check()` gate into a passing live re-record. The fixed
+/// `check` reflects the real diff between the outgoing golden and the freshly-recorded one, counts
+/// the live calls the re-recording turn actually made, and — because a re-baseline is a live
+/// operation by definition, never a pinned re-drive — is never reported clean.
+#[tokio::test]
+async fn flux_golden_update_check_never_reports_clean() {
+    let _serialize = serialize();
+    let dir = tmp_dir("golden-update-check");
+    let fixture = dir.join("scenario-fixture");
+    let first = record_client(
+        &dir,
+        vec![("bump", json!({}))],
+        "first answer",
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let scenario = Scenario::record(&first, "bump the counter", &fixture)
+        .await
+        .unwrap();
+
+    let live_calls = Arc::new(AtomicUsize::new(0));
+    let report = {
+        let _env = EnvGuard::set("FLUX_GOLDEN", "update");
+        let updater = record_client_counting(
+            &dir,
+            vec![("bump", json!({}))],
+            "second answer, updated",
+            Arc::new(AtomicUsize::new(0)),
+            live_calls.clone(),
+        );
+        scenario.check(&updater).await.unwrap()
+    };
+
+    assert!(
+        !report.is_clean(),
+        "a FLUX_GOLDEN=update re-baseline is a live operation — it must never read as a clean, \
+         pinned re-drive: {:?}",
+        report.render()
+    );
+    assert!(
+        report.model_live > 0,
+        "the re-baseline's live calls must be counted honestly, not hardcoded: {}",
+        report.model_live
+    );
+    assert_eq!(
+        report.model_live,
+        live_calls.load(Ordering::SeqCst),
+        "model_live must equal the re-recording turn's REAL live-call count, not a fabricated \
+         constant"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A truncated cassette cell (`FLUX_CASSETTE_MAX_BYTES` too small to capture the op's content)
 /// reports the actionable "re-record with a larger FLUX_CASSETTE_MAX_BYTES" diagnostic —
 /// `assert_faithful`/`faithful()` treat it as a diagnostic, never a silent pass.
@@ -711,6 +818,14 @@ async fn check_counts_every_model_call_the_golden_does_not_cover() {
          silently served: served={} live={}",
         report.model_served,
         report.model_live
+    );
+    // D-184: a live fall-through is never a clean re-drive, no matter what the plan/world diff
+    // says — `is_clean()` is the whole-report pass/fail a CI guard reads, so this is what stops a
+    // guard from letting real spend through silently.
+    assert!(
+        !report.is_clean(),
+        "a live fall-through must never report clean: {:?}",
+        report.render()
     );
 
     std::fs::remove_dir_all(&dir).ok();

@@ -26,6 +26,33 @@
 //! rehydrated through the ledger (`ResumeLedger::from_interrupted`), and serving their op cells again
 //! to a *different* (fast-forwarded, not re-executed) statement would risk a false match. See
 //! [`crash_tail_cells`].
+//!
+//! # Turn scoping (D-181)
+//!
+//! Both the ledger fast-forward and the crash-tail cell slice are built ONLY from the interrupted
+//! turn's own events (see [`crate::cassette::turn_run_trace`]), never the whole session. A
+//! whole-session fold has two failure modes a per-turn one closes: (1) a later turn that re-accepts
+//! an IDENTICAL plan (same [`flow_key`]) as an earlier, fully-completed turn would inherit that
+//! earlier turn's completed statements even though the later turn made zero progress of its own —
+//! resurrecting it would fast-forward everything and dispatch nothing; (2) a completed turn that
+//! dispatched ops WITHOUT any plan (a purely native, non-flow-driven turn) leaves `OpRecorded` cells
+//! with no `StatementCompleted`/`PlanHalted` boundary around them — a whole-session crash-tail slice
+//! can offer those cells to a *later*, unrelated crashed turn, which may then serve them into a
+//! matching `(op, input_hash)` dispatch instead of running it live, silently skipping that turn's
+//! real side effect.
+//!
+//! # Purely native crashed turns
+//!
+//! A crashed turn can itself have NO statement boundary at all — the crash happened before its own
+//! first top-level statement finished. [`crash_tail_cells`] is conservative there BY DESIGN (no
+//! boundary means no trustworthy anchor to slice a tail from), so nothing from that window is ever
+//! served: what CAN be resurrected is exactly nothing (`statements_fast_forwarded == 0`, every op
+//! the turn dispatches runs live from scratch); what CANNOT be resurrected exactly-once is any op
+//! that already fired and got recorded in that same window before the crash — it re-fires live too,
+//! same as an ordinary in-flight op, except there can be many of them instead of just one. That is
+//! an honest widening of the documented single-op at-least-once window to the whole unanchored
+//! window, and [`ResurrectReport::unanchored_cells`] says so explicitly (folded into
+//! [`ResurrectReport::diverged`] too) instead of discarding those cells silently.
 
 use std::sync::Arc;
 
@@ -81,22 +108,112 @@ pub struct ResurrectReport {
     pub answer: String,
     /// The reified failure, when `outcome == "halted"`.
     pub halt: Option<PlanHalt>,
-    /// A latched divergence — a re-derived `input_hash` mismatch on a served cell, or unconsumed
-    /// crash-tail cells left over after the run — surfaced loudly, never silently. `None` on a clean
-    /// resurrection.
+    /// A latched divergence — a re-derived `input_hash` mismatch on a served cell, unconsumed
+    /// crash-tail cells left over after the run, or a non-zero [`Self::unanchored_cells`] — surfaced
+    /// loudly, never silently. `None` on a clean resurrection.
     pub diverged: Option<String>,
+    /// D-181: cells recorded in this turn's own trace that could NOT be anchored to a completed
+    /// top-level statement — the turn crashed before finishing even its FIRST statement, so
+    /// [`crash_tail_cells`] has no trustworthy boundary to slice a tail from and conservatively
+    /// offers none of them. Every op they cover re-fires live on resume instead: an honest
+    /// at-least-once for potentially the whole unanchored window, not just the one in-flight op the
+    /// documented crash-tail design accepts. `0` whenever a statement boundary exists in this turn
+    /// (the common case) — see the module docs' "Purely native crashed turns" section.
+    pub unanchored_cells: usize,
 }
 
 fn crash_err(session: &str, msg: impl std::fmt::Display) -> FlowError {
     FlowError::Runtime(format!("session {session} cannot be resurrected: {msg}"))
 }
 
+/// The env var every turn-entry point that resurrects on session open (SDK `Session::send` /
+/// `send_with` / `stream` / `start_flow`; CLI one-shot `flux run`, the REPL, and the TUI) checks
+/// before running [`resurrect_on_open`] — set `FLUX_AUTO_RESURRECT=0` to skip the step entirely.
+pub const AUTO_RESURRECT_ENV: &str = "FLUX_AUTO_RESURRECT";
+
+/// Whether [`AUTO_RESURRECT_ENV`] turns the auto-resurrect-on-open step off for this process.
+pub fn auto_resurrect_disabled() -> bool {
+    std::env::var(AUTO_RESURRECT_ENV).as_deref() == Ok("0")
+}
+
+/// One line [`resurrect_on_open`] wants surfaced — the caller decides how to render it (the CLI
+/// dims info and reds errors; a UI without color just prints both), but every line must be shown
+/// somewhere loud. Never buffer these and drop them silently.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum OnOpenLine {
+    /// A status line: an interrupted turn was found and is being finished, or the outcome once it
+    /// is.
+    Info(String),
+    /// The step could not proceed (a crash during planning) or the resumed run diverged.
+    Error(String),
+}
+
+/// D-183: the one resurrect-on-open step shared by every turn-entry point (SDK
+/// `auto_resurrect_step`, CLI `run_agentic`/`run_repl`, the TUI's `run_with_options`) — finish an
+/// interrupted turn from its crash point (no model call) BEFORE the caller's own new turn runs, so
+/// the new turn is never laid on top of a still-open crashed one. `report` is called for every line
+/// the step wants surfaced (never silent); returns the finished report when something actually got
+/// resurrected. A `FLUX_AUTO_RESURRECT=0` process, or a session with nothing interrupted, returns
+/// `None` without calling `report` at all — the overwhelmingly common, deliberately quiet case.
+pub async fn resurrect_on_open(
+    events: &EventStore,
+    store: &FlowStore,
+    executor: &Executor,
+    session: &str,
+    composites: &[CompositeOpDecl],
+    sink: &mut dyn AgentSink,
+    mut report: impl FnMut(OnOpenLine),
+) -> Option<ResurrectReport> {
+    if auto_resurrect_disabled() {
+        return None;
+    }
+    match interrupted(events, session) {
+        Ok(None) => return None,
+        Ok(Some(it)) => report(OnOpenLine::Info(format!(
+            "resurrect · session {session} · turn {} was interrupted after {} statement(s) — \
+             finishing it offline (no model call)",
+            it.turn_id, it.completed
+        ))),
+        Err(e) => {
+            report(OnOpenLine::Error(format!("resurrect: {e}")));
+            return None;
+        }
+    }
+    match resurrect(events, store, executor, session, composites, sink).await {
+        Ok(Some(rep)) => {
+            report(OnOpenLine::Info(format!(
+                "resurrect · {} · {} statement(s) fast-forwarded, {} op(s) served from the \
+                 cassette, {} run live",
+                rep.outcome,
+                rep.statements_fast_forwarded,
+                rep.ops_served_from_cassette,
+                rep.ops_run_live
+            )));
+            if let Some(diverged) = &rep.diverged {
+                report(OnOpenLine::Error(format!("resurrect diverged: {diverged}")));
+            }
+            Some(rep)
+        }
+        // `interrupted` just confirmed `Some` above; `resurrect` returning `None` here would mean
+        // the turn closed between the two calls (impossible under the turn guard every caller
+        // holds) — still handled honestly rather than assumed unreachable.
+        Ok(None) => None,
+        Err(e) => {
+            report(OnOpenLine::Error(format!("resurrect: {e}")));
+            None
+        }
+    }
+}
+
 /// The crash-tail cell slice: [`RunEvent::OpRecorded`] cells strictly AFTER the last
-/// `StatementCompleted`/`PlanHalted` row in the trace. No statement row at all (the crash happened
-/// before the first top-level statement completed) yields an EMPTY tail — conservative by design:
-/// every op in that window falls into the documented live at-least-once path rather than risking a
-/// stale match against a statement that never actually finished.
-fn crash_tail_cells(trace: &[RunEvent]) -> Vec<Cell> {
+/// `StatementCompleted`/`PlanHalted` row in the trace, plus how many cells were left un-offered for
+/// lack of a boundary to anchor them to (see [`ResurrectReport::unanchored_cells`]). No statement row
+/// at all (the crash happened before the first top-level statement completed) yields an EMPTY tail —
+/// conservative by design: every op in that window falls into the documented live at-least-once path
+/// rather than risking a stale match against a statement that never actually finished — but every
+/// cell that DID get recorded in that window is still counted and reported, not silently dropped.
+fn crash_tail_cells(trace: &[RunEvent]) -> (Vec<Cell>, usize) {
     let boundary = trace.iter().enumerate().rev().find_map(|(i, ev)| {
         matches!(
             ev,
@@ -105,8 +222,8 @@ fn crash_tail_cells(trace: &[RunEvent]) -> Vec<Cell> {
         .then_some(i + 1)
     });
     match boundary {
-        Some(b) => Cell::collect(&trace[b..]),
-        None => Vec::new(),
+        Some(b) => (Cell::collect(&trace[b..]), 0),
+        None => (Vec::new(), Cell::collect(trace).len()),
     }
 }
 
@@ -120,6 +237,26 @@ pub fn interrupted(events: &EventStore, session: &str) -> Result<Option<Interrup
     let Some(turn) = turns.iter().rev().find(|t| t.ended_at_ms.is_none()) else {
         return Ok(None);
     };
+    // D-183 out-of-order tail-guard: the interrupted turn must be the session's MOST RECENT turn.
+    // If a later turn exists and already closed, some entry point ran a new turn on top of this
+    // one instead of resurrecting it first (the exact bug a missed entry point — or a caller that
+    // ignores this step's result — produces): resurrecting now would finish the stale turn and
+    // append its assistant message AFTER turns that already answered it, out of conversational
+    // order. Refuse loudly rather than silently corrupting the transcript's order.
+    if let Some(last) = turns.last() {
+        if last.turn_id != turn.turn_id {
+            return Err(crash_err(
+                session,
+                format!(
+                    "turn {} is interrupted, but turn {} ran and closed after it — resurrecting \
+                     turn {} now would append its assistant message out of conversational order. \
+                     Some entry point ran a new turn without resurrecting the interrupted one \
+                     first; this session needs manual recovery, not an automatic resurrect",
+                    turn.turn_id, last.turn_id, turn.turn_id
+                ),
+            ));
+        }
+    }
     let Some(accepted) = turn
         .plan_attempts
         .iter()
@@ -148,7 +285,10 @@ pub fn interrupted(events: &EventStore, session: &str) -> Result<Option<Interrup
     let plan = flux_lang::parse::parse(src)
         .map_err(|e| crash_err(session, format!("stored plan_source no longer parses: {e}")))?;
     let key = flow_key(plan.name.as_deref(), &plan.body);
-    let trace = events.run_trace(session)?;
+    // D-181: scoped to THIS turn's own events only — a whole-session fold would let an earlier
+    // turn's completed statements (for the identical `flow_key`, e.g. the exact same plan
+    // re-accepted) fast-forward this crash even though this turn made zero progress of its own.
+    let trace = crate::cassette::turn_run_trace(events, session, turn.turn_id)?;
     let completed = ResumeLedger::from_interrupted(&trace, &key)
         .map(|l| l.completed.len())
         .unwrap_or(0);
@@ -190,9 +330,13 @@ pub async fn resurrect(
         return Ok(None);
     };
 
-    let trace = events.run_trace(session)?;
+    // D-181: turn-scoped, not whole-session — see the matching note in `interrupted` above. Both
+    // the ledger fast-forward AND the crash-tail cell slice must only ever see THIS turn's own
+    // events: a previously-completed turn (even a purely native one with no statement boundary at
+    // all) must never donate a ledger entry or a servable cell to this one.
+    let trace = crate::cassette::turn_run_trace(events, session, it.turn_id)?;
     let ledger = ResumeLedger::from_interrupted(&trace, &it.flow_key);
-    let tail_cells = crash_tail_cells(&trace);
+    let (tail_cells, unanchored_cells) = crash_tail_cells(&trace);
     let tail = RecordScope::new(store.event_store(), session);
     let scope = Arc::new(CassetteScope::Resume(ResumeTape::new(tail_cells, tail)));
     store.set_cassette(Some(scope.clone()));
@@ -219,6 +363,10 @@ pub async fn resurrect(
     // cells are themselves a loud divergence signal — every recorded cell in the tail was expected to
     // be re-consumed by the matching dispatch, so leftovers mean the resumed run's dataflow no longer
     // reaches somewhere the crashed run did.
+    // D-181: an unanchored crash-tail (no statement boundary in this turn at all — see the module
+    // docs' "Purely native crashed turns" section) is its own loud signal, distinct from `remaining`
+    // (which counts cells that WERE offered but never consumed): these cells were never offered at
+    // all, so `resume`/`remaining` can't see them.
     let diverged = resume.diverged().or_else(|| {
         (remaining > 0).then(|| {
             format!(
@@ -226,11 +374,20 @@ pub async fn resurrect(
                  resume — the resumed run's dataflow diverged from the crashed one"
             )
         })
+    }).or_else(|| {
+        (unanchored_cells > 0).then(|| {
+            format!(
+                "{unanchored_cells} cell(s) were recorded in this turn before the crash, but no \
+                 completed top-level statement exists yet to anchor a trustworthy crash tail from — \
+                 this turn crashed before finishing even its first statement. Every op they covered \
+                 re-fires live on resume instead of being served: an honest at-least-once for this \
+                 whole unanchored window, not just one in-flight op."
+            )
+        })
     });
 
     let statements_fast_forwarded = if ledger.is_some() {
-        events
-            .run_trace(session)?
+        crate::cassette::turn_run_trace(events, session, it.turn_id)?
             .iter()
             .rev()
             .find_map(|ev| match ev {
@@ -291,6 +448,7 @@ pub async fn resurrect(
         answer,
         halt,
         diverged,
+        unanchored_cells,
     }))
 }
 
@@ -370,12 +528,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(CountingTool(calls)));
+        // The read-only op cache is ON by default and would otherwise memoize repeated identical
+        // zero-arg `counted()` dispatches WITHIN one `Executor` — an orthogonal optimization this
+        // module's exactly-once tests must see straight through (every assertion here counts real
+        // dispatches, not cache hits).
         Executor::new(
             reg,
             PermissionManager::from_rules(&["counted".into()], &[]),
             approver,
             ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
         )
+        .with_op_cache(false)
     }
 
     fn call_counted() -> Node {
@@ -516,6 +679,39 @@ mod tests {
         assert_eq!(it.flow_key, key);
         assert_eq!(it.completed, 2);
         assert_eq!(it.user_input, "do the thing");
+    }
+
+    /// D-183 tail-guard (failing-first): turn 1 crashes mid-execution (left open), but a SECOND
+    /// turn somehow ran and closed on top of it anyway (the exact bug a missed entry point — or a
+    /// caller that ignores `resurrect_on_open`'s result — produces: a new turn entered without
+    /// resurrecting the crashed one first). `interrupted` must refuse loudly instead of quietly
+    /// reporting turn 1 as resurrectable — resurrecting it now would finish it and append its
+    /// assistant message AFTER turn 2's, out of conversational order.
+    #[tokio::test]
+    async fn interrupted_refuses_when_the_open_turn_is_not_the_sessions_most_recent_turn() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let ast = simple_plan();
+
+        // Turn 1: crashes with two of three statements done — left open (no `TurnEnded`).
+        let (turn1, _key) = seed_interrupted_turn(&events, &store, &ast, 2);
+
+        // Turn 2: a later turn runs (out of order relative to the still-open turn 1) and closes
+        // cleanly — the exact shape a resurrect-skipping entry point produces.
+        let turn2 = events
+            .begin_turn("sess", "a later turn", "test-model")
+            .unwrap();
+        events
+            .end_turn("sess", turn2, "completed", 1, "done", None)
+            .unwrap();
+
+        let err = interrupted(&events, "sess").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&turn1.to_string()) && msg.contains(&turn2.to_string()),
+            "must name both the stale interrupted turn and the later turn that ran on top of it, \
+             got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -771,5 +967,166 @@ mod tests {
         );
         assert_eq!(report.outcome, "suspended");
         assert!(store.has_suspension("sess").unwrap());
+    }
+
+    /// D-181 scenario 1 (failing-first): turn 1 runs a plan to completion; turn 2 re-accepts the
+    /// IDENTICAL plan (same `flow_key`, since `simple_plan()` is byte-identical both times) and
+    /// crashes before its own first `StatementCompleted`. A whole-session ledger fold would still
+    /// find turn 1's completed statements (nothing in turn 2 resets the fold, since turn 2 recorded
+    /// zero events of its own) and fast-forward turn 2 as if it had already run — dispatching NONE
+    /// of turn 2's real side effects. Turn-scoping the ledger/crash-tail fold to turn 2's own events
+    /// must instead resurrect turn 2 from statement 0, exactly as if turn 1 never existed.
+    #[tokio::test]
+    async fn identical_plan_reaccepted_in_a_later_turn_resurrects_from_statement_zero() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let ast = simple_plan();
+
+        // Turn 1: the identical plan runs to completion and closes cleanly.
+        let (turn1, _key) = seed_interrupted_turn(&events, &store, &ast, 3);
+        events
+            .end_turn("sess", turn1, "completed", 3, "done", None)
+            .unwrap();
+
+        // Turn 2: re-accepts the SAME plan, crashes before any progress of its own (no
+        // `StatementCompleted` at all) — left open.
+        let (turn2, _key2) = seed_interrupted_turn(&events, &store, &ast, 0);
+
+        let it = interrupted(&events, "sess")
+            .unwrap()
+            .expect("turn 2 is the open (crashed) turn");
+        assert_eq!(it.turn_id, turn2);
+        assert_eq!(
+            it.completed, 0,
+            "turn 2 made zero progress of its own — turn 1's completed statements must not leak in"
+        );
+
+        let live_calls = Arc::new(AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), live_calls.clone());
+        let mut sink = NullSink;
+        let report = resurrect(&events, &store, &ex, "sess", &[], &mut sink)
+            .await
+            .unwrap()
+            .expect("turn 2 is resurrectable");
+
+        assert_eq!(
+            report.statements_fast_forwarded, 0,
+            "nothing from turn 1 may be fast-forwarded into turn 2"
+        );
+        assert_eq!(report.ops_served_from_cassette, 0);
+        assert_eq!(
+            report.ops_run_live, 3,
+            "every one of turn 2's own statements must dispatch live from scratch"
+        );
+        assert_eq!(
+            live_calls.load(Ordering::SeqCst),
+            3,
+            "all three ops must actually run — none fast-forwarded, none served from turn 1"
+        );
+        assert_eq!(report.outcome, "resurrected");
+    }
+
+    /// D-181 scenario 2 (failing-first): an authored (plan-driven) turn completes, then a NATIVE
+    /// turn (no plan at all — dispatches ops directly, so it records `OpRecorded` cells but no
+    /// `StatementCompleted`/`PlanHalted` boundary) also completes cleanly, THEN a second authored
+    /// turn crashes before any progress of its own. A whole-session crash-tail fold's "last
+    /// boundary" search skips straight past the native turn's un-anchored cells (it has none) and
+    /// lands on the FIRST authored turn's last completed statement — so everything strictly after
+    /// that, including the entire native turn's cells, reads as "the crashed turn's crash tail" and
+    /// can be served into it. Turn-scoping must keep the native turn's cell out of the crashed
+    /// turn's own (empty) window entirely.
+    #[tokio::test]
+    async fn a_completed_native_turns_cells_are_never_served_into_a_later_crashed_turn() {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let ast = simple_plan();
+
+        // Turn A: authored, completes cleanly.
+        let (turn_a, _) = seed_interrupted_turn(&events, &store, &ast, 3);
+        events
+            .end_turn("sess", turn_a, "completed", 3, "done", None)
+            .unwrap();
+
+        // Turn B: purely native — no plan attempt, no statement boundary, just a recorded cell for
+        // the exact same zero-arg `counted()` shape turn C is about to dispatch — then closes clean.
+        let turn_b = events
+            .begin_turn("sess", "native tool call", "test-model")
+            .unwrap();
+        events
+            .record_run_event("sess", &counted_cell("native-leak", false))
+            .unwrap();
+        events
+            .end_turn("sess", turn_b, "completed", 1, "done", None)
+            .unwrap();
+
+        // Turn C: authored again (same plan shape), crashes before any progress of its own.
+        seed_interrupted_turn(&events, &store, &ast, 0);
+
+        let live_calls = Arc::new(AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), live_calls.clone());
+        let mut sink = NullSink;
+        let report = resurrect(&events, &store, &ex, "sess", &[], &mut sink)
+            .await
+            .unwrap()
+            .expect("turn C is resurrectable");
+
+        assert_eq!(
+            report.ops_served_from_cassette, 0,
+            "turn B's cell must never be served into turn C"
+        );
+        assert_eq!(
+            report.ops_run_live, 3,
+            "all three of turn C's ops must run live, not be served turn B's leftover cell"
+        );
+        assert_eq!(
+            live_calls.load(Ordering::SeqCst),
+            3,
+            "the tool must actually fire 3 times live"
+        );
+        assert_eq!(report.answer, "live-3");
+    }
+
+    /// D-181 scenario 3 (failing-first): a crashed turn with NO statement boundary at all (the
+    /// "purely native" shape a plan-driven turn can still land in — it crashed before finishing even
+    /// its first top-level statement) but which DID manage to dispatch and record one op before
+    /// dying. `crash_tail_cells` conservatively refuses to serve it (no boundary to anchor a tail
+    /// slice to), so it re-fires live — but that must be reported HONESTLY, not silently: both a
+    /// non-zero `unanchored_cells` count and a `diverged` message, not just a quiet re-fire.
+    #[tokio::test]
+    async fn a_purely_native_crash_tail_reports_its_unanchored_cells_honestly_instead_of_silently_refiring(
+    ) {
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let store = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let ast = simple_plan();
+
+        // Crashes before its own first `StatementCompleted` — but one op already fired and got
+        // recorded before the process died.
+        seed_interrupted_turn(&events, &store, &ast, 0);
+        events
+            .record_run_event("sess", &counted_cell("orphan-native", false))
+            .unwrap();
+
+        let live_calls = Arc::new(AtomicUsize::new(0));
+        let ex = counting_tool_executor(Arc::new(AllowApprover), live_calls.clone());
+        let mut sink = NullSink;
+        let report = resurrect(&events, &store, &ex, "sess", &[], &mut sink)
+            .await
+            .unwrap()
+            .expect("an interrupted turn exists");
+
+        assert_eq!(
+            report.unanchored_cells, 1,
+            "the one recorded-but-unanchored cell must be counted, not silently dropped"
+        );
+        assert!(
+            report.diverged.is_some(),
+            "an unanchored crash tail must be reported loudly, like any other divergence"
+        );
+        assert_eq!(report.ops_served_from_cassette, 0);
+        assert_eq!(
+            report.ops_run_live, 3,
+            "every op re-fires live, including the one that already ran before the crash"
+        );
+        assert_eq!(live_calls.load(Ordering::SeqCst), 3);
     }
 }

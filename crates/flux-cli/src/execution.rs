@@ -1300,10 +1300,15 @@ pub(super) async fn build_agent_with(
     Ok((agent, session_id, canonical_spec, spawner))
 }
 
-/// D-178/D-179 resurrect-on-open: if this session was killed mid-turn (a crash, OOM, or `kill -9`
-/// left a `TurnStarted` with no `TurnEnded`), finish that turn from its crash point BEFORE the new
-/// input runs — the plan is durable source, so no model call is made and no op with a recorded
-/// cassette cell re-fires. Always reported on stderr; never silent.
+/// D-178/D-179/D-183 resurrect-on-open: if this session was killed mid-turn (a crash, OOM, or
+/// `kill -9` left a `TurnStarted` with no `TurnEnded`), finish that turn from its crash point
+/// BEFORE the new input runs — the plan is durable source, so no model call is made and no op with
+/// a recorded cassette cell re-fires. Always reported on stderr; never silent.
+///
+/// The one shared [`flux_flow::resurrect::resurrect_on_open`] step every turn-entry point runs
+/// (D-183: this one-shot `flux run`, the REPL, and the TUI, plus the SDK's `send`/`send_with`/
+/// `stream`/`start_flow`) — this is the CLI's thin reporter over it, coloring
+/// [`flux_flow::resurrect::OnOpenLine`] the way the CLI's other status lines are colored.
 ///
 /// Never fatal. A session with nothing to resurrect is the overwhelmingly common case and stays
 /// quiet, and a session that CAN'T be resurrected (a crash during planning, before any plan was
@@ -1314,53 +1319,22 @@ pub(super) async fn resurrect_on_open(
     session_id: &str,
     sink: &mut dyn AgentSink,
 ) {
-    if std::env::var("FLUX_AUTO_RESURRECT").as_deref() == Ok("0") {
-        return;
-    }
-    match flux_flow::resurrect::interrupted(&agent.events, session_id) {
-        Ok(None) => return,
-        Ok(Some(it)) => eprintln!(
-            "{}",
-            style::dim(&format!(
-                "resurrect · session {session_id} · turn {} was interrupted after {} statement(s) \
-                 — finishing it offline (no model call)",
-                it.turn_id, it.completed
-            ))
-        ),
-        Err(e) => {
-            eprintln!("{} {e}", style::red("resurrect:"));
-            return;
-        }
-    }
-    match flux_flow::resurrect::resurrect(
+    flux_flow::resurrect::resurrect_on_open(
         &agent.events,
         &agent.flow,
         &agent.executor,
         session_id,
         &agent.composites.active_for_session(session_id),
         sink,
+        |line| match line {
+            flux_flow::resurrect::OnOpenLine::Info(msg) => eprintln!("{}", style::dim(&msg)),
+            flux_flow::resurrect::OnOpenLine::Error(msg) => eprintln!("{}", style::red(&msg)),
+            // `OnOpenLine` is `#[non_exhaustive]`; a future variant still gets printed, just
+            // without a color pairing yet.
+            other => eprintln!("resurrect: {other:?}"),
+        },
     )
-    .await
-    {
-        Ok(Some(report)) => {
-            eprintln!(
-                "{}",
-                style::dim(&format!(
-                    "resurrect · {} · {} statement(s) fast-forwarded, {} op(s) served from the \
-                     cassette, {} run live",
-                    report.outcome,
-                    report.statements_fast_forwarded,
-                    report.ops_served_from_cassette,
-                    report.ops_run_live
-                ))
-            );
-            if let Some(diverged) = &report.diverged {
-                eprintln!("{} {diverged}", style::red("resurrect diverged:"));
-            }
-        }
-        Ok(None) => {}
-        Err(e) => eprintln!("{} {e}", style::red("resurrect:")),
-    }
+    .await;
 }
 
 /// One-shot agentic turn.

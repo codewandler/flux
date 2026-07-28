@@ -2298,12 +2298,13 @@ pub struct CapScopeGuard<'a> {
 /// that refuses the call, so classification never has to guess from prose again.
 pub struct DispatchOutcome {
     pub result: ToolResult,
-    /// `true` iff the envelope itself refused to run the op: a capability-scope miss, the
-    /// authorization policy floor, a permission-rule deny, or the approver declining. A pre-tool
-    /// hook's `Deny` is deliberately excluded — hook denials are meant to stay retryable/repairable
-    /// rather than a terminal authorization refusal, exactly as before this flag existed (hook
-    /// denials never matched the old prefix heuristic either, since their wording is `` `{op}`
-    /// blocked by hook `` , not `` `{op}` denied by `` ).
+    /// `true` iff the envelope itself refused to run the op: an unknown tool name (D-184 — matches
+    /// [`Executor::authorize`]'s `Deny`, since a typo'd op can never succeed no matter how many times
+    /// `retry` tries it), a capability-scope miss, the authorization policy floor, a permission-rule
+    /// deny, or the approver declining. A pre-tool hook's `Deny` is deliberately excluded — hook
+    /// denials are meant to stay retryable/repairable rather than a terminal authorization refusal,
+    /// exactly as before this flag existed (hook denials never matched the old prefix heuristic
+    /// either, since their wording is `` `{op}` blocked by hook `` , not `` `{op}` denied by `` ).
     pub denied: bool,
     /// Monotonic phase attribution measured inside the safety envelope.
     pub timing: OperationTiming,
@@ -2925,13 +2926,19 @@ impl Executor {
         let dispatch = self.dispatch_seq.fetch_add(1, Ordering::Relaxed);
         let mut approval_wait = None;
         let Some(tool) = self.registry.get(name) else {
+            // D-184: an unknown tool is a structural refusal — the same bucket `authorize` already
+            // puts it in (`Deny`, below), and the one `ast::Node::Retry`'s own doc comment names as
+            // fatal ("policy denial, unknown op") — never a transient failure worth retrying. Before
+            // this fix `denied` was `false` here, so `flux_lang::runtime::call_failure` wrapped a
+            // typo'd op name in `FlowError::Runtime` and `retry`/`loop` burned attempts on a call that
+            // could never succeed.
             return self.finish_dispatch(
                 name,
                 started,
                 approval_wait,
                 None,
                 ToolResult::error(format!("unknown tool: {name}")),
-                false,
+                true,
             );
         };
 
@@ -5479,9 +5486,15 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 0);
     }
 
-    /// An unknown op is refused by both surfaces rather than silently admitted.
-    #[test]
-    fn authorize_denies_an_unknown_op() {
+    /// An unknown op is refused by both surfaces rather than silently admitted — and (D-184) the two
+    /// surfaces now agree on the CLASSIFICATION too, not just the outcome: `authorize` has always
+    /// called an unknown tool `Deny`, but `dispatch_outcome` used to report the identical refusal
+    /// with `denied: false` (the same shape a transient tool-side failure gets), so
+    /// `flux_lang::runtime::call_failure` wrapped a typo'd op name as a *retryable* `FlowError::Runtime`
+    /// instead of the fatal `FlowError::Denied` — burning `retry`/`loop` attempts on a call that could
+    /// never succeed. Both surfaces must classify it as denied.
+    #[tokio::test]
+    async fn authorize_denies_an_unknown_op() {
         let executor = authorize_executor(
             Arc::new(AtomicU64::new(0)),
             &["boom".into()],
@@ -5490,6 +5503,18 @@ mod tests {
         );
         let verdict = executor.authorize("no-such-op", &json!({}));
         assert!(verdict.is_denied(), "{verdict:?}");
+
+        let outcome = executor.dispatch_outcome("no-such-op", json!({})).await;
+        assert!(
+            outcome.denied,
+            "dispatch_outcome must classify an unknown tool as denied, exactly like authorize: {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            verdict.reason().unwrap(),
+            outcome.result.content,
+            "the two surfaces must not drift apart on the refusal wording"
+        );
     }
 
     #[test]

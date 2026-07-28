@@ -2,7 +2,7 @@
 id: D-181
 title: Scope the resurrect ledger and crash tail to the interrupted turn, not the session
 pillar: Agent
-status: ready
+status: done
 epic: deterministic-agent-lab
 design: docs/designs/deterministic-agent-lab.md
 priority: 1
@@ -35,22 +35,55 @@ Confirmed failure scenarios (2026-07-28 review):
    turn on precisely the sessions the SDK produces.
 
 ## Acceptance
-- [ ] The resume ledger and the crash-tail cell slice are built from the interrupted **turn's**
+- [x] The resume ledger and the crash-tail cell slice are built from the interrupted **turn's**
       events only (`turn_id`-scoped), not the whole session trace.
-- [ ] Failing-first test for scenario 1: identical plan re-accepted in a later turn, crash before
+- [x] Failing-first test for scenario 1: identical plan re-accepted in a later turn, crash before
       any progress → resurrect re-runs the turn from statement 0 (nothing fast-forwarded from the
       earlier turn).
-- [ ] Failing-first test for scenario 2: authored turn → completed native turn → crashed authored
+- [x] Failing-first test for scenario 2: authored turn → completed native turn → crashed authored
       turn; the native turn's cells are never served into the resurrected turn.
-- [ ] Scenario 3 documented honestly: state what a purely native crashed turn can and cannot
+- [x] Scenario 3 documented honestly: state what a purely native crashed turn can and cannot
       resurrect, and make `interrupted()`/`ResurrectReport` say so instead of silently re-firing.
-- [ ] The related content-vs-turn keying in `rerun_pinned`'s turn filter and `replay_turns_prefix`
+- [x] The related content-vs-turn keying in `rerun_pinned`'s turn filter and `replay_turns_prefix`
       (`crates/flux-flow/src/whatif.rs` — `flow_key` set membership lets a repeated identical plan
       leak the target turn's execution into the prefix) is fixed with the same turn attribution, or
       split into its own follow-up with a test pinning the leak.
 
 ## Progress
-- (not started)
+- 2026-07-28: Implemented. `RunEvent`s turned out to carry no `turn_id` at write time anywhere in
+  the live pipeline (`FlowStore::append_event` → `EventStore::record_run_event` never calls
+  `NewEvent::in_turn`; wiring that through the write path lives in `flux-flow/src/state.rs` and
+  `flux-events`, outside this story's file ownership). Fixed on the READ side instead: added
+  `crate::cassette::turn_run_trace`/`turns_run_trace` (`crates/flux-flow/src/cassette.rs`), which
+  positionally windows `EventStore::load_stream` between one (or several) turns' own
+  `TurnStarted.global_seq` boundaries and reuses the existing `flux_events::run_trace` projection —
+  achieving the identical `turn_id`-scoped partition as a pure read-side fix, no write-path or
+  cross-crate change. `resurrect.rs`'s `interrupted`/`resurrect` and `whatif.rs`'s
+  `selected_execution_keys`/`replay_turns_prefix` now derive their traces from this instead of
+  `EventStore::run_trace(session)` (whole session) or `flow_key` set-membership filtering.
+  `ResumeLedger::from_interrupted` (`flux-lang/src/runtime.rs`) needed no logic change — it was
+  already correctly turn-local once given a turn-scoped input slice; only its doc comments were
+  extended to state the turn-scoping contract on the input it expects.
+  Added `ResurrectReport::unanchored_cells: usize` (additive field on the already `#[non_exhaustive]`
+  struct — verified `cargo check -p codewandler-flux-sdk --tests` still compiles unchanged) for
+  scenario 3's honest reporting, folded into `diverged` too.
+  6 new failing-first tests (regression-pinned by temporarily reverting the fix in place, confirming
+  each fails for the intended reason, then restoring it): 3 in `resurrect.rs`
+  (`identical_plan_reaccepted_in_a_later_turn_resurrects_from_statement_zero`,
+  `a_completed_native_turns_cells_are_never_served_into_a_later_crashed_turn`,
+  `a_purely_native_crash_tail_reports_its_unanchored_cells_honestly_instead_of_silently_refiring`)
+  and 2 in `whatif.rs` (`rerun_pinned_turn_filter_does_not_leak_a_repeated_identical_plans_other_turn`,
+  `replay_turns_prefix_does_not_leak_the_target_turns_identical_plan`).
+  Also disabled the `Executor`'s read-only op cache (`.with_op_cache(false)`) in
+  `resurrect.rs`'s shared `counting_tool_executor` test helper — it's ON by default and was
+  silently memoizing the new tests' 3 back-to-back identical zero-arg `counted()` dispatches,
+  an orthogonal optimization unrelated to Resurrect's own exactly-once bookkeeping.
+  Gate: `cargo test -p codewandler-flux-flow -p codewandler-flux-lang` (184 + 361 + integration
+  suites, all green), `cargo clippy -p codewandler-flux-flow -p codewandler-flux-lang --all-targets
+  -- -D warnings` (clean), `cargo fmt --check -p codewandler-flux-flow -p codewandler-flux-lang`
+  (clean). A whole-workspace `cargo fmt --all -- --check` shows one pre-existing diff in
+  `crates/flux-sdk/src/test.rs`, outside this story's file ownership (a concurrent session's
+  in-progress work) and untouched here.
 
 ## Notes
 - Same root cause across all findings: content-addressed plan identity (`flow_key`) with no turn

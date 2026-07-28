@@ -245,6 +245,13 @@ fn node_to_cell_index(trace: &[flux_lang::ast::RunEvent], node: u32) -> Option<u
 /// Build the [`FrozenTape`] a `WhatIf::run()` pins: `src`'s recorded trace, every `.substitute`/
 /// `.substitute_at` applied, off-tape mode `off_tape` — `Live` needs `bridge` (a [`RecordScope`]
 /// pointed at the destination session).
+///
+/// D-182/D-184: errors, naming the node, if a `.substitute_at(node, _)` target maps to no recorded
+/// dispatch at all (`node_to_cell_index` → `None` — a typo'd node id, a node with no statement, or a
+/// statement that made no dispatch). This used to be a silent no-op: the substitution was simply
+/// dropped, and the caller had no way to tell "targeted node, no change" apart from "node doesn't
+/// exist" — both looked like an honest identical run. Handed over from D-184 (same file, filed there
+/// as a concurrent-ownership conflict; fixed here in the D-182 pass).
 fn build_frozen(
     trace: &[flux_lang::ast::RunEvent],
     substitute_ops: &[(String, serde_json::Value)],
@@ -252,7 +259,7 @@ fn build_frozen(
     off_tape: OffTape,
     bridge: Option<RecordScope>,
     reauthorize: bool,
-) -> FrozenTape {
+) -> Result<FrozenTape> {
     let tape = ReplayTape::from_trace(trace);
     let mut frozen = match off_tape {
         OffTape::Halt => FrozenTape::hermetic(tape),
@@ -266,11 +273,15 @@ fn build_frozen(
         frozen = frozen.substitute_op(op.clone(), substitution_outcome(value));
     }
     for (node, value) in substitute_nodes {
-        if let Some(index) = node_to_cell_index(trace, *node) {
-            frozen = frozen.substitute_cell(index, substitution_outcome(value));
-        }
+        let index = node_to_cell_index(trace, *node).ok_or_else(|| {
+            flux_core::Error::Other(format!(
+                "substitute_at({node}, _) targets a node with no recorded dispatch — it has no \
+                 statement, or that statement never called an op, so there is no cell to substitute"
+            ))
+        })?;
+        frozen = frozen.substitute_cell(index, substitution_outcome(value));
     }
-    frozen
+    Ok(frozen)
 }
 
 impl Session {
@@ -447,7 +458,7 @@ impl WhatIf {
                 self.off_tape,
                 bridge,
                 self.permissions.is_some(),
-            );
+            )?;
             let scope = Arc::new(CassetteScope::Frozen(frozen));
 
             flux_flow::whatif::rerun_pinned(
@@ -515,13 +526,34 @@ impl WhatIf {
             self.off_tape,
             Some(bridge),
             self.permissions.is_some(),
-        );
+        )?;
         let scope = Arc::new(CassetteScope::Frozen(frozen));
 
+        // D-182: `run_turn_pinned` here re-plans exactly one LIVE turn under `scope` — every
+        // dispatch the new plan makes that still matches the frozen world is SERVED, and nothing
+        // else ever records a served hit onto `dst` (the cassette layer only ever records a LIVE
+        // fall-through's tail). Without self-recording here, a re-plan whose new plan happens to be
+        // identical (or served in full) would leave `dst`'s own trace with zero cells, and
+        // `Counterfactual::diff()` would read that as a fake total divergence while `hermetic()`
+        // reports `true` — exactly the gap `flux_flow::whatif::rerun_pinned` and the SDK's own
+        // `Scenario::check` already close with `RerunRecordingSink`. `defer_for_live_bridge` covers
+        // `OffTape::Live`: a fall-through dispatch is already recorded by `FrozenTape::record_tail`
+        // via `bridge` above, so deferring to `finish()` keeps this sink from double-recording it —
+        // see `RerunRecordingSink::defer_for_live_bridge`'s doc for why a real-time check can't do
+        // this reliably behind the agent loop's own composite dispatch relay.
+        let redactor = variant.executor.context().redactor.clone();
+        let record = RecordScope::new(variant.events.clone(), dst.clone());
+        let mut rec_sink =
+            flux_flow::whatif::RerunRecordingSink::new(&mut sink, record, redactor, true);
+        if matches!(self.off_tape, OffTape::Live) {
+            rec_sink = rec_sink.defer_for_live_bridge();
+        }
+
         variant
-            .run_turn_pinned(&dst, &user_input, scope.clone(), &mut sink)
+            .run_turn_pinned(&dst, &user_input, scope.clone(), &mut rec_sink)
             .await
             .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+        rec_sink.finish();
 
         let hermetic = matches!(scope.as_ref(), CassetteScope::Frozen(f) if f.is_hermetic());
         let outcome = Session {

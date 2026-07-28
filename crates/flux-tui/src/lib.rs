@@ -1572,6 +1572,35 @@ pub async fn run(
     .await
 }
 
+/// A throwaway [`AgentSink`] that discards every event — the TUI's D-183 resurrect-on-open step
+/// runs before the terminal (and its live [`controller::ChannelSink`]) exist, and the resurrected
+/// turn's persisted result is picked up anyway once `project_session`/`load_history` project the
+/// session, so nothing needs to consume the stream here.
+struct DiscardSink;
+impl AgentSink for DiscardSink {}
+
+/// D-183: the shared [`flux_flow::resurrect::resurrect_on_open`] step, reported to plain stderr —
+/// the TUI has no `flux-cli`-style color chrome of its own, so every line (status or error) just
+/// prints as-is. Mirrors the CLI's own reporter over the same shared step
+/// (`flux-cli/src/execution.rs`'s `resurrect_on_open`) one-for-one, minus the coloring.
+async fn resurrect_on_open(agent: &FlowEngine, session_id: &str) {
+    let mut sink = DiscardSink;
+    flux_flow::resurrect::resurrect_on_open(
+        &agent.events,
+        &agent.flow,
+        &agent.executor,
+        session_id,
+        &agent.composites.active_for_session(session_id),
+        &mut sink,
+        |line| match line {
+            flux_flow::resurrect::OnOpenLine::Info(msg) => eprintln!("{msg}"),
+            flux_flow::resurrect::OnOpenLine::Error(msg) => eprintln!("{msg}"),
+            other => eprintln!("resurrect: {other:?}"),
+        },
+    )
+    .await;
+}
+
 /// Run the interactive TUI with optional surface capabilities such as live model resolution.
 pub async fn run_with_options(
     agent: FlowEngine,
@@ -1595,6 +1624,13 @@ pub async fn run_with_options(
     if !std::io::stdin().is_terminal() || !out.is_terminal() {
         anyhow::bail!("flux tui requires a real terminal on stdin and stdout");
     }
+
+    // D-183: the TUI is a turn-entry point too — finish an interrupted turn from a prior crash
+    // BEFORE the terminal takes over the screen (a plain stderr line the user can actually read,
+    // same `FLUX_AUTO_RESURRECT=0` opt-out as the CLI's REPL and one-shot `flux run`) and before
+    // `project_session`/`load_history` project the session below, so the resurrected turn's own
+    // persisted messages show up in the transcript like any other turn's.
+    resurrect_on_open(&agent, &session_id).await;
 
     let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
     let mut state = ChatState::for_session(model, session_id.clone()).with_verbose(verbose);
