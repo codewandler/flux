@@ -500,7 +500,11 @@ fn render_setting(setting: &flux_config::EffectiveSetting) -> String {
         flux_config::ConfigLayer::BuiltIn => "built-in",
     };
     if setting.pinned {
-        format!("{}={} ({layer}, pinned)", setting.key.as_str(), setting.value)
+        format!(
+            "{}={} ({layer}, pinned)",
+            setting.key.as_str(),
+            setting.value
+        )
     } else {
         format!("{}={} ({layer})", setting.key.as_str(), setting.value)
     }
@@ -1046,6 +1050,74 @@ mod tests {
         assert!(out.detail.contains("web"));
     }
 
+    // -- config provenance (C-165) ---------------------------------------------------------------
+
+    #[test]
+    fn judge_config_provenance_passes_and_names_every_key_when_nothing_is_managed() {
+        let settings = flux_config::effective_settings(
+            &flux_config::Config::default(),
+            &flux_config::Config::default(),
+            &flux_config::Config::default(),
+        );
+        let out = judge_config_provenance(&settings);
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(out.detail.contains("no managed pins in effect"));
+        for (name, _) in flux_config::PinnableKey::ALL {
+            assert!(
+                out.detail.contains(name),
+                "{name} missing from provenance detail: {}",
+                out.detail
+            );
+        }
+    }
+
+    #[test]
+    fn judge_config_provenance_names_the_pinned_key_and_its_managed_value() {
+        let managed = flux_config::Config {
+            managed: flux_config::ManagedMeta {
+                pins: vec!["private_net.web".to_string()],
+            },
+            private_net: flux_config::PrivateNetConfig {
+                web: flux_config::PrivateNetGrant::Hosts(vec!["reports.internal".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let settings = flux_config::effective_settings(
+            &managed,
+            &flux_config::Config::default(),
+            &flux_config::Config::default(),
+        );
+        let out = judge_config_provenance(&settings);
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(out.detail.contains("1 setting(s) pinned by managed config"));
+        assert!(out.detail.contains("private_net.web"));
+        assert!(out.detail.contains("managed"));
+        assert!(out.detail.contains("pinned"));
+    }
+
+    /// Wired correctly end-to-end: `check_config_provenance` reads the three raw layers off
+    /// `DoctorCtx`, not the already-merged `cfg` — a project-only setting must be attributed to
+    /// `project`, not silently folded into an unattributed merged value.
+    #[test]
+    fn check_config_provenance_attributes_a_project_only_setting_to_the_project_layer() {
+        let mut project_cfg = flux_config::Config::default();
+        project_cfg.workspace.allow_all = true;
+        let ctx = DoctorCtx {
+            cfg: project_cfg.clone(),
+            managed_cfg: flux_config::Config::default(),
+            user_cfg: flux_config::Config::default(),
+            project_cfg,
+            own_version: "0.0.0",
+            release_tags: Ok(vec![]),
+            plugins_dir: None,
+            events_db_path: None,
+        };
+        let out = check_config_provenance(&ctx);
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(out.detail.contains("workspace.allow_all=true (project)"));
+    }
+
     // -- version skew -----------------------------------------------------------------------------
 
     #[test]
@@ -1165,6 +1237,9 @@ mod tests {
         ];
         let ctx = DoctorCtx {
             cfg: flux_config::Config::default(),
+            managed_cfg: flux_config::Config::default(),
+            user_cfg: flux_config::Config::default(),
+            project_cfg: flux_config::Config::default(),
             own_version: "0.0.0",
             release_tags: Ok(vec![]),
             plugins_dir: None,

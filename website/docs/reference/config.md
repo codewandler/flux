@@ -6,10 +6,12 @@ description: "Complete .flux/config.toml reference: precedence, permissions, net
 # Configuration
 
 flux works without a config file. User defaults live in `~/.flux/config.toml`; a project can add
-`.flux/config.toml` at its workspace root.
+`.flux/config.toml` at its workspace root. An operator can additionally pin an organization-wide
+floor ahead of both — see [Managed configuration tier](#managed-configuration-tier-operator-floor)
+below.
 
-The broad precedence is CLI flags > project config > user config > built-in defaults, but merging is
-intentional rather than simple replacement:
+The broad precedence is CLI flags > project config > user config > managed config > built-in
+defaults, but merging is intentional rather than simple replacement:
 
 - scalar values use the project value when present;
 - permission lists, policy grants, endpoint credential grants, private-network host lists, and the
@@ -303,6 +305,56 @@ The CLI exports the resolved posture so a child flux invocation (`app run`, an e
 reference — platform coverage, the posture matrix, the browser exemption, and what v1 does not
 defend against.
 
+## Managed configuration tier (operator floor)
+
+A third config layer loads **ahead of** both user and project config: a system-owned **managed**
+file, read from `/etc/flux/config.toml` on Linux/macOS, or from the exact path named by
+`FLUX_MANAGED_CONFIG` (the explicit channel for containerized deploys — there's no conventional
+`/etc` inside a container image, and Windows deployments should use this too since there is no
+wired platform convention there yet). A missing managed file is the ordinary case and changes
+nothing.
+
+The managed file is an ordinary `.flux/config.toml` document (same schema, same keys) plus one
+extra table:
+
+```toml
+# /etc/flux/config.toml
+[managed]
+pins = ["private_net.web", "policy", "tools.disable"]
+
+[private_net]
+web = ["reports.internal.example"]   # the only host a project/user may reach; not "true"
+
+[tools]
+disable = ["browser.*"]
+
+[[policy.grants]]
+subjects  = [{ kind = "user", id = "*" }]
+resources = [{ kind = "workspace", id = "*" }]
+actions   = ["workspace.read"]
+```
+
+Every value in a managed file is a **default** unless its dotted key path is also listed in
+`[managed] pins` — a default still fills in when nothing downstream sets it, but a project or user
+config may freely change it. A **pinned** key is different: a downstream layer may only make it
+*more* restrictive. An attempt to relax a pin (say, a project config setting `[private_net] web =
+true` under the example above, which would open egress beyond the pinned host) is refused at load
+time with a diagnostic naming the pinned key, never silently merged away or silently allowed.
+Making the effective config stricter than the managed floor — narrowing a host list, adding more
+entries to `[tools] disable`, leaving a pinned key untouched — is always permitted.
+
+v1's pinnable keys are the security-relevant ones: the `[[policy.grants]]` authorization floor,
+`[private_net] web` egress, the `[tools] disable` blocklist, and the `[sandbox]`/`[workspace]
+allow_all` confinement knobs. The set is deliberately small and can grow.
+
+**This is an operator control, not a defense against your own machine.** The managed file's
+authority comes entirely from filesystem permissions on that one file (e.g. `/etc/flux/config.toml`
+owned by root, not writable by the account running `flux`). Anyone who can write that file, or who
+owns the machine outright and can patch the `flux` binary, can bypass it — the same honest limit
+that applies to every local control described in [Security overview](../security/overview.md). Its
+job is stopping an ordinary developer from *accidentally or casually* loosening an audited baseline,
+not resisting a privileged attacker on the same host.
+
 ## Endpoint brokerage
 
 `[endpoint] cross_plugin_credentials` grants a consumer plugin permission to use a credential owned
@@ -338,7 +390,9 @@ listener.
 
 Common runtime overrides include `FLUX_VERBOSE=1`, `FLUX_SHOW_LOOP=1`,
 `FLUX_TURN_TOKEN_BUDGET`, `FLUX_COMPACT_CHARS`, `FLUX_ENABLE_BASH=1`,
-`FLUX_BROWSER_BIN`, `FLUX_ALLOW_PRIVATE_NET=1`, `OLLAMA_HOST`, `FLUX_SANDBOX` (`off`/`on`/`require`),
+`FLUX_BROWSER_BIN`, `FLUX_ALLOW_PRIVATE_NET=1`, `FLUX_MANAGED_CONFIG` (path to the managed config
+file, overriding the `/etc/flux/config.toml` convention), `OLLAMA_HOST`,
+`FLUX_SANDBOX` (`off`/`on`/`require`),
 `FLUX_SANDBOX_NET`, `FLUX_SANDBOX_WRITABLE`, `FLUX_BWRAP_BIN`, `FLUX_SANDBOX_EXEC_BIN`, and the
 provider API-key variables listed under [Providers and models](../agent/providers.md).
 Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values such as `0` and
@@ -351,3 +405,7 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 - [Endpoints](../agent/endpoints.md) — weak references and cross-plugin credentials.
 - [Credentials & secrets](../security/credentials.md) — token storage and redaction.
 - [OS process sandboxing](../security/os-sandbox.md) — the full `[sandbox]` reference.
+- [Security overview](../security/overview.md) — the honest-posture summary this doc's managed
+  tier and sandbox sections both back.
+- `flux doctor` (C-128) — its "config provenance" check answers "why can't I enable this" with the
+  effective value and layer of every pinnable key.

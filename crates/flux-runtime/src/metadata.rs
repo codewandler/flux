@@ -32,9 +32,54 @@ fn trusted_flux_root() -> Result<Option<(PathBuf, System)>> {
     Ok(trusted_root(&root)?.map(|system| (root, system)))
 }
 
-/// Load trusted user defaults and guarded project configuration, preserving the established
-/// project-over-user merge order. Missing files are harmless; guard and parse failures are loud.
-pub fn load_config(cwd: &Path) -> Result<flux_config::Config> {
+/// The label under which the managed config's diagnostics are reported (parse errors, pin
+/// violations) — not a real relative path, since the managed root varies by platform/override.
+const MANAGED_CONFIG_LABEL: &str = "managed config (/etc/flux/config.toml or $FLUX_MANAGED_CONFIG)";
+
+/// Resolve the managed config's containing directory and file name (C-165). `FLUX_MANAGED_CONFIG`
+/// names an exact file and wins outright — the explicit channel for containerized deploys, where
+/// there is no conventional `/etc`. Otherwise `/etc/flux/config.toml` is the Linux/macOS system
+/// convention; there is no wired convention on any other platform (Windows deployments should set
+/// `FLUX_MANAGED_CONFIG`). Returns `None` when neither applies — a configured-but-absent *file* is
+/// the ordinary "operator hasn't pinned anything yet" case and is handled by
+/// `read_optional_text` returning `None`, not here.
+fn managed_config_root_and_name() -> Option<(PathBuf, String)> {
+    if let Some(over) = std::env::var_os("FLUX_MANAGED_CONFIG") {
+        let path = PathBuf::from(over);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".to_string());
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        return Some((dir, name));
+    }
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Some((PathBuf::from("/etc/flux"), "config.toml".to_string()));
+    }
+    None
+}
+
+/// Read the managed config's text through the same guarded `System`/`Workspace` confinement as
+/// every other control-plane read. `None` when there is no managed root on this platform/override,
+/// or the root exists but the file doesn't — both are the ordinary unmanaged case.
+fn managed_config_text() -> Result<Option<String>> {
+    let Some((dir, name)) = managed_config_root_and_name() else {
+        return Ok(None);
+    };
+    match trusted_root(&dir)? {
+        Some(system) => system.read_optional_text(&name),
+        None => Ok(None),
+    }
+}
+
+/// Read the managed, user, and project config texts through the same guarded confinement, without
+/// parsing or merging them. Shared by [`load_config`] (which merges) and [`config_layers`] (which
+/// hands back the raw per-layer texts for provenance reporting — e.g. `flux doctor`'s "config
+/// provenance" check, C-165).
+fn read_config_texts(cwd: &Path) -> Result<(Option<String>, Option<String>, Option<String>)> {
     let project = project_system(cwd)?;
     let project_text = project.read_optional_text(PROJECT_CONFIG)?;
     let trusted = trusted_flux_root()?;
@@ -43,13 +88,58 @@ pub fn load_config(cwd: &Path) -> Result<flux_config::Config> {
         .map(|(_, system)| system.read_optional_text("config.toml"))
         .transpose()?
         .flatten();
+    let managed_text = managed_config_text()?;
+    Ok((managed_text, user_text, project_text))
+}
 
-    flux_config::from_sources(
+/// Load the managed floor (C-165), trusted user defaults, and guarded project configuration,
+/// preserving the established managed-over-user-over-project precedence for defaults (a pin
+/// narrows what user/project may do further — see `flux_config::from_sources_with_managed`).
+/// Missing files are harmless; guard, parse, and pin-violation failures are loud.
+pub fn load_config(cwd: &Path) -> Result<flux_config::Config> {
+    let (managed_text, user_text, project_text) = read_config_texts(cwd)?;
+
+    flux_config::from_sources_with_managed(
+        managed_text
+            .as_deref()
+            .map(|text| (MANAGED_CONFIG_LABEL, text)),
         user_text
             .as_deref()
             .map(|text| ("~/.flux/config.toml", text)),
         project_text.as_deref().map(|text| (PROJECT_CONFIG, text)),
     )
+}
+
+/// Parse the managed/user/project layers individually (each defaulting to `Config::default()` when
+/// absent) without merging them — the raw material [`flux_config::effective_settings`] needs to
+/// report which layer supplied each pinnable key's value (C-165). Reads the same guarded sources as
+/// [`load_config`]; parse failures are loud, exactly as they are there.
+pub fn config_layers(
+    cwd: &Path,
+) -> Result<(
+    flux_config::Config,
+    flux_config::Config,
+    flux_config::Config,
+)> {
+    let (managed_text, user_text, project_text) = read_config_texts(cwd)?;
+    let parse = |source: Option<(&str, &str)>| -> Result<flux_config::Config> {
+        source
+            .map(|(name, text)| flux_config::parse_source(name, text))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    let managed = parse(
+        managed_text
+            .as_deref()
+            .map(|text| (MANAGED_CONFIG_LABEL, text)),
+    )?;
+    let user = parse(
+        user_text
+            .as_deref()
+            .map(|text| ("~/.flux/config.toml", text)),
+    )?;
+    let project = parse(project_text.as_deref().map(|text| (PROJECT_CONFIG, text)))?;
+    Ok((managed, user, project))
 }
 
 /// Atomically persist project allow rules through the same repository-only path identity used for
@@ -484,6 +574,10 @@ pub fn expand_command_arguments(body: &str, raw_args: &str) -> String {
 /// env is shared across parallel test threads (mirrors `flux_config`'s `HOME_LOCK`).
 #[cfg(test)]
 pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes tests that set `FLUX_MANAGED_CONFIG` (C-165) — same rationale as `HOME_LOCK`.
+#[cfg(test)]
+static MANAGED_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1136,5 +1230,170 @@ mod tests {
         let body = "!`git status` and @README.md with $1";
         let out = expand_command_arguments(body, "x");
         assert_eq!(out, "!`git status` and @README.md with x");
+    }
+
+    // -----------------------------------------------------------------------
+    // C-165: managed config tier — the guarded FS load, ahead of user/project.
+    // -----------------------------------------------------------------------
+
+    /// `FLUX_MANAGED_CONFIG` names an exact file and is read through the same guarded
+    /// `System`/`Workspace` confinement as `~/.flux/config.toml` and the project config, then
+    /// wins as the lowest-precedence default when nothing downstream sets the same key.
+    #[test]
+    fn load_config_reads_flux_managed_config_env_override() {
+        let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
+        let managed_dir = temp_dir("managed");
+        let managed_path = managed_dir.join("managed.toml");
+        std::fs::write(&managed_path, "model = \"org-default\"\n").unwrap();
+
+        let root = temp_dir("managed-root");
+        std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
+        let result = load_config(&root);
+        std::env::remove_var("FLUX_MANAGED_CONFIG");
+
+        let cfg = result.unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("org-default"));
+
+        std::fs::remove_dir_all(&managed_dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The managed floor loads *ahead of* both user and project (C-165): it fills in when neither
+    /// sets a value, but an un-pinned managed value is still a default a downstream layer may
+    /// change — only a pinned key refuses a relaxing override, asserted end-to-end through
+    /// `load_config` (not just the pure `flux_config` merge).
+    #[test]
+    fn load_config_managed_layer_precedes_user_and_project_for_defaults() {
+        let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
+        let _home_guard = HOME_LOCK.lock().unwrap();
+
+        let managed_dir = temp_dir("managed-prec");
+        let managed_path = managed_dir.join("managed.toml");
+        std::fs::write(&managed_path, "theme = \"dark\"\n").unwrap();
+
+        let home = temp_dir("managed-prec-home");
+        std::env::set_var("HOME", &home);
+
+        let root = temp_dir("managed-prec-root");
+        std::fs::create_dir_all(root.join(".flux")).unwrap();
+        std::fs::write(
+            root.join(".flux").join("config.toml"),
+            "theme = \"light\"\n",
+        )
+        .unwrap();
+
+        std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
+        let with_project_override = load_config(&root).unwrap();
+        std::env::remove_var("FLUX_MANAGED_CONFIG");
+        assert_eq!(
+            with_project_override.theme.as_deref(),
+            Some("light"),
+            "an un-pinned managed default still yields to an explicit project value"
+        );
+
+        let bare_root = temp_dir("managed-prec-bare");
+        std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
+        let bare = load_config(&bare_root).unwrap();
+        std::env::remove_var("FLUX_MANAGED_CONFIG");
+        assert_eq!(
+            bare.theme.as_deref(),
+            Some("dark"),
+            "the managed layer supplies the value when neither user nor project sets it"
+        );
+
+        std::fs::remove_dir_all(&managed_dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&bare_root).ok();
+    }
+
+    /// A pinned managed key refuses a relaxing downstream value with a named diagnostic, surfaced
+    /// as a `load_config` error rather than a silently-applied override — proven through the real
+    /// guarded FS path, not just the pure `flux_config` merge function.
+    #[test]
+    fn load_config_surfaces_a_pin_violation_as_a_named_error() {
+        let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
+        let managed_dir = temp_dir("managed-pin");
+        let managed_path = managed_dir.join("managed.toml");
+        std::fs::write(
+            &managed_path,
+            "[managed]\npins = [\"private_net.web\"]\n\n[private_net]\nweb = false\n",
+        )
+        .unwrap();
+
+        let root = temp_dir("managed-pin-root");
+        std::fs::create_dir_all(root.join(".flux")).unwrap();
+        std::fs::write(
+            root.join(".flux").join("config.toml"),
+            "[private_net]\nweb = true\n",
+        )
+        .unwrap();
+
+        std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
+        let result = load_config(&root);
+        std::env::remove_var("FLUX_MANAGED_CONFIG");
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("private_net.web"), "{err}");
+
+        std::fs::remove_dir_all(&managed_dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// No `FLUX_MANAGED_CONFIG` and (on this test host) no `/etc/flux/config.toml` is the ordinary
+    /// unmanaged case — `load_config` behaves exactly as before C-165.
+    #[test]
+    fn load_config_without_any_managed_source_is_unaffected() {
+        let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
+        std::env::remove_var("FLUX_MANAGED_CONFIG");
+        let root = temp_dir("no-managed");
+        assert!(load_config(&root).is_ok());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `config_layers` hands back the three raw (pre-merge) layers so a caller — `flux doctor`'s
+    /// "config provenance" check — can feed them to `flux_config::effective_settings` (C-165).
+    /// Each layer parses independently of the others; a project-only setting must not leak into
+    /// the returned "user" or "managed" configs.
+    #[test]
+    fn config_layers_returns_each_raw_unmerged_layer() {
+        let _lock = MANAGED_CONFIG_LOCK.lock().unwrap();
+        let _home_guard = HOME_LOCK.lock().unwrap();
+
+        let managed_dir = temp_dir("layers-managed");
+        let managed_path = managed_dir.join("managed.toml");
+        std::fs::write(
+            &managed_path,
+            "[managed]\npins = [\"private_net.web\"]\n\n[private_net]\nweb = false\n",
+        )
+        .unwrap();
+
+        let home = temp_dir("layers-home");
+        std::env::set_var("HOME", &home);
+
+        let root = temp_dir("layers-root");
+        std::fs::create_dir_all(root.join(".flux")).unwrap();
+        std::fs::write(
+            root.join(".flux").join("config.toml"),
+            "theme = \"light\"\n",
+        )
+        .unwrap();
+
+        std::env::set_var("FLUX_MANAGED_CONFIG", &managed_path);
+        let (managed, user, project) = config_layers(&root).unwrap();
+        std::env::remove_var("FLUX_MANAGED_CONFIG");
+
+        assert!(managed.managed.pins.iter().any(|p| p == "private_net.web"));
+        assert!(user.theme.is_none(), "no user config was written");
+        assert_eq!(project.theme.as_deref(), Some("light"));
+        assert_eq!(
+            project.private_net.web,
+            flux_config::PrivateNetGrant::default(),
+            "the project layer never set private_net.web"
+        );
+
+        std::fs::remove_dir_all(&managed_dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

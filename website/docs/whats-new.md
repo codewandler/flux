@@ -20,6 +20,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   comes with a one-line hint for fixing it. `--json` for scripts; the exit code fails only on real
   failures, never on warnings.
 
+- **Organizations can now pin a security baseline.** A managed config file
+  (`/etc/flux/config.toml`, or wherever `FLUX_MANAGED_CONFIG` points) loads ahead of user and
+  project config. Settings there are defaults users may change — unless the operator *pins* them,
+  in which case any attempt to relax them is refused with a clear message naming the pinned key.
+  Making things stricter locally always stays allowed, and `flux doctor` shows which layer each
+  security setting came from. Honest scope: this is an operator control backed by file
+  permissions, not protection against someone who owns the machine.
+
 ### Improved
 
 - **The pickers got faster to drive.** Type into the session picker to filter it — matching is the

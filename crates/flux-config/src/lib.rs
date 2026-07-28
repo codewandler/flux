@@ -1,12 +1,21 @@
 //! `flux-config` — layered project/user configuration for the `flux` binary.
 //!
-//! Two files are read and merged: `~/.flux/config.toml` (user defaults) then
+//! Two files are read and merged by [`from_sources`]: `~/.flux/config.toml` (user defaults) then
 //! `<cwd>/.flux/config.toml` (project, takes precedence). A missing file is not an error — it
 //! contributes nothing; a malformed file is an error. CLI flags layer on top of the result (the
 //! caller resolves that). The config carries the coder-style permission rules, an optional default
 //! model, an optional [`AuthorizationPolicy`] (extends [`flux_policy::default_local_grants`]), and
 //! scoped private-network egress grants. Filesystem discovery and atomic persistence live in the
 //! guarded outer control plane; this crate parses, merges, and serializes injected documents.
+//!
+//! [`from_sources_with_managed`] adds an optional third **managed** layer ahead of both (C-165): a
+//! system-owned floor (`/etc/flux/config.toml` on Linux/macOS, or `FLUX_MANAGED_CONFIG` for
+//! containerized deploys — the guarded read lives in `flux-runtime`'s metadata loader, same as the
+//! other two). Its `[managed] pins` distinguish plain defaults (the user may still change them)
+//! from pins (a downstream layer may only make the value *more* restrictive; a relaxation is a
+//! named, refused [`Error::Config`], not a silent merge). This is an **operator** control backed
+//! by filesystem permissions on the managed file — not a defense against a user who owns the
+//! machine and can edit the binary; see `website/docs/security/overview.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
@@ -404,6 +413,272 @@ impl ConsultConfig {
     }
 }
 
+/// The `[wakeup]` table (A-98): the agent-set wake-up op's surfacing switch, per-session cap, and
+/// maximum horizon. `enabled = false` (the default) keeps `schedule_wakeup` off the catalog
+/// entirely — an operator opts in explicitly, mirroring `enable_shell`'s off-by-default posture.
+/// Registering a wake-up ALSO needs authority (an `AuthorityRequirement::host_write` resolved
+/// against the existing approval-gated `host.write` default policy grant) — this table only
+/// bounds an already-approved registration, it does not itself grant one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeupConfig {
+    /// Surfaces the `schedule_wakeup` op. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum horizon (seconds) a single wake-up may be scheduled for. Absent means the built-in
+    /// default (see `flux_flow::wakeup::DEFAULT_MAX_HORIZON_SECS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_horizon_secs: Option<u64>,
+    /// Maximum number of wake-ups that may be pending at once per session. Absent means the
+    /// built-in default (see `flux_flow::wakeup::DEFAULT_MAX_PENDING_PER_SESSION`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending_per_session: Option<usize>,
+}
+
+impl WakeupConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled && self.max_horizon_secs.is_none() && self.max_pending_per_session.is_none()
+    }
+}
+
+/// One security-relevant key a **managed** config layer may pin (C-165). Deliberately a closed
+/// enum rather than a free-form dotted string: every entry has a defined "would a downstream
+/// value relax this" comparator in [`pin_violation`], so growing the pinnable set means adding a
+/// variant + arm, not accepting an arbitrary path nobody checks. v1 covers the categories named in
+/// the story — the authorization floor, egress/private-network grants, the `[tools] disable`
+/// blocklist, and the sandbox/workspace-confinement knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PinnableKey {
+    /// `[tools] disable` (C-162). Union-merged already, so the pinned entries can never be
+    /// removed by a downstream layer — pinning documents the floor rather than closing a live
+    /// relax path.
+    ToolsDisable,
+    /// `[private_net] web` — the family-wide egress scope for the native web ops. `merge_grant`'s
+    /// direction genuinely widens on merge (`Enabled(true)` wins over a narrower grant), so this
+    /// is the one pin with a real downstream relax path.
+    PrivateNetWeb,
+    /// `[[policy.grants]]` — the authorization floor. Grants concatenate (any additional grant
+    /// only ever widens what's allowed), so pinning closes the effective policy to exactly the
+    /// managed set: no downstream layer may add a grant of its own.
+    Policy,
+    /// `[sandbox] enabled`. OR-merged already (monotonically safe): no downstream layer can turn
+    /// it back off once any layer sets it. Pinning documents operator intent.
+    SandboxEnabled,
+    /// `[sandbox] require`. Same OR-merged safety as `enabled`.
+    SandboxRequire,
+    /// `[sandbox] network`. Already strictest-wins on merge (`Some(false)` beats everything).
+    /// Pinning documents operator intent.
+    SandboxNetwork,
+    /// `[workspace] allow_all` — the unconfined filesystem hatch. OR-merged already.
+    WorkspaceAllowAll,
+}
+
+impl PinnableKey {
+    /// Every pinnable key paired with its `[managed] pins` spelling, in declaration order.
+    pub const ALL: &'static [(&'static str, PinnableKey)] = &[
+        ("tools.disable", PinnableKey::ToolsDisable),
+        ("private_net.web", PinnableKey::PrivateNetWeb),
+        ("policy", PinnableKey::Policy),
+        ("sandbox.enabled", PinnableKey::SandboxEnabled),
+        ("sandbox.require", PinnableKey::SandboxRequire),
+        ("sandbox.network", PinnableKey::SandboxNetwork),
+        ("workspace.allow_all", PinnableKey::WorkspaceAllowAll),
+    ];
+
+    /// Parse a `[managed] pins` entry; `None` for an unrecognized spelling (a load-time error at
+    /// the caller, not a silently-ignored typo).
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
+    }
+
+    /// The canonical `[managed] pins` spelling for this key.
+    pub fn as_str(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, k)| *k == self)
+            .map(|(n, _)| *n)
+            .expect("every PinnableKey variant is listed in ALL")
+    }
+}
+
+/// The `[managed]` table (C-165): present only in a **managed** config layer, naming which of its
+/// own security-relevant keys are **pins** rather than mere defaults. Meaningless (and harmlessly
+/// round-tripped) in a user/project file — only [`from_sources_with_managed`] interprets it, and
+/// only against the config parsed from the managed source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedMeta {
+    /// Dotted key paths naming pinned keys (see [`PinnableKey::ALL`]). An entry that doesn't name
+    /// a recognized pinnable key is a load-time error, not a silent no-op.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<String>,
+}
+
+impl ManagedMeta {
+    fn is_default(&self) -> bool {
+        self.pins.is_empty()
+    }
+}
+
+/// Which config layer supplied an effective setting's value (C-165), for display/inspection only
+/// — the actual merge precedence lives in [`merge`] and [`from_sources_with_managed`]. Ordered
+/// lowest-precedence first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLayer {
+    /// The system-owned managed floor (a documented system path, or `FLUX_MANAGED_CONFIG`).
+    Managed,
+    /// The trusted user-global `~/.flux/config.toml`.
+    User,
+    /// The repository's `.flux/config.toml`.
+    Project,
+    /// No layer set this key; the built-in default is in effect.
+    BuiltIn,
+}
+
+/// One pinnable key's effective provenance: which layer supplied the winning value, a short
+/// display of that value, and whether the managed layer pinned it. The API-level answer to "why
+/// can't I enable this" (C-165) — independent of any CLI surface, so it composes with whatever
+/// inspects it (the natural home is the `flux doctor` diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveSetting {
+    pub key: PinnableKey,
+    pub layer: ConfigLayer,
+    pub pinned: bool,
+    pub value: String,
+}
+
+/// Report the effective provenance of every pinnable security-relevant key across the three raw
+/// (pre-merge) layers. `managed`/`user`/`project` are each the parsed config for that layer alone
+/// (as returned by [`parse_source`]), not an already-merged [`Config`] — provenance is determined
+/// by which layer's own value is non-default, checked in precedence order (project, then user,
+/// then managed).
+pub fn effective_settings(
+    managed: &Config,
+    user: &Config,
+    project: &Config,
+) -> Vec<EffectiveSetting> {
+    PinnableKey::ALL
+        .iter()
+        .map(|(_, key)| {
+            let key = *key;
+            let pinned = managed
+                .managed
+                .pins
+                .iter()
+                .any(|p| PinnableKey::parse(p) == Some(key));
+            let (layer, value) = if let Some(v) = key_value(project, key) {
+                (ConfigLayer::Project, v)
+            } else if let Some(v) = key_value(user, key) {
+                (ConfigLayer::User, v)
+            } else if let Some(v) = key_value(managed, key) {
+                (ConfigLayer::Managed, v)
+            } else {
+                (
+                    ConfigLayer::BuiltIn,
+                    key_value(&Config::default(), key).unwrap_or_default(),
+                )
+            };
+            EffectiveSetting {
+                key,
+                layer,
+                pinned,
+                value,
+            }
+        })
+        .collect()
+}
+
+/// This layer's own value for `key`, and whether that value is non-default (i.e. this layer
+/// actually set it, as opposed to leaving the built-in default in place).
+fn key_value(cfg: &Config, key: PinnableKey) -> Option<String> {
+    let (is_set, display) = match key {
+        PinnableKey::ToolsDisable => (
+            !cfg.tools.disable.is_empty(),
+            format!("{:?}", cfg.tools.disable),
+        ),
+        PinnableKey::PrivateNetWeb => (
+            !cfg.private_net.web.is_default(),
+            format!("{:?}", cfg.private_net.web),
+        ),
+        PinnableKey::Policy => (
+            cfg.policy.as_ref().is_some_and(|p| !p.grants.is_empty()),
+            format!(
+                "{} grant(s)",
+                cfg.policy.as_ref().map_or(0, |p| p.grants.len())
+            ),
+        ),
+        PinnableKey::SandboxEnabled => (cfg.sandbox.enabled, format!("{}", cfg.sandbox.enabled)),
+        PinnableKey::SandboxRequire => (cfg.sandbox.require, format!("{}", cfg.sandbox.require)),
+        PinnableKey::SandboxNetwork => (
+            cfg.sandbox.network.is_some(),
+            format!("{:?}", cfg.sandbox.network),
+        ),
+        PinnableKey::WorkspaceAllowAll => (
+            cfg.workspace.allow_all,
+            format!("{}", cfg.workspace.allow_all),
+        ),
+    };
+    is_set.then_some(display)
+}
+
+/// Whether `candidate` (a downstream user/project value) allows something `floor` (the managed
+/// pin) does not — i.e. whether merging it in would relax the pin. `Enabled(true)` allows every
+/// host; `Hosts(_)` allows exactly its listed patterns; `Enabled(false)` allows none. Equal or
+/// narrower is never a relaxation, matching "a project may still make itself more restrictive."
+fn grant_more_permissive(candidate: &PrivateNetGrant, floor: &PrivateNetGrant) -> bool {
+    match floor {
+        PrivateNetGrant::Enabled(true) => false, // already unrestricted; nothing widens it further
+        PrivateNetGrant::Enabled(false) => !matches!(candidate, PrivateNetGrant::Enabled(false)),
+        PrivateNetGrant::Hosts(allowed) => match candidate {
+            PrivateNetGrant::Enabled(true) => true,
+            PrivateNetGrant::Enabled(false) => false,
+            PrivateNetGrant::Hosts(requested) => requested.iter().any(|h| !allowed.contains(h)),
+        },
+    }
+}
+
+/// Whether `downstream` (the pure `merge(user, project)` result, with no managed floor folded in)
+/// relaxes the managed layer's pin at `key`. Returns `None` when it does not (either downstream
+/// left the key alone, made it stricter, or the key's merge rule is already monotonically safe by
+/// construction — see the per-variant doc comments on [`PinnableKey`]); `Some(diagnostic)` names
+/// the key and the reason when it does.
+fn pin_violation(key: PinnableKey, managed: &Config, downstream: &Config) -> Option<String> {
+    match key {
+        // Union-merged: the pinned entries can never be removed by a downstream layer, so there is
+        // no relax path to detect.
+        PinnableKey::ToolsDisable => None,
+        PinnableKey::PrivateNetWeb => {
+            let floor = &managed.private_net.web;
+            let candidate = &downstream.private_net.web;
+            grant_more_permissive(candidate, floor).then(|| {
+                format!(
+                    "managed config pins `private_net.web` at {floor:?}: a downstream config \
+                     would widen private-network egress to {candidate:?}, which relaxes the \
+                     operator floor and is refused"
+                )
+            })
+        }
+        PinnableKey::Policy => {
+            let extra = downstream
+                .policy
+                .as_ref()
+                .is_some_and(|p| !p.grants.is_empty());
+            extra.then(|| {
+                "managed config pins `policy`: a downstream config declares additional \
+                 [[policy.grants]], which is refused once the authorization floor is pinned \
+                 (any added grant only ever widens what's allowed)"
+                    .to_string()
+            })
+        }
+        // OR-merged / strictest-wins already: monotonically safe by construction, so no downstream
+        // value can relax these — nothing to detect.
+        PinnableKey::SandboxEnabled
+        | PinnableKey::SandboxRequire
+        | PinnableKey::SandboxNetwork
+        | PinnableKey::WorkspaceAllowAll => None,
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -470,6 +745,13 @@ pub struct Config {
     /// The second-opinion `consult` op's default target and per-turn call cap (A-96).
     #[serde(default, skip_serializing_if = "ConsultConfig::is_default")]
     pub consult: ConsultConfig,
+    /// The agent-set wake-up op's surfacing switch, per-session cap, and maximum horizon (A-98).
+    #[serde(default, skip_serializing_if = "WakeupConfig::is_default")]
+    pub wakeup: WakeupConfig,
+    /// Pin declarations (C-165). Only meaningful in a **managed** config layer — see
+    /// [`ManagedMeta`] and [`from_sources_with_managed`]; harmlessly round-tripped elsewhere.
+    #[serde(default, skip_serializing_if = "ManagedMeta::is_default")]
+    pub managed: ManagedMeta,
 }
 
 /// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
@@ -769,6 +1051,52 @@ pub fn from_sources(user: Option<(&str, &str)>, project: Option<(&str, &str)>) -
     Ok(merge(parse(user)?, parse(project)?))
 }
 
+/// Parse and merge three layers — a **managed** floor, then user, then project, in that
+/// precedence (C-165) — enforcing every pin the managed layer declares before folding it in as
+/// the lowest-precedence default. `from_sources` (unchanged) is the two-layer case; this is
+/// additive so existing callers are unaffected.
+///
+/// Enforcement first computes `downstream = merge(user, project)` — what the effective config
+/// would be with **no** managed floor at all — and checks each of the managed layer's
+/// `[managed] pins` against it via [`pin_violation`]. A relaxation returns a named
+/// [`Error::Config`] diagnostic instead of silently folding the pin away or silently letting the
+/// downstream value win; a permitted (equal-or-stricter) downstream value proceeds to the actual
+/// three-layer fold, `merge(merge(managed, user), project)`, so managed acts as the base default
+/// for every key the pin didn't block.
+pub fn from_sources_with_managed(
+    managed: Option<(&str, &str)>,
+    user: Option<(&str, &str)>,
+    project: Option<(&str, &str)>,
+) -> Result<Config> {
+    let parse = |source: Option<(&str, &str)>| -> Result<Config> {
+        source
+            .map(|(name, text)| parse_source(name, text))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    let managed_cfg = parse(managed)?;
+    let user_cfg = parse(user)?;
+    let project_cfg = parse(project)?;
+
+    // What user+project alone would produce, untainted by the managed floor — pin violations are
+    // judged against this, not against the final fold, so detection never depends on fold order.
+    let downstream = merge(user_cfg.clone(), project_cfg.clone());
+
+    for name in &managed_cfg.managed.pins {
+        let key = PinnableKey::parse(name).ok_or_else(|| {
+            Error::Config(format!(
+                "managed config: `[managed] pins` names `{name}`, which is not a recognized \
+                 pinnable key (see PinnableKey::ALL for the supported set)"
+            ))
+        })?;
+        if let Some(reason) = pin_violation(key, &managed_cfg, &downstream) {
+            return Err(Error::Config(reason));
+        }
+    }
+
+    Ok(merge(merge(managed_cfg, user_cfg), project_cfg))
+}
+
 /// Merge new always-allow rules into an injected project config and return the complete serialized
 /// document. The guarded outer control plane owns the atomic write.
 pub fn render_allow_rules(project: Option<(&str, &str)>, rules: &[String]) -> Result<String> {
@@ -932,6 +1260,22 @@ fn merge(user: Config, project: Config) -> Config {
         consult: ConsultConfig {
             model: project.consult.model.or(user.consult.model),
             max_calls: project.consult.max_calls.or(user.consult.max_calls),
+        },
+        // `enabled` is OR'd (a project may turn the op on even if the user's own config didn't;
+        // mirrors the security-tightening direction of `enable_shell`-style switches — either side
+        // opting in is enough). The bounds are scalars: a project value overrides the user's.
+        wakeup: WakeupConfig {
+            enabled: user.wakeup.enabled || project.wakeup.enabled,
+            max_horizon_secs: project.wakeup.max_horizon_secs.or(user.wakeup.max_horizon_secs),
+            max_pending_per_session: project
+                .wakeup
+                .max_pending_per_session
+                .or(user.wakeup.max_pending_per_session),
+        },
+        // Meaningful only when one side is the managed layer itself (see
+        // `from_sources_with_managed`); harmless union otherwise.
+        managed: ManagedMeta {
+            pins: dedupe([user.managed.pins, project.managed.pins].concat()),
         },
     }
 }
@@ -1433,6 +1777,41 @@ max_calls = 3
             merged.consult.max_calls,
             Some(1),
             "project left max_calls unset, so the user's value survives"
+        );
+    }
+
+    /// A-98: `[wakeup]` parses, is off by default, and merges with `enabled` OR'd (either layer
+    /// opting in is enough) while the numeric bounds follow the usual project-overrides-user rule.
+    #[test]
+    fn wakeup_config_parses_and_merges_with_or_semantics_for_enabled() {
+        let cfg: Config = toml::from_str(
+            r#"
+[wakeup]
+enabled = true
+max_horizon_secs = 3600
+max_pending_per_session = 3
+"#,
+        )
+        .unwrap();
+        assert!(cfg.wakeup.enabled);
+        assert_eq!(cfg.wakeup.max_horizon_secs, Some(3600));
+        assert_eq!(cfg.wakeup.max_pending_per_session, Some(3));
+        assert!(!cfg.wakeup.is_default());
+        assert!(Config::default().wakeup.is_default());
+
+        // `enabled` is OR'd: the user turned it on, the project says nothing — still on.
+        let mut user = Config::default();
+        user.wakeup.enabled = true;
+        user.wakeup.max_pending_per_session = Some(2);
+        let mut project = Config::default();
+        project.wakeup.max_horizon_secs = Some(600);
+        let merged = merge(user, project);
+        assert!(merged.wakeup.enabled, "either layer opting in is enough");
+        assert_eq!(merged.wakeup.max_horizon_secs, Some(600));
+        assert_eq!(
+            merged.wakeup.max_pending_per_session,
+            Some(2),
+            "project left this unset, so the user's value survives"
         );
     }
 
@@ -2076,5 +2455,272 @@ allow = ["read"]
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // C-165: managed config tier — pins vs defaults, precedence, provenance.
+    // -----------------------------------------------------------------------
+
+    /// A third layer that sets a value neither user nor project touch is a real layer — not just
+    /// an unused stub — asserted against the two pre-existing layers per the C-165 acceptance.
+    #[test]
+    fn managed_layer_default_wins_when_unset_downstream_but_loses_to_an_explicit_override() {
+        let managed = Config {
+            model: Some("org-default".into()),
+            theme: Some("dark".into()),
+            ..Default::default()
+        };
+        let user = Config::default();
+        let project = Config {
+            // A plain (non-pinned) managed value is still just a default: downstream may change it.
+            theme: Some("light".into()),
+            ..Default::default()
+        };
+
+        let merged = from_sources_with_managed(
+            Some(("managed", &toml::to_string(&managed).unwrap())),
+            Some(("user", &toml::to_string(&user).unwrap())),
+            Some(("project", &toml::to_string(&project).unwrap())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged.model.as_deref(),
+            Some("org-default"),
+            "the managed layer's value survives when nothing downstream sets it"
+        );
+        assert_eq!(
+            merged.theme.as_deref(),
+            Some("light"),
+            "an un-pinned managed value is a default, not a pin — project may still change it"
+        );
+    }
+
+    /// `from_sources` (the existing two-layer entry point) is unaffected by adding the managed
+    /// tier — no managed source in, no managed behavior out.
+    #[test]
+    fn from_sources_without_managed_layer_is_unchanged() {
+        let cfg = from_sources(
+            Some(("user", "model = \"user-model\"\n")),
+            Some(("project", "theme = \"mono\"\n")),
+        )
+        .unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("user-model"));
+        assert_eq!(cfg.theme.as_deref(), Some("mono"));
+    }
+
+    /// The core C-165 contract: a pinned `private_net.web` floor refuses a downstream layer that
+    /// would widen egress, but a downstream layer that leaves it alone or narrows it further is
+    /// accepted — both directions of "relaxation is refused in the permissive direction only."
+    #[test]
+    fn pinned_private_net_web_refuses_widening_but_permits_narrowing_or_silence() {
+        let mut managed = Config {
+            private_net: PrivateNetConfig {
+                web: PrivateNetGrant::Hosts(vec!["reports.internal".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        managed.managed.pins = vec!["private_net.web".to_string()];
+        let managed_text = toml::to_string(&managed).unwrap();
+
+        // Refused: a user config tries to grant unrestricted private-net egress.
+        let widened = Config {
+            private_net: PrivateNetConfig {
+                web: PrivateNetGrant::Enabled(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = from_sources_with_managed(
+            Some(("managed", &managed_text)),
+            Some(("user", &toml::to_string(&widened).unwrap())),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("private_net.web"),
+            "diagnostic names the pinned key: {err}"
+        );
+
+        // Permitted: downstream sets no opinion at all — the pinned floor just applies.
+        let ok = from_sources_with_managed(Some(("managed", &managed_text)), None, None).unwrap();
+        assert_eq!(
+            ok.private_net.web,
+            PrivateNetGrant::Hosts(vec!["reports.internal".into()])
+        );
+
+        // Permitted: downstream is strictly narrower (denies everything) — more restrictive than
+        // the pinned floor is always allowed.
+        let narrower = Config {
+            private_net: PrivateNetConfig {
+                web: PrivateNetGrant::Enabled(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ok = from_sources_with_managed(
+            Some(("managed", &managed_text)),
+            None,
+            Some(("project", &toml::to_string(&narrower).unwrap())),
+        )
+        .unwrap();
+        assert_eq!(
+            ok.private_net.web,
+            PrivateNetGrant::Hosts(vec!["reports.internal".into()]),
+            "an explicit-but-narrower project value doesn't relax the pin, so the floor still wins"
+        );
+    }
+
+    /// A pinned authorization floor (`policy`) refuses any additional downstream grant — every
+    /// grant only ever widens what's allowed, so once pinned the effective policy is closed.
+    #[test]
+    fn pinned_policy_refuses_any_additional_downstream_grant() {
+        use flux_policy::{
+            Action, Grant, ResourceKind, ResourceRef, SubjectKind, SubjectRef, TrustLevel,
+        };
+
+        let mut managed = Config {
+            policy: Some(AuthorizationPolicy {
+                grants: vec![Grant {
+                    subjects: vec![SubjectRef {
+                        kind: SubjectKind::User,
+                        id: "*".into(),
+                    }],
+                    resources: vec![ResourceRef::any(ResourceKind::Workspace)],
+                    actions: vec![Action::from("workspace.read")],
+                    required_trust: TrustLevel::Untrusted,
+                    required_scopes: Vec::new(),
+                    requires_approval: false,
+                }],
+            }),
+            ..Default::default()
+        };
+        managed.managed.pins = vec!["policy".to_string()];
+        let managed_text = toml::to_string(&managed).unwrap();
+
+        // Refused: a project adds its own grant on top of the pinned floor.
+        let extra = Config {
+            policy: Some(AuthorizationPolicy {
+                grants: vec![Grant {
+                    subjects: vec![SubjectRef {
+                        kind: SubjectKind::User,
+                        id: "*".into(),
+                    }],
+                    resources: vec![ResourceRef::any(ResourceKind::Workspace)],
+                    actions: vec![Action::from("workspace.write")],
+                    required_trust: TrustLevel::Untrusted,
+                    required_scopes: Vec::new(),
+                    requires_approval: false,
+                }],
+            }),
+            ..Default::default()
+        };
+        let err = from_sources_with_managed(
+            Some(("managed", &managed_text)),
+            None,
+            Some(("project", &toml::to_string(&extra).unwrap())),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("policy"), "{err}");
+
+        // Permitted: nothing downstream adds a grant — the managed floor is the whole policy.
+        let ok = from_sources_with_managed(Some(("managed", &managed_text)), None, None).unwrap();
+        assert_eq!(ok.policy.unwrap().grants.len(), 1);
+    }
+
+    /// `[tools] disable` is pinnable for documentation/audit purposes, but its merge is a union —
+    /// downstream can only ever add more disables, never remove a pinned one — so both directions
+    /// (adding more, or leaving it alone) are always permitted, never refused.
+    #[test]
+    fn pinned_tools_disable_permits_additional_downstream_entries_in_both_cases() {
+        let mut managed = Config {
+            tools: ToolsConfig {
+                disable: vec!["browser.*".into()],
+            },
+            ..Default::default()
+        };
+        managed.managed.pins = vec!["tools.disable".to_string()];
+        let managed_text = toml::to_string(&managed).unwrap();
+
+        let project = Config {
+            tools: ToolsConfig {
+                disable: vec!["web.*".into()],
+            },
+            ..Default::default()
+        };
+        let merged = from_sources_with_managed(
+            Some(("managed", &managed_text)),
+            None,
+            Some(("project", &toml::to_string(&project).unwrap())),
+        )
+        .unwrap();
+        assert!(merged.tools.disable.contains(&"browser.*".to_string()));
+        assert!(merged.tools.disable.contains(&"web.*".to_string()));
+    }
+
+    /// An unrecognized `[managed] pins` entry is a load-time error, not a silently-ignored typo.
+    #[test]
+    fn unrecognized_pin_name_is_a_load_time_error() {
+        let err = from_sources_with_managed(
+            Some(("managed", "[managed]\npins = [\"totally.bogus\"]\n")),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("totally.bogus"), "{err}");
+    }
+
+    /// `effective_settings` reports, per pinnable key, which layer supplied the winning value and
+    /// whether it's pinned — the API-level "why can't I enable this" answer (C-165).
+    #[test]
+    fn effective_settings_reports_layer_and_pin_status() {
+        let mut managed = Config {
+            tools: ToolsConfig {
+                disable: vec!["browser.*".into()],
+            },
+            ..Default::default()
+        };
+        managed.managed.pins = vec!["tools.disable".to_string()];
+        let user = Config::default();
+        let project = Config {
+            private_net: PrivateNetConfig {
+                web: PrivateNetGrant::Hosts(vec!["docs.internal".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let settings = effective_settings(&managed, &user, &project);
+
+        let tools_disable = settings
+            .iter()
+            .find(|s| s.key == PinnableKey::ToolsDisable)
+            .unwrap();
+        assert_eq!(tools_disable.layer, ConfigLayer::Managed);
+        assert!(tools_disable.pinned);
+
+        let private_net_web = settings
+            .iter()
+            .find(|s| s.key == PinnableKey::PrivateNetWeb)
+            .unwrap();
+        assert_eq!(private_net_web.layer, ConfigLayer::Project);
+        assert!(!private_net_web.pinned);
+
+        let sandbox_enabled = settings
+            .iter()
+            .find(|s| s.key == PinnableKey::SandboxEnabled)
+            .unwrap();
+        assert_eq!(sandbox_enabled.layer, ConfigLayer::BuiltIn);
+        assert!(!sandbox_enabled.pinned);
+    }
+
+    #[test]
+    fn pinnable_key_parse_and_as_str_round_trip() {
+        for (name, key) in PinnableKey::ALL {
+            assert_eq!(PinnableKey::parse(name), Some(*key));
+            assert_eq!(key.as_str(), *name);
+        }
+        assert_eq!(PinnableKey::parse("nope"), None);
     }
 }

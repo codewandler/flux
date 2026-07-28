@@ -69,6 +69,14 @@ you knowing them:
   `[sandbox]` (bubblewrap on Linux, Seatbelt on macOS) — see
   [OS process sandboxing](./os-sandbox.md). Review plugins the way you review dependencies — see
   [Plugin trust & signing](./plugin-trust.md).
+- **The managed config tier is an operator control, not a defense against your own machine.** A
+  system-owned config file (`/etc/flux/config.toml` or `$FLUX_MANAGED_CONFIG`) can pin security-
+  relevant settings — the authorization floor, egress grants, the tool blocklist, sandbox
+  confinement — so a project or user config can only make them *more* restrictive, never relax
+  them. Its authority is entirely filesystem permissions on that one file: it stops an ordinary
+  developer from casually loosening an audited baseline, not a user who owns the machine and can
+  edit the managed file or the `flux` binary itself. See
+  [Managed configuration tier](../reference/config.md#managed-configuration-tier-operator-floor).
 
 ## Where things live
 

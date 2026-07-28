@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-165: a managed config tier — the floor an operator sets and a local user cannot relax.**
+  A third config layer loads ahead of user and project (`/etc/flux/config.toml` on Linux/macOS,
+  or exactly the file `$FLUX_MANAGED_CONFIG` names), turning the two-layer everything-is-advisory
+  merge into an enforceable baseline. The managed file is a plain config document plus
+  `[managed] pins = ["private_net.web", "policy", ...]` — a value is a *default* (user may
+  override) unless its dotted key is pinned, in which case downstream relaxation is refused at
+  load time with a named diagnostic. Refusal is permissive-direction only — a project may always
+  make itself stricter — and violation detection judges `merge(user, project)` independent of fold
+  order. Seven pinnable keys for v1 (`private_net.web`, `policy`, `tools.disable`, `sandbox.*`,
+  `workspace.allow_all`); `tools.disable`/`sandbox.*` are monotonically safe by construction, so a
+  pin there documents intent. Provenance is inspectable via `flux doctor`'s new "config
+  provenance" check (filling the seam C-128 left) naming which layer supplied each
+  security-relevant setting. The docs state the trust model honestly: an operator control backed
+  by filesystem permissions, not a defense against the machine's owner. All additive API.
+
 ### Changed
 
 - **C-166: the plugin compat test is an across-time test again.** `check-plugin-compat.sh` +
