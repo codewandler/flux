@@ -35,13 +35,16 @@ the editor configs below expect it on `$PATH`.
 
 | Capability | Details |
 |---|---|
-| **Diagnostics** | live and error-recovering, with real source spans — parse *and* analysis errors as you type |
-| **Completion** | triggers on `$` and `@`; ops, node-kind keywords, prelude types, and in-scope `$vars` |
-| **Hover** | op signatures with effects and risk, node-kind docs, prelude-type docs |
-| **Formatting** | whole-document formatting via the invertible formatter; a commented flow is re-indented so comments survive |
+| **Diagnostics** | live and error-recovering, with real source spans — parse *and* analysis errors as you type. Composite ops you have defined in `.flux/flows` or `.flux/ops` are known, so calling one is not flagged as unknown. Anything that makes a declaration un-runnable is an error, advisory findings stay warnings, and each one carries a code |
+| **Completion** | knows where your cursor is: after `$` you get variables that are actually in scope (an inner bind shadows an outer one, and another flow's variables are never offered), after `@` annotations, at the start of a statement node-kind keywords and ops, and inside a call ops, variables and prelude types. Nothing is suggested inside a comment or a string. Op suggestions come with their signature and fill in parameter placeholders |
+| **Hover** | reads the token under the cursor, so a word inside a comment or a string stays quiet. Hovering a `$var` shows where it was bound and what it belongs to; ops, node kinds and prelude types show their docs |
+| **Formatting** | whole-document formatting that keeps your comments where you put them and keeps a multi-declaration file in its original order. If the result would not reparse to the same program, no edit is made |
+| **Range formatting** | format just the lines you have selected |
 | **Document symbols** | an outline of every `flow`/`op` with its parameters and `$var` binds |
 | **Go-to-definition** | a `$var` use jumps to its binding; an op/flow reference jumps to its declaration |
-| **Semantic tokens** | for clients that render them (VS Code, Neovim over tree-sitter) — including a registry-known op vs an unknown identifier, and a `$var` bind vs a use |
+| **Find references** | every use of *that* binding — not every variable that happens to share the name. On a flow or op name, its declaration and every call site |
+| **Rename** | renames a variable, flow or op across exactly its own references. Two flows that both use `$x` stay independent, and your editor refuses the rename outright if the cursor is not on something renameable |
+| **Semantic tokens** | full, delta and range, for clients that render them (VS Code, Neovim over tree-sitter) — including a registry-known op vs an unknown identifier, and a `$var` bind vs a use |
 
 Helix does not apply LSP semantic tokens (as of 25.07); its colour comes from the tree-sitter
 grammar above. The semantic-tokens feature is for editors that render them.

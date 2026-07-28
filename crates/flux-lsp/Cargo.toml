@@ -11,6 +11,10 @@ description = "Language Server (LSP) for Flux-Lang — diagnostics, completion, 
 [package.metadata.dist]
 dist = true
 
+[lib]
+name = "flux_lsp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "flux-lsp"
 path = "src/main.rs"
@@ -24,6 +28,7 @@ flux-provider.workspace = true
 flux-cognition.workspace = true
 flux-capabilities.workspace = true
 flux-web.workspace = true
+flux-system.workspace = true
 tower-lsp.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true

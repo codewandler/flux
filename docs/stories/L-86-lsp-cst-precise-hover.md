@@ -2,7 +2,7 @@
 id: L-86
 title: CST-precise hover — including `$vars`, excluding comments and strings
 pillar: Language
-status: backlog
+status: done
 epic: flux-lsp-round-2
 design: docs/designs/flux-lsp-round-2.md
 note: hover_at resolves the word with a raw line scan (word_at, main.rs:686), so `read` inside a string or comment renders the op card, and a `$var` never hovers at all — while the CST token lookup (token_at:1001) and the L-68 scope model already exist
@@ -30,18 +30,26 @@ and covers the identifier authors ask about most, the `$var`.
 
 ## Acceptance
 
-- [ ] Hover resolves via the CST token at the offset, not `word_at`; a token inside a comment or a
+- [x] Hover resolves via the CST token at the offset, not `word_at`; a token inside a comment or a
       string literal produces no hover.
-- [ ] Hovering a `$var` use renders its binding: role (param / bind), the declaration it belongs to,
+- [x] Hovering a `$var` use renders its binding: role (param / bind), the declaration it belongs to,
       and the bind-site line; hovering the bind itself renders the same card.
-- [ ] The returned `Hover` carries the token's `range`.
-- [ ] Op / node-kind / prelude-type hovers keep their current content (`render_op`, `main.rs:733`).
-- [ ] Failing-first tests: (a) hovering `read` inside a `#` comment and inside a string returns
+- [x] The returned `Hover` carries the token's `range`.
+- [x] Op / node-kind / prelude-type hovers keep their current content (`render_op`, `main.rs:733`).
+- [x] Failing-first tests: (a) hovering `read` inside a `#` comment and inside a string returns
       `None`; (b) hovering a `$var` use returns a card naming its bind site; (c) an op hover still
       renders its signature with effects/risk.
 
 ## Progress
-- (not started)
+- **Done (2026-07-28).** `hover.rs` resolves through the CST token at the offset rather than the old
+  raw-line `word_at` scan, so `read` inside a `#` comment or a string no longer renders an op card. A
+  `$var` use renders its binding — role (param vs bind), owning declaration, and bind site — and the
+  bind itself renders the same card. The `Hover` carries the token's range. Op / node-kind /
+  prelude-type content is unchanged.
+- **Tests (6):** prose and comments do not hover, a var use hovers its binding, a param hovers as a
+  parameter, an op still renders its signature, a node kind still hovers, and the range covers the
+  token.
+
 
 ## Notes
 - `word_at` and `scan_symbols` both become dead once L-85 and L-86 land — delete them rather than

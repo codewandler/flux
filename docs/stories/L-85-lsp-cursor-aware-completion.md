@@ -2,7 +2,7 @@
 id: L-85
 title: Cursor-aware, scope-correct completion
 pillar: Language
-status: backlog
+status: done
 epic: flux-lsp-round-2
 design: docs/designs/flux-lsp-round-2.md
 note: completion() never reads the cursor position (main.rs:256-261) — every request returns the union of all ops + all node kinds + all prelude types + every `$` byte-scanned from the buffer (main.rs:343-382, scan_symbols:709), while go-to-definition on the same buffer is scope-correct
@@ -32,22 +32,31 @@ language and the host can do.
 
 ## Acceptance
 
-- [ ] Completion resolves the CST token at the cursor offset (`token_at`, `main.rs:1001`) and picks
+- [x] Completion resolves the CST token at the cursor offset (`token_at`, `main.rs:1001`) and picks
       a context: after `$` → in-scope variables only; after `@` → annotations; at a statement head →
       node-kind keywords + ops; in an argument position → ops, `$vars`, and prelude types.
-- [ ] `$var` candidates come from the L-68 scope model — only definitions whose scope range covers
+- [x] `$var` candidates come from the L-68 scope model — only definitions whose scope range covers
       the cursor, with an inner shadowing bind winning over an outer one — not from `scan_symbols`.
-- [ ] No completion is offered inside a comment or a string literal.
-- [ ] Op items carry `documentation` (the rendered signature from `render_op`, `main.rs:733`) and a
+- [x] No completion is offered inside a comment or a string literal.
+- [x] Op items carry `documentation` (the rendered signature from `render_op`, `main.rs:733`) and a
       snippet `insert_text` with parameter placeholders (`InsertTextFormat::SNIPPET`) instead of the
       bare `format!("{}()", op.name)` at `main.rs:351`.
-- [ ] Failing-first tests: (a) a two-flow buffer where the cursor sits in flow B does not offer flow
+- [x] Failing-first tests: (a) a two-flow buffer where the cursor sits in flow B does not offer flow
       A's binds; (b) the cursor after `$` offers only variables, no keywords or ops; (c) a `$name`
       appearing only inside a string literal is never offered; (d) the cursor inside a comment
       returns no items.
 
 ## Progress
-- (not started)
+- **Done (2026-07-28).** `completion.rs`: `context_at` resolves the CST token at the cursor offset and
+  classifies the position (after `$`, after `@`, statement head, argument position); candidates are
+  filtered per context instead of returning the union of everything. `$var` candidates come from the
+  L-68 scope model, so only definitions whose scope covers the cursor are offered and an inner bind
+  shadows an outer one. Comment and string tokens return nothing. Op items carry the rendered
+  signature as `documentation` plus a `SNIPPET` `insert_text` with parameter placeholders.
+- **Tests (8):** the four the acceptance named (cross-flow binds, `$`-only variables, a name that
+  exists only in a string, cursor in a comment) plus statement-head vs argument-position contexts,
+  snippet/documentation shape, and inner-shadowing precedence.
+
 
 ## Notes
 - Pairs with L-90: cursor context needs the parse, so land the per-document parse cache first or

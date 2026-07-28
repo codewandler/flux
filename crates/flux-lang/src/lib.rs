@@ -36,6 +36,7 @@ pub mod effects;
 pub mod error;
 pub mod expr;
 pub mod format;
+pub mod format_cst;
 pub mod highlight;
 pub mod host;
 pub mod lexer;

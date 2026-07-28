@@ -14,6 +14,34 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Editing `.flux` files got a lot sharper.** The language server used to advertise more than it
+  really did; this round makes each feature work the way you would expect.
+  - **Completion knows where your cursor is.** It used to offer everything it could think of at
+    once — every operation, every keyword, and every `$variable` it could find anywhere in the file,
+    including ones from other flows and ones that only appear inside quoted text. Now typing `$`
+    offers the variables actually in scope at that spot, typing `@` offers annotations, the start of
+    a line offers keywords and operations, and inside a call you get operations, variables and
+    types. Nothing is suggested while you are inside a comment or a string. Operation suggestions
+    come with their signature and fill in the parameter placeholders for you.
+  - **Hover reads the code, not the letters under the pointer.** Hovering the word `read` inside a
+    comment no longer pops up an operation card, and hovering a `$variable` now tells you where it
+    was bound and what it belongs to — before, it told you nothing at all.
+  - **Find references and rename are new.** Rename understands scope: two flows that each use `$x`
+    stay independent, and renaming an inner variable leaves the outer one alone. If your cursor is
+    not on something renameable, the editor tells you up front instead of offering a broken rename.
+  - **Formatting works on more files and preserves more of them.** A file with several `flow` or
+    `op` declarations used to be skipped entirely; it now formats and keeps your declarations in the
+    order you wrote them. A flow with comments used to only get its indentation fixed; it now gets
+    fully tidied with every comment kept where it belongs. You can also format just a selection. If
+    formatting would ever change what your program means, no edit is made.
+  - **Your own operations are recognised.** Calling a composite operation you defined under
+    `.flux/flows` or `.flux/ops` is no longer flagged as an unknown operation. Problems that would
+    actually stop a flow running are now marked as errors rather than warnings, so the real ones
+    stand out.
+  - **Large files stay responsive.** The parsed file is reused across requests instead of being
+    re-read for each one — on a 2,000-line flow, a keystroke followed by completion and hover does a
+    third of the work it used to.
+
 - **Connect to MySQL and MariaDB databases.** Pointing the SQL integration at a MySQL or MariaDB
   server used to fail with "not yet supported" — only PostgreSQL worked. Now all of it works the
   same way it does against Postgres: list databases and tables, inspect a table's columns, primary

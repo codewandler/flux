@@ -469,7 +469,7 @@ tokens, re-scoped to clients that render them), L-70 (incremental sync + comment
 is the subject of the follow-up epic below. Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
 [designs/flux-lsp.md](designs/flux-lsp.md).
 
-### flux-lsp round 2 — from "capability present" to "capability correct" (epic) — 🔜 **PLANNED 2026-07-29 (L-85…L-91, seven stories)**
+### flux-lsp round 2 — from "capability present" to "capability correct" (epic) — ✅ **IMPLEMENTED 2026-07-28 (L-85…L-91, all seven stories; unreleased)**
 
 The first LSP epic answered *"does `.flux` have editor support at all?"* — yes, and the binary
 ships. Reading `crates/flux-lsp/src/main.rs` against what its `initialize` advertises answers the
@@ -490,7 +490,16 @@ not incremental reparse**, and each handler re-parses from text per request. Rou
 feature onto the tree that is already paid for: L-90 (parse cache + real incrementality) and L-85
 (completion) first, then L-86/L-87/L-88/L-89, with L-91 splitting the 1800-line `main.rs` into the
 modules the original design named and adding the in-memory-duplex harness that makes "advertised
-capability without a handler" a test failure. Design:
+capability without a handler" a test failure. **All seven landed.** Completion is cursor-aware and
+scope-correct, hover resolves the CST token, references/rename exist and respect shadowing,
+formatting is CST-driven so modules format and keep declaration order, diagnostics know workspace
+composites and carry real severities and codes, and the document store caches the parse — a
+`didChange` + completion + hover cycle on a 2,099-line buffer went from 3 parses (~38.4 ms) to 1
+(~12.8 ms), with `parsing_is_confined_to_the_document_store` scanning the crate's own sources so
+nothing can bypass the cache. `main.rs` is an 11-line bootstrap. Picking the epic back up turned up
+the tail nobody had closed: the code had landed but every story was still `backlog`, and both
+capability tables still described pre-round-2 behaviour — claiming modules were left unformatted and
+listing neither references, rename, nor range formatting. Design:
 [designs/flux-lsp-round-2.md](designs/flux-lsp-round-2.md).
 
 ### A2A protocol conformance (epic) — ✅ **SHIPPED (Tier 1 v0.4.2/0.4.3; Tier 3 v0.6.0; A-49…A-57 all done)**
