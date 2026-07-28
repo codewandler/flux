@@ -181,7 +181,9 @@ Sub-agents inherit the same safety chain; their loops and operation calls are va
 
 - Built-in tools include file, search, web, and delegation operations.
 - Optional shell support (`bash`) is available behind the `shell` signal.
-- Skills are loaded from project `.flux/skills` and standard global skill directories.
+- Skills and markdown slash-command files load from both the `.flux/` and `.claude/` trees
+  (project and user-global, including nested multi-file skills); skills stay manual-only by
+  default, with an opt-in model-invoked mode.
 - Plugin operations are manifest-scoped; privileges are explicit and enforced.
 - Approval and policy hooks (`.flux/hooks/*.js`) can validate/transform/deny calls.
 - REPL slash commands include `/tools`, `/sessions`, `/compact`, `/evidence`, and more.
