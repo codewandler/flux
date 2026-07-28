@@ -261,7 +261,8 @@ fn composite_index_for_message(program: &Program, message: &str) -> Option<usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{authoring_registry, workspace_composites, TempWorkspace};
+    use crate::catalog::tests::TempWorkspace;
+    use crate::catalog::{authoring_registry, workspace_composites};
 
     fn diagnose(src: &str) -> Vec<Diagnostic> {
         diagnose_with(src, &[])

@@ -120,44 +120,41 @@ pub fn authoring_op_signatures() -> Vec<OpSignature> {
     flux_flow::registry::OpRegistry::new(&reg).signatures()
 }
 
-/// A throwaway workspace root for tests — the repo builds these by hand rather than pulling in a
-/// dev-dependency (see `flux_flow::staged`'s test helper).
 #[cfg(test)]
-pub struct TempWorkspace(std::path::PathBuf);
+pub(crate) mod tests {
+    /// A throwaway workspace root for tests — the repo builds these by hand rather than pulling in a
+    /// dev-dependency (see `flux_flow::staged`'s test helper).
+    pub struct TempWorkspace(std::path::PathBuf);
 
-#[cfg(test)]
-impl TempWorkspace {
-    /// Create `<tmp>/<label>-<pid>-<n>/.flux/flows` and write each `(file, contents)` into it.
-    pub fn with_flows(label: &str, files: &[(&str, &str)]) -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "{label}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::SeqCst)
-        ));
-        let flows = root.join(".flux/flows");
-        std::fs::create_dir_all(&flows).expect("create the flow home");
-        for (name, contents) in files {
-            std::fs::write(flows.join(name), contents).expect("write a flow file");
+    impl TempWorkspace {
+        /// Create `<tmp>/<label>-<pid>-<n>/.flux/flows` and write each `(file, contents)` into it.
+        pub fn with_flows(label: &str, files: &[(&str, &str)]) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "{label}-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::SeqCst)
+            ));
+            let flows = root.join(".flux/flows");
+            std::fs::create_dir_all(&flows).expect("create the flow home");
+            for (name, contents) in files {
+                std::fs::write(flows.join(name), contents).expect("write a flow file");
+            }
+            TempWorkspace(root)
         }
-        TempWorkspace(root)
+
+        pub fn path(&self) -> &std::path::Path {
+            &self.0
+        }
     }
 
-    pub fn path(&self) -> &std::path::Path {
-        &self.0
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
-}
 
-#[cfg(test)]
-impl Drop for TempWorkspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[cfg(test)]
-mod tests {
     use super::*;
 
     /// A minimal, complete composite op — the shape `load_flows_dir` accepts.
