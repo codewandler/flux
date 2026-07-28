@@ -23,7 +23,9 @@ All notable changes to this project are documented in this file. The format is b
 
 - **C-98/C-99: `git_worktree_enter` / `git_worktree_leave` built-ins — context-local git
   worktrees.** `enter` preflights a clean non-detached `main`, creates a generated
-  `flux/worktree/…` branch worktree under a private `/tmp/flux-worktree-*` directory, and
+  `flux/worktree/…` branch worktree under a private on-disk `flux-worktree-*` directory
+  (`$FLUX_WORKTREE_DIR`, default `~/.flux/worktrees` — not `/tmp`, which is commonly a RAM-backed
+  tmpfs a worktree build would fill; C-117), and
   transitions only the calling agent context's guarded root into it. `leave` requires a clean
   worktree and an unmoved clean `main`, proves mergeability with an aborted trial merge, merges
   `--no-ff --no-edit`, removes the worktree and branch, and restores the context; merge failures
@@ -40,6 +42,10 @@ All notable changes to this project are documented in this file. The format is b
   `allocate_worktree_dir`/`remove_worktree_dir` helpers. A worktree transition never touches
   process-global cwd, and the sandbox's writable set follows the re-rooted workspace
   automatically.
+- **C-118: the model is told per turn when its context is inside a worktree.** While a worktree
+  session is active, the turn's base system carries a `<workspace-note>` naming the transitioned
+  root and generated branch (the assembly-time project context still describes the original
+  workspace; the `cwd` op is the live truth). The note disappears after `git_worktree_leave`.
 - **C-100: per-turn op surfacing and sub-agent spawns follow the active root.** Evidence-gated
   group surfacing probes the context's active root each turn (assembly-time config/skills/roles
   stay fixed by design); `SpawnRequest` carries the parent's active-system snapshot so children

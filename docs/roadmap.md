@@ -82,6 +82,19 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### TUI polish — 5 UX + 5 UI (epic) — **in progress (2026-07-28; C-102…C-110 filed ready)**
+
+The TUI became a daily driver (A-65) and just gained its boot splash + spinners (C-101); what
+remains are well-defined rough edges. Five UX fixes — a mouse-capture toggle so terminal-native
+select/copy works (Ctrl-T), an approval modal that no longer denies on stray keys and renders its
+subjects as text, readline Ctrl-R history search, Ctrl-F transcript search with highlights, and a
+real help overlay — and five UI upgrades: progressive narrow-width header/footer degradation, a
+redesigned approval sheet, a theme system (truecolor dark / light / mono + `/theme` + persistence),
+a scroll position indicator, and live animated running tool cards that leave the transcript layout
+cache untouched. Done means all nine stories' acceptance green under the standard gate; the two
+pub-surface breaks (`TuiRunOptions.theme`, `ChatState.modal` → `approval`) ride the next MINOR.
+Design: [designs/tui-polish.md](designs/tui-polish.md).
+
 ### Context-local Git worktrees (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-97…C-100, merged to main, unreleased; next MINOR — `ToolContext.system` field → accessor is breaking)**
 
 Agents that mutate a repo while the user or another agent works in the same checkout step on each

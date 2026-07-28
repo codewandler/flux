@@ -29,13 +29,26 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
+- [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 
 ### TUI polish — 5 UX + 5 UI improvements
 _The TUI became a daily driver with A-65 and gained its boot splash + spinners with C-101. The_
 - [C-103 — Approval modal — explicit keys, real subjects, redesigned sheet](C-103-approval-modal-safety-and-redesign.md) · Core
+- [C-105 — Mouse-capture toggle for native select/copy](C-105-mouse-capture-copy-toggle.md) · Core
 - [C-102 — Graceful narrow-width header/footer bars](C-102-graceful-narrow-width-bars.md) · Core
 - [C-104 — TUI theme system — truecolor dark, light, mono + /theme](C-104-tui-theme-system.md) · Core
+- [C-106 — Transcript scroll position indicator](C-106-scroll-position-indicator.md) · Core
+- [C-107 — Ctrl-R reverse incremental history search](C-107-reverse-history-search.md) · Core
+- [C-108 — Ctrl-F transcript search with match highlight](C-108-transcript-search.md) · Core
+- [C-110 — Help overlay (F1 / /help)](C-110-help-overlay.md) · Core
+- [C-109 — Live elapsed + animated badge on running tool cards](C-109-live-running-tool-cards.md) · Core
+- [C-111 — Transcript entry focus — per-card expansion + OSC-52 yank](C-111-transcript-entry-focus-yank.md) · Core
+- [C-112 — @-triggered file-path completion in the composer](C-112-composer-path-completion.md) · Core
+- [C-113 — Approval deny-with-reason — tell the model why](C-113-approval-deny-with-reason.md) · Core · extends C-103's approval_key contract — lands after it
+- [C-114 — Markdown for the sealed prefix while streaming](C-114-streaming-markdown-prefix.md) · Core · land after C-104 (flux_markdown hardcoded span colors are its known risk)
+- [C-115 — Hunk-view diffs — line numbers + intraline highlight in edit/write cards and the approval sheet](C-115-diff-hunk-view.md) · Core · card half is independent; the approval-sheet half needs C-103
+- [C-116 — Header mode badges — shell, auto-ok, effort, gather](C-116-header-mode-badges.md) · Core
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)

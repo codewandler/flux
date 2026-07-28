@@ -15,8 +15,10 @@ mod state;
 mod terminal_io;
 
 use controller::{
-    send_action_event, show_next_approval, ChannelApprover, ChannelSink, PendingApproval, UiEvent,
+    approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
+    ChannelSink, PendingApproval, UiEvent,
 };
+pub use controller::ApprovalView;
 #[cfg(test)]
 use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
@@ -38,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
@@ -77,6 +79,8 @@ pub struct TuiRunOptions {
     pub model_spec: Option<String>,
     /// Optional surface-owned resolver that enables `/model <spec>`.
     pub model_resolver: Option<Arc<dyn ModelResolver>>,
+    /// Configured theme name (`dark` / `light` / `mono`); `None` falls back to `dark` (C-104).
+    pub theme: Option<String>,
 }
 
 impl TuiRunOptions {
@@ -85,6 +89,7 @@ impl TuiRunOptions {
             auto_approve,
             model_spec,
             model_resolver: None,
+            theme: None,
         }
     }
 }
@@ -105,6 +110,23 @@ fn terminal_truecolor() -> bool {
                 .map(|v| v.contains("truecolor") || v.contains("24bit"))
                 .unwrap_or(false)
     })
+}
+
+/// Whether the operator disabled color output entirely (forces the `mono` theme, C-104).
+fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
+}
+
+/// Resolve a theme name for this terminal, falling back to `dark` for `None`/unknown names.
+fn resolve_theme(name: Option<&str>) -> (String, Theme) {
+    let name = name.unwrap_or("dark");
+    match Theme::by_name(name, terminal_truecolor(), no_color()) {
+        Some(theme) => (name.to_string(), theme),
+        None => (
+            "dark".to_string(),
+            Theme::by_name("dark", terminal_truecolor(), no_color()).unwrap_or(Theme::DARK),
+        ),
+    }
 }
 /// Streaming cursor block appended to an in-progress assistant message.
 const CURSOR: &str = "▍";
@@ -216,6 +238,10 @@ const COMMANDS: &[SlashCmd] = &[
         name: "queue",
         desc: "manage queued follow-ups",
     },
+    SlashCmd {
+        name: "theme",
+        desc: "show or switch the color theme",
+    },
 ];
 
 /// Commands matching `query` (lowercased, no leading `/`): prefix matches first, then substring.
@@ -232,12 +258,23 @@ fn slash_matches(query: &str) -> Vec<&'static SlashCmd> {
     out
 }
 
-/// The `/help` body.
-const HELP_TEXT: &str = "keys: ↵ send/queue · Ctrl-J or Alt-↵ newline · ↑/↓ history\n\
-    PgUp/PgDn or wheel scroll · Ctrl-End latest · Ctrl-E details\n\
-    Ctrl-C interrupt/clear/quit · Ctrl-D quit · Esc close panel\n\
-commands: /model /effort /shell /tools /evidence /session /sessions /resume\n\
-    /new /clear /compact /queue /quit";
+/// The help overlay's keybinding rows (C-110): `(keys, what)`. The slash-command half of the
+/// overlay iterates [`COMMANDS`] directly so it can never drift from the real table.
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("↵", "send (or queue while a turn runs)"),
+    ("Ctrl-J / Alt-↵ / Shift-↵", "newline"),
+    ("↑/↓", "history recall (at the input's edge)"),
+    ("Ctrl-R", "reverse history search (shadows redo; Ctrl-U undo)"),
+    ("Ctrl-F", "transcript search · n/N step matches"),
+    ("PgUp/PgDn / wheel", "scroll transcript"),
+    ("Ctrl-End", "jump to latest"),
+    ("Ctrl-E", "expand/collapse tool details"),
+    ("Ctrl-T", "toggle mouse capture (native select/copy while off)"),
+    ("y / a / n·Esc", "approval: allow / always / deny (other keys ignored)"),
+    ("Ctrl-C", "interrupt · clear · quit"),
+    ("Ctrl-D", "quit (empty input)"),
+    ("F1 / Esc", "open/close this help"),
+];
 
 /// One item in the transcript. Each renders to one or more styled [`Line`]s at a given width.
 #[derive(Debug)]
@@ -381,6 +418,172 @@ struct TranscriptLayout {
     revision: u64,
     width: u16,
     lines: Vec<Line<'static>>,
+    /// `(wrapped row, entry index)` of each running tool card's header row, in order — the
+    /// viewport patches these with a live spinner + elapsed badge per tick (C-109).
+    running_rows: Vec<(u16, usize)>,
+}
+
+/// Ctrl-R reverse incremental history search (C-107): readline behavior — the query edits live,
+/// the newest match lands in the composer, Ctrl-R again steps older, Esc restores the draft.
+#[derive(Debug, Default)]
+pub(crate) struct HistorySearch {
+    pub(crate) query: String,
+    /// Index into `history` of the current match (`None` = no match yet / query empty).
+    pub(crate) index: Option<usize>,
+    /// The composer content stashed when the search opened (restored on Esc).
+    pub(crate) draft: String,
+}
+
+/// Ctrl-F transcript search (C-108) over wrapped transcript rows. `matches` are wrapped-row
+/// indices, valid for exactly one `(revision, width)` layout — recomputed lazily when stale.
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptSearch {
+    pub(crate) query: String,
+    /// True while the query is being edited; Enter commits, then n/N step matches.
+    pub(crate) typing: bool,
+    pub(crate) matches: Vec<u16>,
+    /// Index into `matches` of the current match.
+    pub(crate) current: usize,
+    /// The `(transcript_revision, width)` the matches were computed against.
+    pub(crate) valid_for: (u64, u16),
+}
+
+/// Search `history` backwards (newest first) for a case-insensitive substring match, starting
+/// strictly before `before` (or from the end for `None`). Pure, unit-testable (C-107).
+fn rsearch(history: &[String], query: &str, before: Option<usize>) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    let query = query.to_lowercase();
+    let end = before.unwrap_or(history.len());
+    history[..end.min(history.len())]
+        .iter()
+        .rposition(|entry| entry.to_lowercase().contains(&query))
+}
+
+/// Wrapped-row indices whose flattened text contains `query` (case-insensitive). A match that
+/// spans a wrap boundary is not found — documented v1 limitation (C-108).
+fn find_match_rows(lines: &[Line<'_>], query: &str) -> Vec<u16> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query = query.to_lowercase();
+    lines
+        .iter()
+        .enumerate()
+        .take(u16::MAX as usize)
+        .filter(|(_, line)| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .to_lowercase()
+                .contains(&query)
+        })
+        .map(|(i, _)| i as u16)
+        .collect()
+}
+
+/// Re-style the parts of `line` that match `query` (case-insensitive): REVERSED for every match,
+/// plus `current_style` when this is the current match's row. Splits spans at match boundaries so
+/// only the matching cells change; used on the cloned viewport slice only — the cached layout is
+/// never touched (C-108).
+fn highlight_matches(line: &Line<'static>, query: &str, current: Option<Style>) -> Line<'static> {
+    if query.is_empty() {
+        return line.clone();
+    }
+    // Flatten to chars with their span styles; match on a per-char lowercase projection.
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+        .collect();
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|(c, _)| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let needle: Vec<char> = query
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    if needle.is_empty() || chars.len() < needle.len() {
+        return line.clone();
+    }
+    let mut hit = vec![false; chars.len()];
+    let mut i = 0;
+    while i + needle.len() <= lower.len() {
+        if lower[i..i + needle.len()] == needle[..] {
+            hit[i..i + needle.len()].iter_mut().for_each(|h| *h = true);
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    if !hit.iter().any(|h| *h) {
+        return line.clone();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut run: Option<(Style, bool)> = None;
+    for (idx, (c, style)) in chars.iter().enumerate() {
+        let key = (*style, hit[idx]);
+        if run != Some(key) {
+            if let Some((style, matched)) = run.take() {
+                spans.push(styled_run(std::mem::take(&mut buf), style, matched, current));
+            }
+            run = Some(key);
+        }
+        buf.push(*c);
+    }
+    if let Some((style, matched)) = run {
+        spans.push(styled_run(buf, style, matched, current));
+    }
+    let mut out = Line::from(spans);
+    out.style = line.style;
+    out.alignment = line.alignment;
+    out
+}
+
+/// One tool-card header row: `→ verb  arg … badge` with the arg truncated so the badge sits
+/// flush right. Shared by the cached build (`tool_lines`) and the per-tick running-badge patch
+/// (C-109) so the pad math cannot drift between the two.
+fn tool_header_line(
+    t: &Theme,
+    verb: &str,
+    arg_full: &str,
+    badge: String,
+    badge_style: Style,
+    width: u16,
+) -> Line<'static> {
+    let badge_w = UnicodeWidthStr::width(badge.as_str());
+    let fixed = 2 + UnicodeWidthStr::width(verb) + 2; // "→ " + verb + "  "
+    let arg_room = (width as usize).saturating_sub(fixed + badge_w + 1);
+    let arg = truncate(arg_full, arg_room.max(4));
+    let used = fixed + UnicodeWidthStr::width(arg.as_str());
+    let pad = (width as usize).saturating_sub(used + badge_w).max(1);
+    Line::from(vec![
+        Span::styled("→ ", t.tool_style()),
+        Span::styled(verb.to_string(), t.tool_style().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(arg, t.muted_style()),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(badge, badge_style),
+    ])
+}
+
+/// The static in-flight badge recorded into the cached layout (C-109 patches it per tick in the
+/// viewport only, so the cache stays untouched across animation frames).
+const RUNNING_BADGE: &str = "◌ running";
+
+fn styled_run(text: String, style: Style, matched: bool, current: Option<Style>) -> Span<'static> {
+    if !matched {
+        return Span::styled(text, style);
+    }
+    let mut style = style.add_modifier(Modifier::REVERSED);
+    if let Some(accent) = current {
+        style = style.patch(accent);
+    }
+    Span::styled(text, style)
 }
 
 impl Assistant {
@@ -432,7 +635,7 @@ impl ChatState {
             transcript_revision: 0,
             transcript_layout: RefCell::new(None),
             input: fresh_textarea(),
-            modal: None,
+            approval: None,
             assistant_open: false,
             phase: Phase::Idle,
             turn_start: None,
@@ -440,6 +643,11 @@ impl ChatState {
             model,
             model_spec: None,
             theme: Theme::default(),
+            theme_name: "dark".into(),
+            mouse_capture: true,
+            history_search: None,
+            search: None,
+            help_open: false,
             expand_tools: false,
             verbose: false,
             slash_sel: 0,
@@ -982,10 +1190,33 @@ impl ChatState {
                 ),
             );
         }
+        // C-109: pair each `◌ running` header row with its running tool entry, in order. The
+        // header line is width-fitted (badge flush right) so wrapping never splits it — the
+        // static badge span survives as the row's last span.
+        let running_entries: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, Entry::Tool(tool) if tool.result.is_none()))
+            .map(|(i, _)| i)
+            .collect();
+        let running_rows: Vec<(u16, usize)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.spans.last().is_some_and(|span| {
+                    span.content.as_ref() == RUNNING_BADGE
+                        && span.style == self.theme.warn_style()
+                })
+            })
+            .map(|(row, _)| row as u16)
+            .zip(running_entries)
+            .collect();
         *self.transcript_layout.borrow_mut() = Some(TranscriptLayout {
             revision: self.transcript_revision,
             width,
             lines,
+            running_rows,
         });
     }
 
@@ -1017,13 +1248,100 @@ impl ChatState {
         } else {
             self.scroll.min(max_scroll)
         };
-        layout
+        let mut visible: Vec<Line<'static>> = layout
             .lines
             .iter()
             .skip(offset as usize)
             .take(height as usize)
             .cloned()
-            .collect()
+            .collect();
+        // C-109: patch visible running tool headers with a live spinner + elapsed badge. Only
+        // the cloned slice changes — the cached layout is untouched, so animation frames never
+        // invalidate it.
+        for (row, entry_idx) in &layout.running_rows {
+            let Some(slot) = row
+                .checked_sub(offset)
+                .map(usize::from)
+                .filter(|slot| *slot < visible.len())
+            else {
+                continue;
+            };
+            let Some(Entry::Tool(tool)) = self.entries.get(*entry_idx) else {
+                continue;
+            };
+            let elapsed = tool.started.elapsed();
+            let frame = SPINNER[(elapsed.as_millis() / 80) as usize % SPINNER.len()];
+            visible[slot] = tool_header_line(
+                &self.theme,
+                &tool.call.verb,
+                &tool.call.arg,
+                format!("{frame} running · {}", fmt_elapsed(elapsed)),
+                self.theme.warn_style(),
+                width,
+            );
+        }
+        // C-108: highlight matches on the cloned visible slice only — the cache stays untouched.
+        if let Some(search) = self.search.as_ref().filter(|s| !s.query.is_empty()) {
+            let current_row = search.matches.get(search.current).copied();
+            return visible
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let row = offset + i as u16;
+                    let current = (Some(row) == current_row)
+                        .then(|| Style::default().fg(self.theme.accent));
+                    highlight_matches(&line, &search.query, current)
+                })
+                .collect();
+        }
+        visible
+    }
+
+    /// Recompute the transcript-search match rows against the current cached layout (no-op when
+    /// no layout has been built yet). Keeps `current` clamped and pointing at the last match
+    /// after a fresh query edit when it was unset.
+    fn refresh_search_matches(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let computed = {
+            let layout = self.transcript_layout.borrow();
+            layout
+                .as_ref()
+                .map(|l| (find_match_rows(&l.lines, &query), l.revision, l.width))
+        };
+        let Some((matches, revision, width)) = computed else {
+            return;
+        };
+        if let Some(search) = self.search.as_mut() {
+            search.current = matches.len().saturating_sub(1);
+            search.matches = matches;
+            search.valid_for = (revision, width);
+        }
+    }
+
+    /// Whether the search matches are stale for the current layout (resize / new content).
+    fn search_matches_stale(&self) -> bool {
+        let layout = self.transcript_layout.borrow();
+        match (self.search.as_ref(), layout.as_ref()) {
+            (Some(search), Some(layout)) => search.valid_for != (layout.revision, layout.width),
+            _ => false,
+        }
+    }
+
+    /// Center the current transcript-search match in the viewport (detaches follow mode).
+    fn center_current_match(&mut self) {
+        let Some(row) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.get(s.current).copied())
+        else {
+            return;
+        };
+        self.follow = false;
+        self.unread = 0;
+        let half = self.last_page.get().max(1) / 2;
+        self.scroll = row.saturating_sub(half).min(self.last_max_scroll.get());
     }
 
     /// Render one tool card: a `→ verb arg … [badge]` header, a one-line summary, and — when
@@ -1035,29 +1353,21 @@ impl ChatState {
 
         // Badge (right-aligned, fixed idea of width): running is static, done shows ✓/✗ + elapsed.
         let (badge, badge_style) = match &tool.result {
-            // Keep the in-flight badge static: elapsed time already lives in the animated footer,
-            // which lets the cached transcript remain untouched across spinner-only frames.
-            None => ("◌ running".to_string(), t.warn_style()),
+            // The in-flight badge is static IN THE CACHE; the viewport patches it with a live
+            // spinner + elapsed per tick (C-109), so cached rows stay untouched across frames.
+            None => (RUNNING_BADGE.to_string(), t.warn_style()),
             Some(o) if o.is_error => (format!("✗ {}", fmt_tool_timing(o)), t.err_style()),
             Some(o) => (format!("✓ {}", fmt_tool_timing(o)), t.ok_style()),
         };
 
-        // Header: `→ verb  arg`, with the arg truncated so the badge sits flush right on one row.
-        let verb = &tool.call.verb;
-        let badge_w = UnicodeWidthStr::width(badge.as_str());
-        let fixed = 2 + UnicodeWidthStr::width(verb.as_str()) + 2; // "→ " + verb + "  "
-        let arg_room = (width as usize).saturating_sub(fixed + badge_w + 1);
-        let arg = truncate(&tool.call.arg, arg_room.max(4));
-        let used = fixed + UnicodeWidthStr::width(arg.as_str());
-        let pad = (width as usize).saturating_sub(used + badge_w).max(1);
-        out.push(Line::from(vec![
-            Span::styled("→ ", t.tool_style()),
-            Span::styled(verb.clone(), t.tool_style().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(arg, t.muted_style()),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(badge, badge_style),
-        ]));
+        out.push(tool_header_line(
+            t,
+            &tool.call.verb,
+            &tool.call.arg,
+            badge,
+            badge_style,
+            width,
+        ));
 
         // One-line summary (always, once the result is in).
         if let Some(o) = &tool.result {
@@ -1127,33 +1437,44 @@ impl ChatState {
                 t.muted_style(),
             ),
         ];
-        let mut right = Vec::new();
+        let mut right: Vec<Vec<Span<'static>>> = Vec::new();
         // C-06: the header used to sum only input/output, silently ignoring cache read/write
         // tokens — a heavily-cached session looked identical to an uncached one. `cache` here is
         // BOTH tiers combined (read + write); a session with either shows the segment.
+        //
+        // C-102: tokens / cache / cost are separate droppable segments — on a narrow terminal the
+        // bar sheds cost first, then cache, keeping the token total visible the longest.
         let cache = self.tokens_cache_read + self.tokens_cache_write;
         if self.tokens_in + self.tokens_out + cache > 0 {
-            let mut s = format!(
-                "Σ ↑{} ↓{} tok",
-                fmt_count(self.tokens_in),
-                fmt_count(self.tokens_out)
-            );
+            right.push(vec![Span::styled(
+                format!(
+                    "Σ ↑{} ↓{} tok",
+                    fmt_count(self.tokens_in),
+                    fmt_count(self.tokens_out)
+                ),
+                t.muted_style(),
+            )]);
             if cache > 0 {
-                s.push_str(&format!(" · cache {}", fmt_count(cache)));
+                right.push(vec![Span::styled(
+                    format!(" · cache {}", fmt_count(cache)),
+                    t.muted_style(),
+                )]);
             }
             // C-33: an unpriced metered-cloud turn switches the cost segment to the `$?` state
             // (`$X.XXXX+?` when part of the run WAS priced, bare `$?` when none of it was) rather
             // than rendering a total that silently omits real spend — mirrors flux-cli's
             // ` · $? (unpriced)` marker.
-            match (self.cost_usd, self.cost_unpriced) {
-                (Some(usd), true) => s.push_str(&format!(" · ${usd:.4}+? (unpriced)")),
-                (Some(usd), false) => s.push_str(&format!(" · ${usd:.4}")),
-                (None, true) => s.push_str(" · $? (unpriced)"),
-                (None, false) => {}
+            let cost = match (self.cost_usd, self.cost_unpriced) {
+                (Some(usd), true) => Some(format!(" · ${usd:.4}+? (unpriced)")),
+                (Some(usd), false) => Some(format!(" · ${usd:.4}")),
+                (None, true) => Some(" · $? (unpriced)".to_string()),
+                (None, false) => None,
+            };
+            if let Some(cost) = cost {
+                right.push(vec![Span::styled(cost, t.muted_style())]);
             }
-            s.push(' ');
-            right.push(Span::styled(s, t.muted_style()));
         }
+        // Segment order [tokens, cache, cost]; bar_line drops from the end: cost → cache → tokens.
         bar_line(left, right, width)
     }
 
@@ -1161,10 +1482,61 @@ impl ChatState {
     /// hints — with the last turn's step count + duration on the right.
     fn footer_line(&self, width: u16) -> Line<'static> {
         let t = &self.theme;
+        // Footer takeover precedence (C-107/C-108): transcript search > history search > normal.
+        if let Some(search) = &self.search {
+            let counter = if search.matches.is_empty() {
+                "0/0".to_string()
+            } else {
+                format!("{}/{}", search.current + 1, search.matches.len())
+            };
+            let hint = if search.typing {
+                "Enter commit · Esc close"
+            } else {
+                "n/N next/prev · Esc close"
+            };
+            return bar_line(
+                vec![
+                    Span::styled(" search: ", t.accent_style()),
+                    Span::raw(search.query.clone()),
+                    Span::styled(if search.typing { CURSOR } else { "" }, t.accent_style()),
+                    Span::styled(format!("  {counter}"), t.muted_style()),
+                ],
+                vec![vec![Span::styled(hint.to_string(), t.muted_style())]],
+                width,
+            );
+        }
+        if let Some(hs) = &self.history_search {
+            return bar_line(
+                vec![
+                    Span::styled(" (reverse-i-search) '", t.accent_style()),
+                    Span::raw(hs.query.clone()),
+                    Span::styled("': ", t.accent_style()),
+                    Span::styled(
+                        if hs.index.is_none() && !hs.query.is_empty() {
+                            "no match"
+                        } else {
+                            ""
+                        },
+                        t.warn_style(),
+                    ),
+                ],
+                vec![vec![Span::styled(
+                    "Ctrl-R older · Enter keep · Esc cancel".to_string(),
+                    t.muted_style(),
+                )]],
+                width,
+            );
+        }
         let left = match self.phase {
             Phase::Idle if self.unread > 0 => vec![Span::styled(
                 format!(" ↓ {} new · Ctrl-End latest", self.unread),
                 t.accent_style(),
+            )],
+            // C-105: while capture is off the idle hint IS the indicator — it can never be
+            // dropped by the width fight the right-side segments play.
+            Phase::Idle if !self.mouse_capture => vec![Span::styled(
+                " mouse off · select/copy · Ctrl-T re-enable",
+                t.warn_style(),
             )],
             Phase::Idle => vec![Span::styled(
                 " Enter send · Ctrl-J newline · / commands",
@@ -1201,13 +1573,30 @@ impl ChatState {
                 left
             }
         };
-        let mut right = Vec::new();
+        let mut right: Vec<Vec<Span<'static>>> = Vec::new();
+        // C-105: while a turn runs the left side is the spinner, so the capture state rides the
+        // right side — first segment, so the metrics drop before it on narrow bars.
+        if !self.mouse_capture && self.phase != Phase::Idle {
+            right.push(vec![Span::styled("mouse off (Ctrl-T)", t.warn_style())]);
+        }
+        // C-106: scroll position while detached from follow mode.
+        if !self.follow && self.last_max_scroll.get() > 0 {
+            let pct = (self.scroll as u32 * 100) / self.last_max_scroll.get().max(1) as u32;
+            right.push(vec![Span::styled(
+                format!("⤓ {pct}%"),
+                t.accent_style(),
+            )]);
+        }
         if let Some(e) = self.last_elapsed {
             let plural = if self.steps == 1 { "" } else { "s" };
-            right.push(Span::styled(
-                format!("{} step{plural} · {} ", self.steps, fmt_elapsed(e)),
+            right.push(vec![Span::styled(
+                format!("{} step{plural} · {}", self.steps, fmt_elapsed(e)),
                 t.muted_style(),
-            ));
+            )]);
+        }
+        // Separators lead each non-first segment, so end-dropped segments never strand one.
+        for seg in right.iter_mut().skip(1) {
+            seg.insert(0, Span::styled(" · ", t.muted_style()));
         }
         bar_line(left, right, width)
     }
@@ -1460,24 +1849,37 @@ impl ChatState {
     }
 }
 
-/// Compose a one-row bar: `left` spans, padding, then `right` spans flush to `width`.
-fn bar_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Line<'static> {
+/// Compose a one-row bar: `left` spans, padding, then right-side segments flush to `width`.
+///
+/// `right` is an ordered list of droppable segments: when the bar doesn't fit, segments are
+/// dropped one at a time from the END of the list until it does (an empty right side is the
+/// floor), so callers order them least-precious last.
+fn bar_line(
+    left: Vec<Span<'static>>,
+    mut right: Vec<Vec<Span<'static>>>,
+    width: u16,
+) -> Line<'static> {
     let span_w = |spans: &[Span]| -> usize {
         spans
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum()
     };
-    let mut right = right;
-    if span_w(&left) + span_w(&right) + 1 > width as usize {
-        right.clear();
+    let right_w = |segs: &[Vec<Span>]| -> usize { segs.iter().map(|s| span_w(s)).sum() };
+    // +2: one column of gap before the right side and one of margin after it.
+    while !right.is_empty() && span_w(&left) + right_w(&right) + 2 > width as usize {
+        right.pop();
     }
-    let pad = (width as usize).saturating_sub(span_w(&left) + span_w(&right));
+    let mut flat: Vec<Span<'static>> = right.into_iter().flatten().collect();
+    if !flat.is_empty() {
+        flat.push(Span::raw(" "));
+    }
+    let pad = (width as usize).saturating_sub(span_w(&left) + span_w(&flat));
     let mut spans = left;
     if pad > 0 {
         spans.push(Span::raw(" ".repeat(pad)));
     }
-    spans.extend(right);
+    spans.extend(flat);
     Line::from(spans)
 }
 
@@ -1667,6 +2069,10 @@ pub async fn run_with_options(
 
     let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
     let mut state = ChatState::for_session(model, session_id.clone()).with_verbose(verbose);
+    // C-104: resolve the configured theme for this terminal (NO_COLOR → mono, truecolor → RGB).
+    let (theme_name, theme) = resolve_theme(options.theme.as_deref());
+    state.theme = theme;
+    state.theme_name = theme_name;
     if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
@@ -1786,7 +2192,7 @@ async fn event_loop(
                     for (_tool, _subjects, reply) in approval_queue.drain(..) {
                         let _ = reply.send(ApprovalChoice::Deny);
                     }
-                    state.modal = None;
+                    state.approval = None;
                     state.end_stream();
                     state.phase = Phase::Idle;
                     state.last_elapsed = state.turn_start.map(|s| s.elapsed());
@@ -1843,20 +2249,47 @@ async fn event_loop(
                     continue;
                 }
 
-                // Modal mode: the next key answers the pending approval.
-                if state.modal.is_some() {
-                    if let Some((tool, reply)) = pending_reply.take() {
-                        let choice = match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => ApprovalChoice::Allow,
-                            KeyCode::Char('a') | KeyCode::Char('A') => {
-                                ApprovalChoice::AllowAlways(tool)
+                // Approval sheet: only explicit keys act; anything else is swallowed so a stray
+                // keystroke can't silently deny (C-103).
+                if let Some(view) = state.approval.as_mut() {
+                    match approval_key(key.code) {
+                        ApprovalAction::Ignore => {}
+                        ApprovalAction::Scroll(delta) => {
+                            view.scroll = view
+                                .scroll
+                                .saturating_add_signed(delta)
+                                .min(view.subjects.len().saturating_sub(1));
+                        }
+                        action => {
+                            if let Some((tool, reply)) = pending_reply.take() {
+                                let choice = match action {
+                                    ApprovalAction::Allow => ApprovalChoice::Allow,
+                                    ApprovalAction::AllowAlways => {
+                                        ApprovalChoice::AllowAlways(tool)
+                                    }
+                                    _ => ApprovalChoice::Deny,
+                                };
+                                let _ = reply.send(choice);
                             }
-                            _ => ApprovalChoice::Deny,
-                        };
-                        let _ = reply.send(choice);
+                            state.approval = None;
+                            show_next_approval(state, &mut pending_reply, &mut approval_queue);
+                        }
                     }
-                    state.modal = None;
-                    show_next_approval(state, &mut pending_reply, &mut approval_queue);
+                    continue;
+                }
+
+                // C-110: help overlay — F1/Esc/q close, everything else is swallowed.
+                if state.help_open {
+                    if matches!(
+                        key.code,
+                        KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') | KeyCode::Enter
+                    ) {
+                        state.help_open = false;
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::F(1) {
+                    state.help_open = true;
                     continue;
                 }
 
@@ -1966,6 +2399,125 @@ async fn event_loop(
                     _ => {}
                 }
 
+                // C-108: transcript-search mode — search keys win until Esc closes it.
+                if state.search.is_some() {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let typing = state.search.as_ref().is_some_and(|s| s.typing);
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.search = None;
+                        }
+                        KeyCode::Enter => {
+                            if let Some(s) = state.search.as_mut() {
+                                s.typing = false;
+                            }
+                        }
+                        KeyCode::Char('f') if ctrl => {
+                            if let Some(s) = state.search.as_mut() {
+                                s.typing = true;
+                            }
+                        }
+                        KeyCode::Backspace if typing => {
+                            if let Some(s) = state.search.as_mut() {
+                                s.query.pop();
+                            }
+                            state.refresh_search_matches();
+                            state.center_current_match();
+                        }
+                        KeyCode::Char(c) if typing && !ctrl => {
+                            if let Some(s) = state.search.as_mut() {
+                                s.query.push(c);
+                            }
+                            state.refresh_search_matches();
+                            state.center_current_match();
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') if !typing => {
+                            if state.search_matches_stale() {
+                                state.refresh_search_matches();
+                            } else if let Some(s) = state.search.as_mut() {
+                                let len = s.matches.len();
+                                if len > 0 {
+                                    let forward = key.code == KeyCode::Char('n')
+                                        && !key.modifiers.contains(KeyModifiers::SHIFT);
+                                    s.current = if forward {
+                                        (s.current + 1) % len
+                                    } else {
+                                        (s.current + len - 1) % len
+                                    };
+                                }
+                            }
+                            state.center_current_match();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // C-107: reverse-i-search mode — readline behavior, Esc restores the draft.
+                if state.history_search.is_some() {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(hs) = state.history_search.take() {
+                                state.set_input(&hs.draft);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // Keep whatever the search put in the composer; do not send.
+                            state.history_search = None;
+                        }
+                        KeyCode::Char('r') if ctrl => {
+                            let (query, before) = match state.history_search.as_ref() {
+                                Some(hs) => (hs.query.clone(), hs.index),
+                                None => continue,
+                            };
+                            if let Some(found) = rsearch(&state.history, &query, before) {
+                                let text = state.history[found].clone();
+                                state.set_input(&text);
+                                if let Some(hs) = state.history_search.as_mut() {
+                                    hs.index = Some(found);
+                                }
+                            }
+                        }
+                        KeyCode::Backspace | KeyCode::Char(_) => {
+                            let edited = match key.code {
+                                KeyCode::Backspace => {
+                                    state
+                                        .history_search
+                                        .as_mut()
+                                        .is_some_and(|hs| hs.query.pop().is_some())
+                                }
+                                KeyCode::Char(c) if !ctrl => {
+                                    if let Some(hs) = state.history_search.as_mut() {
+                                        hs.query.push(c);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            };
+                            if edited {
+                                let query = state
+                                    .history_search
+                                    .as_ref()
+                                    .map(|hs| hs.query.clone())
+                                    .unwrap_or_default();
+                                let found = rsearch(&state.history, &query, None);
+                                if let Some(i) = found {
+                                    let text = state.history[i].clone();
+                                    state.set_input(&text);
+                                }
+                                if let Some(hs) = state.history_search.as_mut() {
+                                    hs.index = found;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Slash-command menu: when the input is a bare `/cmd` prefix with matches, ↑/↓ select,
                 // Tab/Enter run the command, Esc dismisses; other keys fall through to edit/filter.
                 if state.queue_edit_index.is_none() {
@@ -2069,6 +2621,36 @@ async fn event_loop(
                         }
                     }
                     KeyCode::Char('e') if ctrl => state.toggle_details(),
+                    // C-107: reverse history search. Deliberately shadows tui-textarea's redo
+                    // (Ctrl-U undo remains) — readline muscle memory wins.
+                    KeyCode::Char('r') if ctrl => {
+                        state.history_search = Some(HistorySearch {
+                            query: String::new(),
+                            index: None,
+                            draft: state.input.lines().join("\n"),
+                        });
+                    }
+                    // C-108: transcript search. Shadows tui-textarea's forward-char (arrows
+                    // remain) — same precedent as Ctrl-E.
+                    KeyCode::Char('f') if ctrl => {
+                        state.search = Some(TranscriptSearch {
+                            typing: true,
+                            ..Default::default()
+                        });
+                        state.refresh_search_matches();
+                    }
+                    // C-105: live mouse-capture toggle so terminal-native select/copy works.
+                    // Wheel scroll is lost while off; PgUp/PgDn remain. (Ctrl-T is unbound in
+                    // tui-textarea, so nothing is shadowed.)
+                    KeyCode::Char('t') if ctrl => {
+                        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+                        state.mouse_capture = !state.mouse_capture;
+                        let _ = if state.mouse_capture {
+                            crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+                        } else {
+                            crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+                        };
+                    }
                     _ if want_newline => state.input.insert_newline(),
                     KeyCode::Enter => {
                         if state.input_blank() {
@@ -2151,10 +2733,7 @@ async fn handle_command(
     }
 
     match name {
-        "" | "help" => state.push(Entry::Notice {
-            text: HELP_TEXT.into(),
-            sev: Sev::Info,
-        }),
+        "" | "help" => state.help_open = true,
         "quit" | "exit" => return Ok(true),
         "queue" => {
             if state.queue.is_empty() {
@@ -2308,6 +2887,33 @@ async fn handle_command(
         "compact" => {
             *cancel = start_compaction(agent, tx, state);
         }
+        "theme" if args.is_empty() => state.push(Entry::Notice {
+            text: format!(
+                "themes: {} · current: {}",
+                Theme::names().join(" "),
+                state.theme_name
+            ),
+            sev: Sev::Info,
+        }),
+        "theme" => match Theme::by_name(args, terminal_truecolor(), no_color()) {
+            Some(theme) => {
+                state.theme = theme;
+                state.theme_name = args.to_string();
+                state.mark_transcript_dirty();
+                let persisted = flux_runtime::metadata::persist_user_theme(args);
+                state.push(Entry::Notice {
+                    text: match persisted {
+                        Ok(()) => format!("theme: {args} (saved to ~/.flux/config.toml)"),
+                        Err(error) => format!("theme: {args} (not saved: {error})"),
+                    },
+                    sev: Sev::Info,
+                });
+            }
+            None => state.push(Entry::Notice {
+                text: format!("unknown theme `{args}` — themes: {}", Theme::names().join(" ")),
+                sev: Sev::Warn,
+            }),
+        },
         "model" if args.is_empty() => state.push(Entry::Notice {
             text: format!(
                 "model: {}",
@@ -2412,7 +3018,7 @@ async fn handle_command(
 }
 
 fn command_is_read_only(name: &str, args: &str) -> bool {
-    matches!(name, "help" | "tools" | "evidence" | "session" | "queue")
+    matches!(name, "help" | "tools" | "evidence" | "session" | "queue" | "theme")
         || (name == "sessions" && args != "--prune")
         || (name == "effort" && args.is_empty())
 }
@@ -2548,6 +3154,7 @@ fn scroll_down(state: &mut ChatState, n: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {
@@ -2665,7 +3272,11 @@ mod tests {
         state.stream_text("done");
         assert_eq!(state.entries.len(), 3);
 
-        state.modal = Some("approve `bash`\n[y]es [a]lways [N]o".to_string());
+        state.approval = Some(ApprovalView {
+            tool: "bash".into(),
+            subjects: vec!["ls".into()],
+            scroll: 0,
+        });
         let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(screen(&terminal).contains("approve"));
@@ -2827,6 +3438,394 @@ mod tests {
         assert!(matches!(request.await.unwrap(), ApprovalChoice::Deny));
     }
 
+    /// C-105: while mouse capture is off, the footer indicates it (warn style) so the state is
+    /// never invisible; the metrics segment drops before the indicator on narrow bars.
+    #[test]
+    fn mouse_off_footer_indicator() {
+        let mut state = ChatState::new("mock".into());
+        state.mouse_capture = false;
+        state.steps = 3;
+        state.last_elapsed = Some(Duration::from_secs(2));
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("mouse off"), "{content}");
+        assert!(content.contains("Ctrl-T re-enable"), "{content}");
+        assert!(content.contains("3 steps"), "{content}");
+
+        // Narrow: the idle-hint indicator survives (it owns the left side).
+        let mut narrow = Terminal::new(TestBackend::new(46, 10)).unwrap();
+        narrow.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&narrow).contains("mouse off"));
+
+        // While running, the state rides the right side as a short segment.
+        state.phase = Phase::Thinking;
+        state.turn_start = Some(Instant::now());
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("mouse off (Ctrl-T)"));
+        state.phase = Phase::Idle;
+        state.turn_start = None;
+
+        state.mouse_capture = true;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("mouse off"));
+    }
+
+    /// C-106: detaching from follow mode shows a scrollbar on the transcript's right column and
+    /// a percent segment in the footer; follow mode shows neither.
+    #[test]
+    fn scroll_indicator_appears_only_while_detached() {
+        let mut state = ChatState::new("mock".into());
+        for i in 0..40 {
+            state.push_user(&format!("message number {i}"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        // Following: no indicator.
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains('%'));
+
+        scroll_up(&mut state, 5);
+        assert!(!state.follow);
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("⤓") && content.contains('%'), "{content}");
+        let buffer = terminal.backend().buffer();
+        let transcript_rows = 1..(12 - 2);
+        let bar_col = 59;
+        let has_bar_glyph = transcript_rows
+            .map(|y| buffer.cell((bar_col, y)).expect("cell").symbol().to_string())
+            .any(|s| s != " ");
+        assert!(has_bar_glyph, "scrollbar glyphs expected in the last column");
+
+        // Reattach: indicator gone.
+        state.follow = true;
+        state.scroll = state.last_max_scroll.get();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains('%'));
+    }
+
+    /// C-110: the help overlay lists keys and every slash command from the COMMANDS table, and
+    /// only renders while open.
+    #[test]
+    fn help_overlay_lists_keys_and_all_commands() {
+        let mut state = ChatState::new("mock".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("help · Esc close"));
+
+        state.help_open = true;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("help · Esc close"), "{content}");
+        assert!(content.contains("Ctrl-J"), "{content}");
+        assert!(content.contains("Ctrl-R"), "{content}");
+        assert!(content.contains("Ctrl-T"), "{content}");
+        for c in COMMANDS {
+            assert!(content.contains(&format!("/{}", c.name)), "missing /{}", c.name);
+        }
+
+        state.help_open = false;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("help · Esc close"));
+    }
+
+    /// C-107: `rsearch` — backwards, case-insensitive, stepping strictly older via `before`.
+    #[test]
+    fn rsearch_steps_backwards_case_insensitive() {
+        let history: Vec<String> = ["fix the Bug", "run tests", "fix bugs again", "deploy"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(rsearch(&history, "bug", None), Some(2));
+        assert_eq!(rsearch(&history, "bug", Some(2)), Some(0));
+        assert_eq!(rsearch(&history, "bug", Some(0)), None);
+        assert_eq!(rsearch(&history, "BUG", None), Some(2));
+        assert_eq!(rsearch(&history, "nope", None), None);
+        assert_eq!(rsearch(&history, "", None), None);
+    }
+
+    /// C-107: the footer takes over with the reverse-i-search line while active, and the matched
+    /// entry lands in the composer.
+    #[test]
+    fn history_search_footer_takeover_renders() {
+        let mut state = ChatState::new("mock".into());
+        state.history = vec!["fix the bug".into(), "run tests".into()];
+        state.history_search = Some(HistorySearch {
+            query: "bug".into(),
+            index: Some(0),
+            draft: String::new(),
+        });
+        state.set_input("fix the bug");
+        let mut terminal = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("(reverse-i-search) 'bug':"), "{content}");
+        assert!(content.contains("fix the bug"), "{content}");
+    }
+
+    /// C-108: `find_match_rows` matches per wrapped row, case-insensitive.
+    #[test]
+    fn find_match_rows_matches_flattened_rows() {
+        let lines = vec![
+            Line::from(vec![Span::raw("alpha "), Span::raw("Beta")]),
+            Line::from("gamma"),
+            Line::from("beta again"),
+        ];
+        assert_eq!(find_match_rows(&lines, "beta"), vec![0, 2]);
+        assert_eq!(find_match_rows(&lines, "ALPHA"), vec![0]);
+        assert_eq!(find_match_rows(&lines, "delta"), Vec::<u16>::new());
+        assert_eq!(find_match_rows(&lines, ""), Vec::<u16>::new());
+        // A match crossing a span boundary within one row IS found (rows are flattened).
+        assert_eq!(find_match_rows(&lines, "alpha b"), vec![0]);
+    }
+
+    /// C-108: an active search highlights visible matches (REVERSED), centers the current match,
+    /// and the footer shows the counter — all without touching the cached layout.
+    #[test]
+    fn transcript_search_highlights_and_centers() {
+        let mut state = ChatState::new("mock".into());
+        for i in 0..30 {
+            state.push_user(&format!("filler {i}"));
+        }
+        state.push_user("the needle message");
+        for i in 0..30 {
+            state.push_user(&format!("padding {i}"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap(); // build the layout
+        let revision_before = state.transcript_revision;
+
+        state.search = Some(TranscriptSearch {
+            query: "needle".into(),
+            typing: false,
+            ..Default::default()
+        });
+        state.refresh_search_matches();
+        assert_eq!(
+            state.search.as_ref().unwrap().matches.len(),
+            1,
+            "one matching row expected"
+        );
+        state.center_current_match();
+        assert!(!state.follow);
+
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("needle"), "{content}");
+        assert!(content.contains("1/1"), "{content}");
+        assert!(content.contains("n/N next/prev"), "{content}");
+
+        // The match cells carry REVERSED; the cache revision is untouched.
+        let buffer = terminal.backend().buffer();
+        let reversed = buffer
+            .content
+            .iter()
+            .any(|c| c.modifier.contains(Modifier::REVERSED) && c.symbol() == "n");
+        assert!(reversed, "match cells must be REVERSED");
+        assert_eq!(state.transcript_revision, revision_before);
+
+        // Esc-equivalent: clearing the search removes highlights.
+        state.search = None;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("n/N next/prev"));
+    }
+
+    /// C-109: running tool cards get a live spinner + elapsed badge patched into the viewport
+    /// per frame — WITHOUT invalidating the cached transcript layout — and stop animating the
+    /// moment the result lands.
+    #[test]
+    fn running_tool_card_animates_without_cache_invalidation() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "sleep 5"}),
+        )));
+        if let Some(Entry::Tool(tool)) = state.entries.last_mut() {
+            tool.started = Instant::now() - Duration::from_secs(2);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(72, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("running · 2"), "{content}");
+        assert!(
+            SPINNER.iter().any(|frame| content.contains(frame)),
+            "animated glyph expected: {content}"
+        );
+        assert!(!content.contains(RUNNING_BADGE), "static badge is patched");
+
+        // A second frame re-patches from the SAME cached layout: revision untouched.
+        let revision = state.transcript_revision;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert_eq!(state.transcript_revision, revision);
+        assert!(
+            state
+                .transcript_layout
+                .borrow()
+                .as_ref()
+                .is_some_and(|l| l.revision == revision && !l.running_rows.is_empty()),
+            "cached layout must survive animation frames"
+        );
+
+        // Result lands → done badge, no more patching.
+        state.finish_tool("bash", "ok".into(), false);
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("✓"), "{content}");
+        assert!(!content.contains("running ·"), "{content}");
+        assert!(state
+            .transcript_layout
+            .borrow()
+            .as_ref()
+            .is_some_and(|l| l.running_rows.is_empty()));
+    }
+
+    /// C-104: `Theme::by_name` — NO_COLOR forces mono, truecolor picks the RGB tuning, unknown
+    /// names are rejected.
+    #[test]
+    fn theme_by_name_resolves_variants() {
+        use ratatui::style::Color;
+        assert!(matches!(
+            Theme::by_name("dark", false, false),
+            Some(t) if t.accent == Theme::DARK.accent
+        ));
+        assert!(matches!(
+            Theme::by_name("dark", true, false),
+            Some(t) if matches!(t.accent, Color::Rgb(..))
+        ));
+        assert!(matches!(
+            Theme::by_name("light", true, false),
+            Some(t) if matches!(t.base_bg, Color::Rgb(..))
+        ));
+        // NO_COLOR wins over everything, including truecolor.
+        assert!(matches!(
+            Theme::by_name("light", true, true),
+            Some(t) if t.accent == Color::Reset && t.base_bg == Color::Reset
+        ));
+        assert!(Theme::by_name("solarized", true, false).is_none());
+        assert!(Theme::by_name("solarized", true, true).is_none());
+    }
+
+    /// C-104: switching the theme restyles the screen — a known cell's colors change and the
+    /// light theme paints the root background.
+    #[test]
+    fn theme_switch_restyles_screen() {
+        let mut state = ChatState::new("mock".into());
+        state.input.insert_str("draft");
+        let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let dark_bg = terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .expect("cell")
+            .bg;
+        assert_eq!(dark_bg, Theme::DARK.base_bg);
+
+        state.theme = Theme::LIGHT;
+        state.theme_name = "light".into();
+        state.mark_transcript_dirty();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 0)).expect("cell").bg, Theme::LIGHT.base_bg);
+        let draft = buffer
+            .content
+            .iter()
+            .find(|c| c.symbol() == "d")
+            .expect("draft cell");
+        assert_eq!(draft.bg, Theme::LIGHT.composer_bg);
+    }
+
+    /// C-103: only explicit keys act on the approval sheet — a stray keystroke is ignored (the
+    /// sheet stays, the reply is not consumed) instead of silently denying.
+    #[test]
+    fn approval_key_only_acts_on_explicit_keys() {
+        assert_eq!(approval_key(KeyCode::Char('y')), ApprovalAction::Allow);
+        assert_eq!(approval_key(KeyCode::Char('Y')), ApprovalAction::Allow);
+        assert_eq!(
+            approval_key(KeyCode::Char('a')),
+            ApprovalAction::AllowAlways
+        );
+        assert_eq!(
+            approval_key(KeyCode::Char('A')),
+            ApprovalAction::AllowAlways
+        );
+        assert_eq!(approval_key(KeyCode::Char('n')), ApprovalAction::Deny);
+        assert_eq!(approval_key(KeyCode::Char('N')), ApprovalAction::Deny);
+        assert_eq!(approval_key(KeyCode::Esc), ApprovalAction::Deny);
+        assert_eq!(approval_key(KeyCode::Up), ApprovalAction::Scroll(-1));
+        assert_eq!(approval_key(KeyCode::Down), ApprovalAction::Scroll(1));
+        // Everything else — including the keys that used to deny — is ignored.
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Char('q'),
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::PageDown,
+        ] {
+            assert_eq!(approval_key(code), ApprovalAction::Ignore, "{code:?}");
+        }
+    }
+
+    /// C-103: the redesigned sheet renders subjects verbatim (no Debug `["…"]`), windows long
+    /// lists with a `+N more` marker, and colors its key hints.
+    #[test]
+    fn approval_sheet_windows_subjects_and_styles_hints() {
+        let mut state = ChatState::new("mock".into());
+        let subjects: Vec<String> = (0..10).map(|i| format!("path/to/file-{i}.rs")).collect();
+        state.approval = Some(ApprovalView {
+            tool: "write".into(),
+            subjects,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("approve"), "{content}");
+        assert!(content.contains("write"), "{content}");
+        assert!(content.contains("path/to/file-0.rs"), "{content}");
+        assert!(!content.contains("[\""), "no Debug formatting: {content}");
+        assert!(content.contains("more"), "windowed list marker: {content}");
+        assert!(content.contains('┌'), "bordered sheet: {content}");
+        assert!(content.contains("[y]") && content.contains("[n/Esc]"), "{content}");
+
+        // Hint keys carry their semantic colors.
+        let buffer = terminal.backend().buffer();
+        let mut found_ok = false;
+        for cell in &buffer.content {
+            if cell.symbol() == "y" && cell.fg == state.theme.ok {
+                found_ok = true;
+            }
+        }
+        assert!(found_ok, "[y] hint must use the ok color");
+    }
+
+    /// C-103: a stray key while the sheet is open must NOT resolve the pending reply.
+    #[tokio::test]
+    async fn stray_key_does_not_resolve_approval() {
+        let mut state = ChatState::new("mock".into());
+        let mut current = None;
+        let mut queued = VecDeque::new();
+        let (reply, mut reply_rx) = oneshot::channel();
+        queued.push_back(("bash".into(), vec!["rm -rf tmp".into()], reply));
+        show_next_approval(&mut state, &mut current, &mut queued);
+        assert!(state.approval.is_some());
+
+        // Simulate the event-loop branch for a stray key: Ignore → nothing happens.
+        assert_eq!(approval_key(KeyCode::Char('x')), ApprovalAction::Ignore);
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "stray key must not consume the reply"
+        );
+        assert!(state.approval.is_some(), "sheet must stay open");
+
+        // An explicit deny resolves it.
+        let (_tool, reply) = current.take().unwrap();
+        let _ = reply.send(ApprovalChoice::Deny);
+        assert!(matches!(reply_rx.try_recv(), Ok(ApprovalChoice::Deny)));
+    }
+
     #[test]
     fn concurrent_approvals_are_presented_fifo() {
         let mut state = ChatState::new("mock".into());
@@ -2840,17 +3839,17 @@ mod tests {
         show_next_approval(&mut state, &mut current, &mut queued);
         assert!(matches!(current.as_ref(), Some((tool, _)) if tool == "write"));
         assert!(state
-            .modal
-            .as_deref()
-            .is_some_and(|text| text.contains("[\"a\"]")));
+            .approval
+            .as_ref()
+            .is_some_and(|view| view.tool == "write" && view.subjects == ["a"]));
         current.take();
-        state.modal = None;
+        state.approval = None;
         show_next_approval(&mut state, &mut current, &mut queued);
         assert!(matches!(current.as_ref(), Some((tool, _)) if tool == "bash"));
         assert!(state
-            .modal
-            .as_deref()
-            .is_some_and(|text| text.contains("[\"b\"]")));
+            .approval
+            .as_ref()
+            .is_some_and(|view| view.tool == "bash" && view.subjects == ["b"]));
     }
 
     #[test]
@@ -3113,6 +4112,53 @@ mod tests {
         assert!(content.contains("anthropic/opus"));
         assert!(content.contains("12.3k")); // cumulative tokens in the header
         assert!(content.contains("3 steps")); // last-turn metrics in the footer
+    }
+
+    /// C-102 graceful narrow-width bars: `bar_line` drops right-side segments one at a time from
+    /// the end (least-precious last) instead of clearing the whole right side at once.
+    #[test]
+    fn bar_line_drops_right_segments_progressively() {
+        let seg = |s: &str| vec![Span::raw(s.to_string())];
+        let render_at = |width: u16| -> String {
+            bar_line(
+                vec![Span::raw("left")],
+                vec![seg("tok"), seg(" · cache"), seg(" · cost")],
+                width,
+            )
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+        };
+        // Wide: everything fits (left 4 + right 19 + 2 = 25).
+        let wide = render_at(40);
+        assert!(wide.contains("tok") && wide.contains("cache") && wide.contains("cost"));
+        // Mid: cost dropped, cache survives (4 + 11 + 2 = 17).
+        let mid = render_at(20);
+        assert!(mid.contains("tok") && mid.contains("cache"), "{mid}");
+        assert!(!mid.contains("cost"), "{mid}");
+        // Narrow: only tokens survive (4 + 3 + 2 = 9).
+        let narrow = render_at(12);
+        assert!(narrow.contains("tok"), "{narrow}");
+        assert!(!narrow.contains("cache") && !narrow.contains("cost"), "{narrow}");
+        // Floor: right side empties entirely rather than truncating the left.
+        let floor = render_at(6);
+        assert!(floor.contains("left") && !floor.contains("tok"), "{floor}");
+    }
+
+    /// C-102: on a narrow terminal the header sheds cost → cache but keeps the token total.
+    #[test]
+    fn narrow_header_keeps_tokens_drops_cost() {
+        let mut state = ChatState::new("m".into());
+        state.tokens_in = 12_300;
+        state.tokens_out = 840;
+        state.tokens_cache_read = 1_000;
+        state.cost_usd = Some(1.2345);
+        let mut terminal = Terminal::new(TestBackend::new(46, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("12.3k"), "tokens must survive: {content}");
+        assert!(!content.contains("$1.2345"), "cost drops first: {content}");
     }
 
     /// C-06 cache-aware surfacing: the TUI header must show cache tokens (previously ignored

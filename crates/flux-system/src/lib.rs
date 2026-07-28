@@ -344,18 +344,39 @@ fn path_to_utf8(path: &Path) -> Result<String> {
         .ok_or_else(|| Error::Config(format!("resolved path {:?} is not valid UTF-8", path)))
 }
 
-/// Whether the environment variable `key` is set to a truthy value (`1`/`true`/`yes`/`on`).
-/// The one owner of boolean `FLUX_*` env semantics: mere presence is NOT truthy, so an operator
-/// exporting `FLUX_ALLOW_PRIVATE_NET=0` (or `FLUX_VERBOSE=false`) disables the signal instead of
-/// silently enabling it.
+/// The base directory worktree parents are allocated under: `$FLUX_WORKTREE_DIR`, else
+/// `$HOME/.flux/worktrees` (beside the other `~/.flux` state), else the system temp dir. A real
+/// on-disk default matters: `/tmp` is commonly a RAM-backed tmpfs, and a build inside an entered
+/// worktree (`cargo build` → a multi-GB `target/`) would fill it and starve every process that
+/// needs `/tmp`.
+fn worktree_base_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("FLUX_WORKTREE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => Path::new(&home).join(".flux").join("worktrees"),
+        _ => std::env::temp_dir(),
+    }
+}
+
 /// Allocate a fresh private parent directory for a context-local git worktree (C-97):
-/// `<tmp>/flux-worktree-<pid>-<seq>` with owner-only permissions on Unix. The directory is
-/// created outside any workspace root on purpose — the caller derives a re-rooted [`System`]
-/// ([`System::rerooted`]) at the checkout inside it.
+/// `<base>/flux-worktree-<pid>-<seq>` with owner-only permissions on Unix, where `<base>` comes
+/// from [`worktree_base_dir`]. The directory is created outside any workspace root on purpose —
+/// the caller derives a re-rooted [`System`] ([`System::rerooted`]) at the checkout inside it.
 pub fn allocate_worktree_dir() -> Result<PathBuf> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("flux-worktree-{}-{seq}", std::process::id()));
+    let base = worktree_base_dir();
+    std::fs::create_dir_all(&base)
+        .map_err(|e| Error::Config(format!("worktree base {}: {e}", base.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = base.join(format!("flux-worktree-{}-{seq}", std::process::id()));
     std::fs::create_dir(&dir)
         .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))?;
     #[cfg(unix)]
@@ -368,12 +389,12 @@ pub fn allocate_worktree_dir() -> Result<PathBuf> {
 }
 
 /// Remove a directory previously allocated by [`allocate_worktree_dir`]. Fail-closed: refuses any
-/// path that is not directly under the system temp dir with the `flux-worktree-` prefix, so a
-/// corrupted session state can never turn cleanup into an arbitrary recursive delete.
+/// path that is not directly under the resolved [`worktree_base_dir`] with the `flux-worktree-`
+/// prefix, so a corrupted session state can never turn cleanup into an arbitrary recursive delete.
 pub fn remove_worktree_dir(path: &Path) -> Result<()> {
-    let tmp = std::env::temp_dir()
+    let tmp = worktree_base_dir()
         .canonicalize()
-        .map_err(|e| Error::Config(format!("temp dir: {e}")))?;
+        .map_err(|e| Error::Config(format!("worktree base dir: {e}")))?;
     let ok = path.parent() == Some(tmp.as_path())
         && path
             .file_name()
@@ -395,6 +416,10 @@ pub fn remove_worktree_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Whether the environment variable `key` is set to a truthy value (`1`/`true`/`yes`/`on`).
+/// The one owner of boolean `FLUX_*` env semantics: mere presence is NOT truthy, so an operator
+/// exporting `FLUX_ALLOW_PRIVATE_NET=0` (or `FLUX_VERBOSE=false`) disables the signal instead of
+/// silently enabling it.
 pub fn env_truthy(key: &str) -> bool {
     std::env::var(key)
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
@@ -2076,8 +2101,17 @@ mod tests {
     /// directly-under-tmp `flux-worktree-*` allocation.
     #[test]
     fn worktree_dir_alloc_and_guarded_removal() {
+        // Pin the base via FLUX_WORKTREE_DIR (under the env lock) so the test never touches the
+        // real ~/.flux/worktrees and stays hermetic under parallel test threads.
+        let _env = sandbox::EnvGuard::new(&["FLUX_WORKTREE_DIR"]);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("flux-wt-base-{}-{n}", std::process::id()));
+        std::env::set_var("FLUX_WORKTREE_DIR", &base);
+
         let dir = allocate_worktree_dir().unwrap();
         assert!(dir.is_dir());
+        assert_eq!(dir.parent().unwrap(), base.canonicalize().unwrap());
         assert!(dir
             .file_name()
             .unwrap()
@@ -2089,11 +2123,31 @@ mod tests {
         // Idempotent: a second removal of the same allocation is fine.
         remove_worktree_dir(&dir).unwrap();
 
-        // Refusals: wrong prefix, nested path, workspace-shaped path.
+        // Refusals: wrong prefix, nested path, workspace-shaped path, and an entry under a
+        // DIFFERENT base than the resolved one (e.g. a stale /tmp allocation after the base moved).
         let (other, _) = temp_workspace();
         assert!(remove_worktree_dir(&other).is_err());
-        assert!(remove_worktree_dir(&std::env::temp_dir().join("flux-worktree-x/nested")).is_err());
+        assert!(remove_worktree_dir(&base.join("flux-worktree-x/nested")).is_err());
+        let foreign = std::env::temp_dir().join("flux-worktree-foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        assert!(remove_worktree_dir(&foreign).is_err());
+        assert!(foreign.exists());
+        std::fs::remove_dir(&foreign).unwrap();
         assert!(other.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The base falls back to `$HOME/.flux/worktrees` (never `/tmp`, which is commonly a
+    /// RAM-backed tmpfs a worktree build would fill) when `FLUX_WORKTREE_DIR` is unset.
+    #[test]
+    fn worktree_base_prefers_home_flux_over_tmp() {
+        let _env = sandbox::EnvGuard::new(&["FLUX_WORKTREE_DIR"]);
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                worktree_base_dir(),
+                Path::new(&home).join(".flux").join("worktrees")
+            );
+        }
     }
 
     /// `env_truthy` requires an explicit truthy VALUE — presence alone (or an explicit "off"

@@ -9,8 +9,8 @@ pub struct ChatState {
     pub(super) transcript_revision: u64,
     pub(super) transcript_layout: RefCell<Option<TranscriptLayout>>,
     pub(super) input: TextArea<'static>,
-    /// When set, an approval modal is shown over the transcript.
-    pub modal: Option<String>,
+    /// When set, an approval sheet is shown over the transcript.
+    pub approval: Option<ApprovalView>,
     pub(super) assistant_open: bool,
     pub(super) phase: Phase,
     pub(super) turn_start: Option<Instant>,
@@ -18,6 +18,7 @@ pub struct ChatState {
     pub(super) model: String,
     pub(super) model_spec: Option<String>,
     pub(super) theme: Theme,
+    pub(super) theme_name: String,
     pub(super) expand_tools: bool,
     pub(super) verbose: bool,
     pub(super) slash_sel: usize,
@@ -42,6 +43,15 @@ pub struct ChatState {
     pub(super) session_sel: usize,
     pub(super) scroll: u16,
     pub(super) follow: bool,
+    /// Whether the terminal's mouse capture is on (Ctrl-T toggles it live so terminal-native
+    /// text selection/copy works while off, C-105).
+    pub(super) mouse_capture: bool,
+    /// Active Ctrl-R reverse incremental history search (C-107).
+    pub(super) history_search: Option<HistorySearch>,
+    /// Active Ctrl-F transcript search (C-108).
+    pub(super) search: Option<TranscriptSearch>,
+    /// Whether the help overlay is open (F1 / `/help`, C-110).
+    pub(super) help_open: bool,
     pub(super) last_max_scroll: Cell<u16>,
     pub(super) last_page: Cell<u16>,
     pub(super) plan_phase: Option<String>,
