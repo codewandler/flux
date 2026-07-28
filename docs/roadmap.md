@@ -95,7 +95,7 @@ cache untouched. Done means all nine stories' acceptance green under the standar
 pub-surface breaks (`TuiRunOptions.theme`, `ChatState.modal` → `approval`) ride the next MINOR.
 Design: [designs/tui-polish.md](designs/tui-polish.md).
 
-### Claude interop — commands + skills that load from both worlds (epic) — ✅ **COMPLETE (2026-07-28; D-186…D-192, all seven stories; supersedes C-93; unreleased)**
+### Claude interop — commands + skills that load from both worlds (epic) — ✅ **COMPLETE (2026-07-28; D-186…D-192, all seven stories; supersedes C-93; merged to main, unreleased)**
 
 A compatibility audit found flux half-speaks Claude Code's dialect: skills already load from
 `.claude/skills`/`~/.claude/skills` with `name`/`description` frontmatter, but command files
