@@ -2,7 +2,7 @@
 id: C-114
 title: Markdown for the sealed prefix while streaming
 pillar: Core
-status: ready
+status: done
 priority: P3
 design: tui-polish
 epic: tui-polish
@@ -19,18 +19,18 @@ the markdown engine while streaming and keep only the trailing unterminated bloc
 replies read styled as they arrive, without flicker.
 
 ## Acceptance
-- [ ] While streaming, text up to the last completed block boundary (a blank line outside an open
+- [x] While streaming, text up to the last completed block boundary (a blank line outside an open
       code fence) renders via `markdown::render`; the tail stays plain + cursor.
-- [ ] Anti-flicker invariant pinned: across two successive stream states, the lines rendered for
+- [x] Anti-flicker invariant pinned: across two successive stream states, the lines rendered for
       the previously-completed prefix are byte-identical (unit test on the boundary-split helper
       at two append states).
-- [ ] An open code fence stays plain in its entirety until the closing fence arrives (no
+- [x] An open code fence stays plain in its entirety until the closing fence arrives (no
       misrender mid-fence) — test.
-- [ ] The sealed render path is unchanged: the final sealed output is byte-identical to today's
+- [x] The sealed render path is unchanged: the final sealed output is byte-identical to today's
       (test compares before/after).
 
 ## Progress
--
+- Done 2026-07-28: `split_sealed_prefix` (blank-line boundaries outside fences; successors that could restyle earlier blocks — indented/list/blockquote — held back; fence opener is a safe successor), streaming branch renders the sealed prefix via markdown::render cached under (width, prefix_len) — the cache IS the anti-flicker guarantee — tail plain + cursor; sealed path byte-identical. Tests: split_sealed_prefix_is_conservative_and_monotonic, streaming_renders_sealed_prefix_styled_and_stable.
 
 ## Notes
 - Seams: streaming plain-text branch `crates/flux-tui/src/lib.rs:391`, sealed render

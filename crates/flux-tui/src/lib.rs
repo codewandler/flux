@@ -250,14 +250,18 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("Ctrl-F", "transcript search · n/N step matches"),
     ("PgUp/PgDn / wheel", "scroll transcript"),
     ("Ctrl-End", "jump to latest"),
-    ("Ctrl-E", "expand/collapse tool details"),
+    ("Ctrl-E", "expand/collapse tool details (all cards)"),
+    (
+        "Shift-↑/↓",
+        "focus transcript entry · ↵ expand card · y copy · Esc",
+    ),
     (
         "Ctrl-T",
         "toggle mouse capture (native select/copy while off)",
     ),
     (
-        "y / a / n·Esc",
-        "approval: allow / always / deny (other keys ignored)",
+        "y / a / n·Esc / d",
+        "approval: allow / always / deny / deny with reason",
     ),
     ("Ctrl-C", "interrupt · clear · quit"),
     ("Ctrl-D", "quit (empty input)"),
@@ -322,6 +326,9 @@ struct ToolEntry {
     timing: Option<flux_core::OperationTiming>,
     /// `None` while the op is still running.
     result: Option<ToolOutcome>,
+    /// Per-card expansion override (C-111): `None` follows the global `expand_tools`; Enter on
+    /// the focused card sets `Some(!effective)` so one card can open/close independently.
+    expanded: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -344,6 +351,7 @@ impl ToolEntry {
             started: Instant::now(),
             timing: None,
             result: None,
+            expanded: None,
         }
     }
 
@@ -371,6 +379,7 @@ impl ToolEntry {
                 elapsed,
                 approval_wait: None,
             }),
+            expanded: None,
         }
     }
 
@@ -399,6 +408,7 @@ impl ToolEntry {
                 elapsed,
                 approval_wait: None,
             }),
+            expanded: None,
         }
     }
 }
@@ -408,8 +418,10 @@ impl ToolEntry {
 struct Assistant {
     text: String,
     done: bool,
-    /// `(width, rendered lines)` — only populated once `done`, recomputed when the width changes.
-    cache: RefCell<Option<(u16, Vec<Line<'static>>)>>,
+    /// `(width, source byte length, rendered lines)` — the sealed message caches its full render;
+    /// while streaming the SEALED PREFIX caches under its byte length (C-114), so a stable prefix
+    /// renders exactly once and its lines are byte-identical across stream states by construction.
+    cache: RefCell<Option<(u16, usize, Vec<Line<'static>>)>>,
 }
 
 /// Cached, fully wrapped transcript layout. State changes invalidate the cache; animation-only
@@ -418,6 +430,9 @@ struct Assistant {
 struct TranscriptLayout {
     revision: u64,
     width: u16,
+    /// Per-entry wrapped row spans `(entry index, first row, row count)` — focus navigation
+    /// (C-111) uses them to highlight and center the focused entry.
+    entry_rows: Vec<(usize, u16, u16)>,
     lines: Vec<Line<'static>>,
     /// `(wrapped row, entry index)` of each running tool card's header row, in order — the
     /// viewport patches these with a live spinner + elapsed badge per tick (C-109).
@@ -460,6 +475,82 @@ fn rsearch(history: &[String], query: &str, before: Option<usize>) -> Option<usi
     history[..end.min(history.len())]
         .iter()
         .rposition(|entry| entry.to_lowercase().contains(&query))
+}
+
+/// Entry cap for the `@` completion's workspace file inventory (C-112) — bounds the lazy walk.
+const PATH_INVENTORY_CAP: usize = 20_000;
+
+/// Bounded, ignore-aware workspace file walk for `@` path completion (C-112): skips hidden
+/// entries, `target`, and `node_modules`; does not follow symlinked directories; stops at `cap`
+/// files. Returns workspace-relative paths, sorted.
+fn workspace_file_inventory(root: &std::path::Path, cap: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= cap {
+            break;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            if out.len() >= cap {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                if let Ok(rel) = entry.path().strip_prefix(root) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Rank workspace paths against a fuzzy query (C-112): path-segment prefix beats substring
+/// beats subsequence; ties go to the shorter path. Case-insensitive. Pure and unit-tested.
+fn fuzzy_rank<'a>(paths: &'a [String], query: &str) -> Vec<&'a str> {
+    fn is_subsequence(hay: &str, needle: &str) -> bool {
+        let mut chars = needle.chars();
+        let mut want = chars.next();
+        for c in hay.chars() {
+            if Some(c) == want {
+                want = chars.next();
+            }
+        }
+        want.is_none()
+    }
+    let query = query.to_lowercase();
+    let mut scored: Vec<(u8, usize, &str)> = paths
+        .iter()
+        .filter_map(|path| {
+            let lower = path.to_lowercase();
+            let score = if query.is_empty()
+                || lower
+                    .split(['/', '\\'])
+                    .any(|segment| segment.starts_with(&query))
+            {
+                0
+            } else if lower.contains(&query) {
+                1
+            } else if is_subsequence(&lower, &query) {
+                2
+            } else {
+                return None;
+            };
+            Some((score, path.len(), path.as_str()))
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().map(|(_, _, p)| p).collect()
 }
 
 /// Wrapped-row indices whose flattened text contains `query` (case-insensitive). A match that
@@ -584,6 +675,57 @@ fn tool_header_line(
 /// viewport only, so the cache stays untouched across animation frames).
 const RUNNING_BADGE: &str = "◌ running";
 
+/// Max text size accepted for an OSC 52 clipboard write (C-111). Terminals commonly cap the
+/// whole sequence around 100 KB; base64 inflates by 4/3, so cap the raw payload at 72 KiB.
+const OSC52_MAX_TEXT: usize = 72 * 1024;
+
+/// Build the OSC 52 set-clipboard escape for `text`, or `None` when it exceeds
+/// [`OSC52_MAX_TEXT`]. Writes the `c` (clipboard) selection; works over SSH because the
+/// sequence travels the terminal stream itself.
+fn osc52_copy(text: &str) -> Option<String> {
+    use base64::Engine;
+    if text.len() > OSC52_MAX_TEXT {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    Some(format!("\x1b]52;c;{payload}\x07"))
+}
+
+/// Render one hunk-view diff row (C-115): `@ path` / `@@ … @@` rows in accent, changed rows with
+/// a `old new ±` gutter and word-level intraline emphasis (REVERSED). Shared by the expanded
+/// edit/write card and the approval sheet's diff preview so the two can't drift.
+fn diff_row_line(t: &Theme, row: &toolview::DiffLine, indent: &'static str) -> Line<'static> {
+    let (style, marker) = match row.kind {
+        toolview::DetailKind::Add => (t.ok_style(), '+'),
+        toolview::DetailKind::Del => (t.err_style(), '-'),
+        toolview::DetailKind::Plain => (t.muted_style(), ' '),
+        toolview::DetailKind::Meta | toolview::DetailKind::Hunk => (t.accent_style(), ' '),
+    };
+    let mut spans = vec![Span::raw(indent)];
+    match row.kind {
+        toolview::DetailKind::Meta | toolview::DetailKind::Hunk => {
+            let text: String = row.spans.iter().map(|(_, s)| s.as_str()).collect();
+            spans.push(Span::styled(text, style));
+        }
+        _ => {
+            let num = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+            spans.push(Span::styled(
+                format!("{:>4} {:>4} {marker} ", num(row.old_no), num(row.new_no)),
+                t.muted_style(),
+            ));
+            for (emph, s) in &row.spans {
+                let seg_style = if *emph {
+                    style.add_modifier(Modifier::REVERSED)
+                } else {
+                    style
+                };
+                spans.push(Span::styled(s.clone(), seg_style));
+            }
+        }
+    }
+    Line::from(spans)
+}
+
 fn styled_run(text: String, style: Style, matched: bool, current: Option<Style>) -> Span<'static> {
     if !matched {
         return Span::styled(text, style);
@@ -598,29 +740,99 @@ fn styled_run(text: String, style: Style, matched: bool, current: Option<Style>)
 impl Assistant {
     fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         if !self.done {
-            // Streaming: plain text (half-parsed Markdown flickers) + a cursor on the last line.
-            let mut lines: Vec<Line> = self
-                .text
+            // C-114: the COMPLETED block prefix renders through the markdown engine (cached under
+            // its byte length, so it renders once and can't flicker); only the trailing
+            // unterminated block stays plain + cursor.
+            let sealed = split_sealed_prefix(&self.text);
+            let mut lines = if sealed > 0 {
+                let mut prefix = self.render_cached(&self.text[..sealed], width, sealed);
+                // One spacer between the styled prefix and the plain tail — the block boundary
+                // the split found IS a blank line, which the renderer swallows.
+                if prefix.last().is_some_and(|l| !l.spans.is_empty()) {
+                    prefix.push(Line::default());
+                }
+                prefix
+            } else {
+                Vec::new()
+            };
+            let mut tail: Vec<Line> = self.text[sealed..]
                 .split('\n')
                 .map(|l| Line::styled(l.to_string(), theme.assistant_style()))
                 .collect();
-            if lines.is_empty() {
-                lines.push(Line::default());
+            if tail.is_empty() {
+                tail.push(Line::default());
             }
-            if let Some(last) = lines.last_mut() {
+            if let Some(last) = tail.last_mut() {
                 last.spans.push(Span::styled(CURSOR, theme.accent_style()));
             }
+            lines.extend(tail);
             return lines;
         }
-        if let Some((w, cached)) = self.cache.borrow().as_ref() {
-            if *w == width {
+        self.render_cached(&self.text, width, self.text.len())
+    }
+
+    fn render_cached(&self, src: &str, width: u16, key: usize) -> Vec<Line<'static>> {
+        if let Some((w, k, cached)) = self.cache.borrow().as_ref() {
+            if *w == width && *k == key {
                 return cached.clone();
             }
         }
-        let lines = markdown::render(&self.text, width).lines;
-        *self.cache.borrow_mut() = Some((width, lines.clone()));
+        let lines = markdown::render(src, width).lines;
+        *self.cache.borrow_mut() = Some((width, key, lines.clone()));
         lines
     }
+}
+
+/// Byte length of a streaming message's SEALED Markdown prefix (C-114): text up to (and
+/// including) the last blank line that (a) sits outside any open ``` / ~~~ fence and (b) is
+/// followed by a line that starts a genuinely new block. A successor that is indented, a list
+/// item, or a blockquote is held back — it could retroactively restyle the blocks before the
+/// blank (e.g. flip a tight list loose) — so those boundaries don't seal. Conservative by
+/// design: blank-line boundaries only.
+fn split_sealed_prefix(text: &str) -> usize {
+    fn is_list_marker(s: &str) -> bool {
+        if let Some(rest) = s.strip_prefix(['-', '*', '+']) {
+            return rest.starts_with(' ');
+        }
+        let digits = s.chars().take_while(char::is_ascii_digit).count();
+        (1..=9).contains(&digits)
+            && matches!(s.as_bytes().get(digits), Some(b'.') | Some(b')'))
+            && matches!(s.as_bytes().get(digits + 1), Some(b' '))
+    }
+    let mut in_fence = false;
+    let mut best = 0;
+    let mut pos = 0;
+    // Byte offset just past a blank line, waiting for a safe successor line to seal at.
+    let mut pending_blank_end: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let trimmed = stripped.trim_start();
+        let fence_marker = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if in_fence {
+            if fence_marker {
+                in_fence = false;
+            }
+            pending_blank_end = None;
+        } else if fence_marker {
+            // A fence opener is a safe successor: it can't join the blocks before the blank.
+            if let Some(end) = pending_blank_end.take() {
+                best = end;
+            }
+            in_fence = true;
+        } else if trimmed.is_empty() {
+            pending_blank_end = Some(pos + line.len());
+        } else if let Some(end) = pending_blank_end.take() {
+            let joins_backwards = stripped.starts_with(' ')
+                || stripped.starts_with('\t')
+                || trimmed.starts_with('>')
+                || is_list_marker(trimmed);
+            if !joins_backwards {
+                best = end;
+            }
+        }
+        pos += line.len();
+    }
+    best
 }
 
 /// Build a fresh, configured input editor (placeholder + no cursor-line highlight). Used at startup
@@ -658,6 +870,10 @@ impl ChatState {
             history_search: None,
             search: None,
             help_open: false,
+            focused: None,
+            file_inventory: None,
+            path_sel: 0,
+            path_dismissed: None,
             auto_approve: false,
             effort: None,
             expand_tools: false,
@@ -741,6 +957,17 @@ impl ChatState {
         self
     }
 
+    /// The call args of the newest still-running tool entry named `tool` — the approval sheet's
+    /// diff-preview source (C-115). The card is pushed when the call dispatches, before its
+    /// approval resolves; if event ordering ever leaves no matching entry the sheet just renders
+    /// without a preview.
+    pub(crate) fn pending_approval_input(&self, tool: &str) -> Option<&serde_json::Value> {
+        self.entries.iter().rev().find_map(|e| match e {
+            Entry::Tool(t) if t.name == tool && t.result.is_none() => Some(&t.input),
+            _ => None,
+        })
+    }
+
     fn mark_transcript_dirty(&mut self) {
         self.transcript_revision = self.transcript_revision.saturating_add(1);
         self.transcript_layout.get_mut().take();
@@ -748,6 +975,13 @@ impl ChatState {
 
     fn toggle_details(&mut self) {
         self.expand_tools = !self.expand_tools;
+        // C-111: the global toggle wins over any per-card overrides — after Ctrl-E every card
+        // follows the new global state again.
+        for entry in &mut self.entries {
+            if let Entry::Tool(tool) = entry {
+                tool.expanded = None;
+            }
+        }
         self.mark_transcript_dirty();
     }
 
@@ -963,6 +1197,69 @@ impl ChatState {
         Some(rest.to_lowercase())
     }
 
+    /// The `@token` being typed at the cursor (C-112): the whitespace-delimited token ending at
+    /// the cursor when it starts with `@` at a token boundary — `@` mid-word (an email) never
+    /// triggers. Returns the token INCLUDING the `@`.
+    fn at_token(&self) -> Option<String> {
+        if self.slash_query().is_some() {
+            return None; // the slash menu owns the popup slot
+        }
+        let (row, col) = self.input.cursor();
+        let line = self.input.lines().get(row)?;
+        let upto: Vec<char> = line.chars().take(col).collect();
+        let start = upto
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token: String = upto[start..].iter().collect();
+        token.starts_with('@').then_some(token)
+    }
+
+    /// Ranked completion candidates for the active `@token` (C-112) — empty when no token is
+    /// active, it was Esc-dismissed, or the inventory hasn't been built yet.
+    fn path_popup_matches(&self) -> Vec<String> {
+        let Some(token) = self.at_token() else {
+            return Vec::new();
+        };
+        if self.path_dismissed.as_deref() == Some(token.as_str()) {
+            return Vec::new();
+        }
+        let Some(inventory) = &self.file_inventory else {
+            return Vec::new();
+        };
+        fuzzy_rank(inventory, &token[1..])
+            .into_iter()
+            .take(50)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Replace the active `@token` with `path` (C-112). The composer is rebuilt via the
+    /// `set_input` pattern, which leaves the cursor at the end — fine for the tail-of-message
+    /// case completion is for.
+    fn insert_path_completion(&mut self, path: &str) {
+        let (row, col) = self.input.cursor();
+        let mut lines: Vec<String> = self.input.lines().to_vec();
+        let Some(line) = lines.get_mut(row) else {
+            return;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let upto = &chars[..col.min(chars.len())];
+        let start = upto
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prefix: String = chars[..start].iter().collect();
+        let suffix: String = chars[col.min(chars.len())..].iter().collect();
+        *line = format!("{prefix}{path}{suffix}");
+        let text = lines.join("\n");
+        self.set_input(&text);
+        self.path_sel = 0;
+        self.path_dismissed = None;
+    }
+
     fn slash_up(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -1084,15 +1381,13 @@ impl ChatState {
         }
     }
 
-    /// Flatten the transcript to styled logical lines at `width`, with a blank line between
-    /// entries. [`Self::ensure_transcript_layout`] wraps and caches these rows.
-    fn build_transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// One entry's styled logical lines (pre-wrap) — the per-entry unit
+    /// [`Self::ensure_transcript_layout`] wraps chunk-by-chunk (with a blank separator line
+    /// between entries) so it can record per-entry row spans (C-111).
+    fn entry_lines(&self, entry: &Entry, width: u16) -> Vec<Line<'static>> {
         let t = &self.theme;
         let mut out: Vec<Line> = Vec::new();
-        for (i, entry) in self.entries.iter().enumerate() {
-            if i > 0 {
-                out.push(Line::default());
-            }
+        {
             match entry {
                 Entry::User(text) => {
                     for (j, raw) in text.split('\n').enumerate() {
@@ -1199,7 +1494,33 @@ impl ChatState {
         if valid {
             return;
         }
-        let mut lines = wrap_styled_lines(self.build_transcript_lines(width), width);
+        // C-111: wrap chunk-by-chunk (the wrapper is per-line stateless, so this equals wrapping
+        // the whole transcript at once) to record each entry's wrapped row span, and paint the
+        // focused entry's rows with the selection background. Focus changes bump the revision,
+        // so the cache stays coherent.
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut entry_rows: Vec<(usize, u16, u16)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            let mut chunk: Vec<Line> = Vec::new();
+            if i > 0 {
+                chunk.push(Line::default());
+            }
+            chunk.extend(self.entry_lines(entry, width));
+            let mut wrapped = wrap_styled_lines(chunk, width);
+            let sep = usize::from(i > 0);
+            if self.focused == Some(i) {
+                for line in wrapped.iter_mut().skip(sep) {
+                    line.style = line.style.bg(self.theme.sel_bg);
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(self.theme.sel_bg);
+                    }
+                }
+            }
+            let start = (lines.len() + sep).min(u16::MAX as usize) as u16;
+            let count = wrapped.len().saturating_sub(sep).min(u16::MAX as usize) as u16;
+            entry_rows.push((i, start, count));
+            lines.extend(wrapped);
+        }
         const MAX_LAYOUT_LINES: usize = u16::MAX as usize;
         if lines.len() > MAX_LAYOUT_LINES {
             let omitted = lines.len() - MAX_LAYOUT_LINES + 1;
@@ -1211,6 +1532,14 @@ impl ChatState {
                     self.theme.muted_style(),
                 ),
             );
+            // Shift the recorded spans past the drained head; fully-omitted entries drop out.
+            entry_rows = entry_rows
+                .into_iter()
+                .filter_map(|(i, start, count)| {
+                    let start = (start as usize).checked_sub(omitted)?;
+                    Some((i, (start + 1) as u16, count))
+                })
+                .collect();
         }
         // C-109: pair each `◌ running` header row with its running tool entry, in order. The
         // header line is width-fitted (badge flush right) so wrapping never splits it — the
@@ -1227,7 +1556,10 @@ impl ChatState {
             .enumerate()
             .filter(|(_, line)| {
                 line.spans.last().is_some_and(|span| {
-                    span.content.as_ref() == RUNNING_BADGE && span.style == self.theme.warn_style()
+                    // fg-only comparison: the C-111 focus highlight patches a bg onto every
+                    // span of the focused entry, which must not unpair its running badge.
+                    span.content.as_ref() == RUNNING_BADGE
+                        && span.style.fg == self.theme.warn_style().fg
                 })
             })
             .map(|(row, _)| row as u16)
@@ -1236,6 +1568,7 @@ impl ChatState {
         *self.transcript_layout.borrow_mut() = Some(TranscriptLayout {
             revision: self.transcript_revision,
             width,
+            entry_rows,
             lines,
             running_rows,
         });
@@ -1351,6 +1684,91 @@ impl ChatState {
     }
 
     /// Center the current transcript-search match in the viewport (detaches follow mode).
+    /// Move the transcript focus cursor by `delta` entries (C-111): detaches follow, bumps the
+    /// revision (the focused entry renders with the selection background), and centers the
+    /// entry in the viewport.
+    fn focus_move(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let last = self.entries.len() - 1;
+        let next = match self.focused {
+            Some(i) => i.saturating_add_signed(delta).min(last),
+            // First press: start at the bottom (newest entry) — that's what the eye is on.
+            None => last,
+        };
+        self.focused = Some(next);
+        self.follow = false;
+        self.unread = 0;
+        self.mark_transcript_dirty();
+        self.center_focused_entry();
+    }
+
+    fn focus_clear(&mut self) {
+        if self.focused.take().is_some() {
+            self.mark_transcript_dirty();
+        }
+    }
+
+    fn center_focused_entry(&mut self) {
+        let Some(idx) = self.focused else { return };
+        // The spans live on the layout, which the dirty-bump above just dropped — rebuild at the
+        // last known width so centering has fresh rows to aim at.
+        let width = self.transcript_layout.borrow().as_ref().map(|l| l.width);
+        let width = width.unwrap_or(80);
+        self.ensure_transcript_layout(width);
+        let layout = self.transcript_layout.borrow();
+        let Some((_, start, count)) = layout
+            .as_ref()
+            .and_then(|l| l.entry_rows.iter().find(|(i, _, _)| *i == idx).copied())
+        else {
+            return;
+        };
+        drop(layout);
+        let mid = start.saturating_add(count / 2);
+        let half = self.last_page.get().max(1) / 2;
+        self.scroll = mid.saturating_sub(half).min(self.last_max_scroll.get());
+    }
+
+    /// Toggle the focused tool card's per-card expansion (C-111). Returns false when the focus
+    /// isn't on a tool card (the key then falls through to the composer).
+    fn toggle_focused_card(&mut self) -> bool {
+        let Some(idx) = self.focused else {
+            return false;
+        };
+        let global = self.expand_tools;
+        if let Some(Entry::Tool(tool)) = self.entries.get_mut(idx) {
+            let effective = tool.expanded.unwrap_or(global);
+            tool.expanded = Some(!effective);
+            self.mark_transcript_dirty();
+            return true;
+        }
+        false
+    }
+
+    /// The focused entry's full text for the OSC 52 yank (C-111) — the un-truncated content, not
+    /// the wrapped screen rows.
+    fn focused_entry_text(&self) -> Option<String> {
+        let entry = self.entries.get(self.focused?)?;
+        Some(match entry {
+            Entry::User(text) => text.clone(),
+            Entry::Assistant(a) | Entry::Thinking(a) => a.text.clone(),
+            Entry::Tool(tool) => {
+                let header = format!("{} {}", tool.call.verb, tool.call.arg);
+                match &tool.result {
+                    Some(o) if !o.content.is_empty() => format!("{header}\n{}", o.content),
+                    _ => header,
+                }
+            }
+            Entry::Notice { text, .. } => text.clone(),
+            Entry::Intent(intent) => intent.intent.clone(),
+            Entry::Plan(data) | Entry::GatherPlan(data) => {
+                serde_json::to_string_pretty(data).unwrap_or_default()
+            }
+            Entry::Brief { goal, needs } => format!("{goal}\n{}", needs.join("\n")),
+        })
+    }
+
     fn center_current_match(&mut self) {
         let Some(row) = self
             .search
@@ -1408,36 +1826,63 @@ impl ChatState {
             ]));
 
             // Full detail, when expanded. Verbose (`-v`/`FLUX_VERBOSE`) lifts the line cap —
-            // "tool output in full (no truncation)" is the flag's promise.
-            if self.expand_tools {
-                let detail =
-                    toolview::format_detail(&tool.name, &tool.input, &o.content, o.is_error);
-                let cap = if self.verbose {
-                    detail.len()
+            // "tool output in full (no truncation)" is the flag's promise. C-111: a per-card
+            // override (Enter on the focused card) beats the global Ctrl-E state.
+            if tool.expanded.unwrap_or(self.expand_tools) {
+                // C-115: edit/write get a real hunk view (headers, line-number gutter, word-level
+                // intraline emphasis); everything else keeps the flat classified detail.
+                let diff = if o.is_error {
+                    None
                 } else {
-                    MAX_DETAIL
+                    toolview::format_diff(&tool.name, &tool.input)
                 };
-                let shown = detail.len().min(cap);
-                for (kind, text) in detail.iter().take(cap) {
-                    let style = match kind {
-                        toolview::DetailKind::Add => t.ok_style(),
-                        toolview::DetailKind::Del => t.err_style(),
-                        toolview::DetailKind::Meta => t.accent_style(),
-                        toolview::DetailKind::Plain => t.muted_style(),
+                if let Some(rows) = diff {
+                    let cap = if self.verbose { rows.len() } else { MAX_DETAIL };
+                    let shown = rows.len().min(cap);
+                    for row in rows.iter().take(cap) {
+                        out.push(diff_row_line(t, row, "   "));
+                    }
+                    if rows.len() > shown {
+                        out.push(Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(
+                                format!("… {} more lines", rows.len() - shown),
+                                t.muted_style(),
+                            ),
+                        ]));
+                    }
+                } else {
+                    let detail =
+                        toolview::format_detail(&tool.name, &tool.input, &o.content, o.is_error);
+                    let cap = if self.verbose {
+                        detail.len()
+                    } else {
+                        MAX_DETAIL
                     };
-                    out.push(Line::from(vec![
-                        Span::raw("   "),
-                        Span::styled(text.clone(), style),
-                    ]));
-                }
-                if detail.len() > shown {
-                    out.push(Line::from(vec![
-                        Span::raw("   "),
-                        Span::styled(
-                            format!("… {} more lines", detail.len() - shown),
-                            t.muted_style(),
-                        ),
-                    ]));
+                    let shown = detail.len().min(cap);
+                    for (kind, text) in detail.iter().take(cap) {
+                        let style = match kind {
+                            toolview::DetailKind::Add => t.ok_style(),
+                            toolview::DetailKind::Del => t.err_style(),
+                            toolview::DetailKind::Meta | toolview::DetailKind::Hunk => {
+                                t.accent_style()
+                            }
+                            toolview::DetailKind::Plain => t.muted_style(),
+                        };
+                        out.push(Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(text.clone(), style),
+                        ]));
+                    }
+                    if detail.len() > shown {
+                        out.push(Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(
+                                format!("… {} more lines", detail.len() - shown),
+                                t.muted_style(),
+                            ),
+                        ]));
+                    }
                 }
             }
         }
@@ -2298,6 +2743,33 @@ async fn event_loop(
                 // Approval sheet: only explicit keys act; anything else is swallowed so a stray
                 // keystroke can't silently deny (C-103).
                 if let Some(view) = state.approval.as_mut() {
+                    // C-113: the `d` reason-input line takes every key while active — Enter
+                    // resolves the denial carrying the reason, Esc returns to the sheet with the
+                    // approval still pending (the reply oneshot stays unresolved).
+                    if let Some(reason) = view.reason.as_mut() {
+                        match key.code {
+                            KeyCode::Enter => {
+                                let reason = reason.trim().to_string();
+                                if let Some((_, reply)) = pending_reply.take() {
+                                    let choice = if reason.is_empty() {
+                                        ApprovalChoice::Deny
+                                    } else {
+                                        ApprovalChoice::DenyWithReason(reason)
+                                    };
+                                    let _ = reply.send(choice);
+                                }
+                                state.approval = None;
+                                show_next_approval(state, &mut pending_reply, &mut approval_queue);
+                            }
+                            KeyCode::Esc => view.reason = None,
+                            KeyCode::Backspace => {
+                                reason.pop();
+                            }
+                            KeyCode::Char(c) => reason.push(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match approval_key(key.code) {
                         ApprovalAction::Ignore => {}
                         ApprovalAction::Scroll(delta) => {
@@ -2306,6 +2778,7 @@ async fn event_loop(
                                 .saturating_add_signed(delta)
                                 .min(view.subjects.len().saturating_sub(1));
                         }
+                        ApprovalAction::DenyWithReason => view.reason = Some(String::new()),
                         action => {
                             if let Some((tool, reply)) = pending_reply.take() {
                                 let choice = match action {
@@ -2607,6 +3080,96 @@ async fn event_loop(
                                 _ => {}
                             }
                         }
+                    }
+                }
+
+                // C-112: `@` path completion. The inventory is built lazily on the first active
+                // token (bounded walk, session-cached); popup keys win while candidates show.
+                if state.queue_edit_index.is_none() {
+                    if let Some(token) = state.at_token() {
+                        if state.file_inventory.is_none() {
+                            let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                            state.file_inventory = Some(Arc::new(workspace_file_inventory(
+                                &root,
+                                PATH_INVENTORY_CAP,
+                            )));
+                        }
+                        let matches = state.path_popup_matches();
+                        if !matches.is_empty() {
+                            match key.code {
+                                KeyCode::Up => {
+                                    state.path_sel = state.path_sel.saturating_sub(1);
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    state.path_sel = (state.path_sel + 1).min(matches.len() - 1);
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    state.path_dismissed = Some(token);
+                                    state.path_sel = 0;
+                                    continue;
+                                }
+                                KeyCode::Tab | KeyCode::Enter => {
+                                    let path =
+                                        matches[state.path_sel.min(matches.len() - 1)].clone();
+                                    state.insert_path_completion(&path);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // C-111: transcript entry focus. Shift-↑/↓ always move the cursor; Enter/y/Esc
+                // act only while focus is active — plain typing keeps going to the composer.
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down)
+                {
+                    state.focus_move(if key.code == KeyCode::Up { -1 } else { 1 });
+                    continue;
+                }
+                if state.focused.is_some() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.focus_clear();
+                            continue;
+                        }
+                        KeyCode::Enter if key.modifiers.is_empty() => {
+                            if state.toggle_focused_card() {
+                                continue;
+                            }
+                        }
+                        KeyCode::Char('y') if key.modifiers.is_empty() => {
+                            if let Some(text) = state.focused_entry_text() {
+                                match osc52_copy(&text) {
+                                    Some(seq) => {
+                                        use std::io::Write;
+                                        let mut out = std::io::stdout();
+                                        let _ = out.write_all(seq.as_bytes());
+                                        let _ = out.flush();
+                                        let n = text.lines().count().max(1);
+                                        state.push(Entry::Notice {
+                                            text: format!(
+                                                "copied {n} line{}",
+                                                if n == 1 { "" } else { "s" }
+                                            ),
+                                            sev: Sev::Info,
+                                        });
+                                    }
+                                    None => state.push(Entry::Notice {
+                                        text: format!(
+                                            "entry too large to copy (> {} KiB)",
+                                            OSC52_MAX_TEXT / 1024
+                                        ),
+                                        sev: Sev::Warn,
+                                    }),
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -3340,6 +3903,7 @@ mod tests {
             tool: "bash".into(),
             subjects: vec!["ls".into()],
             scroll: 0,
+            reason: None,
         });
         let mut terminal = Terminal::new(TestBackend::new(70, 18)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
@@ -3824,6 +4388,15 @@ mod tests {
         assert_eq!(approval_key(KeyCode::Char('n')), ApprovalAction::Deny);
         assert_eq!(approval_key(KeyCode::Char('N')), ApprovalAction::Deny);
         assert_eq!(approval_key(KeyCode::Esc), ApprovalAction::Deny);
+        // C-113: `d` opens the reason input (the denial only resolves on Enter there).
+        assert_eq!(
+            approval_key(KeyCode::Char('d')),
+            ApprovalAction::DenyWithReason
+        );
+        assert_eq!(
+            approval_key(KeyCode::Char('D')),
+            ApprovalAction::DenyWithReason
+        );
         assert_eq!(approval_key(KeyCode::Up), ApprovalAction::Scroll(-1));
         assert_eq!(approval_key(KeyCode::Down), ApprovalAction::Scroll(1));
         // Everything else — including the keys that used to deny — is ignored.
@@ -3850,6 +4423,7 @@ mod tests {
             tool: "write".into(),
             subjects,
             scroll: 0,
+            reason: None,
         });
         let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
@@ -3925,6 +4499,387 @@ mod tests {
             .approval
             .as_ref()
             .is_some_and(|view| view.tool == "bash" && view.subjects == ["b"]));
+    }
+
+    /// C-112: fuzzy ranking is pinned — path-segment prefix > substring > subsequence, ties to
+    /// the shorter path; non-matches drop out.
+    #[test]
+    fn fuzzy_rank_orders_prefix_substring_subsequence() {
+        let paths: Vec<String> = [
+            "crates/flux-tui/src/lib.rs",
+            "docs/library-notes.md",
+            "crates/flux-cli/src/list.rs",
+            "README.md",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let ranked = fuzzy_rank(&paths, "lib");
+        // Segment-prefix matches first (lib.rs, library-notes.md), shorter path breaking the tie;
+        // then the subsequence match (l…i…s…t → contains? "list" contains "li"+"b"? no 'b' —
+        // l-i-b as subsequence of crates/flux-cli/src/list.rs? c-l-i has l,i then b absent → NOT
+        // a match). So exactly two results.
+        assert_eq!(
+            ranked,
+            vec!["docs/library-notes.md", "crates/flux-tui/src/lib.rs"]
+        );
+        // Substring beats subsequence.
+        let paths: Vec<String> = ["a/xlibx.rs", "a/l_i_b.rs", "a/lib.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            fuzzy_rank(&paths, "lib"),
+            vec!["a/lib.rs", "a/xlibx.rs", "a/l_i_b.rs"]
+        );
+        // Empty query lists everything (segment-prefix tier).
+        assert_eq!(fuzzy_rank(&paths, "").len(), 3);
+    }
+
+    /// C-112: the inventory walk skips ignored dirs (`.git`, `target`, `node_modules`, hidden)
+    /// and stops at the entry cap.
+    #[test]
+    fn workspace_inventory_is_ignore_aware_and_capped() {
+        let dir = std::env::temp_dir().join(format!("flux-tui-inv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["src", ".git", "target/debug", "node_modules/x"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.join("README.md"), "").unwrap();
+        std::fs::write(dir.join(".hidden"), "").unwrap();
+        std::fs::write(dir.join(".git/config"), "").unwrap();
+        std::fs::write(dir.join("target/debug/bin"), "").unwrap();
+        std::fs::write(dir.join("node_modules/x/i.js"), "").unwrap();
+
+        let inv = workspace_file_inventory(&dir, 100);
+        assert_eq!(
+            inv,
+            vec!["README.md".to_string(), "src/main.rs".to_string()]
+        );
+
+        let capped = workspace_file_inventory(&dir, 1);
+        assert_eq!(capped.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-112: the `@` trigger only fires at a token start; mid-word `@` (an email) does not,
+    /// and an active slash query suppresses it.
+    #[test]
+    fn at_token_triggers_only_at_token_start() {
+        let mut state = ChatState::new("mock".into());
+        state.set_input("check @lib");
+        assert_eq!(state.at_token().as_deref(), Some("@lib"));
+        state.set_input("@");
+        assert_eq!(state.at_token().as_deref(), Some("@"));
+        state.set_input("mail me at user@example.com");
+        assert_eq!(state.at_token(), None);
+        state.set_input("/theme");
+        assert_eq!(state.at_token(), None);
+        state.set_input("plain text");
+        assert_eq!(state.at_token(), None);
+    }
+
+    /// C-112: the popup renders ranked candidates in the slash-menu slot and Tab-insertion
+    /// replaces the `@token` with the selected path; Esc dismisses until the token changes.
+    #[test]
+    fn path_completion_popup_renders_and_inserts() {
+        let mut state = ChatState::new("mock".into());
+        state.file_inventory = Some(Arc::new(vec![
+            "crates/flux-tui/src/lib.rs".into(),
+            "crates/flux-tui/src/state.rs".into(),
+            "docs/roadmap.md".into(),
+        ]));
+        state.set_input("see @lib");
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("crates/flux-tui/src/lib.rs"), "{content}");
+        assert!(!content.contains("docs/roadmap.md"), "{content}");
+
+        // Insertion replaces the token, keeping the surrounding text.
+        let selected = state.path_popup_matches()[0].clone();
+        state.insert_path_completion(&selected);
+        assert_eq!(state.input.lines()[0], "see crates/flux-tui/src/lib.rs");
+
+        // Esc-dismissal hides the popup for the SAME token only.
+        state.set_input("see @lib");
+        state.path_dismissed = Some("@lib".into());
+        assert!(state.path_popup_matches().is_empty());
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("lib.rs"), "dismissed popup");
+        state.set_input("see @libr");
+        assert!(!state.path_popup_matches().is_empty(), "token changed");
+
+        // The slash menu still owns its popup: a slash query never shows paths.
+        state.set_input("/the");
+        assert!(state.path_popup_matches().is_empty());
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("/theme"));
+    }
+
+    /// C-111: the OSC 52 helper pins the exact escape + base64 payload and enforces the size cap.
+    #[test]
+    fn osc52_copy_builds_base64_payload_and_caps() {
+        assert_eq!(
+            osc52_copy("hello").as_deref(),
+            Some("\x1b]52;c;aGVsbG8=\x07")
+        );
+        assert_eq!(osc52_copy("").as_deref(), Some("\x1b]52;c;\x07"));
+        let big = "x".repeat(OSC52_MAX_TEXT + 1);
+        assert_eq!(osc52_copy(&big), None);
+        assert!(osc52_copy(&big[..OSC52_MAX_TEXT]).is_some());
+    }
+
+    /// C-111: Shift-↑/↓ focus renders the focused entry with the selection background (its
+    /// neighbors keep theirs), detaches follow, and bumps the transcript revision so the
+    /// layout cache re-keys.
+    #[test]
+    fn focus_highlights_entry_and_bumps_revision() {
+        let mut state = ChatState::new("mock".into());
+        state.push_user("first message");
+        state.push_user("second message");
+        state.follow = true;
+        let before = state.transcript_revision;
+
+        state.focus_move(-1); // first press lands on the newest entry
+        assert_eq!(state.focused, Some(1));
+        assert!(!state.follow);
+        assert!(state.transcript_revision > before);
+
+        let rows = state.transcript_lines(40);
+        let sel_bg = state.theme.sel_bg;
+        let has_sel = move |needle: &str, rows: &[Line]| {
+            rows.iter().any(|l| {
+                l.spans.iter().any(|s| s.content.contains(needle)) && l.style.bg == Some(sel_bg)
+            })
+        };
+        assert!(
+            has_sel("second message", &rows),
+            "focused entry highlighted"
+        );
+        assert!(!has_sel("first message", &rows), "neighbor not highlighted");
+
+        // Step up: highlight moves; Esc clears it.
+        state.focus_move(-1);
+        assert_eq!(state.focused, Some(0));
+        let rows = state.transcript_lines(40);
+        assert!(has_sel("first message", &rows));
+        assert!(!has_sel("second message", &rows));
+        state.focus_clear();
+        assert_eq!(state.focused, None);
+        let rows = state.transcript_lines(40);
+        assert!(!has_sel("first message", &rows));
+    }
+
+    /// C-111: Enter on a focused tool card toggles ONLY that card's expansion — the neighbor
+    /// stays collapsed — and Ctrl-E's global toggle resets the per-card overrides.
+    #[test]
+    fn focused_card_expands_independently_of_neighbors() {
+        let mut state = ChatState::new("mock".into());
+        for (path, old) in [("a.rs", "alpha old"), ("b.rs", "beta old")] {
+            state.push(Entry::Tool(ToolEntry::new(
+                "edit".into(),
+                serde_json::json!({"path": path, "old_string": old, "new_string": "new"}),
+            )));
+            state.finish_tool("edit", format!("edited {path}"), false);
+        }
+        let flat = |state: &ChatState| -> String {
+            state
+                .transcript_lines(80)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+        assert!(!flat(&state).contains("alpha old"), "cards start collapsed");
+
+        state.focused = Some(0);
+        assert!(state.toggle_focused_card());
+        let text = flat(&state);
+        assert!(text.contains("alpha old"), "focused card expanded: {text}");
+        assert!(
+            !text.contains("beta old"),
+            "neighbor stays collapsed: {text}"
+        );
+
+        // Ctrl-E resets overrides: everything follows the new global state (all expanded).
+        state.toggle_details();
+        let text = flat(&state);
+        assert!(text.contains("alpha old") && text.contains("beta old"));
+
+        // Focus on a non-tool entry: Enter falls through (no toggle).
+        state.push_user("just text");
+        state.focused = Some(2);
+        assert!(!state.toggle_focused_card());
+    }
+
+    /// C-114: the boundary-split helper seals only at blank lines outside fences, holds back
+    /// successors that could restyle earlier blocks, and never moves backwards as text appends.
+    #[test]
+    fn split_sealed_prefix_is_conservative_and_monotonic() {
+        // No blank line yet → nothing sealed.
+        assert_eq!(split_sealed_prefix("Para one is still going"), 0);
+        // Paragraph boundary: seals through the blank line once the successor arrived.
+        let s = "Para one.\n\nPara tw";
+        assert_eq!(split_sealed_prefix(s), 11);
+        // Appending more text never shrinks the sealed prefix (monotonic across states).
+        let s2 = "Para one.\n\nPara two.\n\nPara three";
+        assert_eq!(split_sealed_prefix(s2), 22);
+        // A blank inside an open fence seals nothing; the closing fence re-arms.
+        let fenced = "Intro.\n\n```rust\nlet x = 1;\n\nlet y = 2;\nstill code";
+        assert_eq!(split_sealed_prefix(fenced), 8);
+        let closed = "Intro.\n\n```rust\ncode\n```\n\nAfter fen";
+        assert_eq!(split_sealed_prefix(closed), 26);
+        // A fence opener right after a blank is a safe successor.
+        assert_eq!(split_sealed_prefix("Para.\n\n```rust\nx"), 7);
+        // List items / indented / blockquote successors could restyle the block before the
+        // blank (tight → loose) — held back.
+        assert_eq!(split_sealed_prefix("- item one\n\n- item two"), 0);
+        assert_eq!(split_sealed_prefix("- item\n\n  continuation"), 0);
+        assert_eq!(split_sealed_prefix("> quote\n\n> more"), 0);
+        // …but a plain paragraph after a list does seal.
+        assert_eq!(split_sealed_prefix("- item\n\nPlain para"), 8);
+    }
+
+    /// C-114: while streaming, the sealed prefix renders styled and stays byte-identical
+    /// across two successive stream states; the open tail stays plain with the cursor.
+    #[test]
+    fn streaming_renders_sealed_prefix_styled_and_stable() {
+        let theme = Theme::default();
+        let mk = |text: &str| Assistant {
+            text: text.into(),
+            done: false,
+            cache: RefCell::new(None),
+        };
+        let flat = |lines: &[Line]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+
+        let a = mk("**Bold** lead.\n\nSecond para grow");
+        let lines_a = a.lines(60, &theme);
+        let text_a = flat(&lines_a);
+        // The sealed prefix is styled: the literal `**` markers are gone.
+        assert!(text_a[0].contains("Bold lead."), "{text_a:?}");
+        assert!(!text_a[0].contains("**"), "{text_a:?}");
+        // The open tail is plain and carries the cursor.
+        assert!(text_a.last().unwrap().contains("Second para grow"));
+        assert!(text_a.last().unwrap().ends_with(CURSOR), "{text_a:?}");
+
+        // Append more: every line rendered for the previous prefix is byte-identical.
+        let b = mk("**Bold** lead.\n\nSecond para grown longer.\n\nThird st");
+        let lines_b = b.lines(60, &theme);
+        let text_b = flat(&lines_b);
+        let prefix_rows = a.cache.borrow().as_ref().unwrap().2.len();
+        assert_eq!(
+            text_a[..prefix_rows],
+            text_b[..prefix_rows],
+            "sealed-prefix lines must not flicker across appends"
+        );
+
+        // An open fence stays plain in its entirety until the closing fence arrives.
+        let fenced = mk("Intro.\n\n```rust\nlet x: u8 = 1;\nmore code");
+        let text_f = flat(&fenced.lines(60, &theme));
+        assert!(
+            text_f.iter().any(|l| l.contains("```rust")),
+            "open fence must stay plain (fence marker visible): {text_f:?}"
+        );
+
+        // Sealing is unchanged: the sealed render equals a direct markdown render.
+        let mut done = mk("**Bold** lead.\n\nSecond para.");
+        done.done = true;
+        let sealed = flat(&done.lines(60, &theme));
+        let direct = flat(&markdown::render("**Bold** lead.\n\nSecond para.", 60).lines);
+        assert_eq!(sealed, direct);
+    }
+
+    /// C-113: `d` switches the sheet into a one-line reason input (cursor + swapped hints);
+    /// Esc returns to the plain sheet with the approval untouched, Enter resolves the denial
+    /// carrying the reason.
+    #[tokio::test]
+    async fn deny_reason_input_renders_and_resolves_both_paths() {
+        let mut state = ChatState::new("mock".into());
+        let mut current = None;
+        let mut queued = VecDeque::new();
+        let (reply, mut reply_rx) = oneshot::channel();
+        queued.push_back(("bash".into(), vec!["rm -rf tmp".into()], reply));
+        show_next_approval(&mut state, &mut current, &mut queued);
+
+        // `d` → reason mode (the loop maps DenyWithReason to opening the input).
+        assert_eq!(
+            approval_key(KeyCode::Char('d')),
+            ApprovalAction::DenyWithReason
+        );
+        state.approval.as_mut().unwrap().reason = Some("wrong dir".into());
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("deny reason: wrong dir"), "{content}");
+        assert!(content.contains("[Enter]"), "{content}");
+        assert!(!content.contains("[y] allow"), "{content}");
+
+        // Esc path: back to the sheet, approval still pending, reply unresolved.
+        state.approval.as_mut().unwrap().reason = None;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("[y]"), "{content}");
+        assert!(content.contains("[d]"), "{content}");
+        assert!(state.approval.is_some());
+        assert!(reply_rx.try_recv().is_err(), "reply must stay unresolved");
+
+        // Enter path: the denial carries the reason inside the choice.
+        let (_tool, reply) = current.take().unwrap();
+        let _ = reply.send(ApprovalChoice::DenyWithReason("wrong dir".into()));
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(ApprovalChoice::DenyWithReason(r)) if r == "wrong dir"
+        ));
+    }
+
+    /// C-115: a pending `edit` approval embeds its hunk diff in the sheet — headers, gutter
+    /// numbers, and a `… more` marker when the preview window overflows.
+    #[test]
+    fn approval_sheet_embeds_diff_preview_for_pending_edit() {
+        let mut state = ChatState::new("mock".into());
+        let old: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let new = old
+            .replace("line 2", "line two")
+            .replace("line 11", "line eleven");
+        state.push(Entry::Tool(ToolEntry::new(
+            "edit".into(),
+            serde_json::json!({"path": "src/a.rs", "old_string": old, "new_string": new}),
+        )));
+        state.approval = Some(ApprovalView {
+            tool: "edit".into(),
+            subjects: vec!["src/a.rs".into()],
+            scroll: 0,
+            reason: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(70, 26)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("@@ -1,4 +1,4 @@"), "{content}");
+        assert!(content.contains("line two"), "{content}");
+        assert!(content.contains("more diff lines"), "{content}");
+
+        // A non-diffable pending tool renders the sheet without a preview.
+        let mut plain = ChatState::new("mock".into());
+        plain.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )));
+        plain.approval = Some(ApprovalView {
+            tool: "bash".into(),
+            subjects: vec!["ls".into()],
+            scroll: 0,
+            reason: None,
+        });
+        terminal.draw(|f| render(f, &plain)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("approve"), "{content}");
+        assert!(!content.contains("@@"), "{content}");
     }
 
     #[test]
@@ -4297,6 +5252,76 @@ mod tests {
         assert!(!content2.contains('$'));
     }
 
+    /// C-116: mode badges ride the header's right side, shown only when active/non-default —
+    /// `auto-ok`, `gather`, and `effort:<level>` all visible together at full width.
+    #[test]
+    fn header_shows_mode_badges_when_active() {
+        let mut state = ChatState::new("mock".into());
+        state.auto_approve = true;
+        state.gather_mode = true;
+        state.effort = Some("high".into());
+        // The shell badge reads the process-global opt-in live; restore it right after the
+        // render so concurrently running tests only ever see additive `contains` noise.
+        let shell_was = flux_runtime::shell_opt_in();
+        flux_runtime::set_shell_opt_in(true);
+        let line = state.header_line(100);
+        flux_runtime::set_shell_opt_in(shell_was);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("auto-ok"), "{text}");
+        assert!(text.contains("shell"), "{text}");
+        assert!(text.contains("gather"), "{text}");
+        assert!(text.contains("effort:high"), "{text}");
+
+        // Defaults: no badges at all.
+        let plain = ChatState::new("mock".into());
+        let text: String = plain
+            .header_line(100)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!text.contains("auto-ok"), "{text}");
+        assert!(!text.contains("gather"), "{text}");
+        assert!(!text.contains("effort:"), "{text}");
+    }
+
+    /// C-116: on a narrow bar the badges shed before the metrics, and the safety-relevant
+    /// `auto-ok` badge is the most precious right segment of all — it survives when even the
+    /// token total has been dropped.
+    #[test]
+    fn narrow_header_drops_badges_last_keeps_auto_ok() {
+        let mut state = ChatState::new("a-rather-long-model-name-here".into());
+        state.auto_approve = true;
+        state.gather_mode = true;
+        state.effort = Some("xhigh".into());
+        state.record_usage(&Usage {
+            input_tokens: 12_345,
+            output_tokens: 6_789,
+            cache_read_input_tokens: 1_000,
+            ..Default::default()
+        });
+
+        // Width fits everything minus a few segments: effort/gather shed before tokens.
+        let mid: String = state
+            .header_line(60)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(mid.contains("auto-ok"), "{mid}");
+        assert!(!mid.contains("effort:"), "{mid}");
+
+        // Extremely narrow: only the left identity + auto-ok survive.
+        let narrow: String = state
+            .header_line(48)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(narrow.contains("auto-ok"), "{narrow}");
+        assert!(!narrow.contains("tok"), "{narrow}");
+    }
+
     /// C-34: an OpenRouter (or any reporting-provider) call with NO pricing-table row still
     /// accumulates a running dollar cost, because `record_usage` prices through
     /// `PricingTable::cost`, which now short-circuits on `Usage.reported_cost_usd` — the TUI header
@@ -4639,6 +5664,11 @@ mod tests {
         let content = screen(&terminal);
         assert!(content.contains("- old line"));
         assert!(content.contains("+ new line"));
+        // C-115: the expanded card is a real hunk view — header + gutter line numbers.
+        assert!(content.contains("@@ -1,1 +1,1 @@"), "{content}");
+        assert!(content.contains("@ a.rs"), "{content}");
+        assert!(content.contains("1      - old line"), "{content}");
+        assert!(content.contains("1 + new line"), "{content}");
     }
 
     /// `flux tui -v` promises "tool output in full (no truncation)": verbose lifts the expanded

@@ -2,7 +2,7 @@
 id: C-115
 title: Hunk-view diffs — line numbers + intraline highlight in edit/write cards and the approval sheet
 pillar: Core
-status: ready
+status: done
 priority: P3
 design: tui-polish
 epic: tui-polish
@@ -19,19 +19,19 @@ highlight on changed spans — and reuse it as a content preview inside C-103's 
 which today shows tool + subjects but no diff where the approval decision actually needs eyes.
 
 ## Acceptance
-- [ ] Expanded edit/write cards render hunks: `@@` headers with real old/new line numbers, a
+- [x] Expanded edit/write cards render hunks: `@@` headers with real old/new line numbers, a
       numbered gutter, and ± markers — extends the existing expanded-card TestBackend pinning
       test.
-- [ ] Changed spans within a modified del/add line pair get word-level intraline emphasis; the
+- [x] Changed spans within a modified del/add line pair get word-level intraline emphasis; the
       hunk-numbering and intraline-split helpers are pure and unit-tested in `toolview` without
       the async loop.
-- [ ] `toolview` keeps its color-free formatting contract: it returns structured kinds/spans and
+- [x] `toolview` keeps its color-free formatting contract: it returns structured kinds/spans and
       the TUI maps them to theme roles.
-- [ ] The C-103 approval sheet embeds the same diff preview for pending `edit`/`write` calls,
+- [x] The C-103 approval sheet embeds the same diff preview for pending `edit`/`write` calls,
       windowed alongside the subject list — TestBackend test with a multi-hunk edit.
 
 ## Progress
--
+- Done 2026-07-28: `toolview::format_diff` from call args via `similar` (grouped_ops(2) hunks, snippet-relative gutter numbers, iter_inline_changes word-level emphasis; `DetailKind::Hunk`, color-free `DiffLine` spans), shared `diff_row_line` renderer in expanded cards AND the approval sheet (windowed preview, 8 rows, squeeze absorbed by the preview never the hints; source = newest running Entry::Tool matching the approval — absent entry degrades to no preview). In-story decision: diff computed from args, not the result. Tests: 4 toolview unit tests + expanded_edit_card_shows_a_diff extended + approval_sheet_embeds_diff_preview_for_pending_edit.
 
 ## Notes
 - Seams: `DetailKind` `crates/flux-tui/src/toolview.rs:152`, the detail formatter

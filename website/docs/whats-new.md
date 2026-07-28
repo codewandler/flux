@@ -22,6 +22,36 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   branch, and returns the agent to your project — and if anything goes wrong, your work and your
   `main` branch are always left intact. Both steps ask for your approval like every other
   high-risk operation.
+- **Your Claude Code commands and skills now work in flux.** Drop markdown command files in
+  `.flux/commands` or `.claude/commands` (in the project or your home directory) and run them as
+  `/name arguments…` in the REPL and TUI — `$ARGUMENTS` and `$1`–`$9` placeholders are filled in,
+  and each command's description appears in `/help` and the slash menu. Skills load from both
+  worlds too, including multi-file skills nested in subdirectories, and a skill can now point the
+  agent at its own bundled reference files instead of everything loading up front. Anything in a
+  skill's frontmatter that flux doesn't support warns loudly at load time instead of silently
+  disappearing.
+- **Optionally let the agent load skills itself.** Activating skills stays a manual choice by
+  default — nothing changes unless you opt in. With `--skills-model-invoked` (or the matching
+  config setting), the agent sees a compact catalog of skill names and descriptions and can pull
+  one in mid-task; a loaded skill stays active for the rest of the session, and individual skills
+  can opt out. Commands and skills explicitly marked agent-triggerable can also be invoked by the
+  agent on its own — but only when policy allows it and the file opts in.
+
+### Improved
+
+- **The terminal UI got a major polish pass.** Pick a theme with `/theme` (`dark`, `light`,
+  `mono`) and it sticks across sessions; press Ctrl-T to release the mouse so your terminal's
+  native text selection and copy work; Ctrl-R searches your prompt history as you type; Ctrl-F
+  searches the transcript with highlighted matches; F1 (or `/help`) opens a real help overlay.
+  Approval prompts are safer and clearer: only explicit keys act — a stray keypress no longer
+  counts as a denial — and what you're approving is shown as readable text. Running tools show a
+  live spinner with elapsed time, a scrollbar appears when you scroll back through the
+  transcript, and narrow terminals now drop the least important status details first instead of
+  losing them all at once.
+- **flux opens with a boot splash, and waiting looks alive.** Interactive starts play a short
+  animated FLUX splash (any key skips it; it never appears for piped output, `NO_COLOR`, small
+  terminals, or with `FLUX_NO_SPLASH=1`), and on terminals with full color support the
+  model-wait spinner becomes an animated effect bar that changes with every model round.
 
 ## [0.27.0] - 2026-07-28
 

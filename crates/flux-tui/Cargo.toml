@@ -23,6 +23,10 @@ tokio-util.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 unicode-width = "0.2"
+# C-115 hunk-view diffs (word-level intraline needs the non-default `inline` feature).
+similar = { workspace = true, features = ["inline"] }
+# C-111 OSC 52 clipboard writes.
+base64.workspace = true
 
 # Markdown rendering for the transcript goes through flux-markdown's `ratatui` feature, which wraps
 # markdown-stream (parse) + markdown-ratatui (render natively to ratatui `Text`, no ANSI round-trip).

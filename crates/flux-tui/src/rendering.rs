@@ -35,7 +35,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         .slash_query()
         .map(|q| slash_matches(&q, &state.file_commands))
         .unwrap_or_default();
-    let menu_h = (slash.len().min(6)) as u16;
+    // C-112: the `@` path-completion popup shares the slash menu's layout slot (the two are
+    // mutually exclusive — an active slash query suppresses `at_token`).
+    let paths = if slash.is_empty() {
+        state.path_popup_matches()
+    } else {
+        Vec::new()
+    };
+    let menu_h = slash.len().max(paths.len()).min(6) as u16;
     let queue_h = if state.queue.is_empty() {
         0
     } else {
@@ -124,6 +131,31 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                     Span::styled(if absolute == sel { " ▸ " } else { "   " }, style),
                     Span::styled(format!("/{}", c.name), style.add_modifier(Modifier::BOLD)),
                     Span::styled(format!("   {}", c.desc), style),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(rows), menu_area);
+    }
+
+    if !paths.is_empty() {
+        let theme = &state.theme;
+        let sel = state.path_sel.min(paths.len() - 1);
+        let start = sel.saturating_sub(5).min(paths.len().saturating_sub(6));
+        let rows: Vec<Line> = paths
+            .iter()
+            .skip(start)
+            .take(6)
+            .enumerate()
+            .map(|(i, path)| {
+                let absolute = start + i;
+                let style = if absolute == sel {
+                    Style::default().bg(theme.sel_bg).fg(theme.accent)
+                } else {
+                    theme.muted_style()
+                };
+                Line::from(vec![
+                    Span::styled(if absolute == sel { " ▸ " } else { "   " }, style),
+                    Span::styled(path.clone(), style),
                 ])
             })
             .collect();
@@ -284,13 +316,36 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
 
     if let Some(view) = &state.approval {
         let t = &state.theme;
-        // Sheet height: border (2) + question + subjects (windowed) + hints, capped at half
-        // the screen so long subject lists scroll instead of swallowing the transcript.
+        // C-115: a pending edit/write shows its hunk diff inside the sheet — the decision point
+        // where eyes on the content matter most. Windowed to a handful of rows; absent entry or
+        // non-diffable tool just means no preview.
+        const PREVIEW_CAP: usize = 8;
+        let diff = state
+            .pending_approval_input(&view.tool)
+            .and_then(|input| toolview::format_diff(&view.tool, input));
+        let diff_total = diff.as_ref().map(|d| d.len()).unwrap_or(0);
+        let reason_row = usize::from(view.reason.is_some());
+
+        // Sheet height: border (2) + question + subjects (windowed) + diff preview + optional
+        // reason line + hints, capped at half the screen so long content scrolls instead of
+        // swallowing the transcript. When the cap bites, the PREVIEW absorbs the squeeze —
+        // question, subjects, and hints always survive.
+        let want_preview = diff_total.min(PREVIEW_CAP) + usize::from(diff_total > PREVIEW_CAP); // "… more" marker row
         let max_h = (frame.area().height / 2).max(5);
-        let want = 2 + 2 + view.subjects.len() as u16;
+        let want = 2 + 2 + (view.subjects.len() + want_preview + reason_row) as u16;
         let height = want.min(max_h).min(input_area.y.saturating_sub(1)).max(5);
-        let inner_rows = height.saturating_sub(2) as usize; // question + subjects + hints
-        let subject_rows = inner_rows.saturating_sub(2);
+        let inner_rows = height.saturating_sub(2) as usize;
+        let body = inner_rows.saturating_sub(2 + reason_row); // minus question + hints + reason
+        let subject_rows = view
+            .subjects
+            .len()
+            .min(body.saturating_sub(want_preview).max(1));
+        let preview_budget = body.saturating_sub(subject_rows);
+        let (preview_rows, preview_more) = if diff_total > preview_budget {
+            (preview_budget.saturating_sub(1), true)
+        } else {
+            (diff_total, false)
+        };
         let area = Rect {
             x: frame.area().x,
             y: input_area.y.saturating_sub(height),
@@ -321,17 +376,48 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             ));
         }
         let hidden = view.subjects.len().saturating_sub(start + subject_rows);
-        let mut hints = vec![
-            Span::styled("[y]", t.ok_style().add_modifier(Modifier::BOLD)),
-            Span::styled(" allow  ", t.muted_style()),
-            Span::styled(
-                "[a]",
-                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" always  ", t.muted_style()),
-            Span::styled("[n/Esc]", t.err_style().add_modifier(Modifier::BOLD)),
-            Span::styled(" deny", t.muted_style()),
-        ];
+        if let Some(diff) = &diff {
+            for row in diff.iter().take(preview_rows) {
+                rows.push(diff_row_line(t, row, " "));
+            }
+            if preview_more {
+                rows.push(Line::styled(
+                    format!(" … {} more diff lines", diff.len() - preview_rows),
+                    t.muted_style(),
+                ));
+            }
+        }
+        // C-113: the one-line deny-reason input replaces nothing — it rides above the hints
+        // while active, with a cursor to signal it takes the keyboard.
+        if let Some(reason) = &view.reason {
+            rows.push(Line::from(vec![
+                Span::styled("deny reason: ", t.err_style().add_modifier(Modifier::BOLD)),
+                Span::styled(reason.clone(), t.err_style()),
+                Span::styled("▍", t.accent_style()),
+            ]));
+        }
+        let mut hints = if view.reason.is_some() {
+            vec![
+                Span::styled("[Enter]", t.err_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" deny with reason  ", t.muted_style()),
+                Span::styled("[Esc]", t.accent_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" back", t.muted_style()),
+            ]
+        } else {
+            vec![
+                Span::styled("[y]", t.ok_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" allow ", t.muted_style()),
+                Span::styled(
+                    "[a]",
+                    Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" always ", t.muted_style()),
+                Span::styled("[n/Esc]", t.err_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" deny ", t.muted_style()),
+                Span::styled("[d]", t.err_style().add_modifier(Modifier::BOLD)),
+                Span::styled(" reason", t.muted_style()),
+            ]
+        };
         if hidden > 0 || start > 0 {
             hints.push(Span::styled(
                 format!("  ↑/↓ +{hidden} more"),

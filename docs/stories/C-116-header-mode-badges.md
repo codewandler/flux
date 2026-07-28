@@ -2,7 +2,7 @@
 id: C-116
 title: Header mode badges — shell, auto-ok, effort, gather
 pillar: Core
-status: ready
+status: done
 priority: P3
 design: tui-polish
 epic: tui-polish
@@ -18,19 +18,19 @@ invisible: the `/shell` bash opt-in, `--yes` auto-approve, reasoning `/effort`, 
 Render compact right-side badges so a permissive or unusual mode is always visible at a glance.
 
 ## Acceptance
-- [ ] `header_line` gains right-side badge segments shown only when active/non-default:
+- [x] `header_line` gains right-side badge segments shown only when active/non-default:
       `shell` (warn style), `auto-ok` (warn style), `effort:<level>`, `gather` — TestBackend test
       with shell + auto-approve on shows both badges at full width.
-- [ ] Badges ride the existing `bar_line` droppable-segment mechanism; among the badges,
+- [x] Badges ride the existing `bar_line` droppable-segment mechanism; among the badges,
       safety-relevant `auto-ok` is ordered most-precious (dropped last) — pinned by a narrow-width
       unit test.
-- [ ] `/shell` and `/effort` changes reflect on the next render: shell reads
+- [x] `/shell` and `/effort` changes reflect on the next render: shell reads
       `flux_runtime::shell_opt_in()` live; the chosen effort is mirrored into `ChatState` when the
       command runs so the sync render path can badge it.
-- [ ] The `gather` badge follows `state.gather_mode` (already phase-driven).
+- [x] The `gather` badge follows `state.gather_mode` (already phase-driven).
 
 ## Progress
--
+- Done 2026-07-28: header badges `auto-ok` (warn), `shell` (live `flux_runtime::shell_opt_in()`), `gather`, `effort:<level>` (mirrored into ChatState by /effort, seeded from engine at startup); segment order [auto-ok, tokens, cache, cost, shell, gather, effort] — badges shed first, auto-ok most precious (survives when even tokens drop). Tests: header_shows_mode_badges_when_active, narrow_header_drops_badges_last_keeps_auto_ok.
 
 ## Notes
 - Seams: `bar_line` droppable segments `crates/flux-tui/src/lib.rs:1481` (mechanism already

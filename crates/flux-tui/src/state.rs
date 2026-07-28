@@ -54,6 +54,16 @@ pub struct ChatState {
     pub(super) search: Option<TranscriptSearch>,
     /// Whether the help overlay is open (F1 / `/help`, C-110).
     pub(super) help_open: bool,
+    /// Focused transcript entry (Shift-↑/↓ moves it, Esc clears; C-111). Enter toggles the
+    /// focused tool card's per-card expansion, `y` yanks the entry via OSC 52.
+    pub(super) focused: Option<usize>,
+    /// Workspace file inventory for `@` path completion (C-112) — built lazily on the first `@`,
+    /// cached for the session (staleness across turns is a documented v1 limitation).
+    pub(super) file_inventory: Option<Arc<Vec<String>>>,
+    /// Selected row in the `@` path-completion popup.
+    pub(super) path_sel: usize,
+    /// The exact `@token` dismissed with Esc — the popup stays hidden until the token changes.
+    pub(super) path_dismissed: Option<String>,
     /// Whether `--yes` auto-approve is active — surfaced as a header badge (C-116).
     pub(super) auto_approve: bool,
     /// The effort level chosen via `/effort`, mirrored here so the sync render path can badge

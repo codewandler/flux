@@ -257,7 +257,11 @@ impl OpHost for ExecutorHost<'_> {
             ApprovalChoice::Allow | ApprovalChoice::AllowAlways(_) => {
                 flux_lang::host::ApprovalChoice::Allow
             }
-            ApprovalChoice::Deny => flux_lang::host::ApprovalChoice::Deny,
+            // The flux-lang host choice is binary — a C-113 reason has nowhere to ride here and
+            // is deliberately dropped at this boundary.
+            ApprovalChoice::Deny | ApprovalChoice::DenyWithReason(_) => {
+                flux_lang::host::ApprovalChoice::Deny
+            }
         }
     }
 

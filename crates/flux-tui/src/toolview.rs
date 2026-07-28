@@ -154,6 +154,96 @@ pub enum DetailKind {
     Add,
     Del,
     Meta,
+    /// A `@@ -a,b +c,d @@` hunk header in a [`format_diff`] hunk view (C-115).
+    Hunk,
+}
+
+/// One row of a hunk-view diff (C-115): a kind for coloring, optional old/new gutter line numbers
+/// (1-based, relative to the diffed snippet), and the text as `(emphasized, s)` spans — `true`
+/// marks the word-level intraline change within a modified line pair. Color-free like the rest of
+/// this module; the surface maps kind → style and emphasis → modifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DetailKind,
+    pub old_no: Option<u32>,
+    pub new_no: Option<u32>,
+    pub spans: Vec<(bool, String)>,
+}
+
+impl DiffLine {
+    fn plain_row(kind: DetailKind, old_no: Option<u32>, new_no: Option<u32>, text: String) -> Self {
+        DiffLine {
+            kind,
+            old_no,
+            new_no,
+            spans: vec![(false, text)],
+        }
+    }
+}
+
+/// A real hunk-view diff for `edit`/`write` calls (C-115): `@@` headers, per-side line numbers,
+/// and word-level intraline emphasis on changed spans. Built from the call *args*
+/// (`old_string`/`new_string`/`content`) — exact, and available before the result, so the
+/// approval sheet can preview a pending call. Returns `None` for every other op (callers fall
+/// back to [`format_detail`]). Line numbers are relative to the diffed snippet: an `edit`'s
+/// `old_string` is a fragment, so its offset within the file is unknown here.
+pub fn format_diff(name: &str, input: &Value) -> Option<Vec<DiffLine>> {
+    use similar::{ChangeTag, TextDiff};
+    let s = |k: &str| input.get(k).and_then(Value::as_str);
+    let (old, new) = match name {
+        "edit" => (s("old_string")?.to_string(), s("new_string")?.to_string()),
+        "write" => (String::new(), s("content")?.to_string()),
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    if let Some(p) = s("path") {
+        out.push(DiffLine::plain_row(
+            DetailKind::Meta,
+            None,
+            None,
+            format!("@ {p}"),
+        ));
+    }
+    let diff = TextDiff::from_lines(&old, &new);
+    for group in diff.grouped_ops(2) {
+        let (first, last) = match (group.first(), group.last()) {
+            (Some(f), Some(l)) => (f, l),
+            _ => continue,
+        };
+        let (os, oe) = (first.old_range().start, last.old_range().end);
+        let (ns, ne) = (first.new_range().start, last.new_range().end);
+        out.push(DiffLine::plain_row(
+            DetailKind::Hunk,
+            None,
+            None,
+            format!("@@ -{},{} +{},{} @@", os + 1, oe - os, ns + 1, ne - ns),
+        ));
+        for op in &group {
+            for change in diff.iter_inline_changes(op) {
+                let kind = match change.tag() {
+                    ChangeTag::Equal => DetailKind::Plain,
+                    ChangeTag::Delete => DetailKind::Del,
+                    ChangeTag::Insert => DetailKind::Add,
+                };
+                let mut spans: Vec<(bool, String)> = change
+                    .iter_strings_lossy()
+                    .map(|(emph, s)| (emph, s.into_owned()))
+                    .collect();
+                if let Some(last) = spans.last_mut() {
+                    while last.1.ends_with('\n') || last.1.ends_with('\r') {
+                        last.1.pop();
+                    }
+                }
+                out.push(DiffLine {
+                    kind,
+                    old_no: change.old_index().map(|i| i as u32 + 1),
+                    new_no: change.new_index().map(|i| i as u32 + 1),
+                    spans,
+                });
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Expanded detail for a tool call, as color-free `(kind, text)` lines. `edit` becomes a unified
@@ -302,6 +392,64 @@ mod tests {
         assert_eq!(d[0], (DetailKind::Meta, "@ a.rs".to_string()));
         assert_eq!(d[1], (DetailKind::Del, "- let x = 1;".to_string()));
         assert_eq!(d[2], (DetailKind::Add, "+ let x = 2;".to_string()));
+    }
+
+    #[test]
+    fn diff_builds_hunks_with_line_numbers() {
+        // Two distant changes in a 12-line snippet → two hunks with correct headers.
+        let old: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let new = old
+            .replace("line 2", "line two")
+            .replace("line 11", "line eleven");
+        let d = format_diff(
+            "edit",
+            &json!({"path": "a.rs", "old_string": old, "new_string": new}),
+        )
+        .unwrap();
+        assert_eq!(d[0].kind, DetailKind::Meta);
+        assert_eq!(d[0].spans[0].1, "@ a.rs");
+        let hunks: Vec<&DiffLine> = d.iter().filter(|l| l.kind == DetailKind::Hunk).collect();
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].spans[0].1, "@@ -1,4 +1,4 @@");
+        assert_eq!(hunks[1].spans[0].1, "@@ -9,4 +9,4 @@");
+        // Context rows carry both numbers; del/add rows carry one side only.
+        let ctx = d.iter().find(|l| l.kind == DetailKind::Plain).unwrap();
+        assert!(ctx.old_no.is_some() && ctx.new_no.is_some());
+        let del = d.iter().find(|l| l.kind == DetailKind::Del).unwrap();
+        assert_eq!((del.old_no, del.new_no), (Some(2), None));
+        let add = d.iter().find(|l| l.kind == DetailKind::Add).unwrap();
+        assert_eq!((add.old_no, add.new_no), (None, Some(2)));
+    }
+
+    #[test]
+    fn diff_emphasizes_intraline_changes() {
+        let d = format_diff(
+            "edit",
+            &json!({"old_string": "let x = 1;\n", "new_string": "let x = 2;\n"}),
+        )
+        .unwrap();
+        let del = d.iter().find(|l| l.kind == DetailKind::Del).unwrap();
+        let add = d.iter().find(|l| l.kind == DetailKind::Add).unwrap();
+        // The changed word is emphasized; the shared prefix is not.
+        assert!(del.spans.iter().any(|(e, s)| *e && s.contains('1')));
+        assert!(add.spans.iter().any(|(e, s)| *e && s.contains('2')));
+        assert!(del.spans.iter().any(|(e, s)| !*e && s.contains("let x")));
+    }
+
+    #[test]
+    fn write_diff_is_all_additions_with_new_numbers() {
+        let d = format_diff("write", &json!({"path": "n.txt", "content": "a\nb\n"})).unwrap();
+        let adds: Vec<&DiffLine> = d.iter().filter(|l| l.kind == DetailKind::Add).collect();
+        assert_eq!(adds.len(), 2);
+        assert_eq!((adds[0].old_no, adds[0].new_no), (None, Some(1)));
+        assert_eq!((adds[1].old_no, adds[1].new_no), (None, Some(2)));
+        assert!(d.iter().all(|l| l.kind != DetailKind::Del));
+    }
+
+    #[test]
+    fn diff_is_none_for_other_ops() {
+        assert_eq!(format_diff("bash", &json!({"command": "ls"})), None);
+        assert_eq!(format_diff("read", &json!({"path": "a.rs"})), None);
     }
 
     #[test]

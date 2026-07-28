@@ -55,6 +55,10 @@ pub struct ApprovalView {
     pub subjects: Vec<String>,
     /// First visible row of the subject list when it overflows the sheet.
     pub scroll: usize,
+    /// `Some` = the `d` reason-input line is active with this draft; Enter resolves the approval
+    /// as a denial carrying the reason, Esc returns to the sheet with the approval still
+    /// pending (C-113).
+    pub reason: Option<String>,
 }
 
 /// What a key press means while the approval sheet is open. Only explicit keys act — anything
@@ -65,6 +69,8 @@ pub(super) enum ApprovalAction {
     Allow,
     AllowAlways,
     Deny,
+    /// Open the one-line reason input; the denial is only resolved on Enter (C-113).
+    DenyWithReason,
     Scroll(isize),
     Ignore,
 }
@@ -74,6 +80,7 @@ pub(super) fn approval_key(code: KeyCode) -> ApprovalAction {
         KeyCode::Char('y') | KeyCode::Char('Y') => ApprovalAction::Allow,
         KeyCode::Char('a') | KeyCode::Char('A') => ApprovalAction::AllowAlways,
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ApprovalAction::Deny,
+        KeyCode::Char('d') | KeyCode::Char('D') => ApprovalAction::DenyWithReason,
         KeyCode::Up => ApprovalAction::Scroll(-1),
         KeyCode::Down => ApprovalAction::Scroll(1),
         _ => ApprovalAction::Ignore,
@@ -93,6 +100,7 @@ pub(super) fn show_next_approval(
             tool: tool.clone(),
             subjects,
             scroll: 0,
+            reason: None,
         });
         *current = Some((tool, reply));
     }

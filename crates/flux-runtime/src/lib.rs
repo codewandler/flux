@@ -1682,6 +1682,11 @@ pub enum ApprovalChoice {
     /// Allow and remember this rule (added to the allow list).
     AllowAlways(String),
     Deny,
+    /// Deny and tell the model why (C-113). The reason is APPENDED to the canonical
+    /// `` `{op}` denied by user `` result text — never a mutation of it — so denial
+    /// classification (structural via `DispatchOutcome.denied`, see L-32) and every
+    /// existing `Deny` construction site are unaffected.
+    DenyWithReason(String),
 }
 
 /// What a whole-plan approval decides on: the plan's statically-visible behavior, aggregated from
@@ -2716,7 +2721,7 @@ impl Executor {
                 self.trust_all.store(true, Ordering::SeqCst);
                 Some(self.enter_approved_scope(plan.destructive))
             }
-            ApprovalChoice::Deny => None,
+            ApprovalChoice::Deny | ApprovalChoice::DenyWithReason(_) => None,
         }
     }
 
@@ -2735,7 +2740,7 @@ impl Executor {
                 self.trust_all.store(true, Ordering::SeqCst);
                 true
             }
-            ApprovalChoice::Deny => false,
+            ApprovalChoice::Deny | ApprovalChoice::DenyWithReason(_) => false,
         }
     }
 
@@ -3271,20 +3276,34 @@ impl Executor {
                     );
                     self.perms.lock().unwrap().add_allow(&rule);
                 }
-                ApprovalChoice::Deny => {
+                ApprovalChoice::Deny | ApprovalChoice::DenyWithReason(_) => {
+                    // C-113: a reason-carrying denial keeps the canonical op-anchored shape and
+                    // appends the user's why, giving the loop something to adapt to instead of
+                    // re-proposing a near-identical call.
+                    let reason = match choice {
+                        ApprovalChoice::DenyWithReason(reason) => Some(reason),
+                        _ => None,
+                    };
                     self.record_dispatch_event(
                         "approval.denied",
                         dispatch,
                         name,
                         started,
-                        json!({}),
+                        match &reason {
+                            Some(reason) => json!({ "reason": reason }),
+                            None => json!({}),
+                        },
                     );
+                    let text = match reason {
+                        Some(reason) => format!("`{name}` denied by user — reason: {reason}"),
+                        None => format!("`{name}` denied by user"),
+                    };
                     return self.finish_dispatch(
                         name,
                         started,
                         approval_wait,
                         None,
-                        ToolResult::error(format!("`{name}` denied by user")),
+                        ToolResult::error(text),
                         true,
                     );
                 }
@@ -4138,6 +4157,37 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(result.content, "safe");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-113: a reason-carrying denial APPENDS to the canonical op-anchored shape — the
+    /// `` `{op}` denied by user `` prefix (and the structural `denied` classification) are
+    /// unchanged, and the user's why rides behind it for the model to adapt to.
+    #[tokio::test]
+    async fn deny_with_reason_appends_to_the_canonical_denial_text() {
+        let approver = Arc::new(RecordingApprover {
+            asked: AtomicBool::new(false),
+            choice: || ApprovalChoice::DenyWithReason("wrong environment, use staging".into()),
+        });
+        let ex = Executor::new(
+            registry(),
+            PermissionManager::new(),
+            approver.clone(),
+            test_ctx(),
+        );
+        let r = ex.dispatch("echo", json!({"text": "hi"})).await;
+        assert!(r.is_error);
+        assert!(approver.asked.load(Ordering::Relaxed));
+        assert!(
+            r.content.contains("`echo` denied by user"),
+            "canonical shape must be intact: {}",
+            r.content
+        );
+        assert!(
+            r.content
+                .contains("— reason: wrong environment, use staging"),
+            "reason must be appended: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

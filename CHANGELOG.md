@@ -8,6 +8,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-111…C-116: TUI polish wave 2** (epic [tui-polish](docs/designs/tui-polish.md)):
+  - **Transcript entry focus + per-card expansion + OSC 52 yank (C-111):** Shift-↑/↓ move a focus
+    cursor through the transcript (selection background, centers the entry, Esc clears); Enter
+    toggles just the focused tool card's expansion (Ctrl-E keeps its global meaning and resets
+    overrides); `y` copies the focused entry's full text as an OSC 52 clipboard write (works over
+    SSH, 72 KiB cap, `copied N lines` notice).
+  - **`@` file-path completion in the composer (C-112):** typing `@` at a token start opens a
+    fuzzy path popup in the slash-menu slot (segment-prefix > substring > subsequence ranking);
+    Tab/Enter insert the selected workspace-relative path; the inventory is a lazy, bounded,
+    ignore-aware walk cached for the session.
+  - **Approval deny-with-reason (C-113):** `d` on the approval sheet opens a one-line reason
+    input; Enter denies carrying the reason, which is APPENDED to the canonical
+    `` `{op}` denied by user `` result text for the model to adapt to (structural denial
+    classification untouched). BREAKING (pub surface): `flux_runtime::ApprovalChoice` gains the
+    `DenyWithReason(String)` variant.
+  - **Markdown for the sealed prefix while streaming (C-114):** streamed assistant text up to the
+    last completed block boundary renders styled (cached, flicker-free by construction); only the
+    trailing unterminated block stays plain + cursor, and an open code fence stays plain until it
+    closes.
+  - **Hunk-view diffs (C-115):** expanded `edit`/`write` cards render real hunks — `@@` headers,
+    old/new gutter line numbers, word-level intraline emphasis — and the approval sheet embeds
+    the same windowed diff preview for pending edit/write calls.
+  - **Header mode badges (C-116):** `auto-ok`, `shell`, `gather`, and `effort:<level>` appear as
+    right-side header segments only when active; on narrow terminals the badges shed first and
+    the safety-relevant `auto-ok` outlives every other right segment.
 - **C-102…C-110: TUI polish — 5 UX + 5 UI improvements** (epic
   [tui-polish](docs/designs/tui-polish.md)):
   - **Ctrl-T mouse-capture toggle (C-105):** terminal-native text selection/copy works while

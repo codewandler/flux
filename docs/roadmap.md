@@ -84,7 +84,7 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > it carries pub-surface breaks from C-97/C-103/C-104 and the D-192 flux-skill removals). See
 > [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### TUI polish — 5 UX + 5 UI (epic) — ✅ **wave 1 IMPLEMENTED 2026-07-28 (C-102…C-110 done, unreleased; wave 2 C-111…C-116 filed)**
+### TUI polish — 5 UX + 5 UI (epic) — ✅ **IMPLEMENTED 2026-07-28 (wave 1 C-102…C-110 + wave 2 C-111…C-116 done, unreleased)**
 
 The TUI became a daily driver (A-65) and just gained its boot splash + spinners (C-101); what
 remains are well-defined rough edges. Five UX fixes — a mouse-capture toggle so terminal-native
