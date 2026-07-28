@@ -17,6 +17,10 @@
 
 ### New
 
+- **Fetch the current Bitcoin price with a deterministic Flux-Lang example.** Run
+  `flux flow run examples/bitcoin-price.flux` to request the BTC/USD spot price from Coinbase and
+  extract it without a model or API credentials.
+
 - **Integration plugins that drive a CLI can no longer run more of it than they need.** A plugin's
   permission to run a program is now spelled out down to the subcommand — the Kubernetes
   integration, for example, is allowed `kubectl get`, `kubectl logs`, or `kubectl scale`, but

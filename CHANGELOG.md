@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Deterministic Bitcoin price example.** `examples/bitcoin-price.flux` fetches the BTC/USD spot
+  price from Coinbase through the guarded `web.fetch` operation and extracts it with a bounded,
+  model-free regex; the repository-wide example validation sweep covers its syntax and live op
+  contract.
+
 - **A-94: mid-turn steering — talk to the agent while it runs.** Text submitted while a turn is
   executing no longer waits for the turn to finish: the TUI's follow-up queue is shared with the
   engine (`FlowEngine::set_steering` + the new `flux_flow::SteeringQueue`), which drains it at
