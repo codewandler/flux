@@ -98,6 +98,42 @@ fn default_mock_run_surfaces_intent_in_plain_output() {
     assert!(stderr.contains("operations"), "{stderr}");
 }
 
+/// C-162: a `[tools] disable` entry that matches no registered op is a loud startup warning naming
+/// the entry, not a silent no-op — end-to-end through the real binary and a real `.flux/config.toml`.
+#[test]
+fn tools_disable_unmatched_entry_warns_at_startup() {
+    let tmp = TempDir::new("tools-disable-unmatched");
+    let work = tmp.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(work.join(".flux")).unwrap();
+    std::fs::write(
+        work.join(".flux/config.toml"),
+        "[tools]\ndisable = [\"no-such-op\"]\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["run", "--yes", "-m", "mock", "say hello"])
+        .current_dir(work)
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn flux");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "an unmatched disable entry must warn, not fail startup\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("[tools] disable entry `no-such-op` matches no known op"),
+        "{stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn malformed_config_stops_plugin_status_before_native_spawn() {

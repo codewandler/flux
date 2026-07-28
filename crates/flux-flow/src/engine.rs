@@ -1001,6 +1001,7 @@ impl FlowEngine {
             session_id,
             &self.ambient_signals,
             user_input,
+            self.executor.disabled_ops(),
         );
         if let Some(surfaced) = surfaced.as_ref() {
             self.record_active_groups(surfaced, sink);
@@ -1641,7 +1642,11 @@ pub enum LoopSource {
 /// engine's preview registries and the loop host's model stages — so they can't drift.
 ///
 /// Gating disabled still excludes the never-surfaced adaptive machinery (`reflect` group). With a
-/// manifest, `advertised_op_names` already excludes it.
+/// manifest, `advertised_op_names` already excludes it. `disabled` (C-162, `[tools] disable`
+/// resolved once at executor construction — see `Executor::disabled_ops`) is subtracted last and
+/// unconditionally in both branches: it is purely subtractive and independent of group gating, so
+/// a config-disabled op is never advertised even when its group is force-on or currently active.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn surfaced_op_names(
     reg: &flux_runtime::ToolRegistry,
     groups: &[flux_evidence::ToolGroup],
@@ -1650,12 +1655,16 @@ pub(crate) fn surfaced_op_names(
     session_id: &str,
     ambient: &[String],
     user_input: &str,
+    disabled: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, Option<SurfacedGroups>) {
     if groups.is_empty() {
         let advertised = reg
             .specs()
             .iter()
-            .filter(|s| s.group.as_deref() != Some(flux_runtime::REFLECT_GROUP))
+            .filter(|s| {
+                s.group.as_deref() != Some(flux_runtime::REFLECT_GROUP)
+                    && !disabled.contains(&s.name)
+            })
             .map(|s| s.name.clone())
             .collect();
         return (advertised, None);
@@ -1683,7 +1692,11 @@ pub(crate) fn surfaced_op_names(
         session.extend(active);
         session.clone()
     };
-    let advertised = flux_runtime::advertised_op_names(&reg.specs(), groups, &accumulated);
+    let advertised: std::collections::HashSet<String> =
+        flux_runtime::advertised_op_names(&reg.specs(), groups, &accumulated)
+            .into_iter()
+            .filter(|op| !disabled.contains(op))
+            .collect();
     // Keep the signal NAMES alongside the resolved groups — the `groups.active` observation
     // records both, so the audit trail says not just which groups surfaced but WHY (C-14).
     let signal_names = signals
@@ -3269,6 +3282,7 @@ mod tests {
             "session-a",
             &[],
             "use slack",
+            &std::collections::HashSet::new(),
         );
         assert!(first.contains("echo"));
 
@@ -3280,10 +3294,77 @@ mod tests {
             "session-b",
             &[],
             "say hello",
+            &std::collections::HashSet::new(),
         );
         assert!(
             !second.contains("echo"),
             "a different session must not inherit another session's surfaced integration"
+        );
+    }
+
+    /// C-162: a config-disabled op is absent from the surfaced (model-facing) set even with no
+    /// group gating in play — the failing-first case for `[tools] disable`'s core promise.
+    #[test]
+    fn disabled_ops_never_reach_the_surfaced_set_with_no_groups() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let root = std::env::temp_dir();
+        let sticky = std::sync::Mutex::new(std::collections::HashMap::new());
+        let disabled: std::collections::HashSet<String> =
+            ["echo".to_string()].into_iter().collect();
+
+        let (advertised, _) = surfaced_op_names(
+            &registry,
+            &[],
+            &root,
+            &sticky,
+            "session",
+            &[],
+            "hi",
+            &disabled,
+        );
+        assert!(
+            !advertised.contains("echo"),
+            "a config-disabled op must never reach the model"
+        );
+    }
+
+    /// C-162: the subtractive `[tools] disable` list wins even when an evidence-gated group would
+    /// otherwise (additively) surface the very same op — proving disable is independent of, and
+    /// takes precedence over, group surfacing rather than being folded into the same additive
+    /// mechanism (tool groups only ever add surface; this is the one knob that removes it).
+    #[test]
+    fn disabled_ops_win_over_an_active_force_on_group() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let groups = vec![flux_evidence::ToolGroup {
+            name: "chat".into(),
+            tools: vec!["echo".into()],
+            surface_when: Vec::new(), // force-on: always active
+            ..Default::default()
+        }];
+        let root = std::env::temp_dir();
+        let sticky = std::sync::Mutex::new(std::collections::HashMap::new());
+        let disabled: std::collections::HashSet<String> =
+            ["echo".to_string()].into_iter().collect();
+
+        let (advertised, surfaced) = surfaced_op_names(
+            &registry,
+            &groups,
+            &root,
+            &sticky,
+            "session-x",
+            &[],
+            "hi",
+            &disabled,
+        );
+        assert!(
+            surfaced.unwrap().active.contains("chat"),
+            "sanity: the group is force-on and active"
+        );
+        assert!(
+            !advertised.contains("echo"),
+            "disable must win even though its group is active"
         );
     }
 
@@ -3929,6 +4010,7 @@ mod tests {
             &first_session,
             &[],
             "",
+            engine.executor.disabled_ops(),
         );
         let (second_advertised, _) = surfaced_op_names(
             engine.executor.registry(),
@@ -3938,6 +4020,7 @@ mod tests {
             &second_session,
             &[],
             "",
+            engine.executor.disabled_ops(),
         );
         assert!(first_advertised.contains("blocking_turn"));
         assert!(!second_advertised.contains("blocking_turn"));

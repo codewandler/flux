@@ -552,6 +552,17 @@ pub trait LoopHost: Send + Sync {
     /// default no-op and can read the operation's evidence observation instead.
     fn record_model_usage(&self, _provider: &str, _model: &str, _usage: Usage) {}
 
+    /// Reserve one call against a guarded operation's own per-turn call budget (A-96's `consult`
+    /// op is the first user): returns the ordinal of THIS call within the turn (`0` for the first,
+    /// `1` for the second, …), reset every turn like the rest of turn accounting. The caller
+    /// compares the ordinal against its own configured cap and refuses once it is reached — this
+    /// method only counts, it never itself blocks. Hosts that do not own turn accounting (direct
+    /// one-shot runtimes) keep the default `0`, so a single dispatched call can never exceed a cap
+    /// of `1` or more on its own.
+    fn reserve_consult_call(&self) -> usize {
+        0
+    }
+
     /// Detect one turn's intent and resolve the initial capability signals into a durable stage
     /// artifact. Adaptive hosts override this; tool-only runtimes fail clearly.
     async fn detect_intent(&self) -> flux_core::Result<serde_json::Value> {
@@ -1210,6 +1221,17 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult>;
 }
 
+/// The result of [`ToolRegistry::resolve_disabled`] (C-162): which concrete op names a `[tools]
+/// disable` list resolves to, and which of its patterns matched nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedDisabledOps {
+    /// Concrete op names to exclude from the surfaced/advertised set and refuse at dispatch.
+    pub disabled: HashSet<String>,
+    /// Patterns that matched no registered op — the caller should warn, naming the entry, rather
+    /// than silently treating it as a no-op.
+    pub unmatched: Vec<String>,
+}
+
 /// A registry of tools keyed by name.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -1409,6 +1431,35 @@ impl ToolRegistry {
         let mut names: Vec<String> = self.tools.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Resolve `[tools] disable` patterns (C-162) against this registry's known op names — an
+    /// exact op name or a `family.*` glob (see [`flux_config::tool_disable_matches`]) — into the
+    /// concrete set to hide/refuse, plus any pattern that matched no registered op (a likely typo
+    /// or a stale entry naming a retired op, so the caller can warn instead of silently no-op-ing).
+    /// Resolving once against a fixed registry snapshot is what keeps the result stable for the
+    /// life of the executor it's installed on (the A-95 cache-stability lesson): the set can never
+    /// churn mid-session.
+    pub fn resolve_disabled(&self, patterns: &[String]) -> ResolvedDisabledOps {
+        let known = self.names();
+        let mut disabled = HashSet::new();
+        let mut unmatched = Vec::new();
+        for pattern in patterns {
+            let mut matched_any = false;
+            for name in &known {
+                if flux_config::tool_disable_matches(pattern, name) {
+                    disabled.insert(name.clone());
+                    matched_any = true;
+                }
+            }
+            if !matched_any {
+                unmatched.push(pattern.clone());
+            }
+        }
+        ResolvedDisabledOps {
+            disabled,
+            unmatched,
+        }
     }
 
     /// Validate every registered tool's static authority declaration.
@@ -2478,6 +2529,15 @@ pub struct Executor {
     dispatch_seq: AtomicU64,
     /// `FLUX_OP_CACHE=off|0` kill switch (resolved at construction); `with_op_cache` overrides.
     cache_enabled: bool,
+    /// `[tools] disable` (C-162), resolved to concrete op names once at construction time via
+    /// [`ToolRegistry::resolve_disabled`] — never recomputed mid-session, so it can't churn the
+    /// prompt prefix (the A-95 cache-stability lesson). Consulted twice: the engine layer narrows
+    /// the per-turn advertised set by it via [`Executor::disabled_ops`] (surface-only), and
+    /// [`Executor::gate`] refuses a dispatch that names one directly, so a cached plan or a resumed
+    /// session can't call it either. Surface-only and defense-in-depth — the authorization policy is
+    /// still the actual security control and wins if the two ever disagree; this never widens what a
+    /// call may do, only what is offered.
+    disabled_ops: HashSet<String>,
 }
 
 /// Holds an approved-plan scope open. While alive, [`Executor::dispatch`] skips the per-op approval
@@ -2523,11 +2583,13 @@ pub struct DispatchOutcome {
     pub result: ToolResult,
     /// `true` iff the envelope itself refused to run the op: an unknown tool name (D-184 — matches
     /// [`Executor::authorize`]'s `Deny`, since a typo'd op can never succeed no matter how many times
-    /// `retry` tries it), a capability-scope miss, the authorization policy floor, a permission-rule
-    /// deny, or the approver declining. A pre-tool hook's `Deny` is deliberately excluded — hook
-    /// denials are meant to stay retryable/repairable rather than a terminal authorization refusal,
-    /// exactly as before this flag existed (hook denials never matched the old prefix heuristic
-    /// either, since their wording is `` `{op}` blocked by hook `` , not `` `{op}` denied by `` ).
+    /// `retry` tries it), an op named in `[tools] disable` (C-162 — surface-only, but refused at
+    /// dispatch too as defense-in-depth), a capability-scope miss, the authorization policy floor, a
+    /// permission-rule deny, or the approver declining. A pre-tool hook's `Deny` is deliberately
+    /// excluded — hook denials are meant to stay retryable/repairable rather than a terminal
+    /// authorization refusal, exactly as before this flag existed (hook denials never matched the
+    /// old prefix heuristic either, since their wording is `` `{op}` blocked by hook `` , not
+    /// `` `{op}` denied by `` ).
     pub denied: bool,
     /// Monotonic phase attribution measured inside the safety envelope.
     pub timing: OperationTiming,
@@ -2688,6 +2750,7 @@ impl Executor {
             cache_enabled: std::env::var("FLUX_OP_CACHE")
                 .map(|v| v != "off" && v != "0")
                 .unwrap_or(true),
+            disabled_ops: HashSet::new(),
         }
     }
 
@@ -2695,6 +2758,22 @@ impl Executor {
     pub fn with_op_cache(mut self, on: bool) -> Self {
         self.cache_enabled = on;
         self
+    }
+
+    /// Install the resolved `[tools] disable` set (C-162) — typically
+    /// [`ToolRegistry::resolve_disabled`]'s `disabled` field, computed once against this executor's
+    /// own registry. Empty by default (nothing disabled). See the `disabled_ops` field doc for how
+    /// this is consulted.
+    pub fn with_disabled_ops(mut self, disabled: HashSet<String>) -> Self {
+        self.disabled_ops = disabled;
+        self
+    }
+
+    /// The resolved `[tools] disable` set this executor was built with (C-162) — the concrete op
+    /// names to exclude from the advertised set and refuse at dispatch. Empty when nothing is
+    /// disabled.
+    pub fn disabled_ops(&self) -> &HashSet<String> {
+        &self.disabled_ops
     }
 
     /// Turn boundary for the op cache (L-54): the engine calls this at the start of every user
@@ -3044,6 +3123,15 @@ impl Executor {
         tool: &dyn Tool,
         audit: GateAudit,
     ) -> std::result::Result<GatedCall, String> {
+        // C-162: `[tools] disable` is checked first, unconditionally — before the capability-scope
+        // floor, hooks, policy, or permission rules — so a disabled op is refused the same way
+        // regardless of scope/rules/plan. This is deliberately NOT the authorization boundary (the
+        // policy below still governs everything that isn't disabled); it exists so a cached plan or
+        // a resumed session can't call an op this workspace configured off, even where the policy
+        // would otherwise allow it. Surface-only + defense-in-depth, never a second permission system.
+        if self.disabled_ops.contains(name) {
+            return Err(format!("`{name}` disabled by config ([tools] disable)"));
+        }
         self.cap_scope_gate(name, audit)?;
 
         let spec = tool.spec();
@@ -5761,6 +5849,59 @@ mod tests {
         );
     }
 
+    /// C-162: an exact name and a `family.*` glob both resolve to concrete registered op names, and
+    /// a pattern matching nothing is reported back rather than silently doing nothing.
+    #[test]
+    fn resolve_disabled_matches_exact_names_and_family_globs_and_reports_unmatched() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool)); // "echo"
+        reg.register(Arc::new(GitishTool)); // "git_status"
+
+        let resolved = reg.resolve_disabled(&[
+            "echo".to_string(),
+            "git_*".to_string(), // no op named exactly this, and no "." so it's an exact-name miss
+            "no-such-op".to_string(),
+        ]);
+        assert_eq!(
+            resolved.disabled,
+            HashSet::from(["echo".to_string()]),
+            "an exact match resolves; `git_*` is not a `family.*` glob (no dot) so it's a plain miss"
+        );
+        assert_eq!(
+            resolved.unmatched,
+            vec!["git_*".to_string(), "no-such-op".to_string()]
+        );
+    }
+
+    /// A `family.*` glob resolves to every registered op under that dotted family.
+    #[test]
+    fn resolve_disabled_family_glob_matches_every_op_in_the_family() {
+        struct DottedTool(&'static str);
+        #[async_trait]
+        impl Tool for DottedTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::read_only(self.0, "d", json!({"type": "object"}))
+            }
+            fn permission_subjects(&self, _p: &Value) -> Vec<String> {
+                Vec::new()
+            }
+            async fn execute(&self, _ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok(""))
+            }
+        }
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DottedTool("browser.navigate")));
+        reg.register(Arc::new(DottedTool("browser.click")));
+        reg.register(Arc::new(EchoTool)); // unrelated, must survive
+
+        let resolved = reg.resolve_disabled(&["browser.*".to_string()]);
+        assert_eq!(
+            resolved.disabled,
+            HashSet::from(["browser.navigate".to_string(), "browser.click".to_string()])
+        );
+        assert!(resolved.unmatched.is_empty());
+    }
+
     #[test]
     fn trim_tool_output_caps_and_annotates() {
         // Under cap → unchanged.
@@ -5987,6 +6128,41 @@ mod tests {
             verdict.reason().unwrap(),
             outcome.result.content,
             "the two surfaces must not drift apart on the refusal wording"
+        );
+    }
+
+    /// C-162 defense-in-depth: an op named in `[tools] disable` is refused at dispatch even though
+    /// it stays fully registered and the permission rules explicitly allow it — proving the refusal
+    /// is a distinct gate, not merely "unknown tool" or "denied by rules". This is what protects a
+    /// cached plan or a resumed session from calling an op the workspace has configured off.
+    #[tokio::test]
+    async fn disabled_op_is_refused_at_dispatch_even_though_still_registered_and_allowed() {
+        let fired = Arc::new(AtomicU64::new(0));
+        let executor =
+            authorize_executor(fired.clone(), &["boom".into()], &[], Arc::new(DenyApprover))
+                .with_disabled_ops(["boom".to_string()].into_iter().collect());
+
+        let verdict = executor.authorize("boom", &json!({}));
+        assert!(verdict.is_denied(), "{verdict:?}");
+        assert!(
+            verdict.reason().unwrap().contains("disabled by config"),
+            "{verdict:?}"
+        );
+
+        let outcome = executor.dispatch_outcome("boom", json!({})).await;
+        assert!(
+            outcome.denied,
+            "a config-disabled op must be refused at dispatch too (defense in depth)"
+        );
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "the op must never actually run"
+        );
+        assert_eq!(
+            verdict.reason().unwrap(),
+            outcome.result.content,
+            "authorize and dispatch must agree on the refusal wording"
         );
     }
 

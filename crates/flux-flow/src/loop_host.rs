@@ -44,6 +44,10 @@ pub struct EngineLoopHost {
     turn: Mutex<TurnContext>,
     usage: Mutex<Usage>,
     calls: Mutex<Vec<(String, Usage)>>,
+    /// A-96: per-turn call counter for the `consult` op's own budget (distinct from `calls`, which
+    /// tallies billed usage for every independent model call regardless of source). Reset to zero
+    /// in [`Self::set_turn`] like the rest of turn accounting.
+    consult_calls: AtomicU32,
     token_budget: Mutex<Option<u64>>,
     adaptive_policy: Mutex<crate::staged::AdaptiveLoopPolicy>,
     conversation_cache: Mutex<HashMap<String, (Vec<Message>, i64)>>,
@@ -115,6 +119,7 @@ impl EngineLoopHost {
                 }),
                 usage: Mutex::new(Usage::default()),
                 calls: Mutex::new(Vec::new()),
+                consult_calls: AtomicU32::new(0),
                 token_budget: Mutex::new(None),
                 adaptive_policy: Mutex::new(crate::staged::AdaptiveLoopPolicy::default()),
                 conversation_cache: Mutex::new(HashMap::new()),
@@ -225,6 +230,7 @@ impl EngineLoopHost {
         };
         *self.usage.lock().unwrap() = Usage::default();
         self.calls.lock().unwrap().clear();
+        self.consult_calls.store(0, Ordering::SeqCst);
         self.receipts.clear();
         reporter
     }
@@ -548,6 +554,10 @@ fn validate_live_batch(
 impl LoopHost for EngineLoopHost {
     fn record_model_usage(&self, provider: &str, model: &str, usage: Usage) {
         self.record_independent_call(provider, model, usage);
+    }
+
+    fn reserve_consult_call(&self) -> usize {
+        self.consult_calls.fetch_add(1, Ordering::SeqCst) as usize
     }
 
     async fn detect_intent(&self) -> Result<Value> {

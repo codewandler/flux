@@ -339,6 +339,71 @@ impl SandboxConfig {
     }
 }
 
+/// The `[tools] disable` table (C-162): a plain, subtractive blocklist for turning ops off. Tool
+/// groups (`flux_evidence::ToolGroup`) are purely additive — they surface ops when evidence fires,
+/// never hide them — so this is the one deliberately subtractive knob, for an operator who wants
+/// less prompt surface / attack surface in a given repo (e.g. `disable = ["browser.*", "web.*"]`)
+/// rather than an authorization decision. **Not a security boundary**: the authorization policy
+/// remains the actual gate, and wins if the two ever disagree (see `Executor`'s dispatch-time
+/// refusal in `flux-runtime`, which is defense-in-depth, not a second permission system).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolsConfig {
+    /// Op names to remove from the surfaced tool set entirely: an exact name (`"bash"`) or a
+    /// `family.*` glob matching every op under that dotted prefix (`"browser.*"` matches
+    /// `browser.navigate`, `browser.click`, …, but not a bare `browser`). An entry that matches no
+    /// known op is reported by the caller as a startup warning rather than silently doing nothing —
+    /// see [`tool_disable_matches`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+}
+
+impl ToolsConfig {
+    fn is_default(&self) -> bool {
+        self.disable.is_empty()
+    }
+}
+
+/// Whether `op_name` matches a single `[tools] disable` entry (C-162): an exact-name match, or —
+/// when `pattern` ends in `.*` — membership in that dotted family (`op_name` starts with the
+/// family prefix followed by `.`). A bare family name with no `.*` suffix is treated as an exact
+/// name, so `"browser"` (no glob) does NOT match `browser.navigate`; only `"browser.*"` does. Pure
+/// and side-effect-free so both the config layer and the runtime's registry-resolution step
+/// (`flux_runtime::ToolRegistry::resolve_disabled`) can share it without disagreeing.
+pub fn tool_disable_matches(pattern: &str, op_name: &str) -> bool {
+    match pattern.strip_suffix(".*") {
+        Some(family) if !family.is_empty() => op_name
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with('.')),
+        _ => pattern == op_name,
+    }
+}
+
+/// The `[consult]` table (A-96): the second-opinion op's default target and per-turn call cap.
+/// `model`'s mere presence is what surfaces the `consult` op into the catalog at all — absent
+/// means the op stays off the model-facing catalog (evidence-gated, the A-95 cache-stability
+/// lesson: within a session the surfacing decision is made once at assembly time and never
+/// churns), since an operator who hasn't named a target hasn't opted into the extra spend.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsultConfig {
+    /// Default `provider/model` spec consulted when a `consult` call omits its own `model`
+    /// argument (e.g. `openrouter/anthropic/claude-opus-4.6`). Resolved through the same
+    /// provider/model routing as `-m`/`--model`, subscription providers included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-turn call cap — a cheap second opinion, not a council of models. Absent means the
+    /// built-in default (see `flux_cognition::DEFAULT_CONSULT_MAX_CALLS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<usize>,
+}
+
+impl ConsultConfig {
+    fn is_default(&self) -> bool {
+        self.model.is_none() && self.max_calls.is_none()
+    }
+}
+
 /// The merged flux configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -398,6 +463,13 @@ pub struct Config {
     /// processes.
     #[serde(default, skip_serializing_if = "SandboxConfig::is_default")]
     pub sandbox: SandboxConfig,
+    /// A plain, subtractive op blocklist (C-162): `disable = ["browser.*", "web.*"]`. Surface-only —
+    /// see [`ToolsConfig`].
+    #[serde(default, skip_serializing_if = "ToolsConfig::is_default")]
+    pub tools: ToolsConfig,
+    /// The second-opinion `consult` op's default target and per-turn call cap (A-96).
+    #[serde(default, skip_serializing_if = "ConsultConfig::is_default")]
+    pub consult: ConsultConfig,
 }
 
 /// The default A2A session TTL (seconds) when `[server] a2a_session_ttl_secs` is absent: 1 hour.
@@ -851,6 +923,16 @@ fn merge(user: Config, project: Config) -> Config {
         // Scalar: a project value overrides the user's.
         browser_bin: project.browser_bin.or(user.browser_bin),
         sandbox: merge_sandbox(user.sandbox, project.sandbox),
+        // Concatenate like the permission lists (order carries no meaning; user first, then
+        // project) — a project's disable list refines (adds to) the user's, never silently drops it.
+        tools: ToolsConfig {
+            disable: dedupe([user.tools.disable, project.tools.disable].concat()),
+        },
+        // Scalars: a project value overrides the user's, same rule as `model`/`limits`.
+        consult: ConsultConfig {
+            model: project.consult.model.or(user.consult.model),
+            max_calls: project.consult.max_calls.or(user.consult.max_calls),
+        },
     }
 }
 
@@ -1269,6 +1351,89 @@ effort = "low"
             Some("medium")
         );
         assert_eq!(merged.agent.adaptive.explore.max_calls, Some(6));
+    }
+
+    #[test]
+    fn tool_disable_matches_exact_names_and_family_globs() {
+        // Exact name.
+        assert!(tool_disable_matches("bash", "bash"));
+        assert!(!tool_disable_matches("bash", "bash2"));
+        // `family.*` matches every op dotted under that family.
+        assert!(tool_disable_matches("browser.*", "browser.navigate"));
+        assert!(tool_disable_matches("browser.*", "browser.click"));
+        assert!(!tool_disable_matches("browser.*", "browserish.foo"));
+        // A bare family name with no `.*` is an exact match only — it does not implicitly glob.
+        assert!(!tool_disable_matches("browser", "browser.navigate"));
+        // Different family, no match.
+        assert!(!tool_disable_matches("web.*", "browser.navigate"));
+        assert!(tool_disable_matches("web.*", "web.fetch"));
+    }
+
+    #[test]
+    fn tools_disable_layers_user_and_project_with_precedence_and_dedup() {
+        let mut user = Config::default();
+        user.tools.disable = vec!["browser.*".into(), "bash".into()];
+        let mut project = Config::default();
+        project.tools.disable = vec!["web.*".into(), "bash".into()];
+
+        let merged = merge(user, project);
+        assert_eq!(
+            merged.tools.disable,
+            vec![
+                "browser.*".to_string(),
+                "bash".to_string(),
+                "web.*".to_string()
+            ],
+            "user entries first, project entries appended, duplicates collapsed"
+        );
+    }
+
+    #[test]
+    fn tools_disable_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+[tools]
+disable = ["browser.*", "web.*"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tools.disable, vec!["browser.*", "web.*"]);
+        assert!(!cfg.tools.is_default());
+        assert!(Config::default().tools.is_default());
+    }
+
+    /// A-96: `[consult] model` parses, is absent by default, and a project value wins over the
+    /// user's on merge — same scalar-override rule as `model`/`limits`.
+    #[test]
+    fn consult_config_parses_and_project_overrides_user_on_merge() {
+        let cfg: Config = toml::from_str(
+            r#"
+[consult]
+model = "openrouter/anthropic/claude-opus-4.6"
+max_calls = 3
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.consult.model.as_deref(),
+            Some("openrouter/anthropic/claude-opus-4.6")
+        );
+        assert_eq!(cfg.consult.max_calls, Some(3));
+        assert!(!cfg.consult.is_default());
+        assert!(Config::default().consult.is_default());
+
+        let mut user = Config::default();
+        user.consult.model = Some("user/model".into());
+        user.consult.max_calls = Some(1);
+        let mut project = Config::default();
+        project.consult.model = Some("project/model".into());
+        let merged = merge(user, project);
+        assert_eq!(merged.consult.model.as_deref(), Some("project/model"));
+        assert_eq!(
+            merged.consult.max_calls,
+            Some(1),
+            "project left max_calls unset, so the user's value survives"
+        );
     }
 
     #[test]

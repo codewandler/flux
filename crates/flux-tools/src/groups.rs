@@ -138,6 +138,18 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             surface_when: when("agent_triggerable"),
         },
         ToolGroup {
+            name: "consult".into(),
+            description: "consult (A-96): ask a DIFFERENT model — often a stronger or \
+                          differently-biased one — for a second opinion on a hard sub-question; \
+                          pure advice, no tools, no side effects beyond the one model call. \
+                          Surfaced only when a consult target is configured (`[consult] model` in \
+                          .flux/config.toml) — absent otherwise, so the prompt catalog stays \
+                          stable within a session (A-95)."
+                .into(),
+            tools: names(&["consult"]),
+            surface_when: when("consult"),
+        },
+        ToolGroup {
             name: "cognition".into(),
             description: "Pure cognition helpers: needs/gaps, list shaping (compare, dedupe, sort, \
                           top, merge, cite, len, first, last, filter), aggregation & predicates \
@@ -200,6 +212,17 @@ mod tests {
         assert!(git.tools.contains(&"git_worktree_enter".to_string()));
         assert!(git.tools.contains(&"git_worktree_leave".to_string()));
         assert_eq!(git.surface_when[0].signal.as_deref(), Some("git_repo"));
+    }
+
+    /// A-96: `consult` carries the `consult` op and is gated on the `consult` signal — the CLI
+    /// only injects that signal when `[consult] model` is configured, so the op stays off the
+    /// catalog by default (A-95: no unconditioned churn to the prompt prefix).
+    #[test]
+    fn consult_group_carries_the_op_and_is_gated_on_the_consult_signal() {
+        let g = builtin_groups();
+        let consult = g.iter().find(|g| g.name == "consult").unwrap();
+        assert_eq!(consult.tools, vec!["consult".to_string()]);
+        assert_eq!(consult.surface_when[0].signal.as_deref(), Some("consult"));
     }
 
     #[test]

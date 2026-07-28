@@ -64,6 +64,40 @@ All notable changes to this project are documented in this file. The format is b
   path being proven, not the prefix heuristic). New public `flux_events::SessionFilter`
   (`#[non_exhaustive]`, builder-style) and `EventStore::search` — additive; `search`'s doc comment
   names it as the seam the TUI session picker (C-153) should consume instead of raw `list(30)`.
+- **C-162: `[tools] disable` — a plain blocklist for turning ops off.** Tool groups only ever ADD
+  surface when evidence fires; there was no subtractive knob, so "I never want `browser.*` in this
+  repo" meant hand-writing authorization policy for what is really a prompt-size/attack-surface
+  concern. `[tools] disable = ["browser.*", "web.*"]` in `.flux/config.toml` accepts exact op
+  names and `family.*` globs, layered user→project like the permission lists (concat + dedupe).
+  Patterns resolve **once at startup** against the final registry (`ToolRegistry::
+  resolve_disabled`) — never recomputed mid-session, so the advertised set can't churn the prompt
+  prefix (the A-95 lesson). Disabled ops are subtracted from the surfaced set (beating even a
+  force-on group) but **stay registered**, so dispatch refuses them with a specific
+  "disabled by config" error rather than "unknown tool" — the defense-in-depth that stops a cached
+  plan or resumed session from calling one. Deliberately NOT a second permission system: the gate
+  runs before scope/hooks/policy/rules, and the docs state the authorization policy remains the
+  security control and wins on any disagreement. Discoverability without C-128's `flux doctor`:
+  an unmatched pattern is a startup warning naming the entry, a `tools.disabled` evidence
+  observation records what was hidden, and the REPL's `/tools` marks disabled ops inline. Additive
+  API only (`flux_config::{ToolsConfig, tool_disable_matches}`, `flux_runtime::
+  {ResolvedDisabledOps, resolve_disabled, with_disabled_ops}`). Scope note: only the primary
+  interactive path wires it — `flux serve` and `flux app run` build their own executors and don't
+  read it yet, filed as C-183.
+- **A-96: `consult` — a second opinion from a different model, advice only, never effects.** Every
+  escalation path carried authority (a sub-agent is a bounded *actor*); this is a bounded
+  *adviser* with no tools at all. The new `consult` op takes a question plus caller-supplied
+  context, performs exactly one model call, and returns text — declared `Effect::Network` /
+  `AccessKind::Provider` / risk-low, with a test pinning that it carries no filesystem, process,
+  or network authority beyond the provider call, so it can't be an egress channel by construction.
+  Model resolution: op-arg `model` → `[consult] model` → the agent's own spec, all through the
+  same routing as `-m` (subscription providers included). Surfacing is config-gated to keep the
+  prompt stable: the op is advertised only when `[consult] model` is set (a new `consult` tool
+  group on an ambient signal); `[consult] max_calls` caps calls per turn (default 2, `0` = off)
+  via the new `LoopHost::reserve_consult_call` accounting seam. The answer re-enters context
+  through the A-21 containment wrap (`ContextBlock` neutralization applied to a tool result), with
+  a hostile-delimiter test; usage lands on the calling turn as a distinct `consult.usage` kind, so
+  `flux usage` and the turn cost line include it. Model-invoked only for now — a `/consult`
+  user command is a possible follow-up.
 
 ## [0.31.0] - 2026-07-28
 

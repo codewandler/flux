@@ -39,6 +39,7 @@ optional arguments are in `[brackets]`.
 | `append` | `path, content` | Low | Append to a file (creates it and parent dirs if absent); lower-risk than `write` |
 | `read_many` | `paths` | Low | Read several files at once (each section headed `==> path <==`); prefer single `read` when you need to embed a file's text into a later string |
 | `task` | `role, task` | Medium | Delegate to a sub-agent role |
+| `consult` | `question[, context, model]` | Low | Ask a DIFFERENT model for a second opinion — pure advice, no tools (only advertised once `[consult] model` is configured) |
 | `bash` | `command[, timeout_secs]` | High | Run a shell command |
 | `proc.run` | `program[, args, timeout_secs]` | High | Run one argv-only process in the workspace root (no shell, env cleared by `flux-system`) |
 | `file_stat` | `path` | Low | File metadata: size, line count, mtime (replaces `wc -l`, `stat`, `ls -la`) |
@@ -130,6 +131,28 @@ registry.
 
 The model-backed ops carry a `Network` effect and require provider access (an LLM call is network
 egress); the pure ops carry no effect and never pause for approval.
+
+## Second opinion (group `consult`)
+
+`consult` (A-96) is deliberately separate from the cognition pack above: it does not reuse the
+agent's own provider/model, it resolves a **different** one per call — an op-argument
+`provider/model` spec, else the configured `[consult] model` default, else the agent's own model —
+through the same routing `-m`/`--model` uses (subscription providers included). It lives in
+`flux-cognition` too but is registered independently of `CognitionPack`, and is only advertised
+when `[consult] model` is configured (evidence-gated group `consult`, so an unconfigured workspace
+never sees it — the A-95 cache-stability lesson: the surfacing decision is made once at agent
+assembly and never churns mid-session).
+
+| op | kind | signature | description |
+|---|---|---|---|
+| `consult` | model | `question[, context, model]` | Ask another model for a second opinion; returns its answer as text |
+
+It is pure: exactly one model call, no tools, no filesystem/process authority, and no network
+authority beyond that one call (`Network` effect + `Provider` access, same pair as the cognition
+ops above). The reply is untrusted model output from elsewhere, so it returns wrapped in the same
+containment tag the knowledge-injection path uses (A-21), and the call is attributed to the
+calling turn's usage exactly like every other model-stage call, subject to a per-turn call cap
+(`[consult] max_calls`, default 2) so it stays a cheap escape valve rather than an unbounded spend.
 
 ## Orchestration ops (the `flux-app` host only)
 

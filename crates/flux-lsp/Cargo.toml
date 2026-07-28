@@ -20,6 +20,7 @@ name = "flux-lsp"
 path = "src/main.rs"
 
 [dependencies]
+flux-core.workspace = true
 flux-lang.workspace = true
 flux-flow.workspace = true
 flux-tools.workspace = true

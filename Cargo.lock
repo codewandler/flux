@@ -862,6 +862,7 @@ dependencies = [
  "codewandler-flux-spec",
  "codewandler-flux-system",
  "futures",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
@@ -921,6 +922,7 @@ dependencies = [
  "codewandler-flux-evidence",
  "codewandler-flux-lang",
  "codewandler-flux-pg",
+ "codewandler-flux-secret",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2360,6 +2362,7 @@ version = "0.31.0"
 dependencies = [
  "codewandler-flux-capabilities",
  "codewandler-flux-cognition",
+ "codewandler-flux-core",
  "codewandler-flux-flow",
  "codewandler-flux-lang",
  "codewandler-flux-provider",

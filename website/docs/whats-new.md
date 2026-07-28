@@ -19,6 +19,17 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   path, and `--since`/`--until` narrow by date — so resuming, replaying, or forking past work no
   longer starts with scrolling a newest-first list for the right id. Secrets stay protected:
   redacted values never appear in results and cannot be used as search terms.
+- **Turn tools off per repo.** A new `[tools]` section in `.flux/config.toml` takes a plain
+  blocklist — exact names or `family.*` patterns like `disable = ["browser.*", "web.*"]` — for
+  ops a repo simply never uses. Disabled ops disappear from what the model sees and are refused
+  if anything tries to call them anyway. A pattern that matches nothing warns at startup instead
+  of silently doing nothing, and `/tools` in the REPL marks what's off. This trims prompt size
+  and attack surface; your authorization policy remains the security control.
+- **Ask another model for a second opinion.** Configure `[consult] model` and the agent gains a
+  `consult` op: it can put a hard sub-question to a different (typically stronger) model and get
+  back advice — never actions. The consulted model has no tools, no file or network access, and
+  its answer is treated as untrusted content; calls are capped per turn and show up in your usage
+  and cost figures like any other model call.
 
 ### Fixed
 

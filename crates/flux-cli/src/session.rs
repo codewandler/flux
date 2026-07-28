@@ -888,7 +888,21 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                 "tools" => {
                     let mut names = agent.executor.registry().names();
                     names.sort();
-                    eprintln!("tools: {}", names.join(", "));
+                    // C-162: `[tools] disable` ops stay registered (dispatch still refuses them),
+                    // so mark them here rather than hiding them — a mysteriously-missing op is one
+                    // command from an explanation instead of a silent gap in this listing.
+                    let disabled = agent.executor.disabled_ops();
+                    let rendered: Vec<String> = names
+                        .into_iter()
+                        .map(|name| {
+                            if disabled.contains(&name) {
+                                format!("{name} (disabled by config)")
+                            } else {
+                                name
+                            }
+                        })
+                        .collect();
+                    eprintln!("tools: {}", rendered.join(", "));
                 }
                 "evidence" => {
                     // The audit trail the loop and the dispatcher have recorded this session: tool

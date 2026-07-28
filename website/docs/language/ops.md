@@ -181,6 +181,22 @@ Model-backed:
 These produce and consume the [prelude artifact types](./types-and-effects.md) — `Claim`,
 `Evidence`, `Verdict`, `Answer`, and friends — so multi-step reasoning pipelines stay typed.
 
+## Second opinion
+
+| op | arguments | risk | description |
+|---|---|---|---|
+| `consult` | `question[, context, model]` | low | Ask a DIFFERENT model for a second opinion — pure advice, no tools |
+
+`consult` is the one op that deliberately calls a model **other than** the agent's own — typically
+a stronger or differently-biased one — for a hard sub-question. It takes a question plus
+caller-supplied context and an optional `provider/model` override, makes exactly one model call,
+and returns the answer as text. It carries no filesystem, process, or network authority beyond
+that single call, so it adds no new authority to the safety envelope; the reply enters context as
+untrusted content. Only surfaced when an operator has configured a default target
+(`[consult] model` in `.flux/config.toml`) — see [configuration](../reference/config.md) — so an
+unconfigured workspace never sees a churn-prone catalog entry. A per-turn call cap
+(`[consult] max_calls`) keeps it a cheap escape valve, not a council of models.
+
 ## App orchestration ops
 
 Registered **only** by the `flux app run` host for [multi-agent programs](../agent/programs.md)

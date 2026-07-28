@@ -12,7 +12,8 @@ The broad precedence is CLI flags > project config > user config > built-in defa
 intentional rather than simple replacement:
 
 - scalar values use the project value when present;
-- permission lists, policy grants, endpoint credential grants, and private-network host lists merge;
+- permission lists, policy grants, endpoint credential grants, private-network host lists, and the
+  `[tools] disable` list merge;
 - custom skill directories use project-before-user order because the first skill name wins;
 - `enable_shell` and `workspace.allow_all` are enabled if either layer enables them.
 
@@ -51,6 +52,13 @@ model_invoked = false
 [workspace]
 add_dirs = ["../shared-docs"]
 allow_all = false
+
+[tools]
+disable = ["browser.*", "web.*"]
+
+[consult]
+model = "openrouter/anthropic/claude-opus-4.6"
+max_calls = 2
 
 [endpoint]
 cross_plugin_credentials = ["sql:kubernetes"]
@@ -208,6 +216,53 @@ context on demand via `skill.load` — see
 to the workspace. It mirrors repeatable `--add-dir`. `allow_all = true` mirrors
 `--allow-all-paths`, removes read and write confinement, and prints a warning—use it only when full
 host access is intentional.
+
+## Tool surface (`[tools] disable`)
+
+`[tools] disable` is a plain blocklist for turning ops off entirely — the subtractive counterpart to
+evidence-gated tool groups (which only ever *add* surface as a workspace signal fires). Use it to say
+"this repo never uses these ops," trimming prompt size and the operations a model could be tricked
+into trying:
+
+```toml
+[tools]
+disable = ["browser.*", "web.*", "bash"]
+```
+
+Each entry is either an exact op name (`"bash"`) or a `family.*` glob matching every op under that
+dotted prefix (`"browser.*"` matches `browser.navigate`, `browser.click`, …; a bare `"browser"` with
+no `.*` is an exact-name match only). An entry matching no known op prints a startup warning naming
+it, rather than silently doing nothing — a likely typo or a stale entry naming a retired op. `/tools`
+in the REPL lists every registered op and marks the disabled ones, so a mysteriously-missing op is
+one command from an explanation.
+
+**This is surface-only and defense-in-depth, not a security boundary.** A disabled op is refused if
+dispatched directly too — so a cached plan or a resumed session can't call it either — but the
+*authorization policy* (`[[policy.grants]]`, permission rules, approval) remains the actual security
+control. If the two ever disagree, the policy wins: `[tools] disable` narrows what is offered and
+dispatchable, never what an already-granted call may do.
+
+## Second opinion (`[consult]`)
+
+`[consult] model` names the default target the `consult` op — a second-opinion adviser that asks a
+DIFFERENT model for advice on a hard sub-question, never an action — falls back to when a call
+doesn't name its own `provider/model` override. Its mere presence is what surfaces `consult` into
+the model-facing catalog at all: an unconfigured workspace never advertises it, so the prompt
+prefix can't churn on this setting mid-session.
+
+```toml
+[consult]
+model = "openrouter/anthropic/claude-opus-4.6"
+max_calls = 2
+```
+
+- `model` — the default `provider/model` spec, resolved through the same routing `-m`/`--model`
+  uses (subscription providers included). Absent means the op isn't registered at all.
+- `max_calls` — per-turn call cap (default `2`) — a cheap second opinion, not a council of models.
+  `0` refuses every call without un-surfacing the op.
+
+See [ops reference](../language/ops.md#second-opinion) for the op's full contract (purity,
+containment, usage attribution).
 
 ## OS-level process sandbox
 

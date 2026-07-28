@@ -975,19 +975,49 @@ pub(super) async fn resolve_agent_loop(
 
 /// Register the model-facing operation packs onto the top-level registry, in the order that lets the
 /// name-collision checks fire deterministically: the cognition pack (when a sibling provider was
-/// built), then eval/self-improvement, the reflect stages, flow discovery/run, and render. These are
-/// registered on the top-level registry ONLY — never on a worker sub-agent's scoped toolset, so a
-/// child can't run eval/git ops or the model-facing cognition ops.
+/// built), the second-opinion `consult` op (when a target is configured), then eval/self-improvement,
+/// the reflect stages, flow discovery/run, and render. These are registered on the top-level registry
+/// ONLY — never on a worker sub-agent's scoped toolset, so a child can't run eval/git ops or the
+/// model-facing cognition/consult ops.
+#[allow(clippy::too_many_arguments)]
 fn register_tool_packs(
     registry: &mut ToolRegistry,
     cog_provider: Option<Box<dyn Provider>>,
     model: &str,
     flags: &AgentFlags,
+    cfg: &flux_config::Config,
+    canonical_model_spec: &str,
 ) -> Result<()> {
     if let Some(cog_provider) = cog_provider {
         flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.to_string())
             .with_reasoning(flags.think, flags.effort.map(Into::into))
             .try_register_from("flux-cli cognition pack", registry)?;
+    }
+    // A-96: `consult` — ask a DIFFERENT model for a second opinion; pure advice, no tools. Only
+    // registered when an operator has named a default target (`[consult] model`): the op's group
+    // gates its ADVERTISEMENT on the same setting (see the `consult` ambient signal above), but
+    // registering it at all only when opted-in keeps an unconfigured workspace from carrying a
+    // dormant model-invoking op in its catalog machinery for no reason. `resolve_cli_provider` is
+    // reused verbatim — the exact provider/model routing `-m`/`--model` uses, subscription
+    // providers included — resolved fresh (eager) on every call, never cached, since a consult
+    // reply is by definition a cold prompt for whichever model answers it.
+    if let Some(consult_target) = cfg.consult.model.clone() {
+        let factory: flux_cognition::ConsultFactory = Arc::new(move |spec: &str| {
+            let resolved = resolve_cli_provider(spec, true)
+                .map_err(|e| flux_core::Error::Other(e.to_string()))?;
+            Ok((resolved.provider, resolved.model))
+        });
+        let max_calls = cfg
+            .consult
+            .max_calls
+            .unwrap_or(flux_cognition::DEFAULT_CONSULT_MAX_CALLS);
+        flux_cognition::ConsultTool::new(
+            factory,
+            Some(consult_target),
+            canonical_model_spec.to_string(),
+            max_calls,
+        )
+        .try_register(registry)?;
     }
     // Eval / self-improvement ops (the ones the improve flows orchestrate).
     flux_eval::try_register_eval_ops(registry)?;
@@ -1272,7 +1302,14 @@ pub(super) async fn build_agent_with(
                 None
             }
         };
-    register_tool_packs(&mut registry, cog_provider, &model, flags)?;
+    register_tool_packs(
+        &mut registry,
+        cog_provider,
+        &model,
+        flags,
+        &cfg,
+        &canonical_spec,
+    )?;
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
@@ -1346,7 +1383,13 @@ pub(super) async fn build_agent_with(
         registry.try_register_from(source, tool)?;
     }
     let plugin_groups = integrations.groups;
-    let ambient_signals = integrations.ambient_signals;
+    let mut ambient_signals = integrations.ambient_signals;
+    // A-96: the `consult` op's group surfaces only when a target is configured, exactly like the
+    // `endpoint` ambient signal above — computed once here from config, never re-probed per turn,
+    // so surfacing can't churn the prompt prefix mid-session (A-95).
+    if cfg.consult.model.is_some() {
+        ambient_signals.push("consult".to_string());
+    }
 
     // Config-authored model stages are ordinary typed operations. Register them only after every
     // built-in/plugin operation is known so name collisions and missing gather-tool wiring fail at
@@ -1418,12 +1461,37 @@ pub(super) async fn build_agent_with(
     )
     .with_workspace(session_workspace)
     .into_executor();
+    // C-162: resolve `[tools] disable` against the now-final registry (exact op names or
+    // `family.*` globs) and install it on the executor — surface-only + defense-in-depth (the
+    // engine narrows the per-turn advertised set by it, and `Executor::gate` separately refuses a
+    // dispatch that names one). Resolved exactly once here, before any turn runs, so the set can
+    // never churn mid-session (A-95). An entry matching no known op is a loud startup warning, not
+    // a silent no-op — it's very likely a typo or a stale entry naming a retired op.
+    let disabled_tools = executor.registry().resolve_disabled(&cfg.tools.disable);
+    for pattern in &disabled_tools.unmatched {
+        eprintln!(
+            "{}",
+            style::dim(&format!(
+                "(warning: [tools] disable entry `{pattern}` matches no known op)"
+            ))
+        );
+    }
+    let executor = executor.with_disabled_ops(disabled_tools.disabled);
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(
         "toolchain",
         flux_evidence::Phase::Startup,
         serde_json::json!({ "tools": executor.registry().names() }),
     ));
+    if !executor.disabled_ops().is_empty() {
+        let mut disabled: Vec<&str> = executor.disabled_ops().iter().map(String::as_str).collect();
+        disabled.sort_unstable();
+        executor.observe(flux_evidence::Observation::new(
+            "tools.disabled",
+            flux_evidence::Phase::Startup,
+            serde_json::json!({ "ops": disabled }),
+        ));
+    }
 
     // Evidence-gated tool groups: built-ins (git + language scaffolds) + the eval group, with
     // `.flux/groups.toml` overrides merged on top. The engine re-probes signals each turn and

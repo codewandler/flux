@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use flux_cognition::CognitionPack;
+use flux_cognition::{CognitionPack, ConsultTool, DEFAULT_CONSULT_MAX_CALLS};
 use flux_core::{Chunk, StopReason};
 use flux_provider::{ChunkStream, NullProvider, Provider, Request};
 use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
@@ -163,6 +163,17 @@ fn operations_reference_covers_the_registered_public_catalog() {
     flux_tools::register_builtins(&mut registry);
     flux_web::register_web(&mut registry, &flux_web::WebOptions::default());
     CognitionPack::new(Arc::new(NullProvider), "mock").register(&mut registry);
+    // A-96: `consult` is registered independently of `CognitionPack` (a different provider per
+    // call, not one fixed at pack construction); the factory is never invoked by this contract
+    // check, only its registered name/spec matter here.
+    ConsultTool::new(
+        Arc::new(|_spec: &str| Err(flux_core::Error::Other("unused in this test".into()))),
+        None,
+        "mock",
+        DEFAULT_CONSULT_MAX_CALLS,
+    )
+    .try_register(&mut registry)
+    .unwrap();
 
     let docs = read("website/docs/language/ops.md");
     let mut names = registry.names();

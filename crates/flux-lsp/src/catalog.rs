@@ -34,6 +34,21 @@ pub fn authoring_registry() -> flux_runtime::ToolRegistry {
     flux_cognition::CognitionPack::new(Arc::new(flux_provider::NullProvider), "flux-lsp")
         .try_register_from("flux-lsp cognition authoring catalog", &mut reg)
         .expect("flux-lsp cognition authoring catalog registration failed");
+    // A-96: `consult` is registered independently of `CognitionPack` (it resolves a DIFFERENT
+    // provider/model per call rather than one fixed at construction) — its factory is never
+    // invoked here, only its spec is read for authoring diagnostics/completion/hover.
+    flux_cognition::ConsultTool::new(
+        Arc::new(|_spec: &str| {
+            Err(flux_core::Error::Other(
+                "flux-lsp authoring catalog never executes ops".into(),
+            ))
+        }),
+        None,
+        "flux-lsp",
+        flux_cognition::DEFAULT_CONSULT_MAX_CALLS,
+    )
+    .try_register(&mut reg)
+    .expect("flux-lsp consult authoring catalog registration failed");
     flux_capabilities::try_register_datasource_ops(
         &mut reg,
         Arc::new(flux_capabilities::MemoryBackend::new()),

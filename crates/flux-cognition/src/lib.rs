@@ -34,6 +34,11 @@ use flux_provider::{Effort, Provider, Request};
 use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Idempotency, Risk, ToolSpec};
 
+mod consult;
+pub use consult::{
+    ConsultFactory, ConsultTool, CONSULT_USAGE_OBSERVATION_KIND, DEFAULT_CONSULT_MAX_CALLS,
+};
+
 /// Token budget for a single cognition completion. Generous enough for a synthesized answer or an
 /// extracted array, bounded so a runaway generation can't burn the whole context.
 const MAX_TOKENS: u32 = 4096;
