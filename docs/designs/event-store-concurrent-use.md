@@ -128,7 +128,15 @@ never a second write path.
    on one file store, asserting contiguous `stream_seq` and zero lost writes.
 3. **C-126 — WAL checkpoint hygiene:** long-lived daemons keep the WAL from checkpointing while
    readers are pinned; a periodic `PRAGMA wal_checkpoint(TRUNCATE)` in the serve loop if
-   `events.db-wal` growth is ever observed.
+   `events.db-wal` growth is ever observed. **Confirmed, not hypothetical (2026-07-29):** a raw
+   connection holding an open read transaction reliably blocks reclaim of everything after its
+   snapshot — writes through the store keep growing `events.db-wal` (measured >200KB in a small
+   test) with no shrink until that reader releases, even though nothing errors in the meantime.
+   Shipped unconditionally (not gated behind observing growth in the wild) as
+   `EventStore::checkpoint` (SQLite: a dedicated zero-busy-timeout connection so a contended
+   attempt never blocks or errors; Postgres: no-op), invoked on a 5-minute tick from the built-in
+   coding agent's `flux app run --serve` daemon only — the one topology that shares the
+   persistent, file-backed store with occasional CLI turns (R1).
 
 ---
 

@@ -1,5 +1,12 @@
 use super::*;
 
+/// C-126: how often the built-in coding agent's `flux app run --serve` daemon nudges
+/// [`flux_events::EventStore::checkpoint`] — see the wiring in [`run_app`]. Periodic rather than
+/// true idle-detection: simpler, and a `TRUNCATE` checkpoint attempt is already a non-blocking,
+/// non-erroring no-op when there is nothing safe to reclaim (busy → skip), so ticking during
+/// active traffic costs nothing beyond the attempt itself.
+const WAL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// `flux run <app.flux>` — load and run a multi-agent flux **Program** through the `flux-app` host
 /// (event bus + triggers + journeys). A bare single-flow file is accepted too. The provider is
 /// best-effort: a program built only from pure ops runs without credentials; model-backed ops need a
@@ -318,7 +325,31 @@ pub(super) async fn run_app(
         // real-binary `tools_disable_unmatched_entry_warns_at_startup` in flux-cli's mock_smoke.rs —
         // that test drives `flux run`, which shares this exact function).
         let (agent, _session_id, _spec, _spawner) = build_agent(flags).await?;
-        return flux_server::serve(&addr, agent, auth).await;
+        // C-126: this is the ONE `flux app run --serve` shape that shares the persistent,
+        // file-backed `~/.flux/events.db` with occasional CLI turns on the same host (design doc
+        // R1's "daemon + occasional CLI turns" topology, C-25's scenario) — a long-lived process
+        // that always holds read snapshots can defer SQLite's own WAL checkpoint indefinitely
+        // (design doc `docs/designs/event-store-concurrent-use.md` §4.3), growing `events.db-wal`
+        // without bound. Program-mode `app run` uses an in-memory `app_events` store (see
+        // `run_app` below), so it has no sidecar to bound and gets no periodic task. The
+        // interactive CLI is a short-lived process that already checkpoints on close — unaffected.
+        let checkpoint_store = agent.events.clone();
+        let checkpoint_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(WAL_CHECKPOINT_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                // Never a turn-visible failure (R6/C-126): `checkpoint` itself already turns a
+                // busy contended attempt into `Ok(())`, so an `Err` here means something ELSE
+                // (a real I/O error) — worth a trace, never worth killing the daemon over.
+                if let Err(e) = checkpoint_store.checkpoint() {
+                    eprintln!("(WAL checkpoint attempt failed: {e})");
+                }
+            }
+        });
+        let result = flux_server::serve(&addr, agent, auth).await;
+        checkpoint_task.abort();
+        return result;
     };
 
     // Program mode runs the program's OWN agents: the built-in coding agent's session/turn flags

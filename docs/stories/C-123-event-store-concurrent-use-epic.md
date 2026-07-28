@@ -2,7 +2,7 @@
 id: C-123
 title: "Event-store concurrent use — visibility, proof, and hygiene (epic)"
 pillar: Core
-status: backlog
+status: done
 epic: event-store-concurrent-use
 design: docs/designs/event-store-concurrent-use.md
 note: "EPIC — the concurrency envelope (WAL + busy_timeout + BEGIN IMMEDIATE + UNIQUE backstops, PG advisory locks) is built and tested; this funds contention visibility, a multi-process stress proof, and WAL checkpoint hygiene"
@@ -28,6 +28,17 @@ documented in [docs/designs/event-store-concurrent-use.md](../designs/event-stor
 ## Progress
 - 2026-07-28 epic filed from the `.flux/plans/event-store-concurrent-use.md` concurrency review;
   guidance promoted to `docs/designs/event-store-concurrent-use.md`.
+- 2026-07-28 C-124 shipped in v0.32.0: the one `begin_write` seam times its wait and warns past a
+  threshold, so contention is observable before it becomes a 5s failure.
+- 2026-07-29 **epic CLOSED** — C-125 and C-126 landed in v0.33.0, all three stories delivered.
+  C-125 replaces the two-connection in-process test with real OS processes and, more usefully,
+  proves it guards something: reverting C-25's `BEGIN IMMEDIATE` makes it fail reliably. C-126
+  verified the premise before building the fix — a pinned reader really does hold `events.db-wal`
+  growth unreclaimed — then bounded it with a `wal_checkpoint(TRUNCATE)` hook on a dedicated
+  zero-busy-timeout connection, swallowing `SQLITE_BUSY` so a checkpoint can never surface as a
+  turn-visible failure. The design doc's R1–R7 rules all still hold: no side-channel state, no
+  second write path, append errors stayed loud, and R6's "schedule off-peak like prunes" is
+  honored by the five-minute serve-loop cadence.
 
 ## Notes
 - Prior art this builds on: C-25 (busy_timeout), C-24 (watermark-after-success), C-87 (idempotent

@@ -289,6 +289,13 @@ trait EventBackend: Send + Sync {
     /// events instead of showing the moment of the copy (`created_at` would otherwise be "now"
     /// while `updated_at` trails behind at the events' true, older timestamps).
     fn copy_session_atomic(&self, info: &SessionInfo, events: Vec<CopyEvent>) -> Result<String>;
+
+    /// C-126: bound `events.db-wal` growth on a long-lived process. A default no-op — only the
+    /// SQLite backend has a WAL sidecar to checkpoint; Postgres has no file-level equivalent, so
+    /// it inherits this arm unchanged rather than needing its own empty override.
+    fn checkpoint(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The concrete storage backend behind an [`EventStore`]. The default build carries only the
@@ -638,6 +645,23 @@ impl EventStore {
     /// actually cover the whole store.
     pub fn prune_adhoc_older_than(&self, cutoff_ms: i64) -> Result<usize> {
         self.backend().prune_adhoc_older_than(cutoff_ms)
+    }
+
+    /// C-126: bound `events.db-wal` growth on a long-lived process (the SQLite backend's WAL
+    /// sidecar; Postgres has no file-level equivalent and no-ops). Under WAL mode, checkpointing
+    /// back into the main database file needs a moment with no pinned readers; a long-lived
+    /// `flux app run --serve` daemon that always holds read snapshots can defer checkpoints
+    /// indefinitely (design doc `docs/designs/event-store-concurrent-use.md` §4.3), so the serve
+    /// loop calls this on an idle/periodic cadence rather than relying on SQLite's own
+    /// autocheckpoint (which only fires opportunistically, at a write commit).
+    ///
+    /// **Never blocks or errors a concurrent writer/reader** — this is a `TRUNCATE` checkpoint
+    /// (R6: it competes for the write lock like a prune, so schedule off-peak) attempted on a
+    /// dedicated connection with a zero busy-timeout: contention is reported back immediately
+    /// rather than waited out, and is treated as "nothing to reclaim this tick" — `Ok(())`, never
+    /// a turn-visible failure. Call again on the next tick; nothing is lost by skipping one.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.backend().checkpoint()
     }
 
     // --- append -------------------------------------------------------------
@@ -3222,6 +3246,130 @@ mod tests {
                 captured.is_empty(),
                 "an uncontended append must emit no contention trace, got: {captured:?}"
             );
+        }
+
+        /// C-126 (failing-first): the design doc §4.3 premise — a long-lived process that always
+        /// holds a read snapshot open (a streamed A2A subscription, a held session cursor, …) can
+        /// defer WAL checkpointing indefinitely, so `events.db-wal` keeps growing. This proves
+        /// both halves of the story in one scenario: while the reader stays pinned, the
+        /// `checkpoint` hook must neither block nor error (it has nothing safe to reclaim, so it
+        /// silently skips); once the reader releases, the very next call actually shrinks the
+        /// sidecar back down.
+        #[test]
+        fn checkpoint_hook_shrinks_the_wal_once_a_pinned_reader_releases_it() {
+            use std::time::Duration;
+            let path = std::env::temp_dir().join(format!(
+                "flux-events-c126-checkpoint-{}-{:?}.db",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let wal_path = format!("{}-wal", path.display());
+
+            let store = EventStore::open(&path).unwrap();
+            let sid = store.create_session("m").unwrap();
+
+            // Pin a read snapshot on a SEPARATE connection, exactly like a long-lived reader
+            // would: `BEGIN` alone takes no lock, an actual read inside it is what pins the WAL
+            // snapshot SQLite's own autocheckpoint (and our hook) must not discard.
+            let reader = rusqlite::Connection::open(&path).unwrap();
+            reader.execute_batch("BEGIN").unwrap();
+            let _pin: i64 = reader
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+
+            // Grow the sidecar visibly while the reader stays pinned.
+            let big_text = "x".repeat(4096);
+            for i in 0..200 {
+                store
+                    .record_message(&sid, &Message::user_text(format!("{i}:{big_text}")))
+                    .unwrap();
+            }
+            let grown = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                grown > 200_000,
+                "WAL should have grown past ~200KB with the reader pinned, got {grown} bytes"
+            );
+
+            // The hook must not block or error while the reader is STILL pinned.
+            let start = std::time::Instant::now();
+            store
+                .checkpoint()
+                .expect("checkpoint must never error under contention");
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "checkpoint must not block on a pinned reader, took {:?}",
+                start.elapsed()
+            );
+            let still_pinned = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                still_pinned >= grown,
+                "a busy checkpoint must not discard anything the pinned reader still needs"
+            );
+
+            // Release the pin — now the hook can actually reclaim + truncate the sidecar.
+            reader.execute_batch("COMMIT").unwrap();
+            drop(reader);
+            store.checkpoint().unwrap();
+            let shrunk = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                shrunk < grown / 10,
+                "checkpoint should shrink the WAL once nothing pins it: {shrunk} vs {grown}"
+            );
+
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&wal_path);
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        }
+
+        /// C-126's other contention case: an ACTIVE WRITER (not just a pinned reader) holding the
+        /// WAL write lock. `checkpoint` must return immediately without error — never wait behind
+        /// (or itself cause) the 5s busy_timeout ordinary appends use.
+        #[test]
+        fn checkpoint_hook_never_blocks_or_errors_under_writer_contention() {
+            use std::time::Duration;
+            let path = std::env::temp_dir().join(format!(
+                "flux-events-c126-writer-contention-{}-{:?}.db",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+
+            let store = EventStore::open(&path).unwrap();
+            store.create_session("m").unwrap();
+
+            // Hold the WAL write lock from a separate connection, as a concurrent writer process
+            // would (mirrors `concurrent_writers_wait_on_busy_timeout_instead_of_erroring` above).
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+            let start = std::time::Instant::now();
+            let result = store.checkpoint();
+            let elapsed = start.elapsed();
+
+            writer.execute_batch("COMMIT").unwrap();
+
+            assert!(
+                result.is_ok(),
+                "a checkpoint contended by an active writer must not error: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "checkpoint must not wait out the writer's lock, took {elapsed:?}"
+            );
+
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        }
+
+        /// The interactive-CLI-unchanged half of C-126's Acceptance: [`EventStore::in_memory`] has
+        /// no WAL sidecar, so `checkpoint` is a plain no-op — never an error, never a panic.
+        #[test]
+        fn checkpoint_hook_is_a_harmless_noop_for_an_in_memory_store() {
+            let store = EventStore::in_memory().unwrap();
+            store.create_session("m").unwrap();
+            store.checkpoint().unwrap();
         }
     }
 

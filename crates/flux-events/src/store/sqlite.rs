@@ -273,6 +273,12 @@ pub(crate) struct SqliteEvents {
     /// tests — overridable only through the `#[cfg(test)]` constructor below, so the contention
     /// trace can be proven without holding the write lock for a full second.
     contention_warn_threshold: Duration,
+    /// C-126: a second connection to the SAME file, dedicated to [`Self::checkpoint`], with a
+    /// zero busy-timeout — contention is reported back immediately instead of waited out, so a
+    /// periodic checkpoint attempt can never block behind (or hold up) the shared `conn` above,
+    /// which every ordinary read/write uses. `None` for an in-memory store: there is no WAL
+    /// sidecar file to reclaim.
+    checkpoint_conn: Option<Mutex<Connection>>,
 }
 
 impl SqliteEvents {
@@ -295,6 +301,7 @@ impl SqliteEvents {
     }
 
     fn open_with_threshold(path: impl AsRef<Path>, threshold: Duration) -> Result<Self> {
+        let path = path.as_ref();
         let conn = Connection::open(path).map_err(map_sql)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
@@ -311,7 +318,17 @@ impl SqliteEvents {
         // per commit — so single-process throughput does not regress.
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(map_sql)?;
-        Self::init(conn, threshold)
+
+        // C-126: the dedicated checkpoint connection — see the `checkpoint_conn` field doc. A
+        // zero busy-timeout means a contended `PRAGMA wal_checkpoint` attempt returns `SQLITE_BUSY`
+        // at once instead of waiting, so `checkpoint` (called on a periodic serve-loop tick) can
+        // never stall behind a writer or a pinned reader.
+        let checkpoint_conn = Connection::open(path).map_err(map_sql)?;
+        checkpoint_conn
+            .busy_timeout(Duration::ZERO)
+            .map_err(map_sql)?;
+
+        Self::init(conn, threshold, Some(checkpoint_conn))
     }
 
     /// An in-memory store (for tests and the SDK's ephemeral sessions).
@@ -319,10 +336,15 @@ impl SqliteEvents {
         Self::init(
             Connection::open_in_memory().map_err(map_sql)?,
             CONTENTION_WARN_THRESHOLD,
+            None,
         )
     }
 
-    fn init(conn: Connection, contention_warn_threshold: Duration) -> Result<Self> {
+    fn init(
+        conn: Connection,
+        contention_warn_threshold: Duration,
+        checkpoint_conn: Option<Connection>,
+    ) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                  global_seq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,6 +376,7 @@ impl SqliteEvents {
         Ok(Self {
             conn: Mutex::new(conn),
             contention_warn_threshold,
+            checkpoint_conn: checkpoint_conn.map(Mutex::new),
         })
     }
 }
@@ -880,6 +903,29 @@ impl EventBackend for SqliteEvents {
             .map_err(map_sql)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(map_sql)
+    }
+
+    /// C-126: see the field doc on [`SqliteEvents::checkpoint_conn`] and the trait doc on
+    /// [`EventBackend::checkpoint`]. `TRUNCATE` mode is what actually shrinks the sidecar file
+    /// (`PASSIVE`/`FULL`/`RESTART` checkpoint frames back into the main db but never truncate);
+    /// on the zero-busy-timeout dedicated connection, a `SQLITE_BUSY` here means some other
+    /// connection currently holds a lock checkpointing needs (an in-flight writer, or a reader
+    /// still pinning frames the truncate would discard) — treated as "nothing to reclaim this
+    /// tick," never an error the caller has to handle.
+    fn checkpoint(&self) -> Result<()> {
+        let Some(checkpoint_conn) = &self.checkpoint_conn else {
+            return Ok(()); // in-memory: no WAL sidecar to reclaim
+        };
+        let conn = checkpoint_conn.lock().unwrap();
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(())) {
+            Ok(()) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(map_sql(e)),
+        }
     }
 
     fn streams_with_correlation(&self) -> Result<Vec<(i64, Option<String>)>> {
