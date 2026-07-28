@@ -84,6 +84,34 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > it carries pub-surface breaks from C-97/C-103/C-104 and the D-192 flux-skill removals). See
 > [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — 🔜 **PLANNED 2026-07-28 (C-133…C-140 + A-95, nine stories)**
+
+A-03 made the planner *prefix* cache-stable and live-verified a 99% cross-process hit. That fix
+still works — and it is also the entire extent of prompt caching in flux. Reading the request path
+end to end turned up the gap: **no cache breakpoint is ever placed in `messages`**. Every
+`cache_control` is stamped in the `system` array, and `ContentBlock` has no field that could carry
+one, so the cacheable prefix stops where the system prompt ends and the whole growing transcript is
+re-priced at full input rate every round. Four aggravators sit on top: tool-set churn mid-loop
+cold-writes the prefix (tools render *before* system, so one `capability_signal` invalidates
+everything), only the 5-minute TTL is ever used (an interactive pause outlives the cache), the
+`% hit` we render is the turn's *last* round rather than the turn, and subscription-claude already
+sits at Anthropic's hard maximum of four breakpoints so the headline fix cannot land until the cap
+becomes a union budget. On the codex side the Responses path sends no cache-routing key and hoists
+the deliberately-volatile trailing system segment into the front of `instructions` — the A-03 layout
+helps Anthropic and actively hurts codex. A first measurement (`flux usage`, 2026-07-28) bounded the
+problem and corrected the premise: 32% cached across 813 calls, with `claude/*` at 35% and
+`codex/*` at 29% — claude is mid-pack, not the outlier — while `openrouter/anthropic/claude-opus-4.6`
+sits at literally 0% for 2.1M tokens and $11.10 (the `openrouter` chat path still pins
+`prompt_caching: false`; C-35 covered `openrouter-anthropic` only). Seeing it clearly comes first
+(C-133 turn-level accounting + trace fields + a repeatable harness, C-139 a TUI header that splits
+the cache tiers and stops summing last rounds, C-140 an in-TUI `/usage` overlay showing per-round
+hit rate live), then claude (C-134 tail breakpoint, C-135 1h TTL on the stable prefix, A-95 freeze
+the tool set per turn), then codex (C-136, C-137), then close-out (C-138). Done means every fix
+carries a live before/after number from the same harness, a regression test pins where breakpoints
+land, and the cache-layout invariant is documented so the next segment change can't halve the cache
+in silence. Design:
+[designs/llm-cache-review.md](designs/llm-cache-review.md).
+
 ### TUI polish — 5 UX + 5 UI (epic) — ✅ **IMPLEMENTED 2026-07-28 (wave 1 C-102…C-110 + wave 2 C-111…C-116 done, unreleased)**
 
 The TUI became a daily driver (A-65) and just gained its boot splash + spinners (C-101); what
