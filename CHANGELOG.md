@@ -35,7 +35,10 @@ All notable changes to this project are documented in this file. The format is b
   - **Codex prefix caching (C-136/C-137).** `prompt_cache_key` (derived per session, hashed) so
     successive rounds route to the same cache shard — verified accepted by the ChatGPT backend — and
     the per-turn system segment no longer flattens into `instructions` at the front of the cacheable
-    prefix, where it invalidated everything behind it.
+    prefix, where it invalidated everything behind it. Measured against
+    `FLUX_RESPONSES_CACHE=off`: a long multi-round codex turn goes from **0% to ~6%** cached in both
+    arm orders; single-round turns are unchanged. Improved, not solved — the Responses wire offers no
+    explicit breakpoints to place, only an automatic prefix match to feed.
   - **A no-op capability signal is now a no-op (A-95).** Re-signalling a family the turn already
     held still rewrote the intent declaration, churning the prompt prefix for zero capability gain.
   - `bench/cache-ab.sh` A/Bs the tail breakpoint against the kill switch, and the model trace reports

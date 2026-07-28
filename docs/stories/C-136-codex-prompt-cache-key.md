@@ -46,6 +46,12 @@ the second-highest-traffic provider and currently gets no deliberate cache help 
 - Derived from `RequestTrace.session_id` as a SHA-256 digest (`flux-<16 hex>`), not the raw id: the
   trace is documented host-owned and never-on-the-wire, so this narrow exception sends an opaque
   value. No trace ⇒ field omitted rather than a constant key shared by every caller.
+- **Measured** (added `FLUX_RESPONSES_CACHE=off` as the control arm, and taught `bench/cache-ab.sh` to
+  pick the kill switch from the provider): long multi-round turns go **0% → ~6%** cached, consistently
+  in both arm orders; single-round turns are **neutral** (four matched pairs, identical ~19% means,
+  variance from shard warmth). One pair looked like a regression and inverted on the repeat — tested,
+  not assumed. Cost is not comparable on the long pairs: codex took 13–33 steps for the same prompt.
+  Numbers in the design doc.
 - **Live-verified on the ChatGPT backend**, which was the open risk — it rejects `max_output_tokens`
   and the sampling params, so an unknown parameter could have 400'd every codex request. A
   `codex/gpt-5.6-sol` turn carrying the key returned normally.

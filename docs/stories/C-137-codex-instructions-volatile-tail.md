@@ -46,9 +46,11 @@ A-03 layout should help every provider, not help Anthropic and hurt codex.
 - `Request::system_text()` left alone — it is the documented fallback for codecs with no breakpoint
   notion and has other callers.
 - Unsegmented path asserted byte-identical.
-- Not separately measured against a codex baseline: A-95's no-op-signal fix removes the most frequent
-  trigger for the trailing segment changing mid-turn, so the remaining delta is small. The body-level
-  behaviour is pinned by test.
+- **Measured with C-136** (shared `FLUX_RESPONSES_CACHE=off` control arm): a long multi-round codex
+  turn goes from **0% to ~6%** cached, in both arm orders. This story is the likely driver — with the
+  per-turn segment at the front of `instructions`, the prefix changes whenever the intent declaration
+  does and OpenAI's automatic prefix match never lands. The two changes were measured together, so
+  the split between them is not separately attributed.
 
 ## Notes
 - Interaction with A-95: freezing the tool set also stabilizes the trailing segment's *families*

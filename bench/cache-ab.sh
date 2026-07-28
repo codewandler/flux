@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # A/B the prompt-cache conversation-tail breakpoint (C-133 / C-134).
 #
-# Runs the SAME prompt twice against the same model — once with the tail breakpoint on, once with
-# `FLUX_CACHE_TAIL=off` — and prints both turn-end annotations so the hit rate, the two cache tiers,
-# and the equivalent cost can be compared side by side.
+# Runs the SAME prompt twice against the same model — once with this epic's caching on, once with it
+# switched off — and prints both turn-end annotations so the hit rate, the two cache tiers, and the
+# equivalent cost can be compared side by side. The kill switch is chosen from the provider:
+# `FLUX_CACHE_TAIL=off` on the Anthropic wire, `FLUX_RESPONSES_CACHE=off` on the Responses wire.
 #
 #   bench/cache-ab.sh [-m provider/model] [-n runs] "<prompt>"
 #
@@ -43,10 +44,20 @@ if [ ! -x "$FLUX" ]; then
   exit 2
 fi
 
+# The control arm's kill switch depends on the wire, because the two wires cache differently:
+#   Anthropic Messages (anthropic/claude/bedrock/openrouter-anthropic) — explicit breakpoints, so the
+#     variable is the conversation-tail breakpoint: FLUX_CACHE_TAIL=off.
+#   OpenAI Responses (codex/openai) — automatic prefix caching, so the variables are the routing key
+#     and keeping per-turn text out of `instructions`: FLUX_RESPONSES_CACHE=off.
+case "${MODEL%%/*}" in
+  codex|openai) KILL_SWITCH="FLUX_RESPONSES_CACHE" ;;
+  *)            KILL_SWITCH="FLUX_CACHE_TAIL" ;;
+esac
+
 arm() { # $1 = on|off
   local tail="$1" out
   if [ "$tail" = off ]; then
-    out=$(FLUX_CACHE_TAIL=off "$FLUX" run -m "$MODEL" --yes "$PROMPT" 2>&1 | tail -1)
+    out=$(env "$KILL_SWITCH=off" "$FLUX" run -m "$MODEL" --yes "$PROMPT" 2>&1 | tail -1)
   else
     out=$("$FLUX" run -m "$MODEL" --yes "$PROMPT" 2>&1 | tail -1)
   fi
@@ -54,7 +65,7 @@ arm() { # $1 = on|off
   echo "${out#*── }"
 }
 
-echo "model:  $MODEL"
+echo "model:  $MODEL  (control arm: $KILL_SWITCH=off)"
 echo "prompt: $PROMPT"
 echo
 

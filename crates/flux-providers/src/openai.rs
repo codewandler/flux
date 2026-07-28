@@ -885,8 +885,61 @@ fn split_system_for_responses(req: &Request) -> (Option<String>, Option<String>)
     (stable, volatile)
 }
 
+/// Which of the Responses prefix-cache behaviours are active (C-136/C-137).
+///
+/// Threaded as a value rather than read from the environment inside the builder so the body shape is
+/// a pure function of its inputs: the A/B arms and their tests are then deterministic, and env
+/// resolution happens once at the codec boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponsesCache {
+    /// Send `prompt_cache_key` for cache-shard affinity (C-136).
+    pub(crate) routing_key: bool,
+    /// Build `instructions` from the cached system segments only, moving the per-turn segment into
+    /// `input` behind the stable prefix (C-137).
+    pub(crate) split_instructions: bool,
+}
+
+impl ResponsesCache {
+    /// Everything on — the shipped default.
+    pub(crate) const ON: Self = Self {
+        routing_key: true,
+        split_instructions: true,
+    };
+
+    /// Everything off — the pre-C-136/C-137 body, and the control arm for `bench/cache-ab.sh`.
+    pub(crate) const OFF: Self = Self {
+        routing_key: false,
+        split_instructions: false,
+    };
+
+    /// `FLUX_RESPONSES_CACHE=off` reverts both behaviours (mirrors `FLUX_CACHE_TAIL=off` on the
+    /// Anthropic wire): the A/B lever that measures what they are worth, and the escape hatch if a
+    /// backend ever rejects `prompt_cache_key`.
+    fn from_env() -> Self {
+        let disabled = std::env::var("FLUX_RESPONSES_CACHE").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        });
+        if disabled {
+            Self::OFF
+        } else {
+            Self::ON
+        }
+    }
+}
+
 fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
-    let (mut instructions, volatile_system) = split_system_for_responses(req);
+    build_responses_body_with(req, codex, ResponsesCache::from_env())
+}
+
+fn build_responses_body_with(req: &Request, codex: bool, cache: ResponsesCache) -> Result<Value> {
+    let (mut instructions, volatile_system) = if cache.split_instructions {
+        split_system_for_responses(req)
+    } else {
+        (req.system_text(), None)
+    };
     let mut input: Vec<Value> = Vec::new();
     // The uncached per-turn system material leads `input`, so it sits BEHIND the stable
     // `instructions` prefix instead of in front of it (C-137).
@@ -1017,8 +1070,10 @@ fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
         // Codex must be told to emit a reasoning summary to stream thinking text.
         body["reasoning"] = json!({ "effort": map_effort_responses(e, codex), "summary": "auto" });
     }
-    if let Some(key) = prompt_cache_key(req) {
-        body["prompt_cache_key"] = json!(key);
+    if cache.routing_key {
+        if let Some(key) = prompt_cache_key(req) {
+            body["prompt_cache_key"] = json!(key);
+        }
     }
     if codex {
         body["store"] = json!(false);
@@ -2185,6 +2240,47 @@ mod cache_tail_tests {
         let body = build_responses_body(&req, true).unwrap();
         assert_eq!(body["instructions"], json!("plain system prompt"));
         assert_eq!(body["input"][0]["content"][0]["text"], "go");
+    }
+
+    /// C-136/C-137: `FLUX_RESPONSES_CACHE=off` must reproduce the pre-epic body exactly — that is
+    /// what makes it a valid A/B control arm, not just a feature toggle.
+    #[test]
+    fn responses_cache_off_reproduces_the_pre_epic_body() {
+        use flux_provider::{RequestTrace, SystemSegment};
+        let mut req = Request::new("gpt-5.6-sol", "hi");
+        req.trace = Some(RequestTrace {
+            session_id: "s_1499".into(),
+            turn_id: 1,
+            stage: "explore".into(),
+            round: 1,
+        });
+        req.system_segments = vec![
+            SystemSegment {
+                text: "stable planner prompt".into(),
+                cache: true,
+            },
+            SystemSegment {
+                text: "Accepted intent: read a file".into(),
+                cache: false,
+            },
+        ];
+        req.messages = vec![flux_core::Message::user_text("go")];
+
+        let off = build_responses_body_with(&req, true, ResponsesCache::OFF).unwrap();
+        // No routing key…
+        assert!(off.get("prompt_cache_key").is_none(), "{off}");
+        // …and `instructions` is the old flattened join of EVERY segment, per-turn text included.
+        assert_eq!(
+            off["instructions"],
+            json!("stable planner prompt\n\nAccepted intent: read a file")
+        );
+        // …so `input` is just the conversation, with no leading system item.
+        assert_eq!(off["input"][0]["content"][0]["text"], "go");
+
+        let on = build_responses_body_with(&req, true, ResponsesCache::ON).unwrap();
+        assert!(on.get("prompt_cache_key").is_some(), "{on}");
+        assert_eq!(on["instructions"], json!("stable planner prompt"));
+        assert_ne!(off, on, "the arms must actually differ");
     }
 
     /// C-134: `cache_tail` is an Anthropic-wire concern. The Responses path shares `Request`, so it

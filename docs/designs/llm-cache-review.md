@@ -94,10 +94,41 @@ Conclusion: the conversation-tail breakpoint pays exactly where the analysis pre
 transcript grows large — and is neutral-to-slightly-costly on short ones, where it buys writes that
 are never re-read. It ships on by default with `FLUX_CACHE_TAIL=off` as the escape hatch.
 
-**Codex.** `prompt_cache_key` was confirmed against current OpenAI documentation (Responses API,
-1024-token minimum) and then **live-verified accepted by the ChatGPT/codex backend** — the risk being
-that the backend rejects unknown parameters as it does `max_output_tokens` and the sampling params. A
-`codex/gpt-5.6-sol` turn carrying the key returned normally.
+### Codex — measured, `FLUX_RESPONSES_CACHE=off` as the control
+
+`prompt_cache_key` was confirmed against current OpenAI documentation (Responses API, combined with
+the prefix hash for routing, 1024-token minimum) and **live-verified accepted by the ChatGPT
+backend** — the risk being that it rejects unknown parameters as it does `max_output_tokens` and the
+sampling params.
+
+**Long multi-round turns — a small but consistent win.** Same five-file prompt as the claude arm,
+`codex/gpt-5.6-sol`, both arm orders:
+
+| run (first arm) | arm | steps | hit | read |
+|---|---|---:|---:|---:|
+| 1 (on) | on | 30 | **6%** | 10.8k |
+| 1 (on) | off | 33 | **0%** | — |
+| 2 (off) | off | 13 | **0%** | — |
+| 2 (off) | on | 33 | **6%** | 20.5k |
+
+Zero cached tokens with the changes off, ~6% with them on, in both orders. The driver is C-137: with
+the per-turn segment flattened into the front of `instructions`, the prefix changes whenever the
+intent declaration does, so OpenAI's automatic prefix caching never matches. **Cost is not
+comparable across these pairs** — codex took 13/30/33/33 steps for the same prompt, so the arms did
+different amounts of work; only the hit rate is meaningful here.
+
+**Single-round turns — neutral.** Four matched pairs (1 step each, identical 16.7k ctx), alternating
+arm order: `on` scored 0/25/0/50%, `off` scored 0/50/25/0% — **identical means (~19%)**, with the
+variance tracking which arm happened to land on an already-warm shard. One pair initially looked like
+a regression (25% on vs 50% off) and inverted on the repeat, so it was shard warmth, not
+`prompt_cache_key` partitioning the cache per session. Worth knowing that the suspicion was tested
+rather than assumed.
+
+**Codex prefix caching is improved, not solved.** ~6% on long turns is well below the 15–31% the
+whole-history baseline shows for codex models, and there is no codex analogue of the conversation-tail
+breakpoint available: the Responses wire has no explicit breakpoints to place, only an automatic
+prefix match we can feed. Squeezing more means making the *prefix itself* more stable — which is
+where A-95's no-op-signal fix helps and where further work belongs.
 
 ## Why
 
