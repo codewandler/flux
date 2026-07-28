@@ -111,6 +111,10 @@ pub struct ChatState {
     pub(super) unread: usize,
     pub(super) next_action_id: u64,
     pub(super) active_action_id: Option<u64>,
+    /// When a blank-composer, idle Ctrl-C armed the quit confirmation (C-156). `None` while
+    /// unarmed; a stale arm (older than [`crate::CTRL_C_QUIT_WINDOW`]) reads as unarmed too, so a
+    /// far-apart pair of presses re-arms instead of quitting.
+    pub(super) ctrl_c_armed_at: Option<Instant>,
 }
 
 /// One model call of the turn in progress, as the `/usage` overlay renders it (C-140). Sourced from

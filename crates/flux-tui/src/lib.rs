@@ -104,6 +104,19 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// Width of the animated footer effect bar.
 const FOOTER_BAR_WIDTH: usize = 12;
 
+/// C-156: how long a first blank-composer, idle Ctrl-C stays armed for a confirming second press
+/// before it decays back to a fresh "first press" (rather than quitting on a stale arm).
+const CTRL_C_QUIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Outcome of [`ChatState::arm_or_confirm_quit`] — the event loop only ever exits on `Quit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCQuit {
+    /// First press: the confirmation is now showing in the footer; the event loop keeps running.
+    Armed,
+    /// Second press within the window: the event loop breaks.
+    Quit,
+}
+
 /// Whether the terminal advertises 24-bit color and color isn't disabled — gates the
 /// truecolor footer effects (`Color::Rgb` would emit raw truecolor SGR regardless).
 fn terminal_truecolor() -> bool {
@@ -1008,6 +1021,7 @@ impl ChatState {
             unread: 0,
             next_action_id: 1,
             active_action_id: None,
+            ctrl_c_armed_at: None,
         }
     }
 
@@ -1195,6 +1209,36 @@ impl ChatState {
 
     fn queue_cancel_edit(&mut self) -> bool {
         self.queue_edit.take().is_some()
+    }
+
+    /// A blank-composer, idle Ctrl-C (C-156): the first press arms the quit confirmation and does
+    /// NOT exit; a second press within [`CTRL_C_QUIT_WINDOW`] confirms it. A stale arm (the window
+    /// elapsed) is treated as no arm at all, so a far-apart pair re-arms rather than quitting on a
+    /// press the user has forgotten about.
+    fn arm_or_confirm_quit(&mut self) -> CtrlCQuit {
+        let now = Instant::now();
+        let armed = self
+            .ctrl_c_armed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < CTRL_C_QUIT_WINDOW);
+        if armed {
+            CtrlCQuit::Quit
+        } else {
+            self.ctrl_c_armed_at = Some(now);
+            CtrlCQuit::Armed
+        }
+    }
+
+    /// Clear the transient Ctrl-C quit arm — any key other than a confirming second Ctrl-C
+    /// disarms it, and so does the window elapsing (checked lazily wherever the arm is read).
+    fn clear_ctrl_c_arm(&mut self) {
+        self.ctrl_c_armed_at = None;
+    }
+
+    /// Whether the Ctrl-C quit confirmation is currently showing (armed and inside the window) —
+    /// what the footer renders and what a second press needs to match.
+    fn ctrl_c_armed(&self) -> bool {
+        self.ctrl_c_armed_at
+            .is_some_and(|at| at.elapsed() < CTRL_C_QUIT_WINDOW)
     }
 
     fn queue_move(&mut self, delta: isize) {
@@ -2269,6 +2313,12 @@ impl ChatState {
                 " mouse off · select/copy · Ctrl-T re-enable",
                 t.warn_style(),
             )],
+            // C-156: lowest idle-left precedence — the unread indicator and the C-105 mouse-off
+            // hint both win over it, since either already occupies the slot for something the
+            // user needs to see; the quit confirmation only shows when nothing else claims it.
+            Phase::Idle if self.ctrl_c_armed() => {
+                vec![Span::styled(" Ctrl-C again to quit", t.warn_style())]
+            }
             Phase::Idle => vec![Span::styled(
                 " Enter send · Ctrl-J newline · / commands",
                 t.muted_style(),
@@ -3096,6 +3146,15 @@ async fn event_loop(
                     continue;
                 }
 
+                // C-156: any key other than Ctrl-C itself disarms a pending quit confirmation —
+                // checked up front so it applies uniformly regardless of which mode below ends up
+                // consuming the key (overlay, search, composer, …).
+                if !(key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    state.clear_ctrl_c_arm();
+                }
+
                 // Approval sheet: only explicit keys act; anything else is swallowed so a stray
                 // keystroke can't silently deny (C-103).
                 if let Some(view) = state.approval.as_mut() {
@@ -3579,6 +3638,7 @@ async fn event_loop(
                     KeyCode::Char('c') if ctrl => {
                         if running {
                             // Cancel the running turn (input stays live so you can keep typing).
+                            state.clear_ctrl_c_arm();
                             cancel.cancel();
                             state.push(Entry::Notice {
                                 text: "(interrupting…)".into(),
@@ -3586,15 +3646,24 @@ async fn event_loop(
                             });
                         } else if state.input_blank() {
                             if state.queue_cancel_edit() {
+                                state.clear_ctrl_c_arm();
                                 state.input = fresh_textarea();
                                 if let Some(next) = state.queue.pop_front() {
                                     cancel = start_turn(&agent, &tx, state, next);
                                 }
                             } else {
-                                break; // empty line → quit
+                                // C-156: blank composer, idle, nothing to cancel — the one
+                                // destructive-feeling key in the map now needs a second press
+                                // within CTRL_C_QUIT_WINDOW (armed state shown in the footer)
+                                // rather than exiting on a single keystroke.
+                                match state.arm_or_confirm_quit() {
+                                    CtrlCQuit::Quit => break,
+                                    CtrlCQuit::Armed => {}
+                                }
                             }
                         } else {
                             let cancelled_edit = state.queue_cancel_edit();
+                            state.clear_ctrl_c_arm();
                             state.input = fresh_textarea(); // non-empty line → clear it
                             if cancelled_edit {
                                 if let Some(next) = state.queue.pop_front() {
@@ -4537,6 +4606,93 @@ mod tests {
         state.mouse_capture = true;
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(!screen(&terminal).contains("mouse off"));
+    }
+
+    /// C-156: the blank-composer, idle Ctrl-C arm — a first press arms the quit confirmation
+    /// (`Armed`, loop survives) and only a second press within the window confirms it (`Quit`).
+    /// This drives the same decision the event loop's key handler makes for two Ctrl-C presses.
+    #[test]
+    fn ctrl_c_on_blank_composer_arms_before_it_quits() {
+        let mut state = ChatState::new("mock".into());
+        assert!(!state.ctrl_c_armed(), "unarmed at rest");
+
+        // First press: arms, does not quit.
+        assert_eq!(state.arm_or_confirm_quit(), CtrlCQuit::Armed);
+        assert!(state.ctrl_c_armed());
+
+        // Second press, same instant (well within the window): confirms.
+        assert_eq!(state.arm_or_confirm_quit(), CtrlCQuit::Quit);
+    }
+
+    /// C-156: the armed footer hint is visible only while armed, and any other input (modeled
+    /// here as `clear_ctrl_c_arm`, which the event loop calls for every key but a confirming
+    /// Ctrl-C) disarms it — a second Ctrl-C after that starts a fresh arm instead of quitting.
+    #[test]
+    fn ctrl_c_arm_clears_on_other_input_and_shows_in_the_footer() {
+        let mut state = ChatState::new("mock".into());
+        state.arm_or_confirm_quit();
+        assert!(state.ctrl_c_armed());
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            screen(&terminal).contains("Ctrl-C again to quit"),
+            "{}",
+            screen(&terminal)
+        );
+
+        // Any other input clears the arm (event loop calls this for every key but Ctrl-C).
+        state.clear_ctrl_c_arm();
+        assert!(!state.ctrl_c_armed());
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("Ctrl-C again to quit"));
+
+        // A press after clearing arms again rather than quitting.
+        assert_eq!(state.arm_or_confirm_quit(), CtrlCQuit::Armed);
+    }
+
+    /// C-156: a stale arm (older than the window) reads as unarmed — a second press long after
+    /// the first re-arms instead of quitting on a press the user has forgotten about.
+    #[test]
+    fn ctrl_c_arm_expires_after_the_window() {
+        let mut state = ChatState::new("mock".into());
+        state.ctrl_c_armed_at = Some(Instant::now() - CTRL_C_QUIT_WINDOW - Duration::from_secs(1));
+        assert!(!state.ctrl_c_armed(), "a stale arm must read as unarmed");
+        assert_eq!(
+            state.arm_or_confirm_quit(),
+            CtrlCQuit::Armed,
+            "a press after the window re-arms rather than quitting"
+        );
+    }
+
+    /// C-156: the armed footer hint slots into the idle-left precedence BELOW the unread
+    /// indicator and the C-105 mouse-off hint — neither is displaced by it.
+    #[test]
+    fn ctrl_c_armed_hint_does_not_displace_unread_or_mouse_off() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+
+        // Unread wins over the armed hint.
+        let mut state = ChatState::new("mock".into());
+        state.unread = 2;
+        state.arm_or_confirm_quit();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("new · Ctrl-End latest"), "{content}");
+        assert!(!content.contains("Ctrl-C again to quit"), "{content}");
+
+        // Mouse-off wins over the armed hint.
+        let mut state = ChatState::new("mock".into());
+        state.mouse_capture = false;
+        state.arm_or_confirm_quit();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("mouse off"), "{content}");
+        assert!(!content.contains("Ctrl-C again to quit"), "{content}");
+
+        // With neither active, the armed hint has the slot.
+        let mut state = ChatState::new("mock".into());
+        state.arm_or_confirm_quit();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("Ctrl-C again to quit"));
     }
 
     /// C-106: detaching from follow mode shows a scrollbar on the transcript's right column and
