@@ -146,7 +146,7 @@ semantics for every op with a recorded cassette cell). One engine spine undernea
 resurrect-on-open. Design:
 [designs/deterministic-agent-lab.md](designs/deterministic-agent-lab.md).
 
-### Harness hardening — guard the untrusted-input surface (epic) — 🔎 **OPEN (filed from the 2026-07-15 full code review; C-76…C-87 + quality C-88)**
+### Harness hardening — guard the untrusted-input surface (epic) — ✅ **SHIPPED 2026-07-15 (v0.26.0; C-76…C-88 + L-81…L-83, all sixteen stories)**
 
 A full-workspace review found the codebase mature and well-gated (CI enforces `fmt`/`clippy -D
 warnings`/the `flux-codegate` L0–L6 layering lint/the raw-spawn scanner; `cargo audit` clean; provider
@@ -160,12 +160,13 @@ credential-leak vectors (**C-82**). **(2) No resource governor at the execution 
 live only in the analyzer, so untrusted `.flux`/LLM plans reach uncatchable stack-overflow aborts (**L-81**),
 CPU-pin + OOM (**L-82**), and host OOM in tool/network/plugin paths (**C-79**, **C-80**, **C-83**, **C-84**);
 plus upgrade-safety (**C-81**), correctness/growth (**C-85**, **C-86**, **L-83**, **C-87**), and a
-code-quality standalone (**C-88**). **C-76/C-77** are `ready` (verified, single-call-reachable secret
-exfiltration); the rest are `backlog` pending triage against the async-live-datasource focus, with
-**C-78** and **L-81** the strongest to promote next. Design:
+code-quality standalone (**C-88**). All sixteen stories closed and shipped in **v0.26.0**: the
+exfiltration surface is gated (secret-resolution consent, connect-time IP pinning, the sqlite jail),
+and execution-boundary budgets (recursion depth, CPU/step, response-size caps) now back the
+analyzer's static limits. Design:
 [designs/harness-hardening.md](designs/harness-hardening.md).
 
-### Async live systems-of-record datasources — ✅ **DONE 2026-07-15 (unreleased; D-62, D-168…D-173)**
+### Async live systems-of-record datasources — ✅ **SHIPPED 2026-07-15 (v0.26.0; D-62, D-168…D-173)**
 
 Added a first-class seam for remote systems of record without turning the synchronous indexed
 knowledge store into an async integration abstraction. A pure L0 contract describes entities,

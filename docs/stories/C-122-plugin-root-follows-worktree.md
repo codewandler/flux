@@ -2,7 +2,8 @@
 id: C-122
 title: "Plugin hosts should follow a worktree transition"
 pillar: Core
-status: backlog
+status: ready
+priority: 2
 epic: context-local-git-worktrees
 design: docs/designs/context-local-git-worktrees.md
 note: "v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter"

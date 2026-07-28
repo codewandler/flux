@@ -32,6 +32,10 @@ _None._
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 - [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
 
+### Context-local Git worktrees
+_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
+- [C-122 — Plugin hosts should follow a worktree transition](C-122-plugin-root-follows-worktree.md) · Core · v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter
+
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
@@ -48,10 +52,6 @@ _None._
 
 ### Approval Distillation
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
-
-### Context-local Git worktrees
-_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
-- [C-122 — Plugin hosts should follow a worktree transition](C-122-plugin-root-follows-worktree.md) · Core · v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter
 
 ### Event-store concurrent use — guarantees, rules, and hardening
 - [C-123 — Event-store concurrent use — visibility, proof, and hygiene (epic)](C-123-event-store-concurrent-use-epic.md) · Core · EPIC — the concurrency envelope (WAL + busy_timeout + BEGIN IMMEDIATE + UNIQUE backstops, PG advisory locks) is built and tested; this funds contention visibility, a multi-process stress proof, and WAL checkpoint hygiene
