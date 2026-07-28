@@ -83,6 +83,48 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
 > and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### MariaDB / MySQL in the `sql` plugin (epic) — ✅ **IMPLEMENTED 2026-07-28 (D-196…D-198, all three stories; unreleased)**
+
+An external user pointed a MariaDB endpoint at the `sql` plugin and got
+`mysql is not yet supported by the flux sql plugin (residual)`. The message is accurate — `mariadb`
+normalizes to `Dialect::MySql` (`plugins/sql/src/main.rs:339`) and all six ops call
+`require_postgres()` before doing anything (`:932,967,1003,1062,1134,1249`) — and it is the residual
+[D-31](stories/D-31-host-terminated-rawsocket-auth.md) recorded when it host-terminated the Postgres
+handshake: *"mysql + Asterisk AMI host-termination (seam in place, clear error, credential cap
+retained for them)"*. A user has now walked into that seam. The design's first job is answering why
+this needs writing at all, because the obvious objection is strong: a SQL connection is a TCP
+connection, Go injects one with `RegisterDialContext`, and flux already has the transport —
+`ConnStream` is `std::io::Read + Write` (`plugins/host-kit/src/lib.rs:818+`). Three things block the
+shortcut, and only the last decides it. No Rust MySQL crate exposes a dialer seam (`mysql_async::Opts`
+and `sqlx::MySqlConnectOptions` offer host/port or a Unix socket *path*, never a caller's stream);
+`ConnStream` is blocking where those crates want tokio; and — decisively — **host-terminated auth
+makes a driver crate unusable in principle**, since a driver insists on running its own handshake,
+which needs the password inside the plugin, which is exactly what the reference invariant forbids. So
+the epic mirrors the Postgres split rather than working around it: **D-196** puts handshake v10 +
+`mysql_native_password` host-side in `crates/flux-plugin/src/mysql.rs` (MariaDB's default auth
+plugin, and *simpler* than the SCRAM already shipped — no PBKDF2, no server-signature check),
+**D-197** gives the plugin a `COM_QUERY` client, and **D-198** replaces `require_postgres()` with
+per-dialect SQL. D-198 is the one that is easy to under-scope: `table.list`/`index.list` read
+`pg_class`/`pg_index` with no MySQL equivalent, foreign keys need a different join shape, and
+`database.list` is a semantic trap — the same `information_schema.schemata` query parses on both
+engines but means *schemas in the current database* on Postgres and *actual databases* on MySQL. A
+"trusted plugin" tier that dials directly with credentials was considered and **rejected**: it would
+make an invariant that is currently absolute and testable into a conditional one. Non-goals: SQLite
+(still needs a host file capability), writes, AMI, and `caching_sha2_password`/`ed25519`/`parsec`
+(follow-ons). Two things the plan did not foresee, both caught while implementing: `pg_lit()` escapes
+only `'`, but MySQL treats `\` as an escape character, so a name containing `\'` could have broken out
+of a literal (new `my_lit()`); and MySQL names *every* primary key `PRIMARY`, so porting the Postgres
+PK join would have matched every table's PK in the schema at once. The `CLIENT_DEPRECATE_EOF`
+plumbing the design called for was also dropped — the two result-set shapes are separable by the
+spec's own fixed sizes (a classic EOF payload is exactly 5 bytes, every OK packet at least 7), which
+avoids widening `HandshakeInfo`, a published 1.0.0 protocol-line type. Live interop against a real
+All six ops were then verified live against a real **MySQL 5.7.44** (dev cluster, `latest`), which
+advertises exactly the `mysql_native_password` handshake D-196 implements — though a MariaDB-specific
+server remains untested. The plugin half lives in `plugins/`, which release cutting never touches —
+it needs its own pack cut to reach users, as the smoke test demonstrated when the registered pack
+v0.1.0 plugin had to be replaced by a local build. Design:
+[designs/mariadb-support.md](designs/mariadb-support.md).
+
 ### Plugin protocol decoupling — a release that leaves the plugin pack alone (epic) — ✅ **SHIPPED 2026-07-28 (C-141…C-147, all seven stories)**
 
 Cutting 0.28.0 made the plugin pack's release tax visible. `scripts/cut-release.sh` rewrites

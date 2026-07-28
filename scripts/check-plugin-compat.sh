@@ -74,16 +74,28 @@ echo "== building this tree's flux =="
 cargo build -p flux-cli --bin flux >/dev/null 2>&1 || fail "could not build flux from this tree"
 FLUX="$PWD/target/debug/flux"
 
-# Install into a throwaway FLUX_HOME so the developer's real ~/.flux is untouched.
-export FLUX_HOME="$WORK/home"
-mkdir -p "$FLUX_HOME"
+# Install into a throwaway home so the developer's real ~/.flux is untouched.
+#
+# ⚠ It must be HOME, not FLUX_HOME. The plugin descriptor directory is resolved as
+# `$HOME/.flux/plugins` (`flux_cli::execution::plugins_dir`) and does NOT consult FLUX_HOME — an
+# earlier version of this script exported FLUX_HOME, which was silently ignored, so running it
+# locally REWROTE the developer's real `~/.flux/plugins/{gitlab,websearch}.toml` to point at this
+# script's `mktemp -d` directory. The moment the script exited and the trap deleted that directory,
+# both plugins were broken and had to be reinstalled from the pack. CI never noticed, because a
+# throwaway runner has nothing to clobber.
+#
+# HOME is overridden per-command rather than exported, because `gh` and `cargo` above need the real
+# one (auth, registry cache, toolchain).
+SANDBOX_HOME="$WORK/home"
+mkdir -p "$SANDBOX_HOME/.flux"
+flux_sandboxed() { HOME="$SANDBOX_HOME" "$FLUX" "$@"; }
 PACK_DIR="$WORK/bin"
 
 echo "== old plugin binaries vs this host =="
 # `--dir=` is the local-scan mode: register already-built binaries with no pack-index
 # signature check. That is what we want — the artifacts are the released ones, and the
 # question under test is the wire, not the distribution channel.
-install_out="$("$FLUX" plugin install "--dir=$PACK_DIR" 2>&1)"
+install_out="$(flux_sandboxed plugin install "--dir=$PACK_DIR" 2>&1)"
 install_status=$?
 if [ "$install_status" -ne 0 ]; then
   echo "$install_out" >&2
@@ -93,7 +105,7 @@ note "installed"
 
 # `plugin list` reads each plugin's MANIFEST over the wire: spawn, frame exchange, protocol-marker
 # check, manifest deserialization. An incompatible wire fails right here, which is the point.
-list_out="$("$FLUX" plugin list 2>&1)"
+list_out="$(flux_sandboxed plugin list 2>&1)"
 list_status=$?
 if [ "$list_status" -ne 0 ]; then
   echo "$list_out" >&2
@@ -108,7 +120,7 @@ note "manifests read over the wire"
 
 # Prove an operation round-trips, not just discovery. `sources` is read-shaped, needs no third-party
 # credential, and every host-kit plugin answers it.
-ops_out="$("$FLUX" plugin call websearch sources '{}' 2>&1)"
+ops_out="$(flux_sandboxed plugin call websearch sources '{}' 2>&1)"
 if echo "$ops_out" | grep -qiE "speaks protocol|unsupported protocol|invalid frame"; then
   echo "$ops_out" >&2
   fail "an operation call hit a protocol error against $TAG binaries"

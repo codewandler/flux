@@ -49,6 +49,55 @@ All notable changes to this project are documented in this file. The format is b
     described pre-round-2 behaviour — claiming modules were left unformatted and listing neither
     references, rename, nor range formatting. Both now match `capabilities()`.
 
+- **D-196…D-198: MariaDB / MySQL support in the `sql` plugin.** Pointing a MariaDB endpoint at the
+  plugin returned `mysql is not yet supported by the flux sql plugin (residual)` — the residual
+  [D-31](docs/stories/D-31-host-terminated-rawsocket-auth.md) recorded when it host-terminated the
+  Postgres handshake. The epic mirrors the Postgres split rather than reaching for a driver crate,
+  and the design records *why*: no Rust MySQL crate exposes a Go-style dialer seam (`mysql_async` and
+  `sqlx` take a URL or a Unix socket path, never a caller's stream), `ConnStream` is blocking where
+  those crates want tokio, and — decisively — a driver insists on running its **own** handshake,
+  which needs the password inside the plugin, exactly what the reference invariant forbids. A
+  "trusted plugin that dials directly" was considered and rejected: it would turn an invariant that
+  is currently absolute and testable into a conditional one.
+  - **D-196 (host):** new `crates/flux-plugin/src/mysql.rs` speaks Handshake v10 +
+    `mysql_native_password` (MariaDB's default; simpler than the shipped SCRAM — no PBKDF2, no
+    server-signature check) and hands the plugin a post-auth connection. `terminate_handshake` moved
+    out of `pg.rs` into a protocol-neutral `handshake.rs`. `CLIENT_LOCAL_FILES` is masked off
+    unconditionally so a hostile server cannot use `LOAD DATA LOCAL INFILE` against the host's
+    filesystem. `caching_sha2_password` (MySQL 8.0+ default), `ed25519`, `parsec`, and
+    `mysql_clear_password` each fail with an error naming the plugin and the workaround.
+  - **D-197 (plugin):** a `COM_QUERY` client decoding the text protocol — length-encoded integers and
+    strings, `0xfb` NULLs, and multi-packet payload reassembly at the `0xFFFFFF` ceiling. It decodes
+    **both** `CLIENT_DEPRECATE_EOF` result-set shapes without being told which was negotiated, by the
+    spec's own length rule (a classic EOF payload is exactly 5 bytes; every OK packet is at least 7)
+    — which keeps it correct under host/plugin version skew and avoids widening `HandshakeInfo`, a
+    published 1.0.0 protocol-line type whose growth would be a semver break.
+  - **D-198 (ops):** `require_postgres()` is gone; all six ops carry per-dialect SQL.
+    `table.list`/`index.list` move off `pg_class`/`pg_index` onto `information_schema`; foreign keys
+    use MySQL's `key_column_usage` shape instead of the Postgres three-way join; the primary-key read
+    is table-scoped because MySQL names *every* PK `PRIMARY`; `index.list` groups
+    `information_schema.statistics`' one-row-per-column into one entry per index. New `my_lit()`
+    escapes backslashes, which MySQL treats as an escape character and `pg_lit()` would let through.
+  - **Behaviour note:** `sql.database.list` **means something different per dialect**. MySQL treats
+    schema and database as one object, so it returns only `kind: "database"` entries, where Postgres
+    returns databases *and* the connected database's schemas. `index.list` omits `definition` on
+    MySQL rather than fabricating DDL (there is no `pg_get_indexdef`).
+  - SQLite is unchanged and still unsupported by design — a local file, not a socket. The plugin
+    remains read-only on every dialect.
+  - **Live interop: verified against MySQL 5.7.44** (2026-07-28, dev cluster `latest` namespace) —
+    all six ops against a real server: `test` capturing `server_version` from the live handshake,
+    `database.list`, `table.list` (173 tables), `table.show` (112 columns, PK), `index.list`
+    (multi-column grouping in `seq_in_index` order), and `query` returning real rows with `NULL`
+    correctly distinguished from `''`. Wrong-password surfaced the server's own `ERR 1045 (28000)`.
+    **Caveat: that server is MySQL 5.7, not literally MariaDB.** The wire protocol and the
+    `mysql_native_password` handshake are the same code path, so this exercises everything the
+    dialect shares, but a MariaDB-specific server (and its `ed25519`/`parsec` options) is still
+    untested. The 22 unit tests remain hand-crafted frames.
+  - **Release note:** D-197/D-198 land in `plugins/`, which is excluded from the root workspace and
+    which `scripts/cut-release.sh` deliberately never touches (C-141…C-147). A root release therefore
+    ships only D-196's host-side handshake; **the plugin pack must be cut separately** or users get a
+    host that can authenticate to MariaDB and a `sql` plugin that still cannot query it.
+
 - **A-97: path-scoped guidance fragments — `.flux/context.d/*.md`.** Project guidance was
   all-or-nothing: `ProjectFiles` reads `CLAUDE.md`/`AGENTS.md`/`.flux/context.md` whole on every
   session, so a large repo either keeps its conventions thin and loses subsystem detail, or keeps
