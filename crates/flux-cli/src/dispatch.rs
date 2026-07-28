@@ -505,6 +505,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             }) => run_record(&name, prompt, dir, &agent).await,
             Some(Commands::Test { name, dir, json }) => run_test(name, dir, json).await,
             Some(Commands::Diff { a, b, json }) => run_diff_cmd(&a, &b, json),
+            Some(Commands::Export { run, out }) => run_export(&run, out.as_deref()),
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),

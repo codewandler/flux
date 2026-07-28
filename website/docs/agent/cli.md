@@ -36,6 +36,7 @@ and [Safety & approvals](./safety.md).
 | `flux review --files …` | run the embedded read-only multi-reviewer protocol; Markdown or JSON output |
 | `flux loop show \| eject` | inspect or scaffold the [agent loop](./agent-loop.md) |
 | `flux fork …` / `flux replay …` / `flux diff …` | branch, replay, and compare recorded runs with [Time Machine](./time-machine.md) |
+| `flux export <run> -o run.html` | render a recorded run — plan tree, per-op results/diffs, cost, timeline, nested sub-agents — as one self-contained, redacted static HTML file; the read-only, shareable sibling of `replay`/`fork`/`diff` |
 | `flux record <name> "…"` | record one live turn as a committed-safe scenario fixture — see the [Agent Lab](../sdk/agent-lab.md) |
 | `flux test [name]` | replay recorded fixtures offline as a test gate ($0, no key, no network; exit 1 on a regression) |
 | `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) |
@@ -58,6 +59,7 @@ redirects that for one invocation:
 ```bash
 flux replay --store tests/scenarios/refund-flow last
 flux diff --store tests/scenarios/refund-flow s_1 s_2
+flux export --store tests/scenarios/refund-flow last -o refund-flow.html
 flux sessions --store tests/scenarios/refund-flow
 ```
 

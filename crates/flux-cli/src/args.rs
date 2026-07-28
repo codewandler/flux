@@ -495,6 +495,21 @@ pub(super) enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Render a recorded run as a single self-contained static HTML file (C-132) — a shareable
+    /// artifact for bug reports, PR links, and demos: the plan tree (via the `flow_render`
+    /// substrate), per-op results and diffs, cost, and a timeline, with sub-agent children (A-59)
+    /// nested. Every piece of rendered text is redacted (C-22) before it reaches the page. The
+    /// read-only sibling of `replay`/`fork`/`diff`: a pure read, no event-store write, no provider
+    /// construction. Inline CSS, no JS, no network references — open the file directly in a browser.
+    Export {
+        /// Session id (`s_42`), or `last` for the most recent session.
+        #[arg(default_value = "last")]
+        run: String,
+        /// Write the HTML to this path (workspace-confined, parents created). Without it, the HTML
+        /// goes to stdout (the same convention as `flux render`).
+        #[arg(short = 'o', long, value_name = "OUT")]
+        out: Option<String>,
+    },
     /// Provider and plugin authentication (status / login / set).
     Auth {
         #[command(subcommand)]
