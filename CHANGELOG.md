@@ -12,6 +12,36 @@ All notable changes to this project are documented in this file. The format is b
 callers are unaffected. Both are subset/surcharge tiers: the extended-TTL cache write Anthropic bills
 at 2x base input. Per flux's SemVer rule this rides the next MINOR.
 
+### Fixed
+
+- **The publish closure was ordered so that three crates preceded their own dependencies.**
+  `flux-spec` came before `flux-policy` (C-141's `FlowEffect` move brought `Action` with it) and
+  `flux-plugin-protocol` before both `flux-spec` and `flux-evidence` (C-142's insert). `cargo
+  publish` rejects a crate whose dependency is not yet on the index, so v0.29.0 would have failed
+  mid-closure — *after* the tag was pushed. `publish_script_covers_a_registry_resolvable_closure`
+  compared the script's list to the workspace as a **set**, so both inversions were invisible to it;
+  it now also asserts ORDER, resolved from real `cargo metadata` edges, and `PUBLISHING.md` §2
+  remirrors the corrected sequence. Caught by auditing the release path before the promote; nothing
+  shipped in the broken order.
+- **The C-141 plugin-build guard could not run in CI.** `plugin_builds_exclude_host_only_crates`
+  resolved the plugins workspace's full dependency graph with `--offline`, but the `check` job never
+  builds that workspace, so plugins-only third-party deps (`pulldown-cmark`, via `confluence`) are
+  absent from its registry cache and the resolve failed outright. It passed locally only on a warm
+  cache. Now `--locked` without `--offline` — `--locked` is the flag that forbids mutating
+  `plugins/Cargo.lock`. The sibling closure test keeps `--offline` safely, since `--no-deps` never
+  resolves a graph.
+- **The plugin pack release failed its first step on a correct manifest.** `release-plugins.yml`
+  read `workspace.package.version` with `grep -A5` after the section header, so a comment above
+  `version` pushed it out of the window and the check compared the input against an empty string. It
+  now parses the whole section with `awk`.
+
+### Changed
+
+- **Plugin pack 0.1.2.** The first pack built since the wire contract moved into its own crate
+  (C-141/C-142) — these binaries no longer compile `flux-lang` or flux's host half. It also carries
+  `codewandler-flux-host-kit@1.0.0` to crates.io: host-kit left the flux closure in C-146, so the
+  pack release is now the only thing that publishes it.
+
 ### Added
 
 - **LLM cache review (epic [llm-cache-review](docs/designs/llm-cache-review.md); C-133…C-140 +
