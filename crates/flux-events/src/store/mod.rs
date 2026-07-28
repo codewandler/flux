@@ -2843,6 +2843,122 @@ mod tests {
             assert_eq!(s2.conversation(&sid).unwrap().len(), 1, "the write landed");
             let _ = std::fs::remove_file(&path);
         }
+
+        /// Minimal `tracing::Subscriber` that records event messages — just enough to assert C-124's
+        /// contention trace without pulling in `tracing-subscriber` (mirrors
+        /// `flux_runtime::metadata`'s test-only `RecordingSubscriber`).
+        struct RecordingSubscriber {
+            messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        struct MessageVisitor<'a>(&'a mut String);
+
+        impl tracing::field::Visit for MessageVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl tracing::Subscriber for RecordingSubscriber {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut message = String::new();
+                event.record(&mut MessageVisitor(&mut message));
+                self.messages.lock().unwrap().push(message);
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        /// C-124: an append that waits on the SQLite write lock past the warn threshold must leave a
+        /// visible trace. Same second-connection-holds-the-lock mechanism as
+        /// `concurrent_writers_wait_on_busy_timeout_instead_of_erroring` above, but the contended
+        /// handle is opened with a test-only, deliberately low threshold (`SqliteEvents` normally
+        /// warns past ~1s) so the test proves the trace deterministically without sleeping a full
+        /// second: the lock is held for a fixed, short delay comfortably past the low threshold.
+        #[test]
+        fn append_that_waits_on_the_busy_handler_leaves_a_warn_trace() {
+            use std::time::Duration;
+            let path = std::env::temp_dir().join(format!(
+                "flux-events-c124-contention-{}-{:?}.db",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+
+            let s1 = EventStore::open(&path).unwrap();
+            let sid = s1.create_session("m").unwrap();
+
+            // The contended handle: same file, but a 20ms warn threshold instead of production's ~1s,
+            // so a deterministic ~150ms lock hold below proves the trace fast.
+            let s2 = EventStore {
+                backend: Backend::Sqlite(
+                    SqliteEvents::open_with_contention_threshold(&path, Duration::from_millis(20))
+                        .unwrap(),
+                ),
+            };
+
+            let blocker = rusqlite::Connection::open(&path).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                blocker.execute_batch("COMMIT").unwrap();
+            });
+
+            let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = RecordingSubscriber {
+                messages: messages.clone(),
+            };
+            let res = tracing::subscriber::with_default(subscriber, || {
+                s2.record_message(&sid, &Message::user_text("under contention"))
+            });
+            releaser.join().unwrap();
+
+            assert!(
+                res.is_ok(),
+                "the contended write must still succeed: {res:?}"
+            );
+            let captured = messages.lock().unwrap();
+            assert!(
+                captured.iter().any(|m| m.contains("wait")),
+                "expected a trace naming the wait on the write lock, got: {captured:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// C-124's flip side: a store with production's default threshold and no contention emits no
+        /// new trace at all — the seam is measurement-only noise on uncontended appends.
+        #[test]
+        fn uncontended_append_emits_no_contention_warning() {
+            let store = EventStore::in_memory().unwrap();
+            let sid = store.create_session("m").unwrap();
+
+            let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = RecordingSubscriber {
+                messages: messages.clone(),
+            };
+            tracing::subscriber::with_default(subscriber, || {
+                store
+                    .record_message(&sid, &Message::user_text("no contention here"))
+                    .unwrap();
+            });
+
+            let captured = messages.lock().unwrap();
+            assert!(
+                captured.is_empty(),
+                "an uncontended append must emit no contention trace, got: {captured:?}"
+            );
+        }
     }
 
     /// The Postgres backend: every backend-agnostic conformance body against a throwaway schema on

@@ -23,6 +23,10 @@ serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 ulid.workspace = true
+# C-124: a visible trace when an append waits on the SQLite busy handler past a threshold. No
+# product surface is required to install a subscriber (mirrors `flux-provider`'s retry warnings) —
+# a silent contended writer stays silent by default, but any embedder that wires up `tracing` sees it.
+tracing.workspace = true
 # The Postgres driver-owner (sqlx + pool + sync↔async bridge). Optional: gated behind `postgres`.
 flux-pg = { workspace = true, optional = true }
 

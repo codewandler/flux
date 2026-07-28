@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-124: event-store append contention is visible before it becomes a failure.** An append that
+  waits on the SQLite busy handler now emits a `tracing` warning once the wait crosses ~1s, naming
+  the wait and the threshold — previously the only signal was the terminal busy error after the
+  full 5s budget. The timing lives on the one shared `begin_write` seam (append, session create,
+  prunes, and atomic copy all inherit it), production keeps the fixed threshold, and a test-only
+  constructor override makes the contention test deterministic (a held second connection, not a
+  race). One honest scope note: no product surface installs a `tracing` subscriber today, so the
+  signal reaches embedders/operators who wire one (or the OTel exporter) — surfacing it in the
+  CLI/TUI is the C-180-style follow-up, not this story.
+
 ### Changed
 
 - **C-184: the `calendar` semantic effect is deprecated.** `FlowEffect::Calendar` was the one

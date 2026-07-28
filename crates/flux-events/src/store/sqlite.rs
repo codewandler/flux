@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -27,15 +28,39 @@ fn map_sql<E: std::fmt::Display>(e: E) -> Error {
     Error::Other(format!("event store: {e}"))
 }
 
+/// C-124: how long a write may wait to acquire the SQLite write lock before it leaves a visible
+/// trace. The `busy_timeout` ceiling is 5s (`SqliteEvents::open`) and a starved writer aborts the
+/// whole turn at that point — this threshold is deliberately far below it, so a deployment
+/// drifting toward the wrong topology (design doc `docs/designs/event-store-concurrent-use.md`,
+/// R1: prefer separate `--session-dir` stores or Postgres for sustained multi-writer load) shows up
+/// while contention is still harmless, instead of only the moment a writer times out.
+const CONTENTION_WARN_THRESHOLD: Duration = Duration::from_secs(1);
+
 /// Begin a write transaction that takes the WAL write lock up front (`BEGIN IMMEDIATE`) (C-25). A
 /// deferred transaction (rusqlite's default `unchecked_transaction`) takes a read lock first and only
 /// tries to promote to the write lock at its first write — and SQLite refuses to run the busy handler
 /// on that read→write upgrade (it could deadlock), returning `SQLITE_BUSY` immediately. So a
 /// cross-process contender would still abort despite the `busy_timeout` set in [`SqliteEvents::open`].
 /// Acquiring the write lock at `BEGIN` instead lets the busy handler wait the other writer out.
-fn begin_write(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
-    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(map_sql)
+///
+/// C-124: times the acquisition itself — the blocking call below IS the busy-handler wait, so
+/// timing around it needs no second write path or new store state (design doc R7). A wait past
+/// `warn_after` leaves a `tracing::warn!` trace naming the duration; an uncontended acquisition
+/// (the overwhelming majority) is sub-millisecond and emits nothing.
+fn begin_write(conn: &Connection, warn_after: Duration) -> Result<rusqlite::Transaction<'_>> {
+    let start = Instant::now();
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(map_sql)?;
+    let waited = start.elapsed();
+    if waited >= warn_after {
+        tracing::warn!(
+            waited_ms = waited.as_millis() as u64,
+            threshold_ms = warn_after.as_millis() as u64,
+            "event store write waited on the SQLite busy handler; a second writer is holding the \
+             lock — see docs/designs/event-store-concurrent-use.md R1 if this recurs"
+        );
+    }
+    Ok(tx)
 }
 
 /// The `streams` columns a [`SessionSummary`] reads, in `row_to_summary` order. Shared by
@@ -244,11 +269,32 @@ fn load_by_id(conn: &Connection, id: &str) -> Result<Option<StoredEvent>> {
 /// with `UNIQUE(id)` and `UNIQUE(stream, stream_seq)` as durable backstops.
 pub(crate) struct SqliteEvents {
     conn: Mutex<Connection>,
+    /// C-124: the `begin_write` warn threshold. Always [`CONTENTION_WARN_THRESHOLD`] outside
+    /// tests — overridable only through the `#[cfg(test)]` constructor below, so the contention
+    /// trace can be proven without holding the write lock for a full second.
+    contention_warn_threshold: Duration,
 }
 
 impl SqliteEvents {
     /// Open (creating if needed) a store at `path`, with WAL enabled for concurrent reads.
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_threshold(path, CONTENTION_WARN_THRESHOLD)
+    }
+
+    /// Test-only seam for C-124: open the same way as [`Self::open`], but with a caller-chosen
+    /// contention warn threshold instead of the production default. Lets a test hold the real
+    /// write lock from a second connection (as the busy-handler mechanism actually works) for a
+    /// short, deterministic delay and still cross the threshold — instead of sleeping a full
+    /// second to exercise the production constant.
+    #[cfg(test)]
+    pub(crate) fn open_with_contention_threshold(
+        path: impl AsRef<Path>,
+        threshold: Duration,
+    ) -> Result<Self> {
+        Self::open_with_threshold(path, threshold)
+    }
+
+    fn open_with_threshold(path: impl AsRef<Path>, threshold: Duration) -> Result<Self> {
         let conn = Connection::open(path).map_err(map_sql)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
@@ -265,15 +311,18 @@ impl SqliteEvents {
         // per commit — so single-process throughput does not regress.
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(map_sql)?;
-        Self::init(conn)
+        Self::init(conn, threshold)
     }
 
     /// An in-memory store (for tests and the SDK's ephemeral sessions).
     pub(crate) fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory().map_err(map_sql)?)
+        Self::init(
+            Connection::open_in_memory().map_err(map_sql)?,
+            CONTENTION_WARN_THRESHOLD,
+        )
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, contention_warn_threshold: Duration) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                  global_seq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,6 +353,7 @@ impl SqliteEvents {
         migrate_stream_context(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            contention_warn_threshold,
         })
     }
 }
@@ -319,7 +369,7 @@ impl SqliteEvents {
                 return Ok(existing);
             }
         }
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         // All events in a stream share its run context; read it once and stamp the stored event.
         let ctx = read_context(&tx, stream)?;
         let next_seq: i64 = tx
@@ -391,7 +441,7 @@ impl EventBackend for SqliteEvents {
     fn create_session_with_context(&self, model: &str, ctx: &EventContext) -> Result<String> {
         let ts = now_ms();
         let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         tx.execute(
             "INSERT INTO streams \
              (model, created_at, updated_at, last_seq, msg_count, \
@@ -555,7 +605,7 @@ impl EventBackend for SqliteEvents {
             .filter_map(|stream| parse_id(stream).ok())
             .collect();
         let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         let mut empty: Vec<i64> = {
             // C-87: gate on `last_seq <= 0` (only the seq-0 `SessionStarted` was ever appended), NOT
             // `msg_count = 0`. A session can carry durable facts — a run trace, observations,
@@ -597,7 +647,7 @@ impl EventBackend for SqliteEvents {
             .filter_map(|s| super::parse_id(s).ok())
             .collect();
         let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         let expired: Vec<i64> = {
             let mut stmt = tx
                 .prepare("SELECT n FROM streams WHERE agent_id = ?1 AND updated_at < ?2")
@@ -626,7 +676,7 @@ impl EventBackend for SqliteEvents {
         // The tag-agnostic sibling of `prune_inactive`: same loop-delete shape, WHERE `updated_at`
         // alone (no `agent_id` predicate) — D-75's whole-store retention.
         let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         let expired: Vec<i64> = {
             let mut stmt = tx
                 .prepare("SELECT n FROM streams WHERE updated_at < ?1")
@@ -654,7 +704,7 @@ impl EventBackend for SqliteEvents {
         // event (`HAVING MAX(ts) < cutoff`), so a still-active ad-hoc stream keeps its FULL
         // history. Same transaction shape as the other prunes; no registry rows to delete.
         let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         let expired: Vec<String> = {
             let mut stmt = tx
                 .prepare(
@@ -684,7 +734,7 @@ impl EventBackend for SqliteEvents {
     /// `created_at > updated_at`.
     fn copy_session_atomic(&self, info: &SessionInfo, events: Vec<CopyEvent>) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let tx = begin_write(&conn)?;
+        let tx = begin_write(&conn, self.contention_warn_threshold)?;
         let created_at = info.created_at_ms;
         let updated_at = events.last().map(|e| e.ts_ms).unwrap_or(info.updated_at_ms);
         tx.execute(
