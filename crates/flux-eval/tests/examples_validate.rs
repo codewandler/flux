@@ -31,7 +31,10 @@
 //! calls an op outside even that reach: `advanced-code-review.flux` calls `slack.message.send`, an
 //! op the out-of-process `flux-plugin-slack` binary registers only once an operator installs it and
 //! the host wires its subprocess — categorically unavailable to an in-process test registry. It is
-//! pinned at parse-only via [`FLOW_PARSE_ONLY`], with the reason recorded next to its name.
+//! pinned at parse-only via [`FLOW_PARSE_ONLY`], with the reason recorded next to its name. The
+//! deterministic `bitcoin-price.flux` example likewise calls `web.fetch`, which is registered by
+//! `flux-web` (L5); flux-eval (L3) cannot depend on that outer crate without violating the workspace
+//! layering rule, so that file receives the same explicit parse-only treatment.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -43,12 +46,19 @@ use flux_runtime::ToolRegistry;
 /// documented layering reason — pinned at parse-only rather than the full `lower` gate. Keep this
 /// list to real cross-layer gaps (checked by hand when added); anything else that fails to lower
 /// is drift and must fail the sweep loudly.
-const FLOW_PARSE_ONLY: &[(&str, &str)] = &[(
-    "advanced-code-review.flux",
-    "calls slack.message.send — an out-of-process flux-plugin-slack op, registered only once an \
-     operator installs the plugin and the host wires its subprocess; no in-process registry \
-     reachable from flux-eval provides it",
-)];
+const FLOW_PARSE_ONLY: &[(&str, &str)] = &[
+    (
+        "advanced-code-review.flux",
+        "calls slack.message.send — an out-of-process flux-plugin-slack op, registered only once an \
+         operator installs the plugin and the host wires its subprocess; no in-process registry \
+         reachable from flux-eval provides it",
+    ),
+    (
+        "bitcoin-price.flux",
+        "calls web.fetch — a flux-web (L5) op; flux-eval (L3) cannot depend on that outer-layer \
+         registry without violating the workspace layering rule",
+    ),
+];
 
 /// The fullest op registry flows_validate can build from flux-eval's own dependency set: builtins,
 /// eval ops, `task`, and the cognition pack. See the module doc for why a `NullProvider` is safe
