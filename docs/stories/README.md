@@ -10,14 +10,14 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.25.0 (2026-07-14). Since the 0.15.x line: the **flux-sdk surface** epic
-  (D-142…D-159, v0.16.0–v0.17.0), the **web-capabilities II** extensions (`web.crawl` + a
-  `max_total_bytes` byte budget, PDF extraction, an embeddings pack, and the breaking
-  `web.fetch`/`web.search` dot-rename; D-160…D-166), **plugin operation output schemas** (D-164), a
-  **runnable Slack support-bot** example (D-165), and a public beginner tutorial. See
+- **Released:** v0.27.0 (2026-07-28) — the **Deterministic Agent Lab** epic (Test · Tune ·
+  Resurrect; D-174…D-180) plus its honesty fix wave (D-181…D-185) and the `/effort` command. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Focus:** the async live-datasource epic and its independent release-promotion and typed
-  GitLab/Slack handler batch are complete; take the highest-priority story from Ready next.
+- **Merged, unreleased (next MINOR, 0.28.0):** the **Claude interop** epic (commands + skills from
+  `.flux`/`.claude` trees; D-186…D-192), **context-local git worktrees** (C-97…C-100, C-120…C-121),
+  **TUI polish wave 1** (C-102…C-110) and the boot splash/spinners (C-101). Breaking: `ToolContext.system`
+  → accessor, `ChatState.modal` → `approval`, `TuiRunOptions.theme`, flux-skill API removals.
+- **Focus:** TUI polish wave 2 (C-111…C-116) and the top Ready stories (C-90, C-117).
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.

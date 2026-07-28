@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.21.0 (2026-07-13)**: public + installable at
+Status as of **0.27.0 (2026-07-28)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
@@ -80,7 +80,9 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> **v0.27.0** is released; the epics stamped "merged, unreleased" ship with the next MINOR (0.28.0 —
+> it carries pub-surface breaks from C-97/C-103/C-104 and the D-192 flux-skill removals). See
+> [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
 ### TUI polish — 5 UX + 5 UI (epic) — ✅ **wave 1 IMPLEMENTED 2026-07-28 (C-102…C-110 done, unreleased; wave 2 C-111…C-116 filed)**
 
