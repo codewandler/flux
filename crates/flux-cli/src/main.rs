@@ -24,6 +24,7 @@ mod rendering;
 mod review;
 mod session;
 mod splash;
+mod wakeup_cmd;
 
 use a2a_cmd::*;
 use app_cmd::*;
@@ -38,6 +39,7 @@ use plugin_cmd::*;
 use rendering::*;
 use review::*;
 use session::*;
+use wakeup_cmd::*;
 
 use std::future::Future;
 use std::io::{IsTerminal, Write};

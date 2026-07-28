@@ -17,6 +17,12 @@
 
 ### New
 
+- **Your agent can now say "wake me in ten minutes."** With `[wakeup] enabled` in config, an
+  agent that kicked off something slow can schedule its own follow-up: the reminder survives
+  restarts, fires as a normal turn in the same session the next time it opens, and counts toward
+  that session's usage. Scheduling one requires approval like any host-level action, there's a
+  per-session cap and a maximum horizon, and `flux wakeups list | cancel` shows and clears what's
+  pending.
 - **`flux doctor` tells you what's wrong with an install.** One command checks your credentials
   (including expiring logins), plugin integrity, the sandbox, the session database's health, risky
   network config, disabled tools, and whether you're behind the latest release — each problem

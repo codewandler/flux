@@ -987,6 +987,7 @@ fn register_tool_packs(
     flags: &AgentFlags,
     cfg: &flux_config::Config,
     canonical_model_spec: &str,
+    events: &Arc<EventStore>,
 ) -> Result<()> {
     if let Some(cog_provider) = cog_provider {
         flux_cognition::CognitionPack::new(Arc::from(cog_provider), model.to_string())
@@ -1016,6 +1017,23 @@ fn register_tool_packs(
             Some(consult_target),
             canonical_model_spec.to_string(),
             max_calls,
+        )
+        .try_register(registry)?;
+    }
+    // A-98: `schedule_wakeup` — let a live turn register a durable future continuation of its own
+    // session. Off by default (`[wakeup] enabled`), mirroring `enable_shell`'s posture: an
+    // unconfigured workspace carries no dormant host-write-authority op. Registering one still
+    // needs approval (the op's default-derived `host.write` authority requirement) — this switch
+    // only controls whether the op is offered at all.
+    if cfg.wakeup.enabled {
+        flux_flow::wakeup::WakeupTool::new(
+            events.clone(),
+            cfg.wakeup
+                .max_horizon_secs
+                .unwrap_or(flux_flow::wakeup::DEFAULT_MAX_HORIZON_SECS),
+            cfg.wakeup
+                .max_pending_per_session
+                .unwrap_or(flux_flow::wakeup::DEFAULT_MAX_PENDING_PER_SESSION),
         )
         .try_register(registry)?;
     }
@@ -1309,6 +1327,7 @@ pub(super) async fn build_agent_with(
         flags,
         &cfg,
         &canonical_spec,
+        &events,
     )?;
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
@@ -1550,20 +1569,26 @@ pub(super) async fn build_agent_with(
     Ok((agent, session_id, canonical_spec, spawner))
 }
 
-/// D-178/D-179/D-183 resurrect-on-open: if this session was killed mid-turn (a crash, OOM, or
-/// `kill -9` left a `TurnStarted` with no `TurnEnded`), finish that turn from its crash point
-/// BEFORE the new input runs — the plan is durable source, so no model call is made and no op with
-/// a recorded cassette cell re-fires. Always reported on stderr; never silent.
+/// D-178/D-179/D-183 resurrect-on-open, plus A-98 wake-up servicing: if this session was killed
+/// mid-turn (a crash, OOM, or `kill -9` left a `TurnStarted` with no `TurnEnded`), finish that turn
+/// from its crash point BEFORE the new input runs — the plan is durable source, so no model call is
+/// made and no op with a recorded cassette cell re-fires. THEN fire any of this session's own
+/// wake-ups (`schedule_wakeup`) whose `fire_at_ms` has already elapsed — the "fires on next open"
+/// answer to "who services it" (see `docs/designs/agent-set-wakeup.md`): a plain `flux` session has
+/// no live host watching a timer, so a due wake-up fires here instead, each as its own ordinary
+/// turn, before the caller's new input runs. Always reported on stderr; never silent.
 ///
-/// The one shared [`flux_flow::resurrect::resurrect_on_open`] step every turn-entry point runs
-/// (D-183: this one-shot `flux run`, the REPL, and the TUI, plus the SDK's `send`/`send_with`/
-/// `stream`/`start_flow`) — this is the CLI's thin reporter over it, coloring
-/// [`flux_flow::resurrect::OnOpenLine`] the way the CLI's other status lines are colored.
+/// The two shared steps every turn-entry point runs (D-183: this one-shot `flux run`, the REPL,
+/// and the TUI, plus the SDK's `send`/`send_with`/`stream`/`start_flow`, for resurrect; A-98's
+/// wake-up step is wired into the plain `flux` CLI only so far — see the design doc's scope note)
+/// — this is the CLI's thin reporter over both, coloring [`flux_flow::resurrect::OnOpenLine`] /
+/// [`flux_flow::wakeup::WakeupLine`] the way the CLI's other status lines are colored.
 ///
-/// Never fatal. A session with nothing to resurrect is the overwhelmingly common case and stays
-/// quiet, and a session that CAN'T be resurrected (a crash during planning, before any plan was
-/// accepted — there is no durable plan to finish) must not stop the user from working: it is
-/// reported and the new turn proceeds. `FLUX_AUTO_RESURRECT=0` turns the whole step off.
+/// Never fatal. A session with nothing to resurrect or fire is the overwhelmingly common case and
+/// stays quiet, and a session that CAN'T be resurrected (a crash during planning, before any plan
+/// was accepted — there is no durable plan to finish) must not stop the user from working: it is
+/// reported and the new turn proceeds. `FLUX_AUTO_RESURRECT=0` turns the resurrect step off (the
+/// wake-up step is independent and always runs).
 pub(super) async fn resurrect_on_open(
     agent: &FlowEngine,
     session_id: &str,
@@ -1584,6 +1609,12 @@ pub(super) async fn resurrect_on_open(
             other => eprintln!("resurrect: {other:?}"),
         },
     )
+    .await;
+    flux_flow::wakeup::service_due_wakeups_on_open(agent, session_id, sink, |line| match line {
+        flux_flow::wakeup::WakeupLine::Info(msg) => eprintln!("{}", style::dim(&msg)),
+        flux_flow::wakeup::WakeupLine::Error(msg) => eprintln!("{}", style::red(&msg)),
+        other => eprintln!("wakeup: {other:?}"),
+    })
     .await;
 }
 

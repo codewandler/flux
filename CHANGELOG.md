@@ -8,6 +8,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A-98: agent-set wake-up — a turn can schedule its own resumption.** (**breaking**, see below)
+  A new `schedule_wakeup` op lets a live turn register a durable future continuation of its own
+  session ("the deploy is running; wake me in ten minutes with this context"). Durability rides
+  the session's own event stream — three new closed facts (`WakeupScheduled`/`WakeupFired`/
+  `WakeupCancelled`) folded by a `PendingWakeup` projection, no new store. The op is **off by
+  default** (`[wakeup] enabled`, `enable_shell`'s posture), declares `LocalSystem`
+  effect/access, and its default authority derivation lands on `host_write("schedule_wakeup")` —
+  gated behind approval by the existing `host.write` grant, zero new policy surface (and the
+  C-184 lesson applied: no new domain semantic-effect tag). Per-session cap and max horizon are
+  config-bounded and enforced against the durable projection. A due wake-up fires **through
+  `FlowEngine::run_turn`** — the identical entry a follow-up message uses — so telemetry, turn
+  ids, and cost attribution to the originating session are correct for free (the C-26 lesson);
+  the honest v1 servicing answer, documented and tested: due wake-ups fire on next session open
+  (`flux` CLI wired; a live `flux app run` proactive poller is a recorded follow-up).
+  `flux wakeups list|cancel` inspects and cancels; deleting a session clears its pending
+  wake-ups. Design: `docs/designs/agent-set-wakeup.md`.
+  **Breaking:** `flux_events::EventKind` (deliberately exhaustive) gained the three variants —
+  external exhaustive matches must add arms; this makes the next release a MINOR per the pre-1.0
+  rule.
+
 - **D-195: judge assertions in the SDK test-kit — semantic grading that stays hermetic.**
   `Scenario` (feature `test-kit`) gains `judge`/`assert_judge`: rubric + target text → a graded
   `Verdict` with its rationale surfaced on failure. The judge's own model call is deterministic

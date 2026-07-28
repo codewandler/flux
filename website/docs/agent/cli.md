@@ -41,6 +41,7 @@ and [Safety & approvals](./safety.md).
 | `flux eval <adapter>` | run `mock`, `synthetic`, `terminal-bench`, or combined [evaluations](./improvement.md) |
 | `flux auth status \| login` | manage [provider credentials](./providers.md) |
 | `flux sessions` / `flux usage` | list recent sessions / show token + cost accounting |
+| `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
 | `flux skill …` | render or install generated Flux skills; see [Skills & roles](./skills-and-roles.md) |

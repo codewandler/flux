@@ -149,6 +149,24 @@ pub enum EventKind {
     /// `flux-evidence` (L0), never re-defined.
     Observation(flux_evidence::Observation),
 
+    /// A turn registered a future wake-up (A-98): resume THIS session later with `prompt` (plus
+    /// optional `context` captured now, replayed back unchanged) once `fire_at_ms` elapses. The
+    /// wake-up's identity is this event's own store-minted `id` — no separate id scheme.
+    WakeupScheduled {
+        fire_at_ms: i64,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+    },
+    /// A previously scheduled wake-up fired: its session was re-entered (via the ordinary
+    /// `FlowEngine::run_turn` path, not a bespoke route) as `turn_id` (A-98, the C-26 lesson — a
+    /// real turn, not a telemetry-free shortcut). `wakeup_id` is the firing `WakeupScheduled`
+    /// event's `id`.
+    WakeupFired { wakeup_id: String, turn_id: i64 },
+    /// A pending wake-up was cancelled before it fired (A-98) — an explicit `flux wakeups cancel`,
+    /// or (implicitly, via whole-stream deletion) the session it belonged to being pruned/deleted.
+    WakeupCancelled { wakeup_id: String },
+
     /// An **app-defined** fact (D-55) — the one open extension point in an otherwise closed enum.
     /// `name` namespaces the fact so unrelated consumers sharing one log don't collide; dotted
     /// names are recommended (e.g. `"audit.tool_call"`, mirroring the `Observation.kind` string
@@ -181,6 +199,9 @@ impl EventKind {
             EventKind::CrossPluginResolve { .. } => "cross_plugin_resolve",
             EventKind::EndpointDiscovered { .. } => "endpoint_discovered",
             EventKind::Observation(_) => "observation",
+            EventKind::WakeupScheduled { .. } => "wakeup_scheduled",
+            EventKind::WakeupFired { .. } => "wakeup_fired",
+            EventKind::WakeupCancelled { .. } => "wakeup_cancelled",
             EventKind::Custom { .. } => "custom",
         }
     }

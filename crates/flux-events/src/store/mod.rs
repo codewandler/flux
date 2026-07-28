@@ -851,6 +851,64 @@ impl EventStore {
         Ok(())
     }
 
+    /// Register a future wake-up on `stream` (A-98): resume this session with `prompt` (+
+    /// optional `context`, replayed back unchanged) once `fire_at_ms` elapses. Returns the
+    /// wake-up's id — the store-minted id of the `WakeupScheduled` event itself, so callers never
+    /// invent a second id scheme.
+    pub fn schedule_wakeup(
+        &self,
+        stream: &str,
+        fire_at_ms: i64,
+        prompt: &str,
+        context: Option<&str>,
+    ) -> Result<String> {
+        let stored = self.append(
+            stream,
+            NewEvent::new(EventKind::WakeupScheduled {
+                fire_at_ms,
+                prompt: prompt.to_string(),
+                context: context.map(|s| s.to_string()),
+            }),
+        )?;
+        Ok(stored.id)
+    }
+
+    /// Cancel a pending wake-up before it fires. Returns `false` (no-op) when `wakeup_id` is not
+    /// currently pending on `stream` (already fired, already cancelled, or never existed) — a
+    /// caller can treat that as "nothing to cancel" rather than a hard error.
+    pub fn cancel_wakeup(&self, stream: &str, wakeup_id: &str) -> Result<bool> {
+        if !self
+            .pending_wakeups(stream)?
+            .iter()
+            .any(|w| w.wakeup_id == wakeup_id)
+        {
+            return Ok(false);
+        }
+        self.append(
+            stream,
+            NewEvent::new(EventKind::WakeupCancelled {
+                wakeup_id: wakeup_id.to_string(),
+            }),
+        )?;
+        Ok(true)
+    }
+
+    /// Record that a pending wake-up fired as `turn_id` — the ordinary turn
+    /// [`flux_flow::wakeup::service_due_wakeups_on_open`] ran to service it (C-26: a real turn,
+    /// not a telemetry-free shortcut). Scoped to `turn_id` like [`record_observation`](Self::record_observation)
+    /// when non-negative.
+    pub fn mark_wakeup_fired(&self, stream: &str, wakeup_id: &str, turn_id: i64) -> Result<()> {
+        let mut ev = NewEvent::new(EventKind::WakeupFired {
+            wakeup_id: wakeup_id.to_string(),
+            turn_id,
+        });
+        if turn_id >= 0 {
+            ev = ev.in_turn(turn_id);
+        }
+        self.append(stream, ev)?;
+        Ok(())
+    }
+
     /// Close a turn with its final outcome, iteration count, assistant answer, and token `usage`
     /// tally (`None` when the provider reported none). A negative `turn_id` is a no-op.
     pub fn end_turn(
@@ -901,6 +959,29 @@ impl EventStore {
     /// The turn telemetry for a session (replaces `turn_log` + `plan_attempts`).
     pub fn turns(&self, stream: &str) -> Result<Vec<projection::TurnSummary>> {
         Ok(projection::turns(&self.load_stream(stream, None)?))
+    }
+
+    /// The wake-ups currently pending on `stream` — registered but not yet fired or cancelled
+    /// (A-98). Loads only the three `wakeup_*` kinds (mirrors `observations`'s `load_by_kind`
+    /// efficiency note), never the bulky message/run/usage payloads.
+    pub fn pending_wakeups(&self, stream: &str) -> Result<Vec<projection::PendingWakeup>> {
+        let mut events = self.load_by_kind(stream, "wakeup_scheduled")?;
+        events.extend(self.load_by_kind(stream, "wakeup_fired")?);
+        events.extend(self.load_by_kind(stream, "wakeup_cancelled")?);
+        events.sort_by_key(|e| e.global_seq);
+        Ok(projection::pending_wakeups(&events))
+    }
+
+    /// The pending wake-ups on `stream` whose `fire_at_ms` is at or before `now_ms`, oldest-due
+    /// first (A-98) — what a servicing step (on-open catch-up, or a live host) should fire.
+    pub fn due_wakeups(&self, stream: &str, now_ms: i64) -> Result<Vec<projection::PendingWakeup>> {
+        let mut due: Vec<_> = self
+            .pending_wakeups(stream)?
+            .into_iter()
+            .filter(|w| w.fire_at_ms <= now_ms)
+            .collect();
+        due.sort_by_key(|w| w.fire_at_ms);
+        Ok(due)
     }
 
     /// Token spend + cost for one session, rolled up by model (see [`projection::cost_summary`]).
@@ -2345,6 +2426,147 @@ mod tests {
         );
     }
 
+    /// A-98: `schedule_wakeup`/`cancel_wakeup`/`mark_wakeup_fired` fold correctly through
+    /// `pending_wakeups` — scheduled minus whatever has since fired or been cancelled, oldest
+    /// registered first, and every field (including `context`) round-trips intact.
+    fn wakeup_schedule_cancel_and_fire_fold_into_pending_correctly(store: &EventStore) {
+        let id = store.create_session("m").unwrap();
+
+        let a = store
+            .schedule_wakeup(&id, 1_000, "check the deploy", Some("deploy id: abc123"))
+            .unwrap();
+        let b = store
+            .schedule_wakeup(&id, 2_000, "second wake", None)
+            .unwrap();
+        let c = store
+            .schedule_wakeup(&id, 3_000, "third wake", None)
+            .unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+
+        let pending = store.pending_wakeups(&id).unwrap();
+        assert_eq!(
+            pending.len(),
+            3,
+            "all three are pending right after scheduling"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|w| w.wakeup_id.clone())
+                .collect::<Vec<_>>(),
+            vec![a.clone(), b.clone(), c.clone()],
+            "oldest-registered first"
+        );
+        assert_eq!(pending[0].fire_at_ms, 1_000);
+        assert_eq!(pending[0].prompt, "check the deploy");
+        assert_eq!(pending[0].context.as_deref(), Some("deploy id: abc123"));
+        assert!(pending[1].context.is_none());
+
+        // Cancel the middle one: it drops out, the other two are untouched.
+        assert!(store.cancel_wakeup(&id, &b).unwrap());
+        let pending = store.pending_wakeups(&id).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|w| w.wakeup_id.clone())
+                .collect::<Vec<_>>(),
+            vec![a.clone(), c.clone()]
+        );
+
+        // Firing the first one also removes it from the pending set.
+        store.mark_wakeup_fired(&id, &a, 42).unwrap();
+        let pending = store.pending_wakeups(&id).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|w| w.wakeup_id.clone())
+                .collect::<Vec<_>>(),
+            vec![c.clone()]
+        );
+    }
+
+    /// A-98: `cancel_wakeup` is a no-op (`false`, no event appended) for an id that is unknown,
+    /// already fired, or already cancelled — a caller can treat that as "nothing to cancel"
+    /// instead of a hard error.
+    fn cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id(store: &EventStore) {
+        let id = store.create_session("m").unwrap();
+        assert!(!store.cancel_wakeup(&id, "not-a-real-id").unwrap());
+
+        let w = store.schedule_wakeup(&id, 1_000, "wake", None).unwrap();
+        assert!(
+            store.cancel_wakeup(&id, &w).unwrap(),
+            "first cancel succeeds"
+        );
+        assert!(
+            !store.cancel_wakeup(&id, &w).unwrap(),
+            "a second cancel of the same id is a no-op, not a double-cancel event"
+        );
+
+        let fired = store.schedule_wakeup(&id, 1_000, "wake", None).unwrap();
+        store.mark_wakeup_fired(&id, &fired, 1).unwrap();
+        assert!(
+            !store.cancel_wakeup(&id, &fired).unwrap(),
+            "an already-fired wake-up cannot be cancelled"
+        );
+    }
+
+    /// A-98: `due_wakeups` returns only wake-ups whose `fire_at_ms` has elapsed, soonest-due first
+    /// — the order a servicing step should fire them in.
+    fn due_wakeups_filters_by_fire_at_and_sorts_soonest_first(store: &EventStore) {
+        let id = store.create_session("m").unwrap();
+        let soon = store.schedule_wakeup(&id, 1_000, "soon", None).unwrap();
+        let later = store.schedule_wakeup(&id, 5_000, "later", None).unwrap();
+        let far = store
+            .schedule_wakeup(&id, 9_000, "far future", None)
+            .unwrap();
+
+        let due = store.due_wakeups(&id, 5_000).unwrap();
+        assert_eq!(
+            due.iter().map(|w| w.wakeup_id.clone()).collect::<Vec<_>>(),
+            vec![soon.clone(), later.clone()],
+            "`far` (9_000) is not yet due at now=5_000"
+        );
+
+        let due_all = store.due_wakeups(&id, 10_000).unwrap();
+        assert_eq!(
+            due_all
+                .iter()
+                .map(|w| w.wakeup_id.clone())
+                .collect::<Vec<_>>(),
+            vec![soon, later, far]
+        );
+    }
+
+    /// A-98 acceptance: a pending wake-up is cleared when its session is deleted — with NO new
+    /// code, because registrations ride the session's own event stream. Every existing whole-stream
+    /// delete primitive (`prune_older_than` here; `prune_inactive`/the D-75 whole-store sweep are
+    /// the same shape) already deletes the wake-up along with everything else in the stream.
+    fn deleting_a_session_clears_its_pending_wakeups(store: &EventStore) {
+        let id = store.create_session("m").unwrap();
+        store
+            .record_message(&id, &Message::user_text("hi"))
+            .unwrap();
+        store
+            .schedule_wakeup(&id, 9_999_999_999_999, "far future", None)
+            .unwrap();
+        assert_eq!(store.pending_wakeups(&id).unwrap().len(), 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let cutoff = now_ms();
+        assert_eq!(
+            store.prune_older_than(cutoff).unwrap(),
+            1,
+            "the session is deleted"
+        );
+
+        assert!(store.info(&id).is_err(), "the session itself is gone");
+        assert!(
+            store.pending_wakeups(&id).unwrap().is_empty(),
+            "its pending wake-up is gone too — no separate cleanup needed"
+        );
+    }
+
     /// D-75: `prune_older_than` deletes every stream older than the cutoff regardless of tag — the
     /// whole-store retention primitive. Streams straddling the cutoff: the old ones (registry row
     /// AND events) go, a fresh one survives; an empty-store call is a no-op.
@@ -2778,6 +3000,10 @@ mod tests {
         sqlite_case!(custom_events_append_and_read_back_scoped_by_account);
         sqlite_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
         sqlite_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+        sqlite_case!(wakeup_schedule_cancel_and_fire_fold_into_pending_correctly);
+        sqlite_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
+        sqlite_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
+        sqlite_case!(deleting_a_session_clears_its_pending_wakeups);
 
         // --- SQLite-specific: no Postgres analog (file reopen / cross-process busy-timeout) ---
 
@@ -2796,6 +3022,44 @@ mod tests {
             let store = EventStore::open(&path).unwrap();
             assert_eq!(store.info(&id).unwrap().context, ctx);
             assert_eq!(store.list_for_account("tenant-7", 10).unwrap()[0].id, id);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// A-98 (failing-first): a registered wake-up survives a real close/reopen of the sqlite
+        /// file — the closest a unit test gets to "survives process exit" — and rehydrates with
+        /// its `context` intact, byte-for-byte.
+        #[test]
+        fn wakeup_registration_survives_reopen_with_context_intact() {
+            let path = std::env::temp_dir().join(format!(
+                "flux-events-a98-wakeup-reopen-{}.db",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let (id, wakeup_id) = {
+                let store = EventStore::open(&path).unwrap();
+                let id = store.create_session("m").unwrap();
+                let wakeup_id = store
+                    .schedule_wakeup(
+                        &id,
+                        1_753_000_000_000,
+                        "check the deploy finished",
+                        Some("deploy id: abc123, started by turn 4"),
+                    )
+                    .unwrap();
+                (id, wakeup_id)
+            };
+            // Reopen: a fresh `EventStore` handle on the SAME file, as a new process would get.
+            let store = EventStore::open(&path).unwrap();
+            let pending = store.pending_wakeups(&id).unwrap();
+            assert_eq!(pending.len(), 1, "the registration survived the reopen");
+            assert_eq!(pending[0].wakeup_id, wakeup_id);
+            assert_eq!(pending[0].fire_at_ms, 1_753_000_000_000);
+            assert_eq!(pending[0].prompt, "check the deploy finished");
+            assert_eq!(
+                pending[0].context.as_deref(),
+                Some("deploy id: abc123, started by turn 4"),
+                "context rehydrates intact, not just the prompt"
+            );
             let _ = std::fs::remove_file(&path);
         }
 
@@ -3033,6 +3297,10 @@ mod tests {
         pg_case!(custom_events_append_and_read_back_scoped_by_account);
         pg_case!(prune_older_than_deletes_streams_straddling_the_cutoff);
         pg_case!(prune_adhoc_older_than_reaches_only_aged_unregistered_streams);
+        pg_case!(wakeup_schedule_cancel_and_fire_fold_into_pending_correctly);
+        pg_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
+        pg_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
+        pg_case!(deleting_a_session_clears_its_pending_wakeups);
 
         /// D-76 (PG-only): eight simultaneous cold-boots against ONE fresh schema must ALL succeed.
         /// Postgres's `IF NOT EXISTS` DDL is not atomic — without the global `flux:ddl` advisory

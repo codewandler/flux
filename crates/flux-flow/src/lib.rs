@@ -38,6 +38,7 @@ pub use staged::{
 pub mod state;
 pub mod steering;
 pub mod voice;
+pub mod wakeup;
 pub mod whatif;
 
 pub use agent_sink::AgentSink;

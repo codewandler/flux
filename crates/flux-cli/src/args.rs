@@ -412,6 +412,12 @@ pub(super) enum Commands {
         #[arg(long)]
         until: Option<String>,
     },
+    /// Inspect or cancel agent-scheduled wake-ups (A-98): a turn that called `schedule_wakeup` to
+    /// resume itself later. Defaults to `list` when no action is given.
+    Wakeups {
+        #[command(subcommand)]
+        action: Option<WakeupAction>,
+    },
     /// Per-model token usage + cost across flux and detected local agent harnesses.
     Usage(usage::UsageArgs),
     /// Hermetically replay a recorded session (A-45): host-recorded execution flows re-parse from
@@ -649,6 +655,24 @@ pub(super) enum LoopAction {
         /// Overwrite an existing ejected copy.
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+/// `flux wakeups …` (A-98)
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum WakeupAction {
+    /// List pending wake-ups for a session (the default action).
+    List {
+        /// Session id (`s_42`), or `last` for the most recent session.
+        #[arg(default_value = "last")]
+        session: String,
+    },
+    /// Cancel a pending wake-up before it fires.
+    Cancel {
+        /// Session id (`s_42`), or `last` for the most recent session.
+        session: String,
+        /// The wake-up id (from `flux wakeups list`).
+        wakeup_id: String,
     },
 }
 

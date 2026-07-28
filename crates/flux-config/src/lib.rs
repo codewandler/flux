@@ -1266,7 +1266,10 @@ fn merge(user: Config, project: Config) -> Config {
         // opting in is enough). The bounds are scalars: a project value overrides the user's.
         wakeup: WakeupConfig {
             enabled: user.wakeup.enabled || project.wakeup.enabled,
-            max_horizon_secs: project.wakeup.max_horizon_secs.or(user.wakeup.max_horizon_secs),
+            max_horizon_secs: project
+                .wakeup
+                .max_horizon_secs
+                .or(user.wakeup.max_horizon_secs),
             max_pending_per_session: project
                 .wakeup
                 .max_pending_per_session

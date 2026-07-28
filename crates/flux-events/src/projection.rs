@@ -43,6 +43,57 @@ pub fn run_trace(events: &[StoredEvent]) -> Vec<RunEvent> {
         .collect()
 }
 
+/// A wake-up currently pending — registered but not yet fired or cancelled (A-98). Folded by
+/// [`pending_wakeups`] from [`EventKind::WakeupScheduled`]/[`EventKind::WakeupFired`]/
+/// [`EventKind::WakeupCancelled`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PendingWakeup {
+    /// Identity: the firing `WakeupScheduled` event's own store-minted `id` — what
+    /// `WakeupFired`/`WakeupCancelled` reference and what `flux wakeups cancel` names.
+    pub wakeup_id: String,
+    /// When this wake-up is due, unix milliseconds.
+    pub fire_at_ms: i64,
+    /// The prompt the woken turn will run with.
+    pub prompt: String,
+    /// Background captured when the wake-up was registered, replayed back unchanged when it fires.
+    pub context: Option<String>,
+    /// When the wake-up was registered, unix milliseconds (its `WakeupScheduled` event's `ts_ms`).
+    pub created_at_ms: i64,
+}
+
+/// Fold `WakeupScheduled`/`WakeupFired`/`WakeupCancelled` events into the currently pending set —
+/// scheduled minus whatever has since fired or been cancelled. Oldest-registered first: `events`
+/// is already in append order, so a plain ordered `Vec` (push on schedule, `retain` on
+/// fired/cancelled) preserves true registration order — deliberately NOT a map keyed/sorted by
+/// `wakeup_id` (a ULID) or `created_at_ms`, either of which can tie or misorder two wake-ups
+/// registered within the same millisecond.
+pub fn pending_wakeups(events: &[StoredEvent]) -> Vec<PendingWakeup> {
+    let mut pending: Vec<PendingWakeup> = Vec::new();
+    for e in events {
+        match &e.kind {
+            EventKind::WakeupScheduled {
+                fire_at_ms,
+                prompt,
+                context,
+            } => {
+                pending.push(PendingWakeup {
+                    wakeup_id: e.id.clone(),
+                    fire_at_ms: *fire_at_ms,
+                    prompt: prompt.clone(),
+                    context: context.clone(),
+                    created_at_ms: e.ts_ms,
+                });
+            }
+            EventKind::WakeupFired { wakeup_id, .. } | EventKind::WakeupCancelled { wakeup_id } => {
+                pending.retain(|w| &w.wakeup_id != wakeup_id);
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
 /// One planning attempt within a turn (the old `plan_attempts` row). Also the WRITE shape
 /// [`EventStore::record_plan_attempt`](crate::EventStore::record_plan_attempt) takes — one struct,
 /// no field drift between what is recorded and what the fold reads back.

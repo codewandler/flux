@@ -460,6 +460,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 since,
                 until,
             }) => run_sessions(prune, query, file, since, until),
+            Some(Commands::Wakeups { action }) => run_wakeups(action),
             Some(Commands::Usage(args)) => run_usage(args),
             Some(Commands::Replay {
                 session,
