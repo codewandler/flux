@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.27.0 (2026-07-28)**: public + installable at
+Status as of **0.28.0 (2026-07-28)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
@@ -80,9 +80,8 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.27.0** is released; the epics stamped "merged, unreleased" ship with the next MINOR (0.28.0 —
-> it carries pub-surface breaks from C-97/C-103/C-104 and the D-192 flux-skill removals). See
-> [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
+> and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
 ### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-133…C-140 + A-95, all nine stories; unreleased)**
 
@@ -118,7 +117,7 @@ were biased to a turn's last round), and the adaptive tool set was already byte-
 no-op capability signal that churned the prompt for nothing. Design:
 [designs/llm-cache-review.md](designs/llm-cache-review.md).
 
-### TUI polish — 5 UX + 5 UI (epic) — ✅ **IMPLEMENTED 2026-07-28 (wave 1 C-102…C-110 + wave 2 C-111…C-116 done, unreleased)**
+### TUI polish — 5 UX + 5 UI (epic) — ✅ **SHIPPED v0.28.0 (2026-07-28; wave 1 C-102…C-110 + wave 2 C-111…C-116, all fifteen stories)**
 
 The TUI became a daily driver (A-65) and just gained its boot splash + spinners (C-101); what
 remains are well-defined rough edges. Five UX fixes — a mouse-capture toggle so terminal-native
@@ -127,11 +126,12 @@ subjects as text, readline Ctrl-R history search, Ctrl-F transcript search with 
 real help overlay — and five UI upgrades: progressive narrow-width header/footer degradation, a
 redesigned approval sheet, a theme system (truecolor dark / light / mono + `/theme` + persistence),
 a scroll position indicator, and live animated running tool cards that leave the transcript layout
-cache untouched. Done means all nine stories' acceptance green under the standard gate; the two
-pub-surface breaks (`TuiRunOptions.theme`, `ChatState.modal` → `approval`) ride the next MINOR.
+cache untouched. Done means all nine stories' acceptance green under the standard gate; the three
+pub-surface breaks (`TuiRunOptions.theme`, `ChatState.modal` → `approval`, and wave 2's
+`ApprovalChoice::DenyWithReason`) shipped with the 0.28.0 MINOR.
 Design: [designs/tui-polish.md](designs/tui-polish.md).
 
-### Claude interop — commands + skills that load from both worlds (epic) — ✅ **COMPLETE (2026-07-28; D-186…D-192, all seven stories; supersedes C-93; merged to main, unreleased)**
+### Claude interop — commands + skills that load from both worlds (epic) — ✅ **SHIPPED v0.28.0 (2026-07-28; D-186…D-192, all seven stories; supersedes C-93)**
 
 A compatibility audit found flux half-speaks Claude Code's dialect: skills already load from
 `.claude/skills`/`~/.claude/skills` with `name`/`description` frontmatter, but command files
@@ -146,7 +146,7 @@ real `.claude` directory (commands + nested multi-file skills) works in place, a
 triple-gated (permitted ∧ accessible ∧ agent-triggerable, absorbing C-93), and one honest discovery
 implementation remains. Design: [designs/claude-interop.md](designs/claude-interop.md).
 
-### Context-local Git worktrees (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-97…C-100, merged to main, unreleased; next MINOR — `ToolContext.system` field → accessor is breaking)**
+### Context-local Git worktrees (epic) — ✅ **SHIPPED v0.28.0 (2026-07-28; C-97…C-100 + C-120/C-121; `ToolContext.system` field → accessor is the breaking change that made it a MINOR)**
 
 > Follow-ups: C-120 (disk-backed worktree allocation — `/tmp` tmpfs hazard) and C-121
 > (per-turn worktree note) landed same day; C-122 (plugin hosts follow the transition) is backlog.

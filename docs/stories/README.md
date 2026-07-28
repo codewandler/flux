@@ -10,14 +10,16 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.27.0 (2026-07-28) — the **Deterministic Agent Lab** epic (Test · Tune ·
-  Resurrect; D-174…D-180) plus its honesty fix wave (D-181…D-185) and the `/effort` command. See
+- **Released:** v0.28.0 (2026-07-28) — a MINOR carrying the **Claude interop** epic (commands +
+  skills from `.flux`/`.claude` trees; D-186…D-192), **context-local git worktrees**
+  (C-97…C-100, C-120…C-121), the full **TUI polish** epic (C-102…C-116) with the boot
+  splash/spinners (C-101), **mid-turn steering** (A-94), argv-prefix plugin process grants (C-90),
+  and composite pruning (C-117). Breaking (embedders only): `ToolContext.system` → accessor,
+  `ApprovalChoice::DenyWithReason`, `ChatState.modal` → `approval`, `TuiRunOptions.theme`,
+  `DynamicComposites::validate_base` removed, flux-skill API removals. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Merged, unreleased (next MINOR, 0.28.0):** the **Claude interop** epic (commands + skills from
-  `.flux`/`.claude` trees; D-186…D-192), **context-local git worktrees** (C-97…C-100, C-120…C-121),
-  **TUI polish wave 1** (C-102…C-110) and the boot splash/spinners (C-101). Breaking: `ToolContext.system`
-  → accessor, `ChatState.modal` → `approval`, `TuiRunOptions.theme`, flux-skill API removals.
-- **Focus:** TUI polish wave 2 (C-111…C-116) and the top Ready stories (C-90, C-117).
+- **Focus:** the **LLM cache review** epic — start at C-133 (measure before fixing), then the
+  live-display stories (C-139, C-140) and the claude-side fixes (C-134, C-135, A-95).
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
