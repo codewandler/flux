@@ -490,6 +490,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 unreleased,
             }) => changelog::run(version.as_deref(), all, unreleased),
             Some(Commands::Preset { args }) => preset::run_preset(&args).await,
+            Some(Commands::Doctor { json }) => run_doctor(json).await,
             // No subcommand → interactive REPL (the one implicit entry point).
             None => run_repl(AgentFlags::from_model_yes(None, false)).await,
         }

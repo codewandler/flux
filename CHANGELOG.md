@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-128: `flux doctor` — end-to-end install diagnostics.** Seven data-driven checks, each
+  pass/warn/fail with a one-line fix-it hint on every non-pass (structurally required by the
+  outcome constructors): provider credentials incl. OAuth expiry, plugin-pack signature/hash drift
+  (the D-48 verification reused), OS sandbox backend probe (bwrap/sandbox-exec; fail only under
+  `require`), `events.db` `PRAGMA integrity_check` + WAL size, private-net/egress config sanity
+  (wildcard grants), `[tools] disable` resolution incl. unmatched patterns (C-162's discoverability
+  home), and version skew vs the latest release (network failure degrades to a warn, never a
+  fail). Checks split into pure `judge_*` functions (36 hermetic unit tests, no network or live
+  credentials) plus thin IO collectors; every probe runs under `catch_unwind` so one panicking
+  check becomes a FAIL row instead of killing the report. Exit code non-zero iff any check fails;
+  `--json` for scripting. A seam comment marks where C-165's config-provenance check slots in.
+
 - **C-153: one fuzzy ranker for every TUI picker, with overflow counters.** `fuzzy_rank_indices`
   (the ranker already serving `@`-path completion) now also drives the slash-command menu (so
   `/thm` finds `/theme`) and a new typed query in the session picker (ranking `<id> <model>`

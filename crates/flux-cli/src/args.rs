@@ -531,6 +531,16 @@ pub(super) enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Diagnose a flux install end-to-end: provider credentials (incl. OAuth expiry), plugin-pack
+    /// signature/hash drift, the OS sandbox backend, `events.db` health, private-network egress
+    /// config sanity, `[tools] disable` resolution, and version skew vs the latest release — each
+    /// with a one-line fix-it hint on any non-pass (C-128). Exit code is non-zero iff any check
+    /// fails (a warning never fails the run).
+    Doctor {
+        /// Machine-readable JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Commands {

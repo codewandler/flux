@@ -47,6 +47,7 @@ and [Safety & approvals](./safety.md).
 | `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
 | `flux changelog [version]` | read the embedded customer changelog (`--all` / `--unreleased`) |
 | `flux completion [shell]` | generate a completion script (fish by default) |
+| `flux doctor` | diagnose the install: credentials, plugin-pack integrity, sandbox backend, `events.db` health, egress config, `[tools] disable`, and version skew (`--json` for scripting) |
 
 ### `--store <DIR>` — point the session tools at another store
 
@@ -61,6 +62,22 @@ flux sessions --store tests/scenarios/refund-flow
 
 A scenario fixture written by `flux record` **is** an ordinary store in that layout, so the existing
 Time Machine tools open one directly — there is no fixture-specific inspection path to learn.
+
+## Diagnostics
+
+`flux doctor` runs a fixed suite of checks over the install and prints a pass/warn/fail line per
+check with a one-line fix-it hint on every non-pass:
+
+```bash
+flux doctor
+flux doctor --json   # machine-readable, for scripting / CI
+```
+
+The suite covers provider credentials (including OAuth token expiry), plugin-pack signature/hash
+drift, the OS sandbox backend (bubblewrap / `sandbox-exec`), `events.db` integrity and WAL size,
+private-network egress config sanity, `[tools] disable` resolution, and version skew against the
+latest release. A `WARN` never affects the exit code; the command exits non-zero iff at least one
+check `FAIL`s.
 
 ## Crash recovery and resurrection
 

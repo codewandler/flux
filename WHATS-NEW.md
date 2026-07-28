@@ -15,6 +15,14 @@
 
 ## [Unreleased]
 
+### New
+
+- **`flux doctor` tells you what's wrong with an install.** One command checks your credentials
+  (including expiring logins), plugin integrity, the sandbox, the session database's health, risky
+  network config, disabled tools, and whether you're behind the latest release — each problem
+  comes with a one-line hint for fixing it. `--json` for scripts; the exit code fails only on real
+  failures, never on warnings.
+
 ### Improved
 
 - **The pickers got faster to drive.** Type into the session picker to filter it — matching is the
