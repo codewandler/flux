@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **D-181: Resurrect and what-if traces are now turn-scoped, not session-scoped.** The resume
+  ledger and crash-tail were folded from the whole session trace, so an identical plan re-accepted
+  in a later turn that crashed with zero progress silently fast-forwarded on the earlier turn's
+  completions, and a completed native turn's cells could be served into a later crashed turn.
+  `interrupted`/`resurrect` and the what-if turn filters now window the stream to the turn's own
+  events; purely native crash tails are reported honestly via `ResurrectReport::unanchored_cells`.
+- **D-182: what-if re-plan diffs are never vacuous.** The re-plan path (`.model()`/
+  `.system_prompt()`) now self-records served cells via `RerunRecordingSink` (as `Scenario::check`
+  already did), so a fully tape-served re-plan diffs as identical instead of fake total divergence;
+  `off_tape(Live)` runs record served hits too, and `substitute_at` on a node with no recorded
+  dispatch is now an error naming the node instead of a silent no-op.
+- **D-183: every turn entry resurrects.** `Session::stream` and `Session::start_flow` now run the
+  same auto-resurrect step as `send`/`send_with`, and the CLI REPL and TUI run resurrect-on-open —
+  previously only one-shot `flux run` did, so other entries ran new turns on top of a crashed one.
+  `resurrect::interrupted` also gained an out-of-order tail-guard refusing a stale non-latest turn.
+- **D-184: the Lab's honesty gaps are closed.** `Report::is_clean()` now fails on any live model
+  fall-through (`model_live > 0`); `FLUX_GOLDEN=update` reports the real live-call count and never
+  reads clean; and an unknown-tool refusal is classified `denied` on both `authorize` and
+  `dispatch_outcome`, so `retry`/`loop` no longer burn attempts on a typo'd op name.
+- **D-185: fixture and Lab-CLI hygiene.** `flux record`/`flux test` reject non-single-segment
+  names (`.`/`..`/separators); `EventStore::copy_session_to` is atomic per backend (a failed copy
+  leaves no listed session) with registry timestamps consistent with the copied events; run-diff
+  rows for natively dispatched runs render readable op labels; a relative `--store` is absolutized
+  before export.
+
 ### Added
 
 - **`/effort` REPL and TUI slash command.** View the active reasoning effort (`/effort`) or set it

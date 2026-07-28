@@ -31,35 +31,39 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Next (ready — take the top one unless the user named a story)
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 
-### Deterministic Agent Lab — Test · Tune · Resurrect
-_flux's founding thesis is *the LLM is not the runtime*. Every turn's plan is persisted as_
-- [D-181 — Scope the resurrect ledger and crash tail to the interrupted turn, not the session](D-181-turn-scoped-resurrect-ledger.md) · Agent · review finding (2026-07-28): session-wide fold can fast-forward on a PREVIOUS turn's progress or serve a previous turn's cells
-- [D-182 — Record served cells on the what-if re-plan path so its diffs are never vacuous](D-182-whatif-replan-self-recording.md) · Agent · review finding (2026-07-28): re-plan path drives run_turn_pinned with a bare NullSink — a fully tape-served re-plan diffs as total divergence
-- [D-183 — Run the auto-resurrect step on every turn entry — SDK stream/start_flow and the CLI REPL/TUI](D-183-auto-resurrect-every-turn-entry.md) · Agent · review finding (2026-07-28): only send/send_with (SDK) and one-shot flux run (CLI) resurrect; stream/start_flow/REPL/TUI turns run on top of a crashed turn
-- [D-184 — Close the Lab's honesty gaps — is_clean vs live calls, golden-update reports, silent no-op substitutions](D-184-lab-honesty-gaps.md) · Agent · review finding (2026-07-28): three spots report cleaner than reality — the opposite of the Lab's stated honesty contract
-- [D-185 — Fixture and Lab-CLI hygiene — record/test name validation, atomic session copy, diff rendering](D-185-fixture-and-lab-cli-hygiene.md) · Agent · review finding (2026-07-28): minor hygiene batch across flux record/test, copy_session_to, and the run-diff fallback renderer
-
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
 ## Backlog
-- [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
-- [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 - [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
 - [C-93 — Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable](C-93-agent-invoke-commands-skills.md) · Core · commands/skills exist only for the human at the REPL/TUI; an agent can't invoke one even when policy would allow it
-- [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
-- [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
-- [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
-- [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
+
+### Approval Distillation
+- [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
+
+### Evidence Pinned Memory
+- [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
 
+### Habit Compiler
+- [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
+
+### Quorum Approval
+- [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
+
+### Taint Flow Policy
+- [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
+
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
+
+### Transactional Turns
+- [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 
 ## Done
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
@@ -403,6 +407,11 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-178 — Resurrect — transparent mid-turn crash recovery](D-178-resurrect-durable-execution.md) · Agent · Phase 4 — 'Temporal for agents'; depends on D-175 (Resume scope)
 - [D-179 — Agent Lab CLI — flux record / flux test / resurrect-on-open](D-179-agent-lab-cli-surface.md) · Agent · Phase 5 — CLI as the reference app on the SDK; depends on D-174/D-178
 - [D-180 — Agent Lab — cookbook recipe and dogfood golden suite](D-180-agent-lab-docs-dogfood.md) · Agent · Phase 6 — adoption proof; the flux coding agent gets its own golden tests
+- [D-181 — Scope the resurrect ledger and crash tail to the interrupted turn, not the session](D-181-turn-scoped-resurrect-ledger.md) · Agent · review finding (2026-07-28): session-wide fold can fast-forward on a PREVIOUS turn's progress or serve a previous turn's cells
+- [D-182 — Record served cells on the what-if re-plan path so its diffs are never vacuous](D-182-whatif-replan-self-recording.md) · Agent · review finding (2026-07-28): re-plan path drives run_turn_pinned with a bare NullSink — a fully tape-served re-plan diffs as total divergence
+- [D-183 — Run the auto-resurrect step on every turn entry — SDK stream/start_flow and the CLI REPL/TUI](D-183-auto-resurrect-every-turn-entry.md) · Agent · review finding (2026-07-28): only send/send_with (SDK) and one-shot flux run (CLI) resurrect; stream/start_flow/REPL/TUI turns run on top of a crashed turn
+- [D-184 — Close the Lab's honesty gaps — is_clean vs live calls, golden-update reports, silent no-op substitutions](D-184-lab-honesty-gaps.md) · Agent · review finding (2026-07-28): three spots report cleaner than reality — the opposite of the Lab's stated honesty contract
+- [D-185 — Fixture and Lab-CLI hygiene — record/test name validation, atomic session copy, diff rendering](D-185-fixture-and-lab-cli-hygiene.md) · Agent · review finding (2026-07-28): minor hygiene batch across flux record/test, copy_session_to, and the run-diff fallback renderer
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this
