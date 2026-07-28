@@ -30,6 +30,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # The layering lint runs `cargo metadata --locked --offline`, which needs every lockfile
+      # dep's manifest locally — including other-target deps (e.g. android_system_properties) that
+      # `cargo build` never downloads on this runner. Fetch the full locked closure up front so a
+      # fresh cache (any Cargo.lock change) can't fail the lint.
+      - name: Fetch locked dependencies (all targets)
+        run: cargo fetch --locked
+
       - name: Format
         run: cargo fmt --all --check
 
