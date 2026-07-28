@@ -2364,6 +2364,7 @@ dependencies = [
  "codewandler-flux-lang",
  "codewandler-flux-provider",
  "codewandler-flux-runtime",
+ "codewandler-flux-system",
  "codewandler-flux-tools",
  "codewandler-flux-web",
  "serde_json",

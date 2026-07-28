@@ -58,6 +58,110 @@ pub fn parse_cst(src: &str) -> Parse {
     Parse { green, errors }
 }
 
+/// Incrementally reparse after one contiguous edit, reusing the green node of every top-level
+/// declaration the edit did not touch (L-90).
+///
+/// The root's children are exactly the top-level declarations (`flow`/`op`/data `decl`), each
+/// covering a contiguous span up to the next declaration's first token — so an edit contained
+/// *strictly inside* one declaration can be answered by reparsing that declaration's text alone and
+/// splicing the fresh green node back into the old root. Every other declaration's subtree is
+/// shared, not rebuilt.
+///
+/// `replaced` is the edited range **in `old_text`** and `inserted` is the byte length of the text
+/// that took its place, so `new_text` is `old_text` with `replaced` swapped for those bytes.
+///
+/// Returns `None` when the edit cannot be localized — the caller then does a full [`parse_cst`].
+/// This is a fast path, never a semantic one: the result is validated to reproduce `new_text`
+/// byte-for-byte and to carry a same-kinded declaration, so a `Some` is always the tree a full
+/// reparse would have produced (pinned by `incremental_reparse_matches_full_reparse`).
+pub fn reparse(
+    old: &Parse,
+    old_text: &str,
+    new_text: &str,
+    replaced: TextRange,
+    inserted: usize,
+) -> Option<Parse> {
+    use crate::syntax::SyntaxNode;
+
+    // The caller's edit must describe `new_text` exactly; a mismatched range means the cached tree
+    // and the buffer have drifted apart, and only a full reparse can be trusted.
+    if usize::from(replaced.end()) > old_text.len()
+        || old_text.len() + inserted != new_text.len() + usize::from(replaced.len())
+    {
+        return None;
+    }
+
+    let root = SyntaxNode::new_root(old.green.clone());
+    // Bail unless the root is a pure list of declaration nodes (no stray top-level tokens): the
+    // child index we splice at must be the same index in `children_with_tokens`.
+    if root.children_with_tokens().count() != root.children().count() {
+        return None;
+    }
+    let (index, decl) = root.children().enumerate().find(|(_, decl)| {
+        decl.text_range().start() < replaced.start() && replaced.end() < decl.text_range().end()
+    })?;
+
+    // The edited declaration's span in the *new* text: everything before it is unmoved, and the
+    // edit's size delta lands inside it.
+    let start = usize::from(decl.text_range().start());
+    let old_end = usize::from(decl.text_range().end());
+    let end = old_end + inserted - usize::from(replaced.len());
+    let slice = new_text.get(start..end)?;
+
+    // Reparse the declaration standalone. It must still be exactly one declaration of the same
+    // kind spanning the whole slice — otherwise the edit changed the top-level structure (opened a
+    // new declaration, dedented the body out of this one) and only a full reparse is correct.
+    let fresh = parse_cst(slice);
+    let mut children = fresh.green.children();
+    let child = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    let rowan::NodeOrToken::Node(fresh_decl) = child else {
+        return None;
+    };
+    if FluxLang::kind_from_raw(fresh_decl.kind()) != decl.kind() {
+        return None;
+    }
+
+    let green = old
+        .green
+        .replace_child(index, rowan::NodeOrToken::Node(fresh_decl.to_owned()));
+    // Losslessness guard: the spliced tree must reproduce the new buffer exactly.
+    if SyntaxNode::new_root(green.clone()).text() != new_text {
+        return None;
+    }
+
+    // Errors: keep the untouched declarations' errors (shifting those that follow the edit) and
+    // take the reparsed declaration's errors, rebased onto the document.
+    let delta = inserted as i64 - i64::from(u32::from(replaced.len()));
+    let shift = |offset: TextSize| -> TextSize {
+        if usize::from(offset) >= old_end {
+            TextSize::new((u32::from(offset) as i64 + delta) as u32)
+        } else {
+            offset
+        }
+    };
+    let mut errors: Vec<ParseError> = old
+        .errors
+        .iter()
+        .filter(|e| {
+            usize::from(e.range.start()) < start || usize::from(e.range.start()) >= old_end
+        })
+        .map(|e| ParseError {
+            range: TextRange::new(shift(e.range.start()), shift(e.range.end())),
+            message: e.message.clone(),
+        })
+        .collect();
+    let base = TextSize::new(start as u32);
+    errors.extend(fresh.errors.into_iter().map(|e| ParseError {
+        range: TextRange::new(e.range.start() + base, e.range.end() + base),
+        message: e.message,
+    }));
+    errors.sort_by_key(|e| e.range.start());
+    Some(Parse { green, errors })
+}
+
 struct Parser<'s> {
     src: &'s str,
     tokens: Vec<LexToken>,
@@ -1475,6 +1579,88 @@ mod tests {
             ok.errors.is_empty(),
             "shallow nesting still parses: {:?}",
             ok.errors
+        );
+    }
+
+    // ---- L-90: incremental reparse (green-node reuse) ----------------------
+
+    /// Apply one contiguous edit and reparse it incrementally, asserting the result is identical to
+    /// a full parse of the resulting text — same tree, same errors.
+    fn assert_incremental(src: &str, replaced: std::ops::Range<usize>, inserted: &str) -> bool {
+        let mut new_text = String::from(src);
+        new_text.replace_range(replaced.clone(), inserted);
+        let old = parse_cst(src);
+        let range = TextRange::new(
+            TextSize::new(replaced.start as u32),
+            TextSize::new(replaced.end as u32),
+        );
+        let Some(incremental) = reparse(&old, src, &new_text, range, inserted.len()) else {
+            return false;
+        };
+        let full = parse_cst(&new_text);
+        assert_eq!(
+            incremental.green, full.green,
+            "incremental tree differs from a full reparse of {new_text:?}"
+        );
+        assert_eq!(
+            incremental.errors, full.errors,
+            "incremental errors differ from a full reparse of {new_text:?}"
+        );
+        true
+    }
+
+    #[test]
+    fn incremental_reparse_matches_full_reparse() {
+        let src = "flow a\n  $x = 1\n  return $x\n\nop b() -> String\n  return \"x\"\n\nflow c\n  $y = 2\n  return $y\n";
+        // Edit inside the first flow's body: replace the literal `1` with a call.
+        let one = src.find("= 1").unwrap() + 2;
+        assert!(
+            assert_incremental(src, one..one + 1, "read(\"a.txt\")"),
+            "an edit inside a declaration body takes the incremental path"
+        );
+        // Edit inside the middle op: insert a comment line.
+        let at = src.find("  return \"x\"").unwrap();
+        assert!(assert_incremental(src, at..at, "  # note\n"), "comment insert reuses the neighbours");
+        // Edit inside the last flow: rename a bind (leaves a temporarily unbound use).
+        let y = src.rfind("$y = 2").unwrap();
+        assert!(assert_incremental(src, y..y + 2, "$z"), "a rename edit reuses the neighbours");
+    }
+
+    #[test]
+    fn incremental_reparse_declines_a_structural_edit() {
+        let src = "flow a\n  return 1\n\nflow b\n  return 2\n";
+        // Typing a new declaration at the very start is not contained in any declaration.
+        assert!(
+            !assert_incremental(src, 0..0, "flow z\n  return 0\n\n"),
+            "a new top-level declaration must fall back to a full reparse"
+        );
+        // Dedenting a body line out of its declaration changes the top-level structure.
+        let body = src.find("  return 1").unwrap();
+        assert!(
+            !assert_incremental(src, body..body + 2, "flow mid\n  return 9\n"),
+            "an edit that splits a declaration must fall back to a full reparse"
+        );
+    }
+
+    #[test]
+    fn incremental_reparse_reuses_untouched_declaration_nodes() {
+        // The point of the fast path: the neighbours' green subtrees are shared, not rebuilt.
+        let src = "flow a\n  return 1\n\nflow b\n  $x = 1\n  return $x\n";
+        let old = parse_cst(src);
+        let at = src.rfind('1').unwrap();
+        let mut new_text = String::from(src);
+        new_text.replace_range(at..at + 1, "42");
+        let range = TextRange::new(TextSize::new(at as u32), TextSize::new(at as u32 + 1));
+        let incremental = reparse(&old, src, &new_text, range, 2).expect("localized edit");
+        let before = old.green.children().next().unwrap();
+        let after = incremental.green.children().next().unwrap();
+        let (rowan::NodeOrToken::Node(before), rowan::NodeOrToken::Node(after)) = (before, after)
+        else {
+            panic!("root children are declaration nodes")
+        };
+        assert!(
+            std::ptr::eq(before as *const _, after as *const _),
+            "the untouched `flow a` green node is reused, not rebuilt"
         );
     }
 }
