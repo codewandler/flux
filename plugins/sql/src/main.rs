@@ -20,8 +20,14 @@
 //!   cleartext / MD5 / SASL SCRAM-SHA-256); the plugin drives the Simple Query protocol. All six read
 //!   ops run parameter-free, whitelisted introspection SQL over Simple Query and shape the rows into
 //!   the same JSON the fluxplane reference returns.
-//! - **MySQL** — *not yet supported*. Routed to a clear error; a minimal handshake-v10 + query client
-//!   is the residual (see the module note on [`open_target`]).
+//! - **MySQL / MariaDB** — implemented (D-196…D-198): the host terminates Handshake v10 +
+//!   `mysql_native_password`; the plugin drives `COM_QUERY` and decodes the text protocol. The
+//!   introspection ops carry per-dialect SQL, since `pg_class`/`pg_index` have no MySQL equivalent
+//!   and the foreign-key metadata sits in a different place. **`sql.database.list` means something
+//!   different per dialect** — MySQL treats schema and database as one object, so it returns
+//!   databases where Postgres returns databases *and* the connected database's schemas.
+//!   `caching_sha2_password` (MySQL 8.0+ default), `ed25519`, and `parsec` are not yet implemented
+//!   and fail with an error naming the plugin and the workaround.
 //! - **SQLite** — *unsupported by design*. SQLite is a local file and flux plugins have no filesystem
 //!   capability (`conn.*` is sockets only); a host file capability would be required.
 //!
@@ -239,7 +245,10 @@ fn manifest_builder() -> PluginBuilder {
         .operation_flexible(
             read_op_typed::<DatabaseListInput>(
                 "sql.database.list",
-                "List databases and the connected database's non-system schemas.",
+                "List databases. On PostgreSQL this also lists the connected database's non-system \
+                 schemas (entries are tagged `kind: \"database\"` or `kind: \"schema\"`). On \
+                 MySQL/MariaDB, where schema and database are the same object, every entry is \
+                 `kind: \"database\"` and no schema entries are returned.",
             ),
             op_database_list,
         )
@@ -525,11 +534,7 @@ fn target_from_url(
     }
 
     if dialect == Dialect::Sqlite {
-        return Err(
-            "sqlite unsupported (needs a host file capability): flux plugins have no filesystem \
-             access and conn.* is sockets only"
-                .into(),
-        );
+        return Err(SQLITE_UNSUPPORTED.into());
     }
 
     let (host, port_str) = match hostport.rsplit_once(':') {
@@ -929,28 +934,19 @@ fn read_only_query(query: &str) -> bool {
 
 fn op_test(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
-    require_postgres(&target)?;
     let (user, database, cred) = resolve_connection(&target);
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(
-            host,
-            cid,
-            target.dialect.label(),
-            &user,
-            &database,
-            cred.as_pg(),
-            target.timeout,
-        )?;
-        let res = pg.simple_query("SELECT 1")?;
+        let mut client = SqlClient::connect(host, cid, &target, &user, &database, cred.as_pg())?;
+        let res = client.query("SELECT 1")?;
         let _ = res; // connectivity only; the value is unused
         Ok(json!({
             "status": "ok",
             "endpoint_url": target.safe_url,
             "driver": target.dialect.label(),
             "database": database,
-            "server_version": pg.server_version.clone().unwrap_or_default(),
+            "server_version": client.server_version(),
         }))
     })();
     host.conn_close(cid)?;
@@ -964,21 +960,12 @@ fn op_query(input: Value, host: &mut Host) -> Result<Value, String> {
     }
     let max_rows = clamp(flex_i64(&input, "max_rows").unwrap_or(0), 100, 1000) as usize;
     let target = resolve_target(&input, host)?;
-    require_postgres(&target)?;
     let (user, database, cred) = resolve_connection(&target);
 
     let cid = dial(&target, host)?;
     let shaped = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(
-            host,
-            cid,
-            target.dialect.label(),
-            &user,
-            &database,
-            cred.as_pg(),
-            target.timeout,
-        )?;
-        let result = pg.simple_query(&query)?;
+        let mut client = SqlClient::connect(host, cid, &target, &user, &database, cred.as_pg())?;
+        let result = client.query(&query)?;
         let (rows, truncated) = bounded_rows(&result, max_rows);
         Ok(json!({
             "endpoint_url": target.safe_url,
@@ -1000,51 +987,74 @@ fn op_query(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn op_database_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
-    require_postgres(&target)?;
     let (user, database, cred) = resolve_connection(&target);
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(
-            host,
-            cid,
-            target.dialect.label(),
-            &user,
-            &database,
-            cred.as_pg(),
-            target.timeout,
-        )?;
+        let mut client = SqlClient::connect(host, cid, &target, &user, &database, cred.as_pg())?;
         let mut databases: Vec<Value> = Vec::new();
-        // Databases.
-        let db_res = pg.simple_query(
-            "SELECT datname AS name, pg_get_userbyid(datdba) AS owner, \
-             datname = current_database() AS current_db \
-             FROM pg_database WHERE NOT datistemplate ORDER BY datname",
-        )?;
-        for row in &db_res.rows {
-            let name = cell(&db_res, row, "name");
-            if name.is_empty() {
-                continue;
+        match target.dialect {
+            Dialect::Postgres => {
+                // Postgres models database > schema > table, so this op reports BOTH levels: the
+                // cluster's databases, then the connected database's non-system schemas.
+                let db_res = client.query(
+                    "SELECT datname AS name, pg_get_userbyid(datdba) AS owner, \
+                     datname = current_database() AS current_db \
+                     FROM pg_database WHERE NOT datistemplate ORDER BY datname",
+                )?;
+                for row in &db_res.rows {
+                    let name = cell(&db_res, row, "name");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    databases.push(json!({
+                        "name": name,
+                        "kind": "database",
+                        "owner": cell(&db_res, row, "owner"),
+                        "current": truthy(&cell(&db_res, row, "current_db")),
+                    }));
+                }
+                // Non-system schemas of the connected database.
+                let schema_res = client.query(
+                    "SELECT schema_name AS name FROM information_schema.schemata \
+                     WHERE schema_name NOT IN ('pg_catalog','information_schema') \
+                     AND schema_name NOT LIKE 'pg_%' ORDER BY schema_name",
+                )?;
+                for row in &schema_res.rows {
+                    let name = cell(&schema_res, row, "name");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    databases.push(json!({ "name": name, "kind": "schema" }));
+                }
             }
-            databases.push(json!({
-                "name": name,
-                "kind": "database",
-                "owner": cell(&db_res, row, "owner"),
-                "current": truthy(&cell(&db_res, row, "current_db")),
-            }));
-        }
-        // Non-system schemas of the connected database.
-        let schema_res = pg.simple_query(
-            "SELECT schema_name AS name FROM information_schema.schemata \
-             WHERE schema_name NOT IN ('pg_catalog','information_schema') \
-             AND schema_name NOT LIKE 'pg_%' ORDER BY schema_name",
-        )?;
-        for row in &schema_res.rows {
-            let name = cell(&schema_res, row, "name");
-            if name.is_empty() {
-                continue;
+            Dialect::MySql => {
+                // MySQL/MariaDB treats schema and database as THE SAME OBJECT — there is no
+                // intermediate level. So this op returns one `kind: "database"` entry per schema and
+                // never a `kind: "schema"` one; `information_schema.schemata` here enumerates real
+                // databases, not (as on Postgres) the schemas inside one. Same table name, different
+                // meaning — see the op description and docs/designs/mariadb-support.md.
+                let res = client.query(
+                    "SELECT schema_name AS name, (schema_name = DATABASE()) AS current_db \
+                     FROM information_schema.schemata \
+                     WHERE schema_name NOT IN \
+                     ('information_schema','mysql','performance_schema','sys') \
+                     ORDER BY schema_name",
+                )?;
+                for row in &res.rows {
+                    let name = cell(&res, row, "name");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    // No per-database owner concept in MySQL — the key is omitted, not faked.
+                    databases.push(json!({
+                        "name": name,
+                        "kind": "database",
+                        "current": truthy(&cell(&res, row, "current_db")),
+                    }));
+                }
             }
-            databases.push(json!({ "name": name, "kind": "schema" }));
+            Dialect::Sqlite => return Err(SQLITE_UNSUPPORTED.into()),
         }
         Ok(json!({
             "endpoint_url": target.safe_url,
@@ -1059,7 +1069,6 @@ fn op_database_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
-    require_postgres(&target)?;
     let (user, database, cred) = resolve_connection(&target);
     let schema = flex_str(&input, "schema").unwrap_or_default();
     let include_views = flex_bool(&input, "include_views");
@@ -1067,30 +1076,46 @@ fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(
-            host,
-            cid,
-            target.dialect.label(),
-            &user,
-            &database,
-            cred.as_pg(),
-            target.timeout,
-        )?;
-        let relkinds = if include_views {
-            "('r','p','v','m')"
-        } else {
-            "('r','p')"
+        let mut client = SqlClient::connect(host, cid, &target, &user, &database, cred.as_pg())?;
+        let sql = match target.dialect {
+            Dialect::Postgres => {
+                let relkinds = if include_views {
+                    "('r','p','v','m')"
+                } else {
+                    "('r','p')"
+                };
+                format!(
+                    "SELECT n.nspname AS table_schema, c.relname AS table_name, c.relkind::text AS table_type, \
+                     c.reltuples::bigint AS row_estimate \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.relkind IN {relkinds} AND n.nspname NOT IN ('pg_catalog','information_schema') \
+                     AND n.nspname NOT LIKE 'pg_%' AND ('{s}' = '' OR n.nspname = '{s}') \
+                     ORDER BY n.nspname, c.relname",
+                    s = pg_lit(&schema),
+                )
+            }
+            Dialect::MySql => {
+                // No pg_class equivalent; information_schema.tables carries the same facts.
+                // `table_rows` is an estimate for InnoDB, matching pg's `reltuples` in spirit.
+                let types = if include_views {
+                    "('BASE TABLE','VIEW')"
+                } else {
+                    "('BASE TABLE')"
+                };
+                format!(
+                    "SELECT table_schema AS table_schema, table_name AS table_name, \
+                     table_type AS table_type, table_rows AS row_estimate \
+                     FROM information_schema.tables \
+                     WHERE table_type IN {types} AND table_schema NOT IN \
+                     ('information_schema','mysql','performance_schema','sys') \
+                     AND ('{s}' = '' OR table_schema = '{s}') \
+                     ORDER BY table_schema, table_name",
+                    s = my_lit(&schema),
+                )
+            }
+            Dialect::Sqlite => return Err(SQLITE_UNSUPPORTED.into()),
         };
-        let sql = format!(
-            "SELECT n.nspname AS table_schema, c.relname AS table_name, c.relkind::text AS table_type, \
-             c.reltuples::bigint AS row_estimate \
-             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN {relkinds} AND n.nspname NOT IN ('pg_catalog','information_schema') \
-             AND n.nspname NOT LIKE 'pg_%' AND ('{s}' = '' OR n.nspname = '{s}') \
-             ORDER BY n.nspname, c.relname",
-            s = pg_lit(&schema),
-        );
-        let res = pg.simple_query(&sql)?;
+        let res = client.query(&sql)?;
         let mut tables: Vec<Value> = Vec::new();
         let mut truncated = false;
         for row in &res.rows {
@@ -1131,33 +1156,39 @@ fn op_table_list(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
-    require_postgres(&target)?;
     let (user, database, cred) = resolve_connection(&target);
     let table = flex_str(&input, "table").ok_or("`table` (string) required")?;
     let schema = flex_str(&input, "schema").unwrap_or_default();
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(
-            host,
-            cid,
-            target.dialect.label(),
-            &user,
-            &database,
-            cred.as_pg(),
-            target.timeout,
-        )?;
+        let mut client = SqlClient::connect(host, cid, &target, &user, &database, cred.as_pg())?;
 
-        // Columns.
-        let col_sql = format!(
-            "SELECT column_name, ordinal_position, data_type, udt_name, is_nullable, column_default, \
-             character_maximum_length FROM information_schema.columns \
-             WHERE table_schema = COALESCE(NULLIF('{s}',''),'public') AND table_name = '{t}' \
-             ORDER BY ordinal_position",
-            s = pg_lit(&schema),
-            t = pg_lit(&table),
-        );
-        let col_res = pg.simple_query(&col_sql)?;
+        // Columns. `information_schema.columns` is the one genuinely portable table here — only the
+        // default schema differs: Postgres falls back to `public`, MySQL to the connected database.
+        let col_sql = match target.dialect {
+            Dialect::Postgres => format!(
+                "SELECT column_name, ordinal_position, data_type, udt_name, is_nullable, column_default, \
+                 character_maximum_length FROM information_schema.columns \
+                 WHERE table_schema = COALESCE(NULLIF('{s}',''),'public') AND table_name = '{t}' \
+                 ORDER BY ordinal_position",
+                s = pg_lit(&schema),
+                t = pg_lit(&table),
+            ),
+            Dialect::MySql => format!(
+                "SELECT column_name AS column_name, ordinal_position AS ordinal_position, \
+                 data_type AS data_type, is_nullable AS is_nullable, \
+                 column_default AS column_default, \
+                 character_maximum_length AS character_maximum_length \
+                 FROM information_schema.columns \
+                 WHERE table_schema = COALESCE(NULLIF('{s}',''), DATABASE()) AND table_name = '{t}' \
+                 ORDER BY ordinal_position",
+                s = my_lit(&schema),
+                t = my_lit(&table),
+            ),
+            Dialect::Sqlite => return Err(SQLITE_UNSUPPORTED.into()),
+        };
+        let col_res = client.query(&col_sql)?;
         if col_res.rows.is_empty() {
             return Err(format!("table {table:?} not found"));
         }
@@ -1184,17 +1215,31 @@ fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
         }
 
         // Primary key.
-        let pk_sql = format!(
-            "SELECT kcu.column_name FROM information_schema.table_constraints tc \
-             JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name \
-             AND kcu.constraint_schema = tc.constraint_schema \
-             WHERE tc.constraint_type = 'PRIMARY KEY' \
-             AND tc.table_schema = COALESCE(NULLIF('{s}',''),'public') AND tc.table_name = '{t}' \
-             ORDER BY kcu.ordinal_position",
-            s = pg_lit(&schema),
-            t = pg_lit(&table),
-        );
-        let pk_res = pg.simple_query(&pk_sql)?;
+        let pk_sql = match target.dialect {
+            Dialect::Postgres => format!(
+                "SELECT kcu.column_name FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name \
+                 AND kcu.constraint_schema = tc.constraint_schema \
+                 WHERE tc.constraint_type = 'PRIMARY KEY' \
+                 AND tc.table_schema = COALESCE(NULLIF('{s}',''),'public') AND tc.table_name = '{t}' \
+                 ORDER BY kcu.ordinal_position",
+                s = pg_lit(&schema),
+                t = pg_lit(&table),
+            ),
+            // MySQL names every primary key `PRIMARY`, so constraint names are unique per TABLE, not
+            // per schema. The Postgres join (constraint_name + constraint_schema) would therefore
+            // match every table's PK in the schema at once — hence the direct, table-scoped read.
+            Dialect::MySql => format!(
+                "SELECT column_name AS column_name FROM information_schema.key_column_usage \
+                 WHERE constraint_name = 'PRIMARY' \
+                 AND table_schema = COALESCE(NULLIF('{s}',''), DATABASE()) AND table_name = '{t}' \
+                 ORDER BY ordinal_position",
+                s = my_lit(&schema),
+                t = my_lit(&table),
+            ),
+            Dialect::Sqlite => return Err(SQLITE_UNSUPPORTED.into()),
+        };
+        let pk_res = client.query(&pk_sql)?;
         let mut primary_key: Vec<String> = Vec::new();
         for row in &pk_res.rows {
             let name = cell(&pk_res, row, "column_name");
@@ -1212,21 +1257,38 @@ fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
             }
         }
 
-        // Foreign keys.
-        let fk_sql = format!(
-            "SELECT tc.constraint_name, kcu.column_name, ccu.table_name AS referenced_table_name, \
-             ccu.column_name AS referenced_column_name FROM information_schema.table_constraints tc \
-             JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name \
-             AND kcu.constraint_schema = tc.constraint_schema \
-             JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name \
-             AND ccu.constraint_schema = tc.constraint_schema \
-             WHERE tc.constraint_type = 'FOREIGN KEY' \
-             AND tc.table_schema = COALESCE(NULLIF('{s}',''),'public') AND tc.table_name = '{t}' \
-             ORDER BY tc.constraint_name, kcu.ordinal_position",
-            s = pg_lit(&schema),
-            t = pg_lit(&table),
-        );
-        let fk_res = pg.simple_query(&fk_sql)?;
+        // Foreign keys. The two engines expose the referenced side in structurally different places,
+        // so this is a different query rather than a dialect-tweaked one: Postgres needs a third join
+        // through `constraint_column_usage`, while MySQL carries `referenced_*` on
+        // `key_column_usage` itself (non-FK rows have them NULL, which is the filter).
+        let fk_sql = match target.dialect {
+            Dialect::Postgres => format!(
+                "SELECT tc.constraint_name, kcu.column_name, ccu.table_name AS referenced_table_name, \
+                 ccu.column_name AS referenced_column_name FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name \
+                 AND kcu.constraint_schema = tc.constraint_schema \
+                 JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name \
+                 AND ccu.constraint_schema = tc.constraint_schema \
+                 WHERE tc.constraint_type = 'FOREIGN KEY' \
+                 AND tc.table_schema = COALESCE(NULLIF('{s}',''),'public') AND tc.table_name = '{t}' \
+                 ORDER BY tc.constraint_name, kcu.ordinal_position",
+                s = pg_lit(&schema),
+                t = pg_lit(&table),
+            ),
+            Dialect::MySql => format!(
+                "SELECT constraint_name AS constraint_name, column_name AS column_name, \
+                 referenced_table_name AS referenced_table_name, \
+                 referenced_column_name AS referenced_column_name \
+                 FROM information_schema.key_column_usage \
+                 WHERE referenced_table_name IS NOT NULL \
+                 AND table_schema = COALESCE(NULLIF('{s}',''), DATABASE()) AND table_name = '{t}' \
+                 ORDER BY constraint_name, ordinal_position",
+                s = my_lit(&schema),
+                t = my_lit(&table),
+            ),
+            Dialect::Sqlite => return Err(SQLITE_UNSUPPORTED.into()),
+        };
+        let fk_res = client.query(&fk_sql)?;
         let foreign_keys = group_foreign_keys(&fk_res);
 
         Ok(json!({
@@ -1246,49 +1308,64 @@ fn op_table_show(input: Value, host: &mut Host) -> Result<Value, String> {
 
 fn op_index_list(input: Value, host: &mut Host) -> Result<Value, String> {
     let target = resolve_target(&input, host)?;
-    require_postgres(&target)?;
     let (user, database, cred) = resolve_connection(&target);
     let schema = flex_str(&input, "schema").unwrap_or_default();
     let table = flex_str(&input, "table").unwrap_or_default();
 
     let cid = dial(&target, host)?;
     let result = (|| -> Result<Value, String> {
-        let mut pg = PgClient::connect(
-            host,
-            cid,
-            target.dialect.label(),
-            &user,
-            &database,
-            cred.as_pg(),
-            target.timeout,
-        )?;
-        let sql = format!(
-            "SELECT n.nspname AS table_schema, t.relname AS table_name, i.relname AS index_name, \
-             ix.indisunique, ix.indisprimary, am.amname, pg_get_indexdef(ix.indexrelid) AS definition \
-             FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
-             JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace \
-             JOIN pg_am am ON am.oid = i.relam \
-             WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_%' \
-             AND ('{s}' = '' OR n.nspname = '{s}') AND ('{tb}' = '' OR t.relname = '{tb}') \
-             ORDER BY n.nspname, t.relname, i.relname",
-            s = pg_lit(&schema),
-            tb = pg_lit(&table),
-        );
-        let res = pg.simple_query(&sql)?;
-        let mut indexes: Vec<Value> = Vec::new();
-        for row in &res.rows {
-            let definition = cell(&res, row, "definition");
-            indexes.push(json!({
-                "name": cell(&res, row, "index_name"),
-                "table": cell(&res, row, "table_name"),
-                "schema": cell(&res, row, "table_schema"),
-                "columns": parse_index_def_columns(&definition),
-                "unique": truthy(&cell(&res, row, "indisunique")),
-                "primary": truthy(&cell(&res, row, "indisprimary")),
-                "method": cell(&res, row, "amname"),
-                "definition": definition,
-            }));
-        }
+        let mut client = SqlClient::connect(host, cid, &target, &user, &database, cred.as_pg())?;
+        let indexes: Vec<Value> = match target.dialect {
+            Dialect::Postgres => {
+                let sql = format!(
+                    "SELECT n.nspname AS table_schema, t.relname AS table_name, i.relname AS index_name, \
+                     ix.indisunique, ix.indisprimary, am.amname, pg_get_indexdef(ix.indexrelid) AS definition \
+                     FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid \
+                     JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace \
+                     JOIN pg_am am ON am.oid = i.relam \
+                     WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_%' \
+                     AND ('{s}' = '' OR n.nspname = '{s}') AND ('{tb}' = '' OR t.relname = '{tb}') \
+                     ORDER BY n.nspname, t.relname, i.relname",
+                    s = pg_lit(&schema),
+                    tb = pg_lit(&table),
+                );
+                let res = client.query(&sql)?;
+                let mut out = Vec::new();
+                for row in &res.rows {
+                    let definition = cell(&res, row, "definition");
+                    out.push(json!({
+                        "name": cell(&res, row, "index_name"),
+                        "table": cell(&res, row, "table_name"),
+                        "schema": cell(&res, row, "table_schema"),
+                        "columns": parse_index_def_columns(&definition),
+                        "unique": truthy(&cell(&res, row, "indisunique")),
+                        "primary": truthy(&cell(&res, row, "indisprimary")),
+                        "method": cell(&res, row, "amname"),
+                        "definition": definition,
+                    }));
+                }
+                out
+            }
+            Dialect::MySql => {
+                // `information_schema.statistics` returns ONE ROW PER INDEXED COLUMN, where pg's
+                // pg_index returns one row per index — so this path groups rather than maps.
+                let sql = format!(
+                    "SELECT table_schema AS table_schema, table_name AS table_name, \
+                     index_name AS index_name, non_unique AS non_unique, \
+                     seq_in_index AS seq_in_index, column_name AS column_name, \
+                     index_type AS index_type FROM information_schema.statistics \
+                     WHERE table_schema NOT IN \
+                     ('information_schema','mysql','performance_schema','sys') \
+                     AND ('{s}' = '' OR table_schema = '{s}') AND ('{tb}' = '' OR table_name = '{tb}') \
+                     ORDER BY table_schema, table_name, index_name, seq_in_index",
+                    s = my_lit(&schema),
+                    tb = my_lit(&table),
+                );
+                let res = client.query(&sql)?;
+                group_mysql_indexes(&res)
+            }
+            Dialect::Sqlite => return Err(SQLITE_UNSUPPORTED.into()),
+        };
         Ok(json!({
             "endpoint_url": target.safe_url,
             "driver": target.dialect.label(),
@@ -1301,27 +1378,25 @@ fn op_index_list(input: Value, host: &mut Host) -> Result<Value, String> {
     result
 }
 
-/// MySQL is the residual; SQLite is unsupported by design. Both error clearly so a misrouted call is
-/// never silently half-handled.
-fn require_postgres(target: &SqlTarget) -> Result<(), String> {
-    match target.dialect {
-        Dialect::Postgres => Ok(()),
-        Dialect::MySql => Err(
-            "mysql is not yet supported by the flux sql plugin (residual): the PostgreSQL wire \
-             client is implemented; a minimal MySQL handshake-v10 + query client is future work"
-                .into(),
-        ),
-        Dialect::Sqlite => {
-            Err("sqlite unsupported (needs a host file capability): conn.* is sockets only".into())
-        }
-    }
-}
+/// SQLite is unsupported by design — it is a local file, and flux plugins have no filesystem
+/// capability (`conn.*` is sockets only). Supporting it would need a new host file capability, not a
+/// wire client. Postgres and MySQL/MariaDB are both implemented; this is the only dialect that errors.
+const SQLITE_UNSUPPORTED: &str =
+    "sqlite unsupported (needs a host file capability): flux plugins have no filesystem access and \
+     conn.* is sockets only";
 
 // ===========================================================================
 // Output-shaping helpers
 // ===========================================================================
 
 /// The value of column `name` in `row` as a string (empty when NULL/absent).
+///
+/// **Matching is case-sensitive, and a miss is indistinguishable from a NULL** — both yield `""`.
+/// That is why every dialect's introspection SQL aliases its projection explicitly (`... AS
+/// table_name`): MySQL's `information_schema` columns are declared uppercase, so an unaliased
+/// `SELECT table_name` that came back labelled `TABLE_NAME` would degrade to empty output on every
+/// row rather than erroring — and the hand-crafted-frame tests, which build labels to match, could
+/// not catch it.
 fn cell(res: &QueryResult, row: &[Option<String>], name: &str) -> String {
     res.columns
         .iter()
@@ -1373,6 +1448,71 @@ fn normalize_table_type(value: &str) -> String {
         "M" => "materialized_view".into(),
         _ => value.trim().to_ascii_lowercase(),
     }
+}
+
+/// `(schema, table, index_name)` — what identifies one MySQL index.
+type MySqlIndexKey = (String, String, String);
+/// `(unique, method, columns)` accumulated across that index's per-column rows.
+type MySqlIndexEntry = (bool, String, Vec<String>);
+
+/// Group MySQL `information_schema.statistics` rows — one per indexed column — into one entry per
+/// index, matching the shape the Postgres path emits.
+///
+/// Two deliberate divergences from the Postgres entry, both because MySQL has no equivalent rather
+/// than because they were overlooked:
+/// - `primary` is `index_name = 'PRIMARY'`, which is how MySQL marks a primary key (there is no
+///   `indisprimary` flag).
+/// - `definition` is **omitted**, not synthesized: MySQL has no `pg_get_indexdef`, and emitting a
+///   hand-assembled `CREATE INDEX` string would present a fabrication as server-reported DDL. The
+///   useful content — `columns`, `unique`, `primary`, `method` — is all present.
+///
+/// **Known limitation — functional/expression indexes.** MySQL 8.0.13+ reports an index over an
+/// expression with `COLUMN_NAME` NULL and the expression in a separate `EXPRESSION` column, so such
+/// a part is dropped here and the index appears with fewer columns than it has. Reading `EXPRESSION`
+/// as a fallback is *not* the fix: MariaDB — the dialect this epic primarily targets, and which has
+/// no functional indexes (it indexes generated columns instead) — has no such column, so selecting
+/// it would hard-fail every `index.list` on the main supported engine. Fixing this properly needs
+/// per-engine version detection; until then the gap is recorded rather than papered over.
+fn group_mysql_indexes(res: &QueryResult) -> Vec<Value> {
+    let mut order: Vec<MySqlIndexKey> = Vec::new();
+    let mut by_key: std::collections::HashMap<MySqlIndexKey, MySqlIndexEntry> =
+        std::collections::HashMap::new();
+    for row in &res.rows {
+        let key = (
+            cell(res, row, "table_schema"),
+            cell(res, row, "table_name"),
+            cell(res, row, "index_name"),
+        );
+        let entry = by_key.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (
+                // non_unique is 0 for a unique index, 1 otherwise — the inverse of `unique`.
+                !truthy(&cell(res, row, "non_unique")),
+                cell(res, row, "index_type"),
+                Vec::new(),
+            )
+        });
+        let col = cell(res, row, "column_name");
+        if !col.is_empty() {
+            entry.2.push(col);
+        }
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let (unique, method, columns) = by_key.remove(&key).unwrap();
+            let (schema, table, name) = key;
+            json!({
+                "primary": name == "PRIMARY",
+                "name": name,
+                "table": table,
+                "schema": schema,
+                "columns": columns,
+                "unique": unique,
+                "method": method,
+            })
+        })
+        .collect()
 }
 
 /// Group foreign-key rows (one per column) into `{name, columns, ref_table, ref_columns}`.
@@ -1432,6 +1572,28 @@ fn parse_index_def_columns(definition: &str) -> Vec<String> {
 /// rejecting NUL keeps a hostile name from breaking out of the literal.
 fn pg_lit(s: &str) -> String {
     s.replace('\'', "''").replace('\0', "")
+}
+
+/// The MySQL/MariaDB equivalent of [`pg_lit`].
+///
+/// **Not interchangeable with `pg_lit`.** MySQL treats `\` as an escape character inside string
+/// literals by default (Postgres, with `standard_conforming_strings` on, does not), so doubling only
+/// the quote would let a `\'` in an identifier terminate the literal and inject. The backslash is
+/// escaped first so the quote-doubling that follows cannot be re-escaped.
+///
+/// Two connection-level assumptions this rests on, neither visible from inside the plugin:
+/// - **An ASCII-compatible connection charset.** Backslash-doubling is only sound while no multi-byte
+///   encoding can swallow the escape. The host fixes the charset to `utf8mb4` in the handshake
+///   (`CHARSET_UTF8MB4` in `crates/flux-plugin/src/mysql.rs`) and never reports it back, so a
+///   host-side charset change would silently reopen that injection class here. Change one, check the
+///   other.
+/// - **`NO_BACKSLASH_ESCAPES` is off** (the default). Under ANSI mode the server does not undo the
+///   doubling, so a schema/table name containing a backslash simply matches nothing — a wrong-but-
+///   safe empty result, not an injection.
+fn my_lit(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "''")
+        .replace('\0', "")
 }
 
 /// Contribute query result rows to the host datasource index (best-effort).
@@ -1609,6 +1771,414 @@ impl<'h, 'a> PgClient<'h, 'a> {
             filled += n;
         }
         Ok(())
+    }
+}
+
+// ===========================================================================
+// MySQL / MariaDB wire-protocol client (hand-rolled over the host ConnStream)
+// ===========================================================================
+
+/// A minimal blocking MySQL/MariaDB frontend over a host [`ConnStream`]. The connection handshake is
+/// **host-terminated** (`host.conn_authenticate`, D-196) — the plugin never speaks it and never holds
+/// the password; this client drives only the post-auth `COM_QUERY` **text** protocol. Prepared
+/// statements and the binary protocol are out of scope: the introspection queries are all text-format
+/// reads, and text values map onto the same `Option<String>` cells the Postgres client produces.
+struct MySqlClient<'h, 'a> {
+    stream: ConnStream<'h, 'a>,
+    server_version: Option<String>,
+    /// The packet sequence id, reset to 0 at the start of every command.
+    seq: u8,
+}
+
+/// The protocol's own maximum single-packet payload. A packet of exactly this size continues into
+/// the next one.
+const MYSQL_MAX_PACKET: usize = 0x00FF_FFFF;
+
+/// A classic EOF packet's payload is **exactly 5 bytes** under `CLIENT_PROTOCOL_41` (`0xfe` +
+/// 2-byte warning count + 2-byte status flags). Every OK packet — including the `0xfe`-headered one
+/// that *replaces* EOF under `CLIENT_DEPRECATE_EOF` — is at least 7 (`0xfe` + a length-encoded
+/// affected-rows + a length-encoded last-insert-id + status + warnings). That gap is what tells the
+/// two apart without knowing which capability was negotiated.
+const MYSQL_EOF_PAYLOAD_LEN: usize = 5;
+
+/// Whether `payload` is a classic (pre-`CLIENT_DEPRECATE_EOF`) EOF packet.
+///
+/// A row cannot be mistaken for one: a row opening with `0xfe` is announcing an 8-byte
+/// length-encoded integer, so it needs at least 9 bytes.
+fn is_classic_eof(payload: &[u8]) -> bool {
+    payload.first() == Some(&0xfe) && payload.len() == MYSQL_EOF_PAYLOAD_LEN
+}
+
+/// Upper bound on one **reassembled** logical payload, enforced as the continuation chain is
+/// stitched. MySQL's 3-byte length field caps a single packet at 16 MiB, but a chain of full-size
+/// packets is unbounded — a hostile or compromised endpoint could answer any query with an endless
+/// stream and grow this buffer until the plugin subprocess is killed. The host reader enforces the
+/// same invariant on the auth phase (`MAX_MESSAGE_BYTES` in `crates/flux-plugin/src/handshake.rs`);
+/// this is its query-phase counterpart, set far higher because a legitimate result row may exceed
+/// one packet, unlike an auth message.
+const MYSQL_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Whether `payload` ends a result set — either kind of terminator, since both carry `0xfe`.
+fn is_result_set_terminator(payload: &[u8]) -> bool {
+    payload.first() == Some(&0xfe) && payload.len() < MYSQL_MAX_PACKET
+}
+
+impl<'h, 'a> MySqlClient<'h, 'a> {
+    /// Open a connection by asking the host to terminate the MySQL handshake on the already-dialed
+    /// `conn_id`. The host speaks Handshake v10 + `mysql_native_password` using a credential it
+    /// resolves host-side and hands back a socket sitting after the auth OK packet.
+    fn connect(
+        host: &'h mut Host<'a>,
+        conn_id: u64,
+        protocol: &str,
+        user: &str,
+        database: &str,
+        credential: PgCredential<'_>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<MySqlClient<'h, 'a>, String> {
+        let timeout_ms = timeout.map(|d| d.as_millis().min(u64::MAX as u128) as u64);
+        let handshake = host.conn_authenticate(
+            conn_id,
+            protocol,
+            user,
+            database,
+            Some("flux-plugin-sql"),
+            credential,
+            timeout_ms,
+        )?;
+        let mut client = MySqlClient {
+            stream: ConnStream::new(host, conn_id),
+            server_version: handshake.server_version,
+            seq: 0,
+        };
+        client.stream.set_read_deadline(timeout);
+        Ok(client)
+    }
+
+    /// Run a `COM_QUERY` (0x03) and decode the text-protocol result set.
+    ///
+    /// The response is one of: ERR, a bare OK (no result set — an empty `QueryResult`), or a
+    /// length-encoded column count followed by that many column-definition packets, the rows, and a
+    /// terminator.
+    ///
+    /// **`CLIENT_DEPRECATE_EOF` is not consulted.** That negotiated flag decides whether the
+    /// intermediate EOF (after the column definitions) is present, and whether the terminator is an
+    /// EOF packet or an OK packet — but **both terminators carry a `0xfe` header**, so the two shapes
+    /// are distinguishable on the wire without knowing the flag. A `0xfe` that instead *opens a row*
+    /// is a length-encoded-integer prefix announcing an 8-byte length, i.e. a cell of at least 2^24
+    /// bytes, whose reassembled payload is necessarily `>= 0xFFFFFF`. So `0xfe` with a payload under
+    /// that ceiling is unambiguously a terminator.
+    ///
+    /// Decoding by that rule rather than by the flag keeps the client correct under a host/plugin
+    /// version skew, and avoids widening `HandshakeInfo` — a published 1.0.0 protocol-line type whose
+    /// growth would be a semver break.
+    fn query(&mut self, sql: &str) -> Result<QueryResult, String> {
+        self.seq = 0;
+        let mut payload = Vec::with_capacity(sql.len() + 1);
+        payload.push(0x03);
+        payload.extend_from_slice(sql.as_bytes());
+        self.write_packet(&payload)?;
+
+        let first = self.read_packet()?;
+        match first.first() {
+            None => return Err("mysql: empty response to COM_QUERY".into()),
+            Some(0xff) => return Err(format!("mysql: {}", parse_mysql_err(&first[1..]))),
+            // OK packet: a statement with no result set. Not an error — just no rows.
+            Some(0x00) => {
+                return Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                })
+            }
+            // LOCAL INFILE request. We never negotiate CLIENT_LOCAL_FILES, so a server sending this
+            // is misbehaving; refuse rather than follow it.
+            Some(0xfb) => {
+                return Err(
+                    "mysql: server sent a LOCAL INFILE request, which this client never solicits \
+                     and will not honour"
+                        .into(),
+                )
+            }
+            _ => {}
+        }
+
+        let mut cur = MyCursor::new(&first);
+        let column_count = cur.lenenc_int("column count")? as usize;
+        if column_count == 0 {
+            return Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            });
+        }
+
+        // Column definitions: catalog, schema, table, org_table, NAME, org_name — `name` is the 5th
+        // length-encoded string.
+        let mut columns = Vec::with_capacity(column_count);
+        for i in 0..column_count {
+            let packet = self.read_packet()?;
+            let mut c = MyCursor::new(&packet);
+            for _ in 0..4 {
+                c.lenenc_bytes("column definition prefix")?;
+            }
+            let name = c.lenenc_bytes("column name")?;
+            columns.push(String::from_utf8_lossy(name).into_owned());
+            let _ = i;
+        }
+
+        // A server that did NOT negotiate CLIENT_DEPRECATE_EOF sends an intermediate EOF here, before
+        // the rows; one that did goes straight to the rows (or, for an empty result set, straight to
+        // the terminator). Peek once: swallow a *classic* EOF, and hand anything else to the row loop.
+        let after_columns = self.read_packet()?;
+        let mut pending = if is_classic_eof(&after_columns) {
+            None
+        } else {
+            Some(after_columns)
+        };
+
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        loop {
+            let packet = match pending.take() {
+                Some(p) => p,
+                None => self.read_packet()?,
+            };
+            match packet.first() {
+                Some(0xff) => return Err(format!("mysql: {}", parse_mysql_err(&packet[1..]))),
+                // Terminator: an EOF packet (pre-DEPRECATE_EOF) or an OK packet (post-) — both carry
+                // the 0xfe header. See the doc comment above for why the length test is what
+                // separates it from a row whose first cell opens with an 0xfe length prefix.
+                Some(0xfe) if is_result_set_terminator(&packet) => break,
+                None => return Err("mysql: empty packet in result set".into()),
+                _ => {
+                    let mut r = MyCursor::new(&packet);
+                    let mut row = Vec::with_capacity(column_count);
+                    for _ in 0..column_count {
+                        row.push(r.lenenc_string_or_null("row value")?);
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(QueryResult { columns, rows })
+    }
+
+    // --- framing ---
+
+    /// Write one packet: 3-byte little-endian payload length + 1-byte sequence id + payload.
+    /// A payload larger than the 3-byte ceiling is split, as the protocol requires.
+    fn write_packet(&mut self, payload: &[u8]) -> Result<(), String> {
+        let mut offset = 0;
+        loop {
+            let chunk = std::cmp::min(MYSQL_MAX_PACKET, payload.len() - offset);
+            let mut msg = Vec::with_capacity(chunk + 4);
+            msg.extend_from_slice(&(chunk as u32).to_le_bytes()[..3]);
+            msg.push(self.seq);
+            msg.extend_from_slice(&payload[offset..offset + chunk]);
+            self.seq = self.seq.wrapping_add(1);
+            self.stream
+                .write_all(&msg)
+                .map_err(|e| format!("mysql: write failed: {e}"))?;
+            offset += chunk;
+            // A final chunk of exactly the maximum needs a trailing empty packet to mark the end.
+            if chunk < MYSQL_MAX_PACKET {
+                return Ok(());
+            }
+            if offset == payload.len() {
+                let term = vec![0u8, 0, 0, self.seq];
+                self.seq = self.seq.wrapping_add(1);
+                self.stream
+                    .write_all(&term)
+                    .map_err(|e| format!("mysql: write failed: {e}"))?;
+                return Ok(());
+            }
+        }
+    }
+
+    /// Read one logical payload, reassembling a `0xFFFFFF`-length continuation chain.
+    fn read_packet(&mut self) -> Result<Vec<u8>, String> {
+        let mut payload = Vec::new();
+        loop {
+            let mut header = [0u8; 4];
+            self.read_exact(&mut header)?;
+            let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+            self.seq = header[3].wrapping_add(1);
+            if payload.len() + len > MYSQL_MAX_PAYLOAD_BYTES {
+                return Err(format!(
+                    "mysql: reassembled payload exceeds the {MYSQL_MAX_PAYLOAD_BYTES}-byte cap \
+                     (refusing to buffer an unbounded packet chain)"
+                ));
+            }
+            if len > 0 {
+                let start = payload.len();
+                payload.resize(start + len, 0);
+                self.read_exact(&mut payload[start..])?;
+            }
+            if len < MYSQL_MAX_PACKET {
+                return Ok(payload);
+            }
+        }
+    }
+
+    /// Read exactly `buf.len()` bytes, looping over the chunked `conn.read`; EOF mid-read is an error.
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = self
+                .stream
+                .read(&mut buf[filled..])
+                .map_err(|e| format!("mysql: read failed: {e}"))?;
+            if n == 0 {
+                return Err("mysql: connection closed mid-packet (EOF)".into());
+            }
+            filled += n;
+        }
+        Ok(())
+    }
+}
+
+/// A bounds-checked cursor over a MySQL packet payload, decoding the protocol's length-encoded
+/// integers and strings. Every accessor names the field it reads so a truncated/hostile packet
+/// produces a diagnosable error instead of a panic.
+struct MyCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> MyCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn need(&self, n: usize, what: &str) -> Result<(), String> {
+        if self.data.len() - self.pos < n {
+            return Err(format!(
+                "mysql: packet truncated reading {what} (need {n} bytes, {} left)",
+                self.data.len() - self.pos
+            ));
+        }
+        Ok(())
+    }
+
+    /// A length-encoded integer: `<0xfb` is the value itself; `0xfc`/`0xfd`/`0xfe` introduce a
+    /// 2/3/8-byte little-endian value.
+    fn lenenc_int(&mut self, what: &str) -> Result<u64, String> {
+        self.need(1, what)?;
+        let first = self.data[self.pos];
+        self.pos += 1;
+        let width = match first {
+            0xfc => 2,
+            0xfd => 3,
+            0xfe => 8,
+            0xfb => return Err(format!("mysql: unexpected NULL marker reading {what}")),
+            v => return Ok(v as u64),
+        };
+        self.need(width, what)?;
+        let mut buf = [0u8; 8];
+        buf[..width].copy_from_slice(&self.data[self.pos..self.pos + width]);
+        self.pos += width;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    /// A length-encoded string's bytes.
+    fn lenenc_bytes(&mut self, what: &str) -> Result<&'a [u8], String> {
+        let len = self.lenenc_int(what)? as usize;
+        self.need(len, what)?;
+        let out = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        Ok(out)
+    }
+
+    /// A row cell: `0xfb` is SQL NULL, anything else a length-encoded string.
+    fn lenenc_string_or_null(&mut self, what: &str) -> Result<Option<String>, String> {
+        self.need(1, what)?;
+        if self.data[self.pos] == 0xfb {
+            self.pos += 1;
+            return Ok(None);
+        }
+        let bytes = self.lenenc_bytes(what)?;
+        Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+    }
+}
+
+/// Parse an ERR packet body (after the `0xff` header): 2-byte error code, then — with
+/// CLIENT_PROTOCOL_41 — a `#` marker and a 5-byte SQLSTATE, then the message.
+fn parse_mysql_err(body: &[u8]) -> String {
+    if body.len() < 2 {
+        return "server error (truncated ERR packet)".into();
+    }
+    let code = u16::from_le_bytes([body[0], body[1]]);
+    let rest = &body[2..];
+    let (sqlstate, message) = if rest.first() == Some(&b'#') && rest.len() >= 6 {
+        (
+            Some(String::from_utf8_lossy(&rest[1..6]).into_owned()),
+            String::from_utf8_lossy(&rest[6..]).into_owned(),
+        )
+    } else {
+        (None, String::from_utf8_lossy(rest).into_owned())
+    };
+    match sqlstate {
+        Some(state) => format!("server error {code} ({state}): {message}"),
+        None => format!("server error {code}: {message}"),
+    }
+}
+
+// ===========================================================================
+// Dialect-dispatching client
+// ===========================================================================
+
+/// The connected client for whichever dialect the target names. Each op opens one of these instead of
+/// a `PgClient` directly, so the op bodies differ only in the SQL they send (D-198), not in how they
+/// talk to the server.
+enum SqlClient<'h, 'a> {
+    Pg(PgClient<'h, 'a>),
+    MySql(MySqlClient<'h, 'a>),
+}
+
+impl<'h, 'a> SqlClient<'h, 'a> {
+    fn connect(
+        host: &'h mut Host<'a>,
+        conn_id: u64,
+        target: &SqlTarget,
+        user: &str,
+        database: &str,
+        credential: PgCredential<'_>,
+    ) -> Result<SqlClient<'h, 'a>, String> {
+        let protocol = target.dialect.label();
+        match target.dialect {
+            Dialect::Postgres => Ok(SqlClient::Pg(PgClient::connect(
+                host,
+                conn_id,
+                protocol,
+                user,
+                database,
+                credential,
+                target.timeout,
+            )?)),
+            Dialect::MySql => Ok(SqlClient::MySql(MySqlClient::connect(
+                host,
+                conn_id,
+                protocol,
+                user,
+                database,
+                credential,
+                target.timeout,
+            )?)),
+            // Rejected far earlier, at URL-parse time — a local file is not a socket.
+            Dialect::Sqlite => Err(SQLITE_UNSUPPORTED.into()),
+        }
+    }
+
+    fn query(&mut self, sql: &str) -> Result<QueryResult, String> {
+        match self {
+            SqlClient::Pg(c) => c.simple_query(sql),
+            SqlClient::MySql(c) => c.query(sql),
+        }
+    }
+
+    fn server_version(&self) -> String {
+        match self {
+            SqlClient::Pg(c) => c.server_version.clone().unwrap_or_default(),
+            SqlClient::MySql(c) => c.server_version.clone().unwrap_or_default(),
+        }
     }
 }
 
@@ -1791,6 +2361,151 @@ mod tests {
 
     fn run(op: &str, input: Value, host: &mut MockHost) -> Result<Value, String> {
         manifest_builder().build().call(op, input, host)
+    }
+
+    // -----------------------------------------------------------------
+    // MySQL / MariaDB wire frames (D-197)
+    //
+    // HONESTY: like the PostgreSQL frames above, these are hand-crafted by the test author. They
+    // prove the frame parser and message assembly — NOT live interop with a real MariaDB.
+    // -----------------------------------------------------------------
+
+    /// Frame a MySQL packet: 3-byte little-endian payload length + 1-byte sequence id + payload.
+    fn my_packet(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let mut m = (payload.len() as u32).to_le_bytes()[..3].to_vec();
+        m.push(seq);
+        m.extend_from_slice(payload);
+        m
+    }
+
+    /// A length-encoded string (the short form is enough for every field these tests build).
+    fn my_lenenc(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let n = bytes.len();
+        if n < 251 {
+            out.push(n as u8);
+        } else if n < 65536 {
+            out.push(0xfc);
+            out.extend_from_slice(&(n as u16).to_le_bytes());
+        } else {
+            out.push(0xfd);
+            out.extend_from_slice(&(n as u32).to_le_bytes()[..3]);
+        }
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// A protocol-41 column definition: catalog, schema, table, org_table, NAME, org_name, then the
+    /// fixed tail the client skips.
+    fn my_column_def(name: &str) -> Vec<u8> {
+        let mut p = Vec::new();
+        for field in ["def", "warehouse", "t", "t"] {
+            p.extend(my_lenenc(field.as_bytes()));
+        }
+        p.extend(my_lenenc(name.as_bytes()));
+        p.extend(my_lenenc(name.as_bytes()));
+        p.push(0x0c);
+        p.extend_from_slice(&45u16.to_le_bytes()); // charset
+        p.extend_from_slice(&255u32.to_le_bytes()); // column length
+        p.push(0xfd); // type VAR_STRING
+        p.extend_from_slice(&[0, 0]); // flags
+        p.push(0); // decimals
+        p.extend_from_slice(&[0, 0]); // filler
+        p
+    }
+
+    /// A classic EOF packet (pre-`CLIENT_DEPRECATE_EOF`): `0xfe`, warnings, status.
+    fn my_eof() -> Vec<u8> {
+        vec![0xfe, 0x00, 0x00, 0x02, 0x00]
+    }
+
+    /// The `CLIENT_DEPRECATE_EOF` result-set terminator: an OK packet that also carries the **`0xfe`
+    /// header** (affected_rows, last_insert_id, status, warnings). Deliberately longer than
+    /// [`my_eof`] so the two shapes are not accidentally byte-identical in tests.
+    fn my_eof_ok() -> Vec<u8> {
+        vec![0xfe, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]
+    }
+
+    fn my_err(code: u16, sqlstate: &str, message: &str) -> Vec<u8> {
+        let mut p = vec![0xff];
+        p.extend_from_slice(&code.to_le_bytes());
+        p.push(b'#');
+        p.extend_from_slice(sqlstate.as_bytes());
+        p.extend_from_slice(message.as_bytes());
+        p
+    }
+
+    /// A text-protocol row; `None` is SQL NULL (the `0xfb` marker).
+    fn my_row(values: &[Option<&str>]) -> Vec<u8> {
+        let mut p = Vec::new();
+        for v in values {
+            match v {
+                Some(s) => p.extend(my_lenenc(s.as_bytes())),
+                None => p.push(0xfb),
+            }
+        }
+        p
+    }
+
+    /// A complete `COM_QUERY` result set. `with_eof` selects the pre-`CLIENT_DEPRECATE_EOF` shape
+    /// (intermediate EOF after the column defs, EOF terminator) versus the post- shape (no
+    /// intermediate EOF, OK terminator). The client must decode both without being told which.
+    fn my_result_set(cols: &[&str], rows: &[Vec<Option<&str>>], with_eof: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut seq = 1u8;
+        out.extend(my_packet(seq, &[cols.len() as u8]));
+        seq += 1;
+        for c in cols {
+            out.extend(my_packet(seq, &my_column_def(c)));
+            seq += 1;
+        }
+        if with_eof {
+            out.extend(my_packet(seq, &my_eof()));
+            seq += 1;
+        }
+        for r in rows {
+            out.extend(my_packet(seq, &my_row(r)));
+            seq += 1;
+        }
+        // Both terminators carry the 0xfe header; the shapes differ in the INTERMEDIATE EOF above.
+        out.extend(my_packet(
+            seq,
+            &if with_eof { my_eof() } else { my_eof_ok() },
+        ));
+        out
+    }
+
+    /// The MySQL counterpart of [`host_with`] — a mysql DSN plus the named endpoint ref.
+    fn mysql_host_with(responses: Vec<Vec<u8>>) -> MockHost {
+        let mut stream = Vec::new();
+        for r in responses {
+            stream.extend(r);
+        }
+        MockHost::default()
+            .with_config("dsn", "mariadb://app@db.test:3306/warehouse")
+            .with_endpoint_ref("sql.endpoint", "mariadb://app@db.test:3306/warehouse")
+            .with_conn_response(stream)
+    }
+
+    /// The SQL the plugin actually put on the wire, recovered from the recorded `conn.write` bytes
+    /// (every COM_QUERY payload is `0x03` + the statement).
+    fn sent_queries(host: &MockHost) -> Vec<String> {
+        let buf = host.conn_buf.borrow().clone();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= buf.len() {
+            let len = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], 0]) as usize;
+            let start = i + 4;
+            if start + len > buf.len() {
+                break;
+            }
+            let payload = &buf[start..start + len];
+            if payload.first() == Some(&0x03) {
+                out.push(String::from_utf8_lossy(&payload[1..]).into_owned());
+            }
+            i = start + len;
+        }
+        out
     }
 
     #[test]
@@ -2204,14 +2919,365 @@ mod tests {
     }
 
     #[test]
-    fn mysql_and_sqlite_route_to_clear_errors() {
-        let mut mysql = MockHost::default().with_config("dsn", "mysql://root@db.test:3306/app");
-        let err = run("sql.test", json!({}), &mut mysql).unwrap_err();
-        assert!(err.contains("mysql is not yet supported"), "err = {err}");
-
+    fn sqlite_routes_to_a_clear_error() {
+        // D-198: mysql/mariadb no longer belongs here — it is implemented. SQLite still does, and
+        // still by design: it is a local file, not a socket.
         let mut sqlite = MockHost::default().with_config("dsn", "sqlite:///tmp/app.db");
         let err = run("sql.test", json!({}), &mut sqlite).unwrap_err();
         assert!(err.contains("sqlite unsupported"), "err = {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // D-197 / D-198: MySQL / MariaDB
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn mariadb_test_op_connects_and_reports_the_driver() {
+        // The op that used to return "mysql is not yet supported" now completes.
+        let mut host = mysql_host_with(vec![my_result_set(&["1"], &[vec![Some("1")]], false)]);
+        let out = run("sql.test", json!({}), &mut host).expect("sql.test on mariadb");
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["driver"], "mysql");
+        assert_eq!(out["database"], "warehouse");
+    }
+
+    #[test]
+    fn mysql_query_decodes_columns_rows_and_nulls() {
+        let mut host = mysql_host_with(vec![my_result_set(
+            &["id", "email"],
+            &[
+                vec![Some("1"), Some("a@example.com")],
+                vec![Some("2"), None],
+            ],
+            false,
+        )]);
+        let out = run(
+            "sql.query",
+            json!({"query": "SELECT id, email FROM users"}),
+            &mut host,
+        )
+        .expect("sql.query on mariadb");
+        assert_eq!(out["columns"], json!(["id", "email"]));
+        assert_eq!(out["row_count"], 2);
+        assert_eq!(out["rows"][0]["email"], "a@example.com");
+        assert_eq!(
+            out["rows"][1]["email"],
+            Value::Null,
+            "the 0xfb marker must decode to SQL NULL, not an empty string"
+        );
+    }
+
+    #[test]
+    fn mysql_decodes_both_deprecate_eof_result_set_shapes() {
+        // The client is NOT told whether CLIENT_DEPRECATE_EOF was negotiated; it must decode either
+        // shape from the wire. Both arms must produce identical output.
+        for with_eof in [true, false] {
+            let mut host = mysql_host_with(vec![my_result_set(
+                &["n"],
+                &[vec![Some("7")], vec![Some("8")]],
+                with_eof,
+            )]);
+            let out = run("sql.query", json!({"query": "SELECT n FROM t"}), &mut host)
+                .unwrap_or_else(|e| panic!("with_eof={with_eof}: {e}"));
+            assert_eq!(out["row_count"], 2, "with_eof={with_eof}");
+            assert_eq!(out["rows"][1]["n"], "8", "with_eof={with_eof}");
+        }
+    }
+
+    #[test]
+    fn mysql_decodes_an_empty_result_set_in_both_shapes() {
+        // The case the intermediate-EOF peek can silently break: with no rows, the pre-DEPRECATE_EOF
+        // stream is EOF-then-EOF while the post- stream is a single 0xfe OK. Both must yield zero
+        // rows and neither may block waiting for a packet that is never coming.
+        for with_eof in [true, false] {
+            let mut host = mysql_host_with(vec![my_result_set(&["n"], &[], with_eof)]);
+            let out = run("sql.query", json!({"query": "SELECT n FROM t"}), &mut host)
+                .unwrap_or_else(|e| panic!("with_eof={with_eof}: {e}"));
+            assert_eq!(out["row_count"], 0, "with_eof={with_eof}");
+            assert_eq!(out["columns"], json!(["n"]), "with_eof={with_eof}");
+        }
+    }
+
+    #[test]
+    fn mysql_err_packet_surfaces_code_and_sqlstate() {
+        let mut host = mysql_host_with(vec![my_packet(
+            1,
+            &my_err(1146, "42S02", "Table 'warehouse.nope' doesn't exist"),
+        )]);
+        let err = run(
+            "sql.query",
+            json!({"query": "SELECT * FROM nope"}),
+            &mut host,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("1146") && err.contains("42S02") && err.contains("doesn't exist"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn mysql_reassembles_a_payload_split_at_the_packet_ceiling() {
+        // A payload of exactly 0xFFFFFF continues into the next packet. Build one row whose single
+        // cell fills the first packet to the brim, so the client must stitch both to decode it.
+        let value_len = 0x00FF_FFFF - 4; // 4 = the 0xfd + 3-byte length prefix
+        let value = "x".repeat(value_len);
+        let mut row_payload = my_lenenc(value.as_bytes());
+        assert_eq!(row_payload.len(), 0x00FF_FFFF);
+
+        let mut stream = Vec::new();
+        stream.extend(my_packet(1, &[1u8])); // column count
+        stream.extend(my_packet(2, &my_column_def("blob")));
+        // The row, split: a full-size packet then an empty continuation marking the end.
+        let head: Vec<u8> = std::mem::take(&mut row_payload);
+        stream.extend(my_packet(3, &head));
+        stream.extend(my_packet(4, &[]));
+        stream.extend(my_packet(5, &my_eof_ok()));
+
+        let mut host = mysql_host_with(vec![stream]);
+        let out = run(
+            "sql.query",
+            json!({"query": "SELECT blob FROM t"}),
+            &mut host,
+        )
+        .expect("split payload must reassemble");
+        assert_eq!(out["row_count"], 1);
+        assert_eq!(
+            out["rows"][0]["blob"].as_str().map(|s| s.len()),
+            Some(value_len)
+        );
+    }
+
+    #[test]
+    fn mysql_refuses_an_unbounded_packet_chain() {
+        // A hostile endpoint answers with an endless chain of full-size packets. Reassembly must hit
+        // a ceiling rather than grow the buffer until the plugin subprocess is killed.
+        let mut stream = Vec::new();
+        stream.extend(my_packet(1, &[1u8]));
+        stream.extend(my_packet(2, &my_column_def("blob")));
+        // Five full-size continuation packets: 5 x 16 MiB overruns the 64 MiB cap.
+        let full = vec![b'x'; MYSQL_MAX_PACKET];
+        for seq in 3..8u8 {
+            stream.extend(my_packet(seq, &full));
+        }
+        let mut host = mysql_host_with(vec![stream]);
+        let err = run(
+            "sql.query",
+            json!({"query": "SELECT blob FROM t"}),
+            &mut host,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains("cap"),
+            "an unbounded chain must be refused at the ceiling: {err}"
+        );
+    }
+
+    #[test]
+    fn mysql_write_queries_are_still_rejected() {
+        // The read-only guard is dialect-independent — it must hold on the MySQL path too.
+        let mut host = mysql_host_with(vec![my_result_set(&["x"], &[], false)]);
+        let err = run(
+            "sql.query",
+            json!({"query": "delete from users"}),
+            &mut host,
+        )
+        .unwrap_err();
+        assert!(err.contains("read-only"), "err = {err}");
+    }
+
+    #[test]
+    fn mysql_table_list_reads_information_schema_not_pg_catalog() {
+        let mut host = mysql_host_with(vec![my_result_set(
+            &["table_schema", "table_name", "table_type", "row_estimate"],
+            &[vec![
+                Some("warehouse"),
+                Some("orders"),
+                Some("BASE TABLE"),
+                Some("42"),
+            ]],
+            false,
+        )]);
+        let out = run("sql.table.list", json!({}), &mut host).expect("table.list on mariadb");
+        assert_eq!(out["tables"][0]["name"], "orders");
+        assert_eq!(out["tables"][0]["type"], "table");
+        assert_eq!(out["tables"][0]["row_estimate"], 42);
+
+        let sql = sent_queries(&host).join(" ");
+        assert!(
+            sql.contains("information_schema.tables"),
+            "MySQL must not be sent pg_class: {sql}"
+        );
+        assert!(
+            !sql.contains("pg_class") && !sql.contains("pg_namespace"),
+            "no pg_catalog SQL may reach MySQL: {sql}"
+        );
+        assert!(
+            sql.contains("performance_schema"),
+            "MySQL system schemas must be filtered, not pg_catalog: {sql}"
+        );
+    }
+
+    #[test]
+    fn mysql_database_list_returns_databases_never_schemas() {
+        // The semantic divergence, pinned: MySQL has no schema-vs-database distinction, so every
+        // entry is `kind: "database"` — where the Postgres path also emits `kind: "schema"` rows.
+        let mut host = mysql_host_with(vec![my_result_set(
+            &["name", "current_db"],
+            &[
+                vec![Some("warehouse"), Some("1")],
+                vec![Some("analytics"), Some("0")],
+            ],
+            false,
+        )]);
+        let out = run("sql.database.list", json!({}), &mut host).expect("database.list on mariadb");
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["databases"][0]["kind"], "database");
+        assert_eq!(out["databases"][0]["current"], true);
+        assert_eq!(out["databases"][1]["current"], false);
+        assert!(
+            out["databases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|d| d["kind"] == "database"),
+            "MySQL must never report a `schema` kind: {out}"
+        );
+    }
+
+    #[test]
+    fn mysql_table_show_uses_the_mysql_foreign_key_shape() {
+        let mut host = mysql_host_with(vec![
+            // Columns.
+            my_result_set(
+                &[
+                    "column_name",
+                    "ordinal_position",
+                    "data_type",
+                    "is_nullable",
+                    "column_default",
+                    "character_maximum_length",
+                ],
+                &[vec![
+                    Some("id"),
+                    Some("1"),
+                    Some("int"),
+                    Some("NO"),
+                    None,
+                    None,
+                ]],
+                false,
+            ),
+            // Primary key.
+            my_result_set(&["column_name"], &[vec![Some("id")]], false),
+            // Foreign keys.
+            my_result_set(
+                &[
+                    "constraint_name",
+                    "column_name",
+                    "referenced_table_name",
+                    "referenced_column_name",
+                ],
+                &[vec![
+                    Some("fk_customer"),
+                    Some("customer_id"),
+                    Some("customers"),
+                    Some("id"),
+                ]],
+                false,
+            ),
+        ]);
+        let out = run("sql.table.show", json!({"table": "orders"}), &mut host)
+            .expect("table.show on mariadb");
+        assert_eq!(out["primary_key"], json!(["id"]));
+        assert_eq!(out["columns"][0]["primary_key"], true);
+        assert_eq!(out["foreign_keys"][0]["ref_table"], "customers");
+
+        let sql = sent_queries(&host).join(" ");
+        assert!(
+            !sql.contains("constraint_column_usage"),
+            "MySQL exposes referenced_* on key_column_usage; the pg 3-way join must not be sent: {sql}"
+        );
+        assert!(
+            sql.contains("constraint_name = 'PRIMARY'"),
+            "the PK read must be table-scoped via MySQL's PRIMARY constraint name: {sql}"
+        );
+    }
+
+    #[test]
+    fn mysql_index_list_groups_one_row_per_column_into_one_entry_per_index() {
+        // information_schema.statistics returns a row PER COLUMN, unlike pg_index.
+        let mut host = mysql_host_with(vec![my_result_set(
+            &[
+                "table_schema",
+                "table_name",
+                "index_name",
+                "non_unique",
+                "seq_in_index",
+                "column_name",
+                "index_type",
+            ],
+            &[
+                vec![
+                    Some("warehouse"),
+                    Some("orders"),
+                    Some("PRIMARY"),
+                    Some("0"),
+                    Some("1"),
+                    Some("id"),
+                    Some("BTREE"),
+                ],
+                vec![
+                    Some("warehouse"),
+                    Some("orders"),
+                    Some("idx_cust_date"),
+                    Some("1"),
+                    Some("1"),
+                    Some("customer_id"),
+                    Some("BTREE"),
+                ],
+                vec![
+                    Some("warehouse"),
+                    Some("orders"),
+                    Some("idx_cust_date"),
+                    Some("1"),
+                    Some("2"),
+                    Some("created_at"),
+                    Some("BTREE"),
+                ],
+            ],
+            false,
+        )]);
+        let out = run("sql.index.list", json!({}), &mut host).expect("index.list on mariadb");
+        assert_eq!(out["count"], 2, "three rows must group into two indexes");
+        assert_eq!(out["indexes"][0]["name"], "PRIMARY");
+        assert_eq!(out["indexes"][0]["primary"], true);
+        assert_eq!(out["indexes"][0]["unique"], true);
+        assert_eq!(out["indexes"][1]["name"], "idx_cust_date");
+        assert_eq!(out["indexes"][1]["primary"], false);
+        assert_eq!(
+            out["indexes"][1]["unique"], false,
+            "non_unique=1 must invert to unique=false"
+        );
+        assert_eq!(
+            out["indexes"][1]["columns"],
+            json!(["customer_id", "created_at"]),
+            "multi-column indexes must keep seq_in_index order"
+        );
+        assert!(
+            out["indexes"][0].get("definition").is_none(),
+            "MySQL has no pg_get_indexdef; `definition` is omitted rather than fabricated"
+        );
+    }
+
+    #[test]
+    fn my_lit_escapes_backslashes_that_pg_lit_would_let_through() {
+        // MySQL treats `\` as an escape character inside string literals, so doubling only the quote
+        // (as pg_lit does) would let `\'` terminate the literal and inject.
+        assert_eq!(my_lit(r"a\'b"), r"a\\''b");
+        assert_eq!(pg_lit(r"a\'b"), r"a\''b");
+        assert_eq!(my_lit("plain"), "plain");
+        assert_eq!(my_lit("it's"), "it''s");
     }
 
     #[test]
