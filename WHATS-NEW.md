@@ -17,6 +17,18 @@
 
 ### New
 
+- **Connect to MySQL and MariaDB databases.** Pointing the SQL integration at a MySQL or MariaDB
+  server used to fail with "not yet supported" — only PostgreSQL worked. Now all of it works the
+  same way it does against Postgres: list databases and tables, inspect a table's columns, primary
+  key and foreign keys, list its indexes, and run your own read-only queries. Everything stays
+  read-only, and the connection password is still never handed to the integration itself.
+  Two things worth knowing. On MySQL and MariaDB a schema *is* a database — there is no level in
+  between — so listing databases gives you just the databases, where on Postgres it also lists the
+  schemas inside the one you are connected to. And servers configured for MySQL 8's newer
+  `caching_sha2_password` login are not supported yet; you will get a message naming it, and can
+  either use a server-standard password login or connect to MariaDB, which does not default to it.
+  SQLite is still unsupported — it is a file on disk rather than something to connect to.
+
 - **Project guidance that only shows up when it applies.** Conventions files like `AGENTS.md` are
   read in full every session, so in a big repository you either keep them short and lose the
   subsystem detail, or keep them complete and pay for all of it on every message. You can now put a
