@@ -12,6 +12,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **The chat UI now shows where your time went.** Each model reply carries a badge with how long
+  the model took and how quickly it started answering; while a call runs, the footer shows that
+  wait live next to the turn total; and a finished turn splits its clock into model time versus
+  everything else — so a slow model, a slow tool, and a paused connection stop looking identical.
+  When a provider hiccups and flux retries behind the scenes, the footer now says so (`↻ retry 2/6 ·
+  waiting 4s`) instead of leaving you staring at a spinner, and the transcript records how many
+  retries a reply needed.
+- **Approving a plan now shows you the plan.** The approval sheet used to summarize a multi-step
+  plan as a count (“3 op(s)”); it now lists each operation with what it will touch, so you can see
+  exactly what you are authorizing before you say yes.
+
 ### Improved
 
 - **Claude models through OpenRouter got much cheaper.** They were being billed at full price on
