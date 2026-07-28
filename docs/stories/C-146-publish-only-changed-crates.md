@@ -31,7 +31,7 @@ version lines require.
 
 ## Progress
 - Done. See the CHANGELOG `[Unreleased]` entries and `docs/designs/plugin-protocol-decoupling.md` ("As built").
-- Wall-clock can only be measured at the next release: the pre-check turns 28 `cargo package` invocations into 28 HTTP GETs plus a package for whatever actually moved.
+- Wall-clock is not measurable yet. At the 0.29.0 cut every closure crate is genuinely new (`1.0.0` has never been published, `0.29.0` is fresh), so the pre-check skips nothing. The saving lands from 0.29.1 onward, when the six 1.x crates are already live and skip without packaging.
 
 ## Notes
 - Depends on C-143 — with every crate on one version line there is nothing to skip.
