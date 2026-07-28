@@ -1,6 +1,6 @@
 //! Host-side capability enforcement and its security regression tests.
 
-use super::pg;
+use super::handshake;
 use super::*;
 
 /// The privileged operations a plugin may request of the host during an operation call. Every
@@ -970,7 +970,7 @@ impl HostCapabilities for SystemHostCaps {
                     sink.register_secret(&password);
                 }
 
-                let params = pg::HandshakeParams {
+                let params = handshake::HandshakeParams {
                     user,
                     database,
                     application_name,
@@ -980,7 +980,8 @@ impl HostCapabilities for SystemHostCaps {
                     .get_mut(&conn_id)
                     .ok_or_else(|| format!("conn.authenticate: no open connection {conn_id}"))?;
                 let result =
-                    pg::terminate_handshake(protocol, stream, &params, &password, timeout).await?;
+                    handshake::terminate_handshake(protocol, stream, &params, &password, timeout)
+                        .await?;
                 drop(guard);
                 // The response carries ONLY negotiated non-secret parameters — never the password.
                 let mut out = json!({
@@ -992,6 +993,14 @@ impl HostCapabilities for SystemHostCaps {
                 }
                 if let Some(key) = result.backend_key {
                     out["backend_key"] = json!(key);
+                }
+                // MySQL only: the negotiated capability flags, reported for diagnosis. The `sql`
+                // plugin deliberately does NOT consume these — it decodes both CLIENT_DEPRECATE_EOF
+                // result-set shapes from packet sizes instead, because surfacing the flag through
+                // `host_kit::HandshakeInfo` would mean a new public field on a 1.0.0 protocol-line
+                // type (a semver break). See the D-197 story for the full reasoning.
+                if let Some(caps) = result.capabilities {
+                    out["capabilities"] = json!(caps);
                 }
                 Ok(out)
             }
@@ -1714,6 +1723,9 @@ use loading::{plugin_tool_spec, semantic_effect_tags};
 
 #[cfg(test)]
 mod tests {
+    // The pg/mysql protocol modules are exercised directly by the D-31/D-196 handshake tests; the
+    // non-test host path reaches them only through `handshake::terminate_handshake`.
+    use super::pg;
     use super::*;
 
     #[test]
@@ -4674,8 +4686,8 @@ mod tests {
         .unwrap()
     }
 
-    fn pg_params() -> pg::HandshakeParams {
-        pg::HandshakeParams {
+    fn pg_params() -> handshake::HandshakeParams {
+        handshake::HandshakeParams {
             user: "app".into(),
             database: "warehouse".into(),
             application_name: "flux-test".into(),
@@ -4923,6 +4935,398 @@ mod tests {
             .await
             .ok();
         std::env::remove_var("FLUX_TEST_PG_PW_D31");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===========================================================================
+    // D-196: host-terminated MySQL/MariaDB auth (the `mysql` module) against a scripted
+    // MySQL-server stub over a real loopback TcpListener. Hermetic — no external mysqld.
+    //
+    // HONESTY: these replay hand-crafted server frames. They prove the frame parser and message
+    // assembly against bytes this test author wrote — NOT live interop with a real MariaDB.
+    // ===========================================================================
+
+    /// The 20-byte scramble every scripted MySQL server below issues.
+    const MY_SCRAMBLE: &[u8; 20] = b"ABCDEFGHIJKLMNOPQRST";
+
+    /// Frame a MySQL packet: 3-byte little-endian payload length + 1-byte sequence id + payload.
+    fn my_packet(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let mut m = (payload.len() as u32).to_le_bytes()[..3].to_vec();
+        m.push(seq);
+        m.extend_from_slice(payload);
+        m
+    }
+
+    /// Read one MySQL packet from the client on the server side, returning its payload.
+    async fn my_read_packet(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut hdr = [0u8; 4];
+        sock.read_exact(&mut hdr).await.unwrap();
+        let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], 0]) as usize;
+        let mut body = vec![0u8; len];
+        sock.read_exact(&mut body).await.unwrap();
+        body
+    }
+
+    /// A Handshake v10 greeting advertising `auth_plugin` and 4.1 + secure-connection +
+    /// plugin-auth + deprecate-EOF.
+    fn my_greeting(auth_plugin: &str) -> Vec<u8> {
+        let caps: u32 = 0x0108_A20D;
+        let mut p = vec![10u8];
+        p.extend_from_slice(b"11.4.2-MariaDB\0");
+        p.extend_from_slice(&77u32.to_le_bytes()); // connection id
+        p.extend_from_slice(&MY_SCRAMBLE[..8]);
+        p.push(0); // filler
+        p.extend_from_slice(&(caps as u16).to_le_bytes());
+        p.push(45); // charset
+        p.extend_from_slice(&[0, 0]); // status flags
+        p.extend_from_slice(&((caps >> 16) as u16).to_le_bytes());
+        p.push(21); // auth-plugin-data length (20 + NUL)
+        p.extend_from_slice(&[0u8; 10]); // reserved
+        p.extend_from_slice(&MY_SCRAMBLE[8..]); // 12 bytes
+        p.push(0); // scramble terminator
+        p.extend_from_slice(auth_plugin.as_bytes());
+        p.push(0);
+        p
+    }
+
+    fn my_ok_packet() -> Vec<u8> {
+        vec![0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]
+    }
+
+    fn my_err_packet(code: u16, sqlstate: &str, message: &str) -> Vec<u8> {
+        let mut p = vec![0xff];
+        p.extend_from_slice(&code.to_le_bytes());
+        p.push(b'#');
+        p.extend_from_slice(sqlstate.as_bytes());
+        p.extend_from_slice(message.as_bytes());
+        p
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum MyMode {
+        /// Native password, correct credential accepted.
+        Ok,
+        /// Native password, but the server rejects the token with ERR 1045.
+        WrongPassword,
+        /// The greeting advertises `caching_sha2_password` (the MySQL 8.0+ default).
+        CachingSha2,
+        /// Native greeting, then an AuthSwitchRequest to `ed25519` mid-handshake.
+        Ed25519Switch,
+    }
+
+    /// A scripted MySQL server. On the success path it recomputes the expected
+    /// `mysql_native_password` token with the host's own helper, so the test proves the client's
+    /// scramble arithmetic rather than merely that it sent 20 bytes.
+    async fn spawn_mysql_server(password: &'static str, mode: MyMode) -> u16 {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            let advertised = match mode {
+                MyMode::CachingSha2 => "caching_sha2_password",
+                _ => "mysql_native_password",
+            };
+            sock.write_all(&my_packet(0, &my_greeting(advertised)))
+                .await
+                .unwrap();
+
+            if mode == MyMode::CachingSha2 {
+                // The client must refuse before sending anything — nothing left to script.
+                let _ = sock.shutdown().await;
+                return;
+            }
+
+            let response = my_read_packet(&mut sock).await;
+
+            if mode == MyMode::Ed25519Switch {
+                let mut sw = vec![0xfe];
+                sw.extend_from_slice(b"ed25519\0");
+                sw.extend_from_slice(MY_SCRAMBLE);
+                sw.push(0);
+                sock.write_all(&my_packet(2, &sw)).await.unwrap();
+                let _ = sock.shutdown().await;
+                return;
+            }
+
+            // Parse HandshakeResponse41 far enough to reach the 1-byte-prefixed auth response:
+            // 4 caps + 4 max-packet + 1 charset + 23 reserved, then the NUL-terminated user.
+            let user_start = 32;
+            let user_end =
+                user_start + response[user_start..].iter().position(|&b| b == 0).unwrap();
+            let auth_len = response[user_end + 1] as usize;
+            let got = &response[user_end + 2..user_end + 2 + auth_len];
+            let want = crate::mysql::native_password(password, MY_SCRAMBLE);
+
+            let reply = if mode == MyMode::Ok && got == want.as_slice() {
+                my_ok_packet()
+            } else {
+                my_err_packet(
+                    1045,
+                    "28000",
+                    "Access denied for user 'app'@'localhost' (using password: YES)",
+                )
+            };
+            sock.write_all(&my_packet(2, &reply)).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        port
+    }
+
+    fn my_params() -> handshake::HandshakeParams {
+        handshake::HandshakeParams {
+            user: "app".into(),
+            database: "warehouse".into(),
+            application_name: "flux-test".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mysql_native_password_handshake_succeeds_and_captures_capabilities() {
+        let port = spawn_mysql_server("pencil", MyMode::Ok).await;
+        let mut stream = dial_loopback(port).await;
+        let result = crate::mysql::authenticate(
+            &mut stream,
+            &my_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("native-password handshake should succeed");
+
+        assert_eq!(result.server_version(), Some("11.4.2-MariaDB"));
+        assert_eq!(result.backend_pid, Some(77));
+        // D-197 needs CLIENT_DEPRECATE_EOF (0x0100_0000) to know the result-set shape.
+        let caps = result.capabilities.expect("mysql must report capabilities");
+        assert_ne!(
+            caps & 0x0100_0000,
+            0,
+            "CLIENT_DEPRECATE_EOF must be negotiated when the server offers it: {caps:#x}"
+        );
+        // CLIENT_LOCAL_FILES (0x80) must never be announced — it lets a hostile server ask the host
+        // to read a local file (`LOAD DATA LOCAL INFILE`).
+        assert_eq!(
+            caps & 0x0000_0080,
+            0,
+            "CLIENT_LOCAL_FILES must never be negotiated: {caps:#x}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_rejects_wrong_password() {
+        let port = spawn_mysql_server("pencil", MyMode::WrongPassword).await;
+        let mut stream = dial_loopback(port).await;
+        let err = crate::mysql::authenticate(
+            &mut stream,
+            &my_params(),
+            "wrong-password",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("1045") && err.contains("28000"),
+            "the server's ERR code and SQLSTATE must survive: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_rejects_caching_sha2_password_by_name() {
+        let port = spawn_mysql_server("pencil", MyMode::CachingSha2).await;
+        let mut stream = dial_loopback(port).await;
+        let err = crate::mysql::authenticate(
+            &mut stream,
+            &my_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("caching_sha2_password") && err.contains("mysql_native_password"),
+            "the error must name the unsupported plugin AND the workaround: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_rejects_ed25519_auth_switch_by_name() {
+        // The mid-handshake AuthSwitchRequest path: a clean named error, not a hang.
+        let port = spawn_mysql_server("pencil", MyMode::Ed25519Switch).await;
+        let mut stream = dial_loopback(port).await;
+        let err = crate::mysql::authenticate(
+            &mut stream,
+            &my_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("ed25519"),
+            "an auth-switch to an unsupported plugin must name it: {err}"
+        );
+    }
+
+    /// A pre-4.1 "old auth switch request" is a bare `0xfe` packet: no plugin name, no nonce.
+    /// Answering it with a native-password token would derive that token from the password ALONE,
+    /// destroying the replay resistance the scheme rests on — so it must be refused, not answered.
+    #[tokio::test]
+    async fn mysql_refuses_a_nonce_free_auth_downgrade() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&my_packet(0, &my_greeting("mysql_native_password")))
+                .await
+                .unwrap();
+            let _ = my_read_packet(&mut sock).await;
+            // The bare 0xfe downgrade request.
+            sock.write_all(&my_packet(2, &[0xfe])).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        let mut stream = dial_loopback(port).await;
+        let err = crate::mysql::authenticate(
+            &mut stream,
+            &my_params(),
+            "pencil",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("downgrade"),
+            "a nonce-free auth switch must be refused by name: {err}"
+        );
+    }
+
+    /// Directly: a short scramble can never yield a token, whatever path reaches it.
+    #[test]
+    fn mysql_native_password_requires_a_full_scramble() {
+        assert!(crate::mysql::auth_response_for("mysql_native_password", "pw", &[]).is_err());
+        assert!(
+            crate::mysql::auth_response_for("mysql_native_password", "pw", &MY_SCRAMBLE[..8])
+                .is_err(),
+            "a truncated scramble must be refused, not silently padded"
+        );
+        assert!(
+            crate::mysql::auth_response_for("mysql_native_password", "pw", MY_SCRAMBLE).is_ok()
+        );
+    }
+
+    /// The vendored SHA-1 against RFC 3174 vectors. Vendored rather than depended on for the same
+    /// reason `pg.rs` vendors MD5 — the *server* picks the algorithm, so it is not a security
+    /// boundary we chose — which makes a known-vector test the thing that keeps it honest.
+    #[test]
+    fn mysql_sha1_matches_known_vectors() {
+        let hex = |b: [u8; 20]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            hex(crate::mysql::sha1(b"")),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert_eq!(
+            hex(crate::mysql::sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex(crate::mysql::sha1(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+    }
+
+    /// An empty password sends an empty response — the protocol's own convention, and a case a
+    /// naive XOR implementation would get wrong by emitting 20 bytes of `SHA1("")` material.
+    #[test]
+    fn mysql_empty_password_sends_an_empty_token() {
+        assert!(crate::mysql::native_password("", MY_SCRAMBLE).is_empty());
+        assert_eq!(
+            crate::mysql::native_password("pencil", MY_SCRAMBLE).len(),
+            20
+        );
+    }
+
+    /// The D-31 invariant, re-asserted on the MySQL path: `conn.authenticate` resolves the credential
+    /// host-side and the password appears NOWHERE in the frame handed back to the plugin.
+    #[tokio::test]
+    async fn conn_authenticate_terminates_mysql_handshake_without_returning_the_password() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-connauth-my-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        let password = "mariadb-env-password";
+        std::env::set_var("FLUX_TEST_MY_PW_D196", password);
+        let port = spawn_mysql_server("mariadb-env-password", MyMode::Ok).await;
+
+        let redactor = flux_secret::Redactor::new();
+        let sink = Arc::new(RedactorSink {
+            redactor: redactor.clone(),
+        });
+        let manifest = PluginManifest {
+            name: "sql".into(),
+            auth: vec![AuthMethod {
+                purpose: "password".into(),
+                env: vec!["FLUX_TEST_MY_PW_D196".into()],
+                ..Default::default()
+            }],
+            capabilities: PluginCapabilities {
+                conn: vec!["tcp:127.0.0.1:*".into()],
+                private_hosts: vec!["127.0.0.1".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let caps = SystemHostCaps::new(sys)
+            .with_manifest(&manifest)
+            .with_private_net_grants(vec!["127.0.0.1".into()])
+            .with_secret_sink(sink.clone());
+
+        let dialed = caps
+            .handle(
+                "conn.dial",
+                &json!({"kind": "tcp", "host": "127.0.0.1", "port": port}),
+            )
+            .await
+            .unwrap();
+        let conn_id = dialed["conn_id"].as_u64().unwrap();
+        let result = caps
+            .handle(
+                "conn.authenticate",
+                &json!({
+                    "conn_id": conn_id,
+                    "protocol": "mariadb",
+                    "user": "app",
+                    "database": "warehouse",
+                    "auth_purpose": "password",
+                    "timeout_ms": 5000,
+                }),
+            )
+            .await
+            .expect("host-terminated mariadb auth should succeed");
+
+        assert_eq!(result["server_version"], "11.4.2-MariaDB");
+        assert!(
+            result["capabilities"].is_number(),
+            "the negotiated capability flags are reported for diagnosis: {result}"
+        );
+        let frame = result.to_string();
+        assert!(
+            !frame.contains(password),
+            "conn.authenticate must never return the password to the plugin: {frame}"
+        );
+        assert_eq!(
+            redactor.redact(&format!("used {password} to connect")),
+            "used [redacted] to connect"
+        );
+
+        caps.handle("conn.close", &json!({"conn_id": conn_id}))
+            .await
+            .ok();
+        std::env::remove_var("FLUX_TEST_MY_PW_D196");
         std::fs::remove_dir_all(&dir).ok();
     }
 

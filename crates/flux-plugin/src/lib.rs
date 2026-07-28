@@ -40,7 +40,13 @@ pub mod hooks;
 #[cfg(feature = "hooks")]
 pub use hooks::JsHookEngine;
 
-/// Host-terminated raw-socket authentication helpers.
+/// Host-terminated raw-socket authentication: shared vocabulary + per-protocol dispatch.
+#[cfg(feature = "host")]
+mod handshake;
+/// Host-terminated MySQL/MariaDB authentication helpers.
+#[cfg(feature = "host")]
+mod mysql;
+/// Host-terminated PostgreSQL authentication helpers.
 #[cfg(feature = "host")]
 mod pg;
 

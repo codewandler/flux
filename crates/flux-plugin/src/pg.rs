@@ -15,7 +15,6 @@
 //! the **server-signature verification** on the server-final message — a MITM/wrong-server guard: a
 //! bad `v=` is rejected rather than trusted.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 // hmac 0.13 (digest 0.11): `new_from_slice` moved off `Mac` onto the re-exported `KeyInit`.
@@ -23,6 +22,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use flux_system::net::DialStream;
+
+use crate::handshake::{HandshakeParams, HandshakeResult, MAX_MESSAGE_BYTES};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -33,37 +34,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// 1..iterations` loop for `i=2000000000`-style counts, which pegs a CPU core for minutes. The
 /// handshake's socket-read `timeout` never covers this — it's pure computation, not I/O.
 pub(crate) const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
-
-/// Upper bound on a single backend message body, enforced *before* buffering it (C-84). The wire
-/// length is a server-declared int32 the host has not yet validated; a hostile/MITM'd endpoint can
-/// declare `~2 GB` and drive an unbounded `read_exact` allocation. Auth-phase messages
-/// (Authentication*, ParameterStatus, BackendKeyData, ErrorResponse) are kilobytes at most, so a
-/// few-MB ceiling is orders of magnitude above anything legitimate yet refuses the DoS.
-pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-
-/// Connection parameters the host puts in the StartupMessage. All non-secret metadata the plugin
-/// already holds (from a discovered endpoint's bare URL or the config DSN) — never the credential.
-pub(crate) struct HandshakeParams {
-    pub user: String,
-    pub database: String,
-    pub application_name: String,
-}
-
-/// The negotiated connection state the host hands back to the plugin after a successful handshake —
-/// `ParameterStatus` values (notably `server_version`) and the backend cancel key. Never the
-/// password. The connection is left at the first `ReadyForQuery`, ready for Simple Query.
-#[derive(Debug, Default)]
-pub(crate) struct HandshakeResult {
-    pub parameters: BTreeMap<String, String>,
-    pub backend_pid: Option<i32>,
-    pub backend_key: Option<i32>,
-}
-
-impl HandshakeResult {
-    pub fn server_version(&self) -> Option<&str> {
-        self.parameters.get("server_version").map(String::as_str)
-    }
-}
 
 /// Perform the PostgreSQL startup + authentication handshake on `stream`, using `password` (resolved
 /// host-side) for whatever auth method the server requests. On success the socket is at the first
@@ -566,33 +536,6 @@ pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(s.trim())
         .map_err(|e| format!("pg scram: bad base64: {e}"))
-}
-
-// ===========================================================================
-// Protocol seam
-// ===========================================================================
-
-/// Dispatch a host-terminated handshake by protocol. **Postgres is implemented**; mysql (handshake
-/// v10) and Asterisk AMI (line-based login) are the declared follow-ons — add an arm here and a
-/// sibling module beside `pg`. The `credential` capability stays available (gated) for any protocol
-/// not yet host-terminated, so those plugins are unaffected until their terminator lands.
-pub(crate) async fn terminate_handshake(
-    protocol: &str,
-    stream: &mut DialStream,
-    params: &HandshakeParams,
-    password: &str,
-    timeout: Option<Duration>,
-) -> Result<HandshakeResult, String> {
-    match protocol.trim().to_ascii_lowercase().as_str() {
-        "postgres" | "postgresql" | "pg" | "pgx" => {
-            authenticate(stream, params, password, timeout).await
-        }
-        other => Err(format!(
-            "conn.authenticate: host-terminated auth is not implemented for protocol {other:?} \
-             (postgres only for now — mysql/AMI are follow-ons); the gated `credential` capability \
-             remains for those"
-        )),
-    }
 }
 
 #[cfg(test)]
