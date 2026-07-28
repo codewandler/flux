@@ -17,9 +17,37 @@
 
 ### New
 
-- **Fetch the current Bitcoin price with a deterministic Flux-Lang example.** Run
-  `flux flow run examples/bitcoin-price.flux` to request the BTC/USD spot price from Coinbase and
-  extract it without a model or API credentials.
+- **You can talk to the agent while it's working.** In the TUI, type while a turn is running and
+  press Enter: your guidance is picked up at the agent's next planning step and folded into the
+  work in progress — no need to interrupt and start over. Queued messages show above the composer
+  and stay editable (open them with `/queue`) until the agent picks them up; the transcript notes
+  the moment each one is delivered, and anything the agent didn't get to simply becomes your next
+  turn. The plain REPL still waits for the turn to finish.
+
+- **Your Claude Code commands and skills now work in flux.** Drop markdown command files in
+  `.flux/commands` or `.claude/commands` (in the project or your home directory) and run them as
+  `/name arguments…` in the REPL and TUI — `$ARGUMENTS` and `$1`–`$9` placeholders are filled in,
+  and each command's description appears in `/help` and the slash menu. Skills load from both
+  worlds too, including multi-file skills nested in subdirectories, and a skill can now point the
+  agent at its own bundled reference files instead of everything loading up front. Anything in a
+  skill's frontmatter that flux doesn't support warns loudly at load time instead of silently
+  disappearing.
+
+- **Optionally let the agent load skills itself.** Activating skills stays a manual choice by
+  default — nothing changes unless you opt in. With `--skills-model-invoked` (or the matching
+  config setting), the agent sees a compact catalog of skill names and descriptions and can pull
+  one in mid-task; a loaded skill stays active for the rest of the session, and individual skills
+  can opt out. Commands and skills explicitly marked agent-triggerable can also be invoked by the
+  agent on its own — but only when policy allows it and the file opts in.
+
+- **The agent can now do risky work in an isolated git worktree — and merge it back when it's
+  done.** Ask the agent to enter a worktree and it moves itself (and only itself — other agents
+  and your own shell are untouched) into a temporary copy of your repository on a scratch branch.
+  Your checkout stays exactly as you left it. When the work is committed, leaving the worktree
+  first proves the merge is conflict-free, then merges it into `main`, cleans up the scratch
+  branch, and returns the agent to your project — and if anything goes wrong, your work and your
+  `main` branch are always left intact. Both steps ask for your approval like every other
+  high-risk operation.
 
 - **Integration plugins that drive a CLI can no longer run more of it than they need.** A plugin's
   permission to run a program is now spelled out down to the subcommand — the Kubernetes
@@ -29,40 +57,12 @@
   prompts show that narrowed permission (so you approve `kubectl get`, not all of kubectl), and
   the AWS integration is now structurally read-only. Existing plugins keep working unchanged.
 
-- **You can talk to the agent while it's working.** In the TUI, type while a turn is running and
-  press Enter: your guidance is picked up at the agent's next planning step and folded into the
-  work in progress — no need to interrupt and start over. Queued messages show above the composer
-  and stay editable (open them with `/queue`) until the agent picks them up; the transcript notes
-  the moment each one is delivered, and anything the agent didn't get to simply becomes your next
-  turn. The plain REPL still waits for the turn to finish.
-- **The agent can now do risky work in an isolated git worktree — and merge it back when it's
-  done.** Ask the agent to enter a worktree and it moves itself (and only itself — other agents
-  and your own shell are untouched) into a temporary copy of your repository on a scratch branch.
-  Your checkout stays exactly as you left it. When the work is committed, leaving the worktree
-  first proves the merge is conflict-free, then merges it into `main`, cleans up the scratch
-  branch, and returns the agent to your project — and if anything goes wrong, your work and your
-  `main` branch are always left intact. Both steps ask for your approval like every other
-  high-risk operation.
-- **Your Claude Code commands and skills now work in flux.** Drop markdown command files in
-  `.flux/commands` or `.claude/commands` (in the project or your home directory) and run them as
-  `/name arguments…` in the REPL and TUI — `$ARGUMENTS` and `$1`–`$9` placeholders are filled in,
-  and each command's description appears in `/help` and the slash menu. Skills load from both
-  worlds too, including multi-file skills nested in subdirectories, and a skill can now point the
-  agent at its own bundled reference files instead of everything loading up front. Anything in a
-  skill's frontmatter that flux doesn't support warns loudly at load time instead of silently
-  disappearing.
-- **Optionally let the agent load skills itself.** Activating skills stays a manual choice by
-  default — nothing changes unless you opt in. With `--skills-model-invoked` (or the matching
-  config setting), the agent sees a compact catalog of skill names and descriptions and can pull
-  one in mid-task; a loaded skill stays active for the rest of the session, and individual skills
-  can opt out. Commands and skills explicitly marked agent-triggerable can also be invoked by the
-  agent on its own — but only when policy allows it and the file opts in.
+- **Fetch the current Bitcoin price with a deterministic Flux-Lang example.** Run
+  `flux flow run examples/bitcoin-price.flux` to request the BTC/USD spot price from Coinbase and
+  extract it without a model or API credentials.
 
 ### Improved
 
-- **The project vision now matches what flux actually ships.** The vision document now calls out
-  replay, fork, run diff, offline agent tests, editor tooling, multi-user deployment foundations,
-  and the current on-hold status of the self-improvement work more clearly.
 - **The terminal UI got a major polish pass.** Pick a theme with `/theme` (`dark`, `light`,
   `mono`) and it sticks across sessions; press Ctrl-T to release the mouse so your terminal's
   native text selection and copy work; Ctrl-R searches your prompt history as you type; Ctrl-F
@@ -72,10 +72,22 @@
   live spinner with elapsed time, a scrollbar appears when you scroll back through the
   transcript, and narrow terminals now drop the least important status details first instead of
   losing them all at once.
+- **Working with what's on screen got easier.** Shift-↑/↓ walk a cursor through the transcript:
+  Enter expands just the entry you're looking at, and `y` copies its full text to your clipboard —
+  including over SSH. Typing `@` in the composer opens fuzzy file-path completion for your
+  project. Denying an approval can now carry a reason (`d`), which the agent reads and adapts to
+  instead of guessing why you said no. Edits and writes render as real diffs — hunk headers, line
+  numbers, word-level highlighting — both in the tool card and in the approval prompt itself. The
+  header shows small badges for the modes that are actually on (`auto-ok`, `shell`, `gather`,
+  `effort:<level>`), and streamed answers are formatted as markdown as they arrive rather than
+  only at the end.
 - **flux opens with a boot splash, and waiting looks alive.** Interactive starts play a short
   animated FLUX splash (any key skips it; it never appears for piped output, `NO_COLOR`, small
   terminals, or with `FLUX_NO_SPLASH=1`), and on terminals with full color support the
   model-wait spinner becomes an animated effect bar that changes with every model round.
+- **The project vision now matches what flux actually ships.** The vision document now calls out
+  replay, fork, run diff, offline agent tests, editor tooling, multi-user deployment foundations,
+  and the current on-hold status of the self-improvement work more clearly.
 
 ### Fixed
 
@@ -86,6 +98,19 @@
   Now it's simply left out of that agent's catalog until its operations are available again — the
   exclusion is recorded in the session's audit trail, and registering a *new* op with unknown
   operations still fails immediately.
+
+### Action needed
+
+- **Codex now defaults to GPT-5.6.** Asking for `codex` without naming a model gets `gpt-5.6-sol`,
+  the model the ChatGPT subscription currently serves, and cost reporting knows its prices. If you
+  want the previous model, name it explicitly (`-m codex/gpt-5.5`) — any model you spell out is
+  still sent as-is.
+- **If you embed flux as a library, five APIs changed.** The guarded system on a tool context is
+  now reached through a method instead of a field, approval choices gained a "deny with reason"
+  variant, two terminal-UI types were renamed/extended, one composite-validation helper was
+  removed in favour of the pruning path, and the skills crate dropped never-shipped entry points.
+  The CLI, your config, and your `.flux` files are unaffected. See the CHANGELOG for the exact
+  signatures.
 
 ## [0.27.0] - 2026-07-28
 

@@ -6,96 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**Breaking (pub surface, embedders only — no CLI or config break).** Five API changes ride this
+release; each is detailed in its entry below:
+
+- `flux_runtime::ToolContext`'s public `system` field → a `system()` accessor over a per-context
+  `WorkspaceContext` (C-97).
+- `flux_runtime::ApprovalChoice` gains a `DenyWithReason(String)` variant (C-113).
+- `flux_tui::ChatState.modal: Option<String>` → `ChatState.approval: Option<ApprovalView>`, and
+  `TuiRunOptions` gains a `theme` field (C-103/C-104).
+- `flux_flow::DynamicComposites::validate_base` removed — the assembly seam calls
+  `prune_unresolvable` (C-117).
+- `codewandler-flux-skill` sheds its never-shipped lazy-body loader, keyword trigger-ranking, and
+  duplicate discovery entry points (D-192).
+
 ### Added
-
-- **Deterministic Bitcoin price example.** `examples/bitcoin-price.flux` fetches the BTC/USD spot
-  price from Coinbase through the guarded `web.fetch` operation and extracts it with a bounded,
-  model-free regex; the repository-wide example validation sweep covers its syntax and live op
-  contract.
-
-- **A-94: mid-turn steering — talk to the agent while it runs.** Text submitted while a turn is
-  executing no longer waits for the turn to finish: the TUI's follow-up queue is shared with the
-  engine (`FlowEngine::set_steering` + the new `flux_flow::SteeringQueue`), which drains it at
-  the head of the next planner-consultation round and injects the messages — in submission
-  order, as one attributed `<user-steering>` block — into the adaptive conversation. In-flight
-  operations and pending approvals are never disturbed (injection happens only at the round
-  head), and consumed steering persists as a durable, redacted `turn.steering` observation —
-  deliberately not a `Message` event, so the session log keeps its strict user → assistant
-  alternation. Queued items stay editable/retractable in the `/queue` overlay until the engine
-  consumes them; consumption empties the strip and leaves a `↪ steering delivered` transcript
-  notice, and leftovers at turn end still become ordinary follow-up turns. Plain-CLI REPL turns
-  remain blocking — steering is TUI-only in v1 (SDK embedders can attach their own queue via
-  `FlowEngine::set_steering`).
-- **C-111…C-116: TUI polish wave 2** (epic [tui-polish](docs/designs/tui-polish.md)):
-  - **Transcript entry focus + per-card expansion + OSC 52 yank (C-111):** Shift-↑/↓ move a focus
-    cursor through the transcript (selection background, centers the entry, Esc clears); Enter
-    toggles just the focused tool card's expansion (Ctrl-E keeps its global meaning and resets
-    overrides); `y` copies the focused entry's full text as an OSC 52 clipboard write (works over
-    SSH, 72 KiB cap, `copied N lines` notice).
-  - **`@` file-path completion in the composer (C-112):** typing `@` at a token start opens a
-    fuzzy path popup in the slash-menu slot (segment-prefix > substring > subsequence ranking);
-    Tab/Enter insert the selected workspace-relative path; the inventory is a lazy, bounded,
-    ignore-aware walk cached for the session.
-  - **Approval deny-with-reason (C-113):** `d` on the approval sheet opens a one-line reason
-    input; Enter denies carrying the reason, which is APPENDED to the canonical
-    `` `{op}` denied by user `` result text for the model to adapt to (structural denial
-    classification untouched). BREAKING (pub surface): `flux_runtime::ApprovalChoice` gains the
-    `DenyWithReason(String)` variant.
-  - **Markdown for the sealed prefix while streaming (C-114):** streamed assistant text up to the
-    last completed block boundary renders styled (cached, flicker-free by construction); only the
-    trailing unterminated block stays plain + cursor, and an open code fence stays plain until it
-    closes.
-  - **Hunk-view diffs (C-115):** expanded `edit`/`write` cards render real hunks — `@@` headers,
-    old/new gutter line numbers, word-level intraline emphasis — and the approval sheet embeds
-    the same windowed diff preview for pending edit/write calls.
-  - **Header mode badges (C-116):** `auto-ok`, `shell`, `gather`, and `effort:<level>` appear as
-    right-side header segments only when active; on narrow terminals the badges shed first and
-    the safety-relevant `auto-ok` outlives every other right segment.
-- **C-90: plugin process capabilities constrain arguments, not just the program.** A manifest's
-  `process` grant entries are now argv **prefixes** matched token-by-token
-  (`flux_plugin::process_grant_allows`): `"kubectl"` keeps today's program-only behavior,
-  `"kubectl get"` pins the leading subcommand so a read-shaped grant is structurally unable to
-  `kubectl delete` — enforced on both `process.run` and `process.spawn` in `SystemHostCaps`.
-  Additive per-operation narrowing via the new optional `OperationSpec.process` field (host-kit
-  combinator `with_process`): enforced at callback time in front of the shared caps (intersection
-  — it can never widen), validated against the manifest grant at load time, and projected as the
-  op's `process.exec` authority so approval prompts and audit show the narrowed resource
-  (`process.exec → kubectl get`). The `kubernetes` plugin now grants exactly the verbs its
-  handlers issue (reads: `get`/`logs`/`config view`/`version`; mutations named explicitly:
-  `scale`/`rollout restart`/`exec`/`port-forward`; no `delete`/`apply`/`patch` at all) and narrows
-  every op; `aws` follows and comes out structurally read-only. Wire-compatible: absent
-  constraints keep today's behavior, existing manifests load unchanged. Decision record in
-  [integration-plugins](docs/designs/integration-plugins.md).
-
-- **C-102…C-110: TUI polish — 5 UX + 5 UI improvements** (epic
-  [tui-polish](docs/designs/tui-polish.md)):
-  - **Ctrl-T mouse-capture toggle (C-105):** terminal-native text selection/copy works while
-    capture is off; the footer indicates the state (idle hint while idle, a short right segment
-    while a turn runs).
-  - **Approval sheet safety + redesign (C-103):** only explicit keys act — `y` allow, `a` always,
-    `n`/`Esc` deny, `↑/↓` scroll long subject lists — stray keys are ignored instead of silently
-    denying; subjects render as text (no more Debug `["…"]`); accent-bordered sheet with windowed
-    subjects and colored key hints. BREAKING (pub surface): `ChatState.modal: Option<String>` →
-    `ChatState.approval: Option<ApprovalView>`.
-  - **Ctrl-R reverse history search (C-107):** readline-style incremental search over durable
-    prompt history (shadows tui-textarea redo; Ctrl-U undo remains).
-  - **Ctrl-F transcript search (C-108):** incremental, case-insensitive, n/N step + center,
-    REVERSED match highlight patched onto the visible slice only (layout cache untouched). Known
-    v1 limit: a match spanning a wrap boundary isn't found.
-  - **Help overlay (C-110):** F1 / `/help` open a centered panel; the command list iterates the
-    real `COMMANDS` table so it can't drift.
-  - **Theme system (C-104):** `dark` (ANSI + truecolor tuning), `light` (with whole-screen
-    background fill), `mono` (`NO_COLOR`); `/theme` switches live and persists to
-    `~/.flux/config.toml` (`flux_config::Config.theme`, additive; new
-    `flux_config::render_theme` + `flux_runtime::metadata::persist_user_theme`). BREAKING (pub
-    surface): `TuiRunOptions` gained a `theme` field; `Theme` gained `text`/`base_bg` roles.
-  - **Graceful narrow-width bars (C-102):** header/footer right sides are ordered droppable
-    segments — cost drops before cache before tokens instead of the whole right side vanishing.
-  - **Scroll position indicator (C-106):** a scrollbar overlays the transcript's right column
-    while detached from follow mode, plus a `⤓ NN%` footer segment.
-  - **Live running tool cards (C-109):** running tool headers animate a spinner glyph + live
-    elapsed, patched per frame into the viewport only — the `(revision, width)`-keyed transcript
-    layout cache is never invalidated by animation.
 
 - **Claude interop epic (D-186…D-192): commands + skills load from both `.flux` and `.claude`
   worlds** (design: `docs/designs/claude-interop.md`; user docs:
@@ -128,18 +52,64 @@ All notable changes to this project are documented in this file. The format is b
     (`.claude/skills/<ns>/<name>/SKILL.md`), symlink jail enforced at every depth; a directory
     containing `SKILL.md` claims its subtree, so a skill's own `references/` never surfaces as a
     separate skill.
-- **C-101: animated boot splash for the interactive surfaces.** Bare `flux` (and prompt-less
-  `flux run`) and `flux tui` now open with an animated FLUX splash — matrix rain dissolving into
-  the block logo, then a pulsing glow with the `[ deterministic agent platform ]` tagline. Any key
-  skips; it auto-dismisses after ~2 s of glow, and is fully suppressed under `NO_COLOR` /
-  `--color never`, piped streams, `FLUX_NO_SPLASH=1`, or terminals smaller than 64×14. Frames are
-  a deterministic function of a seed (embedded PCG32), pinned by tests (`flux_tui::splash`).
-- **C-101: truecolor spinner effects during model waits.** On terminals advertising 24-bit color
-  (`COLORTERM`), the CLI's thinking spinner and the TUI footer replace the braille glyph with a
-  full-width animated effect bar — Knight Rider, Comet, Tidal Wave, Matrix, Equalizer, Aurora,
-  Thunderstrike, Binary Rain (`flux_tui::spinners`, ported from the codewandler/spinners Go
-  catalog) — cycling one effect per model round. Non-truecolor terminals keep the braille spinner
-  unchanged. Showcase: `cargo run -p flux-tui --example spinners`.
+
+- **TUI polish epic (C-102…C-116): 15 UX + UI improvements across two waves** (epic
+  [tui-polish](docs/designs/tui-polish.md)).
+
+  *Wave 1 (C-102…C-110):*
+  - **Ctrl-T mouse-capture toggle (C-105):** terminal-native text selection/copy works while
+    capture is off; the footer indicates the state (idle hint while idle, a short right segment
+    while a turn runs).
+  - **Approval sheet safety + redesign (C-103):** only explicit keys act — `y` allow, `a` always,
+    `n`/`Esc` deny, `↑/↓` scroll long subject lists — stray keys are ignored instead of silently
+    denying; subjects render as text (no more Debug `["…"]`); accent-bordered sheet with windowed
+    subjects and colored key hints. BREAKING (pub surface): `ChatState.modal: Option<String>` →
+    `ChatState.approval: Option<ApprovalView>`.
+  - **Ctrl-R reverse history search (C-107):** readline-style incremental search over durable
+    prompt history (shadows tui-textarea redo; Ctrl-U undo remains).
+  - **Ctrl-F transcript search (C-108):** incremental, case-insensitive, n/N step + center,
+    REVERSED match highlight patched onto the visible slice only (layout cache untouched). Known
+    v1 limit: a match spanning a wrap boundary isn't found.
+  - **Help overlay (C-110):** F1 / `/help` open a centered panel; the command list iterates the
+    real `COMMANDS` table so it can't drift.
+  - **Theme system (C-104):** `dark` (ANSI + truecolor tuning), `light` (with whole-screen
+    background fill), `mono` (`NO_COLOR`); `/theme` switches live and persists to
+    `~/.flux/config.toml` (`flux_config::Config.theme`, additive; new
+    `flux_config::render_theme` + `flux_runtime::metadata::persist_user_theme`). BREAKING (pub
+    surface): `TuiRunOptions` gained a `theme` field; `Theme` gained `text`/`base_bg` roles.
+  - **Graceful narrow-width bars (C-102):** header/footer right sides are ordered droppable
+    segments — cost drops before cache before tokens instead of the whole right side vanishing.
+  - **Scroll position indicator (C-106):** a scrollbar overlays the transcript's right column
+    while detached from follow mode, plus a `⤓ NN%` footer segment.
+  - **Live running tool cards (C-109):** running tool headers animate a spinner glyph + live
+    elapsed, patched per frame into the viewport only — the `(revision, width)`-keyed transcript
+    layout cache is never invalidated by animation.
+
+  *Wave 2 (C-111…C-116):*
+  - **Transcript entry focus + per-card expansion + OSC 52 yank (C-111):** Shift-↑/↓ move a focus
+    cursor through the transcript (selection background, centers the entry, Esc clears); Enter
+    toggles just the focused tool card's expansion (Ctrl-E keeps its global meaning and resets
+    overrides); `y` copies the focused entry's full text as an OSC 52 clipboard write (works over
+    SSH, 72 KiB cap, `copied N lines` notice).
+  - **`@` file-path completion in the composer (C-112):** typing `@` at a token start opens a
+    fuzzy path popup in the slash-menu slot (segment-prefix > substring > subsequence ranking);
+    Tab/Enter insert the selected workspace-relative path; the inventory is a lazy, bounded,
+    ignore-aware walk cached for the session.
+  - **Approval deny-with-reason (C-113):** `d` on the approval sheet opens a one-line reason
+    input; Enter denies carrying the reason, which is APPENDED to the canonical
+    `` `{op}` denied by user `` result text for the model to adapt to (structural denial
+    classification untouched). BREAKING (pub surface): `flux_runtime::ApprovalChoice` gains the
+    `DenyWithReason(String)` variant.
+  - **Markdown for the sealed prefix while streaming (C-114):** streamed assistant text up to the
+    last completed block boundary renders styled (cached, flicker-free by construction); only the
+    trailing unterminated block stays plain + cursor, and an open code fence stays plain until it
+    closes.
+  - **Hunk-view diffs (C-115):** expanded `edit`/`write` cards render real hunks — `@@` headers,
+    old/new gutter line numbers, word-level intraline emphasis — and the approval sheet embeds
+    the same windowed diff preview for pending edit/write calls.
+  - **Header mode badges (C-116):** `auto-ok`, `shell`, `gather`, and `effort:<level>` appear as
+    right-side header segments only when active; on narrow terminals the badges shed first and
+    the safety-relevant `auto-ok` outlives every other right segment.
 
 - **C-98/C-99: `git_worktree_enter` / `git_worktree_leave` built-ins — context-local git
   worktrees.** `enter` preflights a clean non-detached `main`, creates a generated
@@ -153,13 +123,64 @@ All notable changes to this project are documented in this file. The format is b
   "merged, cleanup required" state that never re-merges. Both ops are Git-group,
   `Risk::High`/non-idempotent, argv-only through the guarded `System`.
 
+- **A-94: mid-turn steering — talk to the agent while it runs.** Text submitted while a turn is
+  executing no longer waits for the turn to finish: the TUI's follow-up queue is shared with the
+  engine (`FlowEngine::set_steering` + the new `flux_flow::SteeringQueue`), which drains it at
+  the head of the next planner-consultation round and injects the messages — in submission
+  order, as one attributed `<user-steering>` block — into the adaptive conversation. In-flight
+  operations and pending approvals are never disturbed (injection happens only at the round
+  head), and consumed steering persists as a durable, redacted `turn.steering` observation —
+  deliberately not a `Message` event, so the session log keeps its strict user → assistant
+  alternation. Queued items stay editable/retractable in the `/queue` overlay until the engine
+  consumes them; consumption empties the strip and leaves a `↪ steering delivered` transcript
+  notice, and leftovers at turn end still become ordinary follow-up turns. Plain-CLI REPL turns
+  remain blocking — steering is TUI-only in v1 (SDK embedders can attach their own queue via
+  `FlowEngine::set_steering`).
+
+- **C-90: plugin process capabilities constrain arguments, not just the program.** A manifest's
+  `process` grant entries are now argv **prefixes** matched token-by-token
+  (`flux_plugin::process_grant_allows`): `"kubectl"` keeps today's program-only behavior,
+  `"kubectl get"` pins the leading subcommand so a read-shaped grant is structurally unable to
+  `kubectl delete` — enforced on both `process.run` and `process.spawn` in `SystemHostCaps`.
+  Additive per-operation narrowing via the new optional `OperationSpec.process` field (host-kit
+  combinator `with_process`): enforced at callback time in front of the shared caps (intersection
+  — it can never widen), validated against the manifest grant at load time, and projected as the
+  op's `process.exec` authority so approval prompts and audit show the narrowed resource
+  (`process.exec → kubectl get`). The `kubernetes` plugin now grants exactly the verbs its
+  handlers issue (reads: `get`/`logs`/`config view`/`version`; mutations named explicitly:
+  `scale`/`rollout restart`/`exec`/`port-forward`; no `delete`/`apply`/`patch` at all) and narrows
+  every op; `aws` follows and comes out structurally read-only. Wire-compatible: absent
+  constraints keep today's behavior, existing manifests load unchanged. Decision record in
+  [integration-plugins](docs/designs/integration-plugins.md).
+
+- **C-101: animated boot splash and truecolor spinner effects.**
+  - *Boot splash.* Bare `flux` (and prompt-less `flux run`) and `flux tui` now open with an
+    animated FLUX splash — matrix rain dissolving into the block logo, then a pulsing glow with
+    the `[ deterministic agent platform ]` tagline. Any key skips; it auto-dismisses after ~2 s of
+    glow, and is fully suppressed under `NO_COLOR` / `--color never`, piped streams,
+    `FLUX_NO_SPLASH=1`, or terminals smaller than 64×14. Frames are a deterministic function of a
+    seed (embedded PCG32), pinned by tests (`flux_tui::splash`).
+  - *Spinner effects.* On terminals advertising 24-bit color (`COLORTERM`), the CLI's thinking
+    spinner and the TUI footer replace the braille glyph with a full-width animated effect bar —
+    Knight Rider, Comet, Tidal Wave, Matrix, Equalizer, Aurora, Thunderstrike, Binary Rain
+    (`flux_tui::spinners`, ported from the codewandler/spinners Go catalog) — cycling one effect
+    per model round. Non-truecolor terminals keep the braille spinner unchanged. Showcase:
+    `cargo run -p flux-tui --example spinners`.
+
+- **GPT-5.6 for the codex provider.** Bare `codex` (and any legacy `*-codex` id) now resolves to
+  `gpt-5.6-sol`, the model the ChatGPT-subscription backend currently serves, and the `gpt-5.6`
+  catalog alias resolves to the same concrete id; explicit ids — including `gpt-5.5` — still pass
+  through verbatim, so a pinned model is unaffected. Pricing entries for the GPT-5.6 family land
+  alongside, so cost accounting stays correct for the new default. Provider docs and model
+  examples were refreshed (`docs/model.md`, `website/docs/agent/providers.md`).
+
+- **Deterministic Bitcoin price example.** `examples/bitcoin-price.flux` fetches the BTC/USD spot
+  price from Coinbase through the guarded `web.fetch` operation and extracts it with a bounded,
+  model-free regex; the repository-wide example validation sweep covers its syntax and live op
+  contract.
+
 ### Changed
 
-- **Vision truth pass.** `docs/vision.md` now reflects the current product reality: the Improvement
-  Loop is explicitly on hold/aspirational, deterministic replay/fork/diff and Test · Tune ·
-  Resurrect are named as core payoffs, platform-tier substrates and shipped Flux-Lang editor
-  tooling are called out accurately, and the safety principle includes the opt-in OS sandbox below
-  the guarded envelope.
 - **Dependency refresh across both workspaces.** All compatible bumps plus the incompatible
   majors: `jsonschema` 0.47→0.49, `tokio-tungstenite` 0.29→0.30, `syn` 2→3, `base64` 0.22→0.23,
   `ulid` 1→3 (`Ulid::new()` → `Ulid::generate()` at the call sites), `slack-morphism` 2.22→2.24,
@@ -184,13 +205,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Removed
 
-- **D-192: `codewandler-flux-skill` dead code reconciled away** (breaking → next MINOR): removed the
+- **D-192: `codewandler-flux-skill` dead code reconciled away** (breaking): removed the
   never-shipped lazy-body loader (`SkillBody::lazy`, `SkillBody::is_loaded`) and keyword
   trigger-ranking (`Skill::matches`, `Skill::match_score`, `ActivationLimits`, `active_for`), plus
   the legacy duplicate discovery (`discover`, `discover_merged`); the five-directory precedence list
   now lives only in `flux_runtime::metadata::discover_skills_from`, and the crate docs/architecture
   docs match the shipped eager, manual-first behavior.
-- **C-117: `DynamicComposites::validate_base` removed** (breaking → next MINOR): the assembly seam
+- **C-117: `DynamicComposites::validate_base` removed** (breaking): the assembly seam
   now calls `prune_unresolvable` instead (see Fixed below); the strict all-or-nothing base
   validation has no remaining callers. Live registration (`validate_registration`) is untouched.
 
@@ -212,6 +233,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Documentation
 
+- **Vision truth pass.** `docs/vision.md` now reflects the current product reality: the Improvement
+  Loop is explicitly on hold/aspirational, deterministic replay/fork/diff and Test · Tune ·
+  Resurrect are named as core payoffs, platform-tier substrates and shipped Flux-Lang editor
+  tooling are called out accurately, and the safety principle includes the opt-in OS sandbox below
+  the guarded envelope.
 - **C-123…C-126: event-store concurrent-use epic filed.** The multi-process concurrency guidance
   for `flux-events` is promoted to `docs/designs/event-store-concurrent-use.md` — what the SQLite
   backend (WAL + 5s busy_timeout + `BEGIN IMMEDIATE` + UNIQUE/idempotent-id backstops) and the
