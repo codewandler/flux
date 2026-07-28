@@ -30,6 +30,25 @@ _None._
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
+- [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
+
+### TUI polish — 5 UX + 5 UI improvements
+_The TUI became a daily driver with A-65 and gained its boot splash + spinners with C-101. The_
+- [C-103 — Approval modal — explicit keys, real subjects, redesigned sheet](C-103-approval-modal-safety-and-redesign.md) · Core
+- [C-105 — Mouse-capture toggle for native select/copy](C-105-mouse-capture-copy-toggle.md) · Core
+- [C-102 — Graceful narrow-width header/footer bars](C-102-graceful-narrow-width-bars.md) · Core
+- [C-104 — TUI theme system — truecolor dark, light, mono + /theme](C-104-tui-theme-system.md) · Core
+- [C-106 — Transcript scroll position indicator](C-106-scroll-position-indicator.md) · Core
+- [C-107 — Ctrl-R reverse incremental history search](C-107-reverse-history-search.md) · Core
+- [C-108 — Ctrl-F transcript search with match highlight](C-108-transcript-search.md) · Core
+- [C-110 — Help overlay (F1 / /help)](C-110-help-overlay.md) · Core
+- [C-109 — Live elapsed + animated badge on running tool cards](C-109-live-running-tool-cards.md) · Core
+- [C-111 — Transcript entry focus — per-card expansion + OSC-52 yank](C-111-transcript-entry-focus-yank.md) · Core
+- [C-112 — @-triggered file-path completion in the composer](C-112-composer-path-completion.md) · Core
+- [C-113 — Approval deny-with-reason — tell the model why](C-113-approval-deny-with-reason.md) · Core · extends C-103's approval_key contract — lands after it
+- [C-114 — Markdown for the sealed prefix while streaming](C-114-streaming-markdown-prefix.md) · Core · land after C-104 (flux_markdown hardcoded span colors are its known risk)
+- [C-115 — Hunk-view diffs — line numbers + intraline highlight in edit/write cards and the approval sheet](C-115-diff-hunk-view.md) · Core · card half is independent; the approval-sheet half needs C-103
+- [C-116 — Header mode badges — shell, auto-ok, effort, gather](C-116-header-mode-badges.md) · Core
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
@@ -41,6 +60,10 @@ _None._
 
 ### Approval Distillation
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
+
+### Context-local Git worktrees
+_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
+- [C-119 — Plugin hosts should follow a worktree transition](C-119-plugin-root-follows-worktree.md) · Core · v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter
 
 ### Evidence Pinned Memory
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
@@ -252,6 +275,8 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-99 — git_worktree_leave — merge back to main, restore context, clean up](C-99-git-worktree-leave-op.md) · Core · trial merge then --no-ff; conflict never strands main; cleanup-pending state is retryable without re-merging
 - [C-100 — Worktree-aware engine probing, sub-agent inheritance, and epic docs](C-100-worktree-engine-and-subagents.md) · Core · FlowEngine probes the active root per turn; children get an independent snapshot; ops-reference/CHANGELOG/WHATS-NEW close the epic
 - [C-101 — CLI/TUI boot splash + animated spinner effects](C-101-boot-splash-and-animated-spinners.md) · Core
+- [C-117 — Allocate agent worktrees on real disk, not /tmp](C-117-disk-backed-worktree-allocation.md) · Core · base = $FLUX_WORKTREE_DIR else ~/.flux/worktrees; /tmp is commonly a RAM-backed tmpfs a worktree build would fill
+- [C-118 — Tell the model per turn when its context is inside a worktree](C-118-worktree-turn-note.md) · Core · per-turn <workspace-note> in the base system while a worktree session is active; assembly-time project context stays untouched
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

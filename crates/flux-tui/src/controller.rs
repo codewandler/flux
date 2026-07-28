@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::projection::staged_intent_entry;
+use crossterm::event::KeyCode;
 
 /// A UI event produced by the running turn (on a background task) for the event loop to render.
 pub(super) enum UiEvent {
@@ -47,6 +48,38 @@ pub(super) enum UiEvent {
 
 pub(super) type PendingApproval = (String, Vec<String>, oneshot::Sender<ApprovalChoice>);
 
+/// Display state of the pending approval sheet (the reply channel stays in the event loop).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalView {
+    pub tool: String,
+    pub subjects: Vec<String>,
+    /// First visible row of the subject list when it overflows the sheet.
+    pub scroll: usize,
+}
+
+/// What a key press means while the approval sheet is open. Only explicit keys act — anything
+/// else is `Ignore` (the sheet stays and the reply is NOT consumed), so a stray keystroke can't
+/// silently deny (C-103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApprovalAction {
+    Allow,
+    AllowAlways,
+    Deny,
+    Scroll(isize),
+    Ignore,
+}
+
+pub(super) fn approval_key(code: KeyCode) -> ApprovalAction {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => ApprovalAction::Allow,
+        KeyCode::Char('a') | KeyCode::Char('A') => ApprovalAction::AllowAlways,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ApprovalAction::Deny,
+        KeyCode::Up => ApprovalAction::Scroll(-1),
+        KeyCode::Down => ApprovalAction::Scroll(1),
+        _ => ApprovalAction::Ignore,
+    }
+}
+
 pub(super) fn show_next_approval(
     state: &mut ChatState,
     current: &mut Option<(String, oneshot::Sender<ApprovalChoice>)>,
@@ -56,9 +89,11 @@ pub(super) fn show_next_approval(
         return;
     }
     if let Some((tool, subjects, reply)) = queued.pop_front() {
-        state.modal = Some(format!(
-            "approve `{tool}` {subjects:?}\n\n[y]es   [a]lways   [N]o"
-        ));
+        state.approval = Some(ApprovalView {
+            tool: tool.clone(),
+            subjects,
+            scroll: 0,
+        });
         *current = Some((tool, reply));
     }
 }

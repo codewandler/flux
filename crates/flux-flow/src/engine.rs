@@ -1043,6 +1043,26 @@ impl FlowEngine {
     ) -> String {
         let mut base_system = self.system_prompt.clone();
         let mut injected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // C-117: the assembly-time project context above describes the ORIGINAL workspace; while a
+        // worktree transition is active, tell the model per turn where its operations actually
+        // land (the `cwd` op stays the live ground truth).
+        if let Some(session) = self
+            .executor
+            .context()
+            .workspace_context()
+            .worktree_session()
+        {
+            base_system.push_str(&format!(
+                "\n\n<workspace-note>\nThis context is currently transitioned into a temporary \
+                 git worktree: all file, process, and toolchain operations run under {} on \
+                 branch {}. Any project context above describing the working directory, git \
+                 branch, or git status refers to the ORIGINAL workspace, not this worktree. Use \
+                 the cwd op for the live working directory. Run git_worktree_leave to merge the \
+                 committed work back and return.\n</workspace-note>",
+                session.checkout.display(),
+                session.branch,
+            ));
+        }
         for skill in &self.skills {
             self.inject_skill_tag(&mut base_system, skill, sink);
             injected.insert(skill.name.clone());
@@ -3364,6 +3384,104 @@ mod tests {
         assert_eq!(
             engine.cwd, origin,
             "the assembly-time cwd stays fixed — only the surfacing probe follows the active root"
+        );
+    }
+
+    /// C-117: while a worktree session is active, every turn's base system carries a
+    /// `<workspace-note>` naming the transitioned root (the assembly-time project context still
+    /// describes the original workspace); the note disappears after leave.
+    #[test]
+    fn base_system_carries_a_worktree_note_only_while_transitioned() {
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let origin = std::env::temp_dir().join(format!(
+            "flux-c117-origin-{}-{sequence}",
+            std::process::id()
+        ));
+        let worktree = std::env::temp_dir().join(format!(
+            "flux-c117-worktree-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let system = Arc::new(System::new(Workspace::new(&origin).unwrap()));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(system.clone()),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(Vec::<Vec<Chunk>>::new().into()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        let engine = FlowEngine::assemble_with_loop(
+            provider,
+            executor,
+            events,
+            flow,
+            "test-model".into(),
+            "Use only observed evidence.".into(),
+            2_048,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            origin.clone(),
+            AgentLoopSpec::default(),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let before = engine.base_system_with_skills("session-c118", "hello", &mut sink);
+        assert!(
+            !before.contains("<workspace-note>"),
+            "no note without an active worktree session"
+        );
+
+        let active = engine.executor.context().system();
+        let rerooted = Arc::new(active.rerooted(&worktree).unwrap());
+        engine
+            .executor
+            .context()
+            .workspace_context()
+            .enter_worktree(
+                flux_runtime::WorktreeSession {
+                    original: active,
+                    base_commit: "deadbeef".into(),
+                    branch: "flux/worktree/note-test".into(),
+                    checkout: worktree.clone(),
+                    parent_dir: worktree.clone(),
+                    phase: flux_runtime::WorktreePhase::Active,
+                },
+                rerooted,
+            )
+            .unwrap();
+
+        let during = engine.base_system_with_skills("session-c118", "hello", &mut sink);
+        assert!(during.contains("<workspace-note>"));
+        assert!(
+            during.contains(&worktree.display().to_string()),
+            "the note names the transitioned root"
+        );
+        assert!(during.contains("flux/worktree/note-test"));
+
+        engine
+            .executor
+            .context()
+            .workspace_context()
+            .leave_worktree()
+            .unwrap();
+        let after = engine.base_system_with_skills("session-c118", "hello", &mut sink);
+        assert!(
+            !after.contains("<workspace-note>"),
+            "the note disappears after leave"
         );
     }
 

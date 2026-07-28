@@ -10,8 +10,9 @@ agent to *enter* one — and a naive implementation would call `std::env::set_cu
 process-global and would leak the transition into every other agent context sharing the process.
 
 This epic adds `git_worktree_enter {}` / `git_worktree_leave {}` as guarded Git built-ins that move
-**only the calling agent context** into a temporary worktree (under a private `/tmp` directory,
-writable, outside the original PWD), and on leave merge the work back into `main` and restore that
+**only the calling agent context** into a temporary worktree (under a private on-disk
+directory — `$FLUX_WORKTREE_DIR`, defaulting to `~/.flux/worktrees` — writable, outside the
+original PWD), and on leave merge the work back into `main` and restore that
 context's original root. The per-agent workspace state this requires — a context-owned, swappable
 active `System` — is a runtime seam with value beyond worktrees.
 
@@ -37,11 +38,12 @@ calls see the transitioned root. Never `set_current_dir` — no process-global s
 **Plugin ops are explicitly out of scope in v1**: `PluginTool` executes through the `PluginHost`'s
 own `System` captured at subprocess spawn (and `SystemHostCaps` captures another assembly-time
 `Arc<System>`), so already-spawned plugin subprocesses keep the original root. Documented
-limitation; a re-spawn/notify follow-up story can lift it later.
+limitation; follow-up story C-119 tracks the re-spawn/notify design that lifts it.
 
 Guarded `flux-system` helpers: derive a new guarded `System` rooted at an existing worktree while
 retaining the source sandbox and configured access posture; create and clean a private
-`/tmp/flux-worktree-*` parent directory through guarded system IO. No tool touches raw filesystem or
+`flux-worktree-*` parent directory (under `$FLUX_WORKTREE_DIR` / `~/.flux/worktrees`, C-117)
+through guarded system IO. No tool touches raw filesystem or
 process APIs.
 
 **`git_worktree_enter {}` (C-98).** Requires a Git repository, a clean non-detached checkout on
@@ -132,6 +134,12 @@ Confirmed viable:
   deny worktree paths — a documented consequence, not a code fix. `persist_allow_rules` writes to
   the original project's `.flux/config.toml` (process cwd), which is correct: authority stays with
   the original root.
+- **Worktree parents must live on real disk (C-117).** The original `/tmp` choice failed in
+  practice: `/tmp` is commonly a RAM-backed tmpfs (32 GB on the dev machine), and a build inside
+  an entered worktree writes a multi-GB `target/` there — observed filling the tmpfs and breaking
+  every process needing `/tmp` during the epic's own merge verification. Allocation now defaults
+  to `~/.flux/worktrees` with `$FLUX_WORKTREE_DIR` as the override; the temp dir is only a
+  last-resort fallback when `$HOME` is unset.
 
 ## Acceptance / done
 

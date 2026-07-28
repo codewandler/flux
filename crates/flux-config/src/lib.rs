@@ -346,6 +346,9 @@ pub struct Config {
     /// Default `provider/model` spec (a CLI `--model` flag overrides this).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// TUI color theme name (`dark` / `light` / `mono`); the in-TUI `/theme` command persists it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     /// Deprecated compatibility flag. If true, the native web family (the `web` scope) gets a
     /// private-net `*` grant; plugins still require `[private_net.plugins]` grants.
     #[serde(default)]
@@ -713,6 +716,17 @@ pub fn render_allow_rules(project: Option<(&str, &str)>, rules: &[String]) -> Re
     toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
 }
 
+/// Re-render `current` (usually `~/.flux/config.toml`) with the TUI theme set to `theme`,
+/// round-tripping every other setting — the pure half of the `/theme` persistence path (C-104).
+pub fn render_theme(current: Option<(&str, &str)>, theme: &str) -> Result<String> {
+    let mut cfg = current
+        .map(|(source, text)| parse_source(source, text))
+        .transpose()?
+        .unwrap_or_default();
+    cfg.theme = Some(theme.to_string());
+    toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
+}
+
 /// Merge `project` onto `user`: lists (and policy grants) concatenate (user first), scalars prefer
 /// project, legacy `allow_private_net` is true if either enables it, scoped private-net grants merge.
 fn merge(user: Config, project: Config) -> Config {
@@ -738,6 +752,7 @@ fn merge(user: Config, project: Config) -> Config {
     };
     Config {
         model: project.model.or(user.model),
+        theme: project.theme.or(user.theme),
         allow_private_net: user.allow_private_net || project.allow_private_net,
         private_net: merge_private_net(user.private_net, project.private_net),
         endpoint: EndpointConfig {
@@ -1820,6 +1835,36 @@ allow = ["read"]
             .unwrap_err()
             .to_string();
         assert!(error.contains("guarded-project"), "{error}");
+    }
+
+    /// C-104: the `theme` field round-trips, merges project-over-user like other scalars, and
+    /// `render_theme` sets it while preserving unrelated settings.
+    #[test]
+    fn theme_field_round_trips_and_renders() {
+        let cfg = parse_source("user", "theme = \"light\"\n").unwrap();
+        assert_eq!(cfg.theme.as_deref(), Some("light"));
+
+        let merged = from_sources(
+            Some(("user", "theme = \"light\"\n")),
+            Some(("project", "theme = \"dark\"\n")),
+        )
+        .unwrap();
+        assert_eq!(merged.theme.as_deref(), Some("dark"));
+
+        let rendered = render_theme(
+            Some(("user", "model = \"mock\"\ntheme = \"dark\"\n")),
+            "light",
+        )
+        .unwrap();
+        let reparsed = parse_source("rendered", &rendered).unwrap();
+        assert_eq!(reparsed.theme.as_deref(), Some("light"));
+        assert_eq!(reparsed.model.as_deref(), Some("mock"));
+
+        let fresh = render_theme(None, "mono").unwrap();
+        assert_eq!(
+            parse_source("fresh", &fresh).unwrap().theme.as_deref(),
+            Some("mono")
+        );
     }
 
     #[cfg(unix)]

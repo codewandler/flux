@@ -8,7 +8,6 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-<<<<<<< HEAD
 - **Claude interop epic (D-186…D-192): commands + skills load from both `.flux` and `.claude`
   worlds** (design: `docs/designs/claude-interop.md`; user docs:
   `website/docs/agent/claude-compat.md`, new page):
@@ -40,7 +39,6 @@ All notable changes to this project are documented in this file. The format is b
     (`.claude/skills/<ns>/<name>/SKILL.md`), symlink jail enforced at every depth; a directory
     containing `SKILL.md` claims its subtree, so a skill's own `references/` never surfaces as a
     separate skill.
-=======
 - **C-101: animated boot splash for the interactive surfaces.** Bare `flux` (and prompt-less
   `flux run`) and `flux tui` now open with an animated FLUX splash — matrix rain dissolving into
   the block logo, then a pulsing glow with the `[ deterministic agent platform ]` tagline. Any key
@@ -56,7 +54,9 @@ All notable changes to this project are documented in this file. The format is b
 
 - **C-98/C-99: `git_worktree_enter` / `git_worktree_leave` built-ins — context-local git
   worktrees.** `enter` preflights a clean non-detached `main`, creates a generated
-  `flux/worktree/…` branch worktree under a private `/tmp/flux-worktree-*` directory, and
+  `flux/worktree/…` branch worktree under a private on-disk `flux-worktree-*` directory
+  (`$FLUX_WORKTREE_DIR`, default `~/.flux/worktrees` — not `/tmp`, which is commonly a RAM-backed
+  tmpfs a worktree build would fill; C-117), and
   transitions only the calling agent context's guarded root into it. `leave` requires a clean
   worktree and an unmoved clean `main`, proves mergeability with an aborted trial merge, merges
   `--no-ff --no-edit`, removes the worktree and branch, and restores the context; merge failures
@@ -73,6 +73,10 @@ All notable changes to this project are documented in this file. The format is b
   `allocate_worktree_dir`/`remove_worktree_dir` helpers. A worktree transition never touches
   process-global cwd, and the sandbox's writable set follows the re-rooted workspace
   automatically.
+- **C-118: the model is told per turn when its context is inside a worktree.** While a worktree
+  session is active, the turn's base system carries a `<workspace-note>` naming the transitioned
+  root and generated branch (the assembly-time project context still describes the original
+  workspace; the `cwd` op is the live truth). The note disappears after `git_worktree_leave`.
 - **C-100: per-turn op surfacing and sub-agent spawns follow the active root.** Evidence-gated
   group surfacing probes the context's active root each turn (assembly-time config/skills/roles
   stay fixed by design); `SpawnRequest` carries the parent's active-system snapshot so children
@@ -118,7 +122,6 @@ All notable changes to this project are documented in this file. The format is b
   before export.
 
 ### Added
->>>>>>> main
 
 - **`/effort` REPL and TUI slash command.** View the active reasoning effort (`/effort`) or set it
   mid-session (`/effort low|medium|high|xhigh|max`, or `/effort off` for the provider default). The

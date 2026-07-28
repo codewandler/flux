@@ -608,6 +608,10 @@ pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
     let mut options = flux_tui::TuiRunOptions::new(auto_approve, Some(model_spec));
     options.model_resolver = Some(Arc::new(CliTuiModelResolver));
     options.file_commands = load_command_files(&cwd, TUI_BUILTIN_COMMANDS);
+    // C-104: the persisted theme choice (user-level, project override wins per the merge rules).
+    options.theme = flux_runtime::metadata::load_config(&cwd)
+        .ok()
+        .and_then(|cfg| cfg.theme);
     // Persist even when the TUI returns an error: an earlier "always allow" choice remains a user
     // decision and must not vanish because terminal restoration or a later turn failed.
     let executor = agent.executor.clone();

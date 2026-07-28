@@ -64,6 +64,29 @@ pub fn persist_allow_rules(cwd: &Path, rules: &[String]) -> Result<()> {
     project.write_file_atomic(PROJECT_CONFIG, &body)
 }
 
+/// Atomically persist the user's TUI theme choice to `~/.flux/config.toml` (a personal
+/// preference, so user-level rather than project-level), round-tripping every other setting via
+/// `flux-config`'s pure serializer. Creates `~/.flux` on first use.
+pub fn persist_user_theme(theme: &str) -> Result<()> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Err(Error::Config("HOME is not set".into()));
+    };
+    let root = home.join(".flux");
+    if !root.exists() {
+        std::fs::create_dir_all(&root)
+            .map_err(|error| Error::Config(format!("create {}: {error}", root.display())))?;
+    }
+    let Some((_, system)) = trusted_flux_root()? else {
+        return Err(Error::Config("~/.flux is not usable".into()));
+    };
+    let current = system.read_optional_text("config.toml")?;
+    let body = flux_config::render_theme(
+        current.as_deref().map(|text| ("~/.flux/config.toml", text)),
+        theme,
+    )?;
+    system.write_file_atomic("config.toml", &body)
+}
+
 /// Load guarded project and trusted user-global group manifests. Callers decide how to present a
 /// malformed optional manifest, but an escaping path is never converted to absence here.
 pub fn load_groups(cwd: &Path) -> Result<Vec<flux_evidence::ToolGroup>> {
