@@ -8,6 +8,44 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **C-142 (BREAKING for guest crates): the plugin wire contract is its own crate.** All 856 lines
+  of `crates/flux-plugin/src/protocol.rs` — `Frame`/`FrameKind`, `PluginManifest`,
+  `OperationSpec`, `PluginCapabilities`, `AuthMethod`, `EndpointSpec`, `ConfigSpec`,
+  `process_grant_allows`, the `PluginHandler`/`GuestHost` traits, and the synchronous `serve` stdio
+  loop — moved to **`codewandler-flux-plugin-protocol`** (`flux_plugin_protocol`), an L0 serde-only
+  crate. `flux-plugin` re-exports it, so every `flux_plugin::{Frame, PluginManifest, …}` path still
+  resolves and no host call site changed. **The `guest` feature on `flux-plugin` is gone**: a guest
+  now depends on the protocol crate directly, which is the point — a plugin no longer compiles
+  flux's host half to reach the types on its own pipe. `plugins/host-kit` is built on the protocol
+  crate. `flux-codegate` places the new crate at L0.
+- **C-143 (BREAKING, release mechanics): the plugin protocol is on its own version line.** The
+  crates a plugin binary compiles against — `flux-plugin-protocol` plus the serde-only leaves it
+  needs (`flux-spec`, `flux-policy`, `flux-secret`, `flux-evidence`, `flux-datasource`) and
+  `codewandler-flux-host-kit` — leave `version.workspace = true` and start at **1.0.0**. Their
+  version answers one question, *does a plugin built against it still speak to this host?*, and a
+  flux release does not change that answer. `scripts/cut-release.sh` therefore **no longer edits,
+  re-locks, or stages anything under `plugins/`** (it previously `sed`ed two manifests, ran a
+  second `cargo update`, and staged both — `plugins/Cargo.lock` changed in 5 of the last 8 commits
+  that touched it, every one a release cut); the plugins-workspace `cargo fmt --check` stays in the
+  gate. The documented exception to the single-version rule is recorded in AGENTS.md. Consumers
+  pinning `codewandler-flux-host-kit = "0.28"` must move to `"1"`.
+- **C-146: a release publishes what moved.** `scripts/publish-crates-io.sh` asks the crates.io API
+  whether `<crate>@<version>` is already live and skips without invoking `cargo publish` at all —
+  previously each of the 28 crates paid a full `cargo package` just to learn it was already
+  published (~13 min for the closure). With the protocol line no longer tracking flux, most
+  releases now skip those six crates outright. `codewandler-flux-host-kit` **leaves the flux
+  closure** and publishes with the pack from `release-plugins.yml`, which pre-checks that its
+  protocol dependency is live and fails with that instruction rather than an opaque resolution
+  error. `flux_codegate::tests::publish_script_covers_a_registry_resolvable_closure` now checks
+  both publishers, so no crate can fall between them.
+- **C-147: cutting a release is transactional.** `scripts/cut-release.sh` snapshots every file it
+  touches and an EXIT trap restores them on any non-zero exit before the commit, so a red gate no
+  longer leaves the changelogs half-rolled for a re-run to roll a second time into a phantom
+  version section (the 0.14.3 gap; it recurred on 0.28.0 and was finished by hand). The commit is
+  now by pathspec (`git commit --only`) so another session's staged work cannot ride along, and
+  `docs/roadmap.md`'s "Status as of **X.Y.Z (DATE)**" line is restamped mechanically — included in
+  the release commit only when its sole change is that stamp.
+
 - **C-141: plugin builds no longer compile the Flux-Lang front-end.** `flux-plugin` depended on
   `flux-lang` for exactly one type — `FlowEffect`, the semantic-effect *tag vocabulary* carried in
   `PluginManifest`'s `semantic_effects` — and that single edge pulled the parser, CST, and
@@ -21,6 +59,37 @@ All notable changes to this project are documented in this file. The format is b
   and fails if a host-only crate reappears in it — the edge arrived *through* `host-kit`, which a
   manifest-level check would have missed. First story of the
   [plugin-protocol-decoupling](docs/designs/plugin-protocol-decoupling.md) epic.
+
+### Added
+
+- **C-144: plugin compatibility is a checked contract, not a convention.** `PROTOCOL =
+  "flux.plugin.v1"` was stamped into every `Frame` and read back by nobody — an incompatible plugin
+  surfaced as an opaque serde failure. The host now validates the marker at the load seam
+  (`crates/flux-plugin/src/host/loading.rs`) and rejects a mismatch with a message naming **both**
+  sides; a `future_protocol_plugin` fixture announcing `flux.plugin.v99` proves it. The wire itself
+  is pinned by golden JSON (`crates/flux-plugin-protocol/tests/golden/{frame,manifest}.json`)
+  asserted round-trip in both directions, in the style of `website_in_sync`: the maximal instances
+  are built with **exhaustive struct literals and no `..Default::default()`**, so adding a wire
+  field fails to compile there, and changing one fails the golden with instructions to either
+  re-record with `UPDATE=1` and bump the protocol MINOR, or bump `PROTOCOL` and the MAJOR.
+- **C-145: CI runs a previously released plugin binary against the current host.** Every other test
+  in the repo builds host and guest from the same commit, so none of them can catch "today's host
+  stopped understanding yesterday's binary" — which is the entire claim the decoupling makes.
+  `scripts/check-plugin-compat.sh` (CI job `plugin-compat`) resolves the latest `plugins-v*`
+  release, installs those real binaries into a throwaway `FLUX_HOME`, and asserts manifests load
+  over the wire and one read-shaped operation round-trips. A genuinely absent release is a logged
+  skip; an incompatibility fails the job.
+- **C-146: a changed crate must change its version.** The dropped lockstep was implicitly
+  guaranteeing this. `scripts/check-crate-versions.sh` (CI job `crate-versions`) now says it
+  outright: for every crate that sets its own version, a source change since the previous `v*` tag
+  must come with a moved version — otherwise the edit would ship under a version already on
+  crates.io, where `cargo publish` skips it and consumers keep the old code. Workspace-inherited
+  crates are out of scope (the cut sweeps them). `--self-test` is the failing-first proof.
+- **C-147: the roadmap status line is guarded.**
+  `flux_codegate::tests::roadmap_status_line_matches_the_workspace_version` fails when
+  `docs/roadmap.md`'s "Status as of" line drifts from the workspace version — the same shape as the
+  existing `website_in_sync` guard, and what makes the cut script's new restamp trustworthy rather
+  than something someone remembers to hand-edit.
 
 ### Fixed
 

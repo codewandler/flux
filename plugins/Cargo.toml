@@ -39,12 +39,15 @@ version = "0.1.1"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# flux contracts (path deps into the sibling crates; these are L0/L4 and pure of vendor deps)
-flux-plugin = { package = "codewandler-flux-plugin", version = "0.28.0", path = "../crates/flux-plugin", default-features = false, features = ["guest"] }
-flux-datasource = { package = "codewandler-flux-datasource", version = "0.28.0", path = "../crates/flux-datasource" }
-flux-secret = { package = "codewandler-flux-secret", version = "0.28.0", path = "../crates/flux-secret" }
-flux-spec = { package = "codewandler-flux-spec", version = "0.28.0", path = "../crates/flux-spec" }
-host-kit = { package = "codewandler-flux-host-kit", version = "0.28.0", path = "host-kit" }
+# The flux PROTOCOL LINE (C-143): caret requirements on the 1.x wire contract, not on flux's
+# version. A flux release does not move these, so `scripts/cut-release.sh` never edits this file
+# and a plugin binary is rebuilt only when the wire itself changes. Path deps keep local
+# development working against the sibling crates.
+flux-plugin-protocol = { package = "codewandler-flux-plugin-protocol", version = "1", path = "../crates/flux-plugin-protocol" }
+flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "../crates/flux-datasource" }
+flux-secret = { package = "codewandler-flux-secret", version = "1", path = "../crates/flux-secret" }
+flux-spec = { package = "codewandler-flux-spec", version = "1", path = "../crates/flux-spec" }
+host-kit = { package = "codewandler-flux-host-kit", version = "1", path = "host-kit" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

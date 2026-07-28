@@ -1,7 +1,7 @@
 //! Subprocess lifecycle, tool projection, and descriptor discovery.
 
 use super::*;
-use crate::protocol::validate_manifest_operations;
+use flux_plugin_protocol::validate_manifest_operations;
 
 // ---------------------------------------------------------------------------
 // Plugin host (host side) — async, spawns the subprocess
@@ -175,7 +175,12 @@ impl PluginHost {
         }
         let line = std::str::from_utf8(&buf)
             .map_err(|e| Error::Provider(format!("plugin frame not valid UTF-8: {e}")))?;
-        Ok(serde_json::from_str(line.trim())?)
+        let frame: Frame = serde_json::from_str(line.trim())?;
+        // Every plugin→host frame carries the wire-protocol marker; checking it here — the single
+        // choke point for inbound frames — turns an incompatible plugin into an actionable message
+        // instead of a downstream deserialization failure (C-144).
+        flux_plugin_protocol::check_protocol(&frame.protocol).map_err(Error::Provider)?;
+        Ok(frame)
     }
 
     async fn request(&mut self, command: &str, payload: Value) -> Result<Frame> {
@@ -557,7 +562,8 @@ impl HostCapabilities for OpScopedCaps<'_> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if !argv.is_empty() && !crate::protocol::process_grant_allows(self.process, &argv) {
+            if !argv.is_empty() && !flux_plugin_protocol::process_grant_allows(self.process, &argv)
+            {
                 return Err(format!(
                     "{command}: `{}` is outside operation `{}`'s declared process constraints",
                     argv.join(" "),

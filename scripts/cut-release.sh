@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 #
-# Cut a flux release: bump every version, re-lock both workspaces, roll the CHANGELOG, run the full
-# gate, then commit + tag. Automates the manual dance so cutting a version is one command.
+# Cut a flux release: bump every version, re-lock the root workspace, roll the CHANGELOG, run the
+# full gate, then commit + tag. Automates the manual dance so cutting a version is one command.
 #
 #   scripts/cut-release.sh <version>    # explicit, e.g. 0.9.4
 #   scripts/cut-release.sh patch        # bump the patch component of the current version
 #   scripts/cut-release.sh minor        # bump minor, reset patch  (flux uses minor as the breaking signal)
 #   scripts/cut-release.sh <ver> --no-gate   # skip the build/test/clippy/fmt gate (not recommended)
 #
-# It stages ONLY the release files (root/plugins manifests + locks, both changelogs, and the
-# generated website customer-changelog mirror) so concurrent uncommitted work from other sessions
-# is never swept in. It does NOT push. It prints the build-once sequence: push the commit, prepare
-# its exact-SHA binary artifacts, then push the already-created local tag to promote those artifacts
-# and start crates.io publication. Run from the repo root, and commit your actual code/content
-# changes first: this cuts the release on top of them.
+# It stages ONLY the release files (the root manifest + lock, both changelogs, the generated
+# website customer-changelog mirror, and the roadmap status stamp) so concurrent uncommitted work
+# from other sessions is never swept in. The plugin pack is NOT part of a flux cut: its crates sit
+# on the independent 1.x protocol line (C-143), so nothing under plugins/ is edited, re-locked, or
+# staged here.
+#
+# It does NOT push. It prints the build-once sequence: push the commit, prepare its exact-SHA
+# binary artifacts, then push the already-created local tag to promote those artifacts and start
+# crates.io publication. Run from the repo root, and commit your actual code/content changes first:
+# this cuts the release on top of them.
+#
+# A failed gate is now SAFE to re-run from (C-147): every file the script touches is snapshotted up
+# front and restored on any non-zero exit before the commit, so a red gate no longer leaves the
+# changelogs half-rolled for a second run to roll again into a phantom version section.
 #
 set -euo pipefail
 
@@ -44,26 +52,43 @@ echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad target version:
 
 echo "== cutting $OLD -> $NEW =="
 
-# 1a) bump every flux version string in the root manifest (workspace.package.version reads "$OLD")
-#     and the plugins workspace. On a patch bump this is the only substitution needed.
+# TRANSACTIONAL (C-147). Everything below mutates tracked files — manifests, lockfile, both
+# changelogs, the website mirror, the roadmap stamp — and the gate runs at the END, after those
+# edits, because it must test what is about to be tagged. When the gate then fails, a half-cut tree
+# is left behind: re-running the script would roll [Unreleased] a SECOND time and mint a phantom
+# version section (this is the documented 0.14.3 gap; it recurred cutting 0.28.0). So snapshot every
+# file this script may touch and restore it on ANY non-zero exit before the commit.
+RELEASE_FILES=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md docs/roadmap.md)
+SNAPSHOT="$(mktemp -d)"
+for f in "${RELEASE_FILES[@]}"; do
+  [ -f "$f" ] || continue
+  mkdir -p "$SNAPSHOT/$(dirname "$f")"
+  cp "$f" "$SNAPSHOT/$f"
+done
+COMMITTED=0
+restore_on_failure() {
+  local status=$?
+  rm -rf "$SNAPSHOT.lock"
+  [ "$COMMITTED" -eq 1 ] && { rm -rf "$SNAPSHOT"; return; }
+  [ "$status" -eq 0 ] && { rm -rf "$SNAPSHOT"; return; }
+  echo >&2
+  echo "!! cut FAILED (exit $status) — restoring the working tree to its pre-cut state" >&2
+  for f in "${RELEASE_FILES[@]}"; do
+    [ -f "$SNAPSHOT/$f" ] || continue
+    cp "$SNAPSHOT/$f" "$f"
+  done
+  rm -rf "$SNAPSHOT"
+  echo "!! restored. Fix the failure and re-run — no phantom version section was left behind." >&2
+}
+trap restore_on_failure EXIT
+
+# 1a) bump every flux version string in the root manifest (workspace.package.version reads "$OLD").
+#     The nested plugins/ workspace is deliberately NOT touched (C-143): its crates sit on the
+#     independent 1.x PROTOCOL LINE, so a flux release cannot invalidate their requirements and a
+#     plugin binary is rebuilt only when the wire contract itself changes.
 before=$(grep -c "\"$OLD\"" Cargo.toml || true)
 sed -i "s/\"$OLD\"/\"$NEW\"/g" Cargo.toml
 echo "   bumped $before version string(s) in Cargo.toml"
-plugins_before=$(grep -c "\"$OLD\"" plugins/Cargo.toml || true)
-if [ "$plugins_before" -gt 0 ]; then
-  sed -i "s/\"$OLD\"/\"$NEW\"/g" plugins/Cargo.toml
-  echo "   bumped $plugins_before version string(s) in plugins/Cargo.toml"
-fi
-# host-kit versions in LOCKSTEP with the flux workspace (see plugins/host-kit/Cargo.toml): every
-# cut republishes it with a matching version + flux dep line, so a flux release always has a
-# compatible host-kit by construction.
-hostkit_before=$(grep -c "\"$OLD\"" plugins/host-kit/Cargo.toml || true)
-if [ "$hostkit_before" -gt 0 ]; then
-  sed -i "s/\"$OLD\"/\"$NEW\"/g" plugins/host-kit/Cargo.toml
-  echo "   bumped $hostkit_before version string(s) in plugins/host-kit/Cargo.toml"
-else
-  echo "   !! plugins/host-kit/Cargo.toml carries no \"$OLD\" — lockstep broken? fix by hand" >&2
-fi
 
 # 1b) the `[workspace.dependencies]` publish-closure pins (`flux-core = { version = "0.MI.0", ... }`)
 #     deliberately stay at MINOR.0 across patch releases — the loosest correct `^0.MI.0` requirement
@@ -80,17 +105,12 @@ if [ "$old_pin" != "$new_pin" ]; then
     sed -i "s/version = \"$old_pin\"/version = \"$new_pin\"/g" Cargo.toml
     echo "   bumped $pin_before publish-closure pin(s) $old_pin -> $new_pin in Cargo.toml"
   fi
-  plugins_pin_before=$(grep -c "version = \"$old_pin\"" plugins/Cargo.toml || true)
-  if [ "$plugins_pin_before" -gt 0 ]; then
-    sed -i "s/version = \"$old_pin\"/version = \"$new_pin\"/g" plugins/Cargo.toml
-    echo "   bumped $plugins_pin_before publish-closure pin(s) $old_pin -> $new_pin in plugins/Cargo.toml"
-  fi
 fi
 
-# 2) re-lock both workspaces (root + the nested plugins pack) so the lockfiles carry $NEW.
+# 2) re-lock the root workspace so its lockfile carries $NEW. plugins/Cargo.lock is untouched:
+#    nothing a flux cut changes appears in it (C-143).
 cargo update --workspace >/dev/null 2>&1
-cargo update --manifest-path plugins/Cargo.toml --workspace >/dev/null 2>&1
-echo "   re-locked root + plugins workspaces"
+echo "   re-locked the root workspace"
 
 # 3) roll the CHANGELOG: rename [Unreleased] to the dated release, add a fresh empty [Unreleased].
 DATE=$(date +%Y-%m-%d)
@@ -119,25 +139,61 @@ UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync \
   website_customer_changelog_is_in_sync >/dev/null
 echo "   regenerated website customer changelog"
 
+# 3d) restamp the roadmap's status line so the release version is not hand-maintained (C-147).
+#     `docs/tests` pin this: roadmap_status_line_matches_the_workspace_version fails on drift.
+if grep -qE '^Status as of \*\*[0-9]+\.[0-9]+\.[0-9]+ \([0-9]{4}-[0-9]{2}-[0-9]{2}\)\*\*' docs/roadmap.md; then
+  sed -i -E "s/^Status as of \*\*[0-9]+\.[0-9]+\.[0-9]+ \([0-9]{4}-[0-9]{2}-[0-9]{2}\)\*\*/Status as of **$NEW ($DATE)**/" docs/roadmap.md
+  echo "   restamped docs/roadmap.md status line -> $NEW ($DATE)"
+else
+  echo "   !! docs/roadmap.md has no 'Status as of **X.Y.Z (DATE)**' line — stamp it by hand" >&2
+fi
+
 # 4) the gate (skippable). Mirrors AGENTS.md's dev-loop gate + both-workspace fmt + codegate.
 if [ "$NO_GATE" -eq 0 ]; then
   echo "== gate =="
-  cargo build --workspace
-  cargo test --workspace
-  cargo clippy --workspace --all-targets -- -D warnings
-  cargo fmt --all --check
-  cargo fmt --manifest-path plugins/Cargo.toml --all --check
-  cargo test -p flux-codegate
+  # `set -e` already aborts here, but name the failing step explicitly: a bare non-zero exit from
+  # `cargo test --workspace` scrolled off screen reads as "the script died", not "the gate is red",
+  # and the EXIT trap's restore message is easier to trust when it says which step caused it.
+  gate() { "$@" || { echo "!! gate step failed: $*" >&2; exit 1; }; }
+  gate cargo build --workspace
+  gate cargo test --workspace
+  gate cargo clippy --workspace --all-targets -- -D warnings
+  gate cargo fmt --all --check
+  gate cargo fmt --manifest-path plugins/Cargo.toml --all --check
+  gate cargo test -p flux-codegate
   echo "   gate green"
 else
   echo "== gate SKIPPED (--no-gate) =="
 fi
 
-# 5) commit ONLY the release files, then tag. Never `git add -A` (protects concurrent work).
-git add Cargo.toml plugins/Cargo.toml plugins/host-kit/Cargo.toml Cargo.lock plugins/Cargo.lock \
-  CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md
-git commit -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock both workspaces.
-- Roll CHANGELOG and WHATS-NEW [Unreleased] -> [$NEW], including the generated website mirror."
+# 5) commit ONLY the release files, then tag.
+#
+# Two hazards a rehearsal on 0.29.0 surfaced, both from `git commit` committing the INDEX:
+#   - anything another session had already staged (a `git mv`, a partial `git add`) rode along in
+#     the release commit;
+#   - `docs/roadmap.md` is shared — restamping and staging it whole would sweep in a concurrent
+#     session's roadmap edits.
+# So: commit by pathspec (`--only`, which commits exactly these paths from the working tree and
+# leaves any other staged work alone), and include the roadmap only when its sole change is the
+# stamp this script just made.
+COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md)
+if git diff --quiet HEAD -- docs/roadmap.md; then
+  : # unchanged (no stamp needed, or the file has no status line) — nothing to commit
+elif diff -q <(git show "HEAD:docs/roadmap.md" 2>/dev/null) "$SNAPSHOT/docs/roadmap.md" >/dev/null 2>&1; then
+  # roadmap was clean before the cut, so its only change is our stamp — safe to include
+  COMMIT_PATHS+=(docs/roadmap.md)
+else
+  echo "   !! docs/roadmap.md had uncommitted changes before this cut (another session?)." >&2
+  echo "   !! It was restamped to $NEW but is NOT part of the release commit — commit it yourself." >&2
+fi
+
+git commit --only "${COMMIT_PATHS[@]}" -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock the root workspace.
+- Roll CHANGELOG and WHATS-NEW [Unreleased] -> [$NEW], including the generated website mirror.
+- Restamp the roadmap status line." || { echo "!! commit failed" >&2; exit 1; }
+# Past this point the cut is in history: restoring the working tree would undo nothing useful and
+# would clobber the committed state, so disarm the snapshot.
+COMMITTED=1
+
 # Annotated, not lightweight: `git push --follow-tags` only pushes annotated tags (a lightweight
 # tag here silently stayed local on the 0.11.4 cut and the workflows never fired).
 git tag -a "v$NEW" -m "flux $NEW"

@@ -2,7 +2,7 @@
 id: C-145
 title: Run the previously released plugin binary against the current host in CI
 pillar: Core
-status: ready
+status: done
 priority: 14
 epic: plugin-protocol-decoupling
 design: docs/designs/plugin-protocol-decoupling.md
@@ -18,17 +18,17 @@ against an older protocol crate, still speaks to today's host.
 
 ## Acceptance
 
-- [ ] A CI job downloads a plugin binary from the most recent `plugins-v*` GitHub release, runs it
+- [x] A CI job downloads a plugin binary from the most recent `plugins-v*` GitHub release, runs it
       against the host built from the current tree, and asserts its manifest loads and one
       read-shaped operation round-trips.
-- [ ] The job fails loudly on an incompatibility rather than skipping — a skip on download failure
+- [x] The job fails loudly on an incompatibility rather than skipping — a skip on download failure
       is allowed only when the release is genuinely absent, and it says so in the log.
-- [ ] The asserted operation needs no third-party credential (pick one whose failure mode is local,
+- [x] The asserted operation needs no third-party credential (pick one whose failure mode is local,
       or drive it through the existing plugin test fixtures).
-- [ ] Documented in the design doc as the test that backs the compatibility claim.
+- [x] Documented in the design doc as the test that backs the compatibility claim.
 
 ## Progress
-- (not started)
+- Done. See the CHANGELOG `[Unreleased]` entries and `docs/designs/plugin-protocol-decoupling.md` ("As built").
 
 ## Notes
 - Complements `scripts/smoke-plugins.sh`, which exercises the *installed* pack against live

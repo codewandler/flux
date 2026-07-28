@@ -2,7 +2,7 @@
 id: C-144
 title: Enforce the protocol marker, pin the wire with golden fixtures, guard the version bump
 pillar: Core
-status: ready
+status: done
 priority: 13
 epic: plugin-protocol-decoupling
 design: docs/designs/plugin-protocol-decoupling.md
@@ -18,23 +18,23 @@ does not drop the guarantee it was standing in for.
 
 ## Acceptance
 
-- [ ] The host reads the `protocol` field on frames from a plugin and rejects a mismatch with an
+- [x] The host reads the `protocol` field on frames from a plugin and rejects a mismatch with an
       actionable message naming both sides (e.g. "plugin speaks flux.plugin.v2, this host speaks
       flux.plugin.v1 — upgrade flux or the plugin"), wired into the load path in
       `crates/flux-plugin/src/host.rs`.
-- [ ] Failing-first test: a fixture plugin announcing an unknown protocol string is rejected with
+- [x] Failing-first test: a fixture plugin announcing an unknown protocol string is rejected with
       that error rather than a serde failure.
-- [ ] Golden wire fixtures: serialized `Frame` and `PluginManifest` JSON checked into the protocol
+- [x] Golden wire fixtures: serialized `Frame` and `PluginManifest` JSON checked into the protocol
       crate, asserted to round-trip in both directions — pinning the wire, which Rust signatures
       do not.
-- [ ] A drift guard in the style of `shipped_flux_corpus_agreement` / `website_in_sync`: a
+- [x] A drift guard in the style of `shipped_flux_corpus_agreement` / `website_in_sync`: a
       snapshot of the protocol crate's wire surface that fails loudly and must be updated
       deliberately, alongside the protocol version bump.
-- [ ] The guard's failure message says what to do: bump the protocol version, or explain why the
+- [x] The guard's failure message says what to do: bump the protocol version, or explain why the
       change is wire-compatible.
 
 ## Progress
-- (not started)
+- Done. See the CHANGELOG `[Unreleased]` entries and `docs/designs/plugin-protocol-decoupling.md` ("As built").
 
 ## Notes
 - `PROTOCOL` stays a string — `flux.plugin.v1` is already on the wire in shipped binaries, so

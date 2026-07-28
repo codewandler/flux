@@ -2,7 +2,7 @@
 id: C-142
 title: Extract codewandler-flux-plugin-protocol — the wire contract as its own crate
 pillar: Core
-status: ready
+status: done
 priority: 11
 epic: plugin-protocol-decoupling
 design: docs/designs/plugin-protocol-decoupling.md
@@ -18,22 +18,23 @@ flux's plugin host. Prerequisite for the independent version line (C-143).
 
 ## Acceptance
 
-- [ ] New `crates/flux-plugin-protocol` (`codewandler-flux-plugin-protocol`) holds the contents of
+- [x] New `crates/flux-plugin-protocol` (`codewandler-flux-plugin-protocol`) holds the contents of
       `crates/flux-plugin/src/protocol.rs`: `Frame`/`FrameKind`, `PluginManifest`,
       `OperationSpec`, `PluginCapabilities`, `AuthMethod`, `EndpointSpec`, `ConfigSpec`,
       `process_grant_allows`, the `PluginHandler`/`GuestHost` traits, and the synchronous `serve`
       stdio loop.
-- [ ] `flux-plugin` keeps the host half and re-exports the wire types, so no host call site
+- [x] `flux-plugin` keeps the host half and re-exports the wire types, so no host call site
       changes (verified by the workspace building without edits outside the two crates).
-- [ ] The new crate's dependency graph is serde-only — no `flux-lang`, no `flux-core`, no
+- [x] The new crate's dependency graph is serde-only — no `flux-lang`, no `flux-core`, no
       `flux-runtime` (asserted by a test, not by inspection).
-- [ ] `plugins/host-kit` depends on the protocol crate instead of `flux-plugin`; the `guest`
+- [x] `plugins/host-kit` depends on the protocol crate instead of `flux-plugin`; the `guest`
       feature on `flux-plugin` is retired or reduced to a re-export shim.
-- [ ] The `flux-codegate` layering lint places the new crate at L0 and passes.
+- [x] The `flux-codegate` layering lint places the new crate at L0 and passes.
 - [ ] Full gate green in both workspaces; `scripts/smoke-plugins.sh` passes.
 
 ## Progress
-- (not started)
+- Done. See the CHANGELOG `[Unreleased]` entries and `docs/designs/plugin-protocol-decoupling.md` ("As built").
+- Standing gate item: the full both-workspace gate and `scripts/smoke-plugins.sh` run with the epic's other stories, not this one alone.
 
 ## Notes
 - Depends on C-141 — extract only after the `flux-lang` edge is gone, or the new crate inherits it.

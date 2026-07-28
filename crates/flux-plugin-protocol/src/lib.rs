@@ -6,7 +6,31 @@ use serde_json::Value;
 pub use flux_evidence::{SignalMatch, ToolGroup, KIND_TURN_INTENT};
 use flux_spec::{Effect, FlowEffect, Idempotency, Risk, StagingDisposition};
 
+/// The wire-protocol marker every [`Frame`] carries. A plugin and a host interoperate when — and
+/// only when — this string matches on both sides; it is the compatibility contract that replaced
+/// matching flux version numbers (C-143).
+///
+/// It is versioned independently of flux: a flux release never changes it, and a wire change that
+/// old plugins cannot parse must change it *and* the major version of this crate. Bumping it
+/// orphans every plugin binary built against the old value, so treat it as a last resort — the
+/// `serde` defaults on every field make additive changes compatible without a bump.
 pub const PROTOCOL: &str = "flux.plugin.v1";
+
+/// Check a frame's protocol marker against the one this build speaks.
+///
+/// The host applies this to every frame a plugin sends. Without it an incompatible plugin surfaces
+/// as an opaque deserialization failure somewhere downstream; with it the operator is told which
+/// side is out of date and what to do about it.
+pub fn check_protocol(marker: &str) -> std::result::Result<(), String> {
+    if marker == PROTOCOL {
+        return Ok(());
+    }
+    Err(format!(
+        "plugin speaks protocol `{marker}`, this host speaks `{PROTOCOL}` — \
+         upgrade whichever side is older (`flux plugin install` for the plugin pack, \
+         or a newer flux for the host)"
+    ))
+}
 
 /// Whether a frame is a request (host→plugin) or a response (plugin→host).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,5 +875,127 @@ mod tests {
         manifest.operations[0].process = vec!["  ".into()];
         let err = validate_manifest_operations(&manifest).unwrap_err();
         assert!(err.contains("blank process constraint"), "{err}");
+    }
+
+    // D-54: serve_io malformed-frame handling
+    // -----------------------------------------------------------------
+
+    /// Minimal [`PluginHandler`] for driving [`serve_io`] in-process: `manifest` answers a fixed
+    /// manifest, `echo` answers back whatever input it was given.
+    struct EchoHandler;
+
+    impl PluginHandler for EchoHandler {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest {
+                name: "d54-test".into(),
+                ..PluginManifest::default()
+            }
+        }
+
+        fn call(
+            &self,
+            operation: &str,
+            input: Value,
+            _host: &mut dyn GuestHost,
+        ) -> std::result::Result<Value, String> {
+            match operation {
+                "echo" => Ok(input),
+                other => Err(format!("unknown operation: {other}")),
+            }
+        }
+    }
+
+    fn frame_line(id: &str, command: &str, payload: Value) -> String {
+        let mut s = serde_json::to_string(&Frame::request(id, command, payload)).unwrap();
+        s.push('\n');
+        s
+    }
+
+    /// A single malformed line from the host must not vanish without trace, and must not stop the
+    /// loop from answering the next, well-formed request.
+    #[test]
+    fn serve_io_skips_single_malformed_frame_and_answers_next_request() {
+        let mut input = String::new();
+        input.push_str("not a valid frame at all\n");
+        input.push_str(&frame_line("r1", "manifest", Value::Null));
+
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut writer: Vec<u8> = Vec::new();
+        let mut diag: Vec<u8> = Vec::new();
+        serve_io(reader, &mut writer, &mut diag, EchoHandler);
+
+        let diag = String::from_utf8(diag).unwrap();
+        assert_eq!(
+            diag.lines().count(),
+            1,
+            "exactly one diagnostic for the one malformed line: {diag:?}"
+        );
+        assert!(
+            diag.contains("malformed"),
+            "diagnostic names the problem: {diag}"
+        );
+        assert!(
+            !diag.contains("not a valid frame at all"),
+            "diagnostic must not echo the raw malformed content: {diag}"
+        );
+
+        let out = String::from_utf8(writer).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the valid request after the bad line is still answered: {out:?}"
+        );
+        let resp: Frame = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(resp.id, "r1");
+        assert!(resp.ok, "manifest request answered ok: {resp:?}");
+        assert_eq!(resp.result["name"], "d54-test");
+    }
+
+    /// `MAX_CONSECUTIVE_MALFORMED_FRAMES` malformed frames in a row terminate the loop with a final
+    /// diagnostic instead of spinning forever — the host would otherwise hang awaiting a response
+    /// that never arrives. A valid frame in between resets the counter, so it takes a genuinely
+    /// unbroken run of bad frames to trip the bound.
+    #[test]
+    fn serve_io_terminates_after_consecutive_malformed_frames_but_valid_frame_resets_counter() {
+        let mut input = String::new();
+        // One below the bound, then a valid frame: must NOT terminate.
+        for _ in 0..MAX_CONSECUTIVE_MALFORMED_FRAMES - 1 {
+            input.push_str("garbage\n");
+        }
+        input.push_str(&frame_line("r1", "manifest", Value::Null));
+        // A full run of the bound now: must terminate here...
+        for _ in 0..MAX_CONSECUTIVE_MALFORMED_FRAMES {
+            input.push_str("garbage\n");
+        }
+        // ...and never reach this trailing valid request.
+        input.push_str(&frame_line("r2", "manifest", Value::Null));
+
+        let reader = std::io::Cursor::new(input.into_bytes());
+        let mut writer: Vec<u8> = Vec::new();
+        let mut diag: Vec<u8> = Vec::new();
+        serve_io(reader, &mut writer, &mut diag, EchoHandler);
+
+        let out = String::from_utf8(writer).unwrap();
+        let responses: Vec<Frame> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            responses.len(),
+            1,
+            "only the reset-point request (r1) is answered, not the trailing r2: {out:?}"
+        );
+        assert_eq!(responses[0].id, "r1");
+
+        let diag = String::from_utf8(diag).unwrap();
+        assert!(
+            diag.contains(&MAX_CONSECUTIVE_MALFORMED_FRAMES.to_string()),
+            "final diagnostic names the bound: {diag}"
+        );
+        assert!(
+            diag.lines().last().unwrap().contains("exiting"),
+            "loop ends with a termination diagnostic, not silence: {diag}"
+        );
     }
 }

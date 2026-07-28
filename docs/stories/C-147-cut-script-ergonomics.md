@@ -2,7 +2,7 @@
 id: C-147
 title: Make the cut transactional and restamp release docs mechanically
 pillar: Core
-status: ready
+status: done
 priority: 16
 epic: plugin-protocol-decoupling
 design: docs/designs/plugin-protocol-decoupling.md
@@ -27,17 +27,17 @@ Separately, `docs/roadmap.md`'s "Status as of **X**" line and the hand-written S
 
 ## Acceptance
 
-- [ ] `scripts/cut-release.sh` is transactional: either it runs the gate before mutating anything,
+- [x] `scripts/cut-release.sh` is transactional: either it runs the gate before mutating anything,
       or it snapshots every file it touches and restores them on failure. Verified by forcing a
       gate failure and confirming `git status` is clean afterwards.
-- [ ] The script restamps `docs/roadmap.md`'s status line to the version being cut.
-- [ ] A test fails when the roadmap status line drifts from the workspace version (same shape as
+- [x] The script restamps `docs/roadmap.md`'s status line to the version being cut.
+- [x] A test fails when the roadmap status line drifts from the workspace version (same shape as
       the existing `website_in_sync` guard).
-- [ ] The `⚠️ do not re-run` hazard note in the script header is either removed as fixed, or
+- [x] The `⚠️ do not re-run` hazard note in the script header is either removed as fixed, or
       narrowed to whatever genuinely remains.
 
 ## Progress
-- (not started)
+- Done. See the CHANGELOG `[Unreleased]` entries and `docs/designs/plugin-protocol-decoupling.md` ("As built").
 
 ## Notes
 - Related: C-39 (live smoke gate) — steps 7/8 report "no claude/codex credential" while the

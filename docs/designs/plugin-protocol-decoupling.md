@@ -90,6 +90,29 @@ of" line, the board's Status block) is hand-done and drifts.
 - **Out of scope:** the pack index gaining compatibility metadata (a natural follow-on once the
   protocol has a version worth recording), and any change to the plugin capability model.
 
+## As built
+
+Where each guarantee physically lives, once the epic landed:
+
+| Guarantee | Artifact |
+| --- | --- |
+| A guest compiles the wire, not the host | `crates/flux-plugin-protocol` (serde-only; `flux-plugin` re-exports it, so no host call site moved) |
+| The wire cannot change unnoticed | `crates/flux-plugin-protocol/tests/wire_contract.rs` + `tests/golden/{frame,manifest}.json`; the maximal instances use exhaustive struct literals, so a *new field* fails to compile there |
+| An incompatible plugin says so | `check_protocol` at the load seam (`crates/flux-plugin/src/host/loading.rs`), proven by the `future_protocol_plugin` fixture in `crates/flux-plugin/tests/host.rs` |
+| Yesterday's binary still works | `scripts/check-plugin-compat.sh` — downloads the latest `plugins-v*` release, installs those binaries into a throwaway `FLUX_HOME`, reads manifests and round-trips one read-shaped op against a `flux` built from this tree. **This is the test that backs the compatibility claim**; every other test builds host and guest from the same commit. CI job `plugin-compat`. Exit 2 (release genuinely absent) is a logged skip; an incompatibility exits 1 and fails |
+| A changed crate changed its version | `scripts/check-crate-versions.sh` (CI job `crate-versions`), scoped to crates that set their own version — workspace-inherited ones are swept by the cut. `--self-test` is the failing-first proof that a stale version is detectable |
+| A flux cut leaves `plugins/` alone | `scripts/cut-release.sh` — no `plugins/` sed, no nested `cargo update`, no `plugins/` path in the commit; the plugins-workspace `cargo fmt --check` stays in the gate |
+| A failed cut is safe to re-run | `scripts/cut-release.sh` snapshots every file it touches and an EXIT trap restores them on any non-zero exit before the commit |
+
+**The closure now has two publishers**, because it spans two version lines:
+`scripts/publish-crates-io.sh` ships the root workspace on the flux line, and
+`.github/workflows/release-plugins.yml` ships `codewandler-flux-host-kit` with the pack. Ordering
+is a real constraint — host-kit's dependencies are published by the flux closure — so the pack
+workflow pre-checks that its `codewandler-flux-plugin-protocol` version is already live and fails
+with that instruction rather than an opaque resolution error.
+`flux_codegate::tests::publish_script_covers_a_registry_resolvable_closure` checks both halves, so
+a crate cannot fall between them.
+
 ## Related
 
 - **C-39** — repair the live smoke gate: steps 7/8 report "no claude/codex credential" while the

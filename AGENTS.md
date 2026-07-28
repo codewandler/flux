@@ -173,10 +173,24 @@ Each invariant below was established (and several re-learned the hard way) durin
   Do not use the patch position as a rolling release counter. (Established 2026-07-07 when v0.2.24
   shipped a breaking realtime-seam change and had to be re-cut as v0.3.0.)
 - Release mechanics: bump every `version = "..."` occurrence in the root `Cargo.toml`, run
-  `cargo update --workspace` in **both** workspaces (root and `plugins/`), roll `[Unreleased]` into
-  a dated version section in `CHANGELOG.md` **and in `WHATS-NEW.md`**, run the full dev-loop gate,
-  then commit `chore(release): cut X.Y.Z`, tag `vX.Y.Z`, and push the branch **and** the tag — the
-  tag triggers the Release workflow (verify it completes with all assets).
+  `cargo update --workspace`, roll `[Unreleased]` into a dated version section in `CHANGELOG.md`
+  **and in `WHATS-NEW.md`**, run the full dev-loop gate, then commit `chore(release): cut X.Y.Z`,
+  tag `vX.Y.Z`, and push the branch **and** the tag — the tag triggers the Release workflow (verify
+  it completes with all assets). `scripts/cut-release.sh` does all of this and is transactional: a
+  red gate restores the tree, so a failed cut is safe to re-run (C-147).
+- **The one documented exception to the single-version rule: the plugin PROTOCOL LINE** (C-143).
+  Everything flux ships moves together on `0.y.z` — except the crates a plugin binary compiles
+  against, which carry an independent `1.x`: `codewandler-flux-plugin-protocol` (the wire contract),
+  the serde-only leaves it needs (`flux-spec`, `flux-policy`, `flux-secret`, `flux-evidence`,
+  `flux-datasource`), and `codewandler-flux-host-kit` in `plugins/`. Their version answers one
+  question — *does a plugin built against it still speak to this host?* — which a flux release does
+  not change the answer to. So **`scripts/cut-release.sh` never edits, re-locks, or stages anything
+  under `plugins/`**, and bumping a `1.x` crate is a deliberate act: SemVer over the **wire**, not
+  over the Rust API. The lockstep was doing one useful thing implicitly — guaranteeing a changed
+  crate shipped under a changed version — so two checks now do it explicitly:
+  `scripts/check-crate-versions.sh` (a changed crate on the 1.x line must move its version) and
+  `scripts/check-plugin-compat.sh` (a previously released plugin binary still speaks to today's
+  host). Both run in CI. Design: `docs/designs/plugin-protocol-decoupling.md`.
 - **Two changelogs, two audiences.** `CHANGELOG.md` is the engineering log (story IDs, crates,
   invariants). `WHATS-NEW.md` at the repo root is the CUSTOMER changelog: every **user-visible**
   change adds a plain-language entry to its `[Unreleased]` section alongside the CHANGELOG entry —

@@ -70,7 +70,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "codewandler-flux-datasource"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-evidence"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -86,11 +86,11 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-host-kit"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "codewandler-flux-datasource",
- "codewandler-flux-plugin",
+ "codewandler-flux-plugin-protocol",
  "codewandler-flux-spec",
  "schemars",
  "serde",
@@ -99,8 +99,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "codewandler-flux-plugin"
-version = "0.28.0"
+name = "codewandler-flux-plugin-protocol"
+version = "1.0.0"
 dependencies = [
  "codewandler-flux-datasource",
  "codewandler-flux-evidence",
@@ -111,14 +111,14 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-policy"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "codewandler-flux-spec"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "codewandler-flux-policy",
  "schemars",

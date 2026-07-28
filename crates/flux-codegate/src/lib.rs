@@ -22,9 +22,18 @@ pub fn layer(name: &str) -> Option<u8> {
     let name = name.strip_prefix("codewandler-").unwrap_or(name);
     Some(match name {
         // L0 — pure contracts: no IO, no flux deps except other L0. Safe for anything to use.
-        "flux-core" | "flux-policy" | "flux-secret" | "flux-spec" | "flux-config"
-        | "flux-evidence" | "flux-skill" | "flux-lang" | "flux-markdown" | "flux-datasource"
-        | "flux-audio" => 0,
+        "flux-core"
+        | "flux-policy"
+        | "flux-secret"
+        | "flux-spec"
+        | "flux-config"
+        | "flux-evidence"
+        | "flux-skill"
+        | "flux-lang"
+        | "flux-markdown"
+        | "flux-datasource"
+        | "flux-audio"
+        | "flux-plugin-protocol" => 0,
         // L1 — the provider abstraction, the concrete providers (Anthropic/OpenAI/OpenRouter/
         // Ollama + the shared Messages protocol core, all in `flux-providers`), credentials, the
         // A2A agent-protocol client + wire types (`flux-a2a`; no flux deps — a network client), and
@@ -740,9 +749,48 @@ mod tests {
         );
     }
 
+    /// The roadmap's "Status as of **X.Y.Z (DATE)**" line must name the version this workspace
+    /// actually is. `scripts/cut-release.sh` restamps it on every cut (C-147); this test is what
+    /// makes that stamp trustworthy rather than something someone remembers to hand-edit — it was
+    /// stale through several releases before the cut script owned it.
+    #[test]
+    fn roadmap_status_line_matches_the_workspace_version() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        let manifest =
+            std::fs::read_to_string(repo_root.join("Cargo.toml")).expect("read Cargo.toml");
+        let version = manifest
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("version = \""))
+            .and_then(|rest| rest.split('"').next())
+            .expect("workspace.package.version in the root Cargo.toml");
+
+        let roadmap = std::fs::read_to_string(repo_root.join("docs/roadmap.md"))
+            .expect("read docs/roadmap.md");
+        let status = roadmap
+            .lines()
+            .find(|line| line.starts_with("Status as of "))
+            .expect("docs/roadmap.md must carry a `Status as of **X.Y.Z (DATE)**` line");
+
+        assert!(
+            status.contains(&format!("**{version} (")),
+            "docs/roadmap.md says `{status}` but this workspace is {version} — \
+             scripts/cut-release.sh restamps this line on a cut; if you got here another way, \
+             update it by hand"
+        );
+    }
+
     /// A vanity-prefixed package is part of the crates.io closure. Every production path
     /// dependency in that closure needs a registry version, and the ordered publisher must include
     /// every closure member. Otherwise `cargo publish` fails only after a release tag is pushed.
+    ///
+    /// The closure has TWO publishers since C-146, because it spans two version lines: the root
+    /// workspace ships on the flux line via `scripts/publish-crates-io.sh`, while the nested
+    /// `plugins/` workspace sits on the independent 1.x protocol line and ships with the pack via
+    /// `.github/workflows/release-plugins.yml`. Both halves are checked — a vanity-prefixed package
+    /// that no publisher names is the failure this test exists to catch, and moving one between
+    /// lines must not create a gap.
     #[test]
     fn publish_script_covers_a_registry_resolvable_closure() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -752,9 +800,11 @@ mod tests {
             repo_root.join("plugins/Cargo.toml"),
         ];
         let mut closure = BTreeSet::new();
+        let mut pack_closure = BTreeSet::new();
         let mut path_only = Vec::new();
 
-        for manifest in manifests {
+        for (index, manifest) in manifests.into_iter().enumerate() {
+            let is_pack = index == 1;
             let metadata = MetadataCommand::new()
                 .manifest_path(manifest)
                 .other_options(vec![
@@ -768,7 +818,11 @@ mod tests {
                 if !package.name.starts_with("codewandler-") {
                     continue;
                 }
-                closure.insert(package.name.to_string());
+                if is_pack {
+                    pack_closure.insert(package.name.to_string());
+                } else {
+                    closure.insert(package.name.to_string());
+                }
                 for dependency in &package.dependencies {
                     if dependency.kind != DependencyKind::Development
                         && dependency.path.is_some()
@@ -803,7 +857,23 @@ mod tests {
 
         assert_eq!(
             scripted, closure,
-            "scripts/publish-crates-io.sh must list every vanity-prefixed workspace package exactly once"
+            "scripts/publish-crates-io.sh must list every vanity-prefixed package of the ROOT \
+             workspace exactly once (packages in plugins/ ship with the pack — see C-146)"
+        );
+
+        // The pack half: every vanity-prefixed package in plugins/ must be named by the workflow
+        // that releases the pack, or nothing publishes it at all.
+        let workflow =
+            std::fs::read_to_string(repo_root.join(".github/workflows/release-plugins.yml"))
+                .expect("read release-plugins.yml");
+        let unpublished: Vec<&String> = pack_closure
+            .iter()
+            .filter(|name| !workflow.contains(name.as_str()))
+            .collect();
+        assert!(
+            unpublished.is_empty(),
+            ".github/workflows/release-plugins.yml publishes the plugin-pack half of the closure, \
+             but never mentions: {unpublished:?}"
         );
     }
 

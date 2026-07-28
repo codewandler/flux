@@ -1,7 +1,10 @@
 [package]
 name = "codewandler-flux-policy"
 edition.workspace = true
-version.workspace = true
+# PROTOCOL LINE (C-143), not the flux workspace version: the Action half of FlowEffect::lower, reached through flux-spec,
+# so a plugin built against 1.x keeps resolving across flux releases. Moves only when the
+# wire vocabulary changes — scripts/cut-release.sh never touches it.
+version = "1.0.0"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

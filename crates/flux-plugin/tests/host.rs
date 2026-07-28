@@ -355,3 +355,29 @@ async fn op_process_narrowing_gates_callbacks_and_names_authority() {
         .unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A plugin speaking a different wire protocol must be rejected at the seam, naming both markers.
+///
+/// The version lockstep between flux and the plugin pack was removed (C-143), so this check is what
+/// enforces compatibility now. Without it an incompatible plugin surfaces as an opaque
+/// deserialization failure with nothing pointing at the real cause.
+#[tokio::test]
+async fn a_plugin_speaking_a_foreign_protocol_is_rejected_with_both_markers_named() {
+    let exe = env!("CARGO_BIN_EXE_future_protocol_plugin");
+    let system = test_system();
+    let mut host = PluginHost::spawn(&system, exe, &[]).await.unwrap();
+
+    let err = host
+        .manifest()
+        .await
+        .expect_err("a foreign protocol marker must not be accepted");
+    let message = err.to_string();
+    assert!(
+        message.contains("flux.plugin.v99"),
+        "names the plugin's marker: {message}"
+    );
+    assert!(
+        message.contains(flux_plugin::PROTOCOL),
+        "names the host's marker: {message}"
+    );
+}

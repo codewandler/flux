@@ -1,0 +1,149 @@
+{
+  "auth": [
+    {
+      "description": "fixture auth",
+      "env": [
+        "FIXTURE_TOKEN"
+      ],
+      "oauth2": {
+        "authorize_path": "/oauth/authorize",
+        "client_id": "fixture-client",
+        "endpoint": "https://example.invalid",
+        "grants": [
+          "authorization_code"
+        ],
+        "redirect": {
+          "path": "/callback",
+          "port": 7777
+        },
+        "scopes": [
+          "read"
+        ],
+        "token_path": "/oauth/token"
+      },
+      "purpose": "api",
+      "scheme": {
+        "header": {
+          "name": "PRIVATE-TOKEN"
+        }
+      },
+      "user_env": [
+        "FIXTURE_USER"
+      ]
+    }
+  ],
+  "capabilities": {
+    "blob": true,
+    "conn": [
+      "tcp:*:5432"
+    ],
+    "credential": true,
+    "discover": true,
+    "fs": [
+      {
+        "path": "/etc/fixture",
+        "secret": true
+      }
+    ],
+    "http": true,
+    "http_hosts": [
+      "example.invalid"
+    ],
+    "private_hosts": [
+      "10.0.0.1"
+    ],
+    "process": [
+      "kubectl get"
+    ],
+    "secrets": [
+      "FIXTURE_TOKEN"
+    ]
+  },
+  "config": [
+    {
+      "description": "fixture config",
+      "env": [
+        "FIXTURE_REGION"
+      ],
+      "name": "region"
+    }
+  ],
+  "datasources": [
+    {
+      "capabilities": [
+        "search"
+      ],
+      "description": "fixture datasource",
+      "entity": "ticket",
+      "name": "fixture-ds"
+    }
+  ],
+  "discovers": [
+    "prometheus"
+  ],
+  "endpoints": [
+    {
+      "default": "https://example.invalid",
+      "description": "fixture endpoint",
+      "env": [
+        "FIXTURE_URL"
+      ],
+      "http_hosts": [
+        "example.invalid"
+      ],
+      "name": "api",
+      "template": "https://{region}.example.invalid"
+    }
+  ],
+  "groups": [
+    {
+      "description": "fixture group",
+      "name": "fixture-group",
+      "surface_when": [
+        {
+          "kind": "turn.intent",
+          "signal": "fixture"
+        }
+      ],
+      "tools": [
+        "fixture.op"
+      ]
+    }
+  ],
+  "name": "fixture",
+  "operations": [
+    {
+      "description": "every field set",
+      "effects": [
+        "read",
+        "network"
+      ],
+      "group": "fixture-group",
+      "idempotency": "idempotent",
+      "input_schema": {
+        "type": "object"
+      },
+      "internal": true,
+      "name": "fixture.op",
+      "output_schema": {
+        "type": "string"
+      },
+      "process": [
+        "kubectl get"
+      ],
+      "public_name": "fixture.public",
+      "redact_fields": [
+        "token"
+      ],
+      "risk": "high",
+      "secret_purposes": [
+        "api"
+      ],
+      "semantic_effects": [
+        "money"
+      ],
+      "staging": "gather"
+    }
+  ],
+  "version": "9.9.9"
+}

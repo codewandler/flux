@@ -83,7 +83,7 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
 > and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### Plugin protocol decoupling — a release that leaves the plugin pack alone (epic) — 🔜 **PLANNED 2026-07-28 (C-141…C-147, seven stories)**
+### Plugin protocol decoupling — a release that leaves the plugin pack alone (epic) — ✅ **SHIPPED 2026-07-28 (C-141…C-147, all seven stories)**
 
 Cutting 0.28.0 made the plugin pack's release tax visible. `scripts/cut-release.sh` rewrites
 `plugins/Cargo.toml`'s pins, bumps `plugins/host-kit/Cargo.toml` in lockstep, and re-locks the
@@ -103,9 +103,18 @@ split honest: the host validates the protocol marker, golden JSON fixtures pin t
 than the Rust signatures, a snapshot guard forces a deliberate version bump, and CI runs the
 *previously released* plugin binary against the current host. Publishing then only touches what
 moved, and the cut becomes transactional (0.28.0's gate failure left both changelogs rolled and had
-to be finished by hand). C-141 lands first and alone is worth shipping: it deletes the 75-crate
-subtree with no version-line change. Design:
-[designs/plugin-protocol-decoupling.md](designs/plugin-protocol-decoupling.md).
+to be finished by hand). C-141 landed first and alone was worth shipping: it deleted the 75-crate
+subtree with no version-line change (a plugin's build graph went from **74 to 30** crates).
+
+**As shipped:** the wire contract is `codewandler-flux-plugin-protocol` at `1.0.0`, the `guest`
+feature on `flux-plugin` is gone, and `scripts/cut-release.sh` touches nothing under `plugins/`.
+What the lockstep was implicitly guaranteeing is now checked explicitly, in CI:
+`scripts/check-plugin-compat.sh` runs the *previously released* plugin binaries against a host
+built from the tree, and `scripts/check-crate-versions.sh` fails a crate that changed content
+without moving its version. The host rejects a foreign protocol marker by name, golden JSON pins
+the wire, `host-kit` publishes with the pack instead of the flux closure, and a failed cut restores
+the tree instead of leaving it half-rolled. Design:
+[designs/plugin-protocol-decoupling.md](designs/plugin-protocol-decoupling.md) (see "As built").
 
 ### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — 🔜 **PLANNED 2026-07-28 (C-133…C-140 + A-95, nine stories)**
 

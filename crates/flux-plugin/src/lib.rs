@@ -29,8 +29,10 @@ use flux_spec::{AccessKind, Effect, FlowEffect, Idempotency, Risk, StagingDispos
 #[cfg(feature = "host")]
 use flux_system::net::PrivateNetAllow;
 
-mod protocol;
-pub use protocol::*;
+// The wire contract lives in its own crate on its own version line (C-142/C-143) so a guest plugin
+// can depend on the protocol without depending on flux's host half. Re-exported here so every
+// existing `flux_plugin::{Frame, PluginManifest, OperationSpec, …}` path keeps resolving.
+pub use flux_plugin_protocol::*;
 
 /// JavaScript pre-tool hooks (QuickJS via `rquickjs`).
 #[cfg(feature = "hooks")]

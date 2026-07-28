@@ -1,0 +1,26 @@
+[package]
+name = "codewandler-flux-plugin-protocol"
+edition.workspace = true
+# INDEPENDENT of the flux workspace version (C-143): this crate is the plugin *wire contract*, and
+# its version answers one question only — "does a plugin built against it still speak to this
+# host?". A flux release does not move it; a wire change does. `scripts/cut-release.sh` therefore
+# never touches this file, and `flux_plugin_protocol::PROTOCOL` is the runtime half of the same
+# promise. See docs/designs/plugin-protocol-decoupling.md.
+version = "1.0.0"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "flux plugin wire contract: framed (NDJSON) stdio protocol, manifest/operation types, and the synchronous guest SDK"
+
+[lib]
+name = "flux_plugin_protocol"
+
+# Guest plugins compile this crate, so its dependency set is the build cost every plugin pays.
+# Keep it serde-only: no host crates, no async runtime, no HTTP. The architecture guard
+# `flux_codegate::tests::plugin_builds_exclude_host_only_crates` enforces the important half.
+[dependencies]
+flux-datasource.workspace = true
+flux-evidence.workspace = true
+flux-spec.workspace = true
+serde.workspace = true
+serde_json.workspace = true

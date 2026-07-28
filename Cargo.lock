@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-datasource"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-evidence"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1044,6 +1044,7 @@ dependencies = [
  "codewandler-flux-credentials",
  "codewandler-flux-datasource",
  "codewandler-flux-evidence",
+ "codewandler-flux-plugin-protocol",
  "codewandler-flux-runtime",
  "codewandler-flux-secret",
  "codewandler-flux-spec",
@@ -1066,8 +1067,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-flux-plugin-protocol"
+version = "1.0.0"
+dependencies = [
+ "codewandler-flux-datasource",
+ "codewandler-flux-evidence",
+ "codewandler-flux-spec",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codewandler-flux-policy"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
 ]
@@ -1172,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-secret"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1190,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "codewandler-flux-spec"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "codewandler-flux-policy",
  "schemars",
