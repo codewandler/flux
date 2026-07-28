@@ -53,6 +53,26 @@ fn render_empty_state_card(frame: &mut Frame, state: &ChatState, area: Rect) {
     frame.render_widget(Paragraph::new(lines), card);
 }
 
+/// The approval sheet's border/title style and title text, tiered by the pending call's
+/// risk/effect (C-154): a destructive delete and a read used to render identically (both plain
+/// `accent`). Tiers reuse the runtime's own destructive/mutating signal
+/// (`ApprovalRequest::destructive`/`mutating`, sourced from `IntentSet`/`PlanApprovalRequest` —
+/// no new classification invented). `destructive` additionally carries `BOLD` and `mutating`
+/// changes the title text, so `Theme::MONO` (`NO_COLOR`) — whose roles all resolve to the same
+/// `Color::Reset` — still tells the three tiers apart without relying on color.
+fn approval_tier_style(request: &controller::ApprovalRequest, t: &Theme) -> (Style, &'static str) {
+    if request.destructive {
+        (
+            t.err_style().add_modifier(Modifier::BOLD),
+            " approval · destructive ",
+        )
+    } else if request.mutating {
+        (t.warn_style(), " approval · write ")
+    } else {
+        (t.accent_style(), " approval ")
+    }
+}
+
 /// Render the chat: scrollable transcript, a status/spinner row, the input box, optional modal.
 pub fn render(frame: &mut Frame, state: &ChatState) {
     // Whole-screen fill so a light theme works on terminals with a dark background (C-104);
@@ -658,10 +678,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         }
         rows.push(Line::from(hints));
 
+        // C-154: border + title tint by risk tier instead of a fixed accent, so a destructive
+        // delete no longer looks like a read at a glance; MONO/NO_COLOR still tells the tiers
+        // apart via the BOLD modifier + title text (its roles all resolve to the same color).
+        let (tier_style, tier_title) = approval_tier_style(&view.request, t);
         let sheet = Paragraph::new(rows).style(state.theme.panel_style()).block(
             Block::bordered()
-                .border_style(t.accent_style())
-                .title(Span::styled(" approval ", t.accent_style())),
+                .border_style(tier_style)
+                .title(Span::styled(tier_title, tier_style)),
         );
         frame.render_widget(sheet, area);
     }

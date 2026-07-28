@@ -95,6 +95,10 @@ pub struct ApprovalRequest {
     pub summary: Option<String>,
     /// Whether the request discloses a destructive operation.
     pub destructive: bool,
+    /// Whether the request discloses a mutating call (write/execute/connect out) that is not
+    /// itself destructive. Neither flag set means the pending call is read-only. Drives the
+    /// sheet's border/title risk tier (C-154); never widens the approval decision itself.
+    pub mutating: bool,
 }
 
 /// Display state of the pending approval sheet (the reply channel stays in the event loop).
@@ -361,15 +365,20 @@ impl ChannelApprover {
 
 #[async_trait]
 impl Approver for ChannelApprover {
+    /// C-154: `intents` already carries the runtime's pre-execution risk signal (the same one the
+    /// per-op gate itself acts on) — spend it on the sheet's risk tier instead of discarding it, so
+    /// a destructive delete and a read don't render identically.
     async fn request(
         &self,
         tool: &str,
         subjects: &[String],
-        _intents: &IntentSet,
+        intents: &IntentSet,
     ) -> ApprovalChoice {
         self.ask(ApprovalRequest {
             tool: tool.to_string(),
             subjects: subjects.to_vec(),
+            destructive: intents.is_destructive(),
+            mutating: intents.is_mutating(),
             ..ApprovalRequest::default()
         })
         .await
@@ -386,6 +395,7 @@ impl Approver for ChannelApprover {
             subjects: plan_detail_lines(plan),
             summary: Some(plan.summary.clone()),
             destructive: plan.destructive,
+            mutating: plan.mutating,
         })
         .await
     }

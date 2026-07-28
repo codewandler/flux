@@ -4633,6 +4633,43 @@ mod tests {
         assert!(matches!(request.await.unwrap(), ApprovalChoice::Deny));
     }
 
+    /// C-154: the per-op path used to discard `intents` entirely (it was bound `_intents` and
+    /// never read), so a per-op destructive delete reached the sheet as an ordinary
+    /// `ApprovalRequest::default()` — `destructive`/`mutating` both `false`. `intents` was already
+    /// a parameter on `Approver::request`; this proves it is now spent, not that the approval
+    /// decision path grew a new one.
+    #[tokio::test]
+    async fn per_op_request_plumbs_destructive_and_mutating_from_intents() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = ChannelApprover { tx };
+        let mut intents = IntentSet::default();
+        intents.push(flux_spec::Intent {
+            behavior: flux_spec::IntentBehavior::CommandExecution,
+            target: flux_spec::IntentTarget::Process {
+                command: "rm -rf build".into(),
+            },
+            role: flux_spec::IntentRole::ProcessCommand,
+            certainty: flux_spec::IntentCertainty::Certain,
+        });
+        let raised = tokio::spawn(async move {
+            approver
+                .request("bash", &["rm -rf build".into()], &intents)
+                .await
+        });
+
+        let UiEvent::Approval { request, reply } = rx.recv().await.expect("approval raised") else {
+            panic!("expected an Approval event");
+        };
+        assert!(request.destructive, "rm -rf is destructive-shaped");
+        assert!(
+            request.mutating,
+            "a destructive command execution is also mutating"
+        );
+
+        let _ = reply.send(ApprovalChoice::Deny);
+        let _ = raised.await;
+    }
+
     /// C-105: while mouse capture is off, the footer indicates it (warn style) so the state is
     /// never invisible; the metrics segment drops before the indicator on narrow bars.
     #[test]
@@ -6051,6 +6088,7 @@ mod tests {
                 subjects: controller::plan_detail_lines(&plan_request()),
                 summary: Some("medium · mutating".into()),
                 destructive: false,
+                mutating: true,
             },
             scroll: 0,
             reason: None,
@@ -6085,6 +6123,10 @@ mod tests {
         assert_eq!(request.tool, "run plan");
         assert_eq!(request.summary.as_deref(), Some("medium · mutating"));
         assert!(!request.destructive);
+        assert!(
+            request.mutating,
+            "C-154: plan.mutating must reach the sheet's ApprovalRequest"
+        );
         assert!(
             request.subjects.iter().any(|s| s.contains("process.exec")),
             "the ops must reach the sheet, not just their count: {:?}",
@@ -6130,6 +6172,7 @@ mod tests {
                 subjects: controller::plan_detail_lines(&plan),
                 summary: Some(plan.summary.clone()),
                 destructive: true,
+                mutating: true,
             },
             scroll: 20, // scrolled past the detail list
             reason: None,
@@ -6184,6 +6227,119 @@ mod tests {
         let content = screen(&terminal);
         assert!(content.contains("approve"), "{content}");
         assert!(!content.contains("@@"), "{content}");
+    }
+
+    /// C-154 failing first: border + title used to be a fixed `t.accent_style()` for every pending
+    /// call, so a destructive delete and a read/write looked identical. The sheet's `┌` border
+    /// corner must now carry a visibly different style (color and/or modifier) per risk tier.
+    #[test]
+    fn approval_sheet_border_style_reflects_risk_tier() {
+        fn border_style(state: &ChatState) -> (Color, Modifier) {
+            let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+            terminal.draw(|f| render(f, state)).unwrap();
+            let cell = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .find(|c| c.symbol() == "┌")
+                .expect("bordered approval sheet")
+                .clone();
+            (cell.fg, cell.modifier)
+        }
+
+        let read_request = controller::ApprovalRequest {
+            tool: "read".into(),
+            subjects: vec!["src/a.rs".into()],
+            summary: None,
+            destructive: false,
+            mutating: false,
+        };
+        let write_request = controller::ApprovalRequest {
+            mutating: true,
+            ..read_request.clone()
+        };
+        let destructive_request = controller::ApprovalRequest {
+            destructive: true,
+            mutating: true,
+            ..read_request.clone()
+        };
+
+        let mut state = ChatState::new("mock".into());
+        state.approval = Some(ApprovalView {
+            request: read_request,
+            scroll: 0,
+            reason: None,
+        });
+        let read_style = border_style(&state);
+
+        state.approval = Some(ApprovalView {
+            request: write_request,
+            scroll: 0,
+            reason: None,
+        });
+        let write_style = border_style(&state);
+
+        state.approval = Some(ApprovalView {
+            request: destructive_request,
+            scroll: 0,
+            reason: None,
+        });
+        let destructive_style = border_style(&state);
+
+        assert_ne!(
+            destructive_style, write_style,
+            "a destructive approval must render a visibly different border than a write approval"
+        );
+        assert_ne!(
+            write_style, read_style,
+            "a write approval must render a visibly different border than a read approval"
+        );
+        assert_ne!(
+            destructive_style, read_style,
+            "a destructive approval must render a visibly different border than a read approval"
+        );
+
+        // MONO/NO_COLOR: every role collapses to the same `Color::Reset`, so color alone can't
+        // carry the tier — the title text (and the destructive BOLD modifier) must still.
+        let mut mono = ChatState::new("mock".into());
+        mono.theme = Theme::MONO;
+        mono.approval = Some(ApprovalView {
+            request: controller::ApprovalRequest {
+                tool: "bash".into(),
+                subjects: vec!["rm -rf build".into()],
+                summary: None,
+                destructive: true,
+                mutating: true,
+            },
+            scroll: 0,
+            reason: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal.draw(|f| render(f, &mono)).unwrap();
+        let content = screen(&terminal);
+        assert!(
+            content.contains("destructive"),
+            "MONO must still name the tier in the title text: {content}"
+        );
+
+        mono.approval = Some(ApprovalView {
+            request: controller::ApprovalRequest {
+                tool: "write".into(),
+                subjects: vec!["src/a.rs".into()],
+                summary: None,
+                destructive: false,
+                mutating: true,
+            },
+            scroll: 0,
+            reason: None,
+        });
+        terminal.draw(|f| render(f, &mono)).unwrap();
+        let content = screen(&terminal);
+        assert!(
+            content.contains("write") && !content.contains("destructive"),
+            "MONO write tier must read distinctly from the destructive tier: {content}"
+        );
     }
 
     #[test]
