@@ -15,6 +15,26 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **Long conversations got substantially cheaper and faster.** flux now reuses the cached
+  conversation itself, not just the system prompt, so a long turn stops re-paying full price for the
+  whole transcript on every round. On a long-transcript turn that took the share served from cache
+  from 47% to 71% and the equivalent cost from about $0.11 to about $0.04; short turns are
+  unaffected. The reusable part of the prompt also survives an hour now instead of five minutes, so
+  stepping away for a coffee no longer cold-starts your next message.
+- **Codex sessions stopped throwing their cache away.** The `codex` provider now talks HTTP by
+  default: it was opening a fresh connection per request and resending the whole conversation, which
+  landed on an arbitrary server with nothing cached — about 3% reuse, against roughly 50% on the new
+  default and up to 97% once warm, with no speed penalty.
+- **See the caching work, in the moment.** `/usage` in the TUI shows this turn's cache hit rate, the
+  read/write/fresh split, and a per-round bar list that makes a mid-turn cache reset visible as it
+  happens, plus session totals.
+- **The live token counters stopped under-reporting.** The TUI header and the CLI turn summary were
+  showing only the last round of a multi-round turn, and blended cache reads with cache writes.
+  They now add up the whole turn and report reads and writes separately. `flux usage` was always
+  correct and is unchanged.
+
 ## [0.29.0] - 2026-07-28
 
 ### Improved
