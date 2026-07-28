@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-29
+
 ### New
 
 - **Share a run as a single file.** `flux export <run> -o run.html` turns a recorded session into

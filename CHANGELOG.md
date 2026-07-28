@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-29
+
 ### Added
 
 - **C-132: `flux export <run>` — a recorded run as one self-contained HTML file.** The read-only
