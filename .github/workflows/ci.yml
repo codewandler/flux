@@ -115,6 +115,32 @@ jobs:
           ./scripts/check-crate-versions.sh --self-test
           ./scripts/check-crate-versions.sh
 
+  host-kit-protocol-drift:
+    name: published host-kit is not behind the live protocol version
+    runs-on: ubuntu-latest
+    # C-167: the ordering preflight in release-plugins.yml and the crate-versions job above both
+    # watch for COMMISSIONS (a wrong publish order; a changed-but-unbumped crate). Neither catches
+    # an OMISSION — a flux release publishing a newer `codewandler-flux-plugin-protocol` while
+    # nobody runs the pack workflow to publish a `codewandler-flux-host-kit` that depends on it.
+    # This runs on every push to main (i.e. every flux release commit), not only inside the pack
+    # workflow that may never be dispatched — so a flux cut tells you a pack release is now owed.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Published host-kit's protocol requirement is not behind the live protocol version
+        run: |
+          # Live crates.io state, not this tree's — see the script header for why exit 2 (data
+          # unobtainable, e.g. a crates.io outage) is a logged skip rather than a failure.
+          set +e
+          ./scripts/check-host-kit-protocol-drift.sh --self-test && ./scripts/check-host-kit-protocol-drift.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::host-kit/protocol drift check skipped — crates.io state unobtainable"
+            exit 0
+          fi
+          exit "$status"
+
   plugin-compat:
     name: released plugin binaries vs this host
     runs-on: ubuntu-latest
@@ -122,6 +148,22 @@ jobs:
     # wire contract and are rebuilt only when it changes. Every other job builds host and guest from
     # the same commit, so none of them can catch "today's host stopped understanding yesterday's
     # binary". This one points a real, already-shipped artifact at the current host.
+    #
+    # C-166: "the newest release" is only an across-time check by accident — a pack cut minutes
+    # after the host it will be tested against proves nothing a same-tree build wouldn't. So this
+    # job runs the script TWICE, as two separate assertions that are never merged into one
+    # PASS/FAIL:
+    #   1. pinned at COMPAT_BASELINE_TAG, a pack that predates `crates/flux-plugin-protocol`
+    #      existing as its own crate (verified: `git merge-base --is-ancestor d19212f
+    #      <that tag's commit>` fails) — the genuine cross-generation guarantee this job exists
+    #      to make. If this tag is ever pruned from the release list, or the wire moves to a new
+    #      PROTOCOL marker, repin it to the oldest surviving `plugins-v*` release whose
+    #      `plugins-index.json` `protocol` field still equals
+    #      `crates/flux-plugin-protocol/src/lib.rs`'s `PROTOCOL` constant.
+    #   2. the newest pack (no PACK_TAG override — the script's own default resolution), which is
+    #      still worth knowing works, but proves something weaker and must not be read as #1.
+    env:
+      COMPAT_BASELINE_TAG: plugins-v0.1.1
     steps:
       - uses: actions/checkout@v4
 
@@ -129,14 +171,29 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Released plugin binaries still speak this host's protocol
+      - name: "Baseline (cross-time): a pack older than the protocol crate still speaks this host's protocol"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACK_TAG: ${{ env.COMPAT_BASELINE_TAG }}
         # Exit 2 means the pack release genuinely could not be obtained — reported, not failed.
         # An actual incompatibility exits 1 and fails the job.
         run: |
           # GitHub runs this block under `bash -e`, which would abort on the script's own non-zero
           # exit before the status could be read at all — turning a skip into a failed job.
+          set +e
+          ./scripts/check-plugin-compat.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::plugin compatibility baseline check skipped — $COMPAT_BASELINE_TAG unavailable"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: "Newest pack (separate, second assertion): still speaks this host's protocol"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           set +e
           ./scripts/check-plugin-compat.sh
           status=$?

@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **C-166: the plugin compat test is an across-time test again.** `check-plugin-compat.sh` +
+  CI's `plugin-compat` job now run twice as separate, never-merged steps: pinned at
+  `plugins-v0.1.1` — a baseline verified to predate the `flux-plugin-protocol` crate split, so the
+  step genuinely proves an OLD pack still speaks to a NEW host — and again at the newest pack. The
+  log states the pack's release age and protocol marker vs the host's own. Failing path proven
+  live with a disguised `flux.plugin.v99` plugin driven through the real CLI.
+- **C-167: CI fails when the published host-kit lags the protocol crate.** New
+  `check-host-kit-protocol-drift.sh` (+ CI job) compares live crates.io state: the protocol
+  dependency requirement recorded by the published `codewandler-flux-host-kit` vs the live
+  `codewandler-flux-plugin-protocol` version — an absent dependency counts as maximally stale (the
+  v0.29.0 incident shape), and the failure message names the exact `release-plugins.yml` run to
+  cut. `--self-test` covers the fail/pass branches offline; AGENTS.md now records the
+  wire-change → pack-release-owed rule.
+
 ### Fixed
 
 - **C-183: `[tools] disable` now applies to every execution path, not just the interactive one.**

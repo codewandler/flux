@@ -190,7 +190,14 @@ Each invariant below was established (and several re-learned the hard way) durin
   crate shipped under a changed version — so two checks now do it explicitly:
   `scripts/check-crate-versions.sh` (a changed crate on the 1.x line must move its version) and
   `scripts/check-plugin-compat.sh` (a previously released plugin binary still speaks to today's
-  host). Both run in CI. Design: `docs/designs/plugin-protocol-decoupling.md`.
+  host). Both run in CI. **A wire change implies a pack release is owed**: publishing a newer
+  `codewandler-flux-plugin-protocol` from the flux closure without also running
+  `release-plugins.yml` with `publish: true` leaves the published `codewandler-flux-host-kit`
+  behind it on crates.io — the published advice ("depend on host-kit 1.x") becomes unfollowable
+  for that window, which is exactly what happened at v0.29.0. `scripts/check-host-kit-protocol-drift.sh`
+  (CI job `host-kit-protocol-drift`, C-167) enforces this: it compares the live crates.io versions
+  directly and fails loudly, naming the pack version to cut, if host-kit's published protocol
+  dependency has fallen behind. Design: `docs/designs/plugin-protocol-decoupling.md`.
 - **Two changelogs, two audiences.** `CHANGELOG.md` is the engineering log (story IDs, crates,
   invariants). `WHATS-NEW.md` at the repo root is the CUSTOMER changelog: every **user-visible**
   change adds a plain-language entry to its `[Unreleased]` section alongside the CHANGELOG entry —
