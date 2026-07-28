@@ -166,6 +166,36 @@ Also found and fixed while investigating: the Responses codec dropped
 `input_tokens_details.cache_write_tokens`, which this wire *does* report — so every codex row in
 `flux usage` showed a blank cache-write column and a cached prefix appeared to come from nowhere.
 
+### C-159 shipped — re-measured 2026-07-28
+
+The session-scoped design landed: `CodexWsTransport` caches the live connection after each clean
+`response.completed` (keyed on the body minus `input` — the upstream reuse predicate), a reused
+connection sends `previous_response_id` plus only the unseen items (full resend on the warm socket
+when the conversation was rewritten — compaction and forks stay correct), and the
+`x-codex-turn-state` token is echoed response→request on **both** transports through one shared
+slot, so the HTTP fallback of a WS session keeps the affinity the WS leg established. All
+per-connection state dies with the socket — with `store: false` the server retains conversation
+state only for the connection's lifetime, so a fresh socket never claims continuity. A dead cached
+socket (the live backend resets liberally) reconnects fresh *inside* the transport; the HTTP
+fallback stays reserved for a fresh connection failing.
+
+Re-measured, `codex/gpt-5.6-sol`, 2-step tool turns, three pairs, both arm orders:
+
+| pair (first arm) | WS | HTTP |
+|---|---:|---:|
+| 1 (WS) | **37%** | 0% |
+| 2 (HTTP) | **37%** | 19% |
+| 3 (WS) | **37%** | 56% |
+
+**WS 37/37/37 — the hit rate became *deterministic*, because the connection is the affinity**;
+HTTP's 0/19/56 is content-addressed shard luck (pair 3's 56% read five earlier runs' writes). WS
+wins the mean (37% vs 25%), decisively wins the cold case (37% vs 0%), and cost tracked it
+(~$0.011–0.014 WS vs ~$0.010–0.021 HTTP). Longer turns compound the gap: every extra round is
+another socket reuse and another avoided transcript resend. **The default flipped back to WS**
+(`FLUX_CODEX_WS=off` is the escape hatch), closing the interim-HTTP chapter above. Prewarm (the one
+upstream trick not adopted) is left as a follow-up — it halves first-call latency but does not
+change the cache economics.
+
 ### Review pass (2026-07-28)
 
 A code review of the epic surfaced two correctness gaps in what had already landed, both fixed here:

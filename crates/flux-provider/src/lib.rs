@@ -250,6 +250,12 @@ pub trait Credential: Send + Sync {
     fn token_source(&self) -> Option<Arc<dyn TokenSource>> {
         None
     }
+
+    /// Observe the response headers of a successful request (C-159). The generic HTTP path calls
+    /// this once per success, so a credential can capture a server-issued routing token (codex's
+    /// `x-codex-turn-state`) and replay it from [`apply`](Credential::apply) on the next request —
+    /// the request/response halves of a sticky-routing echo. Default: ignore them.
+    fn observe_response_headers(&self, _headers: &reqwest::header::HeaderMap) {}
 }
 
 /// Axis (c): an **alternative streaming transport** (e.g. the codex WebSocket) tried *before*
@@ -259,11 +265,23 @@ pub trait Credential: Send + Sync {
 /// JSON-event codecs). Any `Err` — handshake failure, policy close before data, refused
 /// connection — makes [`NativeProvider`] fall back transparently to HTTP; providers without a
 /// transport keep the reqwest path untouched.
+///
+/// **The transport is session-scoped, not per-call (C-159 — a deliberate contract change).** A
+/// [`NativeProvider`] is built once per session and shared across its turns, and the transport it
+/// carries lives just as long — so an implementation MAY hold state across `connect` calls:
+/// cache a live connection and reuse it for the next call, remember what it already sent so a
+/// follow-up can be incremental, or pin routing affinity. That statefulness is why the codex
+/// prompt cache works at all over WS (upstream's client is built the same way; a per-call socket
+/// reaches an arbitrary node with a cold prompt). Two obligations come with it: a cached
+/// connection that turns out dead must be recovered *inside* `connect` (reconnect fresh) rather
+/// than surfacing as an `Err` — the HTTP fallback exists for "this transport cannot serve the
+/// call", not "the cache was stale"; and concurrent `connect` calls must each get their own
+/// connection rather than interleaving on one socket.
 #[async_trait]
 pub trait StreamTransport: Send + Sync {
-    /// Open the transport, send `body`, and return the response byte stream. Must fail (rather
-    /// than hang or return an empty stream) on any connect-time problem so the HTTP fallback
-    /// can take over before the turn is committed to this transport.
+    /// Open (or resume) the transport, send `body`, and return the response byte stream. Must
+    /// fail (rather than hang or return an empty stream) on any connect-time problem so the HTTP
+    /// fallback can take over before the turn is committed to this transport.
     async fn connect(&self, body: &serde_json::Value) -> Result<ByteStream>;
 }
 
@@ -823,6 +841,9 @@ impl Provider for NativeProvider {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
+                        // C-159: let the credential capture any sticky-routing token the server
+                        // issued (codex `x-codex-turn-state`) for replay on the next request.
+                        self.cred.observe_response_headers(resp.headers());
                         break resp;
                     }
                     // Force-refresh on 401: the stored expiry can be wrong, so the lazy

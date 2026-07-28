@@ -2,8 +2,7 @@
 id: C-159
 title: Use the codex WebSocket the way upstream does — reuse the socket, replay turn-state, send only the delta
 pillar: Core
-status: ready
-priority: 1
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "flux opens a FRESH socket per request, replays no `x-codex-turn-state` token, and resends the whole `input` — so every codex WS request hits an arbitrary node with a cold full prompt (measured ~3% cache hit vs ~50% on HTTP). Upstream `codex-rs/core/src/client.rs` caches+prewarms one connection per session, replays the sticky-routing header, and sends only new items with `previous_response_id`."
@@ -62,7 +61,37 @@ better only because flux's stateless usage costs it less there.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started — filed 2026-07-28; root cause corrected the same day after reading the upstream client)
+- DONE 2026-07-28. The session-scoped transport landed in `flux-providers/src/codex.rs`:
+  - `CodexWsTransport` caches the live connection in a session slot; a clean `response.completed`
+    puts the socket back with the conversation it has seen and the response id; `response.failed`
+    or truncation drops it. `connect` TAKES the slot, so concurrent calls each get their own
+    connection instead of interleaving on one socket.
+  - Reuse predicate = the wire body minus `input` (`reuse_props`) — model/instructions/tools/
+    store/include/`prompt_cache_key`/… must all match, exactly upstream's
+    `responses_request_properties_match` shape. A mismatch dials fresh.
+  - Incremental input: when the cached conversation is a strict prefix of the new one, the reused
+    connection sends `previous_response_id` + only the unseen items; a rewritten conversation
+    (compaction/fork) full-resends on the warm socket, claiming no continuity. All of it dies with
+    the socket — `store:false` means server-side state is per-connection, so a fresh socket never
+    sends a stale `previous_response_id`.
+  - `x-codex-turn-state` echoed response→request on BOTH transports via one shared `TurnStateSlot`
+    (`Credential::observe_response_headers`, a new defaulted trait method, is the response-header
+    capture seam the HTTP path was missing; the WS side captures from the upgrade response and
+    replays on the next upgrade).
+  - A dead cached socket reconnects fresh INSIDE the transport (the live backend resets sockets
+    liberally); the HTTP fallback is reserved for a fresh connection failing. `StreamTransport`'s
+    trait doc now states the session-scoped contract explicitly.
+- Six new hermetic tests (session-capable WS stub serving many requests per socket): reuse+delta,
+  rewrite→full-resend-on-warm-socket, predicate-mismatch→fresh connection, dead-socket reconnect
+  without HTTP fallback, WS turn-state replay across upgrades, HTTP turn-state replay across
+  requests. C-07's WS/SSE equivalence suite passes unchanged.
+- **Re-measured** (2-step tool turns, three pairs, both arm orders): WS **37/37/37%** —
+  deterministic, the connection is the affinity — vs HTTP 0/19/56% shard luck. WS wins mean and
+  cold case; cost tracked. Table in the design doc.
+- **Default flipped back to WS**; `FLUX_CODEX_WS=off` is the escape hatch, pinned by
+  `ws_transport_is_the_default_with_an_off_switch`.
+- NOT adopted (follow-up): upstream's prewarm (`response.create` with `generate=false`) — a
+  first-call latency win, not a cache-economics one.
 
 ## Notes
 - **Measured 2026-07-28**, `codex/gpt-5.6-sol`, same prompt, 1 step per run, identical ctx, both

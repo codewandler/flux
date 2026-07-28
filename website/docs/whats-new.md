@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **Long codex sessions got cheaper and lighter on the wire.** flux now keeps one live connection
+  to the ChatGPT backend per session and sends only what's new in the conversation each round,
+  instead of reconnecting and resending the whole history every time. Repeat rounds now reliably
+  hit the server's prompt cache where they used to miss it almost entirely, and the same
+  connection routing means the benefit no longer depends on luck. No setup needed; set
+  `FLUX_CODEX_WS=off` if you ever need the old plain-HTTP behaviour.
+
 ## [0.31.0] - 2026-07-28
 
 ### New

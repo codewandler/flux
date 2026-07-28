@@ -6,6 +6,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-159: the codex WebSocket now works the way upstream's client does — and is the default
+  again.** flux opened a fresh socket per request, replayed no routing token, and resent the whole
+  `input`, so every WS request reached an arbitrary node with a full cold prompt (measured ~3%
+  cache hit vs ~50% on HTTP; the interim fix made HTTP the default). The transport is now
+  session-scoped, adopting `codex-rs/core/src/client.rs`'s design:
+  - the live connection is cached after each clean `response.completed` and reused when the next
+    request's properties match (the wire body minus `input` — model, instructions, tools, `store`,
+    `prompt_cache_key` must all agree); a mismatch dials fresh;
+  - a reused connection sends `previous_response_id` plus **only the unseen items** when the
+    conversation strictly extends the last one — the transcript stops being resent, a token win
+    independent of the cache; a rewritten conversation (compaction, fork) full-resends on the warm
+    socket and claims no continuity. All per-connection state dies with the socket: `store: false`
+    keeps server-side state per-connection, so a fresh socket never sends a stale response id;
+  - the server-issued `x-codex-turn-state` sticky-routing token is echoed response→request on
+    **both** transports through one shared slot (new defaulted `Credential::
+    observe_response_headers` seam — the HTTP path had no response-header capture at all), so the
+    HTTP fallback keeps the affinity the WS leg established;
+  - a dead cached socket (the live backend resets liberally) reconnects fresh *inside* the
+    transport; the HTTP fallback stays reserved for a fresh connection failing. `StreamTransport`'s
+    docs now state the session-scoped contract explicitly.
+  Re-measured on 2-step tool turns, three pairs, both arm orders: WS **37/37/37%** cache hit —
+  deterministic, the connection is the affinity — against HTTP's shard-luck 0/19/56%. The default
+  flipped back to WS; `FLUX_CODEX_WS=off` is the escape hatch. Six new hermetic tests cover
+  reuse+delta, rewrite, predicate mismatch, dead-socket recovery, and turn-state replay on both
+  transports; the C-07 WS/SSE equivalence suite passes unchanged. Upstream's prewarm is the one
+  trick not adopted (first-call latency, not cache economics) — noted as a follow-up.
+
 ## [0.31.0] - 2026-07-28
 
 ### Added

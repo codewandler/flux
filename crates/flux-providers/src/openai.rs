@@ -649,6 +649,16 @@ pub(crate) enum Secret {
     OAuth(Arc<dyn TokenSource>),
 }
 
+/// The codex sticky-routing header (C-159): issued by the server on a response, replayed by the
+/// client on the next request so successive requests of one turn land on the same node — where the
+/// prompt cache lives. Mirrors `X_CODEX_TURN_STATE_HEADER` in the upstream `codex-rs` client.
+pub(crate) const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+
+/// The shared latest-turn-state slot (C-159). One per codex session, shared between the HTTP
+/// credential and the WS transport so a token issued on either transport steers the other too —
+/// the HTTP fallback of a WS session must not lose the affinity the WS leg established.
+pub(crate) type TurnStateSlot = Arc<std::sync::Mutex<Option<String>>>;
+
 /// A Bearer-token credential covering `openai`, `openrouter`, and `codex` — they differ only in
 /// endpoint, extra gating headers, and whether a `chatgpt-account-id` header is sent. Fields are
 /// `pub(crate)` so the sibling [`crate::codex`] module can assemble the codex variant without
@@ -659,6 +669,9 @@ pub struct OpenAiCred {
     pub(crate) secret: Secret,
     pub(crate) extra: Vec<(&'static str, String)>,
     pub(crate) send_account_id: bool,
+    /// `Some` only for codex (C-159): the sticky-routing echo — [`Credential::apply`] replays the
+    /// stored token, [`Credential::observe_response_headers`] refreshes it from each response.
+    pub(crate) turn_state: Option<TurnStateSlot>,
 }
 
 #[async_trait]
@@ -689,6 +702,12 @@ impl Credential for OpenAiCred {
             })?;
             rb = rb.header("chatgpt-account-id", account);
         }
+        // C-159: replay the latest server-issued turn-state token for sticky routing.
+        if let Some(slot) = &self.turn_state {
+            if let Some(token) = slot.lock().expect("turn-state lock").clone() {
+                rb = rb.header(CODEX_TURN_STATE_HEADER, token);
+            }
+        }
         Ok(rb)
     }
 
@@ -698,6 +717,18 @@ impl Credential for OpenAiCred {
         match &self.secret {
             Secret::OAuth(ts) => Some(ts.clone()),
             Secret::ApiKey(_) => None,
+        }
+    }
+
+    // C-159: capture the sticky-routing token a response carries, overwriting the previous one —
+    // the server refreshes it per turn and the latest is the one to replay.
+    fn observe_response_headers(&self, headers: &reqwest::header::HeaderMap) {
+        let Some(slot) = &self.turn_state else { return };
+        if let Some(token) = headers
+            .get(CODEX_TURN_STATE_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            *slot.lock().expect("turn-state lock") = Some(token.to_string());
         }
     }
 }
@@ -716,6 +747,7 @@ pub fn openai_api(api_key: impl Into<String>) -> NativeProvider {
             secret: Secret::ApiKey(api_key.into()),
             extra: Vec::new(),
             send_account_id: false,
+            turn_state: None,
         }),
     )
 }
@@ -766,6 +798,7 @@ pub fn ollama_api() -> NativeProvider {
             secret: Secret::ApiKey("ollama".to_string()),
             extra: Vec::new(),
             send_account_id: false,
+            turn_state: None,
         }),
     )
 }
@@ -1915,6 +1948,7 @@ mod tests {
             secret: Secret::OAuth(Arc::new(NoAccount)),
             extra: Vec::new(),
             send_account_id: true,
+            turn_state: None,
         };
         let rb = reqwest::Client::new().post(cred.endpoint());
         let err = cred
