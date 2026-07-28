@@ -19,9 +19,12 @@ flux-policy.workspace = true
 flux-evidence.workspace = true
 flux-config.workspace = true
 flux-skill.workspace = true
+flux-markdown.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 async-trait.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 # tokio (full) backs the context-projector module's async file/process IO (folded in from flux-context).
 tokio.workspace = true

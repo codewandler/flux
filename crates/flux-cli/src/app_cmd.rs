@@ -593,12 +593,21 @@ impl flux_tui::ModelResolver for CliTuiModelResolver {
     }
 }
 
+/// Built-in TUI slash commands (D-186): a file command sharing one of these names is dropped at
+/// load (with a warning) rather than shadowing it — mirrors `flux-tui`'s `BUILTIN_COMMANDS` names.
+const TUI_BUILTIN_COMMANDS: &[&str] = &[
+    "help", "clear", "new", "model", "effort", "quit", "exit", "compact", "shell", "tools",
+    "evidence", "session", "sessions", "resume", "queue",
+];
+
 pub(super) async fn run_tui(flags: AgentFlags) -> Result<()> {
     let auto_approve = flags.yes;
     let (agent, session_id, model_spec, _spawner) = build_agent(&flags).await?;
     let initial_rules = agent.executor.allow_rules();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut options = flux_tui::TuiRunOptions::new(auto_approve, Some(model_spec));
     options.model_resolver = Some(Arc::new(CliTuiModelResolver));
+    options.file_commands = load_command_files(&cwd, TUI_BUILTIN_COMMANDS);
     // Persist even when the TUI returns an error: an earlier "always allow" choice remains a user
     // decision and must not vanish because terminal restoration or a later turn failed.
     let executor = agent.executor.clone();

@@ -82,6 +82,21 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### Claude interop — commands + skills that load from both worlds (epic) — ✅ **COMPLETE (2026-07-28; D-186…D-192, all seven stories; supersedes C-93; unreleased)**
+
+A compatibility audit found flux half-speaks Claude Code's dialect: skills already load from
+`.claude/skills`/`~/.claude/skills` with `name`/`description` frontmatter, but command files
+(`.claude/commands/*.md`, `$ARGUMENTS`) don't exist at all, every other frontmatter field
+(`allowed-tools`, `model`, `disable-model-invocation`, …) is silently dropped, supporting files
+(`references/`) are unreachable, nested skill trees are invisible, and half of `flux-skill` is dead
+code. The epic's stance: compatible where Claude's semantics are good, deliberately divergent where
+ours are better (manual `--skill` activation stays the default; model-invoked disclosure becomes an
+opt-in), and loud about the difference — no silently dropped fields, and a dedicated
+`website/docs/agent/claude-compat.md` page whose claims track what actually ships. Done looks like: a
+real `.claude` directory (commands + nested multi-file skills) works in place, agent invocation is
+triple-gated (permitted ∧ accessible ∧ agent-triggerable, absorbing C-93), and one honest discovery
+implementation remains. Design: [designs/claude-interop.md](designs/claude-interop.md).
+
 ### Deterministic Agent Lab — Test · Tune · Resurrect (epic) — ✅ **COMPLETE (2026-07-28; D-174…D-180, all seven stories)**
 
 Turns the deterministic-run substrate (canonical `plan_source` + the redacted op cassette) from

@@ -68,5 +68,7 @@ API — not an incremental charge. See [Usage & cost](./cost.md).
 
 ## Related docs
 
+- [Claude Code compatibility](./claude-compat.md) — this page is about the *provider*; that one
+  covers loading Claude Code's skills/commands file formats.
 - [Providers and models](./providers.md) — every provider, routing, and the capability floor.
 - [Credentials and secrets](../security/credentials.md) — where the OAuth token lives.

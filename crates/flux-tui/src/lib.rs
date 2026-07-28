@@ -75,6 +75,9 @@ pub struct TuiRunOptions {
     pub model_spec: Option<String>,
     /// Optional surface-owned resolver that enables `/model <spec>`.
     pub model_resolver: Option<Arc<dyn ModelResolver>>,
+    /// Command files (D-186) discovered by the surface — already filtered against its own
+    /// built-in names (built-ins always win a clash; the caller warns at load).
+    pub file_commands: Vec<flux_runtime::metadata::CommandFile>,
 }
 
 impl TuiRunOptions {
@@ -83,6 +86,7 @@ impl TuiRunOptions {
             auto_approve,
             model_spec,
             model_resolver: None,
+            file_commands: Vec::new(),
         }
     }
 }
@@ -135,84 +139,62 @@ enum Sev {
     Err,
 }
 
-/// A slash command shown in the `/` menu.
+/// A slash command shown in the `/` menu — a fixed built-in or a discovered command file (D-186).
 struct SlashCmd {
-    name: &'static str,
-    desc: &'static str,
+    name: String,
+    desc: String,
 }
 
-/// The available slash commands.
-const COMMANDS: &[SlashCmd] = &[
-    SlashCmd {
-        name: "help",
-        desc: "show keybindings",
-    },
-    SlashCmd {
-        name: "clear",
-        desc: "start a fresh session",
-    },
-    SlashCmd {
-        name: "new",
-        desc: "clear and start fresh",
-    },
-    SlashCmd {
-        name: "model",
-        desc: "show or switch model",
-    },
-    SlashCmd {
-        name: "effort",
-        desc: "show or set reasoning effort",
-    },
-    SlashCmd {
-        name: "quit",
-        desc: "exit flux",
-    },
-    SlashCmd {
-        name: "compact",
-        desc: "compact session context",
-    },
-    SlashCmd {
-        name: "shell",
-        desc: "toggle the generic bash op",
-    },
-    SlashCmd {
-        name: "tools",
-        desc: "list registered tools",
-    },
-    SlashCmd {
-        name: "evidence",
-        desc: "show durable evidence",
-    },
-    SlashCmd {
-        name: "session",
-        desc: "show the active session",
-    },
-    SlashCmd {
-        name: "sessions",
-        desc: "list recent sessions",
-    },
-    SlashCmd {
-        name: "resume",
-        desc: "resume a session id",
-    },
-    SlashCmd {
-        name: "queue",
-        desc: "manage queued follow-ups",
-    },
+/// The built-in slash commands. A command file naming one of these is dropped at load (with a
+/// warning) rather than shadowing it — see `flux-cli`'s `TUI_BUILTIN_COMMANDS`.
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("help", "show keybindings"),
+    ("clear", "start a fresh session"),
+    ("new", "clear and start fresh"),
+    ("model", "show or switch model"),
+    ("effort", "show or set reasoning effort"),
+    ("quit", "exit flux"),
+    ("compact", "compact session context"),
+    ("shell", "toggle the generic bash op"),
+    ("tools", "list registered tools"),
+    ("evidence", "show durable evidence"),
+    ("session", "show the active session"),
+    ("sessions", "list recent sessions"),
+    ("resume", "resume a session id"),
+    ("queue", "manage queued follow-ups"),
 ];
 
-/// Commands matching `query` (lowercased, no leading `/`): prefix matches first, then substring.
-fn slash_matches(query: &str) -> Vec<&'static SlashCmd> {
-    let mut out: Vec<&SlashCmd> = COMMANDS
+/// The full slash-menu source: built-ins followed by discovered command files (already filtered
+/// against built-in names by the caller — see `flux-cli`'s `load_command_files`).
+fn all_slash_commands(file_commands: &[flux_runtime::metadata::CommandFile]) -> Vec<SlashCmd> {
+    let mut out: Vec<SlashCmd> = BUILTIN_COMMANDS
         .iter()
-        .filter(|c| c.name.starts_with(query))
+        .map(|(name, desc)| SlashCmd {
+            name: (*name).to_string(),
+            desc: (*desc).to_string(),
+        })
         .collect();
-    out.extend(
-        COMMANDS
-            .iter()
-            .filter(|c| !c.name.starts_with(query) && c.name.contains(query)),
-    );
+    out.extend(file_commands.iter().map(|c| SlashCmd {
+        name: c.name.clone(),
+        desc: if c.argument_hint.is_empty() {
+            c.description.clone()
+        } else {
+            format!("{} ({})", c.description, c.argument_hint)
+        },
+    }));
     out
+}
+
+/// Commands matching `query` (lowercased, no leading `/`): prefix matches first, then substring.
+fn slash_matches(
+    query: &str,
+    file_commands: &[flux_runtime::metadata::CommandFile],
+) -> Vec<SlashCmd> {
+    let all = all_slash_commands(file_commands);
+    let (mut prefix, substring): (Vec<SlashCmd>, Vec<SlashCmd>) =
+        all.into_iter().partition(|c| c.name.starts_with(query));
+    prefix.extend(substring.into_iter().filter(|c| c.name.contains(query)));
+    prefix
 }
 
 /// The `/help` body.
@@ -221,6 +203,36 @@ const HELP_TEXT: &str = "keys: ↵ send/queue · Ctrl-J or Alt-↵ newline · �
     Ctrl-C interrupt/clear/quit · Ctrl-D quit · Esc close panel\n\
 commands: /model /effort /shell /tools /evidence /session /sessions /resume\n\
     /new /clear /compact /queue /quit";
+
+/// The `/help` body: built-in keybindings/commands, plus (D-186) any discovered command files.
+fn help_text(file_commands: &[flux_runtime::metadata::CommandFile]) -> String {
+    let mut text = HELP_TEXT.to_string();
+    if !file_commands.is_empty() {
+        text.push_str("\ncommand files:\n");
+        for c in file_commands {
+            let hint = if c.argument_hint.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", c.argument_hint)
+            };
+            text.push_str(&format!("    /{}{hint}  {}\n", c.name, c.description));
+        }
+    }
+    text
+}
+
+/// Look up `name` among discovered command files and, if found, substitute `args` into its body
+/// (D-186's `$ARGUMENTS`/`$1..$9`) — the prompt [`start_turn`] then runs exactly like typed input.
+fn file_command_prompt(
+    name: &str,
+    args: &str,
+    file_commands: &[flux_runtime::metadata::CommandFile],
+) -> Option<String> {
+    file_commands
+        .iter()
+        .find(|c| c.name == name)
+        .map(|c| flux_runtime::metadata::expand_command_arguments(&c.body, args))
+}
 
 /// One item in the transcript. Each renders to one or more styled [`Line`]s at a given width.
 #[derive(Debug)]
@@ -422,6 +434,7 @@ impl ChatState {
             session_id,
             model,
             model_spec: None,
+            file_commands: Vec::new(),
             theme: Theme::default(),
             expand_tools: false,
             verbose: false,
@@ -491,6 +504,16 @@ impl ChatState {
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self.expand_tools = self.expand_tools || verbose;
+        self
+    }
+
+    /// Attach the surface's discovered command files (D-186) — listed in `/help` and the slash
+    /// menu, dispatched by name from [`handle_command`].
+    pub fn with_file_commands(
+        mut self,
+        file_commands: Vec<flux_runtime::metadata::CommandFile>,
+    ) -> Self {
+        self.file_commands = file_commands;
         self
     }
 
@@ -1597,7 +1620,9 @@ pub async fn run_with_options(
     }
 
     let verbose = std::env::var("FLUX_VERBOSE").is_ok_and(|v| flag_on(&v));
-    let mut state = ChatState::for_session(model, session_id.clone()).with_verbose(verbose);
+    let mut state = ChatState::for_session(model, session_id.clone())
+        .with_verbose(verbose)
+        .with_file_commands(options.file_commands.clone());
     if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
@@ -1897,7 +1922,7 @@ async fn event_loop(
                 // Tab/Enter run the command, Esc dismisses; other keys fall through to edit/filter.
                 if state.queue_edit_index.is_none() {
                     if let Some(query) = state.slash_query() {
-                        let matches = slash_matches(&query);
+                        let matches = slash_matches(&query, &state.file_commands);
                         if !matches.is_empty() {
                             match key.code {
                                 KeyCode::Up => {
@@ -1913,8 +1938,14 @@ async fn event_loop(
                                     continue;
                                 }
                                 KeyCode::Tab => {
-                                    let name = matches[state.slash_sel.min(matches.len() - 1)].name;
-                                    let needs_arg = matches!(name, "model" | "resume");
+                                    let name = matches[state.slash_sel.min(matches.len() - 1)]
+                                        .name
+                                        .clone();
+                                    let needs_arg = matches!(name.as_str(), "model" | "resume")
+                                        || state
+                                            .file_commands
+                                            .iter()
+                                            .any(|c| c.name == name && !c.argument_hint.is_empty());
                                     state.set_input(&format!(
                                         "/{name}{}",
                                         if needs_arg { " " } else { "" }
@@ -1923,7 +1954,9 @@ async fn event_loop(
                                     continue;
                                 }
                                 KeyCode::Enter => {
-                                    let name = matches[state.slash_sel.min(matches.len() - 1)].name;
+                                    let name = matches[state.slash_sel.min(matches.len() - 1)]
+                                        .name
+                                        .clone();
                                     state.set_input(&format!("/{name}"));
                                     state.slash_sel = 0;
                                 }
@@ -2079,7 +2112,7 @@ async fn handle_command(
 
     match name {
         "" | "help" => state.push(Entry::Notice {
-            text: HELP_TEXT.into(),
+            text: help_text(&state.file_commands),
             sev: Sev::Info,
         }),
         "quit" | "exit" => return Ok(true),
@@ -2330,10 +2363,15 @@ async fn handle_command(
                 }),
             }
         }
-        other => state.push(Entry::Notice {
-            text: format!("unknown command /{other} · try /help"),
-            sev: Sev::Warn,
-        }),
+        other => match file_command_prompt(other, args, &state.file_commands) {
+            Some(prompt) => {
+                *cancel = start_turn(agent, tx, state, prompt);
+            }
+            None => state.push(Entry::Notice {
+                text: format!("unknown command /{other} · try /help"),
+                sev: Sev::Warn,
+            }),
+        },
     }
     Ok(false)
 }
@@ -3344,7 +3382,7 @@ mod tests {
         assert!(state.slash_query().is_none());
         state.set_input("/cl");
         assert_eq!(state.slash_query().as_deref(), Some("cl"));
-        assert!(slash_matches("cl").iter().any(|c| c.name == "clear"));
+        assert!(slash_matches("cl", &[]).iter().any(|c| c.name == "clear"));
         // a space (typing an argument) closes the menu
         state.set_input("/clear x");
         assert!(state.slash_query().is_none());
@@ -3355,6 +3393,79 @@ mod tests {
         let content = screen(&terminal);
         assert!(content.contains("/help"));
         assert!(content.contains("/quit"));
+    }
+
+    fn test_command_file(
+        name: &str,
+        description: &str,
+        argument_hint: &str,
+    ) -> flux_runtime::metadata::CommandFile {
+        flux_runtime::metadata::CommandFile {
+            name: name.to_string(),
+            description: description.to_string(),
+            argument_hint: argument_hint.to_string(),
+            body: format!("do the {name} thing: $ARGUMENTS"),
+            source: std::path::PathBuf::from(format!(".flux/commands/{name}.md")),
+            agent_triggerable: false,
+        }
+    }
+
+    /// D-186: a discovered command file is listed in the `/` slash menu alongside built-ins, with
+    /// its description and argument-hint shown.
+    #[test]
+    fn slash_menu_lists_discovered_command_files_with_hint() {
+        let file_commands = vec![test_command_file("review", "Review a PR", "<pr-number>")];
+        let mut state = ChatState::new("opus".into()).with_file_commands(file_commands);
+        state.set_input("/rev");
+        assert_eq!(state.slash_query().as_deref(), Some("rev"));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("/review"));
+        assert!(content.contains("Review a PR"));
+        assert!(content.contains("pr-number"));
+    }
+
+    /// D-186: `/help` lists discovered command files (name, description, argument-hint) alongside
+    /// the built-in keybinding summary.
+    #[test]
+    fn help_text_lists_discovered_command_files() {
+        let file_commands = vec![test_command_file("review", "Review a PR", "<pr-number>")];
+        let text = help_text(&file_commands);
+        assert!(text.contains(HELP_TEXT));
+        assert!(text.contains("/review"));
+        assert!(text.contains("Review a PR"));
+        assert!(text.contains("<pr-number>"));
+    }
+
+    #[test]
+    fn help_text_without_command_files_is_unchanged() {
+        assert_eq!(help_text(&[]), HELP_TEXT);
+    }
+
+    /// D-186: dispatching `/name args` substitutes `$ARGUMENTS`/`$1` into the command body —
+    /// [`start_turn`] then runs the result exactly like typed input.
+    #[test]
+    fn file_command_prompt_substitutes_arguments() {
+        let file_commands = vec![flux_runtime::metadata::CommandFile {
+            name: "greet".to_string(),
+            description: "greet someone".to_string(),
+            argument_hint: "<name>".to_string(),
+            body: "Say hello to $1 ($ARGUMENTS)".to_string(),
+            source: std::path::PathBuf::from(".flux/commands/greet.md"),
+            agent_triggerable: false,
+        }];
+        let prompt = file_command_prompt("greet", "world today", &file_commands);
+        assert_eq!(prompt.as_deref(), Some("Say hello to world (world today)"));
+    }
+
+    /// An undiscovered name resolves to `None` — the caller reports "unknown command" rather than
+    /// dispatching a turn.
+    #[test]
+    fn file_command_prompt_is_none_for_an_unknown_name() {
+        let file_commands = vec![test_command_file("review", "Review a PR", "<pr-number>")];
+        assert!(file_command_prompt("nope", "", &file_commands).is_none());
     }
 
     #[test]

@@ -617,10 +617,21 @@ impl TurnCost {
     }
 }
 
+/// Built-in REPL slash commands (D-186): a file command sharing one of these names is dropped at
+/// load (with a warning) rather than shadowing it — see [`load_command_files`].
+const REPL_BUILTIN_COMMANDS: &[&str] = &[
+    "exit", "quit", "help", "shell", "model", "effort", "pd", "goal", "loop", "tools", "evidence",
+    "session", "sessions", "resume", "compact", "clear",
+];
+
 pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
     let (mut agent, mut session_id, _spec, spawner) = build_agent(&flags).await?;
     let cost = TurnCost::load();
     let initial_rules = agent.executor.allow_rules();
+    // Command files (D-186): discovered once at REPL start, not gated behind a flag like skills —
+    // `/help` and dispatch below need the full set up front.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let command_files = load_command_files(&cwd, REPL_BUILTIN_COMMANDS);
     eprintln!(
         "{}",
         style::dim(&format!(
@@ -697,6 +708,17 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                         eprintln!("  {:<24} {}", cmd, desc);
                     }
                     eprintln!("  Ctrl-C  interrupt a running turn   Ctrl-D  exit");
+                    if !command_files.is_empty() {
+                        eprintln!("command files (.flux/commands, .claude/commands):");
+                        for c in &command_files {
+                            let hint = if c.argument_hint.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", c.argument_hint)
+                            };
+                            eprintln!("  {:<24} {}", format!("/{}{hint}", c.name), c.description);
+                        }
+                    }
                 }
                 "shell" => {
                     // Toggle the generic `bash` op for the session via the runtime's in-process
@@ -915,7 +937,28 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                         Err(e) => eprintln!("{} new session: {e}", style::red("error:")),
                     }
                 }
-                other => eprintln!("unknown command /{other} (try /help)"),
+                other => match command_files.iter().find(|c| c.name == other) {
+                    Some(cmd) => {
+                        // D-186: the substituted body enters the turn exactly like typed input.
+                        let raw_args = rest.strip_prefix(other).unwrap_or("").trim();
+                        let prompt =
+                            flux_runtime::metadata::expand_command_arguments(&cmd.body, raw_args);
+                        let agent_ref = &agent;
+                        let cost_ref = &cost;
+                        let sid_ref = session_id.as_str();
+                        run_interruptible(move |c| async move {
+                            let mut sink = cost_ref.sink(agent_ref, agent_ref.max_iterations);
+                            if let Err(e) = agent_ref
+                                .run_turn_cancellable(sid_ref, &prompt, &mut sink, &c)
+                                .await
+                            {
+                                eprintln!("{} {e:#}", style::red("error:"));
+                            }
+                        })
+                        .await;
+                    }
+                    None => eprintln!("unknown command /{other} (try /help)"),
+                },
             }
             continue;
         }

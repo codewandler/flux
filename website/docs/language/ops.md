@@ -204,6 +204,30 @@ was non-empty at session startup. See [Endpoints](../agent/endpoints.md).
 | `endpoint.select` | `id` | Return one model-safe `EndpointRef` for reuse in another operation |
 | `endpoint.import` | `id` | Persist a known record to `~/.flux/endpoints.toml` (approval-gated local write) |
 
+## Agent-invoked commands and skills
+
+Registered as one evidence-gated group, surfaced only when the session discovers at least one
+command file or skill explicitly marked `agent-triggerable: true` in its own frontmatter (default
+`false` — human-only stays the default). See [Claude compatibility](../agent/claude-compat.md).
+
+| op | arguments | description |
+|---|---|---|
+| `command.invoke` | `kind, name[, arguments]` | Invoke a discovered command file (`kind: "command"`) or skill (`kind: "skill"`) by name — only when it is policy-permitted, discovered in this session, AND explicitly `agent-triggerable`. A command expands `$ARGUMENTS`/`$1..$9` and returns the substituted body as prompt text (no nested execution); a skill returns its body. Any missing gate is a clean refusal, never a partial run |
+
+## Model-invoked skills
+
+Opt-in Claude-style progressive skill disclosure (`--skills-model-invoked` / `[skills]
+model_invoked`): every discovered skill's name+description is surfaced compactly, and the model
+loads a body on demand instead of every skill's full text being injected up front. Off by default —
+manual `--skill` activation stays the (measured cheaper) default path. Advertised only when the
+opt-in is on and at least one loadable skill was discovered; a skill declaring
+`disable-model-invocation: true` never enters this catalog. See [Model-invoked skills
+(opt-in)](../agent/skills-and-roles.md#model-invoked-skills-opt-in).
+
+| op | arguments | description |
+|---|---|---|
+| `skill.load` | `name` | Pull one skill's full body into context by exact `name`. Idempotent and persistent: once loaded, the skill behaves like an explicitly `--skill`-activated one for the rest of the session |
+
 ## Flows
 
 Discover and run reusable flows and composite ops stored under `.flux/flows` (project) and

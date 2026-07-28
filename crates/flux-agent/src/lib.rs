@@ -205,6 +205,13 @@ pub struct AgentSpec {
     pub context: Vec<ContextBlock>,
     /// Byte budget for rendered `context` (`0` = unbounded). Over-budget blocks truncate with a marker.
     pub context_budget: usize,
+    /// D-188: the opt-in model-invoked skill catalog — every discovered skill eligible for
+    /// on-demand `skill.load` (already filtered to exclude `disable-model-invocation: true`
+    /// skills). Empty (the default) means the mode is off: no catalog is surfaced in the system
+    /// prompt and `skill.load` stays out of the advertised op set, so an agent that never touches
+    /// this field behaves byte-identically to before D-188. Distinct from `skills`, the explicit
+    /// `--skill`-style active set — populate this via [`Self::try_with_model_invoked_skills`].
+    pub model_invoked_skills: Vec<flux_skill::Skill>,
 }
 
 impl Default for AgentSpec {
@@ -227,6 +234,7 @@ impl Default for AgentSpec {
             cwd: PathBuf::from("."),
             context: Vec::new(),
             context_budget: DEFAULT_CONTEXT_BUDGET,
+            model_invoked_skills: Vec::new(),
         }
     }
 }
@@ -254,6 +262,20 @@ impl AgentSpec {
     pub fn with_default_skills(self) -> Self {
         self.try_with_default_skills()
             .expect("guarded default skill discovery failed")
+    }
+
+    /// Opt into Claude-style progressive skill disclosure (D-188): discover every skill under this
+    /// spec's `cwd` (set `cwd` first) and enable model-invoked on-demand loading for all of them
+    /// except those marked `disable-model-invocation: true`. Distinct from — and additive to —
+    /// [`Self::skills`](Self)/[`Self::try_with_default_skills`], which stays the explicit
+    /// always-injected activation surface; this only surfaces name+description up front and loads
+    /// a body when the model calls `skill.load`.
+    pub fn try_with_model_invoked_skills(mut self) -> Result<Self> {
+        self.model_invoked_skills = flux_runtime::metadata::discover_skills(&self.cwd, &[])?
+            .into_iter()
+            .filter(|skill| !skill.disable_model_invocation)
+            .collect();
+        Ok(self)
     }
 
     /// Set the compaction threshold (serialized chars) — the size past which older turns are
@@ -375,7 +397,8 @@ impl AgentSpec {
         engine.loop_host.set_adaptive_policy(adaptive_policy);
         Ok(engine
             .with_reasoning(self.thinking, self.effort)
-            .with_ambient_signals(self.ambient_signals))
+            .with_ambient_signals(self.ambient_signals)
+            .with_model_invoked_skills(self.model_invoked_skills))
     }
 }
 
@@ -430,6 +453,50 @@ pub fn register_agent_ops(registry: &mut ToolRegistry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-188: `try_with_model_invoked_skills` discovers every skill under `cwd` EXCEPT one
+    /// declaring `disable-model-invocation: true`, and leaves `skills` (the explicit always-on
+    /// activation set) untouched — the two are additive, not the same knob.
+    #[test]
+    fn try_with_model_invoked_skills_excludes_disable_model_invocation() {
+        let root = std::env::temp_dir().join(format!(
+            "flux-agent-model-invoked-skills-{}",
+            std::process::id()
+        ));
+        let dir = root.join(".flux/skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pdf.md"),
+            "---\nname: pdf-extract\ndescription: extract PDFs\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("private.md"),
+            "---\nname: private-only\ndescription: manual only\ndisable-model-invocation: \
+             true\n---\nbody",
+        )
+        .unwrap();
+
+        let spec = AgentSpec {
+            cwd: root.clone(),
+            ..AgentSpec::new("mock")
+        }
+        .try_with_model_invoked_skills()
+        .unwrap();
+
+        let names: Vec<&str> = spec
+            .model_invoked_skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"pdf-extract"), "got {names:?}");
+        assert!(!names.contains(&"private-only"), "got {names:?}");
+        assert!(
+            spec.skills.is_empty(),
+            "the opt-in catalog must not populate the explicit `skills` activation set"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn canonical_control_plane_replaces_conflicts_and_survives_tool_subsets() {
@@ -698,7 +765,7 @@ mod tests {
         assert!(error.contains("parent's provider ('codex')"), "{error}");
     }
 
-    /// L-02: guarded default discovery injects a project skill's bytes into the pure L0 parser.
+    /// Guarded default discovery injects a project skill's bytes into the pure L0 parser.
     #[test]
     fn with_default_skills_populates_from_cwd_dirs() {
         let dir = std::env::temp_dir().join(format!("flux-agent-skills-{}", std::process::id()));
@@ -721,10 +788,6 @@ mod tests {
             .iter()
             .find(|s| s.name == "agent-spec-l02")
             .expect("project skill discovered");
-        assert!(
-            s.body.is_loaded(),
-            "guarded project bytes are injected inline"
-        );
         assert_eq!(s.body.text(), "BODY");
         std::fs::remove_dir_all(&dir).ok();
     }

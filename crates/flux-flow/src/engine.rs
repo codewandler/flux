@@ -340,6 +340,19 @@ impl FlowEngine {
         self
     }
 
+    /// Opt into model-invoked progressive skill disclosure (D-188): `catalog` is every discovered
+    /// skill eligible for on-demand loading (already filtered to exclude
+    /// `disable-model-invocation: true` skills by the caller). A non-empty catalog is what makes the
+    /// engine surface a compact name+description listing in the system prompt and advertise
+    /// `skill.load`; an empty catalog (the default — nobody calls this) leaves both absent, so the
+    /// manual-only default path stays byte-identical. Stored on the long-lived loop host (not this
+    /// engine) so the `skill.load` op — dispatched through `ToolContext`, not through `self` — can
+    /// read the same catalog.
+    pub fn with_model_invoked_skills(self, catalog: Vec<flux_skill::Skill>) -> Self {
+        self.loop_host.set_skill_catalog(catalog);
+        self
+    }
+
     /// Apply one reasoning policy to the full agent call graph: intent, exploration, repair,
     /// presentation, authored model stages, and compaction calls.
     pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
@@ -408,7 +421,7 @@ impl FlowEngine {
         ));
         let iteration_base = self.evidence_kind_count("turn.iteration");
         let subagent_base = self.evidence_kind_count("subagent.usage");
-        let base_system = self.base_system_with_skills(skill_input, sink);
+        let base_system = self.base_system_with_skills(session_id, skill_input, sink);
         let advertised = self.surfaced_for_turn(session_id, skill_input, sink);
         let (sender, receiver) =
             tokio::sync::mpsc::unbounded_channel::<crate::loop_host::SinkEvent>();
@@ -946,7 +959,50 @@ impl FlowEngine {
         if let Some(surfaced) = surfaced.as_ref() {
             self.record_active_groups(surfaced, sink);
         }
+        self.narrow_by_skill_catalog(self.narrow_by_skill_allowed_tools(advertised))
+    }
+
+    /// Suppress `skill.load` from the advertised set unless the opt-in model-invoked skill catalog
+    /// (D-188) is non-empty for this engine. `skill.load` is unconditionally registered (so
+    /// `Executor::dispatch` can find and clearly reject a stray call), but must never appear in the
+    /// model-facing catalog on the default-off path — this is what keeps
+    /// `skills_are_disabled_until_named_explicitly` byte-identical: no catalog is set, so
+    /// `skill_catalog()` is empty, so this always removes the op.
+    fn narrow_by_skill_catalog(
+        &self,
+        mut advertised: std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        if self.loop_host.skill_catalog().is_empty() {
+            advertised.remove("skill.load");
+        }
         advertised
+    }
+
+    /// Narrow this turn's advertised ops to any active skill's Claude `allowed-tools` (D-189):
+    /// intersect with the union of every active skill's translated allowlist
+    /// (`flux_skill::Skill::allowed_ops`). A skill with no `allowed-tools` imposes no constraint;
+    /// when NO active skill declares one, `advertised` passes through unchanged. This sits on top
+    /// of whatever policy/group gating already produced — the same narrowing-only spirit as a
+    /// role's `tools:` allowlist — and can only shrink the surfaced set, never grow it.
+    fn narrow_by_skill_allowed_tools(
+        &self,
+        advertised: std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        let mut allowlisted = self
+            .skills
+            .iter()
+            .filter(|s| !s.allowed_ops.is_empty())
+            .peekable();
+        if allowlisted.peek().is_none() {
+            return advertised;
+        }
+        let allowed: std::collections::HashSet<&str> = allowlisted
+            .flat_map(|s| s.allowed_ops.iter().map(String::as_str))
+            .collect();
+        advertised
+            .into_iter()
+            .filter(|op| allowed.contains(op.as_str()))
+            .collect()
     }
 
     /// Record (audit + surface) which evidence-gated groups are active this turn — and which
@@ -967,23 +1023,58 @@ impl FlowEngine {
     }
 
     /// The agent identity + project context + explicitly enabled skills — the common base for every
-    /// model-backed stage.
-    fn base_system_with_skills(&self, _user_input: &str, sink: &mut dyn AgentSink) -> String {
+    /// model-backed stage. When the opt-in model-invoked catalog (D-188) is non-empty, also injects
+    /// the full body of any skill loaded via `skill.load` earlier in this session (one consistent
+    /// semantics with manual `--skill` activation — see `docs/designs/claude-interop.md`) and a
+    /// compact name+description listing of the rest, so the model knows what else it can load.
+    fn base_system_with_skills(
+        &self,
+        session_id: &str,
+        _user_input: &str,
+        sink: &mut dyn AgentSink,
+    ) -> String {
         let mut base_system = self.system_prompt.clone();
+        let mut injected: std::collections::HashSet<String> = std::collections::HashSet::new();
         for skill in &self.skills {
-            base_system.push_str(&format!(
-                "\n\n<skill name=\"{}\">\n{}\n</skill>",
-                skill.name, skill.body
-            ));
-            let obs = flux_evidence::Observation::new(
-                "skill.activated",
-                flux_evidence::Phase::Turn,
-                serde_json::json!({ "skill": skill.name }),
-            );
-            self.executor.observe(obs.clone());
-            sink.observation(&obs);
+            self.inject_skill_tag(&mut base_system, skill, sink);
+            injected.insert(skill.name.clone());
+        }
+        let catalog = self.loop_host.skill_catalog();
+        if !catalog.is_empty() {
+            let loaded = self.loop_host.loaded_skill_names(session_id);
+            for skill in catalog
+                .iter()
+                .filter(|s| loaded.contains(&s.name) && !injected.contains(&s.name))
+            {
+                self.inject_skill_tag(&mut base_system, skill, sink);
+            }
+            base_system.push_str(&render_skill_catalog(&catalog));
         }
         base_system
+    }
+
+    /// Inject one skill's full body as a `<skill>` block and emit the `skill.activated`
+    /// observation both `self.skills` (manual) and a `skill.load`-loaded catalog entry share.
+    fn inject_skill_tag(
+        &self,
+        base_system: &mut String,
+        skill: &flux_skill::Skill,
+        sink: &mut dyn AgentSink,
+    ) {
+        let path_attr = skill_disclosed_path(skill)
+            .map(|p| format!(" path=\"{}\"", p.display()))
+            .unwrap_or_default();
+        base_system.push_str(&format!(
+            "\n\n<skill name=\"{}\"{path_attr}>\n{}\n</skill>",
+            skill.name, skill.body
+        ));
+        let obs = flux_evidence::Observation::new(
+            "skill.activated",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({ "skill": skill.name }),
+        );
+        self.executor.observe(obs.clone());
+        sink.observation(&obs);
     }
 
     /// Persist the single assistant message for this turn (keeping the `user → assistant` session
@@ -1422,6 +1513,49 @@ fn redact_json_strings(redactor: &flux_secret::Redactor, value: &mut serde_json:
     }
 }
 
+/// The location disclosed to the model for a skill's supporting files (D-190). A `SKILL.md`-backed
+/// skill discloses its **directory** — `references/*.md`, scripts, and templates all resolve
+/// relative to it — while a flat `.md` skill discloses the file itself (it has no sibling files to
+/// anchor). `None` when the skill carries no `source` (e.g. constructed in-memory via the SDK):
+/// there is no real location to disclose, and injecting a fabricated one would mislead a `read`.
+///
+/// This is disclosure only — it grants no read access. The path is read (or not) through the
+/// normal `read` op, which still runs the standard authorization/approval flow; a project-local
+/// skill's supporting files are reachable exactly because they already sit inside the workspace
+/// jail, not because of anything this function does.
+fn skill_disclosed_path(skill: &flux_skill::Skill) -> Option<std::path::PathBuf> {
+    let source = skill.source.as_ref()?;
+    if source.file_name().map(|n| n == "SKILL.md").unwrap_or(false) {
+        source.parent().map(std::path::Path::to_path_buf)
+    } else {
+        Some(source.clone())
+    }
+}
+
+/// D-188: render the compact `<available-skills>` catalog block — name, optional disclosed path
+/// (D-190), and description only. Bodies are deliberately absent; the model pulls one into context
+/// with `skill.load(name)` when it decides a skill applies. Listed unconditionally (including
+/// already-loaded ones) — re-listing costs a line, and `skill.load` is idempotent, so there's no
+/// correctness reason to track and exclude them here.
+fn render_skill_catalog(catalog: &[flux_skill::Skill]) -> String {
+    let mut listing = String::from(
+        "\n\n<available-skills>\nOther skills discovered in this workspace. Only their name and \
+         description are shown — call `skill.load` with a skill's exact `name` to pull its full \
+         instructions into context before following it.\n",
+    );
+    for skill in catalog {
+        let path_attr = skill_disclosed_path(skill)
+            .map(|p| format!(" ({})", p.display()))
+            .unwrap_or_default();
+        listing.push_str(&format!(
+            "- {}{path_attr}: {}\n",
+            skill.name, skill.description
+        ));
+    }
+    listing.push_str("</available-skills>");
+    listing
+}
+
 /// True if a message carries a tool_result block (a `user` message answering tool calls).
 fn has_tool_result(msg: &Message) -> bool {
     msg.content
@@ -1844,7 +1978,7 @@ mod tests {
     use flux_core::{StopReason, ToolResultContent};
     use flux_provider::ChunkStream;
     use flux_runtime::{
-        AllowApprover, PermissionManager, Tool, ToolContext, ToolRegistry, ToolResult,
+        AllowApprover, PermissionManager, SkillLoader, Tool, ToolContext, ToolRegistry, ToolResult,
     };
     use flux_spec::{Effect, Idempotency, Risk, ToolSpec};
     use flux_system::{System, Workspace};
@@ -2930,6 +3064,200 @@ mod tests {
         );
     }
 
+    /// D-189: a skill with `allowed-tools` narrows the turn's surfaced ops to the union of every
+    /// active skill's translated allowlist — an out-of-allowlist op is not offered, even though
+    /// policy/group gating alone would have surfaced it.
+    #[test]
+    fn skill_allowed_tools_narrows_the_advertised_op_set() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let mut engine = engine.unwrap();
+        engine.skills = vec![flux_skill::Skill {
+            name: "reviewer".into(),
+            description: String::new(),
+            triggers: Vec::new(),
+            body: "body".into(),
+            format: flux_skill::SkillFormat::AgentSkills,
+            source: None,
+            allowed_ops: vec!["read".to_string()],
+            model: None,
+            disable_model_invocation: false,
+            argument_hint: String::new(),
+            agent_triggerable: false,
+        }];
+
+        let advertised: std::collections::HashSet<String> = ["echo", "read", "bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let narrowed = engine.narrow_by_skill_allowed_tools(advertised);
+
+        assert_eq!(
+            narrowed,
+            std::collections::HashSet::from(["read".to_string()]),
+            "only the allowlisted op survives narrowing"
+        );
+    }
+
+    /// No active skill declares `allowed-tools` → the advertised set passes through unchanged
+    /// (narrowing never engages without an explicit allowlist).
+    #[test]
+    fn no_skill_allowlist_leaves_the_advertised_op_set_unchanged() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let mut engine = engine.unwrap();
+        engine.skills = vec![flux_skill::Skill {
+            name: "plain".into(),
+            description: String::new(),
+            triggers: Vec::new(),
+            body: "body".into(),
+            format: flux_skill::SkillFormat::AgentSkills,
+            source: None,
+            allowed_ops: Vec::new(),
+            model: None,
+            disable_model_invocation: false,
+            argument_hint: String::new(),
+            agent_triggerable: false,
+        }];
+
+        let advertised: std::collections::HashSet<String> = ["echo", "read", "bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let narrowed = engine.narrow_by_skill_allowed_tools(advertised.clone());
+
+        assert_eq!(narrowed, advertised);
+    }
+
+    /// D-188 default-off invariant: an engine that never calls `with_model_invoked_skills` has an
+    /// empty catalog, so `skill.load` is narrowed back out of the advertised set even though
+    /// nothing else would exclude it, and the system prompt gets no `<available-skills>` block —
+    /// the manual-only default stays byte-identical.
+    #[test]
+    fn no_model_invoked_catalog_hides_skill_load_and_the_catalog_block() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let engine = engine.unwrap();
+
+        let advertised: std::collections::HashSet<String> = ["echo", "skill.load"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let narrowed = engine.narrow_by_skill_catalog(advertised);
+        assert_eq!(
+            narrowed,
+            std::collections::HashSet::from(["echo".to_string()]),
+            "skill.load must not be advertised when no catalog is installed"
+        );
+
+        let mut sink = CollectSink::default();
+        let rendered = engine.base_system_with_skills("session", "hello", &mut sink);
+        assert!(
+            !rendered.contains("<available-skills>"),
+            "no catalog block should appear by default: {rendered}"
+        );
+    }
+
+    /// D-188 surfacing: a non-empty opt-in catalog (1) keeps `skill.load` in the advertised set and
+    /// (2) renders a compact `<available-skills>` listing with every catalog skill's name and
+    /// description — but never its body, so the token cost stays proportional to the summary, not
+    /// every skill's full content.
+    #[test]
+    fn model_invoked_catalog_surfaces_names_and_descriptions_without_bodies() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let engine = engine
+            .unwrap()
+            .with_model_invoked_skills(vec![skill_fixture(
+                "pdf-extract",
+                "Extract text and tables from PDF files",
+                "SECRET FULL BODY NOT YET REQUESTED",
+                None,
+            )]);
+
+        let advertised: std::collections::HashSet<String> =
+            ["echo"].iter().map(|s| s.to_string()).collect();
+        let narrowed = engine.narrow_by_skill_catalog(advertised);
+        assert!(
+            !narrowed.contains("skill.load"),
+            "narrow_by_skill_catalog only ever removes; skill.load wasn't in the starting set"
+        );
+
+        let mut sink = CollectSink::default();
+        let rendered = engine.base_system_with_skills("session", "hello", &mut sink);
+        assert!(
+            rendered.contains("<available-skills>"),
+            "expected the catalog block: {rendered}"
+        );
+        assert!(
+            rendered.contains("pdf-extract")
+                && rendered.contains("Extract text and tables from PDF files"),
+            "expected name+description in the catalog: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SECRET FULL BODY NOT YET REQUESTED"),
+            "the body must not be injected until skill.load is called: {rendered}"
+        );
+    }
+
+    /// D-188 on-demand load + persistence: loading a catalog skill for a session (the
+    /// `SkillLoader` capability `skill.load` delegates to) makes its full body appear in that
+    /// session's system prompt on a LATER call — the same one-consistent-semantics treatment as an
+    /// explicitly `--skill`-activated skill — while a different session sees no body at all.
+    #[tokio::test]
+    async fn loaded_skill_persists_its_body_for_the_loading_session_only() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let engine = engine
+            .unwrap()
+            .with_model_invoked_skills(vec![skill_fixture(
+                "pdf-extract",
+                "Extract text and tables from PDF files",
+                "full pdf-extract instructions",
+                None,
+            )]);
+
+        let outcome = engine
+            .loop_host
+            .load_skill("session-a", "pdf-extract")
+            .await
+            .expect("known catalog skill loads");
+        assert_eq!(outcome.body, "full pdf-extract instructions");
+
+        let mut sink = CollectSink::default();
+        let loaded_session = engine.base_system_with_skills("session-a", "hello", &mut sink);
+        assert!(
+            loaded_session.contains("full pdf-extract instructions"),
+            "the loaded skill's body must be injected on a later call in the same session: \
+             {loaded_session}"
+        );
+
+        let other_session = engine.base_system_with_skills("session-b", "hello", &mut sink);
+        assert!(
+            !other_session.contains("full pdf-extract instructions"),
+            "loading is per-session, not global: {other_session}"
+        );
+    }
+
+    /// D-188 unknown-skill error: `skill.load` on a name outside the catalog (including one that
+    /// exists but declared `disable-model-invocation: true`, since the caller never puts those in
+    /// the catalog) fails clearly instead of silently no-op'ing.
+    #[tokio::test]
+    async fn loading_an_unknown_skill_fails_clearly() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let engine = engine.unwrap();
+        let error = engine
+            .loop_host
+            .load_skill("session-a", "nope")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("nope"),
+            "expected the unknown name in the error: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_authored_loop_runs_without_a_model_call() {
         let loop_spec = AgentLoopSpec::parse("flow custom -> string\n  return \"custom loop\"")
@@ -3618,5 +3946,211 @@ mod tests {
             "the pinned scope must win over FLUX_CASSETTE=0 — a live re-dispatch would bump this to 2"
         );
         assert!(engine.flow.cassette().is_none(), "still reset on finish");
+    }
+
+    /// Minimal test fixture for a discovered skill, filling every field D-190 doesn't care about
+    /// with its inert default.
+    fn skill_fixture(
+        name: &str,
+        description: &str,
+        body: &str,
+        source: Option<std::path::PathBuf>,
+    ) -> flux_skill::Skill {
+        flux_skill::Skill {
+            name: name.into(),
+            description: description.into(),
+            triggers: Vec::new(),
+            body: body.into(),
+            format: flux_skill::SkillFormat::AgentSkills,
+            source,
+            allowed_ops: Vec::new(),
+            model: None,
+            disable_model_invocation: false,
+            argument_hint: String::new(),
+            agent_triggerable: false,
+        }
+    }
+
+    /// D-190: a `SKILL.md`-backed skill discloses its **directory** in the injected `<skill>` tag —
+    /// the anchor a model needs to `read` sibling `references/*.md` — while a flat `.md` skill
+    /// discloses the file itself, and a skill with no captured `source` (constructed in-memory, as
+    /// the SDK does) discloses nothing at all.
+    #[test]
+    fn skill_tag_discloses_directory_for_skill_md_and_file_for_flat_skills() {
+        let dir_skill = skill_fixture(
+            "pkg",
+            "",
+            "See references/extra.md",
+            Some(std::path::PathBuf::from(
+                "/proj/.claude/skills/pkg/SKILL.md",
+            )),
+        );
+        assert_eq!(
+            skill_disclosed_path(&dir_skill),
+            Some(std::path::PathBuf::from("/proj/.claude/skills/pkg"))
+        );
+
+        let flat_skill = skill_fixture(
+            "flat",
+            "",
+            "flat body",
+            Some(std::path::PathBuf::from("/proj/.claude/skills/flat.md")),
+        );
+        assert_eq!(
+            skill_disclosed_path(&flat_skill),
+            Some(std::path::PathBuf::from("/proj/.claude/skills/flat.md"))
+        );
+
+        let in_memory_skill = skill_fixture("sdk", "", "sdk body", None);
+        assert_eq!(skill_disclosed_path(&in_memory_skill), None);
+    }
+
+    /// The same behavior through the actual injection path: `base_system_with_skills` renders a
+    /// `path="…"` attribute for skills with a source and omits it entirely otherwise, matching the
+    /// `<skill name="x" path="…">` shape the model is meant to anchor a `read` on.
+    #[tokio::test]
+    async fn injected_skill_tag_carries_the_disclosed_path_attribute() {
+        let (engine, _events) =
+            assemble_test_engine(Arc::new(PendingProvider), AgentLoopSpec::default());
+        let mut engine = engine.unwrap();
+        engine.skills = vec![
+            skill_fixture(
+                "with-dir",
+                "",
+                "dir body",
+                Some(std::path::PathBuf::from(
+                    "/proj/.claude/skills/with-dir/SKILL.md",
+                )),
+            ),
+            skill_fixture("no-source", "", "in-memory body", None),
+        ];
+        let mut sink = CollectSink::default();
+        let rendered = engine.base_system_with_skills("session", "hello", &mut sink);
+
+        assert!(
+            rendered.contains("<skill name=\"with-dir\" path=\"/proj/.claude/skills/with-dir\">"),
+            "expected a directory path attribute for the SKILL.md-backed skill: {rendered}"
+        );
+        assert!(
+            rendered.contains("<skill name=\"no-source\">\nin-memory body\n</skill>"),
+            "a source-less skill must not gain a fabricated path attribute: {rendered}"
+        );
+        assert!(
+            !rendered.contains("no-source\" path"),
+            "a source-less skill must not disclose any path: {rendered}"
+        );
+    }
+
+    /// End-to-end: a skill whose body points at `references/extra.md` discloses its directory, and a
+    /// turn that reads that supporting file through the normal `read` op succeeds under the same
+    /// default policy the CLI ships (`read` is in `DEFAULT_ALLOW`) — disclosure does not widen any
+    /// grant, the file is reachable because it already sits inside the project workspace jail.
+    #[tokio::test]
+    async fn turn_reads_a_skills_supporting_file_via_the_disclosed_path() {
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "flux-skill-supporting-file-{}-{sequence}",
+            std::process::id()
+        ));
+        let skill_dir = root.join(".claude/skills/pkg");
+        let refs_dir = skill_dir.join("references");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pkg\ndescription: a multi-file skill\n---\nSee references/extra.md for detail.",
+        )
+        .unwrap();
+        std::fs::write(refs_dir.join("extra.md"), "the extra detail").unwrap();
+
+        let skill = skill_fixture(
+            "pkg",
+            "a multi-file skill",
+            "See references/extra.md for detail.",
+            Some(skill_dir.join("SKILL.md")),
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(flux_tools::ReadTool));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        // Mirrors flux-cli's `DEFAULT_ALLOW` (`crates/flux-cli/src/execution.rs`): `read` is
+        // pre-allowed with no configured rules, so this is the standard policy outcome, not a
+        // widened grant for this story.
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["read".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap()))),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(
+                vec![
+                    native_call(
+                        "intent-1",
+                        "declare_intent",
+                        json!({
+                            "intent": "read the pkg skill's reference",
+                            "capability_families": ["workspace.read"]
+                        }),
+                    ),
+                    native_call(
+                        "read-1",
+                        "read",
+                        json!({"path": ".claude/skills/pkg/references/extra.md"}),
+                    ),
+                    prose("Found it: the extra detail."),
+                ]
+                .into(),
+            ),
+            requests: requests.clone(),
+        });
+        let engine = FlowEngine::assemble_with_loop(
+            provider,
+            executor,
+            events.clone(),
+            flow,
+            "test-model".into(),
+            "Use only observed evidence.".into(),
+            2_048,
+            5,
+            vec![skill],
+            0,
+            Vec::new(),
+            root.clone(),
+            AgentLoopSpec::default(),
+        )
+        .unwrap();
+
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+        engine
+            .run_turn(
+                &session,
+                "what does the pkg skill's reference say?",
+                &mut sink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.tools,
+            vec!["read"],
+            "the read op was actually dispatched"
+        );
+        // The system prompt segments handed to the model carry the disclosed directory path.
+        let expected = skill_dir.display().to_string();
+        let seen = requests.lock().unwrap();
+        let carried_path = seen
+            .iter()
+            .any(|r| r.system_segments.iter().any(|s| s.text.contains(&expected)));
+        assert!(
+            carried_path,
+            "the skill's directory path was not carried into the request"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

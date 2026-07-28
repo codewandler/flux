@@ -9,15 +9,18 @@ use std::time::Duration;
 
 pub mod cargo;
 pub mod cognition;
+pub mod command_invoke;
 pub mod evidence;
 pub mod extra;
 pub mod flows;
 pub mod groups;
 pub mod reflect;
 pub mod render;
+mod skill_load;
 pub mod toolchains;
 pub mod transform;
 
+pub use command_invoke::{register_command_invoke, try_register_command_invoke};
 pub use evidence::{install_evidence, register_evidence, try_register_evidence};
 pub use flows::{
     register_flows, try_register_flows, ResolvedStoredFlow, StoredFlowCatalog, StoredFlowEntry,
@@ -253,6 +256,14 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
     // Evidence primitives (`observe`/`evidence`): general-purpose audit ops any flow may use to emit
     // and read its own runtime observations.
     evidence::try_register_evidence(&mut assembled)?;
+    // `command.invoke` (D-187): agent-side invocation of a discovered, agent-triggerable command
+    // or skill. Always registered; surfacing is gated by its `agent_invoke` group (`groups.rs`) on
+    // the `agent_triggerable` evidence signal (`flux_runtime::detect_signals`).
+    command_invoke::try_register_command_invoke(&mut assembled)?;
+    // `skill.load` (D-188): on-demand skill-body loading for the opt-in model-invoked catalog.
+    // Always registered; the engine's per-turn surfacing narrows it back out whenever no session
+    // has a non-empty catalog installed, which is the default (`FlowEngine::narrow_by_skill_catalog`).
+    skill_load::try_register_skill_load(&mut assembled)?;
     *registry = assembled;
     Ok(())
 }
@@ -3607,6 +3618,7 @@ mod tests {
                 "cargo_test",
                 "cite",
                 "coalesce",
+                "command.invoke",
                 "compare",
                 "count_by",
                 "cwd",
@@ -3661,6 +3673,7 @@ mod tests {
                 "regex_match",
                 "review.aggregate",
                 "review.normalize",
+                "skill.load",
                 "skip",
                 "sort",
                 "split",

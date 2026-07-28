@@ -27,7 +27,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     let input_h = state.input_rows();
     let slash = state
         .slash_query()
-        .map(|q| slash_matches(&q))
+        .map(|q| slash_matches(&q, &state.file_commands))
         .unwrap_or_default();
     let menu_h = (slash.len().min(6)) as u16;
     let queue_h = if state.queue.is_empty() {

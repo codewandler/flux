@@ -1511,6 +1511,7 @@ mod tests {
         let cfg = flux_config::Config {
             skills: flux_config::SkillsConfig {
                 dirs: vec!["cfg-skills".to_string()],
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1579,6 +1580,63 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// D-188: with the opt-in off (`model_invoked: false`), `load_model_invoked_skill_catalog`
+    /// discovers nothing at all — no directory walk, no catalog — matching the default-off
+    /// invariant `skills_are_disabled_until_named_explicitly` pins for `load_skills`.
+    #[test]
+    fn model_invoked_catalog_is_empty_when_the_opt_in_is_off() {
+        let root =
+            std::env::temp_dir().join(format!("flux-cli-model-invoked-off-{}", std::process::id()));
+        let dir = root.join(".flux/skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pdf.md"),
+            "---\nname: pdf-extract\ndescription: extract PDFs\n---\nbody",
+        )
+        .unwrap();
+        let cfg = flux_config::Config::default();
+        assert!(
+            super::load_model_invoked_skill_catalog(&root, &cfg, &[], false)
+                .unwrap()
+                .is_empty(),
+            "the opt-in is off, so nothing should be discovered"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D-188: with the opt-in on, every discovered skill is surfaced EXCEPT one that declares
+    /// `disable-model-invocation: true` — that field opts a skill out of both surfacing and
+    /// on-demand loading, not just loading.
+    #[test]
+    fn model_invoked_catalog_excludes_disable_model_invocation_skills() {
+        let root = std::env::temp_dir().join(format!(
+            "flux-cli-model-invoked-exclude-{}",
+            std::process::id()
+        ));
+        let dir = root.join(".flux/skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pdf.md"),
+            "---\nname: pdf-extract\ndescription: extract PDFs\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("private.md"),
+            "---\nname: private-only\ndescription: manual-only skill\ndisable-model-invocation: \
+             true\n---\nbody",
+        )
+        .unwrap();
+        let cfg = flux_config::Config::default();
+        let catalog = super::load_model_invoked_skill_catalog(&root, &cfg, &[], true).unwrap();
+        let names: Vec<&str> = catalog.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"pdf-extract"), "got {names:?}");
+        assert!(
+            !names.contains(&"private-only"),
+            "disable-model-invocation must exclude the skill from the catalog: {names:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn unknown_explicit_skill_fails_before_agent_construction() {
         let root =
@@ -1598,6 +1656,45 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D-189: a skill's `model` frontmatter is a precedence tier between the explicit `--model`
+    /// flag and config/default — same spirit as `Role::to_spec`'s `model.unwrap_or(default_model)`,
+    /// just one tier lower than the caller's own explicit choice rather than above it.
+    #[test]
+    fn skill_model_sits_between_explicit_cli_model_and_config_default() {
+        let cfg = flux_config::Config {
+            model: Some("config-model".to_string()),
+            ..Default::default()
+        };
+        let mut skill = flux_skill::parse("---\nname: fast\nmodel: haiku\n---\nbody", None);
+
+        // No CLI flag, an enabled skill sets `model` → the skill wins over config.
+        assert_eq!(
+            super::resolve_model_spec_with_skill(&None, &cfg, std::slice::from_ref(&skill)),
+            "haiku"
+        );
+        // An explicit CLI/SDK model always wins over the skill's request.
+        assert_eq!(
+            super::resolve_model_spec_with_skill(
+                &Some("cli-model".to_string()),
+                &cfg,
+                std::slice::from_ref(&skill)
+            ),
+            "cli-model"
+        );
+        // No skill model, no CLI flag → falls through to config.
+        skill.model = None;
+        assert_eq!(
+            super::resolve_model_spec_with_skill(&None, &cfg, std::slice::from_ref(&skill)),
+            "config-model"
+        );
+        // Nothing at all → the hardcoded default.
+        let empty_cfg = flux_config::Config::default();
+        assert_eq!(
+            super::resolve_model_spec_with_skill(&None, &empty_cfg, &[]),
+            "sonnet"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

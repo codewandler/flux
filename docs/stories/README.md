@@ -43,23 +43,34 @@ _flux's founding thesis is *the LLM is not the runtime*. Every turn's plan is pe
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
 ## Backlog
-- [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
-- [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 - [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
-- [C-93 — Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable](C-93-agent-invoke-commands-skills.md) · Core · commands/skills exist only for the human at the REPL/TUI; an agent can't invoke one even when policy would allow it
-- [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
-- [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
-- [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
-- [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
+
+### Approval Distillation
+- [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
+
+### Evidence Pinned Memory
+- [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
 
+### Habit Compiler
+- [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
+
+### Quorum Approval
+- [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
+
+### Taint Flow Policy
+- [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
+
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
+
+### Transactional Turns
+- [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 
 ## Done
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
@@ -240,6 +251,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-88 — Decompose god-functions and de-duplicate helpers trapped in binary crates](C-88-quality-godfunctions-dedup.md) · Core · Quality (Low) — build_agent_with (417 LOC) + exec_body (~1520 LOC); humanizers/dispatch/temp-dir duplicated; stringify error idiom
 - [C-89 — Let process access carry network and write effects in the authority contract](C-89-process-authority-carrier.md) · Core · the typed-authority validator rejected every process-mediated plugin op (kubernetes/aws), so `flux run` aborted at registration with "declares a network effect without network, browser, or provider access"
 - [C-91 — Make approval prompts visible in the plain CLI](C-91-visible-approval-prompts-plain-cli.md) · Core
+- [C-93 — Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable](C-93-agent-invoke-commands-skills.md) · Core · SUPERSEDED by D-187 (claude-interop epic) — contract carried over unchanged, extended to file-based commands
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
@@ -403,6 +415,13 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [D-178 — Resurrect — transparent mid-turn crash recovery](D-178-resurrect-durable-execution.md) · Agent · Phase 4 — 'Temporal for agents'; depends on D-175 (Resume scope)
 - [D-179 — Agent Lab CLI — flux record / flux test / resurrect-on-open](D-179-agent-lab-cli-surface.md) · Agent · Phase 5 — CLI as the reference app on the SDK; depends on D-174/D-178
 - [D-180 — Agent Lab — cookbook recipe and dogfood golden suite](D-180-agent-lab-docs-dogfood.md) · Agent · Phase 6 — adoption proof; the flux coding agent gets its own golden tests
+- [D-186 — Discover command files from .flux/.claude trees and dispatch them at the REPL/TUI](D-186-command-files-human-invocation.md) · Agent · Claude-compatible slash-command files with $ARGUMENTS substitution; today commands are hardcoded built-ins
+- [D-187 — Let the agent invoke commands and skills behind three fail-closed gates (absorbs C-93)](D-187-agent-invocable-commands-skills.md) · Agent · guarded op: permitted ∧ accessible ∧ agent-triggerable, through Executor::dispatch; supersedes C-93
+- [D-188 — Opt-in progressive skill disclosure — surface descriptions, load bodies on demand](D-188-opt-in-model-invoked-skills.md) · Agent · Claude-style model-invoked skills behind an explicit opt-in; manual --skill stays the default
+- [D-189 — Stop silently dropping skill frontmatter — lint, warn, and honor allowed-tools/model](D-189-skill-frontmatter-honesty.md) · Agent · allowed-tools/model/context/hooks currently vanish in serde with no warning; validate() is dead code
+- [D-190 — Disclose a skill's directory path so the model can reach its supporting files](D-190-skill-supporting-file-disclosure.md) · Agent · multi-file Claude skills (references/, scripts) currently degrade to the SKILL.md body alone
+- [D-191 — Discover nested/namespaced skill trees one-to-N levels deep](D-191-nested-skill-discovery.md) · Agent · .claude/skills/<ns>/<name>/SKILL.md trees are invisible today — discovery is one level deep
+- [D-192 — Reconcile flux-skill with the production discovery path — delete or align the dead code](D-192-flux-skill-reconciliation.md) · Agent · lazy loader, active_for ranking, and validate() are dead; crate docs contradict the shipping path
 - [I-02 — Reduce wasted agent-loop retries](I-02-agent-loop-retry-efficiency.md) · Improve · cargo wrappers normalize duplicate model-supplied scope flags, and the loop guard fingerprints repeated deterministic failures before replanning again
 - [I-03 — Measure the multi-pass cutover — time-to-first-feedback, rounds, tokens, tbench pass-rate](I-03-multipass-cutover-measurement.md) · Improve · the epic's acceptance gate — judged on evidence, not vibes; runs after the MVP stories land; baseline = pre-cutover main
 - [I-04 — Terminal-bench containers run flux with the shell group disabled — enable it in the harness](I-04-tbench-container-shell-enable.md) · Improve · found validating A-40: flux_agent.py forwards only provider keys, so in-container flux has no bash — the agent WRITES a correct server then says it cannot start it; every historical tbench number (I-01/I-03 both legs) is depressed by this

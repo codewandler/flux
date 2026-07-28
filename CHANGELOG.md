@@ -8,6 +8,38 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Claude interop epic (D-186…D-192): commands + skills load from both `.flux` and `.claude`
+  worlds** (design: `docs/designs/claude-interop.md`; user docs:
+  `website/docs/agent/claude-compat.md`, new page):
+  - **D-186: file-based slash commands.** Markdown command files discovered from project
+    `.flux/commands` + `.claude/commands` and user `~/.flux/commands` + `~/.claude/commands`
+    (first-wins precedence, project dirs symlink-jailed like skills), dispatched as `/name args…`
+    at the REPL and TUI with `$ARGUMENTS`/`$1..$9` substitution; frontmatter `description` +
+    `argument-hint` shown in `/help` and the slash menu; built-ins always win a name clash (load
+    warning). Claude's `!`-inline-bash and `@file` body syntax pass through as literal text.
+  - **D-187: agent-invocable commands and skills** (absorbs C-93). New `command.invoke` op lets the
+    agent pull a discovered command (argument-substituted) or skill body mid-turn — only behind
+    three independently fail-closed gates: policy **permitted**, **accessible** in the session, and
+    frontmatter `agent-triggerable: true` (default false). Runs through `Executor::dispatch` under
+    the frozen `TurnIdentity`; surfaced only when an agent-triggerable target exists.
+  - **D-188: opt-in model-invoked skills.** `--skills-model-invoked` / `[skills] model_invoked` /
+    `ClientBuilder::model_invoked_skills()` surface a compact name+description catalog and a new
+    `skill.load` op; a loaded skill persists for the session like a `--skill` activation. Skills
+    with `disable-model-invocation: true` are excluded. Manual activation stays the default —
+    with the opt-in off, behavior is unchanged.
+  - **D-189: skill frontmatter honesty.** Recognized-but-unsupported Claude fields (`context`,
+    `agent`, `hooks`, `license`, `compatibility`) warn at load instead of vanishing;
+    `flux_skill::validate()` now runs as a discovery-time lint. `allowed-tools` is honored via an
+    explicit Claude→flux op table and narrows the turn's advertised ops while the skill is active;
+    skill `model` joins the resolution chain (`--model`/SDK > skill > config > default).
+  - **D-190: supporting-file disclosure.** The injected `<skill>` block carries a `path="…"`
+    attribute (skill directory for `SKILL.md` skills, file for flat ones) so the model can lazily
+    `read` sibling `references/` — no eager loading, no policy widening.
+  - **D-191: nested skill discovery.** `SKILL.md` found at any depth up to 4 levels
+    (`.claude/skills/<ns>/<name>/SKILL.md`), symlink jail enforced at every depth; a directory
+    containing `SKILL.md` claims its subtree, so a skill's own `references/` never surfaces as a
+    separate skill.
+
 - **`/effort` REPL and TUI slash command.** View the active reasoning effort (`/effort`) or set it
   mid-session (`/effort low|medium|high|xhigh|max`, or `/effort off` for the provider default). The
   new level applies from the next turn and is ephemeral session state (not persisted like the
@@ -135,6 +167,15 @@ All notable changes to this project are documented in this file. The format is b
   ~16.7M-pixel canvas budget rejects oversized renders before allocation. flux-cli enables `png`
   in its default features, so the stock binary and `task install` include it, while the eight
   library consumers of flux-tools never build the rasterizer.
+
+### Removed
+
+- **D-192: `codewandler-flux-skill` dead code reconciled away** (breaking → next MINOR): removed the
+  never-shipped lazy-body loader (`SkillBody::lazy`, `SkillBody::is_loaded`) and keyword
+  trigger-ranking (`Skill::matches`, `Skill::match_score`, `ActivationLimits`, `active_for`), plus
+  the legacy duplicate discovery (`discover`, `discover_merged`); the five-directory precedence list
+  now lives only in `flux_runtime::metadata::discover_skills_from`, and the crate docs/architecture
+  docs match the shipped eager, manual-first behavior.
 
 ### Changed
 
