@@ -450,10 +450,13 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         // non-diffable tool just means no preview.
         const PREVIEW_CAP: usize = 8;
         let diff = state
-            .pending_approval_input(&view.tool)
-            .and_then(|input| toolview::format_diff(&view.tool, input));
+            .pending_approval_input(&view.request.tool)
+            .and_then(|input| toolview::format_diff(&view.request.tool, input));
         let diff_total = diff.as_ref().map(|d| d.len()).unwrap_or(0);
         let reason_row = usize::from(view.reason.is_some());
+        // C-182: a plan's destructive disclosure gets its own row above the detail list, where it
+        // cannot be scrolled out of sight by a long target list.
+        let warn_row = usize::from(view.request.destructive);
 
         // Sheet height: border (2) + question + subjects (windowed) + diff preview + optional
         // reason line + hints, capped at half the screen so long content scrolls instead of
@@ -461,11 +464,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         // question, subjects, and hints always survive.
         let want_preview = diff_total.min(PREVIEW_CAP) + usize::from(diff_total > PREVIEW_CAP); // "… more" marker row
         let max_h = (frame.area().height / 2).max(5);
-        let want = 2 + 2 + (view.subjects.len() + want_preview + reason_row) as u16;
+        let want =
+            2 + 2 + (view.request.subjects.len() + want_preview + reason_row + warn_row) as u16;
         let height = want.min(max_h).min(input_area.y.saturating_sub(1)).max(5);
         let inner_rows = height.saturating_sub(2) as usize;
-        let body = inner_rows.saturating_sub(2 + reason_row); // minus question + hints + reason
+        // minus question + hints + reason + destructive warning
+        let body = inner_rows.saturating_sub(2 + reason_row + warn_row);
         let subject_rows = view
+            .request
             .subjects
             .len()
             .min(body.saturating_sub(want_preview).max(1));
@@ -483,18 +489,31 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         };
         frame.render_widget(Clear, area);
 
-        let mut rows: Vec<Line> = vec![Line::from(vec![
+        let mut header = vec![
             Span::styled("approve ", Style::default().fg(t.warn)),
             Span::styled(
-                view.tool.clone(),
+                view.request.tool.clone(),
                 t.tool_style().add_modifier(Modifier::BOLD),
             ),
             Span::styled("?", Style::default().fg(t.warn)),
-        ])];
+        ];
+        // C-182: a plan's aggregate risk rides the header in risk color, so the badge survives
+        // however far the detail list is scrolled.
+        if let Some(summary) = &view.request.summary {
+            header.push(Span::raw("  "));
+            header.push(Span::styled(summary.clone(), plan::risk_style(summary, t)));
+        }
+        let mut rows: Vec<Line> = vec![Line::from(header)];
+        if view.request.destructive {
+            rows.push(Line::styled(
+                "⚠ contains a destructive operation",
+                t.warn_style().add_modifier(Modifier::BOLD),
+            ));
+        }
         let start = view
             .scroll
-            .min(view.subjects.len().saturating_sub(subject_rows));
-        let shown = view.subjects.iter().skip(start).take(subject_rows);
+            .min(view.request.subjects.len().saturating_sub(subject_rows));
+        let shown = view.request.subjects.iter().skip(start).take(subject_rows);
         for subject in shown {
             rows.push(Line::styled(
                 format!(
@@ -504,7 +523,11 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 t.muted_style(),
             ));
         }
-        let hidden = view.subjects.len().saturating_sub(start + subject_rows);
+        let hidden = view
+            .request
+            .subjects
+            .len()
+            .saturating_sub(start + subject_rows);
         if let Some(diff) = &diff {
             for row in diff.iter().take(preview_rows) {
                 rows.push(diff_row_line(t, row, " "));

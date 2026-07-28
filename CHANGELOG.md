@@ -6,6 +6,54 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-180…C-182: where the turn's wall clock actually went.** The TUI attributed execution time to
+  **operations** and nothing else — every tool card carried `exec 1.2s`, and a turn closed with
+  `4 steps · 18.1s` — so the largest component of almost every turn, waiting on the model, was
+  invisible. The measurements already existed; the surface dropped them.
+  - **C-180 LLM wait time in the TUI.** The engine's per-call `model.call` observation already
+    carried `duration_us` and `ttft_us` (the plain CLI renders them behind `--trace-loop`); the TUI's
+    sink extracted only `usage` and threw the rest away. Each round's sealed thinking entry now
+    carries a badge — `◇ model explore #2 · 4.2s · ttft 0.9s` — rendered even for a stage that
+    streamed no thinking tokens, because that stage still made you wait. While a call is in flight
+    the footer names *that* wait beside the turn total (`explore · 18.1s · model 3.2s`), so a slow
+    model is distinguishable from a slow op without waiting for the turn to end. The closing summary
+    splits the clock: `4 steps · 18.1s · llm 12.4s`, summed across every round rather than the last
+    one. A turn that made no model call shows no `llm` segment at all.
+  - **C-181 provider retries are visible while they happen.** `NativeProvider::stream` retries
+    transient 429/5xx and transport failures with exponential backoff (up to six attempts, capped at
+    30s each) and force-refreshes OAuth on a 401. Every one of those paths reported only through
+    `tracing::warn!`, and no product surface installs a subscriber — so a turn that slept 30s through
+    backoffs looked exactly like a turn where the model was thinking hard. New `RetryObserver` seam
+    in `flux-provider` (`with_retry_observer`, a task-local scoped around one model call, plus a
+    public `report_retry` so a provider implemented outside the crate can use the same channel).
+    The connect loop reports **before** each sleep, so the footer names the wait while it is still
+    ahead of you: `↻ retry 2/6 · http 429 · waiting 4s`, in warn color, taking over from the model
+    timer — a backoff is the one part of the wait that is not the model's fault. Counts also land on
+    `model.call` (`retries`, `oauth_refreshes`, `transport_fallbacks`) for after-the-fact
+    attribution, including on the failure path where no stream ever exists to carry them, and appear
+    on the transcript badge as `· ↻ 2 retries`. The OAuth refresh and the C-07 transport→HTTP
+    fallback ride the same seam. Retry policy itself is unchanged.
+  - **C-182 the plan-approval sheet lists its ops.** Approving a whole plan showed `approve run
+    plan?` over one line reading `3 op(s) · low · mutating` — you were asked to authorize three
+    operations without being told which three, or against what. The TUI's approver never implemented
+    `Approver::request_plan`, so the trait default collapsed the batch to a bare count, discarding
+    the `ops` and typed `requirements` the request already carried (and which the plain CLI's prompt
+    has always rendered). The sheet now shows the risk summary in risk color on the header, a
+    warn-styled `⚠ contains a destructive operation` row above the scrollable list so it cannot be
+    scrolled out of view, the op names, and the concrete statically-visible targets
+    (`workspace.write → src/lib.rs`, `process.exec → $ cargo test --workspace`). Display only —
+    approval semantics, receipt binding, and dispatch's per-op re-check are untouched, so an
+    undisclosed destructive op still re-fires the per-op gate inside an approved scope.
+  - Design: [docs/designs/turn-latency-visibility.md](docs/designs/turn-latency-visibility.md).
+
+### Changed
+
+- **Breaking (embedders only):** `flux_tui::ApprovalView` now holds its content in a nested
+  `ApprovalRequest { tool, subjects, summary, destructive }` instead of flat `tool`/`subjects`
+  fields, so the sheet can carry a plan's risk summary and destructive disclosure (C-182).
+
 ## [0.30.1] - 2026-07-28
 
 ### Added

@@ -14,8 +14,8 @@ use flux_spec::{AccessKind, Effect, Risk, ToolSpec};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::loop_host::{PlanningGuard, SharedSink};
-use crate::model::{stream_blocks, ModelCallMetrics, StageOptions};
+use crate::loop_host::SharedSink;
+use crate::model::{consult_model, ModelCallMetrics, StageOptions};
 use crate::registry::OpRegistry;
 use crate::runtime::execute_flow_with_composites;
 use crate::state::FlowStore;
@@ -718,11 +718,8 @@ async fn run_model_stage_inner(
         correlate_request(ctx, &mut req, &stage_label, round);
         let request_model = req.model.clone();
 
-        let (streamed, usage, metrics) = {
-            let _planning = PlanningGuard::start(ctx.sink.clone());
-            let mut sink = SharedSink::new(ctx.sink.clone());
-            stream_blocks(ctx.provider.as_ref(), req, Some(&mut sink)).await
-        };
+        let (streamed, usage, metrics) =
+            consult_model(ctx.provider.as_ref(), ctx.sink.clone(), req).await;
         observe_model_call(
             ctx,
             ModelCallObservation {
@@ -1151,11 +1148,8 @@ async fn adaptive_explore(
         let repair_attempt = state.explore_calls;
         correlate_request(ctx, &mut req, "explore", state.explore_calls + 1);
         let request_model = req.model.clone();
-        let (result, usage, metrics) = {
-            let _planning = PlanningGuard::start(ctx.sink.clone());
-            let mut sink = SharedSink::new(ctx.sink.clone());
-            stream_blocks(ctx.provider.as_ref(), req, Some(&mut sink)).await
-        };
+        let (result, usage, metrics) =
+            consult_model(ctx.provider.as_ref(), ctx.sink.clone(), req).await;
         state.explore_calls += 1;
         observe_model_call(
             ctx,
@@ -1626,11 +1620,8 @@ async fn declare_intent(
         req.tools = vec![intent_tool(families)];
         correlate_request(ctx, &mut req, "intent", attempt + 1);
         let request_model = req.model.clone();
-        let (result, usage, metrics) = {
-            let _planning = PlanningGuard::start(ctx.sink.clone());
-            let mut sink = SharedSink::new(ctx.sink.clone());
-            stream_blocks(ctx.provider.as_ref(), req, Some(&mut sink)).await
-        };
+        let (result, usage, metrics) =
+            consult_model(ctx.provider.as_ref(), ctx.sink.clone(), req).await;
         observe_model_call(
             ctx,
             ModelCallObservation {
@@ -2253,6 +2244,11 @@ fn observe_model_call(ctx: &StagedContext, call: ModelCallObservation<'_>) {
             "duration_us": metrics.duration_us,
             "ttft_us": metrics.ttft_us,
             "chunks": metrics.chunks,
+            // C-181: connect-phase recovery this call paid for. Present (as 0) on every call so a
+            // consumer never has to tell "no retries" apart from "an older log".
+            "retries": metrics.retries,
+            "oauth_refreshes": metrics.oauth_refreshes,
+            "transport_fallbacks": metrics.transport_fallbacks,
             "system_bytes": metrics.system_bytes,
             "message_bytes": metrics.message_bytes,
             "operations": metrics.operations,
@@ -2733,6 +2729,44 @@ mod tests {
 
         async fn stream(&self, _request: Request) -> Result<ChunkStream> {
             Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    /// A provider that reports one connect-phase retry — exactly as `NativeProvider` does before
+    /// backing off — and then answers normally. Lets the C-181 stage-side reporter be driven
+    /// without standing up a flaky socket.
+    struct RetryingProvider {
+        responses: Mutex<VecDeque<Vec<Chunk>>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Provider for RetryingProvider {
+        fn name(&self) -> &str {
+            "retrying"
+        }
+
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            flux_provider::report_retry(flux_provider::RetryEvent {
+                provider: "retrying".into(),
+                model: request.model.clone(),
+                attempt: 1,
+                max_attempts: 6,
+                delay: std::time::Duration::from_millis(500),
+                reason: flux_provider::RetryReason::Status(429),
+            });
+            if self.fail {
+                return Err(Error::Other("exhausted".into()));
+            }
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(
+                response.into_iter().map(Ok),
+            )))
         }
     }
 
@@ -3754,6 +3788,90 @@ mod tests {
         assert!(calls[0].data["duration_us"].is_number());
         assert!(calls[0].data["ttft_us"].is_number());
         assert_eq!(calls[1].data["stage"], "explore");
+    }
+
+    /// C-181 failing first: a connect retry reaches the live surface as a `model.retry` observation
+    /// *while the call is still open* (between `planning:true` and `planning:false`), and its tally
+    /// lands on the call's `model.call` observation. Pre-fix the retry only reached `tracing`, which
+    /// no surface subscribes to, so neither ever appeared.
+    #[tokio::test]
+    async fn a_connect_retry_reaches_the_surface_live_and_is_tallied_on_the_call() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.provider = Arc::new(RetryingProvider {
+            responses: Mutex::new(VecDeque::from(vec![native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({"intent": "answer", "capability_families": []}),
+            )])),
+            fail: false,
+        });
+        let sink = Arc::new(Mutex::new(RecordingSink::default()));
+        context.sink = sink.clone();
+        let executor = context.executor.clone();
+
+        detect_intent_stage(context).await.result.unwrap();
+
+        let events = sink.lock().unwrap().events.clone();
+        let retry = events
+            .iter()
+            .position(|e| e == "observation:model.retry")
+            .expect("the retry must reach the live sink");
+        let open = events.iter().position(|e| e == "planning:true").unwrap();
+        let close = events.iter().position(|e| e == "planning:false").unwrap();
+        assert!(
+            open < retry && retry < close,
+            "the retry must surface while the call is still open, got {events:?}"
+        );
+
+        let evidence = executor.evidence();
+        let calls = evidence.by_kind("model.call").collect::<Vec<_>>();
+        assert_eq!(calls[0].data["retries"], 1);
+        assert_eq!(calls[0].data["oauth_refreshes"], 0);
+        assert_eq!(calls[0].data["transport_fallbacks"], 0);
+    }
+
+    /// The tally must survive the failure path too: when the retry budget is exhausted no stream
+    /// ever exists, so the count cannot ride the stream — it has to come off the observer.
+    #[tokio::test]
+    async fn retries_are_tallied_even_when_the_call_ultimately_fails() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.provider = Arc::new(RetryingProvider {
+            responses: Mutex::new(VecDeque::new()),
+            fail: true,
+        });
+        let executor = context.executor.clone();
+
+        assert!(detect_intent_stage(context).await.result.is_err());
+
+        let evidence = executor.evidence();
+        let calls = evidence.by_kind("model.call").collect::<Vec<_>>();
+        assert_eq!(calls[0].data["ok"], false);
+        assert_eq!(calls[0].data["retries"], 1);
+    }
+
+    /// The `model.retry` observation carries only the reason's short label — never the underlying
+    /// transport error string, which can embed an endpoint URL.
+    #[tokio::test]
+    async fn a_retry_observation_carries_a_label_not_the_raw_transport_error() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.provider = Arc::new(RetryingProvider {
+            responses: Mutex::new(VecDeque::from(vec![native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({"intent": "answer", "capability_families": []}),
+            )])),
+            fail: false,
+        });
+        let executor = context.executor.clone();
+
+        detect_intent_stage(context).await.result.unwrap();
+
+        let evidence = executor.evidence();
+        let retries = evidence.by_kind("model.retry").collect::<Vec<_>>();
+        assert!(
+            retries.is_empty(),
+            "each retry is a live signal only; the durable tally rides `model.call`"
+        );
     }
 
     #[test]

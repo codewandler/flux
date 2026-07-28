@@ -17,14 +17,14 @@ mod terminal_io;
 pub use controller::ApprovalView;
 use controller::{
     approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
-    ChannelSink, PendingApproval, UiEvent,
+    ChannelSink, ModelCallTiming, PendingApproval, UiEvent,
 };
 #[cfg(test)]
 use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
 pub use rendering::render;
 pub use state::ChatState;
-use state::{Phase, RoundUsage};
+use state::{ModelCallBadge, Phase, RetryView, RoundUsage};
 use terminal_io::{TerminalGuard, Tui};
 
 pub mod theme;
@@ -297,7 +297,15 @@ enum Entry {
     Assistant(Assistant),
     /// Live extended-thinking tokens streamed during a model-backed stage, rendered as Markdown
     /// once sealed (same `Assistant` widget, distinct entry so it doesn't merge with the reply).
-    Thinking(Assistant),
+    ///
+    /// One entry per model call. `call` is the latency badge, attached once the call's `model.call`
+    /// observation lands — which is always *after* the entry seals, so it never races the sealing
+    /// (C-180). Carried here rather than as its own entry so it stays bound to the round it
+    /// measures and still renders for a stage that emitted no thinking tokens at all.
+    Thinking {
+        body: Assistant,
+        call: Option<ModelCallBadge>,
+    },
     /// A dispatched tool/op call + (once it returns) its result — rendered as one card.
     Tool(ToolEntry),
     /// An observation/notice (skill activation, destructive flag, error).
@@ -897,6 +905,10 @@ impl ChatState {
             cost_unpriced: false,
             steps: 0,
             last_elapsed: None,
+            model_call_start: None,
+            turn_llm_wait: Duration::ZERO,
+            last_llm_wait: None,
+            retry: None,
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
@@ -1127,12 +1139,15 @@ impl ChatState {
     /// Open a fresh thinking entry for the upcoming planning call (called on `Planning(true)`).
     fn begin_thinking(&mut self) {
         // Only open a new thinking entry if there isn't already an open one.
-        if !matches!(self.entries.last(), Some(Entry::Thinking(a)) if !a.done) {
-            self.entries.push(Entry::Thinking(Assistant {
-                text: String::new(),
-                done: false,
-                cache: RefCell::new(None),
-            }));
+        if !matches!(self.entries.last(), Some(Entry::Thinking { body, .. }) if !body.done) {
+            self.entries.push(Entry::Thinking {
+                body: Assistant {
+                    text: String::new(),
+                    done: false,
+                    cache: RefCell::new(None),
+                },
+                call: None,
+            });
             self.mark_transcript_dirty();
             self.assistant_open = false;
         }
@@ -1140,32 +1155,73 @@ impl ChatState {
 
     /// Append a thinking-token delta to the open thinking entry.
     fn stream_thinking(&mut self, delta: &str) {
-        if let Some(Entry::Thinking(a)) = self.entries.last_mut() {
-            if !a.done {
-                a.text.push_str(delta);
+        if let Some(Entry::Thinking { body, .. }) = self.entries.last_mut() {
+            if !body.done {
+                body.text.push_str(delta);
                 self.mark_transcript_dirty();
                 return;
             }
         }
         // No open thinking entry — open one on the fly.
-        self.entries.push(Entry::Thinking(Assistant {
-            text: delta.to_string(),
-            done: false,
-            cache: RefCell::new(None),
-        }));
+        self.entries.push(Entry::Thinking {
+            body: Assistant {
+                text: delta.to_string(),
+                done: false,
+                cache: RefCell::new(None),
+            },
+            call: None,
+        });
         self.mark_transcript_dirty();
         self.assistant_open = false;
     }
 
     /// Seal the open thinking entry (called on `Planning(false)`).
     fn end_thinking(&mut self) {
-        if let Some(Entry::Thinking(a)) = self.entries.last_mut() {
-            if !a.done {
-                a.text = a.text.trim_end().to_string();
-                a.done = true;
+        if let Some(Entry::Thinking { body, .. }) = self.entries.last_mut() {
+            if !body.done {
+                body.text = body.text.trim_end().to_string();
+                body.done = true;
                 self.mark_transcript_dirty();
             }
         }
+    }
+
+    /// Fold one completed model call into the turn's wait accounting and badge its round (C-180).
+    fn record_model_call(&mut self, badge: ModelCallBadge) {
+        // A retry that ended the call — rather than being followed by another attempt — never gets
+        // a `Planning(false)` of its own to clear the footer badge (C-181).
+        self.retry = None;
+        self.turn_llm_wait = self.turn_llm_wait.saturating_add(badge.timing.duration);
+        self.attach_model_call(badge);
+    }
+
+    /// Attach one completed model call's latency badge to the round it measured (C-180).
+    ///
+    /// Walks back to the newest thinking entry that has no badge yet — `Planning(true)` opens
+    /// exactly one per call, and the observation always arrives after that entry sealed. If the
+    /// engine ever emitted a `model.call` without a planning bracket, a badge-only entry is created
+    /// so the wait is still accounted for rather than silently dropped.
+    fn attach_model_call(&mut self, badge: ModelCallBadge) {
+        for entry in self.entries.iter_mut().rev() {
+            if let Entry::Thinking { call, .. } = entry {
+                if call.is_none() {
+                    *call = Some(badge);
+                    self.mark_transcript_dirty();
+                    return;
+                }
+                break;
+            }
+        }
+        self.entries.push(Entry::Thinking {
+            body: Assistant {
+                text: String::new(),
+                done: true,
+                cache: RefCell::new(None),
+            },
+            call: Some(badge),
+        });
+        self.mark_transcript_dirty();
+        self.assistant_open = false;
     }
 
     /// Append a streamed assistant token, extending the live assistant message (or starting one).
@@ -1430,11 +1486,11 @@ impl ChatState {
                     }
                 }
                 Entry::Assistant(a) => out.extend(a.lines(width, t)),
-                Entry::Thinking(a) => {
-                    if !a.text.is_empty() {
-                        let count = a.text.lines().count().max(1);
+                Entry::Thinking { body, call } => {
+                    if !body.text.is_empty() {
+                        let count = body.text.lines().count().max(1);
                         out.push(Line::styled(
-                            if a.done {
+                            if body.done {
                                 format!(
                                     "thinking · {count} line{} · Ctrl-E details",
                                     if count == 1 { "" } else { "s" }
@@ -1445,13 +1501,18 @@ impl ChatState {
                             t.muted_style(),
                         ));
                         if self.expand_tools {
-                            out.extend(a.lines(width, t).into_iter().map(|mut l| {
+                            out.extend(body.lines(width, t).into_iter().map(|mut l| {
                                 for span in &mut l.spans {
                                     span.style = span.style.patch(t.muted_style());
                                 }
                                 l
                             }));
                         }
+                    }
+                    // C-180: what this round actually cost in wall clock. Rendered even with no
+                    // thinking text — a stage without extended thinking still made the user wait.
+                    if let Some(call) = call {
+                        out.push(Line::from(model_call_spans(call, t)));
                     }
                 }
                 Entry::Tool(tool) => out.extend(self.tool_lines(tool, width)),
@@ -1783,7 +1844,8 @@ impl ChatState {
         let entry = self.entries.get(self.focused?)?;
         Some(match entry {
             Entry::User(text) => text.clone(),
-            Entry::Assistant(a) | Entry::Thinking(a) => a.text.clone(),
+            Entry::Assistant(a) => a.text.clone(),
+            Entry::Thinking { body, .. } => body.text.clone(),
             Entry::Tool(tool) => {
                 let header = format!("{} {}", tool.call.verb, tool.call.arg);
                 match &tool.result {
@@ -2098,6 +2160,20 @@ impl ChatState {
                     format!("  · {}", fmt_elapsed(elapsed)),
                     t.muted_style(),
                 ));
+                // C-180/C-181: name the wait the user is IN. A pending backoff wins over the model
+                // timer — it is the one part of the wait that is not the model thinking, and saying
+                // "model 31s" through a retry storm would be actively misleading.
+                if let Some(retry) = &self.retry {
+                    left.push(Span::styled(
+                        format!("  · {}", retry.label()),
+                        t.warn_style(),
+                    ));
+                } else if let Some(started) = self.model_call_start {
+                    left.push(Span::styled(
+                        format!("  · model {}", fmt_elapsed(started.elapsed())),
+                        t.muted_style(),
+                    ));
+                }
                 left
             }
         };
@@ -2114,8 +2190,14 @@ impl ChatState {
         }
         if let Some(e) = self.last_elapsed {
             let plural = if self.steps == 1 { "" } else { "s" };
+            // C-180: split the wall clock. Omitted entirely for a turn that made no model call
+            // (a `/`-command, a resumed transcript) rather than rendering a misleading `llm 0s`.
+            let llm = match self.last_llm_wait {
+                Some(wait) => format!(" · llm {}", fmt_elapsed(wait)),
+                None => String::new(),
+            };
             right.push(vec![Span::styled(
-                format!("{} step{plural} · {}", self.steps, fmt_elapsed(e)),
+                format!("{} step{plural} · {}{llm}", self.steps, fmt_elapsed(e)),
                 t.muted_style(),
             )]);
         }
@@ -2323,6 +2405,10 @@ impl ChatState {
         self.active_action_id = None;
         self.steps = 0;
         self.last_elapsed = None;
+        self.model_call_start = None;
+        self.turn_llm_wait = Duration::ZERO;
+        self.last_llm_wait = None;
+        self.retry = None;
         self.session_picker = None;
         self.session_sel = 0;
         self.plan_phase = None;
@@ -2509,6 +2595,38 @@ fn flag_on(value: &str) -> bool {
     )
 }
 
+/// One model call's latency badge (C-180): `◇ model explore #2 · 4.2s · ttft 0.9s · ↻ 2 retries`.
+///
+/// Mirrors the plain CLI's `format_model_call`, minus the schema/op figures the transcript already
+/// carries elsewhere. `stage.<name>` is shortened to `<name>` — the prefix is engine bookkeeping and
+/// the word "model" already leads the line. Retries are warn-styled: they are the one part of the
+/// wait that is not the model thinking.
+fn model_call_spans(call: &ModelCallBadge, t: &Theme) -> Vec<Span<'static>> {
+    let stage = call.stage.strip_prefix("stage.").unwrap_or(&call.stage);
+    let mut spans = vec![Span::styled(
+        format!(
+            "◇ model {stage} #{} · {}",
+            call.round,
+            fmt_elapsed(call.timing.duration)
+        ),
+        t.muted_style(),
+    )];
+    if let Some(ttft) = call.timing.ttft {
+        spans.push(Span::styled(
+            format!(" · ttft {}", fmt_elapsed(ttft)),
+            t.muted_style(),
+        ));
+    }
+    if call.timing.retries > 0 {
+        let plural = if call.timing.retries == 1 { "y" } else { "ies" };
+        spans.push(Span::styled(
+            format!(" · ↻ {} retr{plural}", call.timing.retries),
+            t.warn_style(),
+        ));
+    }
+    spans
+}
+
 fn fmt_tool_timing(outcome: &ToolOutcome) -> String {
     match outcome.approval_wait {
         Some(wait) => format!(
@@ -2677,11 +2795,16 @@ async fn event_loop(
                         // Starting a new planning call: open a fresh thinking entry.
                         state.begin_thinking();
                         state.phase = Phase::Planning;
+                        // C-180: the footer's live model timer runs off this bracket, which is the
+                        // engine's own model-stage scope — not a guess at when inference began.
+                        state.model_call_start = Some(Instant::now());
                     } else {
                         // Planning done: seal the thinking entry and move to Thinking phase
                         // (the engine will emit text_delta or another Planning shortly).
                         state.end_thinking();
                         state.phase = Phase::Thinking;
+                        state.model_call_start = None;
+                        state.retry = None;
                     }
                 }
                 UiEvent::Plan(data) => {
@@ -2723,16 +2846,34 @@ async fn event_loop(
                 UiEvent::CallUsage {
                     model,
                     stage,
+                    round,
                     operations,
                     usage,
-                } => state.record_call_usage(&model, &stage, operations, &usage),
-                UiEvent::Notice { text, sev } => state.push(Entry::Notice { text, sev }),
-                UiEvent::Approval {
-                    tool,
-                    subjects,
-                    reply,
+                    timing,
                 } => {
-                    approval_queue.push_back((tool, subjects, reply));
+                    state.record_call_usage(&model, &stage, operations, &usage);
+                    state.record_model_call(ModelCallBadge {
+                        stage,
+                        round,
+                        timing,
+                    });
+                }
+                UiEvent::Retry {
+                    attempt,
+                    max_attempts,
+                    delay,
+                    reason,
+                } => {
+                    state.retry = Some(RetryView {
+                        attempt,
+                        max_attempts,
+                        delay,
+                        reason,
+                    })
+                }
+                UiEvent::Notice { text, sev } => state.push(Entry::Notice { text, sev }),
+                UiEvent::Approval { request, reply } => {
+                    approval_queue.push_back((request, reply));
                     show_next_approval(state, &mut pending_reply, &mut approval_queue);
                 }
                 UiEvent::Steered(messages) => {
@@ -2749,13 +2890,17 @@ async fn event_loop(
                     if let Some((_tool, reply)) = pending_reply.take() {
                         let _ = reply.send(ApprovalChoice::Deny);
                     }
-                    for (_tool, _subjects, reply) in approval_queue.drain(..) {
+                    for (_request, reply) in approval_queue.drain(..) {
                         let _ = reply.send(ApprovalChoice::Deny);
                     }
                     state.approval = None;
                     state.end_stream();
                     state.phase = Phase::Idle;
                     state.last_elapsed = state.turn_start.map(|s| s.elapsed());
+                    state.last_llm_wait =
+                        (!state.turn_llm_wait.is_zero()).then_some(state.turn_llm_wait);
+                    state.model_call_start = None;
+                    state.retry = None;
                     state.turn_start = None;
                     state.active_action_id = None;
                     // A queued message starts only after the prior task's Finished marker.
@@ -2845,7 +2990,7 @@ async fn event_loop(
                             view.scroll = view
                                 .scroll
                                 .saturating_add_signed(delta)
-                                .min(view.subjects.len().saturating_sub(1));
+                                .min(view.request.subjects.len().saturating_sub(1));
                         }
                         ApprovalAction::DenyWithReason => view.reason = Some(String::new()),
                         action => {
@@ -3790,6 +3935,10 @@ fn start_turn(
     state.phase = Phase::Thinking;
     state.turn_start = Some(Instant::now());
     state.steps = 0;
+    // C-180: the model-wait split is per turn, alongside `steps`/`turn_start` — a `/compact` or
+    // other maintenance action must not inherit or erase the last turn's figure.
+    state.turn_llm_wait = Duration::ZERO;
+    state.last_llm_wait = None;
     state.plan_phase = None;
     state.execute_rounds = 0;
     state.gather_mode = false;
@@ -3878,6 +4027,18 @@ mod tests {
         match event {
             UiEvent::Tagged { event, .. } => *event,
             event => event,
+        }
+    }
+
+    /// A per-op approval request: no aggregate risk summary, not destructive.
+    fn op_request<S: Into<String>>(
+        tool: &str,
+        subjects: impl IntoIterator<Item = S>,
+    ) -> controller::ApprovalRequest {
+        controller::ApprovalRequest {
+            tool: tool.into(),
+            subjects: subjects.into_iter().map(Into::into).collect(),
+            ..controller::ApprovalRequest::default()
         }
     }
 
@@ -3980,8 +4141,7 @@ mod tests {
         assert_eq!(state.entries.len(), 3);
 
         state.approval = Some(ApprovalView {
-            tool: "bash".into(),
-            subjects: vec!["ls".into()],
+            request: op_request("bash", ["ls"]),
             scroll: 0,
             reason: None,
         });
@@ -4551,8 +4711,7 @@ mod tests {
         let mut state = ChatState::new("mock".into());
         let subjects: Vec<String> = (0..10).map(|i| format!("path/to/file-{i}.rs")).collect();
         state.approval = Some(ApprovalView {
-            tool: "write".into(),
-            subjects,
+            request: op_request("write", subjects),
             scroll: 0,
             reason: None,
         });
@@ -4588,7 +4747,7 @@ mod tests {
         let mut current = None;
         let mut queued = VecDeque::new();
         let (reply, mut reply_rx) = oneshot::channel();
-        queued.push_back(("bash".into(), vec!["rm -rf tmp".into()], reply));
+        queued.push_back((op_request("bash", ["rm -rf tmp"]), reply));
         show_next_approval(&mut state, &mut current, &mut queued);
         assert!(state.approval.is_some());
 
@@ -4613,15 +4772,15 @@ mod tests {
         let mut queued = VecDeque::new();
         let (first, _first_rx) = oneshot::channel();
         let (second, _second_rx) = oneshot::channel();
-        queued.push_back(("write".into(), vec!["a".into()], first));
-        queued.push_back(("bash".into(), vec!["b".into()], second));
+        queued.push_back((op_request("write", ["a"]), first));
+        queued.push_back((op_request("bash", ["b"]), second));
 
         show_next_approval(&mut state, &mut current, &mut queued);
         assert!(matches!(current.as_ref(), Some((tool, _)) if tool == "write"));
         assert!(state
             .approval
             .as_ref()
-            .is_some_and(|view| view.tool == "write" && view.subjects == ["a"]));
+            .is_some_and(|view| view.request.tool == "write" && view.request.subjects == ["a"]));
         current.take();
         state.approval = None;
         show_next_approval(&mut state, &mut current, &mut queued);
@@ -4629,7 +4788,7 @@ mod tests {
         assert!(state
             .approval
             .as_ref()
-            .is_some_and(|view| view.tool == "bash" && view.subjects == ["b"]));
+            .is_some_and(|view| view.request.tool == "bash" && view.request.subjects == ["b"]));
     }
 
     /// C-112: fuzzy ranking is pinned — path-segment prefix > substring > subsequence, ties to
@@ -4935,7 +5094,7 @@ mod tests {
         let mut current = None;
         let mut queued = VecDeque::new();
         let (reply, mut reply_rx) = oneshot::channel();
-        queued.push_back(("bash".into(), vec!["rm -rf tmp".into()], reply));
+        queued.push_back((op_request("bash", ["rm -rf tmp"]), reply));
         show_next_approval(&mut state, &mut current, &mut queued);
 
         // `d` → reason mode (the loop maps DenyWithReason to opening the input).
@@ -4969,6 +5128,418 @@ mod tests {
         ));
     }
 
+    // --- C-180 / C-181: where the wall clock went ---------------------------------------------
+
+    fn model_call_event(stage: &str, round: usize, duration_us: u64, retries: u32) -> UiEvent {
+        UiEvent::CallUsage {
+            model: "mock".into(),
+            stage: stage.into(),
+            round,
+            operations: 4,
+            usage: Usage::default(),
+            timing: ModelCallTiming {
+                duration: Duration::from_micros(duration_us),
+                ttft: Some(Duration::from_millis(900)),
+                retries,
+            },
+        }
+    }
+
+    /// C-180 failing first: a completed model call badges the round it measured with its own
+    /// latency. Pre-fix the TUI extracted only `usage` off `model.call` and the wait was invisible.
+    #[test]
+    fn a_sealed_thinking_entry_carries_its_model_call_latency() {
+        let mut state = ChatState::new("mock".into());
+        state.begin_thinking();
+        state.stream_thinking("weighing options");
+        state.end_thinking();
+        state.attach_model_call(ModelCallBadge {
+            stage: "stage.explore".into(),
+            round: 2,
+            timing: ModelCallTiming {
+                duration: Duration::from_millis(4200),
+                ttft: Some(Duration::from_millis(900)),
+                retries: 0,
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("model explore #2"), "{content}");
+        assert!(content.contains("4.2s"), "{content}");
+        assert!(content.contains("ttft"), "{content}");
+    }
+
+    /// A stage that streams no thinking tokens still made the user wait, so the badge renders on
+    /// its own — the thinking body is what's conditional, not the latency.
+    #[test]
+    fn a_model_call_without_thinking_tokens_still_renders_its_latency() {
+        let mut state = ChatState::new("mock".into());
+        state.begin_thinking();
+        state.end_thinking();
+        state.attach_model_call(ModelCallBadge {
+            stage: "intent".into(),
+            round: 1,
+            timing: ModelCallTiming {
+                duration: Duration::from_millis(1500),
+                ttft: None,
+                retries: 2,
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("model intent #1"), "{content}");
+        assert!(
+            !content.contains("thinking"),
+            "no thinking text means no thinking row: {content}"
+        );
+        assert!(content.contains("2 retries"), "{content}");
+    }
+
+    /// Each call badges its own round rather than piling onto the newest entry.
+    #[test]
+    fn consecutive_model_calls_badge_their_own_rounds() {
+        let mut state = ChatState::new("mock".into());
+        for round in 1..=2 {
+            state.begin_thinking();
+            state.stream_thinking("t");
+            state.end_thinking();
+            state.attach_model_call(ModelCallBadge {
+                stage: "explore".into(),
+                round,
+                timing: ModelCallTiming::default(),
+            });
+        }
+        let badged = state
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Thinking { call: Some(_), .. }))
+            .count();
+        assert_eq!(badged, 2, "each round keeps its own badge");
+    }
+
+    /// C-180: while a model call is in flight the footer names *that* wait beside the turn total,
+    /// so a slow model is distinguishable from a slow op without waiting for the turn to end.
+    #[test]
+    fn the_footer_shows_the_in_flight_model_wait() {
+        let mut state = ChatState::new("mock".into());
+        state.phase = Phase::Planning;
+        state.turn_start = Some(Instant::now() - Duration::from_secs(18));
+        state.model_call_start = Some(Instant::now() - Duration::from_secs(3));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("model 3"), "{content}");
+    }
+
+    /// C-181: a pending backoff takes the footer over from the model timer — the wait is the
+    /// provider's, and calling it "model" would misattribute it.
+    #[test]
+    fn a_pending_retry_takes_over_the_footer_from_the_model_timer() {
+        let mut state = ChatState::new("mock".into());
+        state.phase = Phase::Planning;
+        state.turn_start = Some(Instant::now());
+        state.model_call_start = Some(Instant::now());
+        state.retry = Some(RetryView {
+            attempt: 2,
+            max_attempts: 6,
+            delay: Duration::from_secs(4),
+            reason: "http 429".into(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("retry 2/6"), "{content}");
+        assert!(content.contains("http 429"), "{content}");
+        assert!(
+            !content.contains("model 0"),
+            "the retry replaces the model timer: {content}"
+        );
+    }
+
+    /// A budget-free recovery (OAuth refresh, transport fallback) renders without an `N/M` counter
+    /// it cannot honestly fill in.
+    #[test]
+    fn a_budget_free_recovery_renders_without_a_counter() {
+        let view = RetryView {
+            attempt: 1,
+            max_attempts: 0,
+            delay: Duration::ZERO,
+            reason: "auth refresh".into(),
+        };
+        assert_eq!(view.label(), "↻ retry · auth refresh");
+    }
+
+    /// C-180: the closing summary splits wall clock into total and model wait.
+    #[test]
+    fn the_turn_summary_splits_total_time_from_model_wait() {
+        let mut state = ChatState::new("mock".into());
+        state.steps = 4;
+        state.last_elapsed = Some(Duration::from_millis(18_100));
+        state.last_llm_wait = Some(Duration::from_millis(12_400));
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("4 steps"), "{content}");
+        assert!(content.contains("llm 12"), "{content}");
+    }
+
+    /// A turn that made no model call at all (a `/`-command) shows no `llm` segment — an
+    /// `llm 0s` would read as "the model answered instantly", which is not what happened.
+    #[test]
+    fn a_turn_without_a_model_call_shows_no_llm_segment() {
+        let mut state = ChatState::new("mock".into());
+        state.steps = 1;
+        state.last_elapsed = Some(Duration::from_millis(120));
+        state.last_llm_wait = None;
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("llm"));
+    }
+
+    /// The `model.call` observation's latency must survive the sink hop — the field the TUI used
+    /// to drop on the floor.
+    #[test]
+    fn the_sink_carries_model_call_latency_and_retries() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelSink { tx, action_id: 1 };
+        sink.observation(&flux_evidence::Observation::new(
+            "model.call",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "stage": "explore",
+                "round": 3,
+                "operations": 7,
+                "duration_us": 4_200_000u64,
+                "ttft_us": 900_000u64,
+                "retries": 2,
+                "usage": {},
+            }),
+        ));
+        match untag(rx.try_recv().unwrap()) {
+            UiEvent::CallUsage {
+                stage,
+                round,
+                timing,
+                ..
+            } => {
+                assert_eq!(stage, "explore");
+                assert_eq!(round, 3);
+                assert_eq!(timing.duration, Duration::from_micros(4_200_000));
+                assert_eq!(timing.ttft, Some(Duration::from_micros(900_000)));
+                assert_eq!(timing.retries, 2);
+            }
+            _ => panic!("expected a CallUsage event"),
+        }
+    }
+
+    /// C-181: a `model.retry` observation becomes a live footer signal.
+    #[test]
+    fn the_sink_turns_a_model_retry_observation_into_a_live_signal() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelSink { tx, action_id: 1 };
+        sink.observation(&flux_evidence::Observation::new(
+            "model.retry",
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "attempt": 2,
+                "max_attempts": 6,
+                "delay_ms": 4_000u64,
+                "reason": "http 429",
+            }),
+        ));
+        match untag(rx.try_recv().unwrap()) {
+            UiEvent::Retry {
+                attempt,
+                max_attempts,
+                delay,
+                reason,
+            } => {
+                assert_eq!((attempt, max_attempts), (2, 6));
+                assert_eq!(delay, Duration::from_secs(4));
+                assert_eq!(reason, "http 429");
+            }
+            _ => panic!("expected a Retry event"),
+        }
+    }
+
+    /// The per-turn model wait is the SUM of every round's call, not just the last one — the same
+    /// mistake `Usage::accumulate` made for cache accounting before C-139.
+    #[test]
+    fn model_wait_accumulates_across_every_round_of_the_turn() {
+        let mut state = ChatState::new("mock".into());
+        for round in 1..=3 {
+            let UiEvent::CallUsage { timing, stage, .. } =
+                model_call_event("explore", round, 1_000_000, 0)
+            else {
+                unreachable!()
+            };
+            state.begin_thinking();
+            state.end_thinking();
+            state.record_model_call(ModelCallBadge {
+                stage,
+                round,
+                timing,
+            });
+        }
+        assert_eq!(state.turn_llm_wait, Duration::from_secs(3));
+    }
+
+    /// A completed call clears any retry badge left standing — the last retry of a call has no
+    /// `Planning(false)` of its own to clear it (C-181).
+    #[test]
+    fn a_completed_call_clears_a_standing_retry_badge() {
+        let mut state = ChatState::new("mock".into());
+        state.retry = Some(RetryView {
+            attempt: 1,
+            max_attempts: 6,
+            delay: Duration::from_secs(1),
+            reason: "http 503".into(),
+        });
+        state.record_model_call(ModelCallBadge {
+            stage: "explore".into(),
+            round: 1,
+            timing: ModelCallTiming::default(),
+        });
+        assert!(state.retry.is_none());
+    }
+
+    // --- C-182: whole-plan approval discloses its ops ------------------------------------------
+
+    fn plan_request() -> flux_runtime::PlanApprovalRequest {
+        flux_runtime::PlanApprovalRequest {
+            summary: "medium · mutating".into(),
+            ops: vec!["read".into(), "edit".into(), "process.exec".into()],
+            destructive: false,
+            mutating: true,
+            intents: flux_spec::IntentSet {
+                intents: vec![flux_spec::Intent {
+                    behavior: flux_spec::IntentBehavior::CommandExecution,
+                    target: flux_spec::IntentTarget::Process {
+                        command: "cargo test --workspace".into(),
+                    },
+                    role: flux_spec::IntentRole::ProcessCommand,
+                    certainty: flux_spec::IntentCertainty::Certain,
+                }],
+            },
+            requirements: vec![
+                flux_runtime::AuthorityRequirement::operation("invoke", "read"),
+                flux_runtime::AuthorityRequirement::workspace_write("src/lib.rs"),
+            ],
+        }
+    }
+
+    /// C-182 failing first: the sheet names the ops and the concrete targets. Pre-fix the TUI never
+    /// implemented `request_plan`, so the default collapsed everything to `3 op(s) · medium`.
+    #[test]
+    fn the_plan_approval_sheet_lists_its_ops_and_targets() {
+        let mut state = ChatState::new("mock".into());
+        state.approval = Some(ApprovalView {
+            request: controller::ApprovalRequest {
+                tool: "run plan".into(),
+                subjects: controller::plan_detail_lines(&plan_request()),
+                summary: Some("medium · mutating".into()),
+                destructive: false,
+            },
+            scroll: 0,
+            reason: None,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("run plan"), "{content}");
+        assert!(content.contains("medium"), "{content}");
+        assert!(
+            content.contains("read, edit, process.exec"),
+            "the op names must be visible: {content}"
+        );
+        assert!(content.contains("src/lib.rs"), "{content}");
+        assert!(content.contains("cargo test --workspace"), "{content}");
+    }
+
+    /// C-182: the approver must handle whole-plan approval ITSELF. Without an override the trait
+    /// default fires, which asks `request("run plan", ["3 op(s) · medium · mutating"])` — a count
+    /// with no names. This pins that the plan path is the one taken.
+    #[tokio::test]
+    async fn the_approver_raises_a_plan_request_with_its_ops_not_a_bare_count() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = ChannelApprover { tx };
+        let plan = plan_request();
+        let raised = tokio::spawn(async move { approver.request_plan(&plan).await });
+
+        let UiEvent::Approval { request, reply } = rx.recv().await.expect("approval raised") else {
+            panic!("expected an Approval event");
+        };
+        assert_eq!(request.tool, "run plan");
+        assert_eq!(request.summary.as_deref(), Some("medium · mutating"));
+        assert!(!request.destructive);
+        assert!(
+            request.subjects.iter().any(|s| s.contains("process.exec")),
+            "the ops must reach the sheet, not just their count: {:?}",
+            request.subjects
+        );
+        assert!(
+            !request.subjects.iter().any(|s| s.contains("op(s)")),
+            "the default `N op(s)` collapse must be gone: {:?}",
+            request.subjects
+        );
+
+        let _ = reply.send(ApprovalChoice::Allow);
+        assert!(matches!(raised.await.unwrap(), ApprovalChoice::Allow));
+    }
+
+    /// Operation-kind requirements only restate the ops line, and `*` targets say nothing — both
+    /// are dropped so the list is all signal.
+    #[test]
+    fn plan_detail_lines_skip_operation_and_wildcard_requirements() {
+        let lines = controller::plan_detail_lines(&plan_request());
+        assert_eq!(lines[0], "ops: read, edit, process.exec");
+        assert!(
+            !lines.iter().any(|l| l.contains("invoke →")),
+            "operation-kind requirements duplicate the ops line: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l == "workspace.write → src/lib.rs"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "process.exec → $ cargo test --workspace"));
+    }
+
+    /// A destructive plan says so on its own row, above the scrollable detail list so it can never
+    /// be scrolled out of view.
+    #[test]
+    fn a_destructive_plan_warns_on_its_own_row() {
+        let mut state = ChatState::new("mock".into());
+        let mut plan = plan_request();
+        plan.destructive = true;
+        plan.summary = "destructive · contains a destructive operation".into();
+        state.approval = Some(ApprovalView {
+            request: controller::ApprovalRequest {
+                tool: "run plan".into(),
+                subjects: controller::plan_detail_lines(&plan),
+                summary: Some(plan.summary.clone()),
+                destructive: true,
+            },
+            scroll: 20, // scrolled past the detail list
+            reason: None,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(
+            content.contains("destructive operation"),
+            "the warning must survive scrolling: {content}"
+        );
+    }
+
     /// C-115: a pending `edit` approval embeds its hunk diff in the sheet — headers, gutter
     /// numbers, and a `… more` marker when the preview window overflows.
     #[test]
@@ -4983,8 +5554,7 @@ mod tests {
             serde_json::json!({"path": "src/a.rs", "old_string": old, "new_string": new}),
         )));
         state.approval = Some(ApprovalView {
-            tool: "edit".into(),
-            subjects: vec!["src/a.rs".into()],
+            request: op_request("edit", ["src/a.rs"]),
             scroll: 0,
             reason: None,
         });
@@ -5002,8 +5572,7 @@ mod tests {
             serde_json::json!({"command": "ls"}),
         )));
         plain.approval = Some(ApprovalView {
-            tool: "bash".into(),
-            subjects: vec!["ls".into()],
+            request: op_request("bash", ["ls"]),
             scroll: 0,
             reason: None,
         });

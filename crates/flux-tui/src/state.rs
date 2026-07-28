@@ -44,6 +44,18 @@ pub struct ChatState {
     pub(super) cost_unpriced: bool,
     pub(super) steps: usize,
     pub(super) last_elapsed: Option<Duration>,
+    /// When the in-flight model call started (`Planning(true)`), so the footer can show the wait the
+    /// user is currently in rather than only the turn total (C-180). `None` between calls.
+    pub(super) model_call_start: Option<Instant>,
+    /// Model wait accumulated across the turn in progress, summed from each `model.call`'s own
+    /// duration — the split that tells a slow model apart from a slow op.
+    pub(super) turn_llm_wait: Duration,
+    /// The finished turn's model wait, rendered beside `last_elapsed`. `None` for a turn that made
+    /// no model call at all (a `/`-command, a resumed transcript).
+    pub(super) last_llm_wait: Option<Duration>,
+    /// A provider retry announced but not yet resolved (C-181) — takes over the footer's model
+    /// timer while it stands, because a backoff is the one wait that is not the model's fault.
+    pub(super) retry: Option<RetryView>,
     pub(super) history: Vec<String>,
     pub(super) history_pos: Option<usize>,
     pub(super) history_draft: String,
@@ -121,6 +133,43 @@ impl RoundUsage {
             total => self.usage.cache_read_input_tokens as f64 / total as f64,
         }
     }
+}
+
+/// A pending provider retry, as the footer renders it (C-181).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RetryView {
+    pub(super) attempt: u32,
+    /// The connect loop's retry budget; `0` for the budget-free recoveries (OAuth refresh,
+    /// transport fallback), which render without an `N/M` counter.
+    pub(super) max_attempts: u32,
+    pub(super) delay: Duration,
+    /// Short reason label (`http 429`, `transport`, `auth refresh`, `transport fallback`).
+    pub(super) reason: String,
+}
+
+impl RetryView {
+    /// The footer text: `↻ retry 2/6 · http 429 · 4s`. The `N/M` counter and the delay are each
+    /// dropped when they carry no information (a budget-free recovery, an immediate retry), so the
+    /// line never claims precision the event doesn't have.
+    pub(super) fn label(&self) -> String {
+        let mut out = String::from("↻ retry");
+        if self.max_attempts > 0 {
+            out.push_str(&format!(" {}/{}", self.attempt, self.max_attempts));
+        }
+        out.push_str(&format!(" · {}", self.reason));
+        if !self.delay.is_zero() {
+            out.push_str(&format!(" · waiting {}", crate::fmt_elapsed(self.delay)));
+        }
+        out
+    }
+}
+
+/// The latency badge attached to one sealed thinking entry (C-180).
+#[derive(Debug, Clone)]
+pub(super) struct ModelCallBadge {
+    pub(super) stage: String,
+    pub(super) round: usize,
+    pub(super) timing: ModelCallTiming,
 }
 
 /// What the agent is doing — drives the status line.

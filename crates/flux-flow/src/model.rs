@@ -4,10 +4,19 @@
 //! operation schemas and returns stage-owned values; authored Flux controls the outer loop.
 
 use futures::StreamExt;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use serde_json::json;
+
 use flux_core::{Chunk, ContentBlock, Result, StopReason, Usage};
-use flux_provider::{Effort, Provider, Request};
+use flux_provider::{
+    with_retry_observer, Effort, Provider, Request, RetryEvent, RetryObserver, RetryReason,
+};
+
+use crate::loop_host::{PlanningGuard, SharedSink};
+use crate::AgentSink;
 
 /// Provider policy shared by the built-in adaptive stages.
 #[derive(Debug, Clone)]
@@ -37,6 +46,102 @@ pub(crate) struct ModelCallMetrics {
     pub message_bytes: usize,
     pub operations: usize,
     pub schema_bytes: usize,
+    /// Backed-off connect retries this call spent (C-181). Counted at the provider seam, so it is
+    /// populated on the failure path too — where no stream ever exists to carry it.
+    pub retries: u32,
+    /// Forced OAuth token refreshes (at most one per call).
+    pub oauth_refreshes: u32,
+    /// Alternative-transport → HTTP fallbacks (at most one per call).
+    pub transport_fallbacks: u32,
+}
+
+/// The blocks/text/stop-reason/diagnostic tuple one consumed provider stream yields.
+type StreamedCall = (
+    Vec<ContentBlock>,
+    String,
+    Option<StopReason>,
+    Option<(u32, String)>,
+);
+
+/// Counts connect-phase recoveries for one model call and reports each to the live surface as a
+/// `model.retry` observation (C-181).
+///
+/// The observation carries only the reason's short label — never the underlying transport error
+/// string, which can embed an endpoint URL and has no business flowing into evidence. The count
+/// rides the call's `model.call` observation instead, which is where durable attribution belongs.
+struct RetryReporter {
+    sink: Arc<Mutex<dyn AgentSink>>,
+    retries: AtomicU32,
+    oauth_refreshes: AtomicU32,
+    transport_fallbacks: AtomicU32,
+}
+
+impl RetryReporter {
+    fn new(sink: Arc<Mutex<dyn AgentSink>>) -> Arc<Self> {
+        Arc::new(Self {
+            sink,
+            retries: AtomicU32::new(0),
+            oauth_refreshes: AtomicU32::new(0),
+            transport_fallbacks: AtomicU32::new(0),
+        })
+    }
+
+    /// Fold the tallies onto the call's metrics.
+    fn apply(&self, metrics: &mut ModelCallMetrics) {
+        metrics.retries = self.retries.load(Ordering::Relaxed);
+        metrics.oauth_refreshes = self.oauth_refreshes.load(Ordering::Relaxed);
+        metrics.transport_fallbacks = self.transport_fallbacks.load(Ordering::Relaxed);
+    }
+}
+
+impl RetryObserver for RetryReporter {
+    fn retrying(&self, event: &RetryEvent) {
+        let counter = match event.reason {
+            RetryReason::OauthRefresh => &self.oauth_refreshes,
+            RetryReason::TransportFallback(_) => &self.transport_fallbacks,
+            RetryReason::Status(_) | RetryReason::Transport(_) => &self.retries,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+
+        let observation = flux_evidence::Observation::new(
+            "model.retry",
+            flux_evidence::Phase::Turn,
+            json!({
+                "provider": event.provider,
+                "model": event.model,
+                "attempt": event.attempt,
+                "max_attempts": event.max_attempts,
+                "delay_ms": event.delay.as_millis().min(u64::MAX as u128) as u64,
+                "reason": event.reason.label(),
+            }),
+        );
+        SharedSink::new(self.sink.clone()).observation(&observation);
+    }
+}
+
+/// Run one model-stage consultation: bracket it as a planning phase for the surface, install the
+/// retry reporter, stream the provider, and fold the recovery counts onto the metrics.
+///
+/// The [`PlanningGuard`] drops before this returns, so a caller's `model.call` observation is
+/// always emitted *after* the surface has sealed the planning phase — the ordering the TUI's
+/// per-call badge depends on (C-180).
+pub(crate) async fn consult_model(
+    provider: &dyn Provider,
+    sink: Arc<Mutex<dyn AgentSink>>,
+    request: Request,
+) -> (Result<StreamedCall>, Usage, ModelCallMetrics) {
+    let reporter = RetryReporter::new(sink.clone());
+    let (streamed, usage, mut metrics) = {
+        let _planning = PlanningGuard::start(sink.clone());
+        let mut thinking = SharedSink::new(sink.clone());
+        with_retry_observer(
+            reporter.clone(),
+            stream_blocks(provider, request, Some(&mut thinking)),
+        )
+        .await
+    };
+    reporter.apply(&mut metrics);
+    (streamed, usage, metrics)
 }
 
 /// Consume one provider stream without assigning execution semantics to its content.
@@ -49,16 +154,7 @@ pub(crate) async fn stream_blocks<'a, 'b>(
     provider: &dyn Provider,
     request: Request,
     mut thinking_sink: Option<&'a mut (dyn crate::AgentSink + 'b)>,
-) -> (
-    Result<(
-        Vec<ContentBlock>,
-        String,
-        Option<StopReason>,
-        Option<(u32, String)>,
-    )>,
-    Usage,
-    ModelCallMetrics,
-) {
+) -> (Result<StreamedCall>, Usage, ModelCallMetrics) {
     let started = Instant::now();
     let mut usage = Usage::default();
     let mut metrics = ModelCallMetrics {

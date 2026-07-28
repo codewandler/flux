@@ -87,7 +87,8 @@ pub fn render(data: &Value, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 /// Color a risk summary like the CLI's `risk_badge`: low/no-op green, medium yellow, else red.
-fn risk_style(summary: &str, theme: &Theme) -> Style {
+/// Shared with the approval sheet's plan badge (C-182) so the two can't drift.
+pub(crate) fn risk_style(summary: &str, theme: &Theme) -> Style {
     match summary.split([' ', '·']).next().unwrap_or("").trim() {
         "low" | "no-op" => theme.ok_style(),
         "medium" => theme.warn_style(),

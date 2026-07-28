@@ -27,6 +27,9 @@ pub use realtime::{
 pub mod static_providers;
 pub use static_providers::{NullProvider, StaticProvider};
 
+pub mod retry;
+pub use retry::{report_retry, with_retry_observer, RetryEvent, RetryObserver, RetryReason};
+
 /// A boxed, sendable stream of response chunks.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Chunk>> + Send>>;
 
@@ -395,6 +398,26 @@ impl NativeProvider {
         self
     }
 
+    /// Report one connect-phase recovery to the [`RetryObserver`] scoped around this call, if any
+    /// (C-181). A no-op when nothing is installed.
+    fn report_retry(
+        &self,
+        model: &str,
+        attempt: u32,
+        max_attempts: u32,
+        delay: Duration,
+        reason: RetryReason,
+    ) {
+        retry::report_retry(RetryEvent {
+            provider: self.name.clone(),
+            model: model.to_string(),
+            attempt,
+            max_attempts,
+            delay,
+            reason,
+        });
+    }
+
     /// Override the client used by the generic HTTP path.
     ///
     /// Embedders may use this to install their own proxy, TLS, DNS, and timeout policy. It also
@@ -756,6 +779,16 @@ impl Provider for NativeProvider {
                         trace.transport_fallback = true;
                     }
                     tracing::warn!(error = %e, "stream transport failed; falling back to HTTP");
+                    // C-181: the fallback costs a full extra connect leg, so report it on the same
+                    // seam the backoff retries use — a surface otherwise sees only the total.
+                    retry::report_retry(RetryEvent {
+                        provider: self.name.clone(),
+                        model: req.model.clone(),
+                        attempt: 1,
+                        max_attempts: 0,
+                        delay: Duration::ZERO,
+                        reason: RetryReason::TransportFallback(e.to_string()),
+                    });
                     // C-19: the warning above is invisible from the CLI (no tracing subscriber
                     // is installed), so a broken WS leg would silently complete over HTTP. With
                     // FLUX_TRANSPORT_DEBUG=1 the fallback also emits a stable stderr marker the
@@ -802,6 +835,13 @@ impl Provider for NativeProvider {
                             if let Some(trace) = model_trace.as_mut() {
                                 trace.oauth_refreshes += 1;
                             }
+                            self.report_retry(
+                                &req.model,
+                                attempt + 1,
+                                0,
+                                Duration::ZERO,
+                                RetryReason::OauthRefresh,
+                            );
                             ts.refresh().await?;
                             forced_refresh = true;
                             continue;
@@ -814,6 +854,15 @@ impl Provider for NativeProvider {
                             attempt,
                             delay_ms = delay.as_millis() as u64,
                             "retrying after retryable status"
+                        );
+                        // Reported BEFORE the sleep: a surface has to learn about the wait while it
+                        // is still ahead of the user, not once it is already spent (C-181).
+                        self.report_retry(
+                            &req.model,
+                            attempt + 1,
+                            self.max_retries,
+                            delay,
+                            RetryReason::Status(status.as_u16()),
                         );
                         tokio::time::sleep(delay).await;
                         attempt += 1;
@@ -833,6 +882,13 @@ impl Provider for NativeProvider {
                             attempt,
                             delay_ms = delay.as_millis() as u64,
                             "retrying after transport error"
+                        );
+                        self.report_retry(
+                            &req.model,
+                            attempt + 1,
+                            self.max_retries,
+                            delay,
+                            RetryReason::Transport(e.to_string()),
                         );
                         tokio::time::sleep(delay).await;
                         attempt += 1;
@@ -1081,6 +1137,172 @@ mod tests {
             Err(e) => panic!("expected an Api error, got {e}"),
         };
         assert_eq!(status, 503);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
+        handle.abort();
+    }
+
+    /// Records every [`RetryEvent`] it is handed, with the elapsed time since it was built — so a
+    /// test can prove an event was reported *before* the backoff it announces, not after.
+    struct RetryRecorder {
+        started: Instant,
+        seen: std::sync::Mutex<Vec<(RetryEvent, Duration)>>,
+    }
+
+    impl RetryRecorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: Instant::now(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn events(&self) -> Vec<(RetryEvent, Duration)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl RetryObserver for RetryRecorder {
+        fn retrying(&self, event: &RetryEvent) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((event.clone(), self.started.elapsed()));
+        }
+    }
+
+    /// C-181: a retryable status reports one event per retry to the scoped observer, carrying the
+    /// status, the 1-based attempt, the budget, and the delay that is about to be slept. Pre-fix the
+    /// connect loop only `tracing::warn!`d and the recorder stayed empty.
+    #[tokio::test]
+    async fn retryable_status_reports_each_retry_to_the_scoped_observer() {
+        let (url, handle, _) = flaky_server(2).await;
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_max_retries(3);
+        let recorder = RetryRecorder::new();
+        let res =
+            with_retry_observer(recorder.clone(), provider.stream(Request::new("m", "hi"))).await;
+        assert!(res.is_ok(), "should recover after transient 503s");
+
+        let events: Vec<RetryEvent> = recorder.events().into_iter().map(|(e, _)| e).collect();
+        assert_eq!(events.len(), 2, "one event per retried attempt: {events:?}");
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.reason, RetryReason::Status(503));
+            assert_eq!(event.provider, "test");
+            assert_eq!(event.model, "m");
+            assert_eq!(event.attempt, index as u32 + 1, "attempts are 1-based");
+            assert_eq!(event.max_attempts, 3);
+            assert!(
+                event.delay >= backoff_delay(index as u32),
+                "the announced delay is the backoff about to be slept"
+            );
+        }
+        handle.abort();
+    }
+
+    /// The event must arrive BEFORE its sleep — reporting it afterwards would tell a surface about
+    /// a wait the user has already sat through, which is the entire failure this seam fixes.
+    #[tokio::test]
+    async fn a_retry_event_precedes_the_backoff_it_announces() {
+        let (url, handle, _) = flaky_server(1).await;
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_max_retries(2);
+        let recorder = RetryRecorder::new();
+        let started = Instant::now();
+        let res =
+            with_retry_observer(recorder.clone(), provider.stream(Request::new("m", "hi"))).await;
+        assert!(res.is_ok());
+        let total = started.elapsed();
+
+        let (event, at) = recorder.events().into_iter().next().expect("one event");
+        assert!(
+            event.delay >= Duration::from_millis(500),
+            "the first backoff is at least 500ms, got {:?}",
+            event.delay
+        );
+        assert!(
+            at + event.delay <= total,
+            "the event landed at {at:?} and announced a {:?} wait, but the whole call took only \
+             {total:?} — the report must precede the sleep",
+            event.delay
+        );
+        handle.abort();
+    }
+
+    /// A forced OAuth refresh is a recovery the user pays for too, and it is budget-free (it
+    /// happens at most once) — so it reports with `max_attempts: 0` and no delay.
+    #[tokio::test]
+    async fn a_forced_oauth_refresh_is_reported_on_the_retry_seam() {
+        let (url, handle, _, _) = auth_gated_server().await;
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(OAuthTestCred {
+                endpoint: url,
+                ts: Arc::new(FlipToken::new()),
+            }),
+        );
+        let recorder = RetryRecorder::new();
+        let res =
+            with_retry_observer(recorder.clone(), provider.stream(Request::new("m", "hi"))).await;
+        assert!(res.is_ok());
+
+        let events: Vec<RetryEvent> = recorder.events().into_iter().map(|(e, _)| e).collect();
+        assert_eq!(events.len(), 1, "exactly one refresh: {events:?}");
+        assert_eq!(events[0].reason, RetryReason::OauthRefresh);
+        assert_eq!(events[0].delay, Duration::ZERO);
+        assert_eq!(events[0].max_attempts, 0, "the refresh is budget-free");
+        assert!(!events[0].reason.counts_against_budget());
+        handle.abort();
+    }
+
+    /// The C-07 transport→HTTP fallback costs a whole extra connect leg. It rides the same seam so
+    /// a surface can show it instead of silently absorbing the latency (the C-19 stderr marker is a
+    /// developer flag, not a surface).
+    #[tokio::test]
+    async fn a_transport_fallback_is_reported_on_the_retry_seam() {
+        let (url, handle, _) = flaky_server(0).await;
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_transport(Arc::new(FakeTransport {
+            connects: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+        }));
+        let recorder = RetryRecorder::new();
+        let res =
+            with_retry_observer(recorder.clone(), provider.stream(Request::new("m", "hi"))).await;
+        assert!(res.is_ok(), "the turn completes over the HTTP fallback");
+
+        let events: Vec<RetryEvent> = recorder.events().into_iter().map(|(e, _)| e).collect();
+        assert_eq!(events.len(), 1, "one fallback event: {events:?}");
+        assert!(matches!(
+            events[0].reason,
+            RetryReason::TransportFallback(ref detail) if detail.contains("handshake refused")
+        ));
+        handle.abort();
+    }
+
+    /// The seam is opt-in: with no observer installed the connect loop behaves exactly as before,
+    /// including on the give-up path.
+    #[tokio::test]
+    async fn retries_without_an_observer_are_unaffected() {
+        let (url, handle, count) = flaky_server(100).await;
+        let provider = NativeProvider::new(
+            "test",
+            Arc::new(NullCodec),
+            Arc::new(NullCred { endpoint: url }),
+        )
+        .with_max_retries(1);
+        assert!(provider.stream(Request::new("m", "hi")).await.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 2, "initial attempt + 1 retry");
         handle.abort();
     }
