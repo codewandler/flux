@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-28
+
 ### Changed
 
 - **C-142 (BREAKING for guest crates): the plugin wire contract is its own crate.** All 856 lines

@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-28
+
 ### Improved
 
 - **Plugins keep working across flux upgrades, and now say so when they don't.** The protocol a
