@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-98/C-99: `git_worktree_enter` / `git_worktree_leave` built-ins — context-local git
+  worktrees.** `enter` preflights a clean non-detached `main`, creates a generated
+  `flux/worktree/…` branch worktree under a private `/tmp/flux-worktree-*` directory, and
+  transitions only the calling agent context's guarded root into it. `leave` requires a clean
+  worktree and an unmoved clean `main`, proves mergeability with an aborted trial merge, merges
+  `--no-ff --no-edit`, removes the worktree and branch, and restores the context; merge failures
+  keep the agent in its worktree with `main` clean, and partial cleanup returns a retryable
+  "merged, cleanup required" state that never re-merges. Both ops are Git-group,
+  `Risk::High`/non-idempotent, argv-only through the guarded `System`.
+
+### Changed
+
+- **C-97: the guarded system is now context-local and swappable (breaking for embedders).**
+  `ToolContext`'s public `system` field is replaced by a `system()` accessor over a per-context
+  `WorkspaceContext` (active `Arc<System>` + optional worktree session state); `flux-system` gains
+  posture-preserving `Workspace::with_root` / `System::rerooted` derives and fail-closed
+  `allocate_worktree_dir`/`remove_worktree_dir` helpers. A worktree transition never touches
+  process-global cwd, and the sandbox's writable set follows the re-rooted workspace
+  automatically.
+- **C-100: per-turn op surfacing and sub-agent spawns follow the active root.** Evidence-gated
+  group surfacing probes the context's active root each turn (assembly-time config/skills/roles
+  stay fixed by design); `SpawnRequest` carries the parent's active-system snapshot so children
+  inherit the transitioned root with an independent workspace context (fixing the latent
+  child-`cwd = "."` probe bug), and nested spawners re-base on the child's snapshot.
+
 ## [0.27.0] - 2026-07-28
 
 ### Fixed
