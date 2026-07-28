@@ -17,6 +17,14 @@
 
 ### New
 
+- **Integration plugins that drive a CLI can no longer run more of it than they need.** A plugin's
+  permission to run a program is now spelled out down to the subcommand — the Kubernetes
+  integration, for example, is allowed `kubectl get`, `kubectl logs`, or `kubectl scale`, but
+  `kubectl delete` simply does not exist for it, no matter what the cluster credentials would
+  permit. Each individual operation is further limited to exactly the commands it needs, approval
+  prompts show that narrowed permission (so you approve `kubectl get`, not all of kubectl), and
+  the AWS integration is now structurally read-only. Existing plugins keep working unchanged.
+
 - **The agent can now do risky work in an isolated git worktree — and merge it back when it's
   done.** Ask the agent to enter a worktree and it moves itself (and only itself — other agents
   and your own shell are untouched) into a temporary copy of your repository on a scratch branch.

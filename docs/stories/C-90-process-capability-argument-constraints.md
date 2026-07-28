@@ -2,7 +2,7 @@
 id: C-90
 title: Constrain plugin process capabilities by argument, not just program
 pillar: Core
-status: ready
+status: done
 priority: 1
 design: docs/designs/integration-plugins.md
 note: the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced

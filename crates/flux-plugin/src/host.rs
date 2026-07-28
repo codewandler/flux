@@ -701,11 +701,13 @@ impl HostCapabilities for SystemHostCaps {
                 if argv.is_empty() {
                     return Err("process.run: `argv` (non-empty array) required".into());
                 }
-                // The plugin may only run programs it declared in its manifest's capabilities.
-                if !self.grants.process.iter().any(|p| p == &argv[0]) {
+                // The plugin may only run argv shapes it declared in its manifest's capabilities:
+                // each grant entry is an argv prefix (program + optional pinned leading
+                // subcommand tokens, C-90), so `kubectl get` does not authorize `kubectl delete`.
+                if !crate::protocol::process_grant_allows(&self.grants.process, &argv) {
                     return Err(format!(
-                        "process.run: program `{}` not in this plugin's granted capabilities",
-                        argv[0]
+                        "process.run: `{}` does not match this plugin's granted process capabilities",
+                        argv.join(" ")
                     ));
                 }
                 let secs = payload
@@ -734,11 +736,11 @@ impl HostCapabilities for SystemHostCaps {
                 if argv.is_empty() {
                     return Err("process.spawn: `argv` (non-empty array) required".into());
                 }
-                // Same deny-by-default gate as `process.run`: only allow-listed `argv[0]` programs.
-                if !self.grants.process.iter().any(|p| p == &argv[0]) {
+                // Same deny-by-default argv-prefix gate as `process.run` (C-90).
+                if !crate::protocol::process_grant_allows(&self.grants.process, &argv) {
                     return Err(format!(
-                        "process.spawn: program `{}` not in this plugin's granted capabilities",
-                        argv[0]
+                        "process.spawn: `{}` does not match this plugin's granted process capabilities",
+                        argv.join(" ")
                     ));
                 }
                 // Optional caller env overrides (applied on top of the cleared+allow-listed env by
@@ -1873,6 +1875,53 @@ mod tests {
                 .is_err(),
             "secret not in the grant list must be denied"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-90: a multi-token grant pins the leading subcommand, so a read-shaped grant
+    /// (`kubectl get`) is structurally unable to run a mutation (`kubectl delete …`) — on both
+    /// the one-shot and the background spawn path.
+    #[tokio::test]
+    async fn process_grant_pins_leading_arguments() {
+        use flux_system::{System, Workspace};
+        let dir = std::env::temp_dir().join(format!("flux-argcaps-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sys = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        let caps = SystemHostCaps::new(sys.clone()).with_grants(PluginCapabilities {
+            process: vec!["kubectl get".into(), "printf ok".into()],
+            ..Default::default()
+        });
+        assert!(
+            caps.handle(
+                "process.run",
+                &json!({"argv": ["kubectl", "delete", "pod", "x"]})
+            )
+            .await
+            .is_err(),
+            "a grant of `kubectl get` must deny `kubectl delete`"
+        );
+        assert!(
+            caps.handle("process.run", &json!({"argv": ["kubectl"]}))
+                .await
+                .is_err(),
+            "argv shorter than every grant prefix must be denied"
+        );
+        assert!(
+            caps.handle(
+                "process.spawn",
+                &json!({"argv": ["kubectl", "delete", "pod", "x"]})
+            )
+            .await
+            .is_err(),
+            "process.spawn must apply the same argument gate"
+        );
+        // The allowed shape actually runs (printf is argv-executable on every CI runner).
+        let out = caps
+            .handle("process.run", &json!({"argv": ["printf", "ok"]}))
+            .await
+            .expect("a matching argv prefix must be admitted");
+        assert_eq!(out["exit_code"], 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

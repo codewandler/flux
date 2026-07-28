@@ -1346,6 +1346,7 @@ pub fn read_op(name: &str, description: &str, input_schema: Value) -> OperationS
         idempotency: Some(Idempotency::Idempotent),
         staging: StagingDisposition::Infer,
         secret_purposes: Vec::new(),
+        process: Vec::new(),
         group: None,
         internal: false,
         semantic_effects: Vec::new(),
@@ -1366,6 +1367,7 @@ pub fn write_op(name: &str, description: &str, input_schema: Value) -> Operation
         idempotency: Some(Idempotency::NonIdempotent),
         staging: StagingDisposition::Infer,
         secret_purposes: Vec::new(),
+        process: Vec::new(),
         group: None,
         internal: false,
         semantic_effects: Vec::new(),
@@ -1416,6 +1418,7 @@ pub fn internal_op(name: &str, description: &str, input_schema: Value) -> Operat
         idempotency: Some(Idempotency::Idempotent),
         staging: StagingDisposition::Infer,
         secret_purposes: Vec::new(),
+        process: Vec::new(),
         group: None,
         internal: true,
         semantic_effects: Vec::new(),
@@ -1439,6 +1442,17 @@ pub fn exposed_as(mut op: OperationSpec, public_name: &str) -> OperationSpec {
 /// Override an operation's risk classification.
 pub fn risked(mut op: OperationSpec, risk: Risk) -> OperationSpec {
     op.risk = Some(risk);
+    op
+}
+
+/// Declare an operation's per-op `process` narrowing (C-90): the argv **prefixes** this operation
+/// may pass to the host's `process.run`/`process.spawn` capability (e.g. `&["kubectl get"]`).
+/// Each prefix must sit inside the manifest-level `process` grant (manifest validation rejects it
+/// otherwise); the host enforces the narrowing at callback time and projects it as the op's
+/// `process.exec` authority, so a read op declared `kubectl get` both prompts as and is
+/// structurally unable to run anything else.
+pub fn with_process(mut op: OperationSpec, prefixes: &[&str]) -> OperationSpec {
+    op.process = prefixes.iter().map(|s| (*s).to_string()).collect();
     op
 }
 

@@ -276,3 +276,82 @@ async fn spawn_refuses_hash_drift() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// C-90 end-to-end: an op's per-operation `process` narrowing governs both what the approval
+/// layer is told (`process.exec` names the narrowed argv prefix) and what the callback gate
+/// actually admits — an argv inside the manifest-wide grant but outside the op's declaration is
+/// refused at the host boundary.
+#[tokio::test]
+async fn op_process_narrowing_gates_callbacks_and_names_authority() {
+    use flux_plugin::{load_plugin_tools, SystemHostCaps};
+
+    let exe = env!("CARGO_BIN_EXE_caps_plugin");
+    let system = test_system();
+    let desc = flux_plugin::PluginDescriptor {
+        program: exe.to_string(),
+        ..Default::default()
+    };
+    let sys = Arc::new(test_system());
+    let flux_plugin::LoadedPlugin { tools, host, .. } =
+        load_plugin_tools(&system, "caps", &desc, |manifest| {
+            Arc::new(SystemHostCaps::new(sys.clone()).with_grants(manifest.capabilities.clone()))
+        })
+        .await
+        .unwrap();
+    let runproc = tools
+        .iter()
+        .find(|t| t.spec().name == "caps.runproc")
+        .expect("runproc projects as a tool");
+
+    // The narrowed prefix IS the disclosed authority — not the manifest-wide `printf`.
+    let requirements = runproc
+        .authority_requirements(&json!({}), &["caps.runproc".to_string()])
+        .unwrap();
+    let process_resources: Vec<&str> = requirements
+        .iter()
+        .filter(|r| r.action.0 == "process.exec")
+        .map(|r| r.resource.id.as_str())
+        .collect();
+    assert_eq!(
+        process_resources,
+        vec!["printf ok"],
+        "authority must name the op's narrowed argv prefix"
+    );
+
+    let dir = std::env::temp_dir().join(format!("flux-opnarrow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = flux_runtime::ToolContext::new(Arc::new(flux_system::System::new(
+        flux_system::Workspace::new(&dir).unwrap(),
+    )));
+
+    // Inside the op narrowing: runs.
+    let ok = runproc
+        .execute(&ctx, json!({"argv": ["printf", "ok"]}))
+        .await
+        .unwrap();
+    assert!(!ok.is_error, "{}", ok.content);
+    assert!(ok.content.contains("\"exit_code\": 0"), "{}", ok.content);
+
+    // Inside the manifest grant (`printf …`) but outside the op's declaration: refused, naming
+    // the operation.
+    let denied = runproc
+        .execute(&ctx, json!({"argv": ["printf", "nope"]}))
+        .await
+        .unwrap();
+    assert!(denied.is_error, "{}", denied.content);
+    assert!(
+        denied.content.contains("declared process constraints"),
+        "{}",
+        denied.content
+    );
+
+    drop(tools);
+    Arc::try_unwrap(host)
+        .ok()
+        .expect("host is sole owner")
+        .into_inner()
+        .shutdown()
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

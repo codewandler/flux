@@ -248,7 +248,20 @@ struct PodExecInput {
 fn manifest_builder() -> PluginBuilder {
     PluginBuilder::new("kubernetes", env!("CARGO_PKG_VERSION"))
         .capabilities(Caps {
-            process: vec!["kubectl".into()],
+            // C-90: argv-prefix grants — exactly the kubectl verbs this plugin's handlers issue,
+            // so the manifest is structurally unable to `kubectl delete`/`apply`/`patch` even
+            // though the ambient kubeconfig would permit it. Each op additionally narrows to its
+            // own verbs below (`with_process`).
+            process: vec![
+                "kubectl get".into(),
+                "kubectl logs".into(),
+                "kubectl config view".into(),
+                "kubectl version".into(),
+                "kubectl exec".into(),
+                "kubectl scale".into(),
+                "kubectl rollout restart".into(),
+                "kubectl port-forward".into(),
+            ],
             ..Default::default()
         })
         // Discovery products (D-28): the host's fan-out broker routes a consumer's discovery query
@@ -269,17 +282,24 @@ fn manifest_builder() -> PluginBuilder {
         ))
         // --- cluster discovery -------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<ClusterListInput>("kubernetes.cluster.list", "List kubeconfig contexts."),
+                &["kubectl config view"],
+            ),
             cluster_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<ClusterTestInput>(
                 "kubernetes.test",
                 "Probe Kubernetes cluster reachability through kubeconfig.",
             ),
+                &["kubectl version"],
+            ),
             cluster_test,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<EndpointDiscoverInput>(
                 "kubernetes.endpoint.discover",
                 "Discover product endpoints as weak references (URL + credential location, never a \
@@ -294,10 +314,13 @@ fn manifest_builder() -> PluginBuilder {
                  target the newest namespace by creation time (a literal namespace named `latest` is \
                  just `namespace: \"latest\"`; the free-text `query` no longer triggers the heuristic).",
             ),
+                &["kubectl get", "kubectl config view"],
+            ),
             endpoint_discover,
         )
         // --- secrets (sensitive) ----------------------------------------------
         .operation_flexible(
+            with_process(
             op_spec_typed::<SecretReadInput>(
                 "kubernetes.secret.read",
                 "Read one Kubernetes secret's decoded values. Sensitive: the result is secret \
@@ -306,44 +329,65 @@ fn manifest_builder() -> PluginBuilder {
                 Risk::High,
                 Idempotency::Idempotent,
             ),
+                &["kubectl get"],
+            ),
             secret_read,
         )
         // --- inventory ---------------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryListInput>("kubernetes.namespace.list", "List Kubernetes namespaces."),
+                &["kubectl get"],
+            ),
             namespace_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.service.list",
                 "List Kubernetes services (all namespaces unless `namespace` is set).",
             ),
+                &["kubectl get"],
+            ),
             service_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryShowInput>("kubernetes.service.show", "Show one Kubernetes service."),
+                &["kubectl get"],
+            ),
             service_show,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.pod.list",
                 "List Kubernetes pods (all namespaces unless `namespace` is set).",
             ),
+                &["kubectl get"],
+            ),
             pod_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryShowInput>("kubernetes.pod.show", "Show one Kubernetes pod."),
+                &["kubectl get"],
+            ),
             pod_show,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<PodLogsInput>(
                 "kubernetes.pod.logs",
                 "Read bounded logs for one Kubernetes pod (by name) or label selector.",
+            ),
+                &["kubectl logs"],
             ),
             pod_logs,
         )
         // --- port-forward (held by the host's managed-process registry) --------
         .operation_flexible(
+            with_process(
             op_spec_typed::<PortForwardStartInput>(
                 "kubernetes.portforward.start",
                 "Start a managed Kubernetes port-forward for a service, pod, or deployment. The \
@@ -354,9 +398,12 @@ fn manifest_builder() -> PluginBuilder {
                 Risk::Medium,
                 Idempotency::NonIdempotent,
             ),
+                &["kubectl port-forward"],
+            ),
             portforward_start,
         )
         .operation_flexible(
+            with_process(
             op_spec_typed::<PortForwardStopInput>(
                 "kubernetes.portforward.stop",
                 "Stop a managed Kubernetes port-forward by ID (the `id` returned by \
@@ -365,37 +412,52 @@ fn manifest_builder() -> PluginBuilder {
                 Risk::Medium,
                 Idempotency::Idempotent,
             ),
+                &["kubectl port-forward"],
+            ),
             portforward_stop,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<PortForwardListInput>(
                 "kubernetes.portforward.list",
                 "List the managed Kubernetes port-forwards this plugin started, each probed for \
                  liveness, with local URL and target metadata. Filterable by namespace/context.",
             ),
+                &["kubectl port-forward"],
+            ),
             portforward_list,
         )
         // --- deployments -------------------------------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.deployment.list",
                 "List Kubernetes deployments (all namespaces unless `namespace` is set).",
             ),
+                &["kubectl get"],
+            ),
             deployment_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryShowInput>("kubernetes.deployment.show", "Show one Kubernetes deployment."),
+                &["kubectl get"],
+            ),
             deployment_show,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<DeploymentHistoryInput>(
                 "kubernetes.deployment.history",
                 "List a deployment's rollout revisions (ReplicaSets, newest first) with images, \
                  replica counts, and creation timestamps. `name` is the deployment.",
             ),
+                &["kubectl get"],
+            ),
             deployment_history,
         )
         .operation_flexible(
+            with_process(
             op_spec_typed::<DeploymentScaleInput>(
                 "kubernetes.deployment.scale",
                 "Scale a Kubernetes deployment to a desired replica count.",
@@ -403,9 +465,12 @@ fn manifest_builder() -> PluginBuilder {
                 Risk::High,
                 Idempotency::Idempotent,
             ),
+                &["kubectl scale", "kubectl get"],
+            ),
             deployment_scale,
         )
         .operation_flexible(
+            with_process(
             op_spec_typed::<DeploymentRestartInput>(
                 "kubernetes.deployment.restart",
                 "Rolling-restart a Kubernetes deployment (kubectl rollout restart).",
@@ -413,47 +478,65 @@ fn manifest_builder() -> PluginBuilder {
                 Risk::High,
                 Idempotency::NonIdempotent,
             ),
+                &["kubectl rollout restart"],
+            ),
             deployment_restart,
         )
         // --- ingresses / containers / nodes -----------------------------------
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.ingress.list",
                 "List Kubernetes ingresses (all namespaces unless `namespace` is set).",
             ),
+                &["kubectl get"],
+            ),
             ingress_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryListInput>(
                 "kubernetes.container.list",
                 "List Kubernetes containers derived from pods.",
             ),
+                &["kubectl get"],
+            ),
             container_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<InventoryShowInput>(
                 "kubernetes.container.show",
                 "Show one Kubernetes container (by name) derived from a pod.",
             ),
+                &["kubectl get"],
+            ),
             container_show,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<EventListInput>(
                 "kubernetes.event.list",
                 "List Kubernetes events (newest-first via the API), filterable by namespace, \
                  involved object name/kind, and Warning type.",
             ),
+                &["kubectl get"],
+            ),
             event_list,
         )
         .operation_flexible(
+            with_process(
             read_op_typed::<NodeListInput>(
                 "kubernetes.node.list",
                 "List Kubernetes nodes with readiness, roles, kubelet version, and capacity.",
+            ),
+                &["kubectl get"],
             ),
             node_list,
         )
         // --- exec (sensitive) --------------------------------------------------
         .operation_flexible(
+            with_process(
             op_spec_typed::<PodExecInput>(
                 "kubernetes.pod.exec",
                 "Run a one-shot command in a pod container and return bounded stdout/stderr with \
@@ -461,6 +544,8 @@ fn manifest_builder() -> PluginBuilder {
                 vec![Effect::Process, Effect::Network],
                 Risk::High,
                 Idempotency::NonIdempotent,
+            ),
+                &["kubectl exec"],
             ),
             pod_exec,
         )
@@ -497,6 +582,7 @@ fn op_spec_typed<T: JsonSchema + 'static>(
         staging: StagingDisposition::Infer,
         group: None,
         secret_purposes: Vec::new(),
+        process: Vec::new(),
         internal: false,
         semantic_effects: Vec::new(),
         redact_fields: Vec::new(),
@@ -3163,7 +3249,21 @@ mod tests {
     fn manifest_declares_ops_and_kubectl_capability() {
         let m = manifest_builder().build().manifest();
         assert_eq!(m.operations.iter().filter(|o| !o.internal).count(), 24);
-        assert_eq!(m.capabilities.process, vec!["kubectl".to_string()]);
+        // C-90: the manifest grants argv prefixes, not a blanket `kubectl` — mutation verbs are
+        // named explicitly and destructive verbs (`delete`, `apply`, `patch`) are simply absent.
+        assert_eq!(
+            m.capabilities.process,
+            vec![
+                "kubectl get".to_string(),
+                "kubectl logs".to_string(),
+                "kubectl config view".to_string(),
+                "kubectl version".to_string(),
+                "kubectl exec".to_string(),
+                "kubectl scale".to_string(),
+                "kubectl rollout restart".to_string(),
+                "kubectl port-forward".to_string(),
+            ]
+        );
         assert!(m
             .datasources
             .iter()
@@ -3173,6 +3273,59 @@ mod tests {
             .operations
             .iter()
             .any(|o| o.name == "kubernetes.cluster.list"));
+        // C-90: every op narrows to its own verbs — read ops carry only read-shaped verbs, and
+        // each mutation op names its verbs explicitly.
+        let read_verbs = [
+            "kubectl get",
+            "kubectl logs",
+            "kubectl config view",
+            "kubectl version",
+        ];
+        for op in m.operations.iter().filter(|o| !o.internal) {
+            assert!(
+                !op.process.is_empty(),
+                "{} must declare a per-op process narrowing",
+                op.name
+            );
+            // The portforward family narrows to `kubectl port-forward` regardless of shape:
+            // `list`/`stop` never run kubectl (they drive the host's managed-process registry,
+            // which is not argv-gated), so the narrowing is their disclosed ceiling, not a verb
+            // they exercise.
+            if op.name.starts_with("kubernetes.portforward.") {
+                assert_eq!(op.process, vec!["kubectl port-forward".to_string()]);
+                continue;
+            }
+            if op.effects.contains(&Effect::Read) && !op.effects.contains(&Effect::Write) {
+                for prefix in &op.process {
+                    assert!(
+                        read_verbs.contains(&prefix.as_str()),
+                        "read op {} must not carry mutation verb `{prefix}`",
+                        op.name
+                    );
+                }
+            }
+        }
+        let verbs = |name: &str| {
+            m.operations
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap()
+                .process
+                .clone()
+        };
+        assert_eq!(
+            verbs("kubernetes.deployment.scale"),
+            vec!["kubectl scale", "kubectl get"]
+        );
+        assert_eq!(
+            verbs("kubernetes.deployment.restart"),
+            vec!["kubectl rollout restart"]
+        );
+        assert_eq!(verbs("kubernetes.pod.exec"), vec!["kubectl exec"]);
+        assert_eq!(
+            verbs("kubernetes.portforward.start"),
+            vec!["kubectl port-forward"]
+        );
         assert!(m.operations.iter().any(|o| o.name == "kubernetes.pod.exec"));
         // secret.read is a high-risk read; pod.exec a high-risk process write
         let secret = m

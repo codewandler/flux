@@ -114,6 +114,16 @@ pub struct OperationSpec {
     /// Secret purposes (auth-method names) this op needs the host to resolve (e.g. `"api_token"`).
     #[serde(default)]
     pub secret_purposes: Vec<String>,
+    /// Per-operation narrowing of the manifest's `process` capability (C-90): the argv prefixes
+    /// (same grammar as [`PluginCapabilities::process`]) THIS op may use. Empty (the default, and
+    /// the wire form of every existing manifest) means the op is bounded by the manifest grant
+    /// alone. When set, the host enforces it at callback time *in addition to* the manifest gate —
+    /// the intersection applies, so a per-op entry can only ever narrow, never widen — and the
+    /// op's projected `process.exec` authority names these prefixes instead of the manifest-wide
+    /// ones, so a read op declared `["kubectl get"]` both prompts as and is structurally limited
+    /// to `kubectl get …`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process: Vec<String>,
     /// Optional evidence/catalog group this operation belongs to. Plugin-authored groups are declared
     /// on the manifest and merged into the runtime group list when the plugin loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +254,26 @@ pub fn validate_manifest_operations(manifest: &PluginManifest) -> std::result::R
                 "plugin `{}` operations `{previous}` and `{}` both project as `{public_name}`",
                 manifest.name, op.name
             ));
+        }
+
+        // A per-op `process` narrowing (C-90) must stay inside the manifest-level grant: the
+        // runtime double-gate already makes widening impossible, but rejecting the declaration at
+        // load time turns a dead op (every callback denied) into an authoring error.
+        for entry in &op.process {
+            let tokens: Vec<String> = entry.split_whitespace().map(String::from).collect();
+            if tokens.is_empty() {
+                return Err(format!(
+                    "plugin `{}` operation `{}` declares a blank process constraint",
+                    manifest.name, op.name
+                ));
+            }
+            if !process_grant_allows(&manifest.capabilities.process, &tokens) {
+                return Err(format!(
+                    "plugin `{}` operation `{}` declares process constraint `{entry}` outside the \
+                     manifest's `process` capability grant",
+                    manifest.name, op.name
+                ));
+            }
         }
     }
     Ok(())
@@ -460,7 +490,18 @@ pub struct ConfigSpec {
 /// var, or reach the network unless its manifest said so. Empty/false = that capability is denied.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginCapabilities {
-    /// Allowed `argv[0]` programs for `process.run` (matched exactly; empty = `process.run` denied).
+    /// Allowed argv **prefixes** for `process.run` / `process.spawn` (empty = both denied).
+    ///
+    /// Each entry is a whitespace-separated token sequence matched exactly, token by token,
+    /// against the leading tokens of the callback's argv (C-90). A single-token entry
+    /// (`"kubectl"`) grants the program with any arguments — the original wire form, so existing
+    /// manifests keep today's behavior. A multi-token entry (`"kubectl get"`,
+    /// `"kubectl rollout restart"`) additionally pins the leading subcommand tokens, making an
+    /// op's declared read-only-ness structurally enforced rather than advisory: a manifest
+    /// granting `"kubectl get"` cannot spawn `kubectl delete …`. No globs — the grant is an
+    /// auditable literal, and it projects verbatim as the `process.exec` authority resource the
+    /// approval prompt shows. Trailing flags are unconstrained (`kubectl get -o jsonpath` matches
+    /// `"kubectl get"`); the narrowing pins the verbs, which is where CLI semantics change.
     #[serde(default)]
     pub process: Vec<String>,
     /// Allowed env-var keys for the `secret` capability (empty = `secret` denied).
@@ -505,6 +546,25 @@ pub struct PluginCapabilities {
     /// output. Empty = `fs.read` denied (the default).
     #[serde(default)]
     pub fs: Vec<FsReadScope>,
+}
+
+/// Whether `argv` is admitted by any of the `process` capability's argv-prefix `grants` (C-90).
+///
+/// An entry admits a call when its whitespace-separated tokens equal the call's leading argv
+/// tokens exactly — `"kubectl"` admits any `kubectl …`; `"kubectl get"` admits `kubectl get pods`
+/// but not `kubectl delete pod x`. Deny-by-default: an empty grant list (or empty argv) admits
+/// nothing. Both the manifest-level gate in `SystemHostCaps` and the per-operation narrowing
+/// wrapper use this one matcher so the two levels can never disagree on the grammar.
+pub fn process_grant_allows(grants: &[String], argv: &[String]) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+    grants.iter().any(|entry| {
+        let tokens: Vec<&str> = entry.split_whitespace().collect();
+        !tokens.is_empty()
+            && tokens.len() <= argv.len()
+            && tokens.iter().zip(argv.iter()).all(|(t, a)| *t == a)
+    })
 }
 
 /// One path scope the host may read on a plugin's behalf via the `fs.read` capability (C-09a).
@@ -718,5 +778,79 @@ pub(crate) fn serve_io<R: std::io::BufRead, W: std::io::Write, D: std::io::Write
             other => Frame::err_response(&req.id, format!("unknown command: {other}")),
         };
         write_line(&mut writer, &resp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// C-90: the argv-prefix grammar — single-token entries keep today's program-only behavior,
+    /// multi-token entries pin the leading subcommand tokens, and matching is exact (no globs).
+    #[test]
+    fn process_grant_prefix_matching() {
+        let grants = vec!["kubectl get".to_string(), "printf".to_string()];
+        assert!(process_grant_allows(
+            &grants,
+            &argv(&["kubectl", "get", "pods"])
+        ));
+        assert!(process_grant_allows(
+            &grants,
+            &argv(&["kubectl", "get", "-o", "jsonpath"])
+        ));
+        assert!(
+            process_grant_allows(&grants, &argv(&["printf", "anything", "at all"])),
+            "a single-token entry grants the program with any arguments"
+        );
+        assert!(
+            !process_grant_allows(&grants, &argv(&["kubectl", "delete", "pod", "x"])),
+            "a pinned subcommand must not admit a different one"
+        );
+        assert!(
+            !process_grant_allows(&grants, &argv(&["kubectl"])),
+            "argv shorter than the grant prefix is not admitted"
+        );
+        assert!(
+            !process_grant_allows(&grants, &argv(&["kubectl2", "get"])),
+            "tokens match exactly, not by prefix of the token itself"
+        );
+        assert!(!process_grant_allows(&grants, &[]));
+        assert!(!process_grant_allows(&[], &argv(&["kubectl", "get"])));
+    }
+
+    /// C-90: a per-op `process` narrowing outside the manifest grant is a load-time authoring
+    /// error, not a dead op discovered at callback time.
+    #[test]
+    fn manifest_validation_rejects_out_of_grant_op_process() {
+        let mut manifest = PluginManifest {
+            name: "k".into(),
+            capabilities: PluginCapabilities {
+                process: vec!["kubectl get".into()],
+                ..Default::default()
+            },
+            operations: vec![OperationSpec {
+                name: "k.pods.list".into(),
+                process: vec!["kubectl get".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(validate_manifest_operations(&manifest).is_ok());
+
+        manifest.operations[0].process = vec!["kubectl delete".into()];
+        let err = validate_manifest_operations(&manifest).unwrap_err();
+        assert!(err.contains("kubectl delete"), "{err}");
+
+        // Broader than the manifest grant is also outside it.
+        manifest.operations[0].process = vec!["kubectl".into()];
+        assert!(validate_manifest_operations(&manifest).is_err());
+
+        manifest.operations[0].process = vec!["  ".into()];
+        let err = validate_manifest_operations(&manifest).unwrap_err();
+        assert!(err.contains("blank process constraint"), "{err}");
     }
 }
