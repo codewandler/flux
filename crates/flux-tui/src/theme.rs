@@ -1,10 +1,10 @@
 //! The TUI color theme: named semantic roles as ratatui [`Color`]s, plus the ANSI palette the
 //! plan-tree renderer paints with (its output is converted to ratatui `Text` via `ansi-to-tui`).
 //!
-//! Themes are values passed into rendering, so call sites never branch: `dark` (ANSI) with a
-//! truecolor variant, `light` for light terminals, and `mono` for `NO_COLOR` — selected via
-//! [`Theme::by_name`] and the `/theme` command (C-104). Roles mirror `flux-cli`'s `style.rs` so
-//! the CLI and TUI read as the same product.
+//! Themes are values passed into rendering, so call sites never branch: `dark`, `light`,
+//! `dracula`, `nord`, and `high-contrast` each with an ANSI and a truecolor tuning, plus `mono`
+//! for `NO_COLOR` — selected via [`Theme::by_name`] and the `/theme` command (C-104). Roles
+//! mirror `flux-cli`'s `style.rs` so the CLI and TUI read as the same product.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -133,18 +133,129 @@ impl Theme {
         base_bg: Color::Reset,
     };
 
+    /// Dracula (ANSI). Its background is a distinctive dark purple-navy, not "whatever the
+    /// terminal is set to" — `base_bg` is painted (256-color approximation) so the theme reads
+    /// the same everywhere, the same reasoning [`Theme::LIGHT`] uses.
+    pub const DRACULA: Theme = Theme {
+        user: Color::LightMagenta,
+        assistant: Color::White,
+        tool: Color::Cyan,
+        ok: Color::Green,
+        err: Color::LightRed,
+        warn: Color::LightYellow,
+        muted: Color::Indexed(61),
+        accent: Color::Magenta,
+        sel_bg: Color::Indexed(60),
+        composer_bg: Color::Indexed(236),
+        panel_bg: Color::Indexed(234),
+        text: Color::White,
+        base_bg: Color::Indexed(235),
+    };
+
+    /// Truecolor tuning of [`Theme::DRACULA`] — the canonical Dracula palette values.
+    pub const DRACULA_RGB: Theme = Theme {
+        user: Color::Rgb(255, 121, 198),
+        assistant: Color::Rgb(248, 248, 242),
+        tool: Color::Rgb(139, 233, 253),
+        ok: Color::Rgb(80, 250, 123),
+        err: Color::Rgb(255, 85, 85),
+        warn: Color::Rgb(241, 250, 140),
+        muted: Color::Rgb(98, 114, 164),
+        accent: Color::Rgb(189, 147, 249),
+        sel_bg: Color::Rgb(68, 71, 90),
+        composer_bg: Color::Rgb(52, 55, 70),
+        panel_bg: Color::Rgb(44, 46, 59),
+        text: Color::Rgb(248, 248, 242),
+        base_bg: Color::Rgb(40, 42, 54),
+    };
+
+    /// Nord (ANSI) — the cool, arctic-blue palette. Like [`Theme::DRACULA`], `base_bg` is
+    /// painted rather than left `Reset` so the theme's identity survives a mismatched terminal
+    /// background.
+    pub const NORD: Theme = Theme {
+        user: Color::Yellow,
+        assistant: Color::Gray,
+        tool: Color::Cyan,
+        ok: Color::Green,
+        err: Color::Red,
+        warn: Color::Yellow,
+        muted: Color::Indexed(60),
+        accent: Color::Cyan,
+        sel_bg: Color::Indexed(238),
+        composer_bg: Color::Indexed(236),
+        panel_bg: Color::Indexed(234),
+        text: Color::Gray,
+        base_bg: Color::Indexed(235),
+    };
+
+    /// Truecolor tuning of [`Theme::NORD`] — the canonical Nord (nordtheme.com) palette values.
+    pub const NORD_RGB: Theme = Theme {
+        user: Color::Rgb(235, 203, 139),
+        assistant: Color::Rgb(216, 222, 233),
+        tool: Color::Rgb(136, 192, 208),
+        ok: Color::Rgb(163, 190, 140),
+        err: Color::Rgb(191, 97, 106),
+        warn: Color::Rgb(235, 203, 139),
+        muted: Color::Rgb(76, 86, 106),
+        accent: Color::Rgb(136, 192, 208),
+        sel_bg: Color::Rgb(67, 76, 94),
+        composer_bg: Color::Rgb(59, 66, 82),
+        panel_bg: Color::Rgb(50, 56, 70),
+        text: Color::Rgb(229, 233, 240),
+        base_bg: Color::Rgb(46, 52, 64),
+    };
+
+    /// High-contrast (ANSI) — an accessibility palette, distinct from [`Theme::MONO`]: it keeps
+    /// maximal-saturation *color* (bright ANSI variants) rather than dropping to no color at all,
+    /// while forcing a pure black `base_bg` so contrast never depends on the terminal's own
+    /// (possibly low-contrast) background or remapped ANSI palette.
+    pub const HIGH_CONTRAST: Theme = Theme {
+        user: Color::LightYellow,
+        assistant: Color::White,
+        tool: Color::LightCyan,
+        ok: Color::LightGreen,
+        err: Color::LightRed,
+        warn: Color::LightYellow,
+        muted: Color::Indexed(250),
+        accent: Color::LightCyan,
+        sel_bg: Color::Indexed(238),
+        composer_bg: Color::Indexed(234),
+        panel_bg: Color::Indexed(232),
+        text: Color::White,
+        base_bg: Color::Black,
+    };
+
+    /// Truecolor tuning of [`Theme::HIGH_CONTRAST`] — pure primaries against pure black, so
+    /// contrast is guaranteed rather than best-effort against the terminal's own ANSI remap.
+    pub const HIGH_CONTRAST_RGB: Theme = Theme {
+        user: Color::Rgb(255, 255, 0),
+        assistant: Color::Rgb(255, 255, 255),
+        tool: Color::Rgb(0, 255, 255),
+        ok: Color::Rgb(0, 255, 0),
+        err: Color::Rgb(255, 0, 0),
+        warn: Color::Rgb(255, 255, 0),
+        muted: Color::Rgb(200, 200, 200),
+        accent: Color::Rgb(0, 255, 255),
+        sel_bg: Color::Rgb(80, 80, 80),
+        composer_bg: Color::Rgb(30, 30, 30),
+        panel_bg: Color::Rgb(20, 20, 20),
+        text: Color::Rgb(255, 255, 255),
+        base_bg: Color::Rgb(0, 0, 0),
+    };
+
     /// Selectable theme names (what `/theme` lists and [`Theme::by_name`] accepts).
     pub fn names() -> &'static [&'static str] {
-        &["dark", "light", "mono"]
+        &["dark", "light", "dracula", "nord", "high-contrast", "mono"]
     }
 
     /// Resolve a theme name for this terminal: `NO_COLOR` forces [`Theme::MONO`]; truecolor
     /// terminals get the `_RGB` tuning. Unknown names return `None`.
     pub fn by_name(name: &str, truecolor: bool, no_color: bool) -> Option<Theme> {
         if no_color {
-            return match name {
-                "dark" | "light" | "mono" => Some(Self::MONO),
-                _ => None,
+            return if Self::names().contains(&name) {
+                Some(Self::MONO)
+            } else {
+                None
             };
         }
         match name {
@@ -157,6 +268,21 @@ impl Theme {
                 Self::LIGHT_RGB
             } else {
                 Self::LIGHT
+            }),
+            "dracula" => Some(if truecolor {
+                Self::DRACULA_RGB
+            } else {
+                Self::DRACULA
+            }),
+            "nord" => Some(if truecolor {
+                Self::NORD_RGB
+            } else {
+                Self::NORD
+            }),
+            "high-contrast" => Some(if truecolor {
+                Self::HIGH_CONTRAST_RGB
+            } else {
+                Self::HIGH_CONTRAST
             }),
             "mono" => Some(Self::MONO),
             _ => None,

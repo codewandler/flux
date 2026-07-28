@@ -4705,11 +4705,47 @@ mod tests {
         assert!(Theme::by_name("solarized", true, true).is_none());
     }
 
+    /// C-150: the new named palettes (`dracula`, `nord`, `high-contrast`) resolve through the
+    /// same truecolor/`NO_COLOR` precedence as `dark`/`light`, are listed by `Theme::names`, and
+    /// paint an explicit (non-`Reset`) `base_bg` so they stay correct on a mismatched terminal
+    /// background.
+    #[test]
+    fn theme_by_name_resolves_variants_new_palettes() {
+        use ratatui::style::Color;
+        for name in ["dracula", "nord", "high-contrast"] {
+            assert!(Theme::names().contains(&name), "names() missing {name}");
+
+            // ANSI fallback (no truecolor): resolves, and every role is defined (base_bg/text
+            // are non-Reset so the theme reads correctly regardless of the terminal's own bg).
+            let ansi = Theme::by_name(name, false, false)
+                .unwrap_or_else(|| panic!("{name} should resolve without truecolor"));
+            assert_ne!(ansi.base_bg, Color::Reset, "{name} ANSI base_bg");
+
+            // Truecolor tuning: distinct RGB base_bg, still non-Reset.
+            let rgb = Theme::by_name(name, true, false)
+                .unwrap_or_else(|| panic!("{name} should resolve with truecolor"));
+            assert!(
+                matches!(rgb.base_bg, Color::Rgb(..)),
+                "{name} truecolor base_bg should be Rgb, got {:?}",
+                rgb.base_bg
+            );
+
+            // NO_COLOR still forces MONO regardless of truecolor.
+            assert!(matches!(
+                Theme::by_name(name, true, true),
+                Some(t) if t.accent == Color::Reset && t.base_bg == Color::Reset
+            ));
+        }
+    }
+
     /// C-104: switching the theme restyles the screen — a known cell's colors change and the
     /// light theme paints the root background.
     #[test]
     fn theme_switch_restyles_screen() {
         let mut state = ChatState::new("mock".into());
+        // A non-empty transcript, so C-157's empty-state card (which also contains a "d" glyph,
+        // in "commands") doesn't shadow the composer's own "d" for the `.find()` below.
+        state.push_user("hi");
         state.input.insert_str("draft");
         let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
