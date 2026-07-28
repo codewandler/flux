@@ -64,6 +64,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   terminals, or with `FLUX_NO_SPLASH=1`), and on terminals with full color support the
   model-wait spinner becomes an animated effect bar that changes with every model round.
 
+### Fixed
+
+- **A saved flow or op that needs an integration you don't have no longer blocks the agent — or
+  its sub-agents — from starting.** A definition in `~/.flux/flows` or `.flux/flows` that calls
+  operations that aren't available (for example, a plugin you've since uninstalled, or ops a
+  delegated sub-agent was never given) used to abort startup or make every sub-agent spawn fail.
+  Now it's simply left out of that agent's catalog until its operations are available again — the
+  exclusion is recorded in the session's audit trail, and registering a *new* op with unknown
+  operations still fails immediately.
+
 ## [0.27.0] - 2026-07-28
 
 ### New

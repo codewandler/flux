@@ -99,6 +99,9 @@ pub struct FlowEngine {
     pub loop_host: Arc<crate::loop_host::EngineLoopHost>,
     /// Dynamic composite ops loaded from global/project stores or registered by this agent.
     pub composites: Arc<DynamicComposites>,
+    /// Persisted composites excluded from this engine's catalog because they don't resolve
+    /// against its registry (C-117); surfaced per turn as a `composites.pruned` observation.
+    pub pruned_composites: Vec<crate::composites::PrunedComposite>,
     pub model: String,
     pub system_prompt: String,
     pub max_tokens: u32,
@@ -301,7 +304,11 @@ impl FlowEngine {
             "evidence",
             "metrics",
         ]);
-        composites.validate_base(executor.registry())?;
+        // C-117: a persisted composite that doesn't resolve against THIS engine's registry is
+        // excluded from the catalog (never a boot failure — sub-agent registries are narrowed,
+        // and a global file referencing an uninstalled plugin must not brick startup). The
+        // exclusions are surfaced per turn as a `composites.pruned` observation.
+        let pruned_composites = composites.prune_unresolvable(executor.registry());
         let agent_loop = load_agent_loop_with_iterations(agent_loop, max_iterations)?;
         validate_agent_loop(
             &agent_loop,
@@ -316,6 +323,7 @@ impl FlowEngine {
             agent_loop,
             loop_host,
             composites,
+            pruned_composites,
             model,
             system_prompt,
             max_tokens,
@@ -421,6 +429,27 @@ impl FlowEngine {
                 "trust": identity.trust(),
             }),
         ));
+        // C-117: make assembly-time composite exclusions auditable per session — the pruned
+        // definitions were never dispatchable on this engine, but their absence must be visible.
+        if !self.pruned_composites.is_empty() {
+            self.executor.observe(flux_evidence::Observation::new(
+                "composites.pruned",
+                flux_evidence::Phase::Turn,
+                serde_json::json!({
+                    "pruned": self
+                        .pruned_composites
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "name": p.name,
+                                "scope": p.scope,
+                                "reason": p.reason,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                }),
+            ));
+        }
         let iteration_base = self.evidence_kind_count("turn.iteration");
         let subagent_base = self.evidence_kind_count("subagent.usage");
         let base_system = self.base_system_with_skills(session_id, skill_input, sink);
@@ -2420,6 +2449,102 @@ mod tests {
             loop_spec,
         );
         (engine, events)
+    }
+
+    /// C-117 (failing-first): a persisted composite whose body references an op absent from THIS
+    /// engine's registry must not abort assembly — it is pruned from the catalog with a durable
+    /// `composites.pruned` observation on the first turn. This is the exact live-repro shape:
+    /// before the fix, assembly fails with `composite validation failed: unknown operation: …`.
+    #[tokio::test]
+    async fn unresolvable_persisted_composite_prunes_instead_of_failing_assembly() {
+        let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("flux-c117-prune-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(root.join(".flux/flows")).unwrap();
+        std::fs::write(
+            root.join(".flux/flows/broken.flux"),
+            "op broken_helper() -> any\n  $x = gitlab_mr_show()\n  return $x\n",
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(
+                vec![
+                    native_call(
+                        "intent-1",
+                        "declare_intent",
+                        json!({"intent": "answer", "capability_families": ["core"]}),
+                    ),
+                    prose("done"),
+                ]
+                .into(),
+            ),
+            requests: requests.clone(),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(AllowApprover),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap()))),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let flow = FlowStore::in_memory_with_events(events.clone()).unwrap();
+        let engine = FlowEngine::assemble_with_loop(
+            provider,
+            executor,
+            events.clone(),
+            flow,
+            "test-model".into(),
+            "Use only observed evidence.".into(),
+            2_048,
+            5,
+            Vec::new(),
+            0,
+            Vec::new(),
+            root.clone(),
+            AgentLoopSpec::default(),
+        )
+        .expect("assembly must prune the unresolvable composite, not fail");
+
+        // The pruned op is not in this engine's catalog…
+        assert!(
+            !engine
+                .composites
+                .active_for_session("")
+                .iter()
+                .any(|c| c.name == "broken_helper"),
+            "pruned composite must not be advertised"
+        );
+
+        // …and the first turn leaves a durable audit record of the exclusion.
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+        engine.run_turn(&session, "hello", &mut sink).await.unwrap();
+        let pruned: Vec<_> = events
+            .observations(&session)
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "composites.pruned")
+            .collect();
+        assert_eq!(pruned.len(), 1, "one composites.pruned observation");
+        let list = pruned[0].data["pruned"].as_array().unwrap().clone();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["name"], "broken_helper");
+        assert_eq!(list[0]["scope"], "project");
+        assert!(
+            list[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unknown operation"),
+            "{:?}",
+            list[0]["reason"]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn scripted_engine(

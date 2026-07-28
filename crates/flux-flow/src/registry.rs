@@ -199,54 +199,130 @@ pub fn analyze_composites(
     let mut diags = Vec::new();
     let mut names = HashSet::new();
     for op in composites {
-        if tools.get(&op.name).is_some() {
-            diags.push(Diagnostic::new(format!(
-                "composite op `{}` conflicts with a registered tool",
-                op.name
-            )));
-        }
+        diags.extend(analyze_one_structural(op, tools, &catalog));
         if !names.insert(op.name.clone()) {
             diags.push(Diagnostic::new(format!(
                 "duplicate composite op `{}`",
                 op.name
             )));
         }
-        // Composites validate through the same typed gate as any authored flow (L-16/F9): full
-        // structural analysis + lowering. Params seed the definedness scope; no session set.
-        lower(&op.body, &catalog, &std::collections::HashSet::new())
-            .map(|_| ())
-            .unwrap_or_else(|mut e| diags.append(&mut e));
-        if body_contains_await(&op.body.body) {
-            diags.push(Diagnostic::new(format!(
-                "composite op `{}` cannot contain `await` in v1",
-                op.name
-            )));
-        }
     }
     detect_composite_cycles(composites, &mut diags);
     for op in composites {
-        if let Some((risk, effects)) = transitive_surface(&op.body.body, &catalog) {
-            if op.meta.risk < risk {
-                diags.push(Diagnostic::new(format!(
-                    "composite op `{}` declares risk {:?} but body requires {:?}",
-                    op.name, op.meta.risk, risk
-                )));
-            }
-            for effect in effects {
-                if !op.meta.effects.contains(&effect) {
-                    diags.push(Diagnostic::new(format!(
-                        "composite op `{}` missing declared effect {:?}",
-                        op.name, effect
-                    )));
-                }
-            }
-        }
+        diags.extend(analyze_one_surface(op, &catalog));
     }
     if diags.is_empty() {
         Ok(())
     } else {
         Err(diags)
     }
+}
+
+/// Per-composite structural diagnostics against a catalog: registered-tool name conflict, full
+/// lowering (the typed gate any authored flow passes — unknown ops surface here), and the v1
+/// `await` ban. Shared by strict [`analyze_composites`] and the C-117 pruning pass.
+fn analyze_one_structural(
+    op: &CompositeOpDecl,
+    tools: &ToolRegistry,
+    catalog: &OpRegistry<'_>,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    if tools.get(&op.name).is_some() {
+        diags.push(Diagnostic::new(format!(
+            "composite op `{}` conflicts with a registered tool",
+            op.name
+        )));
+    }
+    // Composites validate through the same typed gate as any authored flow (L-16/F9): full
+    // structural analysis + lowering. Params seed the definedness scope; no session set.
+    lower(&op.body, catalog, &std::collections::HashSet::new())
+        .map(|_| ())
+        .unwrap_or_else(|mut e| diags.append(&mut e));
+    if body_contains_await(&op.body.body) {
+        diags.push(Diagnostic::new(format!(
+            "composite op `{}` cannot contain `await` in v1",
+            op.name
+        )));
+    }
+    diags
+}
+
+/// Per-composite declared-surface diagnostics: the body's transitive risk/effects must be covered
+/// by the op's own declaration. Shared by strict [`analyze_composites`] and the C-117 pruning pass.
+fn analyze_one_surface(op: &CompositeOpDecl, catalog: &OpRegistry<'_>) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    if let Some((risk, effects)) = transitive_surface(&op.body.body, catalog) {
+        if op.meta.risk < risk {
+            diags.push(Diagnostic::new(format!(
+                "composite op `{}` declares risk {:?} but body requires {:?}",
+                op.name, op.meta.risk, risk
+            )));
+        }
+        for effect in effects {
+            if !op.meta.effects.contains(&effect) {
+                diags.push(Diagnostic::new(format!(
+                    "composite op `{}` missing declared effect {:?}",
+                    op.name, effect
+                )));
+            }
+        }
+    }
+    diags
+}
+
+/// Per-composite diagnostics shared by [`analyze_composites`] and the C-117 pruning pass:
+/// structural checks plus the declared-surface check, against the given catalog.
+fn analyze_one(
+    op: &CompositeOpDecl,
+    tools: &ToolRegistry,
+    catalog: &OpRegistry<'_>,
+) -> Vec<Diagnostic> {
+    let mut diags = analyze_one_structural(op, tools, catalog);
+    diags.extend(analyze_one_surface(op, catalog));
+    diags
+}
+
+/// One pruning round (C-117): each composite that does not resolve against `tools` + the given
+/// set — including every participant of a composite→composite cycle — is returned with its joined
+/// diagnostics. Callers iterate to a fixed point: removing a callee can invalidate its callers.
+pub fn unresolvable_composites(
+    composites: &[CompositeOpDecl],
+    tools: &ToolRegistry,
+) -> Vec<(String, String)> {
+    let catalog = OpRegistry::new(tools).with_composites(composites);
+    let cyclic = composite_cycle_participants(composites);
+    let mut out = Vec::new();
+    for op in composites {
+        let mut reasons: Vec<String> = analyze_one(op, tools, &catalog)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        if let Some(cycle) = cyclic.get(&op.name) {
+            reasons.push(cycle.clone());
+        }
+        if !reasons.is_empty() {
+            out.push((op.name.clone(), reasons.join("; ")));
+        }
+    }
+    out
+}
+
+/// Every composite participating in a composite→composite cycle, mapped to its cycle description.
+fn composite_cycle_participants(
+    composites: &[CompositeOpDecl],
+) -> std::collections::HashMap<String, String> {
+    let mut diags = Vec::new();
+    detect_composite_cycles(composites, &mut diags);
+    let mut out = std::collections::HashMap::new();
+    for diag in diags {
+        // Message shape (pinned by detect_composite_cycles): "recursive composite op cycle: a -> b -> a".
+        if let Some(path) = diag.message.strip_prefix("recursive composite op cycle: ") {
+            for name in path.split(" -> ") {
+                out.entry(name.to_string()).or_insert(diag.message.clone());
+            }
+        }
+    }
+    out
 }
 
 fn body_contains_await(body: &[Node]) -> bool {

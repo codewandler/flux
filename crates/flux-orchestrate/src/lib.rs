@@ -1359,6 +1359,45 @@ mod tests {
             .is_err());
     }
 
+    /// C-117 failing-first (the live repro): a persisted composite requiring ops outside a
+    /// `tools: [read]` role's narrowed registry must not fail `LocalSpawner::spawn` — before the
+    /// fix, EVERY spawn of EVERY role died at child-engine assembly with
+    /// `composite validation failed: unknown operation: …`. The unresolvable definition is simply
+    /// pruned from the child's catalog and the turn completes.
+    #[tokio::test]
+    async fn spawn_survives_unresolvable_persisted_composite() {
+        let dir = std::env::temp_dir().join(format!("flux-orch-c117-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".flux/flows")).unwrap();
+        std::fs::write(
+            dir.join(".flux/flows/mr_update.flux"),
+            "op mr_update() -> any\n  $x = gitlab_mr_show()\n  return $x\n",
+        )
+        .unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ndescription: recon\ntools: [read]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            system,
+            "mock",
+            1024,
+        );
+        let cancel = CancellationToken::new();
+        let out = spawner
+            .spawn(SpawnRequest::new("scout", "look around"), &cancel)
+            .await
+            .expect("spawn must not fail on an unresolvable persisted composite");
+        assert_eq!(out.text, "scouted: 3 files");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A-82 failing-first: the reusable `SubAgents` path must put the host's complete adaptive
     /// policy on the role-derived child `AgentSpec` before engine assembly. Request capture proves
     /// the stage-local wire settings; two refusal cases prove the stage and logical call ceilings
