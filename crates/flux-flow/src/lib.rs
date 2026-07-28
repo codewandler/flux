@@ -36,11 +36,13 @@ pub use staged::{
     ADAPTIVE_AMBIENT_GROUP, DEFAULT_ADAPTIVE_MODEL_CALLS,
 };
 pub mod state;
+pub mod steering;
 pub mod voice;
 pub mod whatif;
 
 pub use agent_sink::AgentSink;
 pub use engine::{DEFAULT_AGENT_LOOP_ITERATIONS, MAX_AGENT_LOOP_ITERATIONS};
+pub use steering::{SteeringItem, SteeringQueue};
 pub use voice::{
     tool_defs_from_registry, TranscriptAccumulator, UsageRecording, VoiceSessionDriver, VoiceSink,
     VoiceTurnHandler,

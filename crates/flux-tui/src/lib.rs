@@ -49,7 +49,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use flux_core::humanize::{fmt_count, fmt_elapsed};
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
-use flux_flow::AgentSink;
+use flux_flow::{AgentSink, SteeringQueue};
 use flux_provider::Provider;
 use flux_runtime::{ApprovalChoice, Approver, ToolResult};
 use flux_spec::IntentSet;
@@ -892,10 +892,10 @@ impl ChatState {
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
-            queue: VecDeque::new(),
+            queue: Arc::new(SteeringQueue::default()),
             queue_open: false,
             queue_sel: 0,
-            queue_edit_index: None,
+            queue_edit: None,
             session_picker: None,
             session_sel: 0,
             scroll: 0,
@@ -1019,71 +1019,71 @@ impl ChatState {
     }
 
     fn enqueue(&mut self, text: String) {
-        if !text.trim().is_empty() {
-            self.queue.push_back(text);
+        if self.queue.push(text).is_some() {
             self.queue_sel = self.queue_sel.min(self.queue.len().saturating_sub(1));
         }
     }
 
+    /// Texts currently queued — a point-in-time snapshot; the engine may drain the shared queue
+    /// concurrently while a turn runs (A-94).
+    fn queue_texts(&self) -> Vec<String> {
+        self.queue
+            .snapshot()
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
     fn queue_remove_selected(&mut self) -> Option<String> {
-        if self.queue.is_empty() {
+        let snapshot = self.queue.snapshot();
+        if snapshot.is_empty() {
             return None;
         }
-        let index = self.queue_sel.min(self.queue.len() - 1);
-        let removed = self.queue.remove(index);
-        self.queue_edit_index = self.queue_edit_index.and_then(|editing| {
-            if editing == index {
-                None
-            } else if editing > index {
-                Some(editing - 1)
-            } else {
-                Some(editing)
-            }
-        });
+        let index = self.queue_sel.min(snapshot.len() - 1);
+        let id = snapshot[index].id;
+        if self.queue_edit == Some(id) {
+            self.queue_edit = None;
+        }
+        let removed = self.queue.retract(id);
         self.queue_sel = self.queue_sel.min(self.queue.len().saturating_sub(1));
         removed
     }
 
     fn queue_begin_edit(&mut self) -> Option<String> {
-        if self.queue.is_empty() {
+        let snapshot = self.queue.snapshot();
+        if snapshot.is_empty() {
             return None;
         }
-        let index = self.queue_sel.min(self.queue.len() - 1);
-        let text = self.queue.get(index)?.clone();
-        self.queue_edit_index = Some(index);
-        Some(text)
+        let item = snapshot
+            .into_iter()
+            .nth(self.queue_sel.min(self.queue.len().saturating_sub(1)))?;
+        self.queue_edit = Some(item.id);
+        Some(item.text)
     }
 
+    /// `false` when no edit was active — or when the engine consumed the item mid-edit, in which
+    /// case the caller treats the text as a fresh submission instead of silently dropping it.
     fn queue_commit_edit(&mut self, text: String) -> bool {
-        let Some(index) = self.queue_edit_index.take() else {
+        let Some(id) = self.queue_edit.take() else {
             return false;
         };
-        let Some(item) = self.queue.get_mut(index) else {
-            return false;
-        };
-        *item = text;
-        true
+        self.queue.edit(id, text)
     }
 
     fn queue_cancel_edit(&mut self) -> bool {
-        self.queue_edit_index.take().is_some()
+        self.queue_edit.take().is_some()
     }
 
     fn queue_move(&mut self, delta: isize) {
-        if self.queue.len() < 2 {
+        let snapshot = self.queue.snapshot();
+        if snapshot.len() < 2 {
             return;
         }
-        let from = self.queue_sel.min(self.queue.len() - 1);
+        let from = self.queue_sel.min(snapshot.len() - 1);
         let to = from
             .saturating_add_signed(delta)
-            .min(self.queue.len().saturating_sub(1));
-        if from != to {
-            self.queue.swap(from, to);
-            if self.queue_edit_index == Some(from) {
-                self.queue_edit_index = Some(to);
-            } else if self.queue_edit_index == Some(to) {
-                self.queue_edit_index = Some(from);
-            }
+            .min(snapshot.len().saturating_sub(1));
+        if from != to && self.queue.move_by(snapshot[from].id, delta) {
             self.queue_sel = to;
         }
     }
@@ -2567,6 +2567,9 @@ pub async fn run_with_options(
     if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
+    // A-94: share the composer's follow-up queue with the engine, which drains it into the
+    // running turn at the next planner consultation instead of waiting for the turn to finish.
+    agent.set_steering(Some(state.queue.clone()));
     state.project_session(&events, &session_id)?;
     state.history = load_history(&events);
     let agent = Arc::new(tokio::sync::RwLock::new(agent));
@@ -2676,6 +2679,16 @@ async fn event_loop(
                     approval_queue.push_back((tool, subjects, reply));
                     show_next_approval(state, &mut pending_reply, &mut approval_queue);
                 }
+                UiEvent::Steered(messages) => {
+                    // The engine consumed these from the shared queue (the strip empties by
+                    // itself); leave a transcript record that the running turn was steered.
+                    for text in messages {
+                        state.push(Entry::Notice {
+                            text: format!("↪ steering delivered: {text}"),
+                            sev: Sev::Info,
+                        });
+                    }
+                }
                 UiEvent::Finished => {
                     if let Some((_tool, reply)) = pending_reply.take() {
                         let _ = reply.send(ApprovalChoice::Deny);
@@ -2690,7 +2703,7 @@ async fn event_loop(
                     state.turn_start = None;
                     state.active_action_id = None;
                     // A queued message starts only after the prior task's Finished marker.
-                    if !state.queue_open && state.queue_edit_index.is_none() {
+                    if !state.queue_open && state.queue_edit.is_none() {
                         if let Some(queued) = state.queue.pop_front() {
                             cancel = start_turn(&agent, &tx, state, queued);
                         }
@@ -3037,7 +3050,7 @@ async fn event_loop(
 
                 // Slash-command menu: when the input is a bare `/cmd` prefix with matches, ↑/↓ select,
                 // Tab/Enter run the command, Esc dismisses; other keys fall through to edit/filter.
-                if state.queue_edit_index.is_none() {
+                if state.queue_edit.is_none() {
                     if let Some(query) = state.slash_query() {
                         let matches = slash_matches(&query, &state.file_commands);
                         if !matches.is_empty() {
@@ -3085,7 +3098,7 @@ async fn event_loop(
 
                 // C-112: `@` path completion. The inventory is built lazily on the first active
                 // token (bounded walk, session-cached); popup keys win while candidates show.
-                if state.queue_edit_index.is_none() {
+                if state.queue_edit.is_none() {
                     if let Some(token) = state.at_token() {
                         if state.file_inventory.is_none() {
                             let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -3200,12 +3213,10 @@ async fn event_loop(
                         }
                     }
                     KeyCode::Char('d') if ctrl && !running && state.input_blank() => break,
-                    KeyCode::Up if cur_row == 0 && !ctrl && state.queue_edit_index.is_none() => {
+                    KeyCode::Up if cur_row == 0 && !ctrl && state.queue_edit.is_none() => {
                         state.history_prev()
                     }
-                    KeyCode::Down
-                        if cur_row == last_row && !ctrl && state.queue_edit_index.is_none() =>
-                    {
+                    KeyCode::Down if cur_row == last_row && !ctrl && state.queue_edit.is_none() => {
                         state.history_next()
                     }
                     KeyCode::Char('c') if ctrl => {
@@ -3278,7 +3289,7 @@ async fn event_loop(
                             continue;
                         }
                         let text = state.take_input();
-                        if state.queue_edit_index.is_none() && text.trim_start().starts_with('/') {
+                        if state.queue_edit.is_none() && text.trim_start().starts_with('/') {
                             let wants_quit = handle_command(
                                 &text,
                                 &agent,
@@ -3989,22 +4000,13 @@ mod tests {
         state.enqueue("first".into());
         state.enqueue("second".into());
         state.enqueue("third".into());
-        assert_eq!(
-            state.queue.iter().cloned().collect::<Vec<_>>(),
-            ["first", "second", "third"]
-        );
+        assert_eq!(state.queue_texts(), ["first", "second", "third"]);
 
         state.queue_sel = 1;
         state.queue_move(-1);
-        assert_eq!(
-            state.queue.iter().cloned().collect::<Vec<_>>(),
-            ["second", "first", "third"]
-        );
+        assert_eq!(state.queue_texts(), ["second", "first", "third"]);
         assert_eq!(state.queue_remove_selected().as_deref(), Some("second"));
-        assert_eq!(
-            state.queue.iter().cloned().collect::<Vec<_>>(),
-            ["first", "third"]
-        );
+        assert_eq!(state.queue_texts(), ["first", "third"]);
     }
 
     #[test]
@@ -4017,17 +4019,77 @@ mod tests {
 
         assert_eq!(state.queue_begin_edit().as_deref(), Some("second"));
         assert_eq!(
-            state.queue.iter().cloned().collect::<Vec<_>>(),
+            state.queue_texts(),
             ["first", "second", "third"],
             "beginning an edit must not remove or reorder the item"
         );
         assert!(state.queue_commit_edit("second refined".into()));
-        assert_eq!(
-            state.queue.iter().cloned().collect::<Vec<_>>(),
-            ["first", "second refined", "third"]
-        );
+        assert_eq!(state.queue_texts(), ["first", "second refined", "third"]);
         assert_eq!(state.queue.pop_front().as_deref(), Some("first"));
         assert_eq!(state.queue.pop_front().as_deref(), Some("second refined"));
+    }
+
+    #[test]
+    fn engine_drain_empties_the_strip_and_steered_messages_reach_the_transcript() {
+        let mut state = ChatState::new("mock".into());
+        state.enqueue("focus on the parser".into());
+        state.enqueue("skip the tests".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            screen(&terminal).contains("focus on the parser"),
+            "queued strip renders"
+        );
+
+        // The engine consumes the shared queue at its next planner consultation (A-94)…
+        let drained = state.queue.drain();
+        assert_eq!(drained, vec!["focus on the parser", "skip the tests"]);
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            !screen(&terminal).contains("focus on the parser"),
+            "consumed items leave the strip without any UI bookkeeping"
+        );
+
+        // …and its `turn.steering` observation leaves a transcript record.
+        let action = state.begin_action();
+        let event = state
+            .accept_ui_event(UiEvent::Tagged {
+                action_id: action,
+                event: Box::new(UiEvent::Steered(drained)),
+            })
+            .expect("live action");
+        if let UiEvent::Steered(messages) = event {
+            for text in messages {
+                state.push(Entry::Notice {
+                    text: format!("↪ steering delivered: {text}"),
+                    sev: Sev::Info,
+                });
+            }
+        } else {
+            panic!("expected the steered event back");
+        }
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(screen(&terminal).contains("↪ steering delivered: focus on the parser"));
+    }
+
+    #[test]
+    fn an_edit_raced_by_engine_consumption_falls_back_to_a_fresh_submission() {
+        let mut state = ChatState::new("mock".into());
+        state.enqueue("tighten the loop".into());
+        assert_eq!(
+            state.queue_begin_edit().as_deref(),
+            Some("tighten the loop")
+        );
+
+        // The engine drains the queue while the user is still editing the item.
+        state.queue.drain();
+
+        assert!(
+            !state.queue_commit_edit("tighten the outer loop".into()),
+            "a consumed item can no longer be edited — the caller must treat the text as new input"
+        );
+        assert!(state.queue.is_empty());
     }
 
     #[test]

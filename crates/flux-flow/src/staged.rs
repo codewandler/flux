@@ -98,6 +98,9 @@ pub(crate) struct StagedContext {
     /// Logical-run and per-stage cognition policy. Counts live in [`AdaptiveState`] so an `await`
     /// and process restart cannot reset them.
     pub adaptive_policy: AdaptiveLoopPolicy,
+    /// A-94: the surface-shared mid-turn steering queue, drained at each planner-consultation
+    /// round head. `None` for every caller without an interactive composer.
+    pub steering: Option<Arc<crate::steering::SteeringQueue>>,
 }
 
 /// Usage stays outside the result: a provider error after usage arrived still costs tokens and must
@@ -1057,6 +1060,46 @@ fn resolve_routing_choice(
     (matched.len() == 1).then(|| matched.into_iter().next().unwrap())
 }
 
+/// A-94: drain the surface-shared steering queue and inject the drained texts into the adaptive
+/// conversation before the next planner consultation. The block is appended to a trailing user
+/// message when one exists (a gather/report `tool_result` round) so the conversation never grows
+/// a consecutive-user pair; otherwise it becomes its own user message. Consumed steering is
+/// recorded as a durable `turn.steering` observation — deliberately NOT an `EventKind::Message`,
+/// which would break the session log's strict user → assistant alternation.
+fn inject_steering(ctx: &StagedContext, state: &mut AdaptiveState) {
+    let Some(queue) = &ctx.steering else {
+        return;
+    };
+    let texts = queue.drain();
+    if texts.is_empty() {
+        return;
+    }
+    observe(ctx, "turn.steering", json!({ "messages": &texts }));
+    let block = steering_block(&texts);
+    match state.messages.last_mut() {
+        Some(last) if last.role == flux_core::Role::User => {
+            last.content.push(ContentBlock::text(block));
+        }
+        _ => state.messages.push(Message::user_text(block)),
+    }
+}
+
+/// Render drained steering texts as one attributed block, preserving submission order.
+fn steering_block(texts: &[String]) -> String {
+    let mut block = String::from(
+        "<user-steering>\nThe user sent this guidance while the turn was executing. Honor it from \
+         this point on; it refines the original request, and results above were produced before \
+         it arrived.\n",
+    );
+    for text in texts {
+        block.push_str("- ");
+        block.push_str(text);
+        block.push('\n');
+    }
+    block.push_str("</user-steering>");
+    block
+}
+
 async fn adaptive_explore(
     ctx: &StagedContext,
     mut state: AdaptiveState,
@@ -1075,6 +1118,7 @@ async fn adaptive_explore(
     for _round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
         ensure_model_call_budget(ctx, state.intent_calls, state.explore_calls, "explore")?;
+        inject_steering(ctx, &mut state);
         let selected = selected_specs_for_state(&state, &families, &ambient, ctx)?;
         let mut selected_by_native = BTreeMap::<String, ToolSpec>::new();
         for spec in &selected {
@@ -2698,6 +2742,34 @@ mod tests {
         }
     }
 
+    /// A-94: pushes steering messages into the shared queue immediately after serving the request
+    /// at index `after` (0-based) — simulating a user typing while that round's tool calls run.
+    struct SteerAfterProvider {
+        inner: Arc<dyn Provider>,
+        queue: Arc<crate::steering::SteeringQueue>,
+        after: usize,
+        texts: Mutex<Vec<String>>,
+        served: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Provider for SteerAfterProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            let stream = self.inner.stream(request).await;
+            let index = self.served.fetch_add(1, Ordering::SeqCst) as usize;
+            if index == self.after {
+                for text in self.texts.lock().unwrap().drain(..) {
+                    self.queue.push(text);
+                }
+            }
+            stream
+        }
+    }
+
     struct CountingTool {
         spec: ToolSpec,
         result: String,
@@ -2874,6 +2946,7 @@ mod tests {
             opts: StageOptions::default(),
             remaining_token_budget: None,
             adaptive_policy: AdaptiveLoopPolicy::default(),
+            steering: None,
         };
         TestHarness {
             context,
@@ -4022,6 +4095,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_queued_mid_turn_is_injected_at_the_next_consultation_in_order() {
+        let responses = vec![
+            native_call(
+                "intent",
+                DECLARE_INTENT,
+                json!({
+                    "intent": "inspect the fixture",
+                    "capability_families": ["workspace.read"]
+                }),
+            ),
+            native_call("read", "inspect", json!({"key": "alpha"})),
+            prose("The fixture says fixture-evidence."),
+        ];
+        let TestHarness {
+            context: mut ctx,
+            requests,
+            ..
+        } = staged_context(responses);
+        let queue = Arc::new(crate::steering::SteeringQueue::default());
+        // The user "types" both messages while the round-1 gather call is executing.
+        ctx.provider = Arc::new(SteerAfterProvider {
+            inner: ctx.provider.clone(),
+            queue: queue.clone(),
+            after: 1,
+            texts: Mutex::new(vec![
+                "focus only on alpha".into(),
+                "answer in one sentence".into(),
+            ]),
+            served: AtomicU64::new(0),
+        });
+        ctx.steering = Some(queue.clone());
+
+        let output = run(ctx).await.result.unwrap();
+        assert_eq!(output["kind"], "chat");
+        assert!(queue.is_empty(), "drained at the next consultation");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .any(|message| message.text().contains("user-steering")),
+            "steering queued mid-round must not reach the consultation already in flight"
+        );
+        let last = requests[2].messages.last().expect("gather result message");
+        assert_eq!(last.role, flux_core::Role::User);
+        let text = last.text();
+        assert!(
+            text.contains("<user-steering>"),
+            "steering is attributed, got: {text}"
+        );
+        let first = text.find("focus only on alpha").expect("first message");
+        let second = text.find("answer in one sentence").expect("second message");
+        assert!(first < second, "messages inject in submission order");
+        assert!(
+            last.content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+            "steering merges into the trailing tool_result user message — never a consecutive-user pair"
+        );
+    }
+
+    #[tokio::test]
     async fn native_requests_use_exact_selected_schema_and_feed_gather_result_back() {
         let responses = vec![
             native_call(
@@ -4167,6 +4304,7 @@ mod tests {
             opts: StageOptions::default(),
             remaining_token_budget: None,
             adaptive_policy: AdaptiveLoopPolicy::default(),
+            steering: None,
         };
 
         let output = run(ctx).await.result.unwrap();

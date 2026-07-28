@@ -379,6 +379,15 @@ impl FlowEngine {
         self.loop_host.set_reasoning(self.thinking, effort);
     }
 
+    /// A-94: attach the surface-shared mid-turn steering queue. Messages the surface pushes while
+    /// a turn is executing are drained at the next planner-consultation round and injected into
+    /// the model conversation as an attributed steering block — in-flight operations and pending
+    /// approvals are never disturbed. The queue stays attached across turns; still-queued items
+    /// remain the surface's to edit, reorder, retract, or drain at a turn boundary.
+    pub fn set_steering(&self, queue: Option<Arc<crate::steering::SteeringQueue>>) {
+        self.loop_host.set_steering(queue);
+    }
+
     /// Atomically switch the live model and the session's durable model attribution. Persistence
     /// happens first; if it fails, the in-memory engine remains unchanged.
     pub fn switch_model_for_session(
@@ -3021,6 +3030,67 @@ mod tests {
             requests.lock().unwrap().len(),
             4,
             "each resume must continue the native ledger without rerunning intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_the_planner_and_leaves_shape_and_execution_intact() {
+        let responses = vec![
+            native_call(
+                "intent-1",
+                "declare_intent",
+                json!({
+                    "intent": "change a fixture",
+                    "capability_families": ["workspace.write"]
+                }),
+            ),
+            native_call("change-1", "change", json!({"value": "updated"})),
+            native_call(
+                "finalize-1",
+                "finalize_plan",
+                json!({"instructions": "Report the completed change."}),
+            ),
+            prose("Changed as steered."),
+        ];
+        let (engine, events, requests, writes) = scripted_write_engine(responses);
+        let queue = Arc::new(crate::steering::SteeringQueue::default());
+        engine.set_steering(Some(queue.clone()));
+        queue.push("keep the change minimal");
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "Change the fixture", &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "steering must neither block nor re-fire the approved batch"
+        );
+        assert!(queue.is_empty(), "consumed at the next consultation");
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[1].messages.iter().any(|message| {
+                let text = message.text();
+                text.contains("<user-steering>") && text.contains("keep the change minimal")
+            }),
+            "steering reaches the next planner consultation"
+        );
+        // The durable conversation keeps its strict user → assistant alternation; consumed
+        // steering persists as a `turn.steering` observation instead of a message event.
+        let conversation = events.conversation(&session).unwrap();
+        assert_eq!(conversation.len(), 2);
+        assert_eq!(conversation[0].role, flux_core::Role::User);
+        assert_eq!(conversation[1].role, flux_core::Role::Assistant);
+        let observations = events.observations(&session).unwrap();
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.kind == "turn.steering"
+                    && observation.data["messages"][0] == "keep the change minimal"),
+            "consumed steering is durably recorded"
         );
     }
 
