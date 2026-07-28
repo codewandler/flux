@@ -207,13 +207,15 @@ its costs are shown as the *equivalent* metered figure, marked `(sub)` — the s
 `claude`.
 
 ```bash
-flux run -m codex           "explain the auth flow"   # bare `codex` = codex/gpt-5.5
-flux run -m codex/gpt-5.5   "refactor this module"
+flux run -m codex           "explain the auth flow"   # bare `codex` = codex/gpt-5.6-sol
+flux run -m codex/gpt-5.6   "refactor this module"
 ```
 
-- Bare `codex` (or `codex/`) resolves to the backend's default model, **`gpt-5.5`**.
-- The ChatGPT-subscription backend serves the `gpt-5.5` family and rejects the legacy
-  `*-codex`-suffixed ids (`gpt-5-codex`, …) with HTTP 400; flux maps those to `gpt-5.5`. Any other
+- Bare `codex` (or `codex/`) resolves to the backend's default model, **`gpt-5.6-sol`**.
+- OpenAI lists `gpt-5.6` as the alias for GPT-5.6 Sol, so flux maps `codex/gpt-5.6` to
+  `codex/gpt-5.6-sol` for stable pricing and attribution.
+- The ChatGPT-subscription backend serves the current GPT-5 family and rejects the legacy
+  `*-codex`-suffixed ids (`gpt-5-codex`, …) with HTTP 400; flux maps those to `gpt-5.6-sol`. Any other
   id is forwarded verbatim, so a future model works without a flux release.
 - Single owner: `flux_providers::codex::resolve_model`.
 

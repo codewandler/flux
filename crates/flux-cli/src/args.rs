@@ -87,10 +87,10 @@ pub(super) struct AgentFlags {
     ///   `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local Messages endpoint).
     ///   Short aliases `sonnet`, `opus`, `haiku`, `fable` are shorthands for `anthropic/<model>`;
     ///   bare `claude` is shorthand for `claude/sonnet` (the subscription's default model); bare
-    ///   `codex` is shorthand for `codex/gpt-5.5` (the ChatGPT-subscription main model; the
+    ///   `codex` is shorthand for `codex/gpt-5.6-sol` (the ChatGPT-subscription main model; the
     ///   legacy `*-codex` ids are rejected by the backend); bare `aws` (or `aws/sonnet`,
     ///   `aws/opus`, `aws/haiku`) resolves to the region's Bedrock inference profile.
-    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-4o`, `codex/gpt-5.5`,
+    /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-5.6`, `codex/gpt-5.6-sol`,
     ///   `aws/us.anthropic.claude-sonnet-4-6`, `openrouter-anthropic/z-ai/glm-4.6`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-5`).
     #[arg(short = 'm', long)]

@@ -103,7 +103,7 @@ or both. The setting follows the whole agent call graph—intent, exploration, r
 context compaction, cognition operations, and sub-agents that do not override it.
 
 ```bash
-flux run -m codex/gpt-5.5 --effort low "summarize this repository"
+flux run -m codex/gpt-5.6 --effort low "summarize this repository"
 flux run -m anthropic/claude-sonnet-5 --think --effort high "debug this failure"
 ```
 
@@ -121,7 +121,7 @@ time. It applies consistently to intent, exploration, repair, presentation, comp
 calls, and sub-agents.
 
 ```bash
-FLUX_MODEL_TRACE=1 flux run -m codex/gpt-5.5 --effort low "explain this failure"
+FLUX_MODEL_TRACE=1 flux run -m codex/gpt-5.6 --effort low "explain this failure"
 ```
 
 `FLUX_MODEL_TRACE=full` additionally prints the exact JSON request body. **That body is sensitive:**

@@ -269,7 +269,7 @@ pub fn resolve_role_model(parent_provider: &str, role_model: &str) -> crate::Res
 impl PricingTable {
     /// The built-in curated rate table. Prices are USD per 1M tokens.
     ///
-    /// Verified against the vendors' public pricing pages on **2026-07-09**:
+    /// Verified against the vendors' public pricing pages on **2026-07-28**:
     /// - Anthropic: <https://platform.claude.com/docs/en/about-claude/pricing>
     /// - OpenAI: <https://developers.openai.com/api/docs/pricing> (base `gpt-5` is off the main
     ///   sheet but still served at its published rate, confirmed on the per-model page
@@ -288,9 +288,9 @@ impl PricingTable {
     ///
     /// Cache tiers per vendor: Anthropic bills ephemeral (5-minute) cache writes at 1.25× input
     /// and cache reads at 0.1× input — both confirmed on the sheet; the 1-hour cache-write tier
-    /// (2× input) is NOT modelled because flux never requests it. OpenAI has no cache-write tier —
-    /// cached input is simply discounted (0.1× input on the current sheet) — so `cache_write`
-    /// mirrors `input` there.
+    /// (2× input) is NOT modelled because flux never requests it. Most OpenAI rows have no
+    /// cache-write premium and mirror `input`; GPT-5.6's Sol/Terra/Luna rows publish a 1.25×
+    /// cache-write tier, while cached input remains 0.1× input.
     ///
     /// Audio tiers (`audio_input`/`audio_output`, C-38): a **surcharge** over the text rate, since
     /// `Usage::audio_input_tokens`/`audio_output_tokens` are subsets of `input_tokens`/
@@ -301,7 +301,7 @@ impl PricingTable {
     /// - Bedrock regional/multi-region cross-region profiles (`us.`/`eu.`/`apac.`) carry a ~10%
     ///   premium over `global.` endpoints on 4.5+ models; this table prices every routing prefix
     ///   at the base (global) rate.
-    /// - OpenAI's gpt-5.4/gpt-5.5 long-context premium (input beyond 272K tokens bills 2× input /
+    /// - OpenAI's gpt-5.4/gpt-5.5/gpt-5.6 long-context premium (input beyond 272K tokens bills 2× input /
     ///   1.5× output) and priority service-tier premium are not modelled.
     /// - Rows with no current public sheet are marked **estimated** inline (`gpt-5-codex`,
     ///   delisted; `gpt-5.3-codex-spark`, documented by OpenAI as a Codex research-preview model);
@@ -368,6 +368,10 @@ impl PricingTable {
         // --- OpenAI / Codex (GPT-5 family; cache_write == input, no write premium) ----------------
         let gpt5 = text(1.25, 10.0, 1.25, 0.125);
         rates.insert("gpt-5".to_string(), gpt5);
+        rates.insert("gpt-5.6".to_string(), text(5.0, 30.0, 6.25, 0.50));
+        rates.insert("gpt-5.6-sol".to_string(), text(5.0, 30.0, 6.25, 0.50));
+        rates.insert("gpt-5.6-terra".to_string(), text(2.5, 15.0, 3.125, 0.25));
+        rates.insert("gpt-5.6-luna".to_string(), text(1.0, 6.0, 1.25, 0.10));
         rates.insert("gpt-5.5".to_string(), text(5.0, 30.0, 5.0, 0.50));
         rates.insert("gpt-5.4".to_string(), text(2.5, 15.0, 2.5, 0.25));
         rates.insert("gpt-5.4-mini".to_string(), text(0.75, 4.5, 0.75, 0.075));
@@ -776,8 +780,13 @@ mod tests {
         pin("claude-sonnet-4-5-20250929", 3.0, 15.0, 3.75, 0.30);
         pin("claude-haiku-4-5", 1.0, 5.0, 1.25, 0.10);
 
-        // OpenAI (no cache-write tier: cache_write == input; cached input = 0.1x input).
+        // OpenAI (most rows: no cache-write tier, so cache_write == input; cached input = 0.1x input).
+        // GPT-5.6 publishes a 1.25x cache-write tier.
         pin("gpt-5", 1.25, 10.0, 1.25, 0.125);
+        pin("gpt-5.6", 5.0, 30.0, 6.25, 0.50);
+        pin("gpt-5.6-sol", 5.0, 30.0, 6.25, 0.50);
+        pin("gpt-5.6-terra", 2.5, 15.0, 3.125, 0.25);
+        pin("gpt-5.6-luna", 1.0, 6.0, 1.25, 0.10);
         pin("gpt-5.5", 5.0, 30.0, 5.0, 0.50);
         pin("gpt-5.4", 2.5, 15.0, 2.5, 0.25);
         pin("gpt-5.4-mini", 0.75, 4.5, 0.75, 0.075);
@@ -829,6 +838,14 @@ mod tests {
             output_tokens: 1_000_000,
             ..Default::default()
         };
+
+        let sol = t.cost(&u, "codex/gpt-5.6-sol").unwrap();
+        assert!(sol.subscription);
+        assert!((sol.usd - 35.0).abs() < 1e-9);
+
+        let luna = t.cost(&u, "codex/gpt-5.6-luna").unwrap();
+        assert!(luna.subscription);
+        assert!((luna.usd - 7.0).abs() < 1e-9);
 
         let spark = t.cost(&u, "codex/gpt-5.3-codex-spark").unwrap();
         assert!(spark.subscription);
@@ -899,13 +916,12 @@ mod tests {
 
         // claude/codex providers → labelled as subscription (equivalent metered cost).
         assert!(table.cost(&usage, "claude/opus").unwrap().subscription);
-        // The codex provider resolves to `gpt-5.5` (C-03); cost must resolve on that canonical id,
-        // not just the legacy `gpt-5-codex`. Failing-first: before `gpt-5.5` was added to the table
-        // this returned `None` (codex spend unpriced) — the C-03 model-resolution fix had made the
-        // resolver emit an id the pricing table didn't carry.
+        // The codex provider resolves bare/legacy specs to `gpt-5.6-sol`; cost must resolve on that
+        // canonical id, not just the legacy `gpt-5-codex`. Failing-first: before the GPT-5.6 update,
+        // this path still used `gpt-5.5`, so new Codex spend could be misattributed.
         let codex_cost = table
-            .cost(&usage, "codex/gpt-5.5")
-            .expect("codex/gpt-5.5 must price — the resolver emits this canonical id");
+            .cost(&usage, "codex/gpt-5.6-sol")
+            .expect("codex/gpt-5.6-sol must price — the resolver emits this canonical id");
         assert!(codex_cost.subscription);
         assert!(codex_cost.usd > 0.0);
 

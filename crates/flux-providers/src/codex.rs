@@ -10,7 +10,7 @@
 //! `codex: bool` flag on the codec toggles the ChatGPT-backend quirks.
 //!
 //! This is also the single owner of **codex model resolution**: the ChatGPT-subscription backend
-//! serves the `gpt-5.5` family and rejects the legacy `*-codex`-suffixed ids (`gpt-5-codex`, …)
+//! serves the current GPT-5 family and rejects the legacy `*-codex`-suffixed ids (`gpt-5-codex`, …)
 //! with HTTP 400 ("not supported when using Codex with a ChatGPT account"). [`resolve_model`]
 //! encodes that knowledge once so every surface — CLI, SDK, server, TUI, the sub-agent spawner —
 //! reaches it as `flux_providers::codex::resolve_model` instead of each carrying its own table.
@@ -54,18 +54,20 @@ fn derive_ws_url(endpoint: &str) -> String {
 }
 
 /// The default model the ChatGPT-subscription Codex backend serves. Used when a caller specifies
-/// the `codex` provider with no model (bare `codex`) or with a legacy `*-codex` id.
-pub const DEFAULT_MODEL: &str = "gpt-5.5";
+/// the `codex` provider with no model (bare `codex`) or with a legacy `*-codex` id. OpenAI's
+/// model catalog lists `gpt-5.6` as the alias for this concrete `gpt-5.6-sol` model.
+pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 
 /// Resolve a codex model id to what the live ChatGPT-subscription backend accepts.
 ///
-/// - An empty model (the bare `codex` shorthand) → [`DEFAULT_MODEL`] (`gpt-5.5`).
+/// - An empty model (the bare `codex` shorthand) → [`DEFAULT_MODEL`] (`gpt-5.6-sol`).
+/// - `gpt-5.6`, listed by OpenAI as the alias for GPT-5.6 Sol, → [`DEFAULT_MODEL`].
 /// - A legacy `*-codex`-suffixed id (`gpt-5-codex`, `o3-codex`, …) → [`DEFAULT_MODEL`]; the
 ///   backend rejects these with HTTP 400.
-/// - Any other id is passed through verbatim, so an explicit current id (`gpt-5.5`, `gpt-5`, …)
-///   is sent as-is and a future model is honoured without a flux release.
+/// - Any other id is passed through verbatim, so an explicit current concrete id (`gpt-5.6-sol`,
+///   `gpt-5.5`, `gpt-5`, …) is sent as-is and a future model is honoured without a flux release.
 pub fn resolve_model(model: &str) -> String {
-    if model.is_empty() || model.ends_with("-codex") {
+    if model.is_empty() || model == "gpt-5.6" || model.ends_with("-codex") {
         DEFAULT_MODEL.to_string()
     } else {
         model.to_string()
@@ -348,16 +350,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_model_defaults_empty_to_gpt55() {
+    fn resolve_model_defaults_empty_to_gpt56_sol() {
         assert_eq!(resolve_model(""), DEFAULT_MODEL);
-        assert_eq!(resolve_model(""), "gpt-5.5");
+        assert_eq!(resolve_model(""), "gpt-5.6-sol");
     }
 
     #[test]
     fn resolve_model_rewrites_legacy_codex_suffix() {
         // The ChatGPT-subscription backend rejects `*-codex` ids with HTTP 400.
-        assert_eq!(resolve_model("gpt-5-codex"), "gpt-5.5");
-        assert_eq!(resolve_model("o3-codex"), "gpt-5.5");
+        assert_eq!(resolve_model("gpt-5-codex"), "gpt-5.6-sol");
+        assert_eq!(resolve_model("o3-codex"), "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn resolve_model_maps_gpt56_alias_to_concrete_model() {
+        assert_eq!(resolve_model("gpt-5.6"), "gpt-5.6-sol");
+        assert_eq!(resolve_model("gpt-5.6-sol"), "gpt-5.6-sol");
     }
 
     #[test]
