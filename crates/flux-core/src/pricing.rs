@@ -5,8 +5,8 @@
 //! reasoning / audio-input / audio-output, each a price **per 1,000,000 tokens**), and computes
 //!
 //! ```text
-//! cost = (input·r_in + output·r_out + cache_write·r_cw + cache_read·r_cr + reasoning·r_re
-//!         + audio_input·r_ai + audio_output·r_ao) / 1e6
+//! cost = (input·r_in + output·r_out + cache_write·r_cw + cache_write_1h·r_cw1h
+//!         + cache_read·r_cr + reasoning·r_re + audio_input·r_ai + audio_output·r_ao) / 1e6
 //! ```
 //!
 //! It is deliberately pure: there is no IO here. The optional user override file
@@ -29,6 +29,13 @@
 //! the `gpt-realtime` family is the only row that sets them, since it is the only provider that
 //! bills audio tokens apart from text.
 //!
+//! ## Extended-TTL cache writes (C-135)
+//! `cache_creation_1h_input_tokens` is a **subset** of `cache_creation_input_tokens` (Anthropic
+//! reports the per-TTL split of the same total), so `cache_write_1h` is a **surcharge** over
+//! `cache_write`, exactly like `reasoning` and the audio tiers: the 1h write costs 2x base input
+//! against 1.25x for the five-minute default, so Anthropic rows carry a 0.75x-input surcharge and
+//! every other row leaves it `0.0`.
+//!
 //! ## Subscription providers
 //! `claude` (Claude Max / Claude-Code OAuth) and `codex` (ChatGPT/Codex OAuth) bill against a flat
 //! subscription, not metered API usage. When the model spec carries a `claude/` or `codex/` provider
@@ -48,8 +55,17 @@ pub struct Rates {
     pub input: f64,
     /// Generated output tokens (includes reasoning at this rate unless `reasoning` overrides it).
     pub output: f64,
-    /// Cache-creation ("cache write") input tokens.
+    /// Cache-creation ("cache write") input tokens, at the provider's default TTL (five minutes on
+    /// Anthropic — 1.25x base input).
     pub cache_write: f64,
+    /// Extended-TTL cache-creation tokens (C-135) — a **surcharge** over `cache_write` per
+    /// `cache_creation_1h_input_tokens` (already a subset of `cache_creation_input_tokens`, already
+    /// billed once at `cache_write`). Anthropic prices the 1h write at 2x base input against 1.25x
+    /// for five minutes, so the surcharge is 0.75x input on those rows. `0.0` (the default, and
+    /// every non-Anthropic row) means an extended write bills as an ordinary one. `#[serde(default)]`
+    /// keeps existing serialized rates and `~/.flux/pricing.toml` overrides decoding without it.
+    #[serde(default)]
+    pub cache_write_1h: f64,
     /// Cache-read input tokens.
     pub cache_read: f64,
     /// Reasoning tokens — a **surcharge** over `output`. Default `0.0` because reasoning is a subset
@@ -100,6 +116,8 @@ pub struct RateOverride {
     pub output: Option<f64>,
     #[serde(default)]
     pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub cache_write_1h: Option<f64>,
     #[serde(default)]
     pub cache_read: Option<f64>,
     #[serde(default)]
@@ -313,16 +331,25 @@ impl PricingTable {
             input,
             output,
             cache_write,
+            cache_write_1h: 0.0,
             cache_read,
             reasoning: 0.0,
             audio_input: 0.0,
             audio_output: 0.0,
         };
+        // Anthropic-family rows: the `cache_write` column above is the five-minute write (1.25x
+        // input) and the extended TTL (C-135) costs 2x input, so the 1h *surcharge* over it is
+        // 0.75x input. Bedrock's Anthropic rows share these values; they report no per-TTL split
+        // today, so the surcharge simply never applies there (`extended_cache_ttl` is off for them).
+        let anthropic = |input: f64, output: f64, cache_write: f64, cache_read: f64| Rates {
+            cache_write_1h: input * 0.75,
+            ..text(input, output, cache_write, cache_read)
+        };
 
         // --- Anthropic / Claude (input, output, cache_write, cache_read, reasoning) ---------------
-        let fable = text(10.0, 50.0, 12.50, 1.00);
+        let fable = anthropic(10.0, 50.0, 12.50, 1.00);
         rates.insert("claude-fable-5".to_string(), fable);
-        let opus = text(5.0, 25.0, 6.25, 0.50);
+        let opus = anthropic(5.0, 25.0, 6.25, 0.50);
         rates.insert("claude-opus-5".to_string(), opus);
         rates.insert("claude-opus-4-8".to_string(), opus);
         rates.insert("claude-opus-4-7".to_string(), opus);
@@ -330,13 +357,13 @@ impl PricingTable {
         rates.insert("claude-opus-4-5".to_string(), opus);
         // Anthropic's introductory Sonnet 5 pricing runs through 2026-08-31. `PricingTable` is
         // deliberately static/IO-free, so this row should be revisited when that window closes.
-        let sonnet5_intro = text(2.0, 10.0, 2.50, 0.20);
+        let sonnet5_intro = anthropic(2.0, 10.0, 2.50, 0.20);
         rates.insert("claude-sonnet-5".to_string(), sonnet5_intro);
-        let sonnet = text(3.0, 15.0, 3.75, 0.30);
+        let sonnet = anthropic(3.0, 15.0, 3.75, 0.30);
         rates.insert("claude-sonnet-4-6".to_string(), sonnet);
         rates.insert("claude-sonnet-4-5-20250929".to_string(), sonnet);
         rates.insert("claude-sonnet-4-5".to_string(), sonnet);
-        let haiku = text(1.0, 5.0, 1.25, 0.10);
+        let haiku = anthropic(1.0, 5.0, 1.25, 0.10);
         rates.insert("claude-haiku-4-5-20251001".to_string(), haiku);
         rates.insert("claude-haiku-4-5".to_string(), haiku);
 
@@ -402,6 +429,7 @@ impl PricingTable {
             input: 4.0,
             output: 24.0,
             cache_write: 4.0,
+            cache_write_1h: 0.0,
             cache_read: 0.40,
             reasoning: 0.0,
             audio_input: 28.0,
@@ -444,6 +472,7 @@ impl PricingTable {
                 input: 0.10,
                 output: 0.32,
                 cache_write: 0.10,
+                cache_write_1h: 0.0,
                 cache_read: 0.10,
                 reasoning: 0.0,
                 audio_input: 0.0,
@@ -505,6 +534,7 @@ impl PricingTable {
         let usd = (usage.input_tokens as f64 * r.input
             + usage.output_tokens as f64 * r.output
             + usage.cache_creation_input_tokens as f64 * r.cache_write
+            + usage.cache_creation_1h_input_tokens as f64 * r.cache_write_1h
             + usage.cache_read_input_tokens as f64 * r.cache_read
             + usage.reasoning_tokens as f64 * r.reasoning
             + usage.audio_input_tokens as f64 * r.audio_input
@@ -527,6 +557,7 @@ impl PricingTable {
             input: ov.input.unwrap_or(base.input),
             output: ov.output.unwrap_or(base.output),
             cache_write: ov.cache_write.unwrap_or(base.cache_write),
+            cache_write_1h: ov.cache_write_1h.unwrap_or(base.cache_write_1h),
             cache_read: ov.cache_read.unwrap_or(base.cache_read),
             reasoning: ov.reasoning.unwrap_or(base.reasoning),
             audio_input: ov.audio_input.unwrap_or(base.audio_input),
@@ -556,6 +587,7 @@ mod tests {
                 input: 2.0,
                 output: 4.0,
                 cache_write: 6.0,
+                cache_write_1h: 3.0,
                 cache_read: 1.0,
                 reasoning: 8.0,
                 audio_input: 10.0,
@@ -567,16 +599,18 @@ mod tests {
             input_tokens: 1_000_000,
             output_tokens: 500_000,
             cache_creation_input_tokens: 200_000,
+            cache_creation_1h_input_tokens: 100_000,
             cache_read_input_tokens: 2_000_000,
             reasoning_tokens: 100_000,
             audio_input_tokens: 50_000,
             audio_output_tokens: 25_000,
             ..Default::default()
         };
-        // 1.0·2 + 0.5·4 + 0.2·6 + 2.0·1 + 0.1·8 + 0.05·10 + 0.025·20
-        // = 2 + 2 + 1.2 + 2 + 0.8 + 0.5 + 0.5 = 9.0
+        // 1.0·2 + 0.5·4 + 0.2·6 + 0.1·3 (1h surcharge on a subset of the writes) + 2.0·1
+        //   + 0.1·8 + 0.05·10 + 0.025·20
+        // = 2 + 2 + 1.2 + 0.3 + 2 + 0.8 + 0.5 + 0.5 = 9.3
         let money = table.cost(&usage, "test-model").unwrap();
-        assert!((money.usd - 9.0).abs() < 1e-9, "got {}", money.usd);
+        assert!((money.usd - 9.3).abs() < 1e-9, "got {}", money.usd);
         assert!(!money.subscription);
 
         // Unknown model → None, no panic.

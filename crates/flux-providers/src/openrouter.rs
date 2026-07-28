@@ -50,6 +50,9 @@ impl ProviderProfile for OpenRouterProfile {
         let caps = anthropic_model_caps(model);
         MessagesQuirks {
             prompt_caching: anthropic_served,
+            // Unverified through the OpenRouter proxy — anthropic-served slugs still cache, on the
+            // five-minute default.
+            extended_cache_ttl: false,
             thinking_adaptive: if anthropic_served {
                 caps.adaptive_thinking
             } else {

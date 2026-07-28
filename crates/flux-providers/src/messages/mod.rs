@@ -101,10 +101,11 @@ pub fn build_messages_body(req: &Request, q: &MessagesQuirks) -> Result<Value> {
             &req.system_segments,
             system.as_deref(),
             q.prompt_caching,
+            q.extended_cache_ttl,
             reserved,
         );
     } else if let Some(s) = system {
-        body["system"] = system_field(&s, q.prompt_caching);
+        body["system"] = system_field(&s, q.prompt_caching, q.extended_cache_ttl);
     }
     if !req.tools.is_empty() {
         body["tools"] = serde_json::to_value(&req.tools)?;
@@ -176,8 +177,17 @@ const CACHE_LOOKBACK_BLOCKS: usize = 20;
 /// of a session, and interactive use — a human reading output between turns — routinely outlives
 /// five minutes, cold-starting the whole prefix on the next turn. The 1h write premium (2x base vs
 /// 1.25x) pays back in three requests, which a single multi-round turn already clears.
-fn stable_cache_control() -> Value {
-    json!({ "type": "ephemeral", "ttl": "1h" })
+///
+/// Gated on `extended_ttl` ([`MessagesQuirks::extended_cache_ttl`]) because the field is verified on
+/// the Anthropic-direct wire only — a gateway that rejects an unknown `cache_control` member would
+/// fail every request carrying it, so everything else keeps the plain five-minute breakpoint and
+/// still gets the caching.
+fn stable_cache_control(extended_ttl: bool) -> Value {
+    if extended_ttl {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral" })
+    }
 }
 
 /// The cache-control value for the **rolling** conversation tail (C-134/C-135).
@@ -188,18 +198,53 @@ fn rolling_cache_control() -> Value {
     json!({ "type": "ephemeral" })
 }
 
-fn system_field(s: &str, caching: bool) -> Value {
+fn system_field(s: &str, caching: bool, extended_ttl: bool) -> Value {
     if caching && s.len() >= CACHE_MIN_CHARS {
-        json!([{ "type": "text", "text": s, "cache_control": stable_cache_control() }])
+        json!([{ "type": "text", "text": s, "cache_control": stable_cache_control(extended_ttl) }])
     } else {
         json!(s)
     }
+}
+
+/// How many content blocks this round appended after the previous round's tail breakpoint — the
+/// quantity that decides whether that entry is still inside Anthropic's ~20-block backward search.
+///
+/// One agent round appends the assistant message and the message answering it (tool results), so
+/// the last two messages are that append. Approximate by construction: a round that appends more
+/// than two messages under-counts, which only makes the warning conservative.
+fn blocks_appended_since_tail(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .take(2)
+        .map(|m| {
+            m.get("content")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        })
+        .sum()
 }
 
 /// Stamp the rolling breakpoint on the last content block of the last message. Returns whether one
 /// was placed — a conversation with no messages, or whose final message has no content blocks, has
 /// nothing to cache and must not consume a slot.
 fn stamp_tail_breakpoint(messages: &mut [Value]) -> bool {
+    // What pushes the previous round's tail entry out of Anthropic's backward search is the number
+    // of blocks appended *since* it — the assistant turn plus the tool results answering it, not
+    // the final message alone. A round appending a 15-block assistant message and a 10-block
+    // tool-result message is a guaranteed re-write that counting only the last message misses.
+    // Approximated by the last two messages, which is exactly one round's append on the agent loop.
+    // Nothing to do about it inside a full breakpoint budget — but say so, because the whole point
+    // of C-134 is that a cache miss should never be silent.
+    let appended = blocks_appended_since_tail(messages);
+    if appended > CACHE_LOOKBACK_BLOCKS {
+        tracing::debug!(
+            blocks = appended,
+            window = CACHE_LOOKBACK_BLOCKS,
+            "conversation tail exceeds the prompt-cache lookback window; this round's tail is a \
+             cache write, not a read"
+        );
+    }
     let Some(last) = messages.last_mut() else {
         return false;
     };
@@ -207,18 +252,6 @@ fn stamp_tail_breakpoint(messages: &mut [Value]) -> bool {
     let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut) else {
         return false;
     };
-    // The final message alone exceeding the window means the previous round's tail entry is
-    // certainly out of Anthropic's backward search range, so this tail will be written rather than
-    // read. Nothing to do about it inside a full breakpoint budget — but say so, because the whole
-    // point of C-134 is that a cache miss should never be silent.
-    if blocks.len() > CACHE_LOOKBACK_BLOCKS {
-        tracing::debug!(
-            blocks = blocks.len(),
-            window = CACHE_LOOKBACK_BLOCKS,
-            "conversation tail exceeds the prompt-cache lookback window; this round's tail is a \
-             cache write, not a read"
-        );
-    }
     let Some(block) = blocks.last_mut() else {
         return false;
     };
@@ -238,6 +271,7 @@ fn segmented_system_field(
     segments: &[flux_provider::SystemSegment],
     folded: Option<&str>,
     caching: bool,
+    extended_ttl: bool,
     reserved: usize,
 ) -> Value {
     if caching {
@@ -248,7 +282,7 @@ fn segmented_system_field(
             .map(|(i, seg)| {
                 let mut b = json!({ "type": "text", "text": seg.text });
                 if keep.contains(&i) {
-                    b["cache_control"] = stable_cache_control();
+                    b["cache_control"] = stable_cache_control(extended_ttl);
                 }
                 b
             })
@@ -582,6 +616,13 @@ fn map_messages_stream_inner(
                         if u.cache_creation_input_tokens == 0 {
                             u.cache_creation_input_tokens = prior_usage.cache_creation_input_tokens;
                         }
+                        // The 1h split (C-135) rides the same frame as the write total, so it must
+                        // be carried forward with it — otherwise a delta zeroes the extended tier
+                        // while the total survives, and the write silently re-prices as 5m.
+                        if u.cache_creation_1h_input_tokens == 0 {
+                            u.cache_creation_1h_input_tokens =
+                                prior_usage.cache_creation_1h_input_tokens;
+                        }
                         if u.cache_read_input_tokens == 0 {
                             u.cache_read_input_tokens = prior_usage.cache_read_input_tokens;
                         }
@@ -632,10 +673,20 @@ mod tests {
     fn anthropic_quirks() -> MessagesQuirks {
         MessagesQuirks {
             prompt_caching: true,
+            extended_cache_ttl: true,
             thinking_adaptive: true,
             effort_output_config: true,
             sampling_params: true,
             extra_body: Default::default(),
+        }
+    }
+
+    /// Quirks matching a gateway that proxies the Messages shape but was never verified with the
+    /// extended cache TTL (Bedrock, OpenRouter's anthropic-served slugs): caching on, 1h off.
+    fn gateway_quirks() -> MessagesQuirks {
+        MessagesQuirks {
+            extended_cache_ttl: false,
+            ..anthropic_quirks()
         }
     }
 
@@ -963,6 +1014,103 @@ mod tests {
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h", "{body}");
     }
 
+    /// Drive an SSE body through the Messages codec and return the last `Usage` chunk it yielded.
+    async fn last_usage(sse: &'static str) -> flux_core::Usage {
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+        let mut usage = None;
+        let mut stream = map_messages_stream(byte_stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.expect("chunk") {
+                usage = Some(u);
+            }
+        }
+        usage.expect("a usage chunk")
+    }
+
+    /// C-135: Anthropic reports the cache-write tier split per TTL under `usage.cache_creation`.
+    /// The 1h portion is billed at 2x base input against 1.25x for the five-minute default, so
+    /// dropping it silently under-reports the cost of exactly the prefix this epic made 1h.
+    #[tokio::test]
+    async fn usage_captures_the_one_hour_cache_write_split() {
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\
+             \"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":900,\
+             \"cache_creation_input_tokens\":500,\
+             \"cache_creation\":{\"ephemeral_1h_input_tokens\":400,\"ephemeral_5m_input_tokens\":100}}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\
+             \"usage\":{\"output_tokens\":42}}\n\n",
+        );
+        let usage = last_usage(sse).await;
+        assert_eq!(usage.cache_creation_input_tokens, 500);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 400, "1h split");
+        // The subset must not inflate the prompt: context is input + read + the write TOTAL.
+        assert_eq!(usage.context_tokens(), 100 + 900 + 500);
+        // …and it survives the output-only delta frame that carries the write total forward.
+        assert_eq!(usage.output_tokens, 42);
+    }
+
+    /// A gateway that reports no per-TTL breakdown leaves the extended tier at zero, so the write
+    /// prices as an ordinary one — which is correct, since those profiles send no `ttl`.
+    #[tokio::test]
+    async fn usage_without_a_split_reports_no_extended_writes() {
+        let sse = "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\
+             \"input_tokens\":100,\"output_tokens\":1,\"cache_creation_input_tokens\":500}}}\n\n";
+        let usage = last_usage(sse).await;
+        assert_eq!(usage.cache_creation_input_tokens, 500);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
+    }
+
+    /// C-135: a caching profile that did **not** verify the extended TTL (Bedrock's Anthropic
+    /// passthrough, OpenRouter's anthropic-served slugs) still caches the stable prefix, but on the
+    /// five-minute default. Sending an optional field a gateway may reject would fail *every*
+    /// request on a path this epic never measured — same rule as `thinking_adaptive` (C-49).
+    #[test]
+    fn a_gateway_profile_caches_without_the_extended_ttl() {
+        use flux_provider::SystemSegment;
+        let mut req = Request::new("anthropic/claude-sonnet-4.6", "hi");
+        req.system_segments = vec![SystemSegment {
+            text: "x".repeat(CACHE_MIN_CHARS),
+            cache: true,
+        }];
+        let body = build_messages_body(&req, &gateway_quirks()).unwrap();
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            serde_json::json!({ "type": "ephemeral" }),
+            "the breakpoint must stay, without a ttl member: {body}"
+        );
+
+        // Unsegmented path too — one `system` string long enough to be worth caching.
+        let mut plain = Request::new("anthropic/claude-sonnet-4.6", "hi");
+        plain.system = Some("y".repeat(CACHE_MIN_CHARS));
+        let body = build_messages_body(&plain, &gateway_quirks()).unwrap();
+        assert!(!body.to_string().contains("1h"), "{body}");
+        assert_eq!(count_cache_control(&body), 1, "{body}");
+    }
+
+    /// The profiles decide it, so pin the resolved quirk per provider — this is the field that
+    /// reaches the wire.
+    #[test]
+    fn only_the_anthropic_direct_profile_asks_for_the_extended_ttl() {
+        assert!(
+            crate::anthropic::AnthropicProfile
+                .quirks_for("claude-opus-4-8")
+                .extended_cache_ttl
+        );
+        assert!(
+            !crate::bedrock::BedrockProfile
+                .quirks_for("us.anthropic.claude-sonnet-4-6-v1:0")
+                .extended_cache_ttl
+        );
+        assert!(
+            !crate::openrouter::OpenRouterProfile
+                .quirks_for("anthropic/claude-sonnet-4.6")
+                .extended_cache_ttl
+        );
+    }
+
     /// C-135: a profile without prompt caching (ollama-anthropic) must not leak a TTL — or any
     /// `cache_control` — onto the wire.
     #[test]
@@ -1115,6 +1263,31 @@ mod tests {
             appended > CACHE_LOOKBACK_BLOCKS,
             "this round appends {appended} blocks, beyond the {CACHE_LOOKBACK_BLOCKS}-block window: \
              the previous round's tail entry is out of range and this tail is written, not read"
+        );
+    }
+
+    /// The gap the block count exists to surface is what a *round* appends — assistant blocks plus
+    /// the tool results answering them — not the final message alone. Counting only the last
+    /// message silently missed the split case, which is the common shape on the agent loop.
+    #[test]
+    fn appended_blocks_span_the_round_not_just_the_last_message() {
+        let msg = |n: usize| {
+            json!({
+                "role": "user",
+                "content": (0..n).map(|i| json!({"type": "text", "text": format!("b{i}")})).collect::<Vec<_>>(),
+            })
+        };
+        // 15 assistant blocks + 10 tool-result blocks = 25 appended: over the window, even though
+        // neither message alone is.
+        let split = vec![msg(1), msg(15), msg(10)];
+        assert_eq!(blocks_appended_since_tail(&split), 25);
+        assert!(blocks_appended_since_tail(&split) > CACHE_LOOKBACK_BLOCKS);
+        // A quiet round stays under it.
+        assert_eq!(blocks_appended_since_tail(&[msg(1), msg(2)]), 3);
+        // A string-content message contributes nothing rather than panicking.
+        assert_eq!(
+            blocks_appended_since_tail(&[json!({"role": "user", "content": "plain"})]),
+            0
         );
     }
 

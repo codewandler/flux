@@ -124,6 +124,74 @@ a regression (25% on vs 50% off) and inverted on the repeat, so it was shard war
 `prompt_cache_key` partitioning the cache per session. Worth knowing that the suspicion was tested
 rather than assumed.
 
+**Root cause of the remaining codex gap: flux uses the codex WebSocket wrong (C-159).** The `codex`
+provider defaulted to a WS transport (C-07) that opens a **fresh socket per request** and resends the
+whole `input`. Measured with `FLUX_CODEX_WS` as the control, same prompt, 1 step per run, both orders:
+
+| order | transport | hit rates | mean |
+|---|---|---|---:|
+| WS first | WS | 0%, 0%, 0% | 0% |
+| WS first | HTTP | 0%, 50%, 53% | 34% |
+| HTTP first | HTTP | 42%, 55%, **97%** | 65% |
+| HTTP first | WS | 0%, 20%, 0% | 7% |
+
+**WS ~3% vs HTTP ~50%**, order-independent: HTTP ran first (cold) in the second batch and still
+reached 97%, while WS ran second against a warm cache and got 0/20/0. Cost tracked it — ~$0.02 on a
+97% HTTP run against ~$0.14 on a 0% WS run — with no latency advantage for WS.
+
+The first explanation drafted for this was *"a websocket is routed at upgrade time, so
+`prompt_cache_key` arrives too late to steer it"*. **That was wrong**, and reading the upstream client
+(`openai/codex`, `codex-rs/core/src/client.rs`) says why: caching on WS works fine, through a
+session-scoped design flux does not implement.
+
+| upstream | flux today |
+|---|---|
+| One `ApiWebSocketConnection` cached and **reused** across requests, gated by `responses_request_properties_match` | a **fresh socket per request** |
+| **Prewarms** the socket (`response.create` with `generate=false`) so the next request reuses the connection *and* its `previous_response_id` | no prewarm |
+| Replays the server-issued **`x-codex-turn-state`** token as a request header for every request in the turn — sticky routing | never sent, on **either** transport |
+| Reuse sends `previous_response_id` + **only the new items**, so the conversation is never resent | resends the whole `input` every round |
+| `prompt_cache_key` = the session id | ✅ (C-136) |
+
+So every flux WS request reaches an arbitrary node with a full cold prompt. HTTP wins today only
+because flux's stateless usage costs it less there — **the HTTP default is interim**, and C-159 is the
+real fix. Note the third row: flux is missing sticky routing on HTTP too, so ~50% is probably not the
+ceiling there either.
+
+**The most effective way to drive codex**, then, is upstream's shape: one reused (prewarmed)
+connection per session, `x-codex-turn-state` replayed for stickiness, `prompt_cache_key` = session id,
+and only the incremental items with `previous_response_id` — which also stops re-sending the
+transcript at all, a token win independent of the cache.
+
+Also found and fixed while investigating: the Responses codec dropped
+`input_tokens_details.cache_write_tokens`, which this wire *does* report — so every codex row in
+`flux usage` showed a blank cache-write column and a cached prefix appeared to come from nowhere.
+
+### Review pass (2026-07-28)
+
+A code review of the epic surfaced two correctness gaps in what had already landed, both fixed here:
+
+- **The extended TTL was reaching providers it was never measured on.** `ttl: "1h"` rode
+  `prompt_caching`, which is also true for Bedrock and for OpenRouter's `anthropic/*` slugs — a
+  gateway that rejects an unknown `cache_control` member would have failed *every* request with a
+  long system prompt. It is now its own quirk (`MessagesQuirks::extended_cache_ttl`), on for the
+  Anthropic-direct profile (which `claude` shares) and off everywhere else; those paths keep the
+  caching, at the five-minute default. Same rule as C-49's per-model gating: send an optional field
+  only where it is known good.
+- **The 1h write was billed at the 5m rate.** Anthropic charges 2x base input for an extended write
+  against 1.25x for the default, and the pricing table hard-codes 1.25x — so this epic *increased*
+  the write tier while under-reporting exactly that tier. `Usage` now carries
+  `cache_creation_1h_input_tokens` (parsed from Anthropic's `usage.cache_creation` per-TTL split, a
+  subset of the write total) and `Rates` a `cache_write_1h` surcharge (0.75x input on Anthropic
+  rows), mirroring how the reasoning and audio subsets are priced. The A/B figures below were taken
+  before this correction, so the "2.5x cheaper" number is the optimistic end of the range.
+
+Also fixed, smaller: the CLI's per-call usage fold shadowed the `--trace-loop` model-call line
+(unreachable `else if`); `turn_end` dropped the cache segment entirely on surfaces that emit no
+`model.call` observation (the flow path) instead of falling back to the turn snapshot; the
+lookback warning counted only the final message rather than the round's whole append; `/compact`
+reset the `/usage` overlay's just-finished turn; and `bench/cache-ab.sh` picked the Anthropic kill
+switch for an unprefixed model spec, silently running both arms identically.
+
 **Codex prefix caching is improved, not solved.** ~6% on long turns is well below the 15–31% the
 whole-history baseline shows for codex models, and there is no codex analogue of the conversation-tail
 breakpoint available: the Responses wire has no explicit breakpoints to place, only an automatic

@@ -14,6 +14,13 @@ use serde_json::{Map, Value};
 pub struct MessagesQuirks {
     /// Mark a long system prompt with `cache_control: ephemeral` (Anthropic prompt caching).
     pub prompt_caching: bool,
+    /// Stamp the **stable** prefix's breakpoint with the extended `ttl: "1h"` (C-135) instead of the
+    /// five-minute default. Off by default and deliberately narrow: the extended TTL is an
+    /// Anthropic-direct field, verified on that wire only. Bedrock's Anthropic passthrough and
+    /// OpenRouter's proxy were never measured with it and can reject an unknown `cache_control`
+    /// member outright — turning a working default path into an error on *every* request. Same
+    /// precedent as `thinking_adaptive`: send an optional field only where it is known good.
+    pub extended_cache_ttl: bool,
     /// Emit `thinking: {"type": "adaptive"}` when the request asks for extended thinking.
     pub thinking_adaptive: bool,
     /// Emit `output_config: {"effort": …}` from the request's effort hint.
@@ -30,6 +37,7 @@ impl Default for MessagesQuirks {
     fn default() -> Self {
         MessagesQuirks {
             prompt_caching: false,
+            extended_cache_ttl: false,
             thinking_adaptive: false,
             effort_output_config: false,
             // The permissive default: every pre-quirk body emitted these, and only the newest

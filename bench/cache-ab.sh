@@ -26,8 +26,8 @@ FLUX="${FLUX_BIN:-./target/debug/flux}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -m) MODEL="$2"; shift 2 ;;
-    -n) RUNS="$2"; shift 2 ;;
+    -m) MODEL="${2:?-m needs a provider/model}"; shift 2 ;;
+    -n) RUNS="${2:?-n needs a run count}"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) break ;;
   esac
@@ -49,9 +49,17 @@ fi
 #     variable is the conversation-tail breakpoint: FLUX_CACHE_TAIL=off.
 #   OpenAI Responses (codex/openai) — automatic prefix caching, so the variables are the routing key
 #     and keeping per-turn text out of `instructions`: FLUX_RESPONSES_CACHE=off.
-case "${MODEL%%/*}" in
-  codex|openai) KILL_SWITCH="FLUX_RESPONSES_CACHE" ;;
-  *)            KILL_SWITCH="FLUX_CACHE_TAIL" ;;
+# A spec with no `provider/` prefix leaves ${MODEL%%/*} equal to the whole string, so match the
+# bare model id too — otherwise a Responses model picks the Anthropic kill switch, which does
+# nothing on that wire, and BOTH arms run the identical body while reporting "no difference".
+case "$MODEL" in
+  codex/*|openai/*|gpt-*|o[0-9]*|*-codex) KILL_SWITCH="FLUX_RESPONSES_CACHE" ;;
+  anthropic/*|claude/*|aws/*|openrouter*|ollama*) KILL_SWITCH="FLUX_CACHE_TAIL" ;;
+  *)
+    echo "unrecognised model spec '$MODEL' — prefix it with its provider (claude/…, codex/…) so the" >&2
+    echo "control arm can pick the right kill switch; otherwise both arms run the same body." >&2
+    exit 2
+    ;;
 esac
 
 arm() { # $1 = on|off

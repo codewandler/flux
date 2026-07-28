@@ -3033,6 +3033,28 @@ mod tests {
         assert!(turn_level.contains("ctx 100.0k"), "{turn_level}");
     }
 
+    /// A surface that emits no `model.call` observations (the flow path's `ai_segment`) leaves the
+    /// per-call fold empty. Rendering it anyway drops the cache segment entirely — worse than the
+    /// last-round approximation it replaced — so an empty fold must fall back to the turn snapshot.
+    #[test]
+    fn an_empty_per_call_fold_falls_back_to_the_turn_snapshot() {
+        let turn = flux_core::Usage {
+            input_tokens: 10_000,
+            output_tokens: 100,
+            cache_read_input_tokens: 90_000,
+            ..Default::default()
+        };
+        let empty = flux_core::CacheEfficiency::default();
+        assert!(empty.is_empty());
+        // Rendered against the empty fold, the cache tiers vanish…
+        let dropped = crate::rendering::usage_annotation_with_cache(&turn, &empty);
+        assert!(!dropped.contains("cache"), "{dropped}");
+        // …so the fallback (what `turn_end` now selects) must still surface them.
+        let fallback = crate::rendering::usage_annotation(&turn);
+        assert!(fallback.contains("cache 90%"), "{fallback}");
+        assert!(fallback.contains("↺90.0k"), "{fallback}");
+    }
+
     /// `cost_annotation` formats metered spend as `$X`, subscription spend (claude/codex) as the
     /// *equivalent metered cost* `~$X (sub)` (it bills against a flat sub, not the API), and a
     /// zero-cost turn as empty (C-05).

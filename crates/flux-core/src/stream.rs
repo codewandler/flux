@@ -20,6 +20,14 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+    /// Cache-creation tokens written at the **one-hour** TTL (C-135) — a **subset of
+    /// `cache_creation_input_tokens`**, so it is deliberately not added in [`Self::total`] /
+    /// [`Self::context_tokens`], mirroring `reasoning_tokens`. Anthropic prices the 1h write at 2x
+    /// base input against 1.25x for the five-minute default, and reports the split under
+    /// `usage.cache_creation`; without this field every 1h write is billed as a 5m one and the
+    /// stable prefix looks cheaper than it is. `#[serde(default)]` keeps old event logs decodable.
+    #[serde(default)]
+    pub cache_creation_1h_input_tokens: u64,
     /// Reasoning / "thinking" tokens generated this call. These are a **subset of
     /// `output_tokens`** (the provider already counts them there), so they are deliberately **not**
     /// added in [`Self::total`] or [`Self::context_tokens`] — doing so would double-count. They are
@@ -82,6 +90,7 @@ impl Usage {
             self.input_tokens = call.input_tokens;
             self.cache_read_input_tokens = call.cache_read_input_tokens;
             self.cache_creation_input_tokens = call.cache_creation_input_tokens;
+            self.cache_creation_1h_input_tokens = call.cache_creation_1h_input_tokens;
             self.audio_input_tokens = call.audio_input_tokens;
         }
         // Reported cost is spend, not a snapshot — like output tokens, every call's slice adds to
@@ -101,6 +110,7 @@ impl Usage {
         self.input_tokens += call.input_tokens;
         self.output_tokens += call.output_tokens;
         self.cache_creation_input_tokens += call.cache_creation_input_tokens;
+        self.cache_creation_1h_input_tokens += call.cache_creation_1h_input_tokens;
         self.cache_read_input_tokens += call.cache_read_input_tokens;
         self.reasoning_tokens += call.reasoning_tokens;
         self.audio_input_tokens += call.audio_input_tokens;
@@ -270,6 +280,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 4,
             cache_creation_input_tokens: 3,
+            cache_creation_1h_input_tokens: 1,
             cache_read_input_tokens: 2,
             reasoning_tokens: 1,
             audio_input_tokens: 2,
@@ -280,6 +291,7 @@ mod tests {
             input_tokens: 20,
             output_tokens: 8,
             cache_creation_input_tokens: 6,
+            cache_creation_1h_input_tokens: 2,
             cache_read_input_tokens: 4,
             reasoning_tokens: 2,
             audio_input_tokens: 4,
@@ -288,6 +300,8 @@ mod tests {
         });
 
         assert_eq!(total.input_tokens, 30);
+        // The 1h tier is a subset of the writes and sums the same way.
+        assert_eq!(total.cache_creation_1h_input_tokens, 3);
         assert_eq!(total.output_tokens, 12);
         assert_eq!(total.cache_creation_input_tokens, 9);
         assert_eq!(total.cache_read_input_tokens, 6);
@@ -492,6 +506,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 5_000,
             cache_creation_input_tokens: 200,
+            cache_creation_1h_input_tokens: 150,
             cache_read_input_tokens: 700,
             reasoning_tokens: 4_000,
             audio_input_tokens: 50,
@@ -499,6 +514,8 @@ mod tests {
             reported_cost_usd: Some(1.0),
         });
         assert_eq!(eff.read, 700);
+        // The write tier is the whole cache_creation figure — the 1h split is a subset of it, not
+        // an extra tier, so folding must not double-count it.
         assert_eq!(eff.write, 200);
         assert_eq!(eff.fresh, 100);
         // The three tiers reconstruct exactly one call's context_tokens().

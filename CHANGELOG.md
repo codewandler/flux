@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+**Breaking (pub surface, embedders only).** `flux_core::Usage` gained
+`cache_creation_1h_input_tokens` and `flux_core::Rates` gained `cache_write_1h` (with the matching
+`RateOverride` field), so struct literals that name every field need updating — `..Default::default()`
+callers are unaffected. Both are subset/surcharge tiers: the extended-TTL cache write Anthropic bills
+at 2x base input. Per flux's SemVer rule this rides the next MINOR.
+
 ### Added
 
 - **LLM cache review (epic [llm-cache-review](docs/designs/llm-cache-review.md); C-133…C-140 +
@@ -35,10 +41,36 @@ All notable changes to this project are documented in this file. The format is b
   - **Codex prefix caching (C-136/C-137).** `prompt_cache_key` (derived per session, hashed) so
     successive rounds route to the same cache shard — verified accepted by the ChatGPT backend — and
     the per-turn system segment no longer flattens into `instructions` at the front of the cacheable
-    prefix, where it invalidated everything behind it. Measured against
-    `FLUX_RESPONSES_CACHE=off`: a long multi-round codex turn goes from **0% to ~6%** cached in both
-    arm orders; single-round turns are unchanged. Improved, not solved — the Responses wire offers no
-    explicit breakpoints to place, only an automatic prefix match to feed.
+    prefix, where it invalidated everything behind it.
+  - **Fixed: codex was throwing its prompt cache away on the WebSocket transport.** The `codex`
+    provider now defaults to HTTP+SSE (`FLUX_CODEX_WS=on` opts back into the WS path). flux opened a
+    **fresh socket per request** and resent the whole conversation, so every request reached an
+    arbitrary node with a cold prompt: measured ~3% cache hit on WS against ~**50%** on HTTP, same
+    prompt and both arm orders, reaching **97%** on a warm HTTP run (~$0.02 vs ~$0.14 equivalent cost,
+    with no latency advantage for WS). Upstream's client caches and prewarms one connection per
+    session, replays the server's `x-codex-turn-state` sticky-routing token, and sends only the new
+    items with `previous_response_id` — flux does none of that yet, so the HTTP default is an interim
+    measure tracked by C-159, not the end state.
+  - **Fixed: the extended cache TTL only goes to the wire that was measured.** `ttl: "1h"` rode the
+    `prompt_caching` quirk, so it also reached Bedrock and OpenRouter's anthropic-served slugs — a
+    gateway rejecting an unknown `cache_control` member would have failed every request with a long
+    system prompt. It is now its own quirk, on for Anthropic-direct (and `claude`) only; the other
+    paths keep the caching at the five-minute default.
+  - **Fixed: extended-TTL cache writes are now priced as such.** Anthropic bills a 1h write at 2x
+    base input against 1.25x for the default, and the table only knew the 1.25x figure — so the
+    epic raised the write tier while under-reporting exactly it. `Usage` gained
+    `cache_creation_1h_input_tokens` (from Anthropic's per-TTL `cache_creation` split) and `Rates` a
+    `cache_write_1h` surcharge, both subsets/surcharges like the existing reasoning and audio tiers.
+  - **Fixed: `--trace-loop` printed no model-call lines.** The per-call cache fold matched
+    `model.call` first, leaving the trace arm unreachable.
+  - **Fixed: the cache segment vanished on `flux flow run`.** Turn-end rendering read only the
+    per-call fold, which is empty on surfaces that emit no `model.call` observation; it now falls
+    back to the turn snapshot.
+  - **Fixed: `/compact` cleared the `/usage` overlay's finished turn.** Only a turn resets the
+    per-turn view now; session totals were never affected.
+  - **Fixed: codex cache writes were invisible.** The Responses codec dropped
+    `input_tokens_details.cache_write_tokens`, which that wire does report, so every codex row in
+    `flux usage` showed a blank cache-write column and a cached prefix appeared to come from nowhere.
   - **A no-op capability signal is now a no-op (A-95).** Re-signalling a family the turn already
     held still rewrote the intent declaration, churning the prompt prefix for zero capability gain.
   - `bench/cache-ab.sh` A/Bs the tail breakpoint against the kill switch, and the model trace reports

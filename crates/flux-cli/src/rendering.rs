@@ -717,6 +717,12 @@ impl AgentSink for CliSink {
             {
                 self.turn_cache.add(&usage);
             }
+            // A-39: the per-call trace line lives on this same observation. It must be printed
+            // *here* — a later `else if o.kind == "model.call"` arm can never be reached once this
+            // one matches, which silently emptied `--trace-loop` when the C-139 fold was added.
+            if flux_flow::engine::show_loop() {
+                eprintln!("{}", style::dim(&format_model_call(o)));
+            }
         } else if o.kind == flux_evidence::KIND_DESTRUCTIVE {
             eprintln!(
                 "{}",
@@ -752,8 +758,6 @@ impl AgentSink for CliSink {
             );
         } else if o.kind == "turn.cancelled" {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
-        } else if o.kind == "model.call" && flux_flow::engine::show_loop() {
-            eprintln!("{}", style::dim(&format_model_call(o)));
         } else if o.kind == "loop.phase" {
             self.record_phase(o);
         } else if o.kind == flux_evidence::KIND_TURN_INTENT
@@ -805,9 +809,18 @@ impl AgentSink for CliSink {
         // The right-hand token annotation: context-window occupancy, generated tokens, cache + hit-rate.
         // `ctx` comes from the turn usage (occupancy); the cache tiers come from the per-call fold,
         // so the hit rate is the turn's, not its last round's (C-139).
+        // The per-call fold is the better source (C-139) — but only surfaces on paths that emit
+        // `model.call` observations. `flux flow run`'s `ai_segment` doesn't, so fall back to the
+        // turn snapshot rather than dropping the cache segment entirely on those surfaces.
         let token_inline = usage
             .as_ref()
-            .map(|u| usage_annotation_with_cache(u, &self.turn_cache))
+            .map(|u| {
+                if self.turn_cache.is_empty() {
+                    usage_annotation(u)
+                } else {
+                    usage_annotation_with_cache(u, &self.turn_cache)
+                }
+            })
             .unwrap_or_default();
         // The dollar cost of this turn's tokens, when a model spec + pricing table were attached.
         let cost_inline = self.cost_inline(usage.as_ref());

@@ -2134,9 +2134,6 @@ impl ChatState {
         let id = self.next_action_id;
         self.next_action_id = self.next_action_id.saturating_add(1);
         self.active_action_id = Some(id);
-        // C-140: a new action is a new turn — the overlay's per-turn view starts empty. Session
-        // totals are deliberately untouched.
-        self.begin_turn_usage();
         id
     }
 
@@ -3782,6 +3779,10 @@ fn start_turn(
     input: String,
 ) -> CancellationToken {
     let action_id = state.begin_action();
+    // C-140: a new *turn* starts the overlay's per-turn view empty. Deliberately here rather than
+    // in `begin_action`, which also covers `/compact` — a maintenance action that would otherwise
+    // erase the usage of the turn the user just watched finish. Session totals are untouched.
+    state.begin_turn_usage();
     state.follow = true;
     state.unread = 0;
     state.record_history(&input);
@@ -5444,6 +5445,41 @@ mod tests {
             "only the changed round: {content}"
         );
         assert!(content.contains("session Σ"), "{content}");
+    }
+
+    /// C-140: only a *turn* resets the per-turn view. `/compact` is a maintenance action that goes
+    /// through the same `begin_action` bookkeeping, and resetting there erased the usage of the turn
+    /// the user had just watched finish — `/usage` read 0% with no rounds while the session totals
+    /// still showed the spend.
+    #[test]
+    fn a_maintenance_action_keeps_the_finished_turns_usage() {
+        let mut state = ChatState::new("claude/claude-fable-5".into());
+        state.record_call_usage(
+            "claude/claude-fable-5",
+            "explore",
+            12,
+            &Usage {
+                input_tokens: 10_000,
+                output_tokens: 10,
+                cache_read_input_tokens: 90_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.turn_rounds.len(), 1);
+
+        // `/compact` (and any other non-turn action) allocates an action id but is not a new turn.
+        let _ = state.begin_action();
+        assert_eq!(
+            state.turn_rounds.len(),
+            1,
+            "the finished turn's rounds survive"
+        );
+        assert_eq!(state.turn_cache.read, 90_000);
+
+        // The next real turn does clear it.
+        state.begin_turn_usage();
+        assert!(state.turn_rounds.is_empty());
+        assert!(state.turn_cache.is_empty());
     }
 
     /// C-140: `/usage` is a registered built-in and the command path opens the overlay — the wiring
