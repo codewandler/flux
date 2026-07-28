@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-28
+
 ### Added
 
 - **C-180…C-182: where the turn's wall clock actually went.** The TUI attributed execution time to

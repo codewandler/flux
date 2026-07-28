@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-28
+
 ### New
 
 - **The chat UI now shows where your time went.** Each model reply carries a badge with how long
