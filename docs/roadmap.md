@@ -80,10 +80,25 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
-> and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> **v0.31.0** is released — that MINOR retired the `openrouter-anthropic` provider name (the wire is
+> now per-model on plain `openrouter`) and carried the embedder-only `ApprovalView` reshape. See
+> [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### Unify the Anthropic Messages provider — gateways become config (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-168…C-172, all five stories; unreleased)**
+### Turn latency visibility — where the wall clock actually went (epic) — ✅ **SHIPPED v0.31.0 (2026-07-28; C-180…C-182, all three stories)**
+
+The TUI attributed execution time to operations and nothing else, so the largest component of almost
+every turn — waiting on the model — was invisible, and a 30s backoff storm looked identical to a
+model thinking hard. C-180 surfaces per-call model time and TTFT on each round's transcript badge,
+live in the footer, and as an `llm` split in the closing summary; C-181 adds a `RetryObserver` seam
+in `flux-provider` so connect-phase retries, OAuth refreshes and transport fallbacks are announced
+*before* their backoff sleep (plus counted on `model.call`); C-182 makes the plan-approval sheet
+list the operations it is asking to authorize instead of a bare count. The retry types were sealed
+`#[non_exhaustive]` before their first crates.io publication in the same release. Known follow-ups
+from the shared code review remain open: the footer badge outlives the recovered call, and the
+observer is wired at the staged model stages but not yet compaction/cognition. Design:
+[designs/turn-latency-visibility.md](designs/turn-latency-visibility.md).
+
+### Unify the Anthropic Messages provider — gateways become config (epic) — ✅ **SHIPPED v0.31.0 (2026-07-28; C-168…C-173, all six stories incl. the review follow-up)**
 
 The [LLM cache review](designs/llm-cache-review.md) closed with one finding it deliberately left
 unfiled, because the epic was scoped to `claude` and `codex`: `openrouter/anthropic/*` runs at
@@ -508,7 +523,7 @@ tokens, re-scoped to clients that render them), L-70 (incremental sync + comment
 is the subject of the follow-up epic below. Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
 [designs/flux-lsp.md](designs/flux-lsp.md).
 
-### flux-lsp round 2 — from "capability present" to "capability correct" (epic) — ✅ **IMPLEMENTED 2026-07-28 (L-85…L-91, all seven stories; unreleased)**
+### flux-lsp round 2 — from "capability present" to "capability correct" (epic) — ✅ **SHIPPED v0.30.1 (2026-07-28; L-85…L-91, all seven stories)**
 
 The first LSP epic answered *"does `.flux` have editor support at all?"* — yes, and the binary
 ships. Reading `crates/flux-lsp/src/main.rs` against what its `initialize` advertises answers the
