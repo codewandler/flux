@@ -15,6 +15,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Integration plugins now follow you into a worktree.** After entering an isolated worktree,
+  flux's own tools worked there — but operations run by integration plugins (kubectl, gitlab, …)
+  quietly kept running in the original checkout. Plugin operations now run in the same directory
+  as everything else, switching when you enter and switching back when you leave.
+
 ### Improved
 
 - **Long codex sessions got cheaper and lighter on the wire.** flux now keeps one live connection

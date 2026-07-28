@@ -1191,6 +1191,9 @@ pub(super) async fn build_agent_with(
     let system = Arc::new(
         System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
     );
+    // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
+    // capabilities and the executor's context share one view of worktree transitions.
+    let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
 
     // Project context folded into the system prompt: environment, git working-tree state, repo
     // shape/stack, and project conventions (CLAUDE.md/AGENTS.md) — so the agent isn't cold-starting.
@@ -1328,6 +1331,9 @@ pub(super) async fn build_agent_with(
 
     let integrations = assemble_integrations(
         system.clone(),
+        Arc::new(super::app_cmd::WorkspaceSystemSource(
+            session_workspace.clone(),
+        )),
         backend.clone(),
         false,
         &cfg,
@@ -1410,6 +1416,7 @@ pub(super) async fn build_agent_with(
         Some(spawner.clone()),
         hooks,
     )
+    .with_workspace(session_workspace)
     .into_executor();
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(

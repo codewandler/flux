@@ -31,10 +31,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 _None._
 
 ## Next (ready — take the top one unless the user named a story)
-
-### Context-local Git worktrees
-_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
-- [C-122 — Plugin hosts should follow a worktree transition](C-122-plugin-root-follows-worktree.md) · Core · v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter
+_None._
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
@@ -328,6 +325,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
 - [C-120 — Allocate agent worktrees on real disk, not /tmp](C-120-disk-backed-worktree-allocation.md) · Core · base = $FLUX_WORKTREE_DIR else ~/.flux/worktrees; /tmp is commonly a RAM-backed tmpfs a worktree build would fill
 - [C-121 — Tell the model per turn when its context is inside a worktree](C-121-worktree-turn-note.md) · Core · per-turn <workspace-note> in the base system while a worktree session is active; assembly-time project context stays untouched
+- [C-122 — Plugin hosts should follow a worktree transition](C-122-plugin-root-follows-worktree.md) · Core · v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter
 - [C-133 — Cache-efficiency telemetry + a repeatable A/B harness — measure before fixing](C-133-cache-efficiency-telemetry-and-harness.md) · Core · `flux usage` is already CORRECT (per-call CallUsage, measured 32% over 813 calls) — the gap is the live path: TurnEnded.usage is the last round only, the model trace has no per-round cache split, and there is no repeatable scenario to A/B a fix against
 - [C-134 — Cache the conversation tail — a rolling breakpoint on the last message block](C-134-conversation-tail-cache-breakpoint.md) · Core · flux never stamps cache_control anywhere in `messages` (only system_field/segmented_system_field do, mod.rs:127,140; ContentBlock has no carrier) — so the cacheable prefix stops where the system prompt ends and the whole growing transcript is re-priced at full input rate every round
 - [C-135 — 1-hour TTL on the stable tools+system prefix — survive interactive pauses](C-135-one-hour-cache-ttl-stable-prefix.md) · Core · no `ttl` field is set anywhere in flux-providers — every breakpoint rides the 5-minute default, so a human reading output for six minutes cold-starts the whole prefix on the next turn; likely the entire claude-vs-anthropic delta for interactive subscription use

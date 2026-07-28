@@ -22,6 +22,18 @@ pub(super) async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Resu
     run_app(Some(path), flags, None).await
 }
 
+/// A [`flux_plugin::SystemSource`] over the session's [`flux_runtime::WorkspaceContext`] (C-122):
+/// plugin host capabilities resolve the guarded system through the same handle the worktree tools
+/// drive, so `process.run`/`process.spawn` from a plugin execute in the context's *active* root.
+/// Lives at the surface because flux-plugin deliberately has no runtime dependency.
+pub(super) struct WorkspaceSystemSource(pub(super) flux_runtime::WorkspaceContext);
+
+impl flux_plugin::SystemSource for WorkspaceSystemSource {
+    fn system(&self) -> Arc<System> {
+        self.0.active()
+    }
+}
+
 /// Build one plugin's [`HostCapabilities`](flux_plugin::HostCapabilities) for every CLI surface:
 /// the guarded `System` + datasource bridge + endpoint-broker fan-out, with shared egress-audit,
 /// cross-plugin resolver, and redactor-backed secret sink hooks. A resolved credential is
@@ -29,7 +41,7 @@ pub(super) async fn run_app_cmd(prompt: Vec<String>, flags: &AgentFlags) -> Resu
 /// private-net admission is recorded through `audit`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn integration_plugin_caps(
-    system: Arc<System>,
+    system: Arc<dyn flux_plugin::SystemSource>,
     backend: Arc<dyn flux_capabilities::DatasourceBackend>,
     datasource_bridge: bool,
     manifest: &flux_plugin::PluginManifest,
@@ -43,7 +55,7 @@ pub(super) fn integration_plugin_caps(
     // redactor-backed secret sink BEFORE optionally adding the App-only datasource bridge and the
     // endpoint-broker host-caps. The flag preserves the pre-consolidation surface contract: plain
     // coding-agent plugins never had App datasource declarations to contribute into.
-    let system_caps = flux_plugin::SystemHostCaps::new(system)
+    let system_caps = flux_plugin::SystemHostCaps::from_source(system)
         .with_manifest(manifest)
         .with_private_net_grants(private_hosts)
         .with_grant_source(private_net_grant_source_for(&manifest.name))
@@ -82,8 +94,10 @@ pub(super) struct IntegrationAssembly {
 /// integration graph so the two CLI surfaces cannot drift into different resolver/audit/root
 /// wiring. Every capability receives the same explicit guarded `system`, datasource backend,
 /// event stream, and redactor.
+#[allow(clippy::too_many_arguments)] // one assembly seam; every input is a distinct session object
 pub(super) async fn assemble_integrations(
     system: Arc<System>,
+    system_source: Arc<dyn flux_plugin::SystemSource>,
     backend: Arc<dyn flux_capabilities::DatasourceBackend>,
     datasource_bridge: bool,
     cfg: &flux_config::Config,
@@ -149,7 +163,7 @@ pub(super) async fn assemble_integrations(
         .into_iter()
         .map(|plugin| {
             let system = system.clone();
-            let caps_system = system.clone();
+            let caps_system = system_source.clone();
             let backend = backend.clone();
             let cfg = cfg.clone();
             let broker_for_caps = broker.clone();
@@ -436,8 +450,12 @@ pub(super) async fn run_app(
     let app_run_stream = app_events
         .create_session(&model)
         .map_err(|e| anyhow::anyhow!("app: open run stream: {e}"))?;
+    // C-122: one workspace handle for the whole app run, bound into BOTH the plugin caps (so
+    // plugin ops follow a worktree transition) and the execution environment below.
+    let app_workspace = flux_runtime::WorkspaceContext::new(system.clone());
     let integrations = assemble_integrations(
         system.clone(),
+        Arc::new(WorkspaceSystemSource(app_workspace.clone())),
         backend,
         true,
         &cfg,
@@ -471,6 +489,7 @@ pub(super) async fn run_app(
         approver,
         ExecutionAuthorization::local(),
     )
+    .with_workspace(app_workspace)
     .with_redactor(redactor);
     let app = std::sync::Arc::new(flux_app::App::try_with_execution_environment(
         program,

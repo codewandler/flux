@@ -841,8 +841,16 @@ pub struct ToolContext {
 
 impl ToolContext {
     pub fn new(system: Arc<System>) -> Self {
+        Self::over_workspace(WorkspaceContext::new(system))
+    }
+
+    /// A context over an **existing** workspace handle (C-122). The session surfaces create the
+    /// [`WorkspaceContext`] early — before plugin loading — and hand the same handle to the plugin
+    /// host capabilities and to this context, so plugin ops and built-in tools observe the same
+    /// worktree transitions. [`ToolContext::new`] mints a fresh handle for everything else.
+    pub fn over_workspace(workspace: WorkspaceContext) -> Self {
         Self {
-            workspace: WorkspaceContext::new(system),
+            workspace,
             redactor: Redactor::new(),
             spawner: None,
             skill_loader: None,
@@ -1870,6 +1878,10 @@ pub struct ExecutionEnvironment {
     spawner: Option<Arc<dyn Spawner>>,
     runtime_turn: Option<RuntimeTurnContext>,
     hooks: Vec<Arc<dyn PreToolHook>>,
+    /// A pre-created workspace handle (C-122): when set, the derived context is built over this
+    /// exact handle instead of minting a fresh one, so a surface that also bound the same handle
+    /// into its plugin host capabilities gets one shared view of worktree transitions.
+    workspace: Option<WorkspaceContext>,
     // Compatibility bridge for callers that already built a richer context. New assembly should
     // use the explicit `System` constructor above so every derived executor receives a fresh
     // evidence/read-set context over the same root.
@@ -1895,6 +1907,7 @@ impl ExecutionEnvironment {
             spawner: None,
             runtime_turn: None,
             hooks: Vec::new(),
+            workspace: None,
             exact_context: None,
         }
     }
@@ -1921,6 +1934,7 @@ impl ExecutionEnvironment {
             spawner: context.spawner.clone(),
             runtime_turn: None,
             hooks: Vec::new(),
+            workspace: None,
             exact_context: Some(context),
         }
     }
@@ -2003,12 +2017,26 @@ impl ExecutionEnvironment {
         self
     }
 
+    /// Build the derived context over this exact workspace handle (C-122) instead of a fresh one.
+    /// The handle's active system should be the environment's `system` at call time; the surfaces
+    /// that use this create the handle from that same system a few lines earlier.
+    pub fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
     /// Build the guarded executor. No ambient path lookup or policy defaulting occurs here.
     pub fn into_executor(mut self) -> Executor {
         let context = match self.exact_context.take() {
             Some(context) => context,
             None => {
-                let mut context = ToolContext::new(self.system).with_redactor(self.redactor);
+                let mut context = match self.workspace.take() {
+                    // C-122: the surface pre-created the workspace handle and bound it into its
+                    // plugin caps too — build over the same handle so both sides see transitions.
+                    Some(workspace) => ToolContext::over_workspace(workspace),
+                    None => ToolContext::new(self.system),
+                }
+                .with_redactor(self.redactor);
                 if let Some(spawner) = self.spawner {
                     context = context.with_spawner(spawner);
                 }
@@ -3503,6 +3531,64 @@ mod tests {
         assert_eq!(ctx_a_clone.system().workspace().root(), canon(&origin));
         assert!(ctx_a.workspace_context().worktree_session().is_none());
         assert!(ctx_a.workspace_context().leave_worktree().is_err());
+    }
+
+    /// C-122: an environment given a pre-created workspace handle builds its executor context
+    /// OVER that handle — a transition driven through the external handle (what a surface's
+    /// plugin-caps adapter shares) is observed by the executor's tools, and vice versa. The
+    /// pre-C-122 behaviour minted a fresh handle in `into_executor`, so the surface's copy and
+    /// the executor's copy could never see each other's transitions.
+    #[test]
+    fn with_workspace_shares_one_handle_between_surface_and_executor() {
+        let (origin, system) = temp_workspace("c122-env");
+        let (target, _) = temp_workspace("c122-env-target");
+        let workspace = WorkspaceContext::new(system.clone());
+
+        let executor = ExecutionEnvironment::new(
+            system.clone(),
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(DenyApprover),
+            ExecutionAuthorization::local(),
+        )
+        .with_workspace(workspace.clone())
+        .into_executor();
+
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap();
+        assert_eq!(
+            executor.context().system().workspace().root(),
+            canon(&origin)
+        );
+
+        // The surface-held handle transitions (what git_worktree_enter does through the tool
+        // context — here driven externally, as the plugin-caps adapter would observe it).
+        let rerooted = Arc::new(system.rerooted(&target).unwrap());
+        workspace
+            .enter_worktree(
+                WorktreeSession {
+                    original: system.clone(),
+                    base_commit: "deadbeef".into(),
+                    branch: "flux/worktree/c122".into(),
+                    checkout: target.clone(),
+                    parent_dir: target.clone(),
+                    phase: WorktreePhase::Active,
+                },
+                rerooted,
+            )
+            .unwrap();
+        assert_eq!(
+            executor.context().system().workspace().root(),
+            canon(&target),
+            "the executor context must observe the surface handle's transition"
+        );
+
+        // And the reverse direction: the executor context's handle IS the surface handle.
+        executor
+            .context()
+            .workspace_context()
+            .leave_worktree()
+            .unwrap();
+        assert_eq!(workspace.active().workspace().root(), canon(&origin));
     }
 
     /// C-97: a retried leave after a partial cleanup must know the merge already landed.

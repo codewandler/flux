@@ -4990,7 +4990,7 @@ mod tests {
         let backend =
             Arc::new(MemoryBackend::new()) as Arc<dyn flux_capabilities::DatasourceBackend>;
         let caps = integration_plugin_caps(
-            system.clone(),
+            Arc::new(flux_plugin::FixedSystem(system.clone())),
             backend,
             true,
             &manifest,

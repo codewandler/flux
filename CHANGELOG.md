@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **C-122: plugin operations now follow a worktree transition.** After `git_worktree_enter`,
+  built-in tools operated in the worktree but plugin `process.run`/`process.spawn` kept executing
+  in the original root — `SystemHostCaps` captured an assembly-time `Arc<System>`, and the
+  executor's context minted its own workspace handle the plugin caps could never see. The design
+  note (epic design doc) chose **neither re-spawn nor notify**: in the reference-only IO
+  architecture the subprocess is not where root-sensitive IO happens, so the fix is host-side
+  dynamic resolution. New `flux_plugin::SystemSource` seam (`FixedSystem` preserves the old
+  semantics for `flux plugin call`); `SystemHostCaps::from_source` snapshots the guarded system
+  once per `handle()` call; the CLI session paths create the `WorkspaceContext` before plugin
+  loading and bind the same handle into both the plugin caps and the executor context
+  (`ExecutionEnvironment::with_workspace` / `ToolContext::over_workspace`) — one shared view of
+  transitions on the agent-session and app-run paths. The subprocess cwd and crash-restart root
+  deliberately stay pinned at the session root, and no `flux.plugin.v1` protocol surface was
+  added — both rejections argued in the design note.
+
 ### Added
 
 - **C-159: the codex WebSocket now works the way upstream's client does — and is the default

@@ -117,6 +117,31 @@ pub trait SecretSink: Send + Sync {
     fn register_secret(&self, value: &str);
 }
 
+/// Where [`SystemHostCaps`] resolves its guarded [`System`](flux_system::System) from (C-122).
+///
+/// A workspace transition (`git_worktree_enter`) swaps the context's active system; host
+/// capabilities that captured an `Arc<System>` at assembly time kept executing `process.run` in
+/// the original root after the rest of the session had moved. This seam makes the resolution
+/// dynamic: each `handle()` call snapshots the source once — the same snapshot-per-operation
+/// discipline as `ToolContext::system` — so a transition is observed by the *next* op, never
+/// mid-call. Surfaces with no transitions (e.g. one-shot `flux plugin call`) use a
+/// [`FixedSystem`]; session surfaces bind an adapter over the context's workspace handle (the
+/// adapter lives at the surface — this crate stays free of a runtime dependency).
+pub trait SystemSource: Send + Sync {
+    /// Snapshot the currently active guarded system.
+    fn system(&self) -> Arc<flux_system::System>;
+}
+
+/// A [`SystemSource`] pinned to one system forever — the non-transitioning surfaces' source, and
+/// exactly the pre-C-122 capture semantics.
+pub struct FixedSystem(pub Arc<flux_system::System>);
+
+impl SystemSource for FixedSystem {
+    fn system(&self) -> Arc<flux_system::System> {
+        self.0.clone()
+    }
+}
+
 /// Host capabilities backed by the guarded [`System`](flux_system::System): `process.run` (argv
 /// only), `http.do` (GET, loopback/private blocked unless allowed), and `secret` (env refs). This
 /// is the bridge that keeps plugin IO inside the same safety boundary as the agent's own tools.
@@ -126,7 +151,10 @@ pub trait SecretSink: Send + Sync {
 /// allow-listed keys, `http.do` only if the plugin declared it. A fresh `SystemHostCaps` grants
 /// nothing — call [`with_grants`](Self::with_grants).
 pub struct SystemHostCaps {
-    system: Arc<flux_system::System>,
+    /// The guarded-system resolution seam (C-122): snapshotted once per `handle()` call, so plugin
+    /// `process.run`/`process.spawn` execute in the context's *active* root — a worktree transition
+    /// is observed by the next op. [`FixedSystem`] for non-transitioning surfaces.
+    system: Arc<dyn SystemSource>,
     /// Redirect-disabled client for `http.do`. Redirects are handled manually so every target is
     /// re-checked against both the shared SSRF guard and this plugin's manifest host scope.
     http: reqwest::Client,
@@ -186,7 +214,21 @@ pub struct SystemHostCaps {
 type ManagedProc = flux_system::ManagedChild;
 
 impl SystemHostCaps {
+    /// Capabilities over a fixed system — the pre-C-122 semantics, right for surfaces where no
+    /// workspace transition can happen (one-shot `flux plugin call`, tests).
     pub fn new(system: Arc<flux_system::System>) -> Self {
+        Self::from_source(Arc::new(FixedSystem(system)))
+    }
+
+    /// Snapshot the active guarded system for one operation (C-122). Every handler resolves
+    /// through here, so a workspace transition is observed by the next op, never mid-call.
+    fn system(&self) -> Arc<flux_system::System> {
+        self.system.system()
+    }
+
+    /// Capabilities over a dynamic [`SystemSource`] (C-122): session surfaces pass an adapter over
+    /// the context's workspace handle so plugin ops follow a worktree transition.
+    pub fn from_source(system: Arc<dyn SystemSource>) -> Self {
         Self {
             system,
             http: reqwest::Client::builder()
@@ -368,7 +410,7 @@ impl SystemHostCaps {
             if !self.grants.secrets.iter().any(|k| k == key) {
                 continue; // not a granted secret — skip
             }
-            if let Some(v) = self.system.env(key) {
+            if let Some(v) = self.system().env(key) {
                 if let Some(sink) = &self.secret_sink {
                     sink.register_secret(&v);
                 }
@@ -396,7 +438,7 @@ impl SystemHostCaps {
             .find(|a| a.purpose == purpose)
             .ok_or_else(|| format!("no auth method declared for handshake purpose `{purpose}`"))?;
         for key in &method.env {
-            if let Some(v) = self.system.env(key) {
+            if let Some(v) = self.system().env(key) {
                 return Ok(v);
             }
         }
@@ -420,7 +462,7 @@ impl SystemHostCaps {
             return self.expand_endpoint_template(template);
         }
         for key in &ep.env {
-            if let Some(v) = self.system.env(key) {
+            if let Some(v) = self.system().env(key) {
                 return Ok(v);
             }
         }
@@ -453,7 +495,7 @@ impl SystemHostCaps {
             }
         }
         for key in &spec.env {
-            if let Some(v) = self.system.env(key) {
+            if let Some(v) = self.system().env(key) {
                 // A value that is itself a credential-bearing URL (a DSN with an embedded
                 // password) is refused: the config capability can never hand the plugin a
                 // secret, even via an operator-misconfigured env value. Move the password to
@@ -547,7 +589,7 @@ impl SystemHostCaps {
                     .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
                     .unwrap_or(false)
                 || ep.env.iter().any(|key| {
-                    self.system
+                    self.system()
                         .env(key)
                         .and_then(|raw| url::Url::parse(&raw).ok())
                         .and_then(|url| url.host_str().map(|h| h.eq_ignore_ascii_case(host)))
@@ -560,7 +602,7 @@ impl SystemHostCaps {
     /// resolved directly from declared env, like an endpoint).
     fn resolve_user(&self, user_env: &[String]) -> std::result::Result<String, String> {
         for key in user_env {
-            if let Some(v) = self.system.env(key) {
+            if let Some(v) = self.system().env(key) {
                 return Ok(v);
             }
         }
@@ -715,7 +757,7 @@ impl HostCapabilities for SystemHostCaps {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(60);
                 let out = self
-                    .system
+                    .system()
                     .run(&argv, std::time::Duration::from_secs(secs))
                     .await
                     .map_err(|e| e.to_string())?;
@@ -755,7 +797,7 @@ impl HostCapabilities for SystemHostCaps {
                     })
                     .unwrap_or_default();
                 let child = self
-                    .system
+                    .system()
                     .spawn_background(&argv, &env)
                     .map_err(|e| e.to_string())?;
                 let id = self
@@ -826,7 +868,7 @@ impl HostCapabilities for SystemHostCaps {
                         "secret `{key}` not in this plugin's granted capabilities"
                     ));
                 }
-                match self.system.env(key) {
+                match self.system().env(key) {
                     Some(v) => {
                         if let Some(sink) = &self.secret_sink {
                             sink.register_secret(&v);
@@ -1030,7 +1072,7 @@ impl HostCapabilities for SystemHostCaps {
                 for grant in &self.grants.fs {
                     let expanded_scope = expand_home(&grant.path);
                     match self
-                        .system
+                        .system()
                         .read_file_scoped(&expanded, &expanded_scope, MAX_FS_READ)
                         .await
                     {
@@ -1886,6 +1928,66 @@ mod tests {
             "secret not in the grant list must be denied"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-122: plugin `process.run` executes in the context's ACTIVE root, not the root captured
+    /// at assembly. A workspace transition (`git_worktree_enter` swapping the active system) must
+    /// be observed by the next plugin op — the pre-C-122 captured-`Arc<System>` semantics kept
+    /// every plugin process in the original root for the rest of the session.
+    #[tokio::test]
+    async fn process_run_follows_the_active_system_across_a_transition() {
+        use flux_system::{System, Workspace};
+        let base = std::env::temp_dir().join(format!("flux-c122-seam-{}", std::process::id()));
+        let (root_a, root_b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let sys_a = Arc::new(System::new(Workspace::new(&root_a).unwrap()));
+        let sys_b = Arc::new(System::new(Workspace::new(&root_b).unwrap()));
+
+        /// A swappable source — what the surfaces' `WorkspaceContext` adapter looks like to this
+        /// crate: `system()` snapshots whatever is active now.
+        struct Swappable(std::sync::Mutex<Arc<System>>);
+        impl SystemSource for Swappable {
+            fn system(&self) -> Arc<System> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        let source = Arc::new(Swappable(std::sync::Mutex::new(sys_a)));
+        let caps = SystemHostCaps::from_source(source.clone()).with_grants(PluginCapabilities {
+            process: vec!["pwd".into()],
+            ..Default::default()
+        });
+
+        let cwd_of = |out: Value| {
+            out["stdout"]
+                .as_str()
+                .expect("pwd writes its cwd")
+                .trim()
+                .to_string()
+        };
+        let before = caps
+            .handle("process.run", &json!({"argv": ["pwd"]}))
+            .await
+            .expect("granted pwd runs");
+        // `pwd` may print a symlink-resolved path (/tmp vs /private/tmp), so compare canonically.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap().display().to_string();
+        assert_eq!(cwd_of(before), canon(&root_a), "before: the original root");
+
+        // The transition: the context's active system swaps (what enter_worktree does).
+        *source.0.lock().unwrap() = sys_b;
+
+        let after = caps
+            .handle("process.run", &json!({"argv": ["pwd"]}))
+            .await
+            .expect("granted pwd still runs");
+        assert_eq!(
+            cwd_of(after),
+            canon(&root_b),
+            "after: the NEXT op observes the transitioned root — the captured-Arc semantics \
+             would still report the original"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// C-90: a multi-token grant pins the leading subcommand, so a read-shaped grant

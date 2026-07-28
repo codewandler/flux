@@ -40,6 +40,50 @@ own `System` captured at subprocess spawn (and `SystemHostCaps` captures another
 `Arc<System>`), so already-spawned plugin subprocesses keep the original root. Documented
 limitation; follow-up story C-122 tracks the re-spawn/notify design that lifts it.
 
+### C-122 — plugin hosts follow the transition (design note, 2026-07-28)
+
+The question the story filed was *re-spawn vs notify*. Reviewing it against the plugin process
+protocol, the answer is **neither** — because in the reference-only IO architecture (D-25…D-32),
+the subprocess is not where root-sensitive IO happens. Guarded IO flows through the **host
+capabilities**: `process.run`/`process.spawn` execute host-side via the guarded `System` (whose
+root is the cwd), `fs.read` is a host-path capability scoped to *absolute* manifest globs
+(`~/.aws/...` — root-independent by design), and `http.do`/`conn.dial`/`blob.*` have no root at
+all. The subprocess's own cwd matters only to a plugin doing direct relative filesystem IO, which
+the protocol's whole design forbids the host from ever guarding — a compliant plugin must not
+depend on it.
+
+So the fix is **host-side dynamic resolution**:
+
+- `SystemHostCaps` resolves its guarded `System` through a `SystemSource` seam instead of a
+  captured `Arc<System>`; each `handle()` call snapshots the source once (same
+  snapshot-per-operation discipline as `ToolContext::system`). A fixed source preserves the old
+  behaviour for non-transitioning surfaces (`flux plugin call`).
+- The CLI session paths bind the source to the session's `WorkspaceContext` — the same handle the
+  worktree tools drive — via a small adapter at the surface (flux-plugin stays free of a runtime
+  dependency). The `WorkspaceContext` is therefore created **early**, at session assembly, and
+  handed to both the plugin caps and the `ExecutionEnvironment` (which previously minted its own
+  in `into_executor`), so plugin ops and built-in tools observe the *same* transitions.
+
+Explicitly rejected:
+
+- **Re-spawn on transition** — kills exactly the state the session-scoped caps exist to keep:
+  host-managed background processes (`process.spawn` port-forwards), open `conn.dial` streams, and
+  the plugin's own in-memory state, all torn down for a cwd the plugin must not rely on anyway.
+  In-flight calls would surface as transport errors mid-turn.
+- **A transition notification** — a `flux.plugin.v1` protocol addition on the independently
+  versioned 1.x line, delivering information (the new root) that a compliant plugin has no
+  legitimate use for. Adding protocol surface to serve non-compliance would be the wrong incentive.
+- **Making `PluginHost`'s subprocess cwd / crash-restart follow the active root** — deliberately
+  not done: the subprocess cwd is *advisory* (see above), and a crash-restart that lands in a
+  different root than the original spawn would make the plugin's own state root-dependent
+  mid-session — strictly harder to reason about than a stable, documented "plugins are spawned at
+  the session root".
+
+Scope note: plugin hosts are **session-global** (one subprocess shared by every agent context),
+while `WorkspaceContext` is context-local. The caps follow the **session's primary context**; a
+sub-agent entering a worktree in its own independent context (C-100 semantics) does not — and
+should not — redirect session-global plugin state.
+
 Guarded `flux-system` helpers: derive a new guarded `System` rooted at an existing worktree while
 retaining the source sandbox and configured access posture; create and clean a private
 `flux-worktree-*` parent directory (under `$FLUX_WORKTREE_DIR` / `~/.flux/worktrees`, C-120)
