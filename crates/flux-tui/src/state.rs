@@ -52,6 +52,11 @@ pub struct ChatState {
     pub(super) search: Option<TranscriptSearch>,
     /// Whether the help overlay is open (F1 / `/help`, C-110).
     pub(super) help_open: bool,
+    /// Whether `--yes` auto-approve is active — surfaced as a header badge (C-116).
+    pub(super) auto_approve: bool,
+    /// The effort level chosen via `/effort`, mirrored here so the sync render path can badge
+    /// it without touching the engine lock (C-116). `None` = provider default (no badge).
+    pub(super) effort: Option<String>,
     pub(super) last_max_scroll: Cell<u16>,
     pub(super) last_page: Cell<u16>,
     pub(super) plan_phase: Option<String>,

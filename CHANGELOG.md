@@ -82,6 +82,16 @@ All notable changes to this project are documented in this file. The format is b
   inherit the transitioned root with an independent workspace context (fixing the latent
   child-`cwd = "."` probe bug), and nested spawners re-base on the child's snapshot.
 
+### Documentation
+
+- **C-123…C-126: event-store concurrent-use epic filed.** The multi-process concurrency guidance
+  for `flux-events` is promoted to `docs/designs/event-store-concurrent-use.md` — what the SQLite
+  backend (WAL + 5s busy_timeout + `BEGIN IMMEDIATE` + UNIQUE/idempotent-id backstops) and the
+  Postgres backend (per-stream advisory locks) already guarantee, the R1–R7 rules for reliable
+  concurrent use, and the accepted limits — with three backlog stories: append-contention
+  visibility (C-124), a spawned-subprocess stress test (C-125), and WAL checkpoint hygiene for
+  long-lived daemons (C-126). Docs/board only; no behavior change.
+
 ## [0.27.0] - 2026-07-28
 
 ### Fixed

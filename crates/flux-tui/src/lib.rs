@@ -665,6 +665,8 @@ impl ChatState {
             history_search: None,
             search: None,
             help_open: false,
+            auto_approve: false,
+            effort: None,
             expand_tools: false,
             verbose: false,
             slash_sel: 0,
@@ -2086,6 +2088,10 @@ pub async fn run_with_options(
     let (theme_name, theme) = resolve_theme(options.theme.as_deref());
     state.theme = theme;
     state.theme_name = theme_name;
+    // C-116: seed the header mode badges — auto-approve from the launch options, effort from
+    // the engine's current setting (later `/effort` changes are mirrored by the handler).
+    state.auto_approve = options.auto_approve;
+    state.effort = agent.effort.map(|e| e.as_str().to_string());
     if let Some(spec) = options.model_spec.clone() {
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }

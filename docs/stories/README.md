@@ -57,6 +57,12 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 _Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
 - [C-122 — Plugin hosts should follow a worktree transition](C-122-plugin-root-follows-worktree.md) · Core · v1 limitation: PluginHost pins cwd at subprocess spawn and SystemHostCaps captures an assembly-time System — plugin ops keep the original root after git_worktree_enter
 
+### Event-Store Concurrent Use
+- [C-123 — Event-store concurrent use — visibility, proof, and hygiene (epic)](C-123-event-store-concurrent-use-epic.md) · Core · EPIC — the concurrency envelope (WAL + busy_timeout + BEGIN IMMEDIATE + UNIQUE backstops, PG advisory locks) is built and tested; this funds contention visibility, a multi-process stress proof, and WAL checkpoint hygiene
+- [C-124 — Surface event-store append contention before it becomes a 5s failure](C-124-append-contention-visibility.md) · Core · an append that waited on the SQLite busy handler > ~1s should leave a visible trace; today the only signal is the terminal busy error after the full 5s budget
+- [C-125 — Multi-process event-store stress test — N writer processes × M streams, zero lost writes](C-125-multiprocess-store-stress-test.md) · Core · the cross-process claim is currently proven by a two-connection in-process test; a spawned-subprocess stress proves the real OS-level file-locking story
+- [C-126 — WAL checkpoint hygiene for long-lived daemons — bound events.db-wal growth](C-126-wal-checkpoint-hygiene.md) · Core · a long-lived serve daemon with pinned readers can keep the WAL from checkpointing; a periodic wal_checkpoint(TRUNCATE) in the serve loop bounds the sidecar
+
 ### Evidence Pinned Memory
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 
