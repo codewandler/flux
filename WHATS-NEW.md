@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-28
+
 ### Improved
 
 - **Long conversations got substantially cheaper and faster.** flux now reuses the cached

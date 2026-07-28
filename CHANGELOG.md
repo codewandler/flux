@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-28
+
 **Breaking (pub surface, embedders only).** `flux_core::Usage` gained
 `cache_creation_1h_input_tokens` and `flux_core::Rates` gained `cache_write_1h` (with the matching
 `RateOverride` field), so struct literals that name every field need updating — `..Default::default()`
