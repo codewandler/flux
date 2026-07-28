@@ -2,6 +2,18 @@
 //!
 //! Composite execution still lives in `flux-lang`; this module only owns host policy around where
 //! definitions are stored, how scopes override each other, and when persisted definitions are loaded.
+//!
+//! Loading is deliberately lenient, twice over (the same policy at two layers):
+//! - **Parse:** an unparseable file in the unified flows home is skipped ([`load_flows_dir`]) — it
+//!   stays runnable via `flow_run`, which surfaces the real error lazily.
+//! - **Resolvability (C-117):** a persisted composite that references operations absent from
+//!   *this* engine's registry is not part of this engine's catalog — it is pruned at assembly
+//!   with a visible `composites.pruned` audit record ([`DynamicComposites::prune_unresolvable`]),
+//!   never a boot failure. Sub-agent registries are role∩cap-scope narrowed, so a global
+//!   composite using plugin/cognition ops would otherwise brick every spawn; the same applies to
+//!   top-level startup after a plugin is uninstalled. Pruning only ever narrows the catalog.
+//!   Live registration (`op.register` → [`DynamicComposites::validate_registration`]) stays
+//!   strict: a *new* composite naming an unknown op fails loudly at registration time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -72,6 +84,18 @@ pub struct DynamicComposites {
     state: Mutex<State>,
 }
 
+/// One persisted composite excluded from an engine's catalog by
+/// [`DynamicComposites::prune_unresolvable`] (C-117) — the audit payload of the
+/// `composites.pruned` observation.
+#[derive(Debug, Clone)]
+pub struct PrunedComposite {
+    pub name: String,
+    /// `"global"` (`~/.flux/flows`, `@global_ops`) or `"project"` (`.flux/flows`, `.flux/ops`).
+    pub scope: &'static str,
+    /// Joined per-composite diagnostics, e.g. `unknown operation: gitlab.mr.show (at body[0].value)`.
+    pub reason: String,
+}
+
 impl DynamicComposites {
     pub fn load(system: &System) -> Result<Self> {
         let ws = system.workspace();
@@ -97,12 +121,37 @@ impl DynamicComposites {
         })
     }
 
-    pub fn validate_base(&self, tools: &ToolRegistry) -> Result<()> {
-        let composites = {
-            let st = self.state.lock().unwrap();
-            active_from_state(&st, "")
-        };
-        validate_composites(&composites, tools)
+    /// Remove every persisted (global/project) composite that does not resolve against `tools`,
+    /// returning the exclusions for the engine's audit record (C-117). Runs to a fixed point:
+    /// pruning a callee invalidates its callers, which the next round catches; cycle participants
+    /// all count as unresolvable. Session/turn scopes are empty at assembly time and unaffected.
+    /// A project entry shadowing a same-named global one is pruned first — the next round then
+    /// validates the unshadowed global entry on its own merits.
+    pub fn prune_unresolvable(&self, tools: &ToolRegistry) -> Vec<PrunedComposite> {
+        let mut st = self.state.lock().unwrap();
+        let mut pruned = Vec::new();
+        loop {
+            let remaining = active_from_state(&st, "");
+            let invalid = crate::registry::unresolvable_composites(&remaining, tools);
+            if invalid.is_empty() {
+                break;
+            }
+            for (name, reason) in invalid {
+                let scope = if st.project.remove(&name).is_some() {
+                    "project"
+                } else if st.global.remove(&name).is_some() {
+                    "global"
+                } else {
+                    continue; // unreachable: the active set is global ∪ project at assembly
+                };
+                pruned.push(PrunedComposite {
+                    name,
+                    scope,
+                    reason,
+                });
+            }
+        }
+        pruned
     }
 
     pub fn ensure_session_loaded(&self, store: &FlowStore, session_id: &str) -> Result<()> {
@@ -376,6 +425,96 @@ mod tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    fn parse_op(source: &str) -> CompositeOpDecl {
+        parse_one_composite(source).unwrap()
+    }
+
+    /// C-117: a persisted composite calling an op absent from the registry is pruned with a
+    /// reason; a valid sibling survives and stays active. `active_for_session("")` excludes the
+    /// pruned name.
+    #[test]
+    fn prunes_unknown_op_composite_and_keeps_valid_sibling() {
+        let dc = DynamicComposites::default();
+        dc.install(
+            CompositeScope::Global,
+            "",
+            parse_op("op good() -> string\n  return \"ok\"\n"),
+            false,
+        )
+        .unwrap();
+        dc.install(
+            CompositeScope::Project,
+            "",
+            parse_op("op broken() -> any\n  $x = missing_op()\n  return $x\n"),
+            false,
+        )
+        .unwrap();
+
+        let pruned = dc.prune_unresolvable(&ToolRegistry::new());
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].name, "broken");
+        assert_eq!(pruned[0].scope, "project");
+        assert!(
+            pruned[0].reason.contains("unknown operation"),
+            "{}",
+            pruned[0].reason
+        );
+
+        let active: Vec<String> = dc
+            .active_for_session("")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(active, ["good"]);
+    }
+
+    /// C-117: the fixed point — pruning a broken callee invalidates its (structurally valid)
+    /// caller, which the next round prunes too.
+    #[test]
+    fn pruning_is_transitive_over_composite_calls() {
+        let dc = DynamicComposites::default();
+        dc.install(
+            CompositeScope::Global,
+            "",
+            parse_op("op caller() -> any\n  $x = broken()\n  return $x\n"),
+            false,
+        )
+        .unwrap();
+        dc.install(
+            CompositeScope::Global,
+            "",
+            parse_op("op broken() -> any\n  $x = missing_op()\n  return $x\n"),
+            false,
+        )
+        .unwrap();
+
+        let mut pruned: Vec<String> = dc
+            .prune_unresolvable(&ToolRegistry::new())
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        pruned.sort();
+        assert_eq!(pruned, ["broken", "caller"]);
+        assert!(dc.active_for_session("").is_empty());
+    }
+
+    /// C-117 strictness pin: pruning governs PERSISTED definitions only — registering a NEW
+    /// composite that names an unknown op still fails loudly.
+    #[test]
+    fn live_registration_stays_strict_on_unknown_ops() {
+        let dc = DynamicComposites::default();
+        let err = dc
+            .validate_registration(
+                CompositeScope::Session,
+                "s",
+                &parse_op("op nope() -> any\n  $x = missing_op()\n  return $x\n"),
+                false,
+                &ToolRegistry::new(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown operation"), "{err}");
     }
 
     /// C-87: `clear_turn` bounds the per-session composite caches on a long-lived shared engine — it

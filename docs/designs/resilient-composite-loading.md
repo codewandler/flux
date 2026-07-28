@@ -1,6 +1,6 @@
 # Resilient persisted-composite loading — prune unresolvable ops instead of failing assembly
 
-Status: proposed (story C-117)
+Status: implemented 2026-07-28 (story C-117)
 Owner seams: `crates/flux-flow/src/composites.rs`, `crates/flux-flow/src/engine.rs`, `crates/flux-flow/src/registry.rs`, `crates/flux-orchestrate/src/lib.rs` (tests only)
 
 ## Problem

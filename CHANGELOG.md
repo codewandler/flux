@@ -156,6 +156,25 @@ All notable changes to this project are documented in this file. The format is b
   the legacy duplicate discovery (`discover`, `discover_merged`); the five-directory precedence list
   now lives only in `flux_runtime::metadata::discover_skills_from`, and the crate docs/architecture
   docs match the shipped eager, manual-first behavior.
+- **C-117: `DynamicComposites::validate_base` removed** (breaking → next MINOR): the assembly seam
+  now calls `prune_unresolvable` instead (see Fixed below); the strict all-or-nothing base
+  validation has no remaining callers. Live registration (`validate_registration`) is untouched.
+
+### Fixed
+
+- **C-117: an unresolvable persisted composite no longer bricks engine assembly — it is pruned
+  from that engine's catalog with an audit record.** A definition in `~/.flux/flows` /
+  `.flux/flows` (or the legacy `ops` dirs) referencing operations absent from an engine's registry
+  used to abort `FlowEngine::assemble` with `composite validation failed` — which made EVERY
+  sub-agent spawn of EVERY role fail (child registries are role ∩ cap-scope narrowed and rarely
+  contain plugin/cognition ops; live repro: a global `mr_update.flux` calling `gitlab.mr.show` /
+  `ai.reason`), and let a global file referencing an uninstalled plugin's ops brick top-level
+  startup. `DynamicComposites::prune_unresolvable` now excludes such definitions at assembly via
+  a fixed point (a pruned callee prunes its callers next round; cycle participants all prune),
+  and each turn emits a `composites.pruned` observation (`[{name, scope, reason}]`) so the
+  exclusion is auditable per session. Pruning only ever narrows the catalog; `op.register`'s
+  strict validation and `validate_agent_loop` are unchanged, and a pruned file stays runnable via
+  `flow_run`, which surfaces the real error lazily.
 
 ### Documentation
 

@@ -39,6 +39,9 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **The project vision now matches what flux actually ships.** The vision document now calls out
+  replay, fork, run diff, offline agent tests, editor tooling, multi-user deployment foundations,
+  and the current on-hold status of the self-improvement work more clearly.
 - **The terminal UI got a major polish pass.** Pick a theme with `/theme` (`dark`, `light`,
   `mono`) and it sticks across sessions; press Ctrl-T to release the mouse so your terminal's
   native text selection and copy work; Ctrl-R searches your prompt history as you type; Ctrl-F
@@ -52,6 +55,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   animated FLUX splash (any key skips it; it never appears for piped output, `NO_COLOR`, small
   terminals, or with `FLUX_NO_SPLASH=1`), and on terminals with full color support the
   model-wait spinner becomes an animated effect bar that changes with every model round.
+
+### Fixed
+
+- **A saved flow or op that needs an integration you don't have no longer blocks the agent — or
+  its sub-agents — from starting.** A definition in `~/.flux/flows` or `.flux/flows` that calls
+  operations that aren't available (for example, a plugin you've since uninstalled, or ops a
+  delegated sub-agent was never given) used to abort startup or make every sub-agent spawn fail.
+  Now it's simply left out of that agent's catalog until its operations are available again — the
+  exclusion is recorded in the session's audit trail, and registering a *new* op with unknown
+  operations still fails immediately.
 
 ## [0.27.0] - 2026-07-28
 

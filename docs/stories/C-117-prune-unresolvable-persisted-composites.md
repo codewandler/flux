@@ -2,8 +2,8 @@
 id: C-117
 title: Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup
 pillar: Core
-status: ready
-priority: 1
+status: done
+
 design: docs/designs/resilient-composite-loading.md
 note: "live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled"
 ---
@@ -18,28 +18,41 @@ registries are role ∩ cap-scope narrowed and rarely contain plugin/cognition o
 matching top-level startup landmine, without weakening any strict validation on live registration.
 
 ## Acceptance
-- [ ] `DynamicComposites::prune_unresolvable(&self, tools) -> Vec<PrunedComposite>` removes
+- [x] `DynamicComposites::prune_unresolvable(&self, tools) -> Vec<PrunedComposite>` removes
       unresolvable global/project composites via a fixed point (a pruned callee prunes its callers
       on the next round); per-composite diagnostics are shared with `analyze_composites` through an
       extracted `analyze_one`, and `analyze_composites` itself is byte-for-byte strict as today.
-- [ ] `FlowEngine::assemble_with_loop` calls `prune_unresolvable` where it called
+- [x] `FlowEngine::assemble_with_loop` calls `prune_unresolvable` where it called
       `validate_base(…)?` (`crates/flux-flow/src/engine.rs:304`); `validate_base` is deleted
       (no remaining callers) and the removal is flagged breaking in the CHANGELOG.
-- [ ] Failing-first engine test: a temp workspace with `.flux/flows/broken.flux` calling a
+- [x] Failing-first engine test: a temp workspace with `.flux/flows/broken.flux` calling a
       nonexistent op assembles successfully (currently errors `composite validation failed`), and
       the turn emits a `composites.pruned` observation with name/scope/reason.
-- [ ] Failing-first orchestrate test (the live repro): a persisted composite requiring ops outside
+- [x] Failing-first orchestrate test (the live repro): a persisted composite requiring ops outside
       a `tools: [read]` role's narrowed registry no longer fails `LocalSpawner::spawn` — the child
       completes its mock turn (modeled on `spawner_runs_a_role_and_returns_text`).
-- [ ] Unit tests: unknown-op pruning with surviving valid sibling; transitive A→B fixed-point
+- [x] Unit tests: unknown-op pruning with surviving valid sibling; transitive A→B fixed-point
       pruning; `active_for_session("")` excludes pruned names.
-- [ ] Strictness pinned: `op.register`'s `validate_registration` still rejects a new composite
+- [x] Strictness pinned: `op.register`'s `validate_registration` still rejects a new composite
       naming an unknown op.
-- [ ] Docs: `composites.rs` module header states the resolvability policy; CHANGELOG entry under
+- [x] Docs: `composites.rs` module header states the resolvability policy; CHANGELOG entry under
       this ID; WHATS-NEW `[Unreleased]` Fixed entry in plain language.
-- [ ] Full gate green: `cargo build/test/clippy -D warnings/fmt` + `cargo test -p flux-codegate`.
+- [x] Full gate green: `cargo build/test/clippy -D warnings/fmt` + `cargo test -p flux-codegate`.
 
 ## Progress
+- 2026-07-28 — IMPLEMENTED (worktree c117-prune-composites). `prune_unresolvable` fixed point in
+  composites.rs (project entry pruned before a same-named shadowed global; cycle participants all
+  prune); per-composite diagnostics shared with `analyze_composites` via extracted
+  `analyze_one`/`analyze_one_structural`/`analyze_one_surface` + `unresolvable_composites` in
+  registry.rs (strictness unchanged; per-op diagnostic ORDER shifts slightly: dup now follows the
+  structural diags). `validate_base` deleted; engine stores `pruned_composites` and emits the
+  `composites.pruned` observation next to `turn.identity`. Failing-first proven for BOTH the
+  engine test (failed with `composite validation failed: unknown operation: gitlab_mr_show`) and
+  the orchestrate live-repro test (run against stashed pre-fix flux-flow). Tests:
+  unresolvable_persisted_composite_prunes_instead_of_failing_assembly (engine),
+  spawn_survives_unresolvable_persisted_composite (orchestrate), prunes_unknown_op_composite_and_
+  keeps_valid_sibling / pruning_is_transitive_over_composite_calls /
+  live_registration_stays_strict_on_unknown_ops (composites unit).
 - 2026-07-28 — Bug found live: an in-harness sub-agent smoke test failed at spawn for every role
   with `composite validation failed: unknown operation: gitlab.mr.show …; ai.reason …;
   gitlab.mr.update …`. Traced to `~/.flux/flows/mr_update.flux` (global scope) being validated

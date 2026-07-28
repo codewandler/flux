@@ -30,7 +30,6 @@ _None._
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
-- [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
 
 ### Context-local Git worktrees
 _Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
@@ -296,6 +295,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-114 — Markdown for the sealed prefix while streaming](C-114-streaming-markdown-prefix.md) · Core · land after C-104 (flux_markdown hardcoded span colors are its known risk)
 - [C-115 — Hunk-view diffs — line numbers + intraline highlight in edit/write cards and the approval sheet](C-115-diff-hunk-view.md) · Core · card half is independent; the approval-sheet half needs C-103
 - [C-116 — Header mode badges — shell, auto-ok, effort, gather](C-116-header-mode-badges.md) · Core
+- [C-117 — Prune unresolvable persisted composites at engine assembly instead of failing spawn/startup](C-117-prune-unresolvable-persisted-composites.md) · Core · live repro: one global composite using gitlab/ai.reason ops bricks EVERY sub-agent spawn of EVERY role; same seam can brick top-level startup when a plugin is uninstalled
 - [C-120 — Allocate agent worktrees on real disk, not /tmp](C-120-disk-backed-worktree-allocation.md) · Core · base = $FLUX_WORKTREE_DIR else ~/.flux/worktrees; /tmp is commonly a RAM-backed tmpfs a worktree build would fill
 - [C-121 — Tell the model per turn when its context is inside a worktree](C-121-worktree-turn-note.md) · Core · per-turn <workspace-note> in the base system while a worktree session is active; assembly-time project context stays untouched
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
