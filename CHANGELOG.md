@@ -8,6 +8,47 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **L-85…L-91: flux-lsp round 2 — every capability moved onto the CST that was already paid for.**
+  The first LSP epic answered "does `.flux` have editor support at all?"; reading `main.rs` against
+  what its `initialize` advertised answered the next question less happily. Several capabilities were
+  advertised at full strength and implemented at a fraction of it, always because a feature was built
+  on the cheapest substrate that passed its test while the lossless CST and the L-68 scope model sat
+  next to it. This epic moves each one onto the tree.
+  - **L-85 completion** now reads the cursor. It used to return the union of every op, every node
+    kind, every prelude type and every `$` byte-scanned out of the buffer — including variables from
+    other flows and from inside string literals. It now resolves the CST token at the offset and
+    picks a context (after `$`, after `@`, statement head, argument position), takes `$var`
+    candidates from the scope model so an inner bind shadows an outer one, offers nothing inside a
+    comment or string, and ships op items with a rendered signature and a parameter snippet.
+  - **L-86 hover** resolves the token instead of scanning the raw line, so `read` inside a `#`
+    comment no longer renders an op card, and a `$var` hovers its binding (role, owning declaration,
+    bind site) — previously it did not hover at all.
+  - **L-87 references and rename** now exist. Both resolve through the scope model, so two flows that
+    each bind `$x` rename independently and an inner shadowing bind renames only its own scope.
+    `prepareRename` refuses a non-symbol position rather than returning a bogus range.
+  - **L-88 formatting** is CST-driven, which makes comments and declaration order structural rather
+    than obstacles. A commented flow now reaches full canonical spacing (it used to get
+    indentation-only); a multi-declaration module now formats at all and keeps its source order (it
+    used to be skipped entirely). `rangeFormatting` is implemented. The reparse-equivalence net —
+    same module, same comment multiset, or no edit — is unchanged.
+  - **L-89 diagnostics** know the workspace: composites in `.flux/flows` / `.flux/ops` and the global
+    roots are loaded through `flux_system::System` (once, refreshed on `didSave`, lenient about an
+    unparseable file), so calling one is no longer "unknown operation". Severity became meaningful —
+    un-runnable findings are `ERROR`, advisory ones `WARNING` — and every diagnostic carries a code.
+  - **L-90 parse cache.** The document store holds the text *and* its `Parse`, and
+    `parsing_is_confined_to_the_document_store` scans the crate's own sources so no module can bypass
+    it. Measured on a 2,099-line buffer: a `didChange` + completion + hover cycle went from 3 parses
+    (~38.4 ms) to 1 (~12.8 ms). Semantic tokens gained `range` and `full/delta`.
+  - **L-91 module split + protocol harness.** `main.rs` is an 11-line bootstrap; the server is eleven
+    modules carrying their own tests. `tests/protocol.rs` drives `LspService` over an in-memory
+    duplex through a scripted session, and `every_advertised_capability_has_a_handler` fails the
+    suite if `initialize` ever advertises something with no handler — the class of bug this epic
+    existed to clean up.
+  - Note on picking the epic back up: the code had landed but nothing was closed out, and both
+    capability tables (`crates/flux-lsp/README.md`, `website/docs/language/editors.md`) still
+    described pre-round-2 behaviour — claiming modules were left unformatted and listing neither
+    references, rename, nor range formatting. Both now match `capabilities()`.
+
 - **A-97: path-scoped guidance fragments — `.flux/context.d/*.md`.** Project guidance was
   all-or-nothing: `ProjectFiles` reads `CLAUDE.md`/`AGENTS.md`/`.flux/context.md` whole on every
   session, so a large repo either keeps its conventions thin and loses subsystem detail, or keeps

@@ -145,9 +145,7 @@ pub fn reparse(
     let mut errors: Vec<ParseError> = old
         .errors
         .iter()
-        .filter(|e| {
-            usize::from(e.range.start()) < start || usize::from(e.range.start()) >= old_end
-        })
+        .filter(|e| usize::from(e.range.start()) < start || usize::from(e.range.start()) >= old_end)
         .map(|e| ParseError {
             range: TextRange::new(shift(e.range.start()), shift(e.range.end())),
             message: e.message.clone(),
@@ -1620,10 +1618,16 @@ mod tests {
         );
         // Edit inside the middle op: insert a comment line.
         let at = src.find("  return \"x\"").unwrap();
-        assert!(assert_incremental(src, at..at, "  # note\n"), "comment insert reuses the neighbours");
+        assert!(
+            assert_incremental(src, at..at, "  # note\n"),
+            "comment insert reuses the neighbours"
+        );
         // Edit inside the last flow: rename a bind (leaves a temporarily unbound use).
         let y = src.rfind("$y = 2").unwrap();
-        assert!(assert_incremental(src, y..y + 2, "$z"), "a rename edit reuses the neighbours");
+        assert!(
+            assert_incremental(src, y..y + 2, "$z"),
+            "a rename edit reuses the neighbours"
+        );
     }
 
     #[test]

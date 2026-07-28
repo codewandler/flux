@@ -43,7 +43,10 @@ fn var_card(root: &SyntaxNode, symbol: &Symbol, text: &str, index: &LineIndex) -
         .position(text, usize::from(def.name_range.start()))
         .line
         + 1;
-    format!("**${}** ({role}) — {owner}\n\nbound at line {line}", def.name)
+    format!(
+        "**${}** ({role}) — {owner}\n\nbound at line {line}",
+        def.name
+    )
 }
 
 /// Hover for the token at `offset`, or `None` for prose, punctuation, and unknown identifiers.
@@ -162,7 +165,10 @@ mod tests {
         let src = "flow f\n  $x = read(\"a.txt\")\n  return $x\n";
         let card = text_of(&hover(src, src.find("read").unwrap() + 2).expect("hovers"));
         assert!(card.contains("**read**"), "{card}");
-        assert!(card.contains("effects:") && card.contains("risk:"), "{card}");
+        assert!(
+            card.contains("effects:") && card.contains("risk:"),
+            "{card}"
+        );
     }
 
     #[test]

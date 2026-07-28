@@ -42,7 +42,7 @@ impl LineIndex {
             return text.len();
         };
         // The line's *content* end — a character column past it clamps to just before the line
-            // break, never onto the next line.
+        // break, never onto the next line.
         let mut line_end = self
             .line_starts
             .get(line + 1)
@@ -85,7 +85,11 @@ pub fn whole_document_range(text: &str, index: &LineIndex) -> Range {
 }
 
 /// The byte range one `didChange` content change replaces (the whole buffer when it has no range).
-pub fn change_range(text: &str, index: &LineIndex, change: &TextDocumentContentChangeEvent) -> std::ops::Range<usize> {
+pub fn change_range(
+    text: &str,
+    index: &LineIndex,
+    change: &TextDocumentContentChangeEvent,
+) -> std::ops::Range<usize> {
     match change.range {
         Some(range) => {
             let start = index.offset(text, range.start);

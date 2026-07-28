@@ -64,10 +64,7 @@ impl Document {
         let mut new_text = self.text.clone();
         new_text.replace_range(replaced.clone(), &change.text);
 
-        let range = TextRange::new(
-            (replaced.start as u32).into(),
-            (replaced.end as u32).into(),
-        );
+        let range = TextRange::new((replaced.start as u32).into(), (replaced.end as u32).into());
         self.parse = match flux_lang::parser::reparse(
             &self.parse,
             &self.text,

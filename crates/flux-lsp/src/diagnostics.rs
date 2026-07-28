@@ -46,7 +46,12 @@ fn code_for(message: &str) -> &'static str {
         .unwrap_or("analyzer-finding")
 }
 
-fn diagnostic(range: Range, message: String, code: &str, severity: DiagnosticSeverity) -> Diagnostic {
+fn diagnostic(
+    range: Range,
+    message: String,
+    code: &str,
+    severity: DiagnosticSeverity,
+) -> Diagnostic {
     Diagnostic {
         range,
         severity: Some(severity),
@@ -224,7 +229,10 @@ fn declaration_findings(
                 .or_else(|| ranges.map(|ranges| source_range(ranges.declaration, text, index)))
                 .unwrap_or_default();
             let message = if precise.is_none() && f.message.contains("(at `") {
-                format!("{} (declaration range — body range map incomplete)", f.message)
+                format!(
+                    "{} (declaration range — body range map incomplete)",
+                    f.message
+                )
             } else {
                 f.message
             };
@@ -275,7 +283,10 @@ mod tests {
     #[test]
     fn parse_errors_have_positioned_ranges() {
         let diags = diagnose("flow f\n  $a =\n  $b = 1\n");
-        assert!(!diags.is_empty(), "expected a diagnostic for the empty bind RHS");
+        assert!(
+            !diags.is_empty(),
+            "expected a diagnostic for the empty bind RHS"
+        );
         assert!(diags.iter().all(|d| d.range.start.line <= 2));
         assert!(diags.iter().all(|d| code(d) == "parse-error"));
     }
@@ -303,7 +314,9 @@ mod tests {
     fn an_unknown_operation_is_an_error_with_a_code() {
         let diagnostics = diagnose("flow f\n  made.up()\n");
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("unknown operation: `made.up`"));
+        assert!(diagnostics[0]
+            .message
+            .contains("unknown operation: `made.up`"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(code(&diagnostics[0]), "unknown-operation");
     }
@@ -369,7 +382,11 @@ flow second
   return $bad
 "#;
         let diagnostics = diagnose(src);
-        assert_eq!(diagnostics.len(), 1, "only the real unknown op: {diagnostics:?}");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "only the real unknown op: {diagnostics:?}"
+        );
         assert!(diagnostics[0].message.contains("definitely_missing"));
         let expected_line = src[..src.find("$bad =").unwrap()].matches('\n').count() as u32;
         assert_eq!(diagnostics[0].range.start.line, expected_line);

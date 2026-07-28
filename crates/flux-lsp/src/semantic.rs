@@ -313,7 +313,8 @@ mod tests {
 
     #[test]
     fn semantic_tokens_distinguish_known_op_from_unknown_and_bind_from_use() {
-        let src = "flow f\n  # a note\n  $x = read(\"a.txt\")\n  $y = made_up(\"z\")\n  return $x\n";
+        let src =
+            "flow f\n  # a note\n  $x = read(\"a.txt\")\n  $y = made_up(\"z\")\n  return $x\n";
         let decoded = decode(src, &tokens_for(src, None));
         let find = |t: &str| {
             decoded
@@ -329,7 +330,11 @@ mod tests {
             .any(|(t, ty, _)| t.contains("a note") && *ty == TOK_COMMENT));
         let read = find("read");
         assert_eq!(read.1, TOK_FUNCTION);
-        assert_ne!(read.2 & MOD_DEFAULT_LIBRARY, 0, "known op is defaultLibrary");
+        assert_ne!(
+            read.2 & MOD_DEFAULT_LIBRARY,
+            0,
+            "known op is defaultLibrary"
+        );
         let made_up = find("made_up");
         assert_eq!(made_up.2 & MOD_DEFAULT_LIBRARY, 0, "unknown op is plain");
         let bind = find("$x");
@@ -345,9 +350,18 @@ mod tests {
         let span = line_span(Range::new(Position::new(2, 0), Position::new(2, 8)));
         let decoded = decode(src, &tokens_for(src, Some(span)));
         let texts: Vec<&str> = decoded.iter().map(|(t, _, _)| t.as_str()).collect();
-        assert!(texts.contains(&"$y"), "the selected line is present: {texts:?}");
-        assert!(!texts.contains(&"read"), "other lines are excluded: {texts:?}");
-        assert!(!texts.contains(&"flow"), "other lines are excluded: {texts:?}");
+        assert!(
+            texts.contains(&"$y"),
+            "the selected line is present: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"read"),
+            "other lines are excluded: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"flow"),
+            "other lines are excluded: {texts:?}"
+        );
     }
 
     #[test]
@@ -357,7 +371,10 @@ mod tests {
         let edits = delta(&before, &after);
         assert_eq!(edits.len(), 1, "one contiguous splice");
         assert!(
-            edits[0].data.as_ref().is_some_and(|d| d.len() < after.len()),
+            edits[0]
+                .data
+                .as_ref()
+                .is_some_and(|d| d.len() < after.len()),
             "the delta is smaller than the full stream"
         );
     }

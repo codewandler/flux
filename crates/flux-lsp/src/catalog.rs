@@ -190,8 +190,11 @@ mod tests {
     fn document_signatures_include_unexposed_local_composites() {
         let src = "op internal(value: String) -> String\n  expose false\n  return $value\n\nflow f\n  return internal(\"x\")\n";
         let parse = flux_lang::parser::parse_cst(src);
-        let signatures =
-            signatures_for(&authoring_op_signatures(), &[], &document_composites(&parse));
+        let signatures = signatures_for(
+            &authoring_op_signatures(),
+            &[],
+            &document_composites(&parse),
+        );
         assert!(signatures.iter().any(|op| op.name == "internal"));
     }
 

@@ -2,7 +2,7 @@
 id: L-87
 title: Find-references and rename over the CST scope model
 pillar: Language
-status: backlog
+status: done
 epic: flux-lsp-round-2
 design: docs/designs/flux-lsp-round-2.md
 note: neither `references` nor `rename`/`prepare_rename` is implemented (no handler in the LanguageServer impl, main.rs:181-340) — yet the scope resolution a correct rename needs already shipped with L-68 (all_var_defs:941, better_binding:1049)
@@ -31,23 +31,32 @@ of a `$var`, param, flow, or op — and rename it correctly, honouring shadowing
 
 ## Acceptance
 
-- [ ] `initialize` advertises `references_provider` and `rename_provider` (with
+- [x] `initialize` advertises `references_provider` and `rename_provider` (with
       `prepare_provider` so clients can pre-validate).
-- [ ] `textDocument/references` on a `$var` returns its bind site (when
+- [x] `textDocument/references` on a `$var` returns its bind site (when
       `include_declaration`) plus every use resolving to *that* binding — never a same-named
       variable in another declaration or another scope.
-- [ ] `textDocument/references` on a flow/op name returns its declaration and every call site.
-- [ ] `textDocument/prepareRename` rejects a position that is not a renameable symbol (punctuation,
+- [x] `textDocument/references` on a flow/op name returns its declaration and every call site.
+- [x] `textDocument/prepareRename` rejects a position that is not a renameable symbol (punctuation,
       a keyword, a literal) instead of returning a bogus range.
-- [ ] `textDocument/rename` returns a `WorkspaceEdit` covering exactly the reference set, with the
+- [x] `textDocument/rename` returns a `WorkspaceEdit` covering exactly the reference set, with the
       `$` sigil handled and the new name validated as a legal identifier.
-- [ ] Failing-first tests: (a) two flows each binding `$x` — renaming one leaves the other
+- [x] Failing-first tests: (a) two flows each binding `$x` — renaming one leaves the other
       untouched; (b) an inner shadowing bind renames only the inner scope's uses; (c) renaming a
       composite op updates its declaration and both call sites; (d) the renamed buffer still parses
       clean and lowers to the same shape.
 
 ## Progress
-- (not started)
+- **Done (2026-07-28).** `initialize` now advertises `references_provider` and `rename_provider` with
+  `prepare_provider`. `references` resolves through the scope model, so a `$x` in one flow never
+  matches a `$x` in another and an inner shadowing bind owns only its own scope; on a flow/op name it
+  returns the declaration plus every call site. `prepareRename` refuses punctuation, keywords and
+  literals instead of handing back a bogus range, and `rename` validates the new name as a legal
+  identifier and handles the `$` sigil.
+- **Tests (7):** references stay inside their binding, respect inner shadowing, a composite name
+  resolves declaration + call sites, punctuation/prose are not renameable, a new name must be
+  spellable, and both go-to-definition paths.
+
 
 ## Notes
 - Single-file scope for the rename edit: cross-file rename waits for the workspace catalog in L-89.

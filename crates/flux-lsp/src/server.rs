@@ -107,7 +107,11 @@ impl Backend {
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 
-    async fn semantic_data(&self, uri: &Url, lines: Option<std::ops::Range<u32>>) -> Option<Vec<SemanticToken>> {
+    async fn semantic_data(
+        &self,
+        uri: &Url,
+        lines: Option<std::ops::Range<u32>>,
+    ) -> Option<Vec<SemanticToken>> {
         let parse = self.docs.with(uri, |doc| doc.parse.clone()).await?;
         let known: HashSet<String> = self
             .signatures_for(&parse)
@@ -172,14 +176,14 @@ pub fn capabilities() -> ServerCapabilities {
             work_done_progress_options: Default::default(),
         })),
         // Semantic tokens (L-69) with range + delta (L-90).
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
                 legend: semantic::legend(),
                 full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                 range: Some(true),
                 ..Default::default()
-            }),
-        ),
+            },
+        )),
         ..Default::default()
     }
 }

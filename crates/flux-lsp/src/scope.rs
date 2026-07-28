@@ -418,7 +418,11 @@ mod tests {
         let root = root_of(src);
         let inner = symbol_at(&root, at(src, "each $it") + 5).expect("resolves the each binder");
         let refs = references(&root, &inner);
-        assert_eq!(refs.len(), 2, "the each binder and the use inside it: {refs:?}");
+        assert_eq!(
+            refs.len(),
+            2,
+            "the each binder and the use inside it: {refs:?}"
+        );
         let outer = symbol_at(&root, at(src, "$it = 0")).expect("resolves the flow bind");
         let outer_refs = references(&root, &outer);
         assert_eq!(

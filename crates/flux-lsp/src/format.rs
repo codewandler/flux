@@ -37,10 +37,8 @@ pub fn format_selection(
     let start = index.offset(text, range.start);
     let end = index.offset(text, range.end).max(start);
     let (replaced, new_text) = flux_lang::format_cst::format_range(parse, text, start..end)?;
-    let replaced = text_size::TextRange::new(
-        (replaced.start as u32).into(),
-        (replaced.end as u32).into(),
-    );
+    let replaced =
+        text_size::TextRange::new((replaced.start as u32).into(), (replaced.end as u32).into());
     Some(vec![TextEdit {
         range: source_range(replaced, text, index),
         new_text,
@@ -63,8 +61,7 @@ mod tests {
         let src = "flow f\n    # a leading note\n    $x   =   1  # trailing\n    return   $x\n";
         let formatted = format(src).expect("formats");
         assert_eq!(
-            formatted,
-            "flow f\n  # a leading note\n  $x = 1  # trailing\n  return $x\n",
+            formatted, "flow f\n  # a leading note\n  $x = 1  # trailing\n  return $x\n",
             "canonical spacing *and* every comment"
         );
     }
@@ -84,13 +81,19 @@ mod tests {
             vec!["op one() -> String", "flow mid", "op two() -> String"],
             "source declaration order is preserved"
         );
-        assert!(formatted.contains("\n  return \"1\"\n"), "bodies re-indented");
+        assert!(
+            formatted.contains("\n  return \"1\"\n"),
+            "bodies re-indented"
+        );
     }
 
     #[test]
     fn a_comment_free_flow_still_reaches_the_canonical_formatter() {
         let src = "flow f\n    $x = 1\n    return $x\n";
-        assert_eq!(format(src).expect("formats"), "flow f\n  $x = 1\n  return $x\n");
+        assert_eq!(
+            format(src).expect("formats"),
+            "flow f\n  $x = 1\n  return $x\n"
+        );
     }
 
     #[test]

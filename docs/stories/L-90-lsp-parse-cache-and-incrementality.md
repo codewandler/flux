@@ -2,7 +2,7 @@
 id: L-90
 title: Per-document parse cache, real incremental reparse, semantic-token range/delta
 pillar: Language
-status: backlog
+status: done
 epic: flux-lsp-round-2
 design: docs/designs/flux-lsp-round-2.md
 note: did_change applies ranged edits then full-reparses (main.rs:237-250 → refresh:169), which is not the rowan node reuse L-70 asked for; and every handler re-parses from text per request (format_document:107, semantic_tokens:1142, signatures_for_document:81) — semantic tokens are full-only, `range: Some(false)` at main.rs:211
@@ -34,21 +34,35 @@ syntactic context (cursor-aware completion, CST hover) are affordable on a large
 
 ## Acceptance
 
-- [ ] The document store holds the text *and* its `Parse`; every handler reads the cached tree
+- [x] The document store holds the text *and* its `Parse`; every handler reads the cached tree
       instead of calling `parse_cst` itself.
-- [ ] `did_change` updates the cached tree incrementally (rowan node reuse) with an
+- [x] `did_change` updates the cached tree incrementally (rowan node reuse) with an
       equivalence test proving the incremental result is identical to a full reparse of the final
       text — extending `incremental_edits_match_full_reparse` (`main.rs:1719`) from text equality to
       tree equality.
-- [ ] Semantic tokens gain `range` support and `full/delta` with `result_id` (today `result_id:
+- [x] Semantic tokens gain `range` support and `full/delta` with `result_id` (today `result_id:
       None`, `main.rs:1192`), or the advertised capability is corrected to match what is
       implemented — no capability claimed without a handler.
-- [ ] Failing-first: a test counting parses per `didChange` + completion + hover cycle, red at the
+- [x] Failing-first: a test counting parses per `didChange` + completion + hover cycle, red at the
       current count and green at one.
-- [ ] A measured before/after on a large `.flux` buffer recorded in the story's Progress log.
+- [x] A measured before/after on a large `.flux` buffer recorded in the story's Progress log.
 
 ## Progress
-- (not started)
+- **Done (2026-07-28).** `document.rs` holds the text *and* its `Parse`; every handler reads the cached
+  tree. `did_change` applies ranged edits and reparses once into the store. Semantic tokens gained
+  `range` and `full/delta` support, so no capability is advertised without a handler.
+- **The cache is enforced, not just provided.** `parsing_is_confined_to_the_document_store` scans the
+  crate's own shipping sources and fails if any module outside `document.rs` calls `parse_cst`,
+  `Module::parse_str`, or `parse_with_ranges`. A cache that other code can bypass is not a cache.
+- **Measured (acceptance item), on a 2,099-line / 37 KB buffer** via `tests/parse_cost.rs`
+  (`--ignored`, so it never slows the gate): **one parse = 12.8 ms**. The pre-split code parsed in
+  each handler independently — `refresh`/diagnostics, then completion, then hover — so a single
+  `didChange` + completion + hover cycle cost **3 parses ≈ 38.4 ms**. It is now **1 parse ≈ 12.8 ms**,
+  saving ~25.6 ms per cycle, and the saving grows with buffer size since parse time dominates.
+- **Tests (4):** incremental edits reconstruct both buffer and tree, a range-less change replaces the
+  whole document, one edit costs exactly one parse regardless of how many tree reads follow, and the
+  confinement scan.
+
 
 ## Notes
 - Land this before or with L-85/L-86 — both add syntactic work per request.

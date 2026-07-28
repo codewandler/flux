@@ -83,16 +83,20 @@ pub fn context_at(root: &SyntaxNode, text: &str, offset: usize) -> Context {
     if token_start >= line_start && text[line_start..token_start].trim().is_empty() {
         return Context::StatementHead;
     }
-    let in_args = tok.parent().into_iter().flat_map(|p| p.ancestors()).any(|n| {
-        matches!(
-            n.kind(),
-            SyntaxKind::ARG_LIST
-                | SyntaxKind::CALL_EXPR
-                | SyntaxKind::OBJ_EXPR
-                | SyntaxKind::LIST_EXPR
-                | SyntaxKind::PARAM_LIST
-        )
-    });
+    let in_args = tok
+        .parent()
+        .into_iter()
+        .flat_map(|p| p.ancestors())
+        .any(|n| {
+            matches!(
+                n.kind(),
+                SyntaxKind::ARG_LIST
+                    | SyntaxKind::CALL_EXPR
+                    | SyntaxKind::OBJ_EXPR
+                    | SyntaxKind::LIST_EXPR
+                    | SyntaxKind::PARAM_LIST
+            )
+        });
     if in_args {
         Context::Argument
     } else {
@@ -266,7 +270,8 @@ mod tests {
 
     #[test]
     fn a_cursor_in_one_flow_does_not_see_another_flows_binds() {
-        let src = "flow a\n  $only_in_a = 1\n  return $only_in_a\n\nflow b\n  $here = 2\n  return $\n";
+        let src =
+            "flow a\n  $only_in_a = 1\n  return $only_in_a\n\nflow b\n  $here = 2\n  return $\n";
         let items = complete(src, src.rfind("return $").unwrap() + 8);
         let labels = labels(&items);
         assert!(labels.contains(&"$here"), "flow b's own bind: {labels:?}");
@@ -281,7 +286,9 @@ mod tests {
         let src = "flow f\n  $x = 1\n  return $\n";
         let items = complete(src, src.rfind('$').unwrap() + 1);
         assert_eq!(labels(&items), vec!["$x"], "only in-scope variables");
-        assert!(items.iter().all(|i| i.kind == Some(CompletionItemKind::VARIABLE)));
+        assert!(items
+            .iter()
+            .all(|i| i.kind == Some(CompletionItemKind::VARIABLE)));
     }
 
     #[test]
@@ -291,12 +298,16 @@ mod tests {
         let items = complete(src, src.rfind('$').unwrap() + 1);
         let labels = labels(&items);
         assert!(labels.contains(&"$x"));
-        assert!(!labels.contains(&"$ghost"), "string interior is not scope: {labels:?}");
+        assert!(
+            !labels.contains(&"$ghost"),
+            "string interior is not scope: {labels:?}"
+        );
     }
 
     #[test]
     fn a_cursor_inside_a_comment_or_string_offers_nothing() {
-        let src = "flow f\n  # write something here\n  $x = fmt(\"read the manual\")\n  return $x\n";
+        let src =
+            "flow f\n  # write something here\n  $x = fmt(\"read the manual\")\n  return $x\n";
         assert!(complete(src, src.find("something").unwrap() + 4).is_empty());
         assert!(complete(src, src.find("the manual").unwrap() + 4).is_empty());
     }
@@ -336,7 +347,9 @@ mod tests {
             .expect("read is offered");
         assert_eq!(read.insert_text_format, Some(InsertTextFormat::SNIPPET));
         assert!(
-            read.insert_text.as_deref().is_some_and(|t| t.contains("${1:")),
+            read.insert_text
+                .as_deref()
+                .is_some_and(|t| t.contains("${1:")),
             "snippet has a parameter placeholder: {:?}",
             read.insert_text
         );
@@ -348,6 +361,11 @@ mod tests {
         let src = "flow f\n  $it = 0\n  each $it in $xs\n    do process $\n";
         let items = complete(src, src.rfind('$').unwrap() + 1);
         let its: Vec<&CompletionItem> = items.iter().filter(|i| i.label == "$it").collect();
-        assert_eq!(its.len(), 1, "one entry per visible name: {:?}", labels(&items));
+        assert_eq!(
+            its.len(),
+            1,
+            "one entry per visible name: {:?}",
+            labels(&items)
+        );
     }
 }
