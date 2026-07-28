@@ -3078,6 +3078,8 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
+        flux_tools::register_reflect(&mut registry);
+        flux_tools::register_evidence(&mut registry);
         let system = Arc::new(System::new(Workspace::new(&origin).unwrap()));
         let executor = Executor::new(
             registry,

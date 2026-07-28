@@ -2101,6 +2101,9 @@ mod tests {
     /// directly-under-tmp `flux-worktree-*` allocation.
     #[test]
     fn worktree_dir_alloc_and_guarded_removal() {
+        // The refusal fixture is built FIRST: temp_workspace() takes the sandbox env lock
+        // internally, and EnvGuard below holds that same non-reentrant lock for the whole test.
+        let (other, _) = temp_workspace();
         // Pin the base via FLUX_WORKTREE_DIR (under the env lock) so the test never touches the
         // real ~/.flux/worktrees and stays hermetic under parallel test threads.
         let _env = sandbox::EnvGuard::new(&["FLUX_WORKTREE_DIR"]);
@@ -2125,7 +2128,6 @@ mod tests {
 
         // Refusals: wrong prefix, nested path, workspace-shaped path, and an entry under a
         // DIFFERENT base than the resolved one (e.g. a stale /tmp allocation after the base moved).
-        let (other, _) = temp_workspace();
         assert!(remove_worktree_dir(&other).is_err());
         assert!(remove_worktree_dir(&base.join("flux-worktree-x/nested")).is_err());
         let foreign = std::env::temp_dir().join("flux-worktree-foreign");
