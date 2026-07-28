@@ -439,8 +439,14 @@ jobs:
           echo "Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
       - name: Cleanup
         run: |
-          # Remove the granular manifests
+          # Remove the granular manifests. NOTE: this glob also matches the plan job's
+          # `plan-dist-manifest.json`, which the candidate-promotion path downloads — so the
+          # top-level manifest has to be re-placed below or the release ships without it (C-47:
+          # v0.27.0 was created with 27 assets but no dist-manifest.json and failed verification).
           rm -f artifacts/*-dist-manifest.json
+          # The `dist host` step above wrote the release's own manifest to the workspace root; it
+          # is a required release asset, so put it where `gh release create artifacts/*` sees it.
+          cp dist-manifest.json artifacts/dist-manifest.json
       - name: Create GitHub Release
         env:
           # Scoped release token: a fine-grained PAT (this repo only, Contents: write) stored as the
