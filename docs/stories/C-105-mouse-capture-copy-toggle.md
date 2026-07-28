@@ -2,7 +2,7 @@
 id: C-105
 title: Mouse-capture toggle for native select/copy
 pillar: Core
-status: ready
+status: done
 priority: P1
 design: tui-polish
 epic: tui-polish
@@ -17,15 +17,15 @@ Mouse capture is unconditionally on, which blocks terminal-native text selection
 toggle so users can copy from the transcript without leaving the TUI.
 
 ## Acceptance
-- [ ] Ctrl-T toggles mouse capture live (crossterm Enable/DisableMouseCapture on the same stdout;
+- [x] Ctrl-T toggles mouse capture live (crossterm Enable/DisableMouseCapture on the same stdout;
       verified unbound in tui-textarea 0.7, so nothing is shadowed).
-- [ ] While off, the footer idle hint shows ` mouse off · select/copy · Ctrl-T re-enable` in warn
+- [x] While off, the footer idle hint shows ` mouse off · select/copy · Ctrl-T re-enable` in warn
       style — pinned by a TestBackend render test on `ChatState.mouse_capture = false`.
-- [ ] Wheel scroll lost while off is accepted (PgUp/PgDn remain); `TerminalGuard` teardown stays
+- [x] Wheel scroll lost while off is accepted (PgUp/PgDn remain); `TerminalGuard` teardown stays
       correct in both states (double-disable is harmless).
 
 ## Progress
--
+- Done 2026-07-28: Ctrl-T toggles capture live; idle footer hint becomes the warn indicator (never dropped), running turns show a short right segment. Test: mouse_off_footer_indicator.
 
 ## Notes
 - Seams: mouse arm `lib.rs:1828`, key dispatch `lib.rs:2022+`, `footer_line` `lib.rs:1160`,

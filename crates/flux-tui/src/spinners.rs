@@ -253,7 +253,11 @@ fn binary_rain(tick: usize, width: usize) -> Vec<Cell> {
         .map(|i| {
             let speed = SPEEDS[i % SPEEDS.len()];
             let col_tick = tick * speed;
-            let digit = if (col_tick + i) % 2 == 0 { '1' } else { '0' };
+            let digit = if (col_tick + i).is_multiple_of(2) {
+                '1'
+            } else {
+                '0'
+            };
             cell(digit, STYLES[(col_tick / speed + i) % STYLES.len()], false)
         })
         .collect()
@@ -399,13 +403,13 @@ mod tests {
         let visible: usize = line
             .split('\x1b')
             .map(|seg| {
-                seg.splitn(2, 'm').nth(1).map_or(
+                seg.split_once('m').map_or(
                     if seg.is_empty() {
                         0
                     } else {
                         seg.chars().count()
                     },
-                    |s| s.chars().count(),
+                    |(_, s)| s.chars().count(),
                 )
             })
             .sum();

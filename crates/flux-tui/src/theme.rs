@@ -148,8 +148,16 @@ impl Theme {
             };
         }
         match name {
-            "dark" => Some(if truecolor { Self::DARK_RGB } else { Self::DARK }),
-            "light" => Some(if truecolor { Self::LIGHT_RGB } else { Self::LIGHT }),
+            "dark" => Some(if truecolor {
+                Self::DARK_RGB
+            } else {
+                Self::DARK
+            }),
+            "light" => Some(if truecolor {
+                Self::LIGHT_RGB
+            } else {
+                Self::LIGHT
+            }),
             "mono" => Some(Self::MONO),
             _ => None,
         }

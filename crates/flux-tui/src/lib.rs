@@ -14,11 +14,11 @@ pub mod splash;
 mod state;
 mod terminal_io;
 
+pub use controller::ApprovalView;
 use controller::{
     approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
     ChannelSink, PendingApproval, UiEvent,
 };
-pub use controller::ApprovalView;
 #[cfg(test)]
 use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
@@ -264,13 +264,22 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("↵", "send (or queue while a turn runs)"),
     ("Ctrl-J / Alt-↵ / Shift-↵", "newline"),
     ("↑/↓", "history recall (at the input's edge)"),
-    ("Ctrl-R", "reverse history search (shadows redo; Ctrl-U undo)"),
+    (
+        "Ctrl-R",
+        "reverse history search (shadows redo; Ctrl-U undo)",
+    ),
     ("Ctrl-F", "transcript search · n/N step matches"),
     ("PgUp/PgDn / wheel", "scroll transcript"),
     ("Ctrl-End", "jump to latest"),
     ("Ctrl-E", "expand/collapse tool details"),
-    ("Ctrl-T", "toggle mouse capture (native select/copy while off)"),
-    ("y / a / n·Esc", "approval: allow / always / deny (other keys ignored)"),
+    (
+        "Ctrl-T",
+        "toggle mouse capture (native select/copy while off)",
+    ),
+    (
+        "y / a / n·Esc",
+        "approval: allow / always / deny (other keys ignored)",
+    ),
     ("Ctrl-C", "interrupt · clear · quit"),
     ("Ctrl-D", "quit (empty input)"),
     ("F1 / Esc", "open/close this help"),
@@ -529,7 +538,12 @@ fn highlight_matches(line: &Line<'static>, query: &str, current: Option<Style>) 
         let key = (*style, hit[idx]);
         if run != Some(key) {
             if let Some((style, matched)) = run.take() {
-                spans.push(styled_run(std::mem::take(&mut buf), style, matched, current));
+                spans.push(styled_run(
+                    std::mem::take(&mut buf),
+                    style,
+                    matched,
+                    current,
+                ));
             }
             run = Some(key);
         }
@@ -563,7 +577,10 @@ fn tool_header_line(
     let pad = (width as usize).saturating_sub(used + badge_w).max(1);
     Line::from(vec![
         Span::styled("→ ", t.tool_style()),
-        Span::styled(verb.to_string(), t.tool_style().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            verb.to_string(),
+            t.tool_style().add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(arg, t.muted_style()),
         Span::raw(" ".repeat(pad)),
@@ -1205,8 +1222,7 @@ impl ChatState {
             .enumerate()
             .filter(|(_, line)| {
                 line.spans.last().is_some_and(|span| {
-                    span.content.as_ref() == RUNNING_BADGE
-                        && span.style == self.theme.warn_style()
+                    span.content.as_ref() == RUNNING_BADGE && span.style == self.theme.warn_style()
                 })
             })
             .map(|(row, _)| row as u16)
@@ -1288,8 +1304,8 @@ impl ChatState {
                 .enumerate()
                 .map(|(i, line)| {
                     let row = offset + i as u16;
-                    let current = (Some(row) == current_row)
-                        .then(|| Style::default().fg(self.theme.accent));
+                    let current =
+                        (Some(row) == current_row).then(|| Style::default().fg(self.theme.accent));
                     highlight_matches(&line, &search.query, current)
                 })
                 .collect();
@@ -1582,10 +1598,7 @@ impl ChatState {
         // C-106: scroll position while detached from follow mode.
         if !self.follow && self.last_max_scroll.get() > 0 {
             let pct = (self.scroll as u32 * 100) / self.last_max_scroll.get().max(1) as u32;
-            right.push(vec![Span::styled(
-                format!("⤓ {pct}%"),
-                t.accent_style(),
-            )]);
+            right.push(vec![Span::styled(format!("⤓ {pct}%"), t.accent_style())]);
         }
         if let Some(e) = self.last_elapsed {
             let plural = if self.steps == 1 { "" } else { "s" };
@@ -2481,12 +2494,10 @@ async fn event_loop(
                         }
                         KeyCode::Backspace | KeyCode::Char(_) => {
                             let edited = match key.code {
-                                KeyCode::Backspace => {
-                                    state
-                                        .history_search
-                                        .as_mut()
-                                        .is_some_and(|hs| hs.query.pop().is_some())
-                                }
+                                KeyCode::Backspace => state
+                                    .history_search
+                                    .as_mut()
+                                    .is_some_and(|hs| hs.query.pop().is_some()),
                                 KeyCode::Char(c) if !ctrl => {
                                     if let Some(hs) = state.history_search.as_mut() {
                                         hs.query.push(c);
@@ -2910,7 +2921,10 @@ async fn handle_command(
                 });
             }
             None => state.push(Entry::Notice {
-                text: format!("unknown theme `{args}` — themes: {}", Theme::names().join(" ")),
+                text: format!(
+                    "unknown theme `{args}` — themes: {}",
+                    Theme::names().join(" ")
+                ),
                 sev: Sev::Warn,
             }),
         },
@@ -3018,8 +3032,10 @@ async fn handle_command(
 }
 
 fn command_is_read_only(name: &str, args: &str) -> bool {
-    matches!(name, "help" | "tools" | "evidence" | "session" | "queue" | "theme")
-        || (name == "sessions" && args != "--prune")
+    matches!(
+        name,
+        "help" | "tools" | "evidence" | "session" | "queue" | "theme"
+    ) || (name == "sessions" && args != "--prune")
         || (name == "effort" && args.is_empty())
 }
 
@@ -3477,7 +3493,7 @@ mod tests {
     fn scroll_indicator_appears_only_while_detached() {
         let mut state = ChatState::new("mock".into());
         for i in 0..40 {
-            state.push_user(&format!("message number {i}"));
+            state.push_user(format!("message number {i}"));
         }
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         // Following: no indicator.
@@ -3493,9 +3509,18 @@ mod tests {
         let transcript_rows = 1..(12 - 2);
         let bar_col = 59;
         let has_bar_glyph = transcript_rows
-            .map(|y| buffer.cell((bar_col, y)).expect("cell").symbol().to_string())
+            .map(|y| {
+                buffer
+                    .cell((bar_col, y))
+                    .expect("cell")
+                    .symbol()
+                    .to_string()
+            })
             .any(|s| s != " ");
-        assert!(has_bar_glyph, "scrollbar glyphs expected in the last column");
+        assert!(
+            has_bar_glyph,
+            "scrollbar glyphs expected in the last column"
+        );
 
         // Reattach: indicator gone.
         state.follow = true;
@@ -3521,7 +3546,11 @@ mod tests {
         assert!(content.contains("Ctrl-R"), "{content}");
         assert!(content.contains("Ctrl-T"), "{content}");
         for c in COMMANDS {
-            assert!(content.contains(&format!("/{}", c.name)), "missing /{}", c.name);
+            assert!(
+                content.contains(&format!("/{}", c.name)),
+                "missing /{}",
+                c.name
+            );
         }
 
         state.help_open = false;
@@ -3585,11 +3614,11 @@ mod tests {
     fn transcript_search_highlights_and_centers() {
         let mut state = ChatState::new("mock".into());
         for i in 0..30 {
-            state.push_user(&format!("filler {i}"));
+            state.push_user(format!("filler {i}"));
         }
         state.push_user("the needle message");
         for i in 0..30 {
-            state.push_user(&format!("padding {i}"));
+            state.push_user(format!("padding {i}"));
         }
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap(); // build the layout
@@ -3713,12 +3742,7 @@ mod tests {
         state.input.insert_str("draft");
         let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
-        let dark_bg = terminal
-            .backend()
-            .buffer()
-            .cell((0, 0))
-            .expect("cell")
-            .bg;
+        let dark_bg = terminal.backend().buffer().cell((0, 0)).expect("cell").bg;
         assert_eq!(dark_bg, Theme::DARK.base_bg);
 
         state.theme = Theme::LIGHT;
@@ -3788,7 +3812,10 @@ mod tests {
         assert!(!content.contains("[\""), "no Debug formatting: {content}");
         assert!(content.contains("more"), "windowed list marker: {content}");
         assert!(content.contains('┌'), "bordered sheet: {content}");
-        assert!(content.contains("[y]") && content.contains("[n/Esc]"), "{content}");
+        assert!(
+            content.contains("[y]") && content.contains("[n/Esc]"),
+            "{content}"
+        );
 
         // Hint keys carry their semantic colors.
         let buffer = terminal.backend().buffer();
@@ -4140,7 +4167,10 @@ mod tests {
         // Narrow: only tokens survive (4 + 3 + 2 = 9).
         let narrow = render_at(12);
         assert!(narrow.contains("tok"), "{narrow}");
-        assert!(!narrow.contains("cache") && !narrow.contains("cost"), "{narrow}");
+        assert!(
+            !narrow.contains("cache") && !narrow.contains("cost"),
+            "{narrow}"
+        );
         // Floor: right side empties entirely rather than truncating the left.
         let floor = render_at(6);
         assert!(floor.contains("left") && !floor.contains("tok"), "{floor}");

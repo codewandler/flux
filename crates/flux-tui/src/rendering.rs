@@ -18,7 +18,10 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 pub fn render(frame: &mut Frame, state: &ChatState) {
     // Whole-screen fill so a light theme works on terminals with a dark background (C-104);
     // `base_bg == Reset` (the dark themes) keeps the terminal's own background untouched.
-    frame.render_widget(Block::default().style(state.theme.base_style()), frame.area());
+    frame.render_widget(
+        Block::default().style(state.theme.base_style()),
+        frame.area(),
+    );
     if frame.area().width < 24 || frame.area().height < 6 {
         frame.render_widget(
             Paragraph::new("terminal too small — resize to continue")
@@ -274,10 +277,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let height = (rows.len() as u16).min(frame.area().height);
         let area = centered(frame.area(), width, height);
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(rows).style(t.panel_style()),
-            area,
-        );
+        frame.render_widget(Paragraph::new(rows).style(t.panel_style()), area);
     }
 
     if let Some(view) = &state.approval {
@@ -311,7 +311,10 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let shown = view.subjects.iter().skip(start).take(subject_rows);
         for subject in shown {
             rows.push(Line::styled(
-                format!("- {}", truncate(subject, area.width.saturating_sub(4) as usize)),
+                format!(
+                    "- {}",
+                    truncate(subject, area.width.saturating_sub(4) as usize)
+                ),
                 t.muted_style(),
             ));
         }
@@ -319,7 +322,10 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let mut hints = vec![
             Span::styled("[y]", t.ok_style().add_modifier(Modifier::BOLD)),
             Span::styled(" allow  ", t.muted_style()),
-            Span::styled("[a]", Style::default().fg(t.warn).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[a]",
+                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" always  ", t.muted_style()),
             Span::styled("[n/Esc]", t.err_style().add_modifier(Modifier::BOLD)),
             Span::styled(" deny", t.muted_style()),

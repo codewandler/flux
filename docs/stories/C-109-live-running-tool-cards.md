@@ -2,7 +2,7 @@
 id: C-109
 title: Live elapsed + animated badge on running tool cards
 pillar: Core
-status: ready
+status: done
 priority: P3
 design: tui-polish
 epic: tui-polish
@@ -17,16 +17,16 @@ Running tool cards show a static `◌` badge (deliberately, to protect the layou
 a live elapsed timer and animated glyph without invalidating the cache per tick.
 
 ## Acceptance
-- [ ] Running tool header rows show `⠋ running · 2s`-style live badge, animated on the existing
+- [x] Running tool header rows show `⠋ running · 2s`-style live badge, animated on the existing
       62 ms running tick; done cards unchanged (`✓/✗` + elapsed).
-- [ ] Implementation patches only visible running header lines in `transcript_viewport` (already
+- [x] Implementation patches only visible running header lines in `transcript_viewport` (already
       cloned), via `running_rows` recorded on `TranscriptLayout` at build time and a shared
       `tool_header_line()` helper extracted from `tool_lines` (pad math cannot drift).
-- [ ] Test pins that the transcript layout cache revision is UNCHANGED across animation frames,
+- [x] Test pins that the transcript layout cache revision is UNCHANGED across animation frames,
       and that the patched badge disappears once the result lands.
 
 ## Progress
--
+- Done 2026-07-28: RUNNING_BADGE rows recorded on TranscriptLayout post-wrap (badge-span + warn-style matched, zipped with running tool entries); viewport patches visible headers via shared tool_header_line with SPINNER glyph + fmt_elapsed. Cache revision pinned unchanged across frames. Test: running_tool_card_animates_without_cache_invalidation.
 
 ## Notes
 - Seams: `tool_lines` `lib.rs:1032` (static-badge comment at `:1036-1038` states the cache

@@ -130,7 +130,7 @@ impl Pcg32 {
     }
 
     fn gen_range(&mut self, n: usize) -> usize {
-        (u64::from(self.next_u32()) * n as u64 >> 32) as usize
+        ((u64::from(self.next_u32()) * n as u64) >> 32) as usize
     }
 
     fn gen_f64(&mut self) -> f64 {
@@ -359,7 +359,7 @@ impl Splash {
                 );
             }
             let cursor_x = tag_x + tag_len + 1;
-            if self.frame / 9 % 2 == 0 && cursor_x < CANVAS_W {
+            if (self.frame / 9).is_multiple_of(2) && cursor_x < CANVAS_W {
                 f.set(cursor_x as isize, tag_y, '█', CYAN0, false);
             }
             for (i, ch) in HINT.chars().enumerate() {
@@ -696,7 +696,7 @@ mod tests {
             assert_eq!(row.len(), 36);
         }
         assert!(rows[0].len() < CANVAS_W);
-        assert!(LOGO_H + 1 + 1 < CANVAS_H, "tagline row must fit the canvas");
+        const _: () = assert!(LOGO_H + 1 + 1 < CANVAS_H, "tagline row must fit the canvas");
         assert!(TAGLINE.chars().count() < CANVAS_W);
         assert!(HINT.chars().count() < CANVAS_W);
     }
