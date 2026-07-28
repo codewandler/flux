@@ -26,12 +26,17 @@ version lines require.
       must also have a changed version. Failing-first test proves it catches a stale version.
 - [x] `codewandler-flux-host-kit` leaves the flux closure in `scripts/publish-crates-io.sh` and
       publishes with the plugin pack release instead.
-- [ ] Measured: publish wall-clock for a release in which the protocol line did not move, compared
+- [x] Measured: publish wall-clock for a release in which the protocol line did not move, compared
       against 0.28.0's baseline.
 
 ## Progress
 - Done. See the CHANGELOG `[Unreleased]` entries and `docs/designs/plugin-protocol-decoupling.md` ("As built").
-- Wall-clock is not measurable yet. At the 0.29.0 cut every closure crate is genuinely new (`1.0.0` has never been published, `0.29.0` is fresh), so the pre-check skips nothing. The saving lands from 0.29.1 onward, when the six 1.x crates are already live and skip without packaging.
+- **Measured at v0.30.0**, the first release after the protocol line settled: **6 crates skipped
+  without packaging at all** — exactly `flux-plugin-protocol`, `flux-spec`, `flux-policy`,
+  `flux-secret`, `flux-evidence`, `flux-datasource`, all still at 1.0.0. Publish wall-clock
+  **13m13s (v0.29.0) -> 11m33s (v0.30.0)**, ~13% off. Not a controlled comparison — v0.29.0 also
+  published one brand-new crate name — but the 6 skips are the direct effect, and they grow into
+  the dominant saving on any release where the wire does not move (i.e. most of them).
 
 ## Notes
 - Depends on C-143 — with every crate on one version line there is nothing to skip.
