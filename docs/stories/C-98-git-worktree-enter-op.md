@@ -2,7 +2,7 @@
 id: C-98
 title: "git_worktree_enter — guarded op that moves this context into a temp worktree"
 pillar: Core
-status: backlog
+status: done
 epic: context-local-git-worktrees
 design: docs/designs/context-local-git-worktrees.md
 note: "clean main → generated flux/worktree/* branch → /tmp worktree → context root transition; argv-only git"
@@ -27,7 +27,7 @@ original checkout.
       permission subjects and process/local-system effects; registry/group/catalog tests updated.
 
 ## Progress
-- (not started)
+- 2026-07-28 implemented (epic worktree branch): GitWorktreeEnterTool in flux-tools — preflights, generated flux/worktree/<pid>-<seq>-<head> branch, allocate_worktree_dir + git worktree add, System::rerooted transition; Risk::High, git group, catalogs synced (ops.md + ops-reference.md). Tests: round trip + dirty-main/non-main/nested rejections. Gate green.
 
 ## Notes
 - Depends on C-97 (WorkspaceContext seam).

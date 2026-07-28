@@ -31,9 +31,11 @@ _None._
 ## Next (ready — take the top one unless the user named a story)
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 
-### Context-local Git worktrees
-_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
-- [C-97 — WorkspaceContext — a context-local, swappable active System](C-97-workspace-context-runtime-seam.md) · Core · runtime seam for the worktree ops: per-agent active-System accessor replaces direct ctx.system; no set_current_dir anywhere
+### TUI polish — 5 UX + 5 UI improvements
+_The TUI became a daily driver with A-65 and gained its boot splash + spinners with C-101. The_
+- [C-103 — Approval modal — explicit keys, real subjects, redesigned sheet](C-103-approval-modal-safety-and-redesign.md) · Core
+- [C-102 — Graceful narrow-width header/footer bars](C-102-graceful-narrow-width-bars.md) · Core
+- [C-104 — TUI theme system — truecolor dark, light, mono + /theme](C-104-tui-theme-system.md) · Core
 
 ## Blocked
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
@@ -46,12 +48,6 @@ _Agents that mutate a repository while the user (or another agent) works in the 
 
 ### Approval Distillation
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
-
-### Context-local Git worktrees
-_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
-- [C-98 — git_worktree_enter — guarded op that moves this context into a temp worktree](C-98-git-worktree-enter-op.md) · Core · clean main → generated flux/worktree/* branch → /tmp worktree → context root transition; argv-only git
-- [C-99 — git_worktree_leave — merge back to main, restore context, clean up](C-99-git-worktree-leave-op.md) · Core · trial merge then --no-ff; conflict never strands main; cleanup-pending state is retryable without re-merging
-- [C-100 — Worktree-aware engine probing, sub-agent inheritance, and epic docs](C-100-worktree-engine-and-subagents.md) · Core · FlowEngine probes the active root per turn; children get an independent snapshot; ops-reference/CHANGELOG/WHATS-NEW close the epic
 
 ### Evidence Pinned Memory
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
@@ -257,6 +253,10 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-88 — Decompose god-functions and de-duplicate helpers trapped in binary crates](C-88-quality-godfunctions-dedup.md) · Core · Quality (Low) — build_agent_with (417 LOC) + exec_body (~1520 LOC); humanizers/dispatch/temp-dir duplicated; stringify error idiom
 - [C-89 — Let process access carry network and write effects in the authority contract](C-89-process-authority-carrier.md) · Core · the typed-authority validator rejected every process-mediated plugin op (kubernetes/aws), so `flux run` aborted at registration with "declares a network effect without network, browser, or provider access"
 - [C-91 — Make approval prompts visible in the plain CLI](C-91-visible-approval-prompts-plain-cli.md) · Core
+- [C-97 — WorkspaceContext — a context-local, swappable active System](C-97-workspace-context-runtime-seam.md) · Core · runtime seam for the worktree ops: per-agent active-System accessor replaces direct ctx.system; no set_current_dir anywhere
+- [C-98 — git_worktree_enter — guarded op that moves this context into a temp worktree](C-98-git-worktree-enter-op.md) · Core · clean main → generated flux/worktree/* branch → /tmp worktree → context root transition; argv-only git
+- [C-99 — git_worktree_leave — merge back to main, restore context, clean up](C-99-git-worktree-leave-op.md) · Core · trial merge then --no-ff; conflict never strands main; cleanup-pending state is retryable without re-merging
+- [C-100 — Worktree-aware engine probing, sub-agent inheritance, and epic docs](C-100-worktree-engine-and-subagents.md) · Core · FlowEngine probes the active root per turn; children get an independent snapshot; ops-reference/CHANGELOG/WHATS-NEW close the epic
 - [C-101 — CLI/TUI boot splash + animated spinner effects](C-101-boot-splash-and-animated-spinners.md) · Core
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)

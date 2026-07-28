@@ -2,8 +2,7 @@
 id: C-97
 title: "WorkspaceContext — a context-local, swappable active System"
 pillar: Core
-status: ready
-priority: 2
+status: done
 epic: context-local-git-worktrees
 design: docs/designs/context-local-git-worktrees.md
 note: "runtime seam for the worktree ops: per-agent active-System accessor replaces direct ctx.system; no set_current_dir anywhere"
@@ -36,7 +35,13 @@ a fixed `ctx.system`. Foundation story for the context-local-git-worktrees epic.
 - [ ] No `std::env::set_current_dir` anywhere in the new paths; full gate green.
 
 ## Progress
-- (not started)
+- 2026-07-28 implemented on the epic worktree branch: `Workspace::with_root` + `System::rerooted`
+  (posture-preserving derives) and `allocate_worktree_dir`/`remove_worktree_dir` (fail-closed) in
+  flux-system; `WorkspaceContext`/`WorktreeSession`/`WorktreePhase` in flux-runtime with
+  `ToolContext::system()` accessor replacing the pub field (~64-site sweep across 8 crates).
+  Tests: `worktree_transition_is_context_local`, `worktree_session_phase_marks_merged`
+  (flux-runtime), `with_root_preserves_access_posture`, `rerooted_system_keeps_sandbox_and_moves_root`,
+  `worktree_dir_alloc_and_guarded_removal` (flux-system). Full workspace suite green.
 
 ## Notes
 - Design: [docs/designs/context-local-git-worktrees.md](../designs/context-local-git-worktrees.md)

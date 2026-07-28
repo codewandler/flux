@@ -82,7 +82,7 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### Context-local Git worktrees (epic) — 🔎 **OPEN (filed 2026-07-28; C-97…C-100, C-97 ready)**
+### Context-local Git worktrees (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-97…C-100, merged to main, unreleased; next MINOR — `ToolContext.system` field → accessor is breaking)**
 
 Agents that mutate a repo while the user or another agent works in the same checkout step on each
 other. This epic adds `git_worktree_enter {}` / `git_worktree_leave {}` as guarded Git built-ins:

@@ -83,6 +83,23 @@ impl Workspace {
         &self.root
     }
 
+    /// Derive a workspace re-rooted at `root` (canonicalized; must exist) while preserving the
+    /// full access posture of `self`: `@named` roots, read-only roots, and the unconfined flag.
+    /// This is the seam a context-local worktree transition uses — the plain constructors would
+    /// drop the widened roots and so break `@named`-root operations inside the new root (C-97).
+    pub fn with_root(&self, root: impl AsRef<Path>) -> Result<Self> {
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|e| Error::Config(format!("workspace root: {e}")))?;
+        Ok(Self {
+            root,
+            named: self.named.clone(),
+            read_roots: self.read_roots.clone(),
+            unconfined: self.unconfined,
+        })
+    }
+
     /// The additional read-only roots (C-21).
     pub fn read_roots(&self) -> &[PathBuf] {
         &self.read_roots
@@ -331,6 +348,53 @@ fn path_to_utf8(path: &Path) -> Result<String> {
 /// The one owner of boolean `FLUX_*` env semantics: mere presence is NOT truthy, so an operator
 /// exporting `FLUX_ALLOW_PRIVATE_NET=0` (or `FLUX_VERBOSE=false`) disables the signal instead of
 /// silently enabling it.
+/// Allocate a fresh private parent directory for a context-local git worktree (C-97):
+/// `<tmp>/flux-worktree-<pid>-<seq>` with owner-only permissions on Unix. The directory is
+/// created outside any workspace root on purpose — the caller derives a re-rooted [`System`]
+/// ([`System::rerooted`]) at the checkout inside it.
+pub fn allocate_worktree_dir() -> Result<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("flux-worktree-{}-{seq}", std::process::id()));
+    std::fs::create_dir(&dir)
+        .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir.canonicalize()
+        .map_err(|e| Error::Config(format!("worktree dir {}: {e}", dir.display())))
+}
+
+/// Remove a directory previously allocated by [`allocate_worktree_dir`]. Fail-closed: refuses any
+/// path that is not directly under the system temp dir with the `flux-worktree-` prefix, so a
+/// corrupted session state can never turn cleanup into an arbitrary recursive delete.
+pub fn remove_worktree_dir(path: &Path) -> Result<()> {
+    let tmp = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|e| Error::Config(format!("temp dir: {e}")))?;
+    let ok = path.parent() == Some(tmp.as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("flux-worktree-"));
+    if !ok {
+        return Err(Error::Config(format!(
+            "refusing to remove {:?}: not an allocated flux worktree dir",
+            path
+        )));
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Config(format!(
+            "worktree dir cleanup {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 pub fn env_truthy(key: &str) -> bool {
     std::env::var(key)
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
@@ -980,6 +1044,17 @@ impl System {
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// Derive a `System` re-rooted at `root` while preserving both the workspace access posture
+    /// (via [`Workspace::with_root`]) and the resolved sandbox. Spawned processes under the
+    /// derived system run with the new root as cwd and the sandbox's writable set follows it
+    /// automatically ([`sandbox::SpawnPolicy::for_workspace`] derives from the workspace root).
+    pub fn rerooted(&self, root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            workspace: self.workspace.with_root(root)?,
+            sandbox: self.sandbox.clone(),
+        })
     }
 
     /// The resolved sandbox posture for this `System`.
@@ -1956,6 +2031,69 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ws = Workspace::new(&dir).unwrap();
         (dir, System::new(ws))
+    }
+
+    /// C-97: the re-root derive must preserve the *entire* access posture — dropping `@named`
+    /// roots would break global-flow ops inside a worktree, and dropping `read_roots`/
+    /// `unconfined` would silently narrow what the user granted.
+    #[test]
+    fn with_root_preserves_access_posture() {
+        let (dir_a, _) = temp_workspace();
+        let (dir_b, _) = temp_workspace();
+        let (dir_named, _) = temp_workspace();
+        let (dir_read, _) = temp_workspace();
+        let mut ws = Workspace::new(&dir_a).unwrap();
+        ws.add_named_root("global_flows", &dir_named).unwrap();
+        ws.add_read_root(&dir_read).unwrap();
+        ws.set_unconfined(true);
+
+        let rerooted = ws.with_root(&dir_b).unwrap();
+        assert_eq!(rerooted.root(), dir_b.canonicalize().unwrap());
+        assert!(rerooted.has_named_root("global_flows"));
+        assert_eq!(rerooted.read_roots(), ws.read_roots());
+        assert!(rerooted.is_unconfined());
+
+        // A missing target stays a hard error — never a silently mis-rooted workspace.
+        assert!(ws.with_root(dir_b.join("missing")).is_err());
+    }
+
+    /// C-97: `System::rerooted` keeps the resolved sandbox (posture object identity is opaque, so
+    /// assert via settings) while swapping the workspace root.
+    #[test]
+    fn rerooted_system_keeps_sandbox_and_moves_root() {
+        let (dir_a, _) = temp_workspace();
+        let (dir_b, _) = temp_workspace();
+        let system = System::new(Workspace::new(&dir_a).unwrap());
+        let rerooted = system.rerooted(&dir_b).unwrap();
+        assert_eq!(rerooted.workspace().root(), dir_b.canonicalize().unwrap());
+        assert_eq!(
+            format!("{:?}", rerooted.sandbox().settings()),
+            format!("{:?}", system.sandbox().settings()),
+        );
+    }
+
+    /// C-97: the worktree-dir helpers are fail-closed — cleanup refuses anything that is not a
+    /// directly-under-tmp `flux-worktree-*` allocation.
+    #[test]
+    fn worktree_dir_alloc_and_guarded_removal() {
+        let dir = allocate_worktree_dir().unwrap();
+        assert!(dir.is_dir());
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("flux-worktree-"));
+        remove_worktree_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        // Idempotent: a second removal of the same allocation is fine.
+        remove_worktree_dir(&dir).unwrap();
+
+        // Refusals: wrong prefix, nested path, workspace-shaped path.
+        let (other, _) = temp_workspace();
+        assert!(remove_worktree_dir(&other).is_err());
+        assert!(remove_worktree_dir(&std::env::temp_dir().join("flux-worktree-x/nested")).is_err());
+        assert!(other.exists());
     }
 
     /// `env_truthy` requires an explicit truthy VALUE — presence alone (or an explicit "off"

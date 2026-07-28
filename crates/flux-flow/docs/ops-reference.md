@@ -69,6 +69,8 @@ optional arguments are in `[brackets]`.
 | `git_push` | `[branch, remote]` | Medium | Push to remote |
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
 | `git_unstage` | `paths` | Low | Unstage files |
+| `git_worktree_enter` | | High | Move this context into an isolated temp git worktree (clean `main` only; generated `flux/worktree/*` branch) |
+| `git_worktree_leave` | | High | Merge the worktree back into `main` (`--no-ff`, trial-merge guarded), clean up, restore the original root |
 | `flow_list` | | Low | List reusable flows and composite ops under `.flux/flows` / `~/.flux/flows` (and the legacy `.flux/ops` / `@global_ops`) — each with its description and params |
 | `flow_run` | `name[, inputs]` | Medium | Run a stored flow by name from the flows home; `inputs` (a JSON object) are seeded as `$key` binds. Runs as an authored flow in the current session (needs a `LoopHost`) |
 | `flow_render` | `source\|name[, view]` | Low | Render Flux-Lang as a syntax-highlighted SVG. Pass exactly one of inline `source` or the `name` of a stored flow. `view: "source"` (default) renders the highlighted source; `view: "tree"` renders the execution-path plan tree. Returns the SVG markup inline — for surfaces that can't highlight `.flux` themselves (READMEs, Slack, docs, chat) |

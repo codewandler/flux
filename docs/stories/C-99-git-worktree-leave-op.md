@@ -2,7 +2,7 @@
 id: C-99
 title: "git_worktree_leave — merge back to main, restore context, clean up"
 pillar: Core
-status: backlog
+status: done
 epic: context-local-git-worktrees
 design: docs/designs/context-local-git-worktrees.md
 note: "trial merge then --no-ff; conflict never strands main; cleanup-pending state is retryable without re-merging"
@@ -30,7 +30,7 @@ generated branch — with failure modes that never lose work or strand `main` in
       subjects/effects); no force, reset, discard, or shell invocation anywhere.
 
 ## Progress
-- (not started)
+- 2026-07-28 implemented (epic worktree branch): GitWorktreeLeaveTool — clean-worktree + unmoved-main preflights, trial merge always aborted, --no-ff merge, mark_merged, worktree/branch/dir cleanup with retryable merged-cleanup-pending state. Tests: dirty-worktree, no-session, moved-main, conflict-aborts-cleanly. Gate green.
 
 ## Notes
 - Depends on C-97 and C-98.

@@ -2,7 +2,7 @@
 id: C-100
 title: "Worktree-aware engine probing, sub-agent inheritance, and epic docs"
 pillar: Core
-status: backlog
+status: done
 epic: context-local-git-worktrees
 design: docs/designs/context-local-git-worktrees.md
 note: "FlowEngine probes the active root per turn; children get an independent snapshot; ops-reference/CHANGELOG/WHATS-NEW close the epic"
@@ -33,7 +33,14 @@ the session, and the epic's user-facing docs land.
       epic.
 
 ## Progress
-- (not started)
+- 2026-07-28 implemented on the epic worktree branch: `surfaced_for_turn` probes the active
+  context root (assembly-time `cwd` retained for config/skills/roles by design);
+  `SpawnRequest.system` snapshot field; `LocalSpawner` seeds the child from the snapshot, fixes the
+  child `spec.cwd == "."` latent bug, and `at_depth` re-bases nested spawners on the child
+  snapshot. Tests: `per_turn_surfacing_probe_follows_the_transitioned_root` (flux-flow),
+  `spawned_child_inherits_transitioned_root_but_transitions_independently`,
+  `nested_spawner_rebases_on_the_child_snapshot` (flux-orchestrate). Gate green.
+- Remaining for close: ops-reference/CHANGELOG/WHATS-NEW docs land with the epic close-out.
 
 ## Notes
 - Depends on C-97..C-99; closes the context-local-git-worktrees epic.

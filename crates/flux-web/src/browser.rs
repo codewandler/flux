@@ -922,7 +922,7 @@ impl Tool for BrowserOpenTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
-        let session = launch_session(&ctx.system, &self.config).await?;
+        let session = launch_session(&ctx.system(), &self.config).await?;
         if let Some(url) = params.get("url").and_then(Value::as_str) {
             session.goto(url).await?;
         }

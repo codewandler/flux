@@ -1,6 +1,6 @@
 # Design: Context-local Git worktrees
 
-**Status:** proposed · **Pillar:** Core · **Stories:** [C-97](../stories/C-97-workspace-context-runtime-seam.md) · [C-98](../stories/C-98-git-worktree-enter-op.md) · [C-99](../stories/C-99-git-worktree-leave-op.md) · [C-100](../stories/C-100-worktree-engine-and-subagents.md)
+**Status:** implemented 2026-07-28 · **Pillar:** Core · **Stories:** [C-97](../stories/C-97-workspace-context-runtime-seam.md) · [C-98](../stories/C-98-git-worktree-enter-op.md) · [C-99](../stories/C-99-git-worktree-leave-op.md) · [C-100](../stories/C-100-worktree-engine-and-subagents.md)
 
 ## Why
 
