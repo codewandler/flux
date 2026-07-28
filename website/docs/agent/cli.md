@@ -74,6 +74,22 @@ from the cassette, and only the remaining live tail runs through the normal appr
 `flux sessions` is intentionally read-only: it marks interrupted sessions in the listing, but never
 resurrects a turn as a side effect of listing sessions.
 
+### Finding a past session
+
+Plain `flux sessions` scrolls newest-first, which doesn't scale once there are dozens of them.
+`--query`, `--file`, `--since`, and `--until` narrow the listing to sessions matching every given
+filter — still newest-first, no session id needed up front:
+
+```bash
+flux sessions --query "refund"                # sessions whose conversation mentions "refund"
+flux sessions --file src/billing/refund.rs    # sessions that touched this file
+flux sessions --since 2026-07-01 --until 2026-07-15
+```
+
+Matching is a read over the same durable, redacted event log every other session tool uses — no
+new index, and a secret's plaintext can never be used as a `--query` to confirm a redacted
+session's existence.
+
 ## Turn controls
 
 ```bash

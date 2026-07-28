@@ -33,4 +33,4 @@ pub use projection::{
     run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow, EfficiencySummary, ModelCost,
     PlanAttempt, RunDiff, StmtRow, TurnSummary,
 };
-pub use store::{EventStore, SessionInfo, SessionSummary};
+pub use store::{EventStore, SessionFilter, SessionInfo, SessionSummary};

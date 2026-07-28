@@ -17,7 +17,17 @@ pub(super) fn fmt_age(created_at_ms: i64) -> String {
 
 /// `flux sessions` — list recent sessions (newest first).
 /// `flux sessions --prune` — delete all zero-message (abandoned) sessions.
-pub(super) fn run_sessions(prune: bool) -> Result<()> {
+/// `flux sessions --query/--file/--since/--until` (C-164) — narrow the listing to sessions
+/// matching every given filter, via [`flux_events::EventStore::search`] (a projection over the
+/// existing event log; see that method's docs for the TUI-picker seam). No filter given behaves
+/// exactly as before.
+pub(super) fn run_sessions(
+    prune: bool,
+    query: Option<String>,
+    file: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<()> {
     let store = open_event_store()?;
     if prune {
         let n = store.prune_empty()?;
@@ -28,9 +38,34 @@ pub(super) fn run_sessions(prune: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let sessions = store.list(30)?;
+
+    let mut filter = flux_events::SessionFilter::new();
+    if let Some(q) = query {
+        filter = filter.with_query(q);
+    }
+    if let Some(f) = file {
+        filter = filter.with_file(f);
+    }
+    if let Some(s) = since {
+        filter = filter.with_since_ms(usage::parse_since_ms(&s, usage::now_ms())?);
+    }
+    if let Some(u) = until {
+        filter = filter.with_until_ms(usage::parse_until_ms(&u)?);
+    }
+    if let (Some(since), Some(until)) = (filter.since_ms, filter.until_ms) {
+        if since >= until {
+            bail!("--since must be before --until");
+        }
+    }
+    let filtered = !filter.is_empty();
+
+    let sessions = store.search(&filter, 30)?;
     if sessions.is_empty() {
-        eprintln!("no sessions yet — start one with `flux` or `flux run`");
+        if filtered {
+            eprintln!("no sessions match the given filter(s)");
+        } else {
+            eprintln!("no sessions yet — start one with `flux` or `flux run`");
+        }
         return Ok(());
     }
     let mut interrupted = 0usize;

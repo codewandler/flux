@@ -389,11 +389,28 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: Option<LoopAction>,
     },
-    /// List recent sessions (newest first).
+    /// List recent sessions (newest first). With `--query`/`--file`/`--since`/`--until`, narrows
+    /// the listing to sessions matching ALL given filters instead of every session (C-164) — bare
+    /// `flux sessions` is unchanged.
     Sessions {
         /// Delete all zero-message (abandoned) sessions.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "file", "since", "until"])]
         prune: bool,
+        /// Only sessions whose conversation contains this text (case-insensitive).
+        #[arg(long)]
+        query: Option<String>,
+        /// Only sessions that touched this file path (matched at a path boundary, e.g. `main.rs`
+        /// matches a recorded `/repo/src/main.rs`).
+        #[arg(long)]
+        file: Option<String>,
+        /// Only sessions active at or after this bound: YYYY-MM-DD, RFC3339, or a duration like
+        /// 24h/7d/2w.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only sessions active at or before this bound: YYYY-MM-DD or RFC3339. Date-only values
+        /// mean next midnight.
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Per-model token usage + cost across flux and detected local agent harnesses.
     Usage(usage::UsageArgs),

@@ -31,3 +31,9 @@ flux-pg = { workspace = true, optional = true }
 # multi-thread tokio context to prove the advisory lock + the flux-pg bridge together. Only
 # referenced from the `postgres`-gated test module; harmless to the default build.
 tokio.workspace = true
+# C-164: the session-search redaction conformance test seeds a session exactly the way
+# `flux-flow`'s `flush_observations` does in production (scrub through `Redactor` BEFORE the
+# store ever sees the payload), to prove a secret's plaintext can never be used as a search term
+# that confirms the redacted session's existence. flux-secret is an L0 leaf, so this is a
+# dev-only, test-scoped reference — no production dependency on redaction semantics.
+flux-secret.workspace = true

@@ -2042,14 +2042,17 @@ fn normalize_epoch_ms(n: i64) -> i64 {
     }
 }
 
-fn parse_since_ms(s: &str, now_ms: i64) -> Result<i64> {
+/// `pub(crate)`: reused by `flux sessions --since` (C-164), which accepts the same
+/// YYYY-MM-DD/RFC3339/duration forms as `flux usage --since`.
+pub(crate) fn parse_since_ms(s: &str, now_ms: i64) -> Result<i64> {
     if let Some(duration) = parse_duration_ms_if_duration(s)? {
         return Ok(now_ms.saturating_sub(duration));
     }
     parse_bound_ms(s, false)
 }
 
-fn parse_until_ms(s: &str) -> Result<i64> {
+/// `pub(crate)`: reused by `flux sessions --until` (C-164).
+pub(crate) fn parse_until_ms(s: &str) -> Result<i64> {
     parse_bound_ms(s, true)
 }
 
@@ -2110,7 +2113,8 @@ fn parse_rfc3339_ms(s: &str) -> Result<i64> {
     Ok(DateTime::parse_from_rfc3339(s)?.timestamp_millis())
 }
 
-fn now_ms() -> i64 {
+/// `pub(crate)`: reused by `flux sessions --since/--until` (C-164) to resolve `now` the same way.
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

@@ -51,6 +51,19 @@ All notable changes to this project are documented in this file. The format is b
   reuse+delta, rewrite, predicate mismatch, dead-socket recovery, and turn-state replay on both
   transports; the C-07 WS/SSE equivalence suite passes unchanged. Upstream's prewarm is the one
   trick not adopted (first-call latency, not cache economics) — noted as a follow-up.
+- **C-164: session search.** `flux sessions` gains `--query` (free text over a session's
+  conversation and observations), `--file <path>` (sessions that touched the path, matched at a
+  `/`-boundary, never as a raw substring), and `--since`/`--until` (the same date forms as
+  `flux usage`), each mutually exclusive with the others and with `--prune`; bare `flux sessions`
+  is unchanged. Implemented as a pure projection over the existing store reads
+  (`list`/`conversation`/`observations`) — no new SQL, no per-backend code, no persisted index —
+  so SQLite/Postgres parity is structural, and both new conformance tests register under
+  `sqlite_case!`/`pg_case!`. Redaction holds by construction: search reads only projections
+  scrubbed before persist, and a registered secret is **not usable as a search term** to confirm
+  its presence (pinned by test with a non-credential-shaped secret, so it is the registered-value
+  path being proven, not the prefix heuristic). New public `flux_events::SessionFilter`
+  (`#[non_exhaustive]`, builder-style) and `EventStore::search` — additive; `search`'s doc comment
+  names it as the seam the TUI session picker (C-153) should consume instead of raw `list(30)`.
 
 ## [0.31.0] - 2026-07-28
 

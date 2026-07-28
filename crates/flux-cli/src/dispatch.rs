@@ -453,7 +453,13 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 fail_on,
             }) => run_review(&flags, files, format, fail_on).await,
             Some(Commands::Loop { action }) => run_loop_cmd(action).await,
-            Some(Commands::Sessions { prune }) => run_sessions(prune),
+            Some(Commands::Sessions {
+                prune,
+                query,
+                file,
+                since,
+                until,
+            }) => run_sessions(prune, query, file, since, until),
             Some(Commands::Usage(args)) => run_usage(args),
             Some(Commands::Replay {
                 session,

@@ -15,6 +15,14 @@
 
 ## [Unreleased]
 
+### New
+
+- **Find a past session without scrolling for it.** `flux sessions` can now search: `--query`
+  matches what was said and done in a session, `--file` finds the sessions that touched a given
+  path, and `--since`/`--until` narrow by date — so resuming, replaying, or forking past work no
+  longer starts with scrolling a newest-first list for the right id. Secrets stay protected:
+  redacted values never appear in results and cannot be used as search terms.
+
 ### Fixed
 
 - **Integration plugins now follow you into a worktree.** After entering an isolated worktree,

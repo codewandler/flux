@@ -134,6 +134,88 @@ pub struct SessionSummary {
     pub context: EventContext,
 }
 
+/// A session-search filter (C-164): narrowing predicates for [`EventStore::search`] — free-text
+/// over the session's conversation, a touched-file path, and/or a date range. Each predicate is
+/// evaluated as a **projection over the existing event log** (`list`/`conversation`/
+/// `observations`, the same backend-neutral primitives every other read uses) — adding a filter
+/// here never means adding SQL, a new table, or a persisted index.
+///
+/// `#[non_exhaustive]`: this crate is published (`codewandler-flux-events`), and a future story is
+/// likely to add another predicate (author, model, …). Construct with [`SessionFilter::new`] (or
+/// `Default`) and the `with_*` builders, so growing this struct stays additive, not breaking.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct SessionFilter {
+    /// Case-insensitive substring match over the session's conversation text.
+    pub query: Option<String>,
+    /// A path a tool call in this session touched, matched at a path boundary in either direction
+    /// (a relative filter like `main.rs` matches a recorded absolute subject like
+    /// `/repo/src/main.rs`, and vice versa) — never a raw substring, so `rc/main.rs` does not
+    /// match `src/main.rs`.
+    pub file: Option<String>,
+    /// Only sessions whose activity window (`created_at_ms..=updated_at_ms`) overlaps this
+    /// inclusive lower bound (epoch ms).
+    pub since_ms: Option<i64>,
+    /// … overlaps this inclusive upper bound (epoch ms).
+    pub until_ms: Option<i64>,
+}
+
+impl SessionFilter {
+    /// An empty filter — equivalent to [`EventStore::list`] when passed to
+    /// [`EventStore::search`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Match sessions whose conversation contains `query` (case-insensitive).
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    /// Match sessions that recorded a tool call touching `file`.
+    pub fn with_file(mut self, file: impl Into<String>) -> Self {
+        self.file = Some(file.into());
+        self
+    }
+
+    /// Match sessions active at or after `since_ms` (epoch ms, inclusive).
+    pub fn with_since_ms(mut self, since_ms: i64) -> Self {
+        self.since_ms = Some(since_ms);
+        self
+    }
+
+    /// Match sessions active at or before `until_ms` (epoch ms, inclusive).
+    pub fn with_until_ms(mut self, until_ms: i64) -> Self {
+        self.until_ms = Some(until_ms);
+        self
+    }
+
+    /// True when no predicate is set — [`EventStore::search`] treats this identically to
+    /// [`EventStore::list`].
+    pub fn is_empty(&self) -> bool {
+        self.query.is_none()
+            && self.file.is_none()
+            && self.since_ms.is_none()
+            && self.until_ms.is_none()
+    }
+}
+
+/// Path-boundary match used by [`EventStore::search`]'s `file` predicate: equal, or one is a
+/// `/`-bounded path suffix of the other. Deliberately NOT a raw substring test — `rc/main.rs` must
+/// not match a recorded subject `src/main.rs` just because the characters appear in sequence.
+fn path_matches(subject: &str, filter: &str) -> bool {
+    if subject == filter {
+        return true;
+    }
+    let ends_at_boundary = |long: &str, short: &str| {
+        long.len() > short.len()
+            && long.ends_with(short)
+            && long.as_bytes()[long.len() - short.len() - 1] == b'/'
+    };
+    ends_at_boundary(subject, filter) || ends_at_boundary(filter, subject)
+}
+
 /// The storage primitives every backend provides. These are exactly the methods that touch SQL;
 /// every wrapper (`record_*`, `begin_turn`, …) and projection (`conversation`, `cost_summary_all`,
 /// …) is implemented once on [`EventStore`] over these, so a new backend only reimplements this
@@ -307,6 +389,92 @@ impl EventStore {
     /// [`turns`](Self::turns)) to replay a tenant's transcripts as projections over the log.
     pub fn account_streams(&self, account: &str) -> Result<Vec<String>> {
         self.backend().account_streams(account)
+    }
+
+    /// Session search (C-164): narrow [`list`](Self::list) by free-text content, a touched-file
+    /// path, and/or a date range. A **projection over the existing event log** — built entirely
+    /// from [`list`](Self::list), [`conversation`](Self::conversation), and
+    /// [`observations`](Self::observations), the same backend-neutral primitives every other read
+    /// uses — so SQLite and Postgres return identical results for identical stores with no new
+    /// SQL and no new persisted index. Results stay newest-first, capped at `limit`.
+    ///
+    /// An empty `filter` is byte-identical to `list(limit)` (the fast path below): a bare
+    /// `flux sessions` must behave exactly as it did before this filter existed.
+    ///
+    /// This is the ONE seam a ranked/fuzzy matcher (C-153's TUI session picker) should plug into
+    /// later — it should call `search` (or a ranking variant built the same way) instead of
+    /// re-deriving its own matching over `list`.
+    ///
+    /// Scans every registered session (cheapest predicates — the date range, already on the
+    /// summary — first; `file`/`query` only load a session's observations/conversation when
+    /// their predicate is actually set). No measured need justifies a persisted index yet; if
+    /// store size ever makes this scan too slow, that is the trigger to add one, not a reason to
+    /// pre-build one now.
+    pub fn search(&self, filter: &SessionFilter, limit: usize) -> Result<Vec<SessionSummary>> {
+        if filter.is_empty() {
+            return self.list(limit);
+        }
+        // A LIMIT large enough that no real store hits it, so this stays the exact same
+        // `list` query both backends already serve identically — no new enumeration primitive.
+        const UNBOUNDED: usize = i64::MAX as usize;
+        let mut out = Vec::new();
+        for s in self.list(UNBOUNDED)? {
+            if let Some(since) = filter.since_ms {
+                if s.updated_at_ms < since {
+                    continue;
+                }
+            }
+            if let Some(until) = filter.until_ms {
+                if s.created_at_ms > until {
+                    continue;
+                }
+            }
+            if let Some(path) = &filter.file {
+                if !self.session_touched_file(&s.id, path)? {
+                    continue;
+                }
+            }
+            if let Some(query) = &filter.query {
+                if !self.session_matches_query(&s.id, query)? {
+                    continue;
+                }
+            }
+            out.push(s);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `stream`'s conversation contains `query` (case-insensitive substring) — the `search`
+    /// free-text predicate.
+    fn session_matches_query(&self, stream: &str, query: &str) -> Result<bool> {
+        let needle = query.to_lowercase();
+        Ok(self
+            .conversation(stream)?
+            .iter()
+            .any(|m| m.text().to_lowercase().contains(&needle)))
+    }
+
+    /// Whether `stream` recorded a `tool_call` observation whose `subjects` include `path` — the
+    /// `search` file predicate. Reads the SAME durable, redacted `tool_call` observations
+    /// `flux-flow` already persists (subjects are scrubbed by the live turn's `Redactor` before
+    /// they ever reach the store, C-22), so a filesystem subject that happened to look
+    /// secret-shaped is never exposed here — it was never stored unredacted in the first place.
+    fn session_touched_file(&self, stream: &str, path: &str) -> Result<bool> {
+        Ok(self.observations(stream)?.iter().any(|o| {
+            o.kind == "tool_call"
+                && o.data
+                    .get("subjects")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|subjects| {
+                        subjects
+                            .iter()
+                            .filter_map(|s| s.as_str())
+                            .any(|s| path_matches(s, path))
+                    })
+        }))
     }
 
     /// A-48: the most recent stream tagged `agent_id` whose `correlation_id` equals
@@ -1115,6 +1283,157 @@ mod tests {
         store.set_model(&a, "opus").unwrap();
         assert_eq!(store.list(1).unwrap()[0].model, "opus");
         assert_eq!(store.info(&a).unwrap().model, "opus");
+    }
+
+    /// C-164: `search`'s three predicates (free-text query, touched-file, date range) each select
+    /// only the session(s) they should and exclude the others, and results stay newest-first —
+    /// seeded over a multi-session store exactly like a real `flux sessions --query|--file|--since`
+    /// invocation would see.
+    fn search_selects_matching_sessions_and_excludes_others(store: &EventStore) {
+        use flux_evidence::{Observation, Phase};
+
+        // Session A (oldest): mentions "pandas", touched src/animals.rs.
+        let a = store.create_session("m").unwrap();
+        store
+            .record_message(&a, &Message::user_text("let's talk about pandas today"))
+            .unwrap();
+        store
+            .record_observation(
+                &a,
+                -1,
+                &Observation::new(
+                    "tool_call",
+                    Phase::Turn,
+                    serde_json::json!({
+                        "tool": "read",
+                        "subjects": ["src/animals.rs"],
+                        "caller": "user",
+                    }),
+                ),
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let mid_cutoff = now_ms(); // separates A's activity from B/C's
+        std::thread::sleep(std::time::Duration::from_millis(3));
+
+        // Session B: mentions "flask", touched src/web/routes.py.
+        let b = store.create_session("m").unwrap();
+        store
+            .record_message(&b, &Message::user_text("deploying the flask app"))
+            .unwrap();
+        store
+            .record_observation(
+                &b,
+                -1,
+                &Observation::new(
+                    "tool_call",
+                    Phase::Turn,
+                    serde_json::json!({
+                        "tool": "write",
+                        "subjects": ["src/web/routes.py"],
+                        "caller": "user",
+                    }),
+                ),
+            )
+            .unwrap();
+
+        // Session C (newest): no matching content or file — proves exclusion.
+        let c = store.create_session("m").unwrap();
+        store
+            .record_message(&c, &Message::user_text("unrelated chit chat"))
+            .unwrap();
+
+        // --- query: case-insensitive, selects only the matching session ---
+        let by_query = store
+            .search(&SessionFilter::new().with_query("PANDAS"), 10)
+            .unwrap();
+        assert_eq!(
+            by_query.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![a.clone()],
+            "query matches only the session whose content contains it"
+        );
+
+        // --- file: path-boundary match, selects only the session that touched it ---
+        let by_file = store
+            .search(&SessionFilter::new().with_file("routes.py"), 10)
+            .unwrap();
+        assert_eq!(
+            by_file.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![b.clone()],
+            "file filter matches only the session that touched that path"
+        );
+        // A near-miss suffix (missing the path boundary) must not match — this is a
+        // path-boundary test, not a raw substring test.
+        assert!(
+            store
+                .search(&SessionFilter::new().with_file("outes.py"), 10)
+                .unwrap()
+                .is_empty(),
+            "a non-path-boundary suffix must not match"
+        );
+
+        // --- date range: selects only sessions active at/after the cutoff (B, C), excludes A ---
+        let by_date = store
+            .search(&SessionFilter::new().with_since_ms(mid_cutoff), 10)
+            .unwrap();
+        let date_ids: Vec<_> = by_date.iter().map(|s| s.id.clone()).collect();
+        assert!(date_ids.contains(&b), "B is active after the cutoff");
+        assert!(date_ids.contains(&c), "C is active after the cutoff");
+        assert!(!date_ids.contains(&a), "A's activity predates the cutoff");
+
+        // --- newest-first holds under actual filtering (not just the `list` fast path) ---
+        let all = store
+            .search(&SessionFilter::new().with_since_ms(0), 10)
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![c.clone(), b.clone(), a.clone()],
+            "results stay newest-first"
+        );
+    }
+
+    /// C-164 redaction: `flux-flow`'s `flush_observations` scrubs every observation through the
+    /// live turn's `Redactor` BEFORE it ever reaches the store (C-22) — this test seeds a session
+    /// the same way, then proves the second Acceptance case explicitly: a secret's own plaintext
+    /// must never be usable as a search term that confirms the redacted session's existence, and
+    /// the content `search` reads back never carries the plaintext either.
+    fn search_query_cannot_recover_a_redacted_secret(store: &EventStore) {
+        // Deliberately NOT a credential-shaped prefix (`sk-`, `ghp_`, …) — this must be redacted
+        // because it was REGISTERED, proving the registered-value path specifically, not the
+        // separate always-on credential-shape heuristic.
+        let redactor = flux_secret::Redactor::new();
+        let secret = "orchid-galaxy-turnip-9317";
+        redactor.add_secret(secret.to_string());
+
+        let id = store.create_session("m").unwrap();
+        // Exactly the C-22 seam: redact BEFORE the store ever sees the payload.
+        let raw = format!("the deploy passphrase is: {secret}");
+        store
+            .record_message(&id, &Message::user_text(redactor.redact(&raw)))
+            .unwrap();
+
+        // The secret's own plaintext must not confirm the session's existence.
+        assert!(
+            store
+                .search(&SessionFilter::new().with_query(secret), 10)
+                .unwrap()
+                .is_empty(),
+            "the raw secret must not match the session that contains it (redacted)"
+        );
+        // The redacted marker legitimately matches — proving the query path itself works and
+        // this isn't passing merely because nothing matches anything.
+        let redacted_hits = store
+            .search(&SessionFilter::new().with_query("[redacted]"), 10)
+            .unwrap();
+        assert_eq!(redacted_hits.len(), 1);
+        assert_eq!(redacted_hits[0].id, id);
+        // And the content search reads back never carries the plaintext.
+        let stored_text = store.conversation(&id).unwrap()[0].text().to_string();
+        assert!(
+            !stored_text.contains(secret),
+            "stored/rendered content must never reveal the secret"
+        );
     }
 
     /// A-48: the stateful-A2A lookup — newest live stream by (correlation_id, agent_id); other
@@ -2431,6 +2750,8 @@ mod tests {
         sqlite_case!(latest_session_tracks_newest);
         sqlite_case!(unknown_session_has_no_conversation_but_info_errors);
         sqlite_case!(list_returns_newest_first_with_counts);
+        sqlite_case!(search_selects_matching_sessions_and_excludes_others);
+        sqlite_case!(search_query_cannot_recover_a_redacted_secret);
         sqlite_case!(set_model_updates_listing);
         sqlite_case!(find_correlated_returns_newest_matching_tagged_stream);
         sqlite_case!(find_correlated_in_realm_isolates_realms);
@@ -2568,6 +2889,8 @@ mod tests {
         pg_case!(latest_session_tracks_newest);
         pg_case!(unknown_session_has_no_conversation_but_info_errors);
         pg_case!(list_returns_newest_first_with_counts);
+        pg_case!(search_selects_matching_sessions_and_excludes_others);
+        pg_case!(search_query_cannot_recover_a_redacted_secret);
         pg_case!(set_model_updates_listing);
         pg_case!(find_correlated_returns_newest_matching_tagged_stream);
         pg_case!(find_correlated_in_realm_isolates_realms);
