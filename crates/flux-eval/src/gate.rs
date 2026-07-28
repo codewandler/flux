@@ -2,7 +2,7 @@
 //!
 //! This is the **hard precondition for keeping** a candidate: the improve loop only commits when the
 //! gate is green (and, separately, the eval score improved). It runs the same commands AGENTS.md
-//! mandates, via `ctx.system.run` (argv-only), in the workspace/worktree the loop operates on.
+//! mandates, via `ctx.system().run` (argv-only), in the workspace/worktree the loop operates on.
 
 use std::time::Duration;
 
@@ -90,7 +90,7 @@ impl Tool for GateCheckTool {
                 continue;
             }
             let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-            let out = ctx.system.run(&argv, timeout).await?;
+            let out = ctx.system().run(&argv, timeout).await?;
             if out.exit_code != 0 {
                 // Show a tail of the failure so the loop's transcript is diagnostic.
                 let mut blob = format!("{}\n{}", out.stdout, out.stderr);

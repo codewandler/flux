@@ -544,7 +544,7 @@ impl Tool for ImproveLogTool {
             "{}\n",
             serde_json::to_string(&entry).map_err(|e| Error::Other(e.to_string()))?
         );
-        ctx.system
+        ctx.system()
             .append_file(".flux/eval/improve-log.jsonl", &line)
             .await?;
         Ok(ToolResult::ok_view(
@@ -644,7 +644,7 @@ impl Tool for GradeTool {
         let criterion: crate::spec::Criterion =
             serde_json::from_value(arg(&params, "criterion"))
                 .map_err(|e| Error::Other(format!("grade: invalid criterion: {e}")))?;
-        let pass = crate::runner::grade(&criterion, ctx.system.as_ref()).await?;
+        let pass = crate::runner::grade(&criterion, ctx.system().as_ref()).await?;
         Ok(ToolResult::ok(
             if pass { "true" } else { "false" }.to_string(),
         ))

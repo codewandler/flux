@@ -118,7 +118,7 @@ impl LiveDatasource for MockBackend {
         filters: &Filters,
     ) -> flux_core::Result<Page<Row>> {
         self.calls.lock().unwrap().push(Call::List {
-            system: Arc::as_ptr(&ctx.system) as usize,
+            system: Arc::as_ptr(&ctx.system()) as usize,
             entity: entity.into(),
             page,
             filters: filters
@@ -148,7 +148,7 @@ impl LiveDatasource for MockBackend {
         id: &str,
     ) -> flux_core::Result<Option<Row>> {
         self.calls.lock().unwrap().push(Call::Get {
-            system: Arc::as_ptr(&ctx.system) as usize,
+            system: Arc::as_ptr(&ctx.system()) as usize,
             entity: entity.into(),
             id: id.into(),
         });
@@ -489,7 +489,7 @@ async fn list_and_get_route_through_the_guarded_context_and_render_consistently(
     let mut registry = ToolRegistry::new();
     try_register_live_datasource(&mut registry, "tickets", backend.clone()).unwrap();
     let ctx = ctx();
-    let system = Arc::as_ptr(&ctx.system) as usize;
+    let system = Arc::as_ptr(&ctx.system()) as usize;
 
     let listed = operation(&registry, "tickets.list")
         .execute(
@@ -701,7 +701,7 @@ async fn limits_filters_and_opaque_cursors_are_normalized_before_backend_entry()
         backend.calls(),
         vec![
             Call::List {
-                system: Arc::as_ptr(&ctx.system) as usize,
+                system: Arc::as_ptr(&ctx.system()) as usize,
                 entity: "ticket".into(),
                 page: PageRequest {
                     cursor: Some(cursor.into()),
@@ -714,7 +714,7 @@ async fn limits_filters_and_opaque_cursors_are_normalized_before_backend_entry()
                 ],
             },
             Call::List {
-                system: Arc::as_ptr(&ctx.system) as usize,
+                system: Arc::as_ptr(&ctx.system()) as usize,
                 entity: "user".into(),
                 page: PageRequest {
                     cursor: None,

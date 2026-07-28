@@ -78,12 +78,12 @@ impl Tool for FileStatTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Other("file_stat: required param `path` missing".into()))?;
 
-        let bytes = ctx.system.read_file_bytes(path).await?;
+        let bytes = ctx.system().read_file_bytes(path).await?;
         let size = bytes.len();
         // Count lines only for text files (skip binary sniff — just count \n bytes).
         let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
         let mtime = ctx
-            .system
+            .system()
             .file_mtime(path)
             .await
             .ok()
@@ -94,7 +94,7 @@ impl Tool for FileStatTool {
         // Mode via std::fs::metadata on the real path (the system jail has already resolved it).
         // We call std::fs here only for metadata — no content IO.
         let mode_str = ctx
-            .system
+            .system()
             .read_file_bytes(path)
             .await
             .ok()
@@ -178,7 +178,7 @@ impl Tool for PathExistsTool {
 
         // Attempt to read metadata via a lightweight guarded probe.
         // read_file_bytes will error if the path doesn't exist or escapes the jail.
-        let exists = ctx.system.file_mtime(path).await.is_ok();
+        let exists = ctx.system().file_mtime(path).await.is_ok();
         Ok(ToolResult::ok(if exists { "true" } else { "false" }))
     }
 }
@@ -236,7 +236,7 @@ fn expand_tilde(raw: &str) -> String {
 /// this Risk::Low read-only tool cannot exfiltrate secrets outside the jail.
 fn jail_sqlite_path(ctx: &ToolContext, raw: &str) -> Result<String> {
     // In-workspace (or a configured read-only root): the workspace enforces the jail.
-    if let Ok(p) = ctx.system.workspace().resolve_read(raw) {
+    if let Ok(p) = ctx.system().workspace().resolve_read(raw) {
         return Ok(p.to_string_lossy().into_owned());
     }
     // Out of the workspace jail: allow only databases under ~/.flux.
@@ -536,7 +536,7 @@ impl Tool for CwdTool {
 
     async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
         Ok(ToolResult::ok(
-            ctx.system.workspace().root().display().to_string(),
+            ctx.system().workspace().root().display().to_string(),
         ))
     }
 }

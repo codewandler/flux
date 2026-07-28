@@ -334,7 +334,7 @@ impl Tool for FlowListTool {
 
     async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
         Ok(ToolResult::ok(
-            StoredFlowCatalog::load(ctx.system.as_ref()).render(),
+            StoredFlowCatalog::load(ctx.system().as_ref()).render(),
         ))
     }
 }
@@ -420,7 +420,7 @@ impl Tool for FlowRunTool {
 }
 
 fn resolve_flow(ctx: &ToolContext, name: &str) -> Result<DraftAst> {
-    StoredFlowCatalog::load(ctx.system.as_ref())
+    StoredFlowCatalog::load(ctx.system().as_ref())
         .resolve(name)
         .map(|resolved| resolved.ast)
         .map_err(|e| Error::Other(format!("flow_run: {e}")))

@@ -1602,8 +1602,8 @@ mod execution_environment_conformance {
             self.roots
                 .lock()
                 .expect("surface-probe roots lock")
-                .push(ctx.system.workspace().root().to_path_buf());
-            ctx.system.read_file(MARKER).await.map(ToolResult::ok)
+                .push(ctx.system().workspace().root().to_path_buf());
+            ctx.system().read_file(MARKER).await.map(ToolResult::ok)
         }
     }
 
@@ -1688,7 +1688,7 @@ mod execution_environment_conformance {
 
     fn assert_executor_identity(executor: &Executor, root: &Path, surface: &str) {
         assert_eq!(
-            executor.context().system.workspace().root(),
+            executor.context().system().workspace().root(),
             root,
             "{surface}: guarded root"
         );

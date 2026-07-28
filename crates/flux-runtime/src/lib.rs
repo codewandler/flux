@@ -488,6 +488,12 @@ pub struct SpawnRequest {
     /// Live reporter snapshotted from the parent turn. `None` preserves the storeless/one-shot
     /// behavior: the child still returns its final [`SpawnOutcome`], but emits no live activity.
     pub activity: Option<Arc<dyn SpawnActivitySink>>,
+    /// Snapshot of the parent context's ACTIVE guarded system at delegation time (C-100). The
+    /// spawner seeds the child's own independent [`WorkspaceContext`] from this snapshot, so a
+    /// child spawned inside a worktree session (C-97) operates from the transitioned root — but a
+    /// child's own enter/leave never affects the parent (and vice versa). `None` falls back to the
+    /// spawner's assembly-time system.
+    pub system: Option<Arc<System>>,
 }
 
 impl std::fmt::Debug for SpawnRequest {
@@ -498,6 +504,10 @@ impl std::fmt::Debug for SpawnRequest {
             .field("cap_scope", &self.cap_scope)
             .field("parent_session", &self.parent_session)
             .field("activity", &self.activity.is_some())
+            .field(
+                "system",
+                &self.system.as_ref().map(|s| s.workspace().root()),
+            )
             .finish()
     }
 }
@@ -511,6 +521,7 @@ impl SpawnRequest {
             cap_scope: None,
             parent_session: None,
             activity: None,
+            system: None,
         }
     }
 }
@@ -643,13 +654,123 @@ pub trait CompositeRegistrar: Send + Sync {
     ) -> flux_core::Result<serde_json::Value>;
 }
 
+/// The lifecycle phase of an active worktree session (C-97). `Merged` exists so a `leave` retry
+/// after a partial cleanup never re-merges: the merge commit landed, only worktree/branch removal
+/// remains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreePhase {
+    /// The context is working inside the worktree; nothing has been merged.
+    Active,
+    /// The merge into the original branch succeeded but worktree/branch cleanup did not complete.
+    Merged,
+}
+
+/// The state of one context-local worktree transition (C-97): everything `git_worktree_leave`
+/// needs to integrate, restore, and clean up — the original guarded system, the commit `main`
+/// pointed at on enter, the generated branch, and the allocated paths.
+#[derive(Clone)]
+pub struct WorktreeSession {
+    /// The guarded system the context had before entering; restored on leave.
+    pub original: Arc<System>,
+    /// The commit `main` pointed at when the worktree was created.
+    pub base_commit: String,
+    /// The generated `flux/worktree/...` branch the worktree checkout is on.
+    pub branch: String,
+    /// The worktree checkout directory (inside `parent_dir`).
+    pub checkout: std::path::PathBuf,
+    /// The allocated private `/tmp/flux-worktree-*` parent directory.
+    pub parent_dir: std::path::PathBuf,
+    /// Where the session is in its lifecycle.
+    pub phase: WorktreePhase,
+}
+
+/// The context-local, swappable workspace handle (C-97). Each agent context owns one; it holds the
+/// currently active guarded [`System`] plus the optional worktree session state. Cloned contexts
+/// share it (so every op in one agent context sees a transition), while a spawned child receives an
+/// **independent** `WorkspaceContext` seeded from the parent's active snapshot. Never touches
+/// process-global state — there is no `set_current_dir` anywhere on this path.
+#[derive(Clone)]
+pub struct WorkspaceContext {
+    state: Arc<Mutex<WorkspaceState>>,
+}
+
+struct WorkspaceState {
+    active: Arc<System>,
+    session: Option<WorktreeSession>,
+}
+
+impl WorkspaceContext {
+    pub fn new(system: Arc<System>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WorkspaceState {
+                active: system,
+                session: None,
+            })),
+        }
+    }
+
+    /// Snapshot the currently active guarded system. Callers hold the snapshot for the duration of
+    /// one operation; a transition made meanwhile is observed by the *next* call, not mid-flight.
+    pub fn active(&self) -> Arc<System> {
+        self.state.lock().unwrap().active.clone()
+    }
+
+    /// Snapshot the current worktree session state, if a transition is active.
+    pub fn worktree_session(&self) -> Option<WorktreeSession> {
+        self.state.lock().unwrap().session.clone()
+    }
+
+    /// Transition this context into a worktree: record the session and swap the active system.
+    /// Recoverable error if a session is already active — nesting is rejected in v1.
+    pub fn enter_worktree(
+        &self,
+        session: WorktreeSession,
+        active: Arc<System>,
+    ) -> flux_core::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.session.is_some() {
+            return Err(flux_core::Error::Config(
+                "a worktree session is already active in this context; run git_worktree_leave first"
+                    .into(),
+            ));
+        }
+        state.session = Some(session);
+        state.active = active;
+        Ok(())
+    }
+
+    /// Record that the session's merge landed (cleanup may still be outstanding), so a retried
+    /// leave never re-merges.
+    pub fn mark_merged(&self) {
+        if let Some(session) = self.state.lock().unwrap().session.as_mut() {
+            session.phase = WorktreePhase::Merged;
+        }
+    }
+
+    /// Complete a leave: restore the original system and clear the session state.
+    pub fn leave_worktree(&self) -> flux_core::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let Some(session) = state.session.take() else {
+            return Err(flux_core::Error::Config(
+                "no worktree session is active in this context".into(),
+            ));
+        };
+        state.active = session.original;
+        Ok(())
+    }
+}
+
 /// What a tool is given at execution time: the guarded IO surface, the secret redactor, an optional
 /// sub-agent spawner, and the per-session read-set (file → mtime at last read) used by the
 /// read-before-write guard. The read-set is shared (an `Arc<Mutex<…>>`) so every op in a session sees
 /// the same map: a `read` in one node records an mtime an `edit` in a later node checks against.
+///
+/// The guarded system is reached through [`ToolContext::system`], which snapshots the context-local
+/// [`WorkspaceContext`]'s active system — a worktree transition (C-97) swaps what subsequent calls
+/// observe without any process-global state change.
 #[derive(Clone)]
 pub struct ToolContext {
-    pub system: Arc<System>,
+    workspace: WorkspaceContext,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
     /// The authored outer-loop capability, installed per turn by the engine. `None` outside a
@@ -696,7 +817,7 @@ pub struct ToolContext {
 impl ToolContext {
     pub fn new(system: Arc<System>) -> Self {
         Self {
-            system,
+            workspace: WorkspaceContext::new(system),
             redactor: Redactor::new(),
             spawner: None,
             loop_host: None,
@@ -710,6 +831,18 @@ impl ToolContext {
             identity: None,
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Snapshot the currently active guarded system for this context. This is the only way tools
+    /// reach IO; the snapshot is stable for the duration of one call, and a worktree transition
+    /// (C-97) is observed by the next call.
+    pub fn system(&self) -> Arc<System> {
+        self.workspace.active()
+    }
+
+    /// The context-local workspace handle — the worktree ops drive transitions through this.
+    pub fn workspace_context(&self) -> &WorkspaceContext {
+        &self.workspace
     }
 
     /// The effective tool-name allowlist of the innermost active capability scope, if any. `None`
@@ -1717,7 +1850,7 @@ impl ExecutionEnvironment {
         context: ToolContext,
     ) -> Self {
         Self {
-            system: context.system.clone(),
+            system: context.system(),
             registry,
             permissions,
             approver,
@@ -2831,7 +2964,7 @@ impl Executor {
             };
             let mut physical = Vec::with_capacity(subjects.len());
             for subject in subjects {
-                match self.ctx.system.path_identity(&subject, access) {
+                match self.ctx.system().path_identity(&subject, access) {
                     Ok(subject) => physical.push(subject),
                     Err(err) => {
                         return Err(format!("`{name}` denied by filesystem path guard: {err}"));
@@ -3223,6 +3356,100 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn temp_workspace(tag: &str) -> (std::path::PathBuf, Arc<System>) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("flux-rt-wsctx-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        (dir, system)
+    }
+
+    /// C-97: a worktree transition is context-local. Two contexts share one initial system;
+    /// transitioning one changes what its clones observe, while the sibling context and the
+    /// process-wide cwd stay untouched.
+    #[test]
+    fn worktree_transition_is_context_local() {
+        let (origin, system) = temp_workspace("origin");
+        let (target, _) = temp_workspace("target");
+        let ctx_a = ToolContext::new(system.clone());
+        let ctx_b = ToolContext::new(system.clone());
+        let ctx_a_clone = ctx_a.clone();
+        let cwd_before = std::env::current_dir().unwrap();
+
+        let rerooted = Arc::new(system.rerooted(&target).unwrap());
+        ctx_a
+            .workspace_context()
+            .enter_worktree(
+                WorktreeSession {
+                    original: system.clone(),
+                    base_commit: "deadbeef".into(),
+                    branch: "flux/worktree/test".into(),
+                    checkout: target.clone(),
+                    parent_dir: target.clone(),
+                    phase: WorktreePhase::Active,
+                },
+                rerooted,
+            )
+            .unwrap();
+
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap();
+        // The transitioned context and its pre-existing clone both observe the new root…
+        assert_eq!(ctx_a.system().workspace().root(), canon(&target));
+        assert_eq!(ctx_a_clone.system().workspace().root(), canon(&target));
+        // …the sibling context does not…
+        assert_eq!(ctx_b.system().workspace().root(), canon(&origin));
+        // …and the process-wide cwd never moves.
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+
+        // Nesting is rejected as a recoverable error.
+        let again = ctx_a.workspace_context().enter_worktree(
+            WorktreeSession {
+                original: system.clone(),
+                base_commit: "deadbeef".into(),
+                branch: "flux/worktree/test2".into(),
+                checkout: target.clone(),
+                parent_dir: target.clone(),
+                phase: WorktreePhase::Active,
+            },
+            Arc::new(system.rerooted(&target).unwrap()),
+        );
+        assert!(again.is_err());
+
+        // Leaving restores the original system for the whole context.
+        ctx_a.workspace_context().leave_worktree().unwrap();
+        assert_eq!(ctx_a.system().workspace().root(), canon(&origin));
+        assert_eq!(ctx_a_clone.system().workspace().root(), canon(&origin));
+        assert!(ctx_a.workspace_context().worktree_session().is_none());
+        assert!(ctx_a.workspace_context().leave_worktree().is_err());
+    }
+
+    /// C-97: a retried leave after a partial cleanup must know the merge already landed.
+    #[test]
+    fn worktree_session_phase_marks_merged() {
+        let (_origin, system) = temp_workspace("phase");
+        let (target, _) = temp_workspace("phase-target");
+        let ctx = ToolContext::new(system.clone());
+        ctx.workspace_context()
+            .enter_worktree(
+                WorktreeSession {
+                    original: system.clone(),
+                    base_commit: "deadbeef".into(),
+                    branch: "flux/worktree/phase".into(),
+                    checkout: target.clone(),
+                    parent_dir: target,
+                    phase: WorktreePhase::Active,
+                },
+                system.clone(),
+            )
+            .unwrap();
+        ctx.workspace_context().mark_merged();
+        assert_eq!(
+            ctx.workspace_context().worktree_session().unwrap().phase,
+            WorktreePhase::Merged
+        );
+    }
+
     struct DropFlag(Arc<AtomicBool>);
 
     impl Drop for DropFlag {
@@ -3379,7 +3606,7 @@ mod tests {
         }
 
         async fn execute(&self, ctx: &ToolContext, _params: Value) -> Result<ToolResult> {
-            let nested = ToolContext::new(ctx.system.clone());
+            let nested = ToolContext::new(ctx.system());
             let inherited = nested.spawn_activity_sink().is_some()
                 && nested.cancel_token().is_some()
                 && nested.session_id().as_deref() == Some("parent-session");
@@ -3468,7 +3695,7 @@ mod tests {
 
         scope_runtime_turn(RuntimeTurnContext::new(), async {
             assert!(ctx.runtime_turn_context().is_empty());
-            let retained = ToolContext::new(ctx.system.clone());
+            let retained = ToolContext::new(ctx.system());
             assert!(retained.runtime_turn_context().is_empty());
         })
         .await;
@@ -3527,7 +3754,7 @@ mod tests {
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            Ok(ToolResult::ok(ctx.system.read_file(path).await?))
+            Ok(ToolResult::ok(ctx.system().read_file(path).await?))
         }
     }
 

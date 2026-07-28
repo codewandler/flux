@@ -2970,7 +2970,7 @@ journey pong
         let canonical_root = std::fs::canonicalize(&root).unwrap();
         assert_eq!(engine.cwd, canonical_root);
         assert_eq!(
-            engine.executor.context().system.workspace().root(),
+            engine.executor.context().system().workspace().root(),
             canonical_root
         );
         assert!(engine.system_prompt.contains("PERSONA-FROM-ORIGINAL-ROOT"));
@@ -2985,7 +2985,7 @@ journey pong
         assert!(!signals.contains(&"node"), "signals: {signals:?}");
 
         let roles = flux_agent::RoleRegistry::try_load_project(
-            engine.executor.context().system.as_ref(),
+            engine.executor.context().system().as_ref(),
             ".flux/agents",
         )
         .unwrap();

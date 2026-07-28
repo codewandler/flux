@@ -1,4 +1,4 @@
-//! Git ops for the keep/commit/revert loop. All exec goes through `ctx.system.run` (argv-only, no
+//! Git ops for the keep/commit/revert loop. All exec goes through `ctx.system().run` (argv-only, no
 //! shell). These are registered on the **top-level** registry only — never a sub-agent's — so a worker
 //! can edit files but cannot itself `git reset --hard`. `git_revert` is `Risk::Destructive` and so still
 //! re-confirms at dispatch unless `--yes` (the autonomous loop runs with `--yes`).
@@ -44,7 +44,7 @@ fn is_protected(path: &str) -> bool {
 async fn git(ctx: &ToolContext, args: &[&str]) -> Result<String> {
     let mut argv = vec!["git".to_string()];
     argv.extend(args.iter().map(|s| s.to_string()));
-    let out = ctx.system.run(&argv, GIT_TIMEOUT).await?;
+    let out = ctx.system().run(&argv, GIT_TIMEOUT).await?;
     if out.exit_code != 0 {
         return Err(Error::Other(format!(
             "git {}: {}",

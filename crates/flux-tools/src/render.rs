@@ -427,7 +427,7 @@ impl Tool for FlowRenderTool {
 /// Resolve through the shared stored-flow catalog, keeping the raw text so source view renders the
 /// selected file as written.
 fn resolve_source(ctx: &ToolContext, name: &str) -> Result<String> {
-    crate::flows::StoredFlowCatalog::load(ctx.system.as_ref())
+    crate::flows::StoredFlowCatalog::load(ctx.system().as_ref())
         .resolve(name)
         .map(|resolved| resolved.source)
         .map_err(|e| Error::Other(format!("flow_render: {e}")))

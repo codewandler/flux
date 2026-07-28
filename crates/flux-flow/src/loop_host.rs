@@ -911,13 +911,17 @@ impl CompositeRegistrar for EngineLoopHost {
             }
             CompositeScope::Project => {
                 let path = scope.path_for(&declaration.name).expect("project path");
-                executor.context().system.write_file(&path, &source).await?;
+                executor
+                    .context()
+                    .system()
+                    .write_file(&path, &source)
+                    .await?;
                 Some(path)
             }
             CompositeScope::Global => {
                 if !executor
                     .context()
-                    .system
+                    .system()
                     .workspace()
                     .has_named_root("global_ops")
                 {
@@ -927,7 +931,11 @@ impl CompositeRegistrar for EngineLoopHost {
                     ));
                 }
                 let path = scope.path_for(&declaration.name).expect("global path");
-                executor.context().system.write_file(&path, &source).await?;
+                executor
+                    .context()
+                    .system()
+                    .write_file(&path, &source)
+                    .await?;
                 Some(path)
             }
         };

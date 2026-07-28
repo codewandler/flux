@@ -72,7 +72,7 @@ fn run_argv(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>> {
     Box::pin(async move {
         let out = ctx
-            .system
+            .system()
             .run(&argv, Duration::from_secs(TOOLCHAIN_TIMEOUT_SECS))
             .await?;
         let mut body = String::new();
@@ -104,13 +104,13 @@ fn run_argv(
 /// The most-recently-modified `.py` file in the workspace root, or `None` if there is none. Backs
 /// `python_run`'s zero-arg default so a bare `python_run` after `write solution.py` just runs it.
 async fn newest_py(ctx: &ToolContext) -> Option<String> {
-    let names = ctx.system.list_dir(".").await.ok()?;
+    let names = ctx.system().list_dir(".").await.ok()?;
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for name in names {
         if !name.ends_with(".py") {
             continue;
         }
-        if let Ok(mtime) = ctx.system.file_mtime(&name).await {
+        if let Ok(mtime) = ctx.system().file_mtime(&name).await {
             if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
                 best = Some((mtime, name));
             }
