@@ -1,5 +1,5 @@
 ---
-id: C-118
+id: C-121
 title: "Tell the model per turn when its context is inside a worktree"
 pillar: Core
 status: done

@@ -978,7 +978,7 @@ impl FlowEngine {
     /// model-backed stage.
     fn base_system_with_skills(&self, _user_input: &str, sink: &mut dyn AgentSink) -> String {
         let mut base_system = self.system_prompt.clone();
-        // C-117: the assembly-time project context above describes the ORIGINAL workspace; while a
+        // C-121: the assembly-time project context above describes the ORIGINAL workspace; while a
         // worktree transition is active, tell the model per turn where its operations actually
         // land (the `cwd` op stays the live ground truth).
         if let Some(session) = self
@@ -3059,18 +3059,18 @@ mod tests {
         );
     }
 
-    /// C-117: while a worktree session is active, every turn's base system carries a
+    /// C-121: while a worktree session is active, every turn's base system carries a
     /// `<workspace-note>` naming the transitioned root (the assembly-time project context still
     /// describes the original workspace); the note disappears after leave.
     #[test]
     fn base_system_carries_a_worktree_note_only_while_transitioned() {
         let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
         let origin = std::env::temp_dir().join(format!(
-            "flux-c117-origin-{}-{sequence}",
+            "flux-c121-origin-{}-{sequence}",
             std::process::id()
         ));
         let worktree = std::env::temp_dir().join(format!(
-            "flux-c117-worktree-{}-{sequence}",
+            "flux-c121-worktree-{}-{sequence}",
             std::process::id()
         ));
         std::fs::create_dir_all(&origin).unwrap();

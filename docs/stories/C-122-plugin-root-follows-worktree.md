@@ -1,5 +1,5 @@
 ---
-id: C-119
+id: C-122
 title: "Plugin hosts should follow a worktree transition"
 pillar: Core
 status: backlog

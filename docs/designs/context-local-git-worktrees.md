@@ -38,11 +38,11 @@ calls see the transitioned root. Never `set_current_dir` — no process-global s
 **Plugin ops are explicitly out of scope in v1**: `PluginTool` executes through the `PluginHost`'s
 own `System` captured at subprocess spawn (and `SystemHostCaps` captures another assembly-time
 `Arc<System>`), so already-spawned plugin subprocesses keep the original root. Documented
-limitation; follow-up story C-119 tracks the re-spawn/notify design that lifts it.
+limitation; follow-up story C-122 tracks the re-spawn/notify design that lifts it.
 
 Guarded `flux-system` helpers: derive a new guarded `System` rooted at an existing worktree while
 retaining the source sandbox and configured access posture; create and clean a private
-`flux-worktree-*` parent directory (under `$FLUX_WORKTREE_DIR` / `~/.flux/worktrees`, C-117)
+`flux-worktree-*` parent directory (under `$FLUX_WORKTREE_DIR` / `~/.flux/worktrees`, C-120)
 through guarded system IO. No tool touches raw filesystem or
 process APIs.
 
@@ -134,7 +134,7 @@ Confirmed viable:
   deny worktree paths — a documented consequence, not a code fix. `persist_allow_rules` writes to
   the original project's `.flux/config.toml` (process cwd), which is correct: authority stays with
   the original root.
-- **Worktree parents must live on real disk (C-117).** The original `/tmp` choice failed in
+- **Worktree parents must live on real disk (C-120).** The original `/tmp` choice failed in
   practice: `/tmp` is commonly a RAM-backed tmpfs (32 GB on the dev machine), and a build inside
   an entered worktree writes a multi-GB `target/` there — observed filling the tmpfs and breaking
   every process needing `/tmp` during the epic's own merge verification. Allocation now defaults

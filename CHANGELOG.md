@@ -8,6 +8,36 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-102…C-110: TUI polish — 5 UX + 5 UI improvements** (epic
+  [tui-polish](docs/designs/tui-polish.md)):
+  - **Ctrl-T mouse-capture toggle (C-105):** terminal-native text selection/copy works while
+    capture is off; the footer indicates the state (idle hint while idle, a short right segment
+    while a turn runs).
+  - **Approval sheet safety + redesign (C-103):** only explicit keys act — `y` allow, `a` always,
+    `n`/`Esc` deny, `↑/↓` scroll long subject lists — stray keys are ignored instead of silently
+    denying; subjects render as text (no more Debug `["…"]`); accent-bordered sheet with windowed
+    subjects and colored key hints. BREAKING (pub surface): `ChatState.modal: Option<String>` →
+    `ChatState.approval: Option<ApprovalView>`.
+  - **Ctrl-R reverse history search (C-107):** readline-style incremental search over durable
+    prompt history (shadows tui-textarea redo; Ctrl-U undo remains).
+  - **Ctrl-F transcript search (C-108):** incremental, case-insensitive, n/N step + center,
+    REVERSED match highlight patched onto the visible slice only (layout cache untouched). Known
+    v1 limit: a match spanning a wrap boundary isn't found.
+  - **Help overlay (C-110):** F1 / `/help` open a centered panel; the command list iterates the
+    real `COMMANDS` table so it can't drift.
+  - **Theme system (C-104):** `dark` (ANSI + truecolor tuning), `light` (with whole-screen
+    background fill), `mono` (`NO_COLOR`); `/theme` switches live and persists to
+    `~/.flux/config.toml` (`flux_config::Config.theme`, additive; new
+    `flux_config::render_theme` + `flux_runtime::metadata::persist_user_theme`). BREAKING (pub
+    surface): `TuiRunOptions` gained a `theme` field; `Theme` gained `text`/`base_bg` roles.
+  - **Graceful narrow-width bars (C-102):** header/footer right sides are ordered droppable
+    segments — cost drops before cache before tokens instead of the whole right side vanishing.
+  - **Scroll position indicator (C-106):** a scrollbar overlays the transcript's right column
+    while detached from follow mode, plus a `⤓ NN%` footer segment.
+  - **Live running tool cards (C-109):** running tool headers animate a spinner glyph + live
+    elapsed, patched per frame into the viewport only — the `(revision, width)`-keyed transcript
+    layout cache is never invalidated by animation.
+
 - **C-101: animated boot splash for the interactive surfaces.** Bare `flux` (and prompt-less
   `flux run`) and `flux tui` now open with an animated FLUX splash — matrix rain dissolving into
   the block logo, then a pulsing glow with the `[ deterministic agent platform ]` tagline. Any key
@@ -25,7 +55,7 @@ All notable changes to this project are documented in this file. The format is b
   worktrees.** `enter` preflights a clean non-detached `main`, creates a generated
   `flux/worktree/…` branch worktree under a private on-disk `flux-worktree-*` directory
   (`$FLUX_WORKTREE_DIR`, default `~/.flux/worktrees` — not `/tmp`, which is commonly a RAM-backed
-  tmpfs a worktree build would fill; C-117), and
+  tmpfs a worktree build would fill; C-120), and
   transitions only the calling agent context's guarded root into it. `leave` requires a clean
   worktree and an unmoved clean `main`, proves mergeability with an aborted trial merge, merges
   `--no-ff --no-edit`, removes the worktree and branch, and restores the context; merge failures
@@ -42,7 +72,7 @@ All notable changes to this project are documented in this file. The format is b
   `allocate_worktree_dir`/`remove_worktree_dir` helpers. A worktree transition never touches
   process-global cwd, and the sandbox's writable set follows the re-rooted workspace
   automatically.
-- **C-118: the model is told per turn when its context is inside a worktree.** While a worktree
+- **C-121: the model is told per turn when its context is inside a worktree.** While a worktree
   session is active, the turn's base system carries a `<workspace-note>` naming the transitioned
   root and generated branch (the assembly-time project context still describes the original
   workspace; the `cwd` op is the live truth). The note disappears after `git_worktree_leave`.

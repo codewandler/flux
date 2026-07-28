@@ -1,5 +1,5 @@
 ---
-id: C-117
+id: C-120
 title: "Allocate agent worktrees on real disk, not /tmp"
 pillar: Core
 status: done

@@ -82,7 +82,7 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.25.0** is released; see [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### TUI polish — 5 UX + 5 UI (epic) — **in progress (2026-07-28; C-102…C-110 filed ready)**
+### TUI polish — 5 UX + 5 UI (epic) — ✅ **wave 1 IMPLEMENTED 2026-07-28 (C-102…C-110 done, unreleased; wave 2 C-111…C-116 filed)**
 
 The TUI became a daily driver (A-65) and just gained its boot splash + spinners (C-101); what
 remains are well-defined rough edges. Five UX fixes — a mouse-capture toggle so terminal-native
@@ -96,6 +96,9 @@ pub-surface breaks (`TuiRunOptions.theme`, `ChatState.modal` → `approval`) rid
 Design: [designs/tui-polish.md](designs/tui-polish.md).
 
 ### Context-local Git worktrees (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-97…C-100, merged to main, unreleased; next MINOR — `ToolContext.system` field → accessor is breaking)**
+
+> Follow-ups: C-120 (disk-backed worktree allocation — `/tmp` tmpfs hazard) and C-121
+> (per-turn worktree note) landed same day; C-122 (plugin hosts follow the transition) is backlog.
 
 Agents that mutate a repo while the user or another agent works in the same checkout step on each
 other. This epic adds `git_worktree_enter {}` / `git_worktree_leave {}` as guarded Git built-ins:
