@@ -28,7 +28,7 @@ The stable vocabulary is:
 | external send | `flow.send_external` plus `network.fetch` | operation plus destination authority |
 | delete | `flow.delete` | operation name |
 | money movement | `flow.money` | operation name |
-| calendar mutation | `flow.calendar` | operation name |
+| calendar mutation *(deprecated, C-184)* | `flow.calendar` — default-deny; declare `send_external` instead | operation name |
 
 `write_file` is valid only with a concrete workspace-write requirement. `write_db` is valid only
 with a `datasource:` subject and produces both datasource-write and semantic write requirements.

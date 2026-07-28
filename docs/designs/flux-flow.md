@@ -186,7 +186,9 @@ host-resource-shaped (consumed by `effect_requests()`). Flux-Lang adds a **paral
 `FlowEffect{Pure,Read,Model,Network,WriteFile,WriteDb,SendExternal,Delete,Money,Calendar,HumanVisible}`
 with a total mapping `FlowEffect → (Effect, Option<policy::Action>)`. Resource effects reuse the bridge;
 semantic-only effects add policy `Action`s (`flow.send_external` / `flow.money` / `flow.calendar`) gated
-by ordinary `Grant`s, with `Delete`/`Money` denied by default. The host-resource enum is not polluted.
+by ordinary `Grant`s, with `Delete`/`Money` denied by default. (`Calendar` was deprecated by C-184 —
+a domain noun in a consequence vocabulary, never declared by anything — and `flow.calendar` joined
+the default-deny set; it parses until the next protocol major.) The host-resource enum is not polluted.
 
 ### 5.6 Things — the full SWE+ops loop
 
@@ -406,7 +408,8 @@ Resolved in design (no longer open):
   review projection* (rendered in CLI/TUI for auditability). A full public authoring grammar waits for
   the editor.
 - **Policy expression.** Reuse `flux-policy` `Grant`s with the new semantic `Action`s
-  (`flow.send_external` / `flow.money` / `flow.calendar`); no new policy language in v1.
+  (`flow.send_external` / `flow.money`; `flow.calendar` until its C-184 removal); no new policy
+  language in v1.
 - **`cache` vs `live` default.** The compiler prefers deterministic ops and minimizes `!model` nodes; a
   `!model` node defaults to `live` (fresh, safe) and opts into `cache` when a flow is persisted for
   repeatable re-run. Overridable per op / per flow.

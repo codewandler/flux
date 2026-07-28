@@ -200,7 +200,7 @@ $gone = bash("rm -rf tmp/")
 ```
 
 Valid tags: `pure`, `read`, `model`, `network`, `write_file`, `write_db`, `send_external`,
-`delete`, `money`, `calendar`, `human_visible`. See
+`delete`, `money`, `human_visible`. See
 [Types & effects](./types-and-effects.md).
 
 ## return

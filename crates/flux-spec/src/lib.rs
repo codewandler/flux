@@ -79,8 +79,14 @@ pub enum Effect {
 
 /// A first-class *semantic* effect, declared on operations. Distinct from the host-resource
 /// [`Effect`] (Read/Write/Network/…): a `FlowEffect` expresses execution *meaning* (this op sends
-/// mail, costs money, touches a calendar) and lowers onto the host effect + a policy action via
+/// mail, costs money, irreversibly deletes) and lowers onto the host effect + a policy action via
 /// [`FlowEffect::lower`]. Policy decides allow / deny / require-approval.
+///
+/// **Vocabulary invariant (C-184):** a variant names a *consequence class* — what could go wrong,
+/// who sees it, whether it can be undone — never an application domain. "Books a meeting",
+/// "updates a CRM record", "changes DNS" are all `send_external`/`write_db`-class consequences of
+/// specific domains; giving each domain its own variant would grow an unbounded catalog on a
+/// frozen wire enum. (`Calendar` predates this rule and is deprecated for exactly this reason.)
 ///
 /// Lives here rather than in `flux-lang` because it is part of the **plugin wire vocabulary**
 /// (`PluginManifest`'s `semantic_effects`), and a guest plugin must be able to name it without
@@ -108,6 +114,15 @@ pub enum FlowEffect {
     /// Moves money.
     Money,
     /// Mutates a calendar.
+    ///
+    /// The one application-domain noun in a consequence-class vocabulary (see the enum docs), with
+    /// zero declaration sites since day one — kept only because removing a wire enum variant fails
+    /// deserialization of any manifest that declares it, a protocol-major event.
+    #[deprecated(
+        since = "1.1.0",
+        note = "a calendar mutation is a `send_external` (or `write_db`) consequence; \
+                `calendar` is queued for removal at the next protocol major"
+    )]
     Calendar,
     /// Produces output a human will see.
     HumanVisible,
@@ -118,6 +133,8 @@ impl FlowEffect {
     /// and the `!tag` bind/memo syntax (see [`FlowEffect::from_tag`] for the inverse). The single
     /// source of truth for the tag vocabulary: `format`/`render`'s pretty-printers and `parse`'s
     /// `@effect`/`!tag` readers all resolve through this pair rather than keeping their own tables.
+    // The deprecated `Calendar` stays wire-parseable until the next protocol major (C-184).
+    #[allow(deprecated)]
     pub fn tag(self) -> &'static str {
         match self {
             FlowEffect::Pure => "pure",
@@ -137,6 +154,7 @@ impl FlowEffect {
     /// Parse a semantic-effect tag (the inverse of [`FlowEffect::tag`]), or `None` for an unknown
     /// tag. Used both by the text-syntax reader and by anything reconstructing a [`FlowEffect`] from
     /// a catalog's serialized tag strings (e.g. a plugin-manifest-declared op, D-138).
+    #[allow(deprecated)]
     pub fn from_tag(tag: &str) -> Option<Self> {
         Some(match tag {
             "pure" => FlowEffect::Pure,
@@ -161,6 +179,7 @@ impl FlowEffect {
     /// effects (`SendExternal`, `Money`, `Calendar`, …) carry a dedicated `flow.*` action a policy
     /// `Grant` can allow / deny / require-approval (`flow.delete` / `flow.money` are denied by
     /// default in policy).
+    #[allow(deprecated)]
     pub fn lower(self) -> (Option<Effect>, Option<flux_policy::Action>) {
         use flux_policy::Action;
         use FlowEffect::*;
@@ -494,6 +513,23 @@ mod tests {
         assert_eq!(s.risk, Risk::High);
         assert!(s.has_effect(Effect::Process));
         assert_eq!(s.access, vec![AccessKind::Process]);
+    }
+
+    /// C-184: the wire contract the deprecation must not break. A manifest that declares
+    /// `"calendar"` in `semantic_effects` (serde), a catalog tag string (`from_tag`), and the
+    /// authority lowering all keep working until the next protocol major — deprecation warns
+    /// authors, it never fails a loaded plugin.
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_calendar_stays_wire_compatible_until_the_next_protocol_major() {
+        let parsed: Vec<FlowEffect> = serde_json::from_value(json!(["calendar"])).unwrap();
+        assert_eq!(parsed, vec![FlowEffect::Calendar]);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json!(["calendar"]));
+        assert_eq!(FlowEffect::from_tag("calendar"), Some(FlowEffect::Calendar));
+        assert_eq!(FlowEffect::Calendar.tag(), "calendar");
+        let (host, action) = FlowEffect::Calendar.lower();
+        assert_eq!(host, None);
+        assert_eq!(action, Some(flux_policy::Action::from("flow.calendar")));
     }
 
     #[test]

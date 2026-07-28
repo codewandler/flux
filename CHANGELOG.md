@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **C-184: the `calendar` semantic effect is deprecated.** `FlowEffect::Calendar` was the one
+  application-domain noun in an otherwise consequence-class vocabulary (send_external, money,
+  delete, …) — day-one taxonomy from the original flux-lang extraction with **zero declaration
+  sites** anywhere (no built-in op, no plugin, no example, no test), a default-policy grant it
+  never earned, and a lowering that carried no `Network` host effect. Removing a wire enum variant
+  fails deserialization of any manifest that declares it (protocol-major event), so instead:
+  `#[deprecated]` on the variant (flux-spec 1.0.0 → 1.1.0), the vocabulary invariant written on
+  the enum (variants name consequence classes, never application domains), the tag un-taught in
+  the language/authoring docs, and `flow.calendar` dropped from the default policy — now
+  default-deny like `flow.money`/`flow.delete`. Wire compatibility is pinned by test: a manifest
+  declaring `"calendar"` still deserializes, round-trips, and lowers until the next protocol
+  major. Declare `send_external` (or `write_db`) instead.
+
 ## [0.31.1] - 2026-07-28
 
 ### Fixed

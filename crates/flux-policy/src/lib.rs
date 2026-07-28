@@ -433,12 +433,13 @@ pub fn default_local_grants() -> AuthorizationPolicy {
                 false,
             ),
             // Externally-visible semantic actions are allowed only after explicit approval. Money
-            // movement and deletion are intentionally absent and therefore remain default-deny.
+            // movement, deletion, and the deprecated `flow.calendar` are intentionally absent and
+            // therefore remain default-deny (C-184: nothing has ever declared the `calendar`
+            // semantic effect, so its grant was authority waiting for an accident).
             grant(
                 vec![
                     Action::from("operation.mutate"),
                     Action::from("flow.send_external"),
-                    Action::from("flow.calendar"),
                 ],
                 vec![ResourceRef::any(ResourceKind::Operation)],
                 true,
@@ -736,6 +737,39 @@ mod tests {
             &ResourceRef::any(ResourceKind::Process),
         );
         assert_eq!(e.decision, Decision::Allow);
+    }
+
+    /// C-184: the deprecated `calendar` semantic effect is default-DENY, exactly like
+    /// `flow.money`/`flow.delete` — its old approval-gated grant was authority for an action no op
+    /// in the repo has ever declared. The neighbouring `flow.send_external` pin proves the grant
+    /// that used to carry it is otherwise intact.
+    #[test]
+    fn default_local_grants_deny_the_deprecated_calendar_action() {
+        let p = default_local_grants();
+        let c = user("local");
+        let t = trust(TrustLevel::Privileged, &[]);
+        assert_eq!(
+            eval(
+                &p,
+                &c,
+                &t,
+                "flow.calendar",
+                &ResourceRef::any(ResourceKind::Operation)
+            )
+            .decision,
+            Decision::Deny
+        );
+        assert_eq!(
+            eval(
+                &p,
+                &c,
+                &t,
+                "flow.send_external",
+                &ResourceRef::any(ResourceKind::Operation)
+            )
+            .decision,
+            Decision::ApprovalRequired
+        );
     }
 
     #[test]

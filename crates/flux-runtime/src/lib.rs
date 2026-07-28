@@ -2462,6 +2462,9 @@ pub fn authority_requirements_from_declaration(
                 &mut requirements,
                 AuthorityRequirement::operation("flow.money", &spec.name),
             ),
+            // Deprecated (C-184): kept parseable so a manifest that declares it still loads, but
+            // `flow.calendar` has no default-policy grant — the op is default-deny unless a policy
+            // grants it explicitly. Removed at the next protocol major.
             "calendar" => push_requirement(
                 &mut requirements,
                 AuthorityRequirement::operation("flow.calendar", &spec.name),

@@ -60,8 +60,12 @@ $sent = send_report($report)
 | `send_external` | sends email / message / webhook |
 | `delete` | irreversibly deletes |
 | `money` | moves money |
-| `calendar` | mutates a calendar |
 | `human_visible` | produces output a human will see |
+
+Every tag names a *consequence class* — what could go wrong, who sees it, whether it can be
+undone — never an application domain: booking a meeting or updating a CRM record is
+`send_external` (or `write_db`), not a tag of its own. (A legacy `calendar` tag still parses for
+compatibility but is deprecated and slated for removal.)
 
 Operations also declare their own effects host-side; the annotation is the plan author's
 declaration of intent on a specific bind. See [Safety & approvals](../agent/safety.md) for how

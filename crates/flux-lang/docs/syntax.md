@@ -451,7 +451,8 @@ $gone = bash("rm -rf tmp/")
 ```
 
 Valid effects: `pure`, `read`, `model`, `network`, `write_file`, `write_db`,
-`send_external`, `delete`, `money`, `calendar`, `human_visible`.
+`send_external`, `delete`, `money`, `human_visible`. (A legacy `calendar` tag still parses but is
+deprecated — declare `send_external` or `write_db` instead.)
 
 The `@` prefix is unambiguous: it introduces an annotation or a thing-reference and
 is never used as an operator.

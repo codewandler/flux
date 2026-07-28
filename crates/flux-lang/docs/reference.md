@@ -1321,7 +1321,7 @@ signature (`OpSignature::semantic_effects` — a plugin manifest's `OperationSpe
 `OpSpec` can declare it, so a plain, untagged call still annotates correctly). Either
 way it drives risk scoring and the typed authorization requirements used by both preview and
 dispatch. The non-authority tags (`pure`, `read`, `human_visible`) add no policy action;
-`write_file`, `write_db`, `send_external`, `delete`, `money`, and `calendar` must resolve to the
+`write_file`, `write_db`, `send_external`, `delete`, and `money` must resolve to the
 matching resource/action contract or registration/dispatch fails closed:
 
 | tag | meaning |
@@ -1335,8 +1335,12 @@ matching resource/action contract or registration/dispatch fails closed:
 | `send_external` | sends email / message / webhook |
 | `delete` | irreversibly deletes |
 | `money` | moves money |
-| `calendar` | mutates a calendar |
 | `human_visible` | produces output a human will see |
+
+A tag names a *consequence class*, never an application domain — booking a meeting is
+`send_external`, not a tag of its own. The legacy `calendar` tag still parses for wire
+compatibility but is deprecated (default-deny under the default policy) and slated for removal
+at the next protocol major.
 
 ---
 

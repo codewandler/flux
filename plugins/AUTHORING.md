@@ -164,7 +164,7 @@ never base64 in-plugin, never read the token from env — declare the scheme and
    remain for the explicit flexible adapter. A write/destructive op sets `Risk`. Effects disclose
    scheduling and risk, while the manifest's declared `http`/`process`/`conn`/`secret`/datasource
    capabilities provide the typed resource requirements enforced by policy. Stable semantic effects
-   (`write_db`, `send_external`, `delete`, `money`, `calendar`) add their own action requirement.
+   (`write_db`, `send_external`, `delete`, `money`) add their own action requirement.
    Missing or inconsistent access declarations and unknown semantic effects reject the operation
    before it is advertised. An empty-effects op is forced through approval as a conservative
    `[Process, Network]` — never ship one by accident.
