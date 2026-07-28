@@ -17,6 +17,10 @@ pub struct ChatState {
     pub(super) session_id: String,
     pub(super) model: String,
     pub(super) model_spec: Option<String>,
+    /// The surface's cwd at launch, shown as-is in the empty-transcript orientation card (C-157).
+    /// Empty for headless/test construction, which just omits the segment rather than showing a
+    /// placeholder.
+    pub(super) workspace_root: String,
     /// Command files (D-186) discovered by the surface, already filtered against built-in names.
     pub(super) file_commands: Vec<flux_runtime::metadata::CommandFile>,
     pub(super) theme: Theme,

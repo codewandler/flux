@@ -14,6 +14,45 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
+/// Minimum transcript width the empty-state card renders into (C-157) — narrower than this it
+/// would need to wrap onto more lines than a short orientation card is worth, so it is skipped
+/// rather than added as noise (the same narrow-width posture C-102 established for the
+/// header/footer bars).
+const EMPTY_CARD_MIN_WIDTH: u16 = 44;
+
+/// A short centered card shown while the transcript has no entries yet (C-157): names the active
+/// model, the workspace root, and the primary affordances (`/help`, `/` commands, `@` file
+/// completion) so a fresh session answers "where am I / what can I do" instead of leaving the
+/// idle footer hint as the only orientation. Drawn straight into `area` with no
+/// [`ChatState::transcript_viewport`] involvement — it is not a transcript row and must never be
+/// treated like one (no layout cache, no focus, no scroll).
+fn render_empty_state_card(frame: &mut Frame, state: &ChatState, area: Rect) {
+    if area.width < EMPTY_CARD_MIN_WIDTH || area.height < 3 {
+        return;
+    }
+    let t = &state.theme;
+    let model = state.model_spec.as_deref().unwrap_or(&state.model);
+    let identity = if state.workspace_root.is_empty() {
+        model.to_string()
+    } else {
+        format!("{model}  ·  {}", state.workspace_root)
+    };
+    let card_width = area.width.min(60);
+    let lines = vec![
+        Line::styled("flux", t.accent_style().add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Center),
+        Line::styled(
+            truncate(&identity, card_width.saturating_sub(2) as usize),
+            t.muted_style(),
+        )
+        .alignment(Alignment::Center),
+        Line::styled("/help commands  ·  / commands  ·  @ files", t.muted_style())
+            .alignment(Alignment::Center),
+    ];
+    let card = centered(area, card_width, lines.len() as u16);
+    frame.render_widget(Paragraph::new(lines), card);
+}
+
 /// Render the chat: scrollable transcript, a status/spinner row, the input box, optional modal.
 pub fn render(frame: &mut Frame, state: &ChatState) {
     // Whole-screen fill so a light theme works on terminals with a dark background (C-104);
@@ -71,24 +110,31 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         header_area,
     );
 
-    let visible = state.transcript_viewport(transcript_area.width, transcript_area.height);
-    frame.render_widget(Paragraph::new(visible), transcript_area);
+    // C-157: an empty session shows a short orientation card instead of running the transcript
+    // viewport at all — the card must never populate the layout cache, participate in focus
+    // (C-111), or set scroll bookkeeping, so it stays entirely outside `transcript_viewport`.
+    if state.entries.is_empty() {
+        render_empty_state_card(frame, state, transcript_area);
+    } else {
+        let visible = state.transcript_viewport(transcript_area.width, transcript_area.height);
+        frame.render_widget(Paragraph::new(visible), transcript_area);
 
-    // C-106: a scroll position indicator while detached from follow mode. It overlays the last
-    // column only while detached — the transcript width never changes, so the layout cache stays
-    // keyed the same across attach/detach.
-    if !state.follow && state.last_max_scroll.get() > 0 {
-        use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-        let mut bar_state = ScrollbarState::new(state.last_max_scroll.get() as usize)
-            .position(state.scroll as usize)
-            .viewport_content_length(transcript_area.height as usize);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(state.theme.muted_style())
-                .thumb_style(state.theme.accent_style()),
-            transcript_area,
-            &mut bar_state,
-        );
+        // C-106: a scroll position indicator while detached from follow mode. It overlays the last
+        // column only while detached — the transcript width never changes, so the layout cache stays
+        // keyed the same across attach/detach.
+        if !state.follow && state.last_max_scroll.get() > 0 {
+            use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+            let mut bar_state = ScrollbarState::new(state.last_max_scroll.get() as usize)
+                .position(state.scroll as usize)
+                .viewport_content_length(transcript_area.height as usize);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .style(state.theme.muted_style())
+                    .thumb_style(state.theme.accent_style()),
+                transcript_area,
+                &mut bar_state,
+            );
+        }
     }
 
     if !queued.is_empty() {

@@ -970,6 +970,7 @@ impl ChatState {
             session_id,
             model,
             model_spec: None,
+            workspace_root: String::new(),
             file_commands: Vec::new(),
             theme: Theme::default(),
             theme_name: "dark".into(),
@@ -2920,6 +2921,11 @@ pub async fn run_with_options(
     let (theme_name, theme) = resolve_theme(options.theme.as_deref());
     state.theme = theme;
     state.theme_name = theme_name;
+    // C-157: the surface's cwd at launch, shown in the empty-transcript orientation card. A
+    // single read at startup — same posture as `session_id`/`model`, not re-read per frame.
+    state.workspace_root = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     // C-116: seed the header mode badges — auto-approve from the launch options, effort from
     // the engine's current setting (later `/effort` changes are mirrored by the handler).
     state.auto_approve = options.auto_approve;
@@ -4278,10 +4284,62 @@ mod tests {
         assert!(content.contains("flux")); // border title + idle hint
     }
 
+    /// C-157: a fresh session with no transcript entries shows a short centered card naming the
+    /// active model, the workspace root, and the primary affordances — the idle footer hint used
+    /// to be the only orientation. The card disappears the instant the first entry lands.
+    #[test]
+    fn empty_transcript_shows_orientation_card_naming_model_workspace_and_affordances() {
+        let mut state = ChatState::new("mock".into());
+        state.workspace_root = "/home/dev/flux".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("mock"), "{content}");
+        assert!(content.contains("/home/dev/flux"), "{content}");
+        assert!(content.contains("/help"), "{content}");
+        assert!(content.contains('@'), "{content}");
+
+        state.push_user("hello");
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            !screen(&terminal).contains("/home/dev/flux"),
+            "the card must not survive the first entry"
+        );
+    }
+
+    /// C-157: the card is drawn straight into the transcript area — it must never run
+    /// `ensure_transcript_layout` (the cache), touch `last_max_scroll`/`last_page` (scrolling), or
+    /// otherwise behave like a transcript row.
+    #[test]
+    fn empty_state_card_never_touches_transcript_layout_cache_or_scroll() {
+        let state = ChatState::new("mock".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            state.transcript_layout.borrow().is_none(),
+            "an empty session must never populate the transcript layout cache"
+        );
+        assert_eq!(state.last_max_scroll.get(), 0);
+    }
+
+    /// C-157: a narrow terminal skips the card entirely rather than wrapping it into noise —
+    /// the same narrow-width posture C-102 established for the header/footer bars.
+    #[test]
+    fn narrow_terminal_skips_the_empty_state_card() {
+        let mut state = ChatState::new("mock".into());
+        state.workspace_root = "/home/dev/flux".into();
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains("/home/dev/flux"));
+    }
+
     #[test]
     fn composer_is_background_only_without_border_or_padding() {
         let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
         let mut state = ChatState::new("mock".into());
+        // A non-empty transcript, so C-157's empty-state card (which also contains a "d" glyph,
+        // in "commands") doesn't shadow the composer's own "d" for the `.find()` below.
+        state.push_user("hi");
         state.input.insert_str("draft");
         terminal.draw(|f| render(f, &state)).unwrap();
 
