@@ -71,20 +71,19 @@ pub fn persist_user_theme(theme: &str) -> Result<()> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Err(Error::Config("HOME is not set".into()));
     };
-    let root = home.join(".flux");
-    if !root.exists() {
-        std::fs::create_dir_all(&root)
-            .map_err(|error| Error::Config(format!("create {}: {error}", root.display())))?;
-    }
-    let Some((_, system)) = trusted_flux_root()? else {
-        return Err(Error::Config("~/.flux is not usable".into()));
+    // First use (`~/.flux` absent, so `trusted_flux_root` is None): write through a `System`
+    // confined to `$HOME` — `write_file_atomic` creates the `.flux` parent inside the guarded
+    // resolve, so this path performs no raw filesystem IO.
+    let (system, rel) = match trusted_flux_root()? {
+        Some((_, system)) => (system, "config.toml"),
+        None => (System::new(Workspace::new(&home)?), ".flux/config.toml"),
     };
-    let current = system.read_optional_text("config.toml")?;
+    let current = system.read_optional_text(rel)?;
     let body = flux_config::render_theme(
         current.as_deref().map(|text| ("~/.flux/config.toml", text)),
         theme,
     )?;
-    system.write_file_atomic("config.toml", &body)
+    system.write_file_atomic(rel, &body)
 }
 
 /// Load guarded project and trusted user-global group manifests. Callers decide how to present a
