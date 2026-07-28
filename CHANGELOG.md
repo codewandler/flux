@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-07-28
+
 ### Added
 
 - **L-85…L-91: flux-lsp round 2 — every capability moved onto the CST that was already paid for.**

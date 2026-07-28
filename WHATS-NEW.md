@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-07-28
+
 ### New
 
 - **Editing `.flux` files got a lot sharper.** The language server used to advertise more than it
