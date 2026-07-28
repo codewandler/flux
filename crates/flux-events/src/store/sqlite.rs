@@ -17,7 +17,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use flux_core::{Error, Result};
 
-use super::{decode_all, now_ms, parse_id, EventBackend, RawEvent, SessionInfo, SessionSummary};
+use super::{
+    decode_all, now_ms, parse_id, CopyEvent, EventBackend, RawEvent, SessionInfo, SessionSummary,
+};
 use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
 
@@ -151,8 +153,8 @@ fn collect_raw(
 /// the event has none. `conn` is the active transaction (a `Transaction` derefs here). `ctx` is
 /// the stream's run context, stamped onto the returned [`StoredEvent`] (it lives on the registry,
 /// not the event row, so it is not persisted here — only surfaced). `ts` is the caller-chosen
-/// timestamp — ordinary appends pass `now_ms()`, [`SqliteEvents::append_at`] preserves an explicit
-/// one (D-174's event-export primitive).
+/// timestamp — ordinary appends pass `now_ms()`; [`SqliteEvents::copy_session_atomic`] preserves
+/// each copied event's original one (D-174/D-185's event-export primitive).
 fn insert_event(
     conn: &Connection,
     stream: &str,
@@ -307,8 +309,9 @@ impl SqliteEvents {
 }
 
 impl SqliteEvents {
-    /// The shared body of `append`/`append_at` — differ only in whether `ts` is `now_ms()` or a
-    /// caller-preserved timestamp (D-174's `copy_session_to`).
+    /// The write body of ordinary `append` (`ts` is always `now_ms()` here — the atomic-copy path
+    /// used by `copy_session_to` (D-174/D-185) inserts directly on its own transaction instead, so
+    /// it can span the session mint and every copied event as one unit).
     fn append_with_ts(&self, stream: &str, ev: NewEvent, ts: i64) -> Result<StoredEvent> {
         let conn = self.conn.lock().unwrap();
         if let Some(id) = &ev.id {
@@ -674,12 +677,80 @@ impl EventBackend for SqliteEvents {
         Ok(expired.len())
     }
 
-    fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
-        self.append_with_ts(stream, ev, now_ms())
+    /// D-185: mint the destination session and append every copied event inside ONE transaction —
+    /// a failure (an unmappable `turn_id`, or any SQL error) rolls the whole thing back, so nothing
+    /// is ever committed to `streams` or `events` for a partial copy. `created_at`/`updated_at` are
+    /// stamped from `info`/the events themselves (never `now_ms()`), so a copied session never shows
+    /// `created_at > updated_at`.
+    fn copy_session_atomic(&self, info: &SessionInfo, events: Vec<CopyEvent>) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let tx = begin_write(&conn)?;
+        let created_at = info.created_at_ms;
+        let updated_at = events.last().map(|e| e.ts_ms).unwrap_or(info.updated_at_ms);
+        tx.execute(
+            "INSERT INTO streams \
+             (model, created_at, updated_at, last_seq, msg_count, \
+              account, agent_id, agent_version, correlation_id) \
+             VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                info.model,
+                created_at,
+                updated_at,
+                info.context.account,
+                info.context.agent_id,
+                info.context.agent_version,
+                info.context.correlation_id,
+            ],
+        )
+        .map_err(map_sql)?;
+        let n = tx.last_insert_rowid();
+        let stream = format!("s_{n}");
+        let started = NewEvent::new(EventKind::SessionStarted {
+            model: info.model.clone(),
+        });
+        insert_event(&tx, &stream, &started, 0, &info.context, created_at)?;
+
+        let mut turn_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut next_seq: i64 = 1;
+        let mut msg_count: i64 = 0;
+        for ev in events {
+            let turn_id = match ev.turn_id {
+                Some(old) => Some(turn_map.get(&old).copied().ok_or_else(|| {
+                    Error::Other(format!(
+                        "copy_session_atomic: event {} references turn {old}, which was never \
+                         copied (its TurnStarted must precede every event it scopes)",
+                        ev.id
+                    ))
+                })?),
+                None => None,
+            };
+            let mut new_ev = NewEvent::new(ev.kind.clone());
+            new_ev.schema_version = ev.schema_version;
+            if let Some(turn_id) = turn_id {
+                new_ev = new_ev.in_turn(turn_id);
+            }
+            let stored = insert_event(&tx, &stream, &new_ev, next_seq, &info.context, ev.ts_ms)?;
+            if matches!(ev.kind, EventKind::TurnStarted { .. }) {
+                turn_map.insert(ev.old_global_seq, stored.global_seq);
+            }
+            match &ev.kind {
+                EventKind::Message(_) => msg_count += 1,
+                EventKind::Compacted { messages } => msg_count = messages.len() as i64,
+                _ => {}
+            }
+            next_seq += 1;
+        }
+        tx.execute(
+            "UPDATE streams SET last_seq = ?1, msg_count = ?2 WHERE n = ?3",
+            rusqlite::params![next_seq - 1, msg_count, n],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(stream)
     }
 
-    fn append_at(&self, stream: &str, ev: NewEvent, ts_ms: i64) -> Result<StoredEvent> {
-        self.append_with_ts(stream, ev, ts_ms)
+    fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
+        self.append_with_ts(stream, ev, now_ms())
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

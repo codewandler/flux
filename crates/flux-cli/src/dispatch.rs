@@ -329,13 +329,24 @@ pub(super) fn run() -> Result<()> {
     // posture and let spawn-capable commands such as `plugin status` execute native code
     // unconfined. Clap handles `--help`/`--version` before this point, so those remain available even
     // when the project config needs repair.
+    let cwd = std::env::current_dir().context("resolve current directory")?;
     // D-179: `--store <DIR>` redirects the session store for this invocation. Exported here,
     // pre-runtime, for the same single-thread reason as the agent env signals below (`set_var` must
     // not race worker-thread `getenv`s).
+    //
+    // D-185: absolutize a relative `--store` against THIS process's cwd before exporting it — a
+    // subprocess (`app run`, a plugin) can have a different cwd, and a bare relative path would
+    // then resolve against that different directory instead of the one the user actually meant.
+    // Only when the flag is given: with no `--store`, `FLUX_STORE_DIR` is left untouched so a
+    // user-set env var (or none at all) is never clobbered.
     if let Some(dir) = cli.store.as_ref() {
-        std::env::set_var("FLUX_STORE_DIR", dir);
+        let abs = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            cwd.join(dir)
+        };
+        std::env::set_var("FLUX_STORE_DIR", abs);
     }
-    let cwd = std::env::current_dir().context("resolve current directory")?;
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
     apply_workspace_access_env(&cli, &cfg);
     // D-130: export the OS-sandbox posture the same way, then run the startup preflight (hard

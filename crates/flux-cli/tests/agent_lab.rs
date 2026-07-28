@@ -195,3 +195,50 @@ fn flux_test_refuses_to_pass_vacuously() {
     assert!(!ok, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stderr.contains("no scenario fixtures"), "stderr: {stderr}");
 }
+
+/// `flux record` rejects any name that is not a single plain path segment (D-185): separators AND
+/// the `.`/`..` special components. Without the dot check, `flux record .. "x"` would target
+/// `tests/scenarios/..` (= `tests/`) — and because no `scenario.toml` exists there, the clobber
+/// guard never trips, so fixture files land outside the scenarios root entirely.
+#[test]
+fn flux_record_rejects_names_that_are_not_a_single_plain_segment() {
+    let tmp = TempDir::new("agent-lab-record-name-guard");
+    let work = tmp.path();
+    for bad in ["..", ".", "a/b", "../escape"] {
+        let (ok, stdout, stderr) = flux(work, &["record", "--yes", "-m", "mock", bad, "hi"]);
+        assert!(
+            !ok,
+            "`flux record {bad}` should be rejected\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("single plain path segment"),
+            "stderr: {stderr}"
+        );
+    }
+    // No fixture must have been written anywhere — not even the scenarios root itself.
+    assert!(
+        !work.join("tests").exists(),
+        "an invalid name must not create any fixture directory"
+    );
+}
+
+/// `flux test <name>` applies the same single-plain-segment guard as `flux record` (D-185): before
+/// this story `discover_fixtures` did a bare `dir.join(name)` with zero validation, so `flux test
+/// ../../anywhere/fixture` could replay an arbitrary path outside `--dir` — asymmetric with
+/// `run_record`'s guard for no good reason.
+#[test]
+fn flux_test_rejects_names_that_are_not_a_single_plain_segment() {
+    let tmp = TempDir::new("agent-lab-test-name-guard");
+    let work = tmp.path();
+    for bad in ["..", ".", "a/b", "../escape"] {
+        let (ok, stdout, stderr) = flux(work, &["test", bad]);
+        assert!(
+            !ok,
+            "`flux test {bad}` should be rejected\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("single plain path segment"),
+            "stderr: {stderr}"
+        );
+    }
+}
