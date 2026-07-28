@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-28
+
 ### New
 
 - **Test your agent offline, for free — record a run once, replay it forever.**

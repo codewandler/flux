@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-28
+
 ### Fixed
 
 - **D-181: Resurrect and what-if traces are now turn-scoped, not session-scoped.** The resume
