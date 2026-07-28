@@ -1175,19 +1175,47 @@ pub(crate) fn map_responses_stream(
                     // prefix, and surfaces the cached count under `input_tokens_details.cached_tokens`
                     // plus reasoning under `output_tokens_details.reasoning_tokens`. Normalize to the
                     // cache-aware Usage shape (fresh input separate from cache reads, reasoning as a
-                    // subset of output) so cost is comparable across providers; there is no cache-write
-                    // tier, so cache_creation stays 0.
+                    // subset of output) so cost is comparable across providers.
+                    //
+                    // `input_tokens_details.cache_write_tokens` IS reported on this wire — observed
+                    // live on both the codex WS and HTTP paths. The pre-existing comment here claimed
+                    // there was no write tier, so the field was dropped and every codex row in
+                    // `flux usage` showed a blank cache-write column; a cached prefix looked like it
+                    // appeared from nowhere. It is part of the prompt, so it comes out of the fresh
+                    // input the same way `cached_tokens` does.
                     let input = u["input_tokens"].as_u64().unwrap_or(0);
                     let cached = u["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    let cache_write = u["input_tokens_details"]["cache_write_tokens"]
                         .as_u64()
                         .unwrap_or(0);
                     let reasoning = u["output_tokens_details"]["reasoning_tokens"]
                         .as_u64()
                         .unwrap_or(0);
+                    // Both tiers are documented as portions OF `input_tokens`. If a backend ever
+                    // reports them *in addition* to it, a bare `saturating_sub` would clamp fresh
+                    // input to 0 while `context_tokens()` over-counted the prompt — a silent cost
+                    // inflation. Keep that visible instead: trust the total, drop the breakdown.
+                    let (fresh, cached, cache_write) = match input.checked_sub(cached + cache_write) {
+                        Some(fresh) => (fresh, cached, cache_write),
+                        None => {
+                            tracing::warn!(
+                                input,
+                                cached,
+                                cache_write,
+                                "Responses usage: cached + cache_write exceeds input_tokens; \
+                                 the tiers are not subsets of the prompt total — reporting the \
+                                 prompt as fresh input rather than a distorted breakdown"
+                            );
+                            (input, 0, 0)
+                        }
+                    };
                     yield Chunk::Usage(Usage {
-                        input_tokens: input.saturating_sub(cached),
+                        input_tokens: fresh,
                         output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                         cache_read_input_tokens: cached,
+                        cache_creation_input_tokens: cache_write,
                         reasoning_tokens: reasoning,
                         ..Default::default()
                     });
@@ -2039,6 +2067,70 @@ mod tests {
         }
 
         assert!(saw_err, "a declared response.failed event must stay fatal");
+    }
+
+    /// The Responses wire reports a cache-WRITE tier (`input_tokens_details.cache_write_tokens`) —
+    /// observed live on both the codex WS and HTTP paths. It used to be dropped on the claim that
+    /// there was no write tier, so every codex row in `flux usage` showed a blank cache-write column
+    /// and a cached prefix appeared to come from nowhere.
+    #[tokio::test]
+    async fn responses_usage_captures_the_cache_write_tier() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\
+             \"input_tokens\":11259,\"output_tokens\":47,\
+             \"input_tokens_details\":{\"cached_tokens\":6000,\"cache_write_tokens\":2000},\
+             \"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n";
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+        let mut usage = None;
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(c) = stream.next().await {
+            if let Chunk::Usage(u) = c.unwrap() {
+                usage = Some(u);
+            }
+        }
+        let u = usage.expect("a usage chunk");
+        assert_eq!(u.cache_read_input_tokens, 6_000);
+        assert_eq!(u.cache_creation_input_tokens, 2_000);
+        // Both tiers come OUT of the fresh-input figure, so the three still reconstruct the prompt.
+        assert_eq!(u.input_tokens, 11_259 - 6_000 - 2_000);
+        assert_eq!(u.context_tokens(), 11_259);
+    }
+
+    /// The tiers are documented subsets of `input_tokens`. A backend reporting them *on top* of the
+    /// total would otherwise clamp fresh input to 0 and inflate `context_tokens()` — so the codec
+    /// keeps the trustworthy figure (the prompt total) and drops the impossible breakdown.
+    #[tokio::test]
+    async fn responses_usage_rejects_a_breakdown_larger_than_the_prompt() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\
+             \"input_tokens\":1000,\"output_tokens\":5,\
+             \"input_tokens_details\":{\"cached_tokens\":900,\"cache_write_tokens\":400}}}}\n\n";
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+        let mut usage = None;
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(c) = stream.next().await {
+            if let Chunk::Usage(u) = c.unwrap() {
+                usage = Some(u);
+            }
+        }
+        let u = usage.expect("a usage chunk");
+        assert_eq!(
+            u.input_tokens, 1_000,
+            "the prompt total is the trustworthy figure"
+        );
+        assert_eq!(u.cache_read_input_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(
+            u.context_tokens(),
+            1_000,
+            "context must not exceed the reported prompt"
+        );
     }
 
     #[tokio::test]
