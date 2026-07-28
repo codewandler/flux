@@ -2,8 +2,7 @@
 id: C-134
 title: Cache the conversation tail — a rolling breakpoint on the last message block
 pillar: Core
-status: ready
-priority: 4
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "flux never stamps cache_control anywhere in `messages` (only system_field/segmented_system_field do, mod.rs:127,140; ContentBlock has no carrier) — so the cacheable prefix stops where the system prompt ends and the whole growing transcript is re-priced at full input rate every round"
@@ -47,7 +46,20 @@ the one with the largest expected effect on subscription spend and latency.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `Request::cache_tail` + `stamp_tail_breakpoint`; `cache_breakpoints` now takes a
+  `reserved` count and caps the UNION at four.
+- Which system breakpoint is dropped is pinned by test: the smallest cache:true segment (on
+  subscription-claude, the identity prefix) loses it, so the large stable prefix keeps its resume
+  point.
+- **20-block lookback: chose "bound it", not "bridge it".** With the budget full there is no slot for
+  intermediate breakpoints, so a round appending >20 blocks writes its tail instead of reading it.
+  Made observable rather than silent — `tracing::debug!` at the codec plus
+  `tail_breakpoint_out_of_lookback` pinning the shape.
+- `FLUX_CACHE_TAIL=off` kill switch added (mirrors `FLUX_OP_CACHE=off`) — the A/B lever and the
+  escape hatch.
+- **Live-validated**: long-transcript turn, same prompt, same 4 steps, tail arm running first
+  (favouring the control) — 47% → **71%** hit and ~$0.106 → **~$0.042** equivalent cost. Short turns
+  showed no reliable gain; both results are in the design doc.
 
 ## Notes
 - Blocked on C-133 for the baseline number, not for the implementation.

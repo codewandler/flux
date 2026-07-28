@@ -2,8 +2,7 @@
 id: A-95
 title: Freeze the advertised tool set within a turn — stop cold-writing the prefix mid-loop
 pillar: Agent
-status: ready
-priority: 6
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "`req.tools` is rebuilt every explore round from selected_specs_for_state (staged.rs:1098) and capability_signal expands it mid-loop; tools render BEFORE system, so one expansion invalidates every system breakpoint too and the next round pays a full cold write"
@@ -41,7 +40,19 @@ cache.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28, **narrower than filed, on evidence.**
+- Reading the loop showed the premise was partly wrong: `selected_specs_for_state` is a pure function
+  of loop-invariant inputs plus `state.declaration`, and `selected_specs` builds a `BTreeMap`, so the
+  advertised tool set is ALREADY byte-stable round to round unless a capability signal widens it.
+  Pinned by `the_advertised_tool_set_is_byte_stable_across_rounds`.
+- Freezing a widening signal (option a) would break capability discovery — the risk the story itself
+  flags — and monotonic growth (option b) is the existing behaviour. So neither listed option was
+  the fix.
+- The real churn found: `apply_capability_signal` mutated the declaration even when the signal
+  widened NOTHING, appending to `intent` on every call and so rewriting the trailing system segment
+  — harmless-ish on the Anthropic wire (it rides after the last breakpoint) but a full prefix
+  invalidation on the Responses wire, where segments are flattened into `instructions` (C-137). A
+  no-op signal is now a true no-op; a widening signal still widens, covered by test.
 
 ## Notes
 - Ordering is already deterministic — `selected_specs` builds a `BTreeMap` (`staged.rs:1769`) and

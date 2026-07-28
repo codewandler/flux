@@ -2,8 +2,7 @@
 id: C-138
 title: Pin the cache-layout contract + close the epic with a live A/B on both providers
 pillar: Core
-status: ready
-priority: 9
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "nothing today pins the realized breakpoint layout or fails when a new system segment / tool-set change silently halves the cache — A-23 pins the count only; this story pins the layout, records the live A/B, and documents the invariant so the epic does not have to be repeated"
@@ -44,7 +43,16 @@ next segment or tool-set change has to respect. Serves Core: cache behavior stop
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `cache_layout_contract` pins the realized layout for BOTH the `claude`
+  (identity-prefix) and `anthropic` segment layouts: union ≤ 4, stable prefix on 1h, rolling tail on
+  5m, per-turn segment after the last breakpoint. Its failure message names the budget and points at
+  the design doc.
+- The invariant is documented in the `flux_providers::messages` module header, where a provider
+  author will hit it.
+- Live A/B recorded in the design doc, including the negative short-turn results and the warm-cache
+  artifact that a naive A/B produces.
+- Design doc status moved to implemented; roadmap entry stamped; CHANGELOG entry written once for
+  the epic.
 
 ## Notes
 - Runs last by construction — it validates the other six. If a wave-1 or wave-2 story is dropped or

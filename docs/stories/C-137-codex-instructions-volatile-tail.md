@@ -2,8 +2,7 @@
 id: C-137
 title: Codex — keep volatile per-turn text out of `instructions`
 pillar: Core
-status: ready
-priority: 8
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "`instructions` is built from req.system_text() (flux-provider/src/lib.rs:147), which joins ALL segments including the trailing cache:false one — the segment the Anthropic path deliberately keeps after the last breakpoint lands at the very front of the Responses prefix"
@@ -42,7 +41,16 @@ A-03 layout should help every provider, not help Anthropic and hurt codex.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `split_system_for_responses` builds `instructions` from the cached segments only;
+  the trailing uncached segment becomes the first `input` item, behind the stable prefix.
+- `Request::system_text()` left alone — it is the documented fallback for codecs with no breakpoint
+  notion and has other callers.
+- Unsegmented path asserted byte-identical.
+- **Measured with C-136** (shared `FLUX_RESPONSES_CACHE=off` control arm): a long multi-round codex
+  turn goes from **0% to ~6%** cached, in both arm orders. This story is the likely driver — with the
+  per-turn segment at the front of `instructions`, the prefix changes whenever the intent declaration
+  does and OpenAI's automatic prefix match never lands. The two changes were measured together, so
+  the split between them is not separately attributed.
 
 ## Notes
 - Interaction with A-95: freezing the tool set also stabilizes the trailing segment's *families*

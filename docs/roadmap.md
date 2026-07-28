@@ -116,7 +116,7 @@ the wire, `host-kit` publishes with the pack instead of the flux closure, and a 
 the tree instead of leaving it half-rolled. Design:
 [designs/plugin-protocol-decoupling.md](designs/plugin-protocol-decoupling.md) (see "As built").
 
-### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — 🔜 **PLANNED 2026-07-28 (C-133…C-140 + A-95, nine stories)**
+### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-133…C-140 + A-95, all nine stories; unreleased)**
 
 A-03 made the planner *prefix* cache-stable and live-verified a 99% cross-process hit. That fix
 still works — and it is also the entire extent of prompt caching in flux. Reading the request path
@@ -141,7 +141,13 @@ hit rate live), then claude (C-134 tail breakpoint, C-135 1h TTL on the stable p
 the tool set per turn), then codex (C-136, C-137), then close-out (C-138). Done means every fix
 carries a live before/after number from the same harness, a regression test pins where breakpoints
 land, and the cache-layout invariant is documented so the next segment change can't halve the cache
-in silence. Design:
+in silence. **Result:** on a long-transcript turn the conversation-tail breakpoint takes the hit rate
+47% → **71%** and equivalent cost ~$0.106 → **~$0.042**, with the tail arm running first so ordering
+favoured the control; on short turns it is neutral, and it ships with a `FLUX_CACHE_TAIL=off` kill
+switch. `prompt_cache_key` was live-verified accepted by the ChatGPT/codex backend. Two stories
+landed narrower than filed on evidence — `flux usage` was already correct (only the live displays
+were biased to a turn's last round), and the adaptive tool set was already byte-stable except for a
+no-op capability signal that churned the prompt for nothing. Design:
 [designs/llm-cache-review.md](designs/llm-cache-review.md).
 
 ### TUI polish — 5 UX + 5 UI (epic) — ✅ **SHIPPED v0.28.0 (2026-07-28; wave 1 C-102…C-110 + wave 2 C-111…C-116, all fifteen stories)**

@@ -103,6 +103,11 @@ pub struct WireUsage {
     pub cache_creation_input_tokens: u64,
     #[serde(default, deserialize_with = "u64_or_zero")]
     pub cache_read_input_tokens: u64,
+    /// The per-TTL split of `cache_creation_input_tokens` (C-135). Anthropic-direct reports it
+    /// whenever a request carries cache breakpoints; gateways that don't send it leave the 1h
+    /// figure 0, which is correct — they get the five-minute breakpoint (`extended_cache_ttl`).
+    #[serde(default)]
+    pub cache_creation: Option<WireCacheCreation>,
     /// OpenRouter's reported total USD cost for this call (C-34), when it proxies this wire
     /// (Anthropic-direct never sends this field). `Option`-based — unlike the token counters above,
     /// no bare-`u64`-style null-tolerance helper is needed.
@@ -114,6 +119,15 @@ pub struct WireUsage {
     pub is_byok: Option<bool>,
     #[serde(default)]
     pub cost_details: Option<WireCostDetails>,
+}
+
+/// Anthropic's per-TTL breakdown of the cache-write tier.
+#[derive(Debug, Default, Deserialize)]
+pub struct WireCacheCreation {
+    #[serde(default, deserialize_with = "u64_or_zero")]
+    pub ephemeral_1h_input_tokens: u64,
+    #[serde(default, deserialize_with = "u64_or_zero")]
+    pub ephemeral_5m_input_tokens: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -152,6 +166,11 @@ impl From<WireUsage> for Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: u
+                .cache_creation
+                .as_ref()
+                .map(|c| c.ephemeral_1h_input_tokens)
+                .unwrap_or(0),
             cache_read_input_tokens: u.cache_read_input_tokens,
             // Anthropic's wire usage folds thinking tokens into output_tokens with no separate
             // count, so there is no reasoning figure to map here.

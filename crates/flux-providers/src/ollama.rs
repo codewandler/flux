@@ -31,6 +31,7 @@ impl ProviderProfile for OllamaProfile {
     fn quirks_for(&self, _model: &str) -> MessagesQuirks {
         MessagesQuirks {
             prompt_caching: false,
+            extended_cache_ttl: false,
             thinking_adaptive: true,
             effort_output_config: false,
             // Local models take the classic sampling params; nothing to gate.

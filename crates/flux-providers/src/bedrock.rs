@@ -67,6 +67,9 @@ impl ProviderProfile for BedrockProfile {
         let caps = anthropic_model_caps(model);
         MessagesQuirks {
             prompt_caching: true,
+            // Bedrock's Anthropic passthrough was never measured with the extended TTL and can
+            // reject an unknown `cache_control` member, so the stable prefix keeps the 5m default.
+            extended_cache_ttl: false,
             thinking_adaptive: caps.adaptive_thinking,
             effort_output_config: caps.effort,
             sampling_params: caps.sampling_params,
@@ -1519,6 +1522,7 @@ mod tests {
             model: "us.anthropic.claude-sonnet-4-6".to_string(),
             system: None,
             system_segments: Vec::new(),
+            cache_tail: false,
             messages: vec![flux_core::Message::user(vec![
                 flux_core::ContentBlock::Text {
                     text: "say ok".to_string(),

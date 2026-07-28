@@ -87,8 +87,52 @@ pub fn oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
 /// [`oauth`] with explicit HTTP + WS endpoints, so hermetic tests can point both transports at
 /// local stub servers. Production goes through [`oauth`] (live ChatGPT backend, `wss://` derived
 /// from [`CODEX_ENDPOINT`]).
+/// HTTP+SSE by default; `FLUX_CODEX_WS=on` opts into the WS transport (C-159).
+///
+/// **This reverses C-07's default as an interim measure, because flux uses the WS wrong — not
+/// because the WS cannot cache.** Reading the upstream client (`openai/codex`,
+/// `codex-rs/core/src/client.rs`) shows a session-scoped design flux does not implement:
+///
+/// * **one connection, reused** — `ModelClientSession` caches the socket and prewarms it with a
+///   `response.create` carrying `generate=false`, so later requests land on the same node;
+/// * **sticky routing** — the server issues an `x-codex-turn-state` token on turn start which the
+///   client replays as a request header for every request in the turn;
+/// * **incremental input** — reuse carries `previous_response_id` and sends only the new items, so
+///   the conversation is never resent.
+///
+/// flux instead opens a **fresh socket per request**, replays no turn-state token, and resends the
+/// whole `input`. Every request therefore reaches an arbitrary node with a full cold prompt, which is
+/// what the measurement shows: on `codex/gpt-5.6-sol`, same prompt, 1 step per run, both arm orders,
+/// **WS ~3%** cache hit (0/0/0/0/20/0) against **HTTP ~50%** (0/50/53/42/55/97, reaching 97%) — HTTP
+/// ran first (cold) in the second batch and still won. Equivalent cost tracked it (~$0.14 on a 0% WS
+/// run vs ~$0.02 on a 97% HTTP run) with no latency advantage for WS. Table in
+/// `docs/designs/llm-cache-review.md`.
+///
+/// So HTTP is the better default **given flux's current stateless transport**, and C-159 is the real
+/// fix: a session-scoped WS with connection reuse, turn-state stickiness, and `previous_response_id`
+/// incremental input. The transport is kept behind the env var rather than removed — C-07's WS/SSE
+/// equivalence test still covers it, and C-159 builds on it.
 fn oauth_at(tokens: Arc<dyn TokenSource>, endpoint: &str, ws_url: &str) -> NativeProvider {
-    oauth_at_timeout(tokens, endpoint, ws_url, DEFAULT_FIRST_FRAME_TIMEOUT)
+    if ws_enabled() {
+        return oauth_at_timeout(tokens, endpoint, ws_url, DEFAULT_FIRST_FRAME_TIMEOUT);
+    }
+    http_native(tokens, endpoint)
+}
+
+/// Whether `FLUX_CODEX_WS=on` has opted this process into the WS transport (C-159). Off by default.
+fn ws_enabled() -> bool {
+    ws_enabled_value(std::env::var("FLUX_CODEX_WS").ok().as_deref())
+}
+
+/// The truthiness rule behind [`ws_enabled`], split out so it can be tested without mutating process
+/// env under a parallel test run.
+fn ws_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes"
+        )
+    })
 }
 
 /// [`oauth_at`] with an explicit first-frame connect timeout (C-28), so tests can keep it short
@@ -125,8 +169,9 @@ fn http_native(tokens: Arc<dyn TokenSource>, endpoint: &str) -> NativeProvider {
 // WebSocket transport (C-07)
 // ---------------------------------------------------------------------------
 
-/// The codex WebSocket transport — the **primary** path for the `codex` provider, mirroring the
-/// upstream codex Rust client. It opens `wss://…/codex/responses` with the auth/gating headers on
+/// The codex WebSocket transport — opt-in behind `FLUX_CODEX_WS=on` since C-159 (it was the primary
+/// path when C-07 introduced it; see [`oauth_at`] for why the default moved to HTTP+SSE), mirroring
+/// the upstream codex Rust client. It opens `wss://…/codex/responses` with the auth/gating headers on
 /// the tungstenite handshake (the reqwest-bound [`OpenAiCred`] cannot serve a WS — same precedent
 /// as the realtime provider), sends the Responses body inline in a `response.create` event frame
 /// (the live contract), and yields the response-event frames re-enveloped as SSE bytes so the
@@ -374,6 +419,33 @@ mod tests {
         assert_eq!(resolve_model("gpt-5"), "gpt-5");
         // A future id is honoured without a flux release.
         assert_eq!(resolve_model("gpt-6"), "gpt-6");
+    }
+
+    /// C-159: the codex provider is HTTP+SSE by default, and `FLUX_CODEX_WS=on` opts into the WS
+    /// transport. `ws_enabled_value` is the whole gate `oauth_at` branches on, so pinning its
+    /// truthiness pins the default — without mutating process env in a parallel test run.
+    #[test]
+    fn ws_transport_is_opt_in_by_default() {
+        // Unset ⇒ HTTP. Only an explicitly truthy value turns the WS transport on.
+        assert!(!ws_enabled_value(None), "unset must mean HTTP");
+        for (value, want) in [
+            ("on", true),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("ON", true),
+            (" on ", true),
+            ("off", false),
+            ("0", false),
+            ("", false),
+            ("maybe", false),
+        ] {
+            assert_eq!(
+                ws_enabled_value(Some(value)),
+                want,
+                "FLUX_CODEX_WS={value:?}"
+            );
+        }
     }
 
     #[test]
@@ -661,6 +733,13 @@ mod tests {
         (format!("http://{addr}/"), handle, hits)
     }
 
+    /// The codex provider with the WS transport attached unconditionally — what `oauth_at` builds
+    /// under `FLUX_CODEX_WS=on`. The WS tests below go through this rather than `oauth_at` so they
+    /// exercise the transport regardless of the ambient env (C-159 made WS opt-in).
+    fn ws_at(tokens: Arc<dyn TokenSource>, endpoint: &str, ws_url: &str) -> NativeProvider {
+        oauth_at_timeout(tokens, endpoint, ws_url, DEFAULT_FIRST_FRAME_TIMEOUT)
+    }
+
     async fn collect_chunks(provider: &NativeProvider) -> Vec<Chunk> {
         let mut stream = provider
             .stream(Request::new("gpt-5.5", "hi"))
@@ -673,13 +752,16 @@ mod tests {
         out
     }
 
+    /// With the WS transport attached (`FLUX_CODEX_WS=on`), WS is dialed and HTTP stays cold. The
+    /// *default* is HTTP since C-159 — that branch is pinned by `ws_transport_is_opt_in_by_default`,
+    /// which does not depend on ambient env.
     #[tokio::test]
-    async fn codex_uses_ws_transport_by_default() {
+    async fn ws_transport_dials_ws_and_leaves_http_cold() {
         let (ws_url, ws_handle, ws_hits, _, _) = ws_stub_server(live_ws_frames()).await;
-        // An HTTP stub that must stay cold: WS is the primary transport.
+        // An HTTP stub that must stay cold: WS takes precedence when it is attached.
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
 
-        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), &http_url, &ws_url);
         let chunks = collect_chunks(&provider).await;
 
         assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be dialed first");
@@ -708,7 +790,7 @@ mod tests {
         // the preamble, so equality also proves the preamble is transparent.
         let (ws_url, ws_handle, _, _, _) = ws_stub_server(live_ws_frames()).await;
         // A dead HTTP endpoint proves the WS side never falls back mid-test.
-        let ws_provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let ws_provider = ws_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
         let ws_chunks = collect_chunks(&ws_provider).await;
 
         // SSE side: the *same* events over plain HTTP+SSE through the same codec.
@@ -733,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn ws_handshake_carries_auth_headers() {
         let (ws_url, ws_handle, _, headers, _) = ws_stub_server(live_ws_frames()).await;
-        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
         let _ = collect_chunks(&provider).await;
 
         let h = headers.lock().unwrap();
@@ -766,7 +848,7 @@ mod tests {
         let (ws_url, ws_handle, ws_hits) = ws_policy_close_server().await;
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
 
-        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), &http_url, &ws_url);
         let chunks = collect_chunks(&provider).await;
 
         assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be attempted");
@@ -796,7 +878,7 @@ mod tests {
         // rejected with "Expected a 'response.create' message as the first websocket event";
         // nesting the body under `response` loses the model).
         let (ws_url, ws_handle, _, _, request) = ws_stub_server(live_ws_frames()).await;
-        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
         let _ = collect_chunks(&provider).await;
 
         let sent = request
@@ -828,7 +910,7 @@ mod tests {
         // socket instead of performing a close handshake. That must end the turn cleanly — a
         // reset BEFORE the terminal event still surfaces as a stream error (real truncation).
         let (ws_url, ws_handle, _) = ws_reset_after_frames_server(live_ws_frames()).await;
-        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
         let chunks = collect_chunks(&provider).await;
 
         assert!(
@@ -855,7 +937,7 @@ mod tests {
             ws_stub_server(vec![error_event.to_string()]).await;
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
 
-        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), &http_url, &ws_url);
         let chunks = collect_chunks(&provider).await;
 
         assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be attempted");
@@ -888,7 +970,7 @@ mod tests {
         });
 
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
-        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), &http_url, &ws_url);
         let chunks = collect_chunks(&provider).await;
 
         assert_eq!(
@@ -934,7 +1016,7 @@ mod tests {
         let (ws_url, ws_handle, ws_hits, _, _) = ws_stub_server(vec![payload]).await;
         let (http_url, http_handle, http_hits) = sse_server(fixture_sse()).await;
 
-        let provider = oauth_at(Arc::new(StubTokens), &http_url, &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), &http_url, &ws_url);
         let chunks = collect_chunks(&provider).await;
 
         assert_eq!(ws_hits.load(Ordering::SeqCst), 1, "WS must be attempted");
@@ -993,7 +1075,7 @@ mod tests {
         // ships whatever partial text arrived.
         let non_terminal = fixture_events()[0].clone(); // "response.output_text.delta"
         let (ws_url, ws_handle, _) = ws_close_before_terminal_server(vec![non_terminal]).await;
-        let provider = oauth_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
+        let provider = ws_at(Arc::new(StubTokens), "http://127.0.0.1:1/", &ws_url);
 
         let mut stream = provider
             .stream(Request::new("gpt-5.5", "hi"))

@@ -275,6 +275,135 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
     }
 
+    // C-140: `/usage` overlay — the turn in progress, per round, from the same per-call data
+    // `flux usage` reads offline. The session header shows cumulative totals; the per-round bars are
+    // where a mid-turn cache collapse (tool-set churn, TTL expiry) becomes visible AS it happens.
+    if state.usage_open {
+        let t = &state.theme;
+        let width = frame.area().width.min(56);
+        // Body width available for a bar: the frame minus the label gutter and the trailing pct.
+        let bar_w = (width as usize).saturating_sub(22).clamp(6, 24);
+        let bar = |ratio: f64| -> String {
+            let filled = ((ratio.clamp(0.0, 1.0)) * bar_w as f64).round() as usize;
+            format!("{}{}", "█".repeat(filled), "░".repeat(bar_w - filled))
+        };
+
+        let mut rows = vec![Line::styled(
+            format!(" usage · {} ", state.session_id),
+            t.accent_style().bg(t.panel_bg),
+        )];
+
+        if state.turn_cache.is_empty() && state.cache.is_empty() {
+            // Empty state: an offline `-m mock` run, or before the first model call of the session.
+            rows.push(Line::styled(
+                " no model calls recorded yet",
+                t.muted_style().bg(t.panel_bg),
+            ));
+        } else {
+            let head = match state.turn_rounds.last() {
+                Some(last) => format!(" {} · round {}", last.model, state.turn_rounds.len()),
+                None => format!(" {}", state.model),
+            };
+            rows.push(Line::styled(head, t.muted_style().bg(t.panel_bg)));
+
+            let turn = &state.turn_cache;
+            rows.push(Line::styled(" this turn", t.muted_style().bg(t.panel_bg)));
+            rows.push(Line::from(vec![
+                Span::styled("   hit  ", t.muted_style().bg(t.panel_bg)),
+                Span::styled(bar(turn.hit_rate()), t.accent_style().bg(t.panel_bg)),
+                Span::styled(
+                    format!("  {:>3.0}%", turn.hit_rate() * 100.0),
+                    t.panel_style(),
+                ),
+            ]));
+            rows.push(Line::styled(
+                format!(
+                    "   read {} · write {} · fresh {}",
+                    fmt_count(turn.read),
+                    fmt_count(turn.write),
+                    fmt_count(turn.fresh)
+                ),
+                t.panel_style(),
+            ));
+
+            if !state.turn_rounds.is_empty() {
+                rows.push(Line::styled(" per round", t.muted_style().bg(t.panel_bg)));
+                // Newest rounds matter most; when the list outgrows the frame keep the tail and
+                // mark how many were elided rather than silently dropping the early ones.
+                let budget = (frame.area().height as usize)
+                    .saturating_sub(rows.len() + 4)
+                    .max(1);
+                let skipped = state.turn_rounds.len().saturating_sub(budget);
+                if skipped > 0 {
+                    rows.push(Line::styled(
+                        format!("   … {skipped} earlier"),
+                        t.muted_style().bg(t.panel_bg),
+                    ));
+                }
+                for (index, round) in state.turn_rounds.iter().enumerate().skip(skipped) {
+                    // The churn marker is DERIVED, not guessed: the engine reports how many
+                    // operations were advertised on each call, and a change between rounds is
+                    // exactly the tool-set churn that cold-writes the cached prefix (tools render
+                    // before system on the Anthropic wire). No change ⇒ no marker.
+                    let churned = index
+                        .checked_sub(1)
+                        .and_then(|prev| state.turn_rounds.get(prev))
+                        .is_some_and(|prev| prev.operations != round.operations);
+                    let mut spans = vec![
+                        Span::styled(
+                            format!("  {:>2} ", index + 1),
+                            t.muted_style().bg(t.panel_bg),
+                        ),
+                        Span::styled(bar(round.hit_rate()), t.accent_style().bg(t.panel_bg)),
+                        Span::styled(
+                            format!("  {:>3.0}%", round.hit_rate() * 100.0),
+                            t.panel_style(),
+                        ),
+                    ];
+                    if churned {
+                        spans.push(Span::styled(
+                            format!(" ← tools {}", round.operations),
+                            t.warn_style().bg(t.panel_bg),
+                        ));
+                    } else if !round.stage.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" {}", round.stage),
+                            t.muted_style().bg(t.panel_bg),
+                        ));
+                    }
+                    rows.push(Line::from(spans));
+                }
+            }
+
+            let session = &state.cache;
+            let cost = match (state.cost_usd, state.cost_unpriced) {
+                (Some(usd), true) => format!(" · ${usd:.4}+?"),
+                (Some(usd), false) => format!(" · ${usd:.4}"),
+                (None, true) => " · $?".to_string(),
+                (None, false) => String::new(),
+            };
+            rows.push(Line::styled(
+                format!(
+                    " session Σ {} prompt · {:.0}% hit · ↓{}{}",
+                    fmt_count(session.prompt_tokens()),
+                    session.hit_rate() * 100.0,
+                    fmt_count(state.tokens_out),
+                    cost
+                ),
+                t.muted_style().bg(t.panel_bg),
+            ));
+        }
+        rows.push(Line::styled(
+            " esc to close ",
+            t.muted_style().bg(t.panel_bg),
+        ));
+
+        let height = (rows.len() as u16).min(frame.area().height);
+        let area = centered(frame.area(), width, height);
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(rows).style(t.panel_style()), area);
+    }
+
     // C-110: help overlay — keys from HELP_KEYS, commands iterated from the merged built-in +
     // command-file table (no drift).
     if state.help_open {

@@ -2,8 +2,7 @@
 id: C-133
 title: Cache-efficiency telemetry + a repeatable A/B harness — measure before fixing
 pillar: Core
-status: ready
-priority: 1
+status: done
 epic: llm-cache-review
 design: docs/designs/llm-cache-review.md
 note: "`flux usage` is already CORRECT (per-call CallUsage, measured 32% over 813 calls) — the gap is the live path: TurnEnded.usage is the last round only, the model trace has no per-round cache split, and there is no repeatable scenario to A/B a fix against"
@@ -42,7 +41,17 @@ measurement that proves it.
 - [ ] Standard gate green (build, test, clippy `-D warnings`, fmt, `flux-codegate`).
 
 ## Progress
-- (not started)
+- DONE 2026-07-28. `flux_core::CacheEfficiency` (read/write/fresh, `hit_rate`) added beside
+  `Usage::accumulate` rather than changing it — occupancy and efficiency now have one accumulator
+  each, and `ctx` is untouched.
+- Model trace gained `cache_breakpoints` + `cache_breakpoints_in_messages` (the realized layout, not
+  the intended one).
+- Harness is `bench/cache-ab.sh`, built around the `FLUX_CACHE_TAIL=off` kill switch added in C-134.
+  It alternates arm order, because the first naive A/B (47% → 97%) turned out to be a warm-cache
+  artifact — reversing the order gave 79% on both arms. That trap is documented in the script.
+- **Scope narrowed on evidence.** `flux usage` was already correct (per-call `CallUsage`), so this
+  story became "make the LIVE path agree with it" rather than "build the metric". The whole-history
+  baseline in the design doc came from running it as-is.
 
 ## Notes
 - **`flux usage` is already correct — do not "fix" it.** It builds records from per-call `CallUsage`

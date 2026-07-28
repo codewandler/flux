@@ -118,6 +118,14 @@ pub struct Request {
     pub trace: Option<RequestTrace>,
     /// Catch-all for provider-specific parameters.
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Ask the codec to place a prompt-cache breakpoint on the **last content block of the last
+    /// message** (C-134), so the conversation itself is cached and a multi-round turn stops
+    /// re-paying full input rate for a transcript it already sent.
+    ///
+    /// A flag rather than a field on `ContentBlock`: the breakpoint is an Anthropic wire concern,
+    /// and putting it on the L0 content type would push a vendor detail into every codec.
+    /// Codecs without a breakpoint notion (OpenAI Chat/Responses, ollama) ignore it entirely.
+    pub cache_tail: bool,
 }
 
 impl Request {
@@ -137,6 +145,7 @@ impl Request {
             effort: None,
             trace: None,
             metadata: serde_json::Map::new(),
+            cache_tail: false,
         }
     }
 
@@ -598,6 +607,19 @@ impl Drop for ModelTraceStream {
     }
 }
 
+/// Count `cache_control` keys anywhere in a request body — the realized breakpoint total, which is
+/// what Anthropic's hard maximum of four applies to.
+fn count_cache_control(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(map) => {
+            usize::from(map.contains_key("cache_control"))
+                + map.values().map(count_cache_control).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_cache_control).sum(),
+        _ => 0,
+    }
+}
+
 fn begin_model_trace(
     mode: ModelTraceMode,
     provider: &str,
@@ -628,6 +650,14 @@ fn begin_model_trace(
         "tools": req.tools.len(),
         "tool_names": req.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
         "body_bytes": serde_json::to_vec(body).map(|v| v.len()).unwrap_or_default(),
+        // C-133: how many prompt-cache breakpoints the codec actually realized, and how many landed
+        // in `messages` rather than `system`. Answers "where did the breakpoints go" from the trace
+        // alone, which is what makes a cache regression diagnosable instead of merely visible.
+        "cache_breakpoints": count_cache_control(body),
+        "cache_breakpoints_in_messages": body
+            .get("messages")
+            .map(count_cache_control)
+            .unwrap_or_default(),
         "body_built_us": body_built_us,
     }));
     if mode == ModelTraceMode::Full {

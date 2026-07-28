@@ -34,6 +34,15 @@ pub(super) enum UiEvent {
         is_error: bool,
     },
     Usage(Usage),
+    /// One model call's usage, delivered live from the engine's `model.call` observation (C-139).
+    /// The turn-end [`UiEvent::Usage`] carries `Usage::accumulate`'s occupancy snapshot — the last
+    /// round only — so cache accounting reads this instead.
+    CallUsage {
+        model: String,
+        stage: String,
+        operations: usize,
+        usage: Usage,
+    },
     Notice {
         text: String,
         sev: Sev,
@@ -176,7 +185,35 @@ impl AgentSink for ChannelSink {
     }
 
     fn observation(&mut self, observation: &flux_evidence::Observation) {
-        if observation.kind == "flow.plan" {
+        if observation.kind == "model.call" {
+            // C-139: the engine emits one of these per model call with the full `Usage`. It is the
+            // live twin of the `CallUsage` event `flux usage` reads offline, and the only per-call
+            // usage a surface can see — `turn_end` hands over the accumulated occupancy snapshot.
+            if let Some(usage) = observation
+                .data
+                .get("usage")
+                .and_then(|value| serde_json::from_value::<Usage>(value.clone()).ok())
+            {
+                let field = |key: &str| {
+                    observation
+                        .data
+                        .get(key)
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                self.send(UiEvent::CallUsage {
+                    model: field("model"),
+                    stage: field("stage"),
+                    operations: observation
+                        .data
+                        .get("operations")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or_default() as usize,
+                    usage,
+                });
+            }
+        } else if observation.kind == "flow.plan" {
             self.send(UiEvent::Plan(observation.data.clone()));
         } else if observation.kind == "loop.phase" {
             if let Some(phase) = observation

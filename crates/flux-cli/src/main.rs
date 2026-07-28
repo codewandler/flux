@@ -2930,7 +2930,7 @@ mod tests {
             ..Default::default()
         };
         let s = usage_annotation(&u);
-        assert_eq!(s, " · ctx 10.0k · out 500 · cache 9.0k (90% hit)");
+        assert_eq!(s, " · ctx 10.0k · out 500 · cache 90% ↺9.0k ✎0");
 
         // No cache → no cache segment, but context + output still show.
         let u = Usage {
@@ -2962,9 +2962,9 @@ mod tests {
             ..Default::default()
         };
         let s = usage_annotation(&u);
-        assert!(s.contains("cache 9.0k"), "cache-read still shown: {s}");
+        assert!(s.contains("↺9.0k"), "cache-read still shown: {s}");
         assert!(
-            s.contains("cache write 2.0k"),
+            s.contains("✎2.0k"),
             "cache-WRITE tokens must be surfaced too (previously dropped entirely): {s}"
         );
         assert!(
@@ -2981,7 +2981,10 @@ mod tests {
             ..Default::default()
         };
         let s2 = usage_annotation(&plain);
-        assert!(!s2.contains("cache write"));
+        assert!(
+            s2.contains("✎0"),
+            "the write tier renders as zero, not absent: {s2}"
+        );
         assert!(!s2.contains("reasoning"));
 
         // The dollar-cost suffix (rendered alongside, via `cost_annotation`) completes the picture:
@@ -2992,6 +2995,64 @@ mod tests {
             source: flux_core::CostSource::Estimated,
         });
         assert_eq!(format!("{s}{cost}"), format!("{s} · $0.0456"));
+    }
+
+    /// C-139: the rendered hit rate must be the TURN's, folded per model call — not the last
+    /// round's, which is what `Usage::accumulate` leaves in the turn snapshot and therefore the
+    /// worst ratio of the turn.
+    #[test]
+    fn usage_annotation_hit_rate_is_the_turn_not_the_last_round() {
+        let call = |read: u64, fresh: u64| flux_core::Usage {
+            input_tokens: fresh,
+            output_tokens: 10,
+            cache_read_input_tokens: read,
+            ..Default::default()
+        };
+        let calls = [
+            call(90_000, 10_000),
+            call(60_000, 40_000),
+            call(20_000, 80_000),
+        ];
+
+        let mut turn = flux_core::Usage::default();
+        let mut cache = flux_core::CacheEfficiency::default();
+        for c in &calls {
+            turn.accumulate(c);
+            cache.add(c);
+        }
+
+        // The old shape: hit rate read straight off the turn snapshot ⇒ round three's 20%.
+        let last_round = crate::rendering::usage_annotation(&turn);
+        assert!(last_round.contains("cache 20%"), "{last_round}");
+
+        // The fixed shape: 170k of 300k prompt tokens ⇒ 57%.
+        let turn_level = crate::rendering::usage_annotation_with_cache(&turn, &cache);
+        assert!(turn_level.contains("cache 57%"), "{turn_level}");
+        assert!(turn_level.contains("↺170.0k"), "{turn_level}");
+        // `ctx` keeps its occupancy meaning — the last round's prompt size, not the sum.
+        assert!(turn_level.contains("ctx 100.0k"), "{turn_level}");
+    }
+
+    /// A surface that emits no `model.call` observations (the flow path's `ai_segment`) leaves the
+    /// per-call fold empty. Rendering it anyway drops the cache segment entirely — worse than the
+    /// last-round approximation it replaced — so an empty fold must fall back to the turn snapshot.
+    #[test]
+    fn an_empty_per_call_fold_falls_back_to_the_turn_snapshot() {
+        let turn = flux_core::Usage {
+            input_tokens: 10_000,
+            output_tokens: 100,
+            cache_read_input_tokens: 90_000,
+            ..Default::default()
+        };
+        let empty = flux_core::CacheEfficiency::default();
+        assert!(empty.is_empty());
+        // Rendered against the empty fold, the cache tiers vanish…
+        let dropped = crate::rendering::usage_annotation_with_cache(&turn, &empty);
+        assert!(!dropped.contains("cache"), "{dropped}");
+        // …so the fallback (what `turn_end` now selects) must still surface them.
+        let fallback = crate::rendering::usage_annotation(&turn);
+        assert!(fallback.contains("cache 90%"), "{fallback}");
+        assert!(fallback.contains("↺90.0k"), "{fallback}");
     }
 
     /// `cost_annotation` formats metered spend as `$X`, subscription spend (claude/codex) as the

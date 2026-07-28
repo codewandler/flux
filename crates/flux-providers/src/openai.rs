@@ -14,6 +14,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use flux_core::{Chunk, ContentBlock, Error, Result, Role, StopReason, ToolResultContent, Usage};
 use flux_provider::{
@@ -826,9 +827,129 @@ fn map_effort_responses(e: Effort, codex: bool) -> &'static str {
 
 /// Build the Responses request body. Content blocks map to typed `input` items; tool results
 /// become `function_call_output`, assistant tool_use becomes `function_call`.
+/// The Responses prefix-cache routing key (C-136).
+///
+/// OpenAI combines `prompt_cache_key` with the prefix hash to route successive requests of one
+/// conversation to the same cache shard; without it, hits across a multi-round turn are
+/// load-balancer luck. Derived from the host's `RequestTrace.session_id` so every round of a session
+/// shares it and distinct sessions do not.
+///
+/// **Hashed, not passed through.** `RequestTrace` is documented as host-owned and never serialized
+/// onto the vendor wire; this is the one deliberate exception, and it sends an opaque digest rather
+/// than the id itself so no host-side identifier crosses the boundary even if session ids ever
+/// become user-derived.
+fn prompt_cache_key(req: &Request) -> Option<String> {
+    let trace = req.trace.as_ref()?;
+    if trace.session_id.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"flux-prompt-cache-v1:");
+    hasher.update(trace.session_id.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("flux-{hex}"))
+}
+
+/// Split a segmented system prompt for the Responses wire (C-137).
+///
+/// Returns `(instructions, leading_input)`: the **cached** segments build `instructions`, and the
+/// trailing uncached segment — the per-turn material the Anthropic path deliberately parks after the
+/// last cache breakpoint — becomes a leading `input` item instead.
+///
+/// `Request::system_text()` joins every segment, which on this wire hoists that volatile text to the
+/// very FRONT of the cacheable prefix, where it invalidates everything behind it on each change. The
+/// A-03 cache-first layout was built for Anthropic; flattened here it actively hurts.
+fn split_system_for_responses(req: &Request) -> (Option<String>, Option<String>) {
+    if req.system_segments.is_empty() {
+        return (req.system_text(), None);
+    }
+    let join = |parts: Vec<&str>| -> Option<String> {
+        let joined = parts.join("\n\n");
+        (!joined.trim().is_empty()).then_some(joined)
+    };
+    let stable = join(
+        req.system_segments
+            .iter()
+            .filter(|s| s.cache)
+            .map(|s| s.text.as_str())
+            .collect(),
+    );
+    let volatile = join(
+        req.system_segments
+            .iter()
+            .filter(|s| !s.cache)
+            .map(|s| s.text.as_str())
+            .collect(),
+    );
+    (stable, volatile)
+}
+
+/// Which of the Responses prefix-cache behaviours are active (C-136/C-137).
+///
+/// Threaded as a value rather than read from the environment inside the builder so the body shape is
+/// a pure function of its inputs: the A/B arms and their tests are then deterministic, and env
+/// resolution happens once at the codec boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponsesCache {
+    /// Send `prompt_cache_key` for cache-shard affinity (C-136).
+    pub(crate) routing_key: bool,
+    /// Build `instructions` from the cached system segments only, moving the per-turn segment into
+    /// `input` behind the stable prefix (C-137).
+    pub(crate) split_instructions: bool,
+}
+
+impl ResponsesCache {
+    /// Everything on — the shipped default.
+    pub(crate) const ON: Self = Self {
+        routing_key: true,
+        split_instructions: true,
+    };
+
+    /// Everything off — the pre-C-136/C-137 body, and the control arm for `bench/cache-ab.sh`.
+    pub(crate) const OFF: Self = Self {
+        routing_key: false,
+        split_instructions: false,
+    };
+
+    /// `FLUX_RESPONSES_CACHE=off` reverts both behaviours (mirrors `FLUX_CACHE_TAIL=off` on the
+    /// Anthropic wire): the A/B lever that measures what they are worth, and the escape hatch if a
+    /// backend ever rejects `prompt_cache_key`.
+    fn from_env() -> Self {
+        let disabled = std::env::var("FLUX_RESPONSES_CACHE").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        });
+        if disabled {
+            Self::OFF
+        } else {
+            Self::ON
+        }
+    }
+}
+
 fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
-    let mut instructions = req.system_text();
+    build_responses_body_with(req, codex, ResponsesCache::from_env())
+}
+
+fn build_responses_body_with(req: &Request, codex: bool, cache: ResponsesCache) -> Result<Value> {
+    let (mut instructions, volatile_system) = if cache.split_instructions {
+        split_system_for_responses(req)
+    } else {
+        (req.system_text(), None)
+    };
     let mut input: Vec<Value> = Vec::new();
+    // The uncached per-turn system material leads `input`, so it sits BEHIND the stable
+    // `instructions` prefix instead of in front of it (C-137).
+    if let Some(text) = volatile_system {
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }],
+        }));
+    }
 
     for m in &req.messages {
         match m.role {
@@ -949,6 +1070,11 @@ fn build_responses_body(req: &Request, codex: bool) -> Result<Value> {
         // Codex must be told to emit a reasoning summary to stream thinking text.
         body["reasoning"] = json!({ "effort": map_effort_responses(e, codex), "summary": "auto" });
     }
+    if cache.routing_key {
+        if let Some(key) = prompt_cache_key(req) {
+            body["prompt_cache_key"] = json!(key);
+        }
+    }
     if codex {
         body["store"] = json!(false);
         // With store:false there is no server-side reasoning state, so ask the backend to return
@@ -1049,19 +1175,47 @@ pub(crate) fn map_responses_stream(
                     // prefix, and surfaces the cached count under `input_tokens_details.cached_tokens`
                     // plus reasoning under `output_tokens_details.reasoning_tokens`. Normalize to the
                     // cache-aware Usage shape (fresh input separate from cache reads, reasoning as a
-                    // subset of output) so cost is comparable across providers; there is no cache-write
-                    // tier, so cache_creation stays 0.
+                    // subset of output) so cost is comparable across providers.
+                    //
+                    // `input_tokens_details.cache_write_tokens` IS reported on this wire — observed
+                    // live on both the codex WS and HTTP paths. The pre-existing comment here claimed
+                    // there was no write tier, so the field was dropped and every codex row in
+                    // `flux usage` showed a blank cache-write column; a cached prefix looked like it
+                    // appeared from nowhere. It is part of the prompt, so it comes out of the fresh
+                    // input the same way `cached_tokens` does.
                     let input = u["input_tokens"].as_u64().unwrap_or(0);
                     let cached = u["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    let cache_write = u["input_tokens_details"]["cache_write_tokens"]
                         .as_u64()
                         .unwrap_or(0);
                     let reasoning = u["output_tokens_details"]["reasoning_tokens"]
                         .as_u64()
                         .unwrap_or(0);
+                    // Both tiers are documented as portions OF `input_tokens`. If a backend ever
+                    // reports them *in addition* to it, a bare `saturating_sub` would clamp fresh
+                    // input to 0 while `context_tokens()` over-counted the prompt — a silent cost
+                    // inflation. Keep that visible instead: trust the total, drop the breakdown.
+                    let (fresh, cached, cache_write) = match input.checked_sub(cached + cache_write) {
+                        Some(fresh) => (fresh, cached, cache_write),
+                        None => {
+                            tracing::warn!(
+                                input,
+                                cached,
+                                cache_write,
+                                "Responses usage: cached + cache_write exceeds input_tokens; \
+                                 the tiers are not subsets of the prompt total — reporting the \
+                                 prompt as fresh input rather than a distorted breakdown"
+                            );
+                            (input, 0, 0)
+                        }
+                    };
                     yield Chunk::Usage(Usage {
-                        input_tokens: input.saturating_sub(cached),
+                        input_tokens: fresh,
                         output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                         cache_read_input_tokens: cached,
+                        cache_creation_input_tokens: cache_write,
                         reasoning_tokens: reasoning,
                         ..Default::default()
                     });
@@ -1915,6 +2069,70 @@ mod tests {
         assert!(saw_err, "a declared response.failed event must stay fatal");
     }
 
+    /// The Responses wire reports a cache-WRITE tier (`input_tokens_details.cache_write_tokens`) —
+    /// observed live on both the codex WS and HTTP paths. It used to be dropped on the claim that
+    /// there was no write tier, so every codex row in `flux usage` showed a blank cache-write column
+    /// and a cached prefix appeared to come from nowhere.
+    #[tokio::test]
+    async fn responses_usage_captures_the_cache_write_tier() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\
+             \"input_tokens\":11259,\"output_tokens\":47,\
+             \"input_tokens_details\":{\"cached_tokens\":6000,\"cache_write_tokens\":2000},\
+             \"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n";
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+        let mut usage = None;
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(c) = stream.next().await {
+            if let Chunk::Usage(u) = c.unwrap() {
+                usage = Some(u);
+            }
+        }
+        let u = usage.expect("a usage chunk");
+        assert_eq!(u.cache_read_input_tokens, 6_000);
+        assert_eq!(u.cache_creation_input_tokens, 2_000);
+        // Both tiers come OUT of the fresh-input figure, so the three still reconstruct the prompt.
+        assert_eq!(u.input_tokens, 11_259 - 6_000 - 2_000);
+        assert_eq!(u.context_tokens(), 11_259);
+    }
+
+    /// The tiers are documented subsets of `input_tokens`. A backend reporting them *on top* of the
+    /// total would otherwise clamp fresh input to 0 and inflate `context_tokens()` — so the codec
+    /// keeps the trustworthy figure (the prompt total) and drops the impossible breakdown.
+    #[tokio::test]
+    async fn responses_usage_rejects_a_breakdown_larger_than_the_prompt() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\
+             \"input_tokens\":1000,\"output_tokens\":5,\
+             \"input_tokens_details\":{\"cached_tokens\":900,\"cache_write_tokens\":400}}}}\n\n";
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+        let mut usage = None;
+        let stream = map_responses_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(c) = stream.next().await {
+            if let Chunk::Usage(u) = c.unwrap() {
+                usage = Some(u);
+            }
+        }
+        let u = usage.expect("a usage chunk");
+        assert_eq!(
+            u.input_tokens, 1_000,
+            "the prompt total is the trustworthy figure"
+        );
+        assert_eq!(u.cache_read_input_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(
+            u.context_tokens(),
+            1_000,
+            "context must not exceed the reported prompt"
+        );
+    }
+
     #[tokio::test]
     async fn responses_usage_captures_cache_and_reasoning() {
         // input_tokens is the whole prompt (incl. cached); cached + reasoning come from the *_details.
@@ -2008,6 +2226,172 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("OPENAI_KEY");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_tail_tests {
+    use super::*;
+    use flux_provider::Request;
+
+    /// C-136: successive rounds of one session must share a `prompt_cache_key`; distinct sessions
+    /// must not; a request with no host trace must omit the field entirely.
+    #[test]
+    fn prompt_cache_key_is_stable_per_session_and_absent_without_a_trace() {
+        use flux_provider::RequestTrace;
+        let with_session = |session: &str, round: usize| {
+            let mut req = Request::new("gpt-5.6-sol", "hi");
+            req.trace = Some(RequestTrace {
+                session_id: session.to_string(),
+                turn_id: 1,
+                stage: "explore".into(),
+                round,
+            });
+            build_responses_body(&req, true).unwrap()["prompt_cache_key"].clone()
+        };
+        let round1 = with_session("s_1499", 1);
+        let round2 = with_session("s_1499", 2);
+        assert_eq!(round1, round2, "one session, one key");
+        assert_ne!(
+            round1,
+            with_session("s_1500", 1),
+            "distinct sessions differ"
+        );
+
+        // Opaque: the host-side session id never reaches the wire (RequestTrace is host-owned).
+        let rendered = round1.as_str().unwrap();
+        assert!(rendered.starts_with("flux-"), "{rendered}");
+        assert!(
+            !rendered.contains("s_1499"),
+            "the raw id must not leak: {rendered}"
+        );
+
+        // No trace ⇒ no field, rather than a constant key shared by every caller.
+        let untraced = build_responses_body(&Request::new("gpt-5.6-sol", "hi"), true).unwrap();
+        assert!(untraced.get("prompt_cache_key").is_none(), "{untraced}");
+    }
+
+    /// C-137's named failing-first test: two requests differing ONLY in the trailing uncached system
+    /// segment must produce byte-identical `instructions`. `system_text()` joins every segment, so
+    /// that per-turn text used to be hoisted to the front of the cacheable prefix and invalidate it.
+    #[test]
+    fn volatile_system_segment_stays_out_of_the_cached_instructions_prefix() {
+        use flux_provider::SystemSegment;
+        let build = |turn_text: &str| {
+            let mut req = Request::new("gpt-5.6-sol", "hi");
+            req.system_segments = vec![
+                SystemSegment {
+                    text: "You are Flux's staged planning agent.".into(),
+                    cache: true,
+                },
+                SystemSegment {
+                    text: "base system prompt".into(),
+                    cache: true,
+                },
+                SystemSegment {
+                    text: turn_text.to_string(),
+                    cache: false,
+                },
+            ];
+            req.messages = vec![flux_core::Message::user_text("go")];
+            build_responses_body(&req, true).unwrap()
+        };
+        let a = build("Accepted intent: read a file\nSelected capability families: fs");
+        let b = build("Accepted intent: read a file\nSelected capability families: fs, net");
+
+        assert_eq!(
+            a["instructions"], b["instructions"],
+            "a capability signal must not rewrite the cached prefix"
+        );
+        assert_eq!(
+            a["instructions"],
+            json!("You are Flux's staged planning agent.\n\nbase system prompt"),
+            "instructions is exactly the cached segments, in order"
+        );
+        // The volatile text is still delivered — as the first `input` item, behind the prefix.
+        let first = &b["input"][0];
+        assert_eq!(first["type"], "message");
+        assert!(
+            first["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fs, net"),
+            "{b}"
+        );
+        // …and it precedes the conversation itself, so the model reads it as turn context.
+        assert_eq!(b["input"][1]["content"][0]["text"], "go");
+    }
+
+    /// The unsegmented path is untouched: a plain `system` still becomes `instructions` verbatim.
+    #[test]
+    fn unsegmented_system_still_becomes_instructions() {
+        let mut req = Request::new("gpt-5.6-sol", "hi");
+        req.system = Some("plain system prompt".into());
+        req.messages = vec![flux_core::Message::user_text("go")];
+        let body = build_responses_body(&req, true).unwrap();
+        assert_eq!(body["instructions"], json!("plain system prompt"));
+        assert_eq!(body["input"][0]["content"][0]["text"], "go");
+    }
+
+    /// C-136/C-137: `FLUX_RESPONSES_CACHE=off` must reproduce the pre-epic body exactly — that is
+    /// what makes it a valid A/B control arm, not just a feature toggle.
+    #[test]
+    fn responses_cache_off_reproduces_the_pre_epic_body() {
+        use flux_provider::{RequestTrace, SystemSegment};
+        let mut req = Request::new("gpt-5.6-sol", "hi");
+        req.trace = Some(RequestTrace {
+            session_id: "s_1499".into(),
+            turn_id: 1,
+            stage: "explore".into(),
+            round: 1,
+        });
+        req.system_segments = vec![
+            SystemSegment {
+                text: "stable planner prompt".into(),
+                cache: true,
+            },
+            SystemSegment {
+                text: "Accepted intent: read a file".into(),
+                cache: false,
+            },
+        ];
+        req.messages = vec![flux_core::Message::user_text("go")];
+
+        let off = build_responses_body_with(&req, true, ResponsesCache::OFF).unwrap();
+        // No routing key…
+        assert!(off.get("prompt_cache_key").is_none(), "{off}");
+        // …and `instructions` is the old flattened join of EVERY segment, per-turn text included.
+        assert_eq!(
+            off["instructions"],
+            json!("stable planner prompt\n\nAccepted intent: read a file")
+        );
+        // …so `input` is just the conversation, with no leading system item.
+        assert_eq!(off["input"][0]["content"][0]["text"], "go");
+
+        let on = build_responses_body_with(&req, true, ResponsesCache::ON).unwrap();
+        assert!(on.get("prompt_cache_key").is_some(), "{on}");
+        assert_eq!(on["instructions"], json!("stable planner prompt"));
+        assert_ne!(off, on, "the arms must actually differ");
+    }
+
+    /// C-134: `cache_tail` is an Anthropic-wire concern. The Responses path shares `Request`, so it
+    /// must ignore the flag entirely — same bytes with and without it.
+    #[test]
+    fn responses_body_ignores_the_anthropic_cache_tail_flag() {
+        let mut off = Request::new("gpt-5.6-sol", "hi");
+        off.messages = vec![flux_core::Message::user_text("hello")];
+        let mut on = off.clone();
+        on.cache_tail = true;
+
+        for codex in [false, true] {
+            let a = build_responses_body(&off, codex).unwrap();
+            let b = build_responses_body(&on, codex).unwrap();
+            assert_eq!(
+                a, b,
+                "cache_tail must not reach the Responses wire (codex={codex})"
+            );
+            assert!(!a.to_string().contains("cache_control"), "{a}");
         }
     }
 }

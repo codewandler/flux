@@ -24,11 +24,21 @@ pub struct ChatState {
     pub(super) expand_tools: bool,
     pub(super) verbose: bool,
     pub(super) slash_sel: usize,
-    pub(super) tokens_in: u64,
     pub(super) tokens_out: u64,
-    pub(super) tokens_cache_read: u64,
-    pub(super) tokens_cache_write: u64,
     pub(super) tokens_reasoning: u64,
+    /// Session-cumulative prompt-cache accounting, folded **per model call** (C-139).
+    ///
+    /// Was three counters summed from `TurnEnded.usage`, which `Usage::accumulate` leaves holding
+    /// the turn's *last round* — so a twelve-round turn contributed round twelve only and the header
+    /// systematically under-counted. `cache.fresh` is the old `tokens_in`; read and write are now
+    /// separate figures rather than one combined `cache N`, so a session reading from cache no
+    /// longer renders identically to one re-writing it.
+    pub(super) cache: flux_core::CacheEfficiency,
+    /// The same accounting scoped to the turn in progress — the `/usage` overlay's headline (C-140).
+    pub(super) turn_cache: flux_core::CacheEfficiency,
+    /// One entry per model call of the turn in progress, oldest first, for the overlay's per-round
+    /// bars. Cleared when a new turn starts; bounded by [`MAX_TURN_ROUNDS`](crate::MAX_TURN_ROUNDS).
+    pub(super) turn_rounds: Vec<RoundUsage>,
     pub(super) cost_usd: Option<f64>,
     pub(super) cost_model: Option<(String, flux_core::PricingTable)>,
     pub(super) cost_unpriced: bool,
@@ -60,6 +70,8 @@ pub struct ChatState {
     pub(super) search: Option<TranscriptSearch>,
     /// Whether the help overlay is open (F1 / `/help`, C-110).
     pub(super) help_open: bool,
+    /// The `/usage` overlay (C-140): this turn's cache accounting, per-round bars, session totals.
+    pub(super) usage_open: bool,
     /// Focused transcript entry (Shift-↑/↓ moves it, Esc clears; C-111). Enter toggles the
     /// focused tool card's per-card expansion, `y` yanks the entry via OSC 52.
     pub(super) focused: Option<usize>,
@@ -83,6 +95,32 @@ pub struct ChatState {
     pub(super) unread: usize,
     pub(super) next_action_id: u64,
     pub(super) active_action_id: Option<u64>,
+}
+
+/// One model call of the turn in progress, as the `/usage` overlay renders it (C-140). Sourced from
+/// the engine's per-call `model.call` observation, so it is the same data `flux usage` reads offline
+/// from the `CallUsage` event log — not a slice of the turn total.
+#[derive(Debug, Clone)]
+pub(super) struct RoundUsage {
+    /// The model that served this call — a mid-turn `/model` switch makes these differ within a turn.
+    pub(super) model: String,
+    /// The engine stage that issued it (`intent`, `explore`, `stage.<name>`, …).
+    pub(super) stage: String,
+    /// How many operations were advertised to the model on this call. A change between rounds is
+    /// the tool-set churn that cold-writes the cached prefix (tools render before system on the
+    /// Anthropic wire), so the overlay marks it — derived from the engine's own metric, not guessed.
+    pub(super) operations: usize,
+    pub(super) usage: Usage,
+}
+
+impl RoundUsage {
+    /// This call's cache share of its own prompt, in `0.0..=1.0`.
+    pub(super) fn hit_rate(&self) -> f64 {
+        match self.usage.context_tokens() {
+            0 => 0.0,
+            total => self.usage.cache_read_input_tokens as f64 / total as f64,
+        }
+    }
 }
 
 /// What the agent is doing — drives the status line.

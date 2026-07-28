@@ -43,6 +43,9 @@ impl ProviderProfile for AnthropicProfile {
         let caps = anthropic_model_caps(model);
         MessagesQuirks {
             prompt_caching: true,
+            // C-135: verified on this wire (Anthropic-direct and the `claude` subscription path,
+            // which share this profile). Gateways get the five-minute default — see the quirk.
+            extended_cache_ttl: true,
             thinking_adaptive: caps.adaptive_thinking,
             effort_output_config: caps.effort,
             sampling_params: caps.sampling_params,
