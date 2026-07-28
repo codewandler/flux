@@ -27,7 +27,10 @@ tools, and orchestration are shared machinery beneath them:
    do not generate the program.
 3. **The Improvement Loop** — the eval + self-improvement harness (`flux-eval`), kept inside the repo
    because it is used directly to make flux better at real coding work; the closer to the code, the
-   better.
+   better. *Status:* the loop's machinery is proven end-to-end, but the autonomous initiative is
+   **on hold** (de-prioritized 2026-07-06) until a statistically clean headline gain is confirmed —
+   this pillar is currently aspirational, and this document says so honestly. See
+   [self-improvement/STATUS.md](self-improvement/STATUS.md).
 
 ## North star: the LLM is not the runtime
 
@@ -39,6 +42,11 @@ batches, and execution remains under policy. Everything else flux is proud of fa
 boundary:
 
 - **Determinism & repeatability** — authored flows own order, bounds, branches, suspension, and resume.
+  Because a run is a deterministic artifact, flux delivers what no LLM-as-runtime framework can:
+  **hermetic replay, fork-at-any-decision, and run-diff** (`flux replay` / `fork` / `diff`), and —
+  for SDK embedders — **Test · Tune · Resurrect**: record a run once and re-run the real agent
+  offline in `cargo test` for $0, re-run a recorded session under exactly one changed variable, and
+  finish a turn killed mid-execution with zero model re-spend.
 - **Token savings & speed** — a native stage keeps one valid provider ledger and repairs locally.
 - **Auditability** — intent, evidence, proposed batches, receipts, and execution reports are explicit.
 - **Safety by construction** — every plan node lowers onto one envelope. All IO goes through
@@ -46,6 +54,8 @@ boundary:
   subjects × resources × actions, gated by trust + scopes, with a usable local default so the agent
   still works out of the box); destructive and policy-flagged effects forced to human approval even
   under permissive rules; secrets redacted from model-visible output and never off the machine.
+  Defense-in-depth reaches below the envelope too: an opt-in OS sandbox (bubblewrap on Linux,
+  Seatbelt on macOS) confines spawned processes at the single spawn choke point.
 
 Safety is no longer billed as *the* headline — it is one of the guarantees the architecture buys. It
 stays non-negotiable: the envelope is the one choke point that no tool, plugin, sub-agent, or surface
@@ -61,8 +71,10 @@ The Agent pillar ships in this order, and ambiguity is resolved in favor of the 
    experience, the local experience wins.
 2. **Reusable agent SDK** — a library others embed to build their own safe agents. The CLI is the
    reference application built on the same SDK; the SDK is not an afterthought.
-3. **Multi-user platform** — a deployable server with per-user identity and policy. The seams exist
-   (HTTP API, OIDC identity); they are hardened as the first two tiers solidify.
+3. **Multi-user platform** — a deployable server with per-user identity and policy. The substrate is
+   real (an authenticated HTTP API, per-request principal auth with per-principal isolation, an
+   opt-in Postgres backend for >1-replica deployments, A2A conformance); it continues to harden as
+   the first two tiers solidify.
 
 **Downstream consumers validate tiers 2–3 in practice.** Managed-agent services and Slack-channel assistants
 build on `flux-sdk` by path-dependency, and drive two platform-tier surfaces flux now carries:
@@ -104,12 +116,15 @@ is unchanged; these are platform-tier capabilities, hardened as the earlier tier
   breadth; no accumulation of an unmaintained issue backlog. Depth and correctness first.
 - **Telemetry / hosted SaaS dependence.** flux is something you run, not something that runs you.
 
-(GUI/IDE surfaces and a managed cloud offering are simply *out of current scope*, not forbidden —
-the roadmap is CLI/TUI/SDK/HTTP. Revisit only with a concrete need.)
+(An agent GUI/IDE *product* and a managed cloud offering are simply *out of current scope*, not
+forbidden — the roadmap is CLI/TUI/SDK/HTTP. Flux-Lang *editor tooling* is in scope and shipped:
+the `flux-lsp` language server plus the tree-sitter/TextMate/IntelliJ grammars. Revisit the rest
+only with a concrete need.)
 
 ## Openness
 
-Public open-source, dual-licensed **MIT OR Apache-2.0**, contributions welcome. Because the quality
+Public open-source, dual-licensed **MIT OR Apache-2.0**, published to crates.io as
+`codewandler-flux-*`, contributions welcome. Because the quality
 bar is a principle (not a nicety), contributions are held to it: the green gate and the no-bypass
 safety tests are the price of entry. See [AGENTS.md](../AGENTS.md) for the contributor contract.
 

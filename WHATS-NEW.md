@@ -42,6 +42,9 @@
 
 ### Improved
 
+- **The project vision now matches what flux actually ships.** The vision document now calls out
+  replay, fork, run diff, offline agent tests, editor tooling, multi-user deployment foundations,
+  and the current on-hold status of the self-improvement work more clearly.
 - **The terminal UI got a major polish pass.** Pick a theme with `/theme` (`dark`, `light`,
   `mono`) and it sticks across sessions; press Ctrl-T to release the mouse so your terminal's
   native text selection and copy work; Ctrl-R searches your prompt history as you type; Ctrl-F
