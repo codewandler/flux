@@ -1462,6 +1462,11 @@ impl ChatState {
         //
         // C-102: tokens / cache / cost are separate droppable segments — on a narrow terminal the
         // bar sheds cost first, then cache, keeping the token total visible the longest.
+        // C-116: safety-relevant `auto-ok` is the most precious right segment — first in the
+        // vec, so bar_line sheds everything else before it.
+        if self.auto_approve {
+            right.push(vec![Span::styled("auto-ok", t.warn_style())]);
+        }
         let cache = self.tokens_cache_read + self.tokens_cache_write;
         if self.tokens_in + self.tokens_out + cache > 0 {
             right.push(vec![Span::styled(
@@ -1474,7 +1479,7 @@ impl ChatState {
             )]);
             if cache > 0 {
                 right.push(vec![Span::styled(
-                    format!(" · cache {}", fmt_count(cache)),
+                    format!("cache {}", fmt_count(cache)),
                     t.muted_style(),
                 )]);
             }
@@ -1483,16 +1488,33 @@ impl ChatState {
             // than rendering a total that silently omits real spend — mirrors flux-cli's
             // ` · $? (unpriced)` marker.
             let cost = match (self.cost_usd, self.cost_unpriced) {
-                (Some(usd), true) => Some(format!(" · ${usd:.4}+? (unpriced)")),
-                (Some(usd), false) => Some(format!(" · ${usd:.4}")),
-                (None, true) => Some(" · $? (unpriced)".to_string()),
+                (Some(usd), true) => Some(format!("${usd:.4}+? (unpriced)")),
+                (Some(usd), false) => Some(format!("${usd:.4}")),
+                (None, true) => Some("$? (unpriced)".to_string()),
                 (None, false) => None,
             };
             if let Some(cost) = cost {
                 right.push(vec![Span::styled(cost, t.muted_style())]);
             }
         }
-        // Segment order [tokens, cache, cost]; bar_line drops from the end: cost → cache → tokens.
+        // C-116: mode badges, shown only when active/non-default. Least precious — dropped first.
+        if flux_runtime::shell_opt_in() {
+            right.push(vec![Span::styled("shell", t.warn_style())]);
+        }
+        if self.gather_mode {
+            right.push(vec![Span::styled("gather", t.accent_style())]);
+        }
+        if let Some(effort) = &self.effort {
+            right.push(vec![Span::styled(
+                format!("effort:{effort}"),
+                t.muted_style(),
+            )]);
+        }
+        // Segment order [auto-ok, tokens, cache, cost, shell, gather, effort]; bar_line drops
+        // from the end, so the badges shed first and auto-ok survives the longest (C-102/C-116).
+        for seg in right.iter_mut().skip(1) {
+            seg.insert(0, Span::styled(" · ", t.muted_style()));
+        }
         bar_line(left, right, width)
     }
 
@@ -3015,6 +3037,8 @@ async fn handle_command(
             match effort {
                 Some(effort) => {
                     agent.write().await.set_effort(effort);
+                    // C-116: mirror into ChatState so the sync render path can badge it.
+                    state.effort = effort.map(|e| e.as_str().to_string());
                     let shown = effort.map(|e| e.as_str()).unwrap_or("(provider default)");
                     state.push(Entry::Notice {
                         text: format!("effort: {shown} — takes effect from the next turn"),
