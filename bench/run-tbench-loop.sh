@@ -30,7 +30,7 @@ mkdir -p "$wt/.flux/agents"
 
 # Optional operator override for the IN-CONTAINER eval model (I-05): the flow pins an
 # anthropic-direct spec; when the Anthropic key isn't funded, route the graded evals through
-# another provider (e.g. FLUX_IMPROVE_EVAL_MODEL=openrouter-anthropic/anthropic/claude-sonnet-4.6).
+# another provider (e.g. FLUX_IMPROVE_EVAL_MODEL=openrouter/anthropic/claude-sonnet-4.6).
 # This is run-config committed on the DISPOSABLE loop branch (git_snapshot needs a clean tree) —
 # provider routing, not a graded change; the flow file itself stays PROTECTED from the worker.
 if [ -n "${FLUX_IMPROVE_EVAL_MODEL:-}" ]; then

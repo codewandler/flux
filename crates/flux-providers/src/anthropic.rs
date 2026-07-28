@@ -1,10 +1,17 @@
-//! The `anthropic` and `claude` providers.
+//! The `anthropic` and `claude` providers, and the codec every Messages transport shares.
 //!
-//! Both speak the Anthropic **Messages** protocol; the wire schema, body builder, and SSE mapper
-//! live in [`crate::messages`]. This module keeps only what is Anthropic-direct: the codec's quirks
+//! Both providers speak the Anthropic **Messages** protocol; the wire schema, body builder, and SSE
+//! mapper live in [`crate::messages`]. This module keeps what is Anthropic-direct — the quirks
 //! ([`AnthropicProfile`] — full feature set: prompt caching, adaptive thinking, effort config) and
-//! the two credentials that ride on it — `ApiKeyAnthropic` (the `anthropic` provider, `x-api-key`)
+//! the two credentials that ride on it, `ApiKeyAnthropic` (the `anthropic` provider, `x-api-key`)
 //! and `OAuthAnthropic` (the `claude` provider — Claude Max / Claude-Code subscription OAuth).
+//!
+//! It also hosts [`AnthropicMessages`] itself, which Anthropic defines and every gateway proxying
+//! the protocol reuses (C-168). The codec takes its [`ProviderProfile`] as configuration, so a new
+//! gateway is `(endpoint, credential, profile)` data rather than another `WireCodec` — before C-168
+//! OpenRouter and ollama each carried a copy that differed by exactly the one line naming its
+//! profile. Bedrock keeps its own codec ([`crate::bedrock::BedrockAnthropic`]): its divergences are
+//! wire behaviour, not configuration.
 
 use std::sync::Arc;
 
@@ -16,7 +23,7 @@ use crate::messages::{
 };
 use flux_core::{Error, Result};
 use flux_provider::{
-    ByteStream, ChunkStream, Credential, NativeProvider, Request, TokenSource, WireCodec,
+    ByteStream, ChunkStream, Credential, NativeProvider, Request, TokenSource, ToolDef, WireCodec,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -58,12 +65,56 @@ impl ProviderProfile for AnthropicProfile {
 // Wire codec
 // ---------------------------------------------------------------------------
 
+/// A gateway's tool-schema compatibility view, applied while building a disposable wire body.
+/// A plain `fn` pointer rather than a closure so the gateway module owns its projection (e.g.
+/// [`crate::schema::openrouter_tools`]) and this module needs no knowledge of it.
+pub type ToolProjection = fn(&str, &[ToolDef]) -> Result<Vec<ToolDef>>;
+
 /// The Anthropic Messages wire protocol (`POST /v1/messages`, SSE streaming).
-pub struct AnthropicMessages;
+///
+/// Shared by every transport that proxies the protocol; the [`ProviderProfile`] is configuration,
+/// not code. Build it with [`AnthropicMessages::new`], adding [`with_tool_projection`] for a gateway
+/// that needs a schema dialect.
+///
+/// [`with_tool_projection`]: AnthropicMessages::with_tool_projection
+pub struct AnthropicMessages {
+    profile: Arc<dyn ProviderProfile>,
+    project_tools: Option<ToolProjection>,
+}
+
+impl AnthropicMessages {
+    /// The codec under `profile`, forwarding tool schemas verbatim.
+    pub fn new(profile: Arc<dyn ProviderProfile>) -> Self {
+        Self {
+            profile,
+            project_tools: None,
+        }
+    }
+
+    /// Project tool schemas through `projection` before emitting them.
+    pub fn with_tool_projection(mut self, projection: ToolProjection) -> Self {
+        self.project_tools = Some(projection);
+        self
+    }
+
+    /// Anthropic-direct and the `claude` subscription: the full feature set, schemas verbatim.
+    pub fn direct() -> Self {
+        Self::new(Arc::new(AnthropicProfile))
+    }
+}
 
 impl WireCodec for AnthropicMessages {
     fn build_body(&self, req: &Request) -> Result<Value> {
-        build_messages_body(req, &AnthropicProfile.quirks_for(&req.model))
+        let quirks = self.profile.quirks_for(&req.model);
+        match self.project_tools {
+            // Clone only when a projection is in play — the request is otherwise passed through.
+            Some(project) => {
+                let mut projected = req.clone();
+                projected.tools = project(&req.model, &req.tools)?;
+                build_messages_body(&projected, &quirks)
+            }
+            None => build_messages_body(req, &quirks),
+        }
     }
 
     fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
@@ -130,7 +181,7 @@ impl Credential for OAuthAnthropic {
 pub fn anthropic_api(api_key: impl Into<String>) -> NativeProvider {
     NativeProvider::new(
         "anthropic",
-        Arc::new(AnthropicMessages),
+        Arc::new(AnthropicMessages::direct()),
         Arc::new(ApiKeyAnthropic {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -152,7 +203,7 @@ pub fn anthropic_from_env() -> Result<NativeProvider> {
 pub fn claude_oauth(tokens: Arc<dyn TokenSource>) -> NativeProvider {
     NativeProvider::new(
         "claude",
-        Arc::new(AnthropicMessages),
+        Arc::new(AnthropicMessages::direct()),
         Arc::new(OAuthAnthropic {
             tokens,
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -233,12 +284,12 @@ mod tests {
         // End-to-end through the codec: the request asks for thinking, the model can't take it,
         // the body must not carry the field (it would be an HTTP 400).
         let req = Request::new("claude-haiku-4-5", "hi").with_thinking(true);
-        let body = AnthropicMessages.build_body(&req).unwrap();
+        let body = AnthropicMessages::direct().build_body(&req).unwrap();
         assert!(body.get("thinking").is_none());
 
         // The same request against a 4.6-family model keeps adaptive thinking.
         let req = Request::new("claude-sonnet-4-6", "hi").with_thinking(true);
-        let body = AnthropicMessages.build_body(&req).unwrap();
+        let body = AnthropicMessages::direct().build_body(&req).unwrap();
         assert_eq!(body["thinking"]["type"], "adaptive");
     }
 
@@ -248,7 +299,7 @@ mod tests {
         // on), proving the codec routes through crate::messages with the right quirks.
         let big = "x".repeat(8192);
         let req = Request::new("claude-opus-4-8", "hi").with_system(big.clone());
-        let body = AnthropicMessages.build_body(&req).unwrap();
+        let body = AnthropicMessages::direct().build_body(&req).unwrap();
         assert_eq!(body["model"], "claude-opus-4-8");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         // Sanity: tools serialize to the Anthropic top-level shape via flux_core::ContentBlock.
@@ -257,7 +308,7 @@ mod tests {
 
     #[test]
     fn wire_headers_carry_the_anthropic_version() {
-        let headers = AnthropicMessages.wire_headers();
+        let headers = AnthropicMessages::direct().wire_headers();
         assert_eq!(
             headers,
             vec![("anthropic-version", "2023-06-01".to_string())]
@@ -331,7 +382,7 @@ mod tests {
         let (url, handle, captured) = capture_server().await;
         let provider = NativeProvider::new(
             "claude",
-            Arc::new(AnthropicMessages),
+            Arc::new(AnthropicMessages::direct()),
             Arc::new(OAuthAnthropic {
                 tokens: Arc::new(StaticToken("test-access-token")),
                 base_url: url,

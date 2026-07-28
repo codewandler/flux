@@ -25,7 +25,7 @@ flux eval <adapter> [--tasks a,b] [--members a,b] [--limit N] [-m <model>] [--tr
 #   adapters: synthetic | mock | terminal-bench | multi
 
 # the synthetic riddles, watching the agent work live, writing a categorized report:
-flux eval synthetic -m openrouter-anthropic/anthropic/claude-sonnet-4.6 --watch --report /tmp/r.md
+flux eval synthetic -m openrouter/anthropic/claude-sonnet-4.6 --watch --report /tmp/r.md
 ```
 
 - `--watch` streams each task's agent activity (plan → tool calls → answer) live to the terminal, headed

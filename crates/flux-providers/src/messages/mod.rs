@@ -1091,22 +1091,37 @@ mod tests {
     }
 
     /// The profiles decide it, so pin the resolved quirk per provider — this is the field that
-    /// reaches the wire.
+    /// reaches the wire. A wire that has not been *verified* to accept `ttl: "1h"` must not ask for
+    /// it: an unknown `cache_control` member can 4xx every long-system-prompt request.
     #[test]
-    fn only_the_anthropic_direct_profile_asks_for_the_extended_ttl() {
+    fn the_extended_ttl_is_asked_for_only_where_it_is_verified() {
         assert!(
             crate::anthropic::AnthropicProfile
                 .quirks_for("claude-opus-4-8")
                 .extended_cache_ttl
         );
+        // C-170: verified live against OpenRouter's Messages endpoint — a 1h breakpoint lands in
+        // `cache_creation.ephemeral_1h_input_tokens`, where the plain form lands in the 5m tier.
+        assert!(
+            crate::openrouter::OpenRouterProfile
+                .quirks_for("anthropic/claude-sonnet-4.6")
+                .extended_cache_ttl
+        );
+        // ...and only for the vendor that honours the member; every other upstream stays plain.
+        for model in ["z-ai/glm-4.6", "google/gemini-3.5-flash"] {
+            assert!(
+                !crate::openrouter::OpenRouterProfile
+                    .quirks_for(model)
+                    .extended_cache_ttl,
+                "{model}"
+            );
+        }
+        // Bedrock-direct remains unverified (no credentialed probe run), so it stays on the 5m
+        // default rather than being enabled on inference from the OpenRouter result — even though
+        // OpenRouter's own 1h probe happened to route through Bedrock upstream.
         assert!(
             !crate::bedrock::BedrockProfile
                 .quirks_for("us.anthropic.claude-sonnet-4-6-v1:0")
-                .extended_cache_ttl
-        );
-        assert!(
-            !crate::openrouter::OpenRouterProfile
-                .quirks_for("anthropic/claude-sonnet-4.6")
                 .extended_cache_ttl
         );
     }
@@ -1145,10 +1160,14 @@ mod tests {
         };
 
         // `claude` (subscription OAuth) inserts its identity line as cached segment 0; `anthropic`
-        // does not. Both layouts must satisfy the contract.
-        for (transport, segments) in [
+        // does not. C-170 adds the gateway: OpenRouter serving an `anthropic/…` slug resolves the
+        // same verified quirks through a different profile, so the realized layout is pinned per
+        // profile rather than only for Anthropic-direct. Every layout must satisfy the contract.
+        for (transport, model, quirks, segments) in [
             (
                 "claude",
+                "claude-sonnet-5",
+                anthropic_quirks(),
                 vec![
                     seg("identity-prefix", 8, true),
                     seg("explore-system", 1_500, true),
@@ -1158,6 +1177,18 @@ mod tests {
             ),
             (
                 "anthropic",
+                "claude-sonnet-5",
+                anthropic_quirks(),
+                vec![
+                    seg("explore-system", 1_500, true),
+                    seg("base-system", 9_000, true),
+                    seg("per-turn-intent", 200, false),
+                ],
+            ),
+            (
+                "openrouter",
+                "anthropic/claude-sonnet-4.6",
+                crate::openrouter::OpenRouterProfile.quirks_for("anthropic/claude-sonnet-4.6"),
                 vec![
                     seg("explore-system", 1_500, true),
                     seg("base-system", 9_000, true),
@@ -1165,7 +1196,7 @@ mod tests {
                 ],
             ),
         ] {
-            let mut req = Request::new("claude-sonnet-5", "hi");
+            let mut req = Request::new(model, "hi");
             req.cache_tail = true;
             req.system_segments = segments;
             req.messages = vec![
@@ -1178,7 +1209,7 @@ mod tests {
                 description: "read a file".into(),
                 input_schema: json!({"type": "object"}),
             }];
-            let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+            let body = build_messages_body(&req, &quirks).unwrap();
 
             let total = count_cache_control(&body);
             assert!(

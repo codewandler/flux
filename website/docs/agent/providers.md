@@ -35,7 +35,7 @@ newer — Haiku 4.5 and older reject them with HTTP 400), and `temperature`/`top
 the generations that reject sampling params (Fable 5, Opus ≥ 4.7, Sonnet ≥ 5). Unknown or future
 ids default to the newest shape, so a new Anthropic generation works on day one. The gating
 applies wherever an Anthropic model is served: `anthropic`, `claude`, `aws` (Bedrock
-inference-profile ids), and `openrouter-anthropic` (`anthropic/…` slugs).
+inference-profile ids), and `openrouter` (`anthropic/…` slugs).
 
 ## Supported providers
 
@@ -46,8 +46,7 @@ inference-profile ids), and `openrouter-anthropic` (`anthropic/…` slugs).
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` | full streaming + tool calls |
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth | opt-in: `flux auth login codex` |
 | `aws` | Anthropic Messages (Bedrock) | AWS chain (env / SSO / IRSA / EKS) | Claude via Bedrock; no `aws` CLI; region-aware ids; metered |
-| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` | proxy to hundreds of models |
-| `openrouter-anthropic` | Anthropic Messages | `OPENROUTER_API_KEY` | native `tool_use`; preferred for agentic use |
+| `openrouter` | Anthropic Messages | `OPENROUTER_API_KEY` | proxy to hundreds of models; native `tool_use`, and prompt caching on `anthropic/…` slugs |
 | `ollama` | OpenAI Chat | none (local) | `OLLAMA_HOST` overrides `localhost:11434`; needs a tool-capable model |
 | `ollama-anthropic` | Anthropic Messages | none (local) | recent Ollama builds; native `tool_use` |
 | `mock` | — | none | offline test provider; exercises the full pipeline |
@@ -63,8 +62,8 @@ provider-native calls against the exact live operation schemas. The model never 
 operation inside a Flux AST. Invalid arguments return schema diagnostics in the same native ledger so
 the model can correct the call locally; rounds and token use are bounded.
 
-OpenRouter Gemini models receive a provider-compatible view of each live operation schema on both
-the `openrouter` and `openrouter-anthropic` wires. Legal JSON Schema shorthands such as an untyped
+OpenRouter Gemini models receive a provider-compatible view of each live operation schema on the
+`openrouter` wire. Legal JSON Schema shorthands such as an untyped
 array or a nullable type are translated without changing the registered contract. If a constraint
 cannot be represented exactly in Gemini's function-schema subset, the request stops locally and the
 error names the operation and schema path—before a billable model call. Returned arguments are still

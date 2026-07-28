@@ -9,10 +9,11 @@
 //!   mapper). Anthropic-direct, OpenRouter, and Ollama all speak this shape; each supplies its own
 //!   `ProviderProfile` describing its quirks.
 //! - [`anthropic`] — the `anthropic` (API key) and `claude` (subscription OAuth) providers.
-//! - [`openrouter`] — the `openrouter-anthropic` provider (Messages protocol, native tool calling).
+//! - [`openrouter`] — the `openrouter` gateway, on its Messages endpoint for every model it proxies
+//!   (native tool calling, prompt caching for `anthropic/…` slugs).
 //! - [`ollama`] — the `ollama-anthropic` provider (local models over the Messages protocol).
 //! - [`openai`] — the API-key OpenAI Chat / Responses wire codecs and the unified Bearer
-//!   credential shared by the OpenAI-family providers (`openai`, `openrouter`, `ollama`).
+//!   credential shared by the OpenAI-family providers (`openai`, `ollama`).
 //! - [`codex`] — the `codex` provider (ChatGPT/Codex subscription over the Responses wire on the
 //!   ChatGPT backend). It reuses the [`openai`] codec but owns its own surface and model
 //!   resolution.
@@ -83,8 +84,9 @@ mod schema_portability_tests {
     use flux_provider::{Credential, NativeProvider, Provider, Request, ToolDef, WireCodec};
 
     use crate::anthropic::AnthropicMessages;
-    use crate::openai::{OpenAiChat, OpenAiResponses, OpenRouterChat};
-    use crate::openrouter::OpenRouterMessages;
+    use crate::ollama::ollama_messages_codec;
+    use crate::openai::{OpenAiChat, OpenAiResponses};
+    use crate::openrouter::openrouter_messages_codec;
 
     fn adversarial_request(model: &str) -> Request {
         let mut request = Request::new(model, "Reply OK without calling any tool.");
@@ -131,8 +133,13 @@ mod schema_portability_tests {
         let request = adversarial_request("google/gemini-3.5-flash");
         let original = request.tools.clone();
 
-        let anthropic = AnthropicMessages.build_body(&request).unwrap();
+        let anthropic = AnthropicMessages::direct().build_body(&request).unwrap();
         assert_unprojected(&anthropic["tools"][0]["input_schema"]);
+
+        // C-168: the projection is now a codec field, so pin it per transport — ollama shares the
+        // codec but must keep forwarding the registered schema verbatim.
+        let ollama = ollama_messages_codec().build_body(&request).unwrap();
+        assert_unprojected(&ollama["tools"][0]["input_schema"]);
 
         let openai = OpenAiChat.build_body(&request).unwrap();
         assert_unprojected(&openai["tools"][0]["function"]["parameters"]);
@@ -142,15 +149,14 @@ mod schema_portability_tests {
             .unwrap();
         assert_unprojected(&codex["tools"][0]["parameters"]);
 
-        let openrouter_chat = OpenRouterChat.build_body(&request).unwrap();
-        assert_projected(&openrouter_chat["tools"][0]["function"]["parameters"]);
-
-        let openrouter_messages = OpenRouterMessages.build_body(&request).unwrap();
+        let openrouter_messages = openrouter_messages_codec().build_body(&request).unwrap();
         assert_projected(&openrouter_messages["tools"][0]["input_schema"]);
 
+        // The projection is keyed on the model, not the transport: a non-Gemini OpenRouter slug on
+        // the same codec is forwarded verbatim.
         let non_gemini = adversarial_request("deepseek/deepseek-v4-flash");
-        let openrouter_non_gemini = OpenRouterChat.build_body(&non_gemini).unwrap();
-        assert_unprojected(&openrouter_non_gemini["tools"][0]["function"]["parameters"]);
+        let openrouter_non_gemini = openrouter_messages_codec().build_body(&non_gemini).unwrap();
+        assert_unprojected(&openrouter_non_gemini["tools"][0]["input_schema"]);
         assert_eq!(request.tools, original);
     }
 
@@ -245,10 +251,7 @@ mod schema_portability_tests {
         ];
 
         for (tool, expected_path) in fixtures {
-            for codec in [
-                Arc::new(OpenRouterChat) as Arc<dyn WireCodec>,
-                Arc::new(OpenRouterMessages) as Arc<dyn WireCodec>,
-            ] {
+            for codec in [Arc::new(openrouter_messages_codec()) as Arc<dyn WireCodec>] {
                 let mut request = Request::new("google/gemini-3.5-flash", "hi");
                 request.tools.push(tool.clone());
                 let endpoint_calls = Arc::new(AtomicUsize::new(0));
@@ -274,17 +277,16 @@ mod schema_portability_tests {
     }
 
     /// Credentialed A-81 smoke. The declaration is inert and no Flux operation is registered or
-    /// executed; consuming either stream proves both OpenRouter wire shapes reached Gemini after
-    /// codec projection instead of failing request validation.
+    /// executed; consuming the stream proves the OpenRouter wire reached Gemini after codec
+    /// projection instead of failing request validation.
     #[tokio::test]
-    #[ignore = "requires OPENROUTER_API_KEY and makes two low-token Gemini requests"]
-    async fn live_openrouter_gemini_accepts_projected_schema_on_both_wires() -> Result<()> {
+    #[ignore = "requires OPENROUTER_API_KEY and makes one low-token Gemini request"]
+    async fn live_openrouter_gemini_accepts_projected_schema() -> Result<()> {
         let key = std::env::var("OPENROUTER_API_KEY")
             .map_err(|_| flux_core::Error::Auth("OPENROUTER_API_KEY is not set".into()))?;
-        let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(crate::openai::openrouter_api(&key, "", "")),
-            Box::new(crate::openrouter::openrouter_anthropic_api(&key, "", "")),
-        ];
+        let providers: Vec<Box<dyn Provider>> = vec![Box::new(
+            crate::openrouter::openrouter_messages_api(&key, "", ""),
+        )];
 
         for provider in providers {
             let mut stream = provider

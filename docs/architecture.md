@@ -201,7 +201,7 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
 - **`Credential`** — auth/transport profile: tokens, base URL, gating headers, refresh.
 
 `provider/model` routing selects a cell. v1 ships `anthropic`, `claude`, `openai`, `codex`, `aws`
-(Bedrock), `openrouter`, `openrouter-anthropic`, `ollama`, and `ollama-anthropic`. Adding a
+(Bedrock), `openrouter`, `ollama`, and `ollama-anthropic`. Adding a
 provider is a small composition, never a fork of the loop. Streaming is a
 `Chunk` stream; usage accounting preserves input/cache tokens across `message_start`/`message_delta`.
 

@@ -1,28 +1,36 @@
-//! The `openrouter-anthropic` provider.
+//! The `openrouter` gateway on its Anthropic **Messages** endpoint.
 //!
-//! OpenRouter speaks the Anthropic **Messages** protocol at `/api/v1/messages` (model-agnostic:
+//! OpenRouter speaks the Messages protocol at `/api/v1/messages` (model-agnostic:
 //! `model: "z-ai/glm-4.6"`, `model: "openai/gpt-4o"`, …). Routing tool calls through it yields
 //! native `tool_use` content blocks that can't leak as inline text — unlike the OpenAI Chat path
-//! (the `openrouter` provider in the [`crate::openai`] module), which some models corrupt by
-//! emitting `<tool_call>` markup. The shared wire/body/stream live in [`crate::messages`]; this
-//! module adds the OpenRouter quirks profile and a Bearer credential with OpenRouter's attribution
-//! headers.
+//! (the same `openrouter` provider on [`crate::openai`]'s codec), which some models corrupt by
+//! emitting `<tool_call>` markup. The shared wire/body/stream live in [`crate::messages`] and the
+//! codec in [`crate::anthropic`]; this module adds the OpenRouter quirks profile and a Bearer
+//! credential with OpenRouter's attribution headers.
+//!
+//! Until C-169 this was reachable only as a separate provider name, `openrouter-anthropic`, so the
+//! obvious spelling `openrouter/anthropic/<model>` silently took the Chat path — which emits no
+//! `cache_control` and so ran at 0% cache, and which leaks tool calls as text for every other
+//! vendor. This is now the only wire flux uses for `openrouter`: it is model-agnostic, so there was
+//! never a reason to make users choose, and the Chat codec for OpenRouter is gone.
+//!
+//! A spec reads `openrouter/<vendor>/<model_id>` — a triple — because the vendor prefix is part of
+//! OpenRouter's own model id, not a flux-side selector. [`OpenRouterProfile`] still keys prompt
+//! caching on that prefix, since only Anthropic-served models honour `cache_control`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::messages::{
-    anthropic_model_caps, build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile,
-};
+use crate::anthropic::AnthropicMessages;
+use crate::messages::{anthropic_model_caps, MessagesQuirks, ProviderProfile};
 use flux_core::{Error, Result};
-use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
+use flux_provider::{Credential, NativeProvider};
 
 use crate::schema::openrouter_tools;
 
 const OPENROUTER_MESSAGES_ENDPOINT: &str = "https://openrouter.ai/api/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 // ---------------------------------------------------------------------------
 // Quirks profile
@@ -50,9 +58,13 @@ impl ProviderProfile for OpenRouterProfile {
         let caps = anthropic_model_caps(model);
         MessagesQuirks {
             prompt_caching: anthropic_served,
-            // Unverified through the OpenRouter proxy — anthropic-served slugs still cache, on the
-            // five-minute default.
-            extended_cache_ttl: false,
+            // C-170, live-verified 2026-07-28 against `/api/v1/messages`: a `ttl: "1h"` breakpoint
+            // is accepted (no 4xx) and lands in the right tier — the response's per-TTL split
+            // reported `ephemeral_1h_input_tokens: 7725` where the plain ephemeral form reported
+            // `ephemeral_5m_input_tokens: 7725` for the identical prompt. Verified even with
+            // OpenRouter routing the call to Amazon Bedrock upstream. Scoped to anthropic-served
+            // slugs for the same reason `prompt_caching` is: no other vendor honours the member.
+            extended_cache_ttl: anthropic_served,
             thinking_adaptive: if anthropic_served {
                 caps.adaptive_thinking
             } else {
@@ -74,24 +86,13 @@ impl ProviderProfile for OpenRouterProfile {
 // ---------------------------------------------------------------------------
 
 /// OpenRouter's Anthropic-Messages-compatible wire (`POST /api/v1/messages`, SSE streaming).
-pub struct OpenRouterMessages;
-
-impl WireCodec for OpenRouterMessages {
-    fn build_body(&self, req: &Request) -> Result<Value> {
-        let mut projected = req.clone();
-        projected.tools = openrouter_tools(&req.model, &req.tools)?;
-        build_messages_body(&projected, &OpenRouterProfile.quirks_for(&projected.model))
-    }
-
-    fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
-        map_messages_stream(bytes)
-    }
-
-    fn wire_headers(&self) -> Vec<(&'static str, String)> {
-        // OpenRouter's Messages endpoint mirrors Anthropic and accepts the version header (the same
-        // one Claude Code sends when pointed at OpenRouter via ANTHROPIC_BASE_URL).
-        vec![("anthropic-version", ANTHROPIC_VERSION.to_string())]
-    }
+///
+/// No codec of its own since C-168 — it is the shared [`AnthropicMessages`] under
+/// [`OpenRouterProfile`], plus the Gemini tool-schema view. OpenRouter's Messages endpoint mirrors
+/// Anthropic and accepts the `anthropic-version` header (the same one Claude Code sends when
+/// pointed at OpenRouter via `ANTHROPIC_BASE_URL`), which the shared codec already emits.
+pub fn openrouter_messages_codec() -> AnthropicMessages {
+    AnthropicMessages::new(Arc::new(OpenRouterProfile)).with_tool_projection(openrouter_tools)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +125,12 @@ impl Credential for BearerOpenRouter {
 // Constructors
 // ---------------------------------------------------------------------------
 
-/// Build the `openrouter-anthropic` provider via API key. `referer`/`title` are OpenRouter's
-/// optional attribution headers; pass empty strings to omit.
-pub fn openrouter_anthropic_api(
+/// Build the `openrouter` provider on its Messages endpoint via API key. `referer`/`title` are
+/// OpenRouter's optional attribution headers; pass empty strings to omit.
+///
+/// The provider name is plain `openrouter` (C-169) — there is no second name to choose, so usage
+/// rows and role specs read `openrouter/<vendor>/<model>` for every model the gateway proxies.
+pub fn openrouter_messages_api(
     api_key: impl Into<String>,
     referer: impl Into<String>,
     title: impl Into<String>,
@@ -141,8 +145,8 @@ pub fn openrouter_anthropic_api(
         extra.push(("X-Title", title));
     }
     NativeProvider::new(
-        "openrouter-anthropic",
-        Arc::new(OpenRouterMessages),
+        "openrouter",
+        Arc::new(openrouter_messages_codec()),
         Arc::new(BearerOpenRouter {
             api_key: api_key.into(),
             extra,
@@ -150,14 +154,14 @@ pub fn openrouter_anthropic_api(
     )
 }
 
-/// Build the `openrouter-anthropic` provider from `OPENROUTER_API_KEY`.
-pub fn openrouter_anthropic_from_env() -> Result<NativeProvider> {
+/// Build the `openrouter` Messages provider from `OPENROUTER_API_KEY`.
+pub fn openrouter_messages_from_env() -> Result<NativeProvider> {
     let key = std::env::var("OPENROUTER_API_KEY")
         .map_err(|_| Error::Auth("OPENROUTER_API_KEY is not set".to_string()))?;
     if key.trim().is_empty() {
         return Err(Error::Auth("OPENROUTER_API_KEY is empty".to_string()));
     }
-    Ok(openrouter_anthropic_api(
+    Ok(openrouter_messages_api(
         key,
         "https://github.com/codewandler/flux",
         "flux",
@@ -167,7 +171,7 @@ pub fn openrouter_anthropic_from_env() -> Result<NativeProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flux_provider::ToolDef;
+    use flux_provider::{Request, ToolDef, WireCodec};
 
     #[test]
     fn profile_is_conservative_and_routes_tool_capable() {
@@ -186,7 +190,7 @@ mod tests {
         let req = Request::new("z-ai/glm-4.6", "hi")
             .with_system(big)
             .with_effort(flux_provider::Effort::High);
-        let body = OpenRouterMessages.build_body(&req).unwrap();
+        let body = openrouter_messages_codec().build_body(&req).unwrap();
         assert_eq!(body["provider"]["require_parameters"], true);
         assert!(body["system"].is_string()); // caching off → plain string, not a cache_control array
         assert!(body.get("output_config").is_none()); // effort off
@@ -235,7 +239,7 @@ mod tests {
         // directive still rides along.
         let big = "x".repeat(8192);
         let req = Request::new("anthropic/claude-sonnet-4.6", "hi").with_system(big);
-        let body = OpenRouterMessages.build_body(&req).unwrap();
+        let body = openrouter_messages_codec().build_body(&req).unwrap();
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["provider"]["require_parameters"], true);
     }
@@ -269,7 +273,7 @@ mod tests {
         });
         let original = req.clone();
 
-        let body = OpenRouterMessages.build_body(&req).unwrap();
+        let body = openrouter_messages_codec().build_body(&req).unwrap();
         let schema = &body["tools"][0]["input_schema"];
 
         assert_eq!(schema["properties"]["records"]["items"], json!({}));
@@ -293,7 +297,10 @@ mod tests {
         });
         let original = req.clone();
 
-        let error = OpenRouterMessages.build_body(&req).unwrap_err().to_string();
+        let error = openrouter_messages_codec()
+            .build_body(&req)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("closed.create"), "error was: {error}");
         assert!(error.contains("/required/0"), "error was: {error}");

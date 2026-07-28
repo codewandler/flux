@@ -139,6 +139,13 @@ pub struct PricingTable {
 /// Provider prefixes flux understands (mirrors `KNOWN_PROVIDERS` in the CLI). Used to recognise and
 /// strip a leading `provider/` from a model spec without mistaking an OpenRouter model id (which
 /// itself contains slashes, e.g. `anthropic/claude-sonnet-4.6`) for a prefix.
+///
+/// This set is deliberately **wider** than the selectable providers: it also carries names that have
+/// been retired, because the event store is append-only and rows written under the old spelling must
+/// keep splitting the same way forever. Dropping `openrouter-anthropic` here would silently reclass
+/// every historical row as a bare model id with no provider, moving spend between `flux usage`
+/// rows retroactively. Retired names belong here; they do not belong in `KNOWN_PROVIDERS`, which
+/// governs what a user can actually run (C-169).
 fn known_provider(p: &str) -> bool {
     matches!(
         p,
@@ -148,6 +155,7 @@ fn known_provider(p: &str) -> bool {
             | "codex"
             | "aws"
             | "openrouter"
+            // Retired 2026-07-28 (C-169) — historical rows only.
             | "openrouter-anthropic"
             | "ollama"
             | "ollama-anthropic"
@@ -339,8 +347,15 @@ impl PricingTable {
         };
         // Anthropic-family rows: the `cache_write` column above is the five-minute write (1.25x
         // input) and the extended TTL (C-135) costs 2x input, so the 1h *surcharge* over it is
-        // 0.75x input. Bedrock's Anthropic rows share these values; they report no per-TTL split
-        // today, so the surcharge simply never applies there (`extended_cache_ttl` is off for them).
+        // 0.75x input. These rows are shared by every transport serving the model, and the
+        // surcharge is driven by the reported per-TTL split rather than by the provider, so it
+        // applies wherever that split arrives *and the table is consulted at all*.
+        //
+        // For OpenRouter specifically the table is usually NOT consulted: that gateway reports its
+        // own `cost`, which short-circuits this math entirely (see `cost`) — and that figure is
+        // routing- and discount-aware, so it is strictly better than anything computed here. The
+        // surcharge is the fallback for a call where no cost came back. Bedrock reports no per-TTL
+        // split today and has `extended_cache_ttl` off, so it never applies there.
         let anthropic = |input: f64, output: f64, cache_write: f64, cache_read: f64| Rates {
             cache_write_1h: input * 0.75,
             ..text(input, output, cache_write, cache_read)
@@ -771,6 +786,87 @@ mod tests {
         assert!(
             !full.subscription,
             "openrouter passthrough is metered, not subscription"
+        );
+    }
+
+    /// C-169: the post-rename spec must price too. This is the silent-failure guard for the
+    /// vendor-segment cutover — `known_provider` decides whether the leading segment is stripped, so
+    /// an unmigrated key would not error, it would quietly degrade to `$? unknown model` in
+    /// `flux usage` and hide real spend. Both spellings resolve the same row: the new one because
+    /// `openrouter` is selectable, the old one because retired names stay recognised for the
+    /// append-only event store.
+    #[test]
+    fn rates_for_resolves_the_vendor_routed_openrouter_spec() {
+        let builtin = PricingTable::builtin();
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        let bare = builtin.cost(&u, "anthropic/claude-sonnet-4.6").unwrap();
+        for spec in [
+            "openrouter/anthropic/claude-sonnet-4.6",
+            "openrouter-anthropic/anthropic/claude-sonnet-4.6",
+        ] {
+            let priced = builtin
+                .cost(&u, spec)
+                .unwrap_or_else(|| panic!("{spec} must price"));
+            assert!(
+                (priced.usd - bare.usd).abs() < 1e-9,
+                "{spec} must resolve the same row as the bare id"
+            );
+            assert!(!priced.subscription, "{spec} is metered, not subscription");
+        }
+        // And the attribution key the write path stamps for the new routing is the new spelling.
+        assert_eq!(
+            canonical_model_spec(Some("openrouter"), "anthropic/claude-sonnet-4.6"),
+            "openrouter/anthropic/claude-sonnet-4.6"
+        );
+    }
+
+    /// C-170: the 1h write surcharge is driven by the reported per-TTL split, not by the provider,
+    /// so a gateway-served Anthropic model must be billed for it exactly as Anthropic-direct is when
+    /// the table is what prices the call.
+    ///
+    /// Scope, so this test is not read as more than it is: for OpenRouter the table is normally
+    /// bypassed, because that gateway reports its own `cost` and [`PricingTable::cost`] returns it
+    /// directly. This pins the **fallback** path — the one that runs when no cost came back — and
+    /// the invariant that the transport does not change what Anthropic bills.
+    #[test]
+    fn the_one_hour_write_surcharge_reaches_gateway_rows() {
+        let builtin = PricingTable::builtin();
+        let all_5m = Usage {
+            cache_creation_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let all_1h = Usage {
+            cache_creation_input_tokens: 1_000_000,
+            cache_creation_1h_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        for spec in [
+            "anthropic/claude-sonnet-4.6",
+            "openrouter/anthropic/claude-sonnet-4.6",
+        ] {
+            let five = builtin.cost(&all_5m, spec).unwrap().usd;
+            let hour = builtin.cost(&all_1h, spec).unwrap().usd;
+            assert!(
+                hour > five,
+                "{spec}: a 1h write must cost more than a 5m write ({hour} vs {five})"
+            );
+        }
+        // Identical on both spellings — the transport does not change what Anthropic bills.
+        assert!(
+            (builtin
+                .cost(&all_1h, "openrouter/anthropic/claude-sonnet-4.6")
+                .unwrap()
+                .usd
+                - builtin
+                    .cost(&all_1h, "anthropic/claude-sonnet-4.6")
+                    .unwrap()
+                    .usd)
+                .abs()
+                < 1e-9
         );
     }
 

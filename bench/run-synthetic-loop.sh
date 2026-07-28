@@ -15,7 +15,7 @@
 # Provider: the loop's sub-agents (reviewer/planner/worker) use $FLUX_IMPROVE_MODEL (the `-m` below);
 # the benchmarked child flux uses the `model` baked into examples/improve-synthetic.flux. For a run
 # where Anthropic credits are unavailable, set FLUX_IMPROVE_MODEL to the OpenRouter Sonnet id
-# (openrouter-anthropic/anthropic/claude-sonnet-4.6) AND change that flow's `model` field to match, so
+# (openrouter/anthropic/claude-sonnet-4.6) AND change that flow's `model` field to match, so
 # both surfaces hit a funded provider.
 #
 # Expensive: 16 riddles × 5 trials per eval × (baseline + candidate) + sub-agent runs. A *kept* gain is

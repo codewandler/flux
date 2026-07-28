@@ -54,6 +54,49 @@ All notable changes to this project are documented in this file. The format is b
   `ApprovalRequest { tool, subjects, summary, destructive }` instead of flat `tool`/`subjects`
   fields, so the sheet can carry a plan's risk summary and destructive disclosure (C-182).
 
+- **C-168/C-169: one Anthropic Messages codec, and OpenRouter stops paying full price.**
+  `openrouter/anthropic/*` ran at **literally 0% prompt cache** — 3.1M tokens and $24.86 of metered
+  spend in 32 days — while the identical model family via `openrouter-anthropic` hit 69%. The cause
+  was a duplicated provider, not a missing feature: `openrouter/anthropic/…` resolved to the Chat
+  codec, which consults no `ProviderProfile` and therefore emits no `cache_control` (and, per
+  `spec.rs`'s own comment, leaks tool calls as `<tool_call>` text). The good path existed only under
+  a second provider name that the obvious spelling never reached.
+  - **C-168** makes `AnthropicMessages` take its `ProviderProfile` — and an optional tool-schema
+    projection — as configuration, so a gateway is `(endpoint, credential, profile)` data rather than
+    another `WireCodec`. `OpenRouterMessages` and `OllamaMessages` are deleted; they differed from
+    the shared codec by exactly the one line naming their profile. `BedrockAnthropic` stays: its
+    divergences (`anthropic_version` in the body, stripped `model`/`stream`, AWS binary event-stream
+    decoding) are wire behaviour, not configuration. Behaviour-preserving — the whole existing cache
+    suite, OpenRouter codec tests and cross-codec sweep pass unchanged.
+  - **C-169** makes OpenRouter's Messages endpoint the only wire flux uses for that gateway, for
+    every model it proxies. An earlier design routed by vendor segment (Anthropic to Messages, the
+    rest to Chat); that was dropped on evidence, because `docs/model.md` already recommends the
+    Messages endpoint for `z-ai/glm-4.6`, `qwen/qwen3-coder` and `deepseek/deepseek-chat` — it is
+    model-agnostic and returns structured `tool_use` for every vendor — so vendor routing would have
+    removed a documented capability in the name of a rename. `OpenRouterChat`, `openrouter_api`,
+    `openrouter_from_env` and the chat endpoint const are gone; the Chat codec now serves only
+    `openai` and `ollama`. `OpenRouterProfile` still keys `prompt_caching` on the `anthropic/`
+    prefix, since only Anthropic-served models honour `cache_control`.
+  - **C-173** (filed by the epic's code review, closed on evidence): moving OpenRouter off the Chat
+    wire also left behind that wire's inline `<tool_call>`/`<function=` text salvage, which the
+    Messages codec deliberately lacks. Verified live across the three models the parse-resilience
+    epic records as leakers (`z-ai/glm-4.6`, `qwen/qwen3-coder`, `deepseek/deepseek-v4-flash`):
+    six tool-shaped runs, every tool call structured (including compound `read_many` calls), zero
+    markup leakage — the salvage is Chat-wire-specific and its absence on Messages is correct. The
+    same probes resolved the open DeepSeek question: its cache split does report through the
+    Messages wire (`cache 32% ↺4.1k`); the earlier blank was a below-threshold trivial prompt.
+
+### Removed
+
+- **Breaking: the `openrouter-anthropic` provider.** It was the same endpoint under a second name.
+  Use `openrouter/<vendor>/<model>` — the model id is unchanged, only the prefix moves, and a spec
+  naming the retired provider now fails with the new spelling rather than a generic unknown-provider
+  list. `KNOWN_PROVIDERS` loses the entry (C-169).
+  `flux_core::pricing::known_provider` deliberately **keeps** recognising it: the event store is
+  append-only, so rows written under the old spelling must keep splitting the same way or historical
+  `flux usage` spend silently reclassifies. Retired names belong in the parser, not in the set of
+  providers a user can select.
+
 ## [0.30.1] - 2026-07-28
 
 ### Added

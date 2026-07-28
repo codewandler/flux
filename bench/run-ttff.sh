@@ -18,7 +18,7 @@
 # Env overrides:
 #   FLUX_TTFF_BASELINE  baseline git ref            (default b528772)
 #   FLUX_TTFF_TRIALS    trials per prompt per leg   (default 3)
-#   FLUX_TTFF_MODEL     provider/model spec         (default openrouter-anthropic/anthropic/claude-sonnet-4.6)
+#   FLUX_TTFF_MODEL     provider/model spec         (default openrouter/anthropic/claude-sonnet-4.6)
 #   FLUX_TTFF_TIMEOUT   per-run kill timeout, secs  (default 300)
 #   FLUX_TTFF_OUT       results dir                 (default bench/ttff/results/<ts>)
 set -euo pipefail
@@ -29,7 +29,7 @@ ts="$(date +%Y%m%d-%H%M%S)"
 
 baseline_ref="${FLUX_TTFF_BASELINE:-b528772}"
 trials="${FLUX_TTFF_TRIALS:-3}"
-model="${FLUX_TTFF_MODEL:-openrouter-anthropic/anthropic/claude-sonnet-4.6}"
+model="${FLUX_TTFF_MODEL:-openrouter/anthropic/claude-sonnet-4.6}"
 timeout="${FLUX_TTFF_TIMEOUT:-300}"
 out="${FLUX_TTFF_OUT:-bench/ttff/results/$ts}"
 

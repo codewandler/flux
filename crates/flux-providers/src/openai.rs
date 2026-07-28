@@ -21,10 +21,7 @@ use flux_provider::{
     ByteStream, ChunkStream, Credential, Effort, NativeProvider, Request, TokenSource, WireCodec,
 };
 
-use crate::schema::openrouter_tools;
-
 const OPENAI_CHAT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const OLLAMA_CHAT_ENDPOINT: &str = "http://localhost:11434/v1/chat/completions";
 
 // ---------------------------------------------------------------------------
@@ -45,28 +42,42 @@ impl WireCodec for OpenAiChat {
     }
 }
 
-/// OpenRouter's Chat Completions codec. It shares the OpenAI wire shape while deriving a
-/// Gemini-compatible view of operation schemas for `google/gemini-*` model ids.
-pub struct OpenRouterChat;
-
-impl WireCodec for OpenRouterChat {
-    fn build_body(&self, req: &Request) -> Result<Value> {
-        let mut projected = req.clone();
-        projected.tools = openrouter_tools(&req.model, &req.tools)?;
-        build_chat_body(&projected)
-    }
-
-    fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
-        Box::pin(map_chat_stream(bytes))
-    }
-}
-
 /// Map flux [`Effort`] to OpenAI's `reasoning_effort` (which tops out at `high`).
 fn map_effort(e: Effort) -> &'static str {
     match e {
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High | Effort::Xhigh | Effort::Max => "high",
+    }
+}
+
+/// Split a prompt total into `(fresh, cache_read, cache_write)` given the two cached tiers this
+/// wire family reports. Shared by the Chat and Responses codecs, which report the same three
+/// numbers under different field names (C-171).
+///
+/// Both tiers are documented as portions OF the total. If a backend ever reports them *in addition*
+/// to it, a bare subtraction would clamp fresh input to 0 while `context_tokens()` over-counted the
+/// prompt — a silent cost inflation. The addition is checked too: the tiers arrive straight off the
+/// wire, so a corrupt or hostile frame can otherwise overflow it (a panic in debug, and in release a
+/// wrap that makes the subtraction *succeed* with garbage). On any such inconsistency, trust the
+/// total and drop the breakdown rather than publishing a distorted one.
+fn split_prompt_tiers(total: u64, cached: u64, cache_write: u64, wire: &str) -> (u64, u64, u64) {
+    match cached
+        .checked_add(cache_write)
+        .and_then(|claimed| total.checked_sub(claimed))
+    {
+        Some(fresh) => (fresh, cached, cache_write),
+        None => {
+            tracing::warn!(
+                wire,
+                total,
+                cached,
+                cache_write,
+                "usage: cached + cache_write is not a subset of the prompt total — reporting the \
+                 prompt as fresh input rather than a distorted breakdown"
+            );
+            (total, 0, 0)
+        }
     }
 }
 
@@ -296,6 +307,10 @@ struct ChatCostDetails {
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u64,
+    /// The cache-WRITE tier (C-171). `serde(default)` so every backend that omits it — most of
+    /// them — still decodes; OpenAI reports it for the models with explicit cache breakpoints.
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 /// Parse the OpenAI Chat Completions SSE stream into normalized [`Chunk`]s. Tool-call argument
@@ -350,22 +365,29 @@ pub(crate) fn map_chat_stream(
             if let Some(u) = chunk.usage {
                 // OpenAI's `prompt_tokens` is the *whole* prompt incl. the cached prefix. Normalize
                 // to the cache-aware Usage shape (fresh input separate from cache reads) so cost and
-                // context figures are comparable with the Anthropic codec; OpenAI has no cache-write
-                // tier, so cache_creation stays 0.
-                let cached = u
+                // context figures are comparable with the Anthropic codec.
+                //
+                // C-171: `prompt_tokens_details.cache_write_tokens` is reported by backends with
+                // explicit cache breakpoints and used to be dropped here, so a cached prefix looked
+                // like it appeared from nowhere — the same defect the Responses wire carried. It is
+                // part of the prompt, so it comes out of the fresh input just as `cached_tokens` does.
+                let (cached, cache_write) = u
                     .prompt_tokens_details
                     .as_ref()
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0);
+                    .map(|d| (d.cached_tokens, d.cache_write_tokens))
+                    .unwrap_or((0, 0));
+                let (fresh, cached, cache_write) =
+                    split_prompt_tiers(u.prompt_tokens, cached, cache_write, "chat");
                 let reported_cost_usd = crate::openrouter_reported_cost(
                     u.cost,
                     u.is_byok,
                     u.cost_details.as_ref().and_then(|d| d.upstream_inference_cost),
                 );
                 yield Chunk::Usage(Usage {
-                    input_tokens: u.prompt_tokens.saturating_sub(cached),
+                    input_tokens: fresh,
                     output_tokens: u.completion_tokens,
                     cache_read_input_tokens: cached,
+                    cache_creation_input_tokens: cache_write,
                     reported_cost_usd,
                     ..Default::default()
                 });
@@ -718,34 +740,6 @@ pub fn openai_from_env() -> Result<NativeProvider> {
     Ok(openai_api(key))
 }
 
-/// `openrouter` provider via API key. `referer`/`title` are OpenRouter's optional attribution
-/// headers (used for app ranking); pass empty strings to omit.
-pub fn openrouter_api(
-    api_key: impl Into<String>,
-    referer: impl Into<String>,
-    title: impl Into<String>,
-) -> NativeProvider {
-    let mut extra = Vec::new();
-    let referer = referer.into();
-    let title = title.into();
-    if !referer.is_empty() {
-        extra.push(("HTTP-Referer", referer));
-    }
-    if !title.is_empty() {
-        extra.push(("X-Title", title));
-    }
-    NativeProvider::new(
-        "openrouter",
-        Arc::new(OpenRouterChat),
-        Arc::new(OpenAiCred {
-            endpoint: OPENROUTER_ENDPOINT.to_string(),
-            secret: Secret::ApiKey(api_key.into()),
-            extra,
-            send_account_id: false,
-        }),
-    )
-}
-
 /// `ollama` — a local [Ollama](https://ollama.com) server, which speaks the OpenAI Chat
 /// Completions wire (so it reuses [`OpenAiChat`] verbatim). Ollama requires no credential; the
 /// Bearer token is a placeholder it ignores. The endpoint defaults to `localhost:11434` and
@@ -774,20 +768,6 @@ pub fn ollama_api() -> NativeProvider {
             send_account_id: false,
         }),
     )
-}
-
-/// `openrouter` provider from `OPENROUTER_API_KEY` (with a default flux attribution title).
-pub fn openrouter_from_env() -> Result<NativeProvider> {
-    let key = std::env::var("OPENROUTER_API_KEY")
-        .map_err(|_| Error::Auth("OPENROUTER_API_KEY is not set".to_string()))?;
-    if key.trim().is_empty() {
-        return Err(Error::Auth("OPENROUTER_API_KEY is empty".to_string()));
-    }
-    Ok(openrouter_api(
-        key,
-        "https://github.com/codewandler/flux",
-        "flux",
-    ))
 }
 
 // ===========================================================================
@@ -1193,24 +1173,8 @@ pub(crate) fn map_responses_stream(
                     let reasoning = u["output_tokens_details"]["reasoning_tokens"]
                         .as_u64()
                         .unwrap_or(0);
-                    // Both tiers are documented as portions OF `input_tokens`. If a backend ever
-                    // reports them *in addition* to it, a bare `saturating_sub` would clamp fresh
-                    // input to 0 while `context_tokens()` over-counted the prompt — a silent cost
-                    // inflation. Keep that visible instead: trust the total, drop the breakdown.
-                    let (fresh, cached, cache_write) = match input.checked_sub(cached + cache_write) {
-                        Some(fresh) => (fresh, cached, cache_write),
-                        None => {
-                            tracing::warn!(
-                                input,
-                                cached,
-                                cache_write,
-                                "Responses usage: cached + cache_write exceeds input_tokens; \
-                                 the tiers are not subsets of the prompt total — reporting the \
-                                 prompt as fresh input rather than a distorted breakdown"
-                            );
-                            (input, 0, 0)
-                        }
-                    };
+                    let (fresh, cached, cache_write) =
+                        split_prompt_tiers(input, cached, cache_write, "responses");
                     yield Chunk::Usage(Usage {
                         input_tokens: fresh,
                         output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
@@ -1323,8 +1287,12 @@ mod tests {
         assert_eq!(tool["content"], "file body");
     }
 
+    /// The Chat codec never projects tool schemas — the registered schema is the host contract and
+    /// only a gateway that needs a dialect view rewrites it. Gemini reaches flux through OpenRouter,
+    /// whose codec carries that projection (see the cross-codec sweep in `lib.rs`); a Gemini-shaped
+    /// model id arriving here must still be forwarded verbatim.
     #[test]
-    fn openrouter_chat_projects_gemini_schemas_without_affecting_openai_chat() {
+    fn openai_chat_forwards_tool_schemas_verbatim() {
         let mut req = Request::new("google/gemini-3.5-flash", "hi");
         req.tools.push(flux_provider::ToolDef {
             name: "records.merge".into(),
@@ -1337,17 +1305,8 @@ mod tests {
         });
         let original = req.clone();
 
-        let gemini = OpenRouterChat.build_body(&req).unwrap();
         let openai = OpenAiChat.build_body(&req).unwrap();
 
-        assert_eq!(
-            gemini["tools"][0]["function"]["parameters"]["properties"]["records"]["items"],
-            json!({})
-        );
-        assert_eq!(
-            gemini["tools"][0]["function"]["parameters"]["properties"]["label"],
-            json!({})
-        );
         assert!(
             openai["tools"][0]["function"]["parameters"]["properties"]["records"]
                 .get("items")
@@ -1523,6 +1482,81 @@ mod tests {
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.context_tokens(), 1000);
+    }
+
+    /// C-171: the chat wire reports a cache-WRITE tier too
+    /// (`prompt_tokens_details.cache_write_tokens`), and it used to be dropped — every affected row
+    /// in `flux usage` showed a blank cache-write column, so a cached prefix looked like it appeared
+    /// from nowhere. Both tiers are portions OF `prompt_tokens`, so neither may be double-counted
+    /// into fresh input and the context total must still equal the prompt.
+    #[tokio::test]
+    async fn chat_usage_captures_cache_write_tokens() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\
+             \"prompt_tokens_details\":{\"cached_tokens\":600,\"cache_write_tokens\":300}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let u = last_chat_usage(sse).await.expect("usage chunk");
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.cache_creation_input_tokens, 300);
+        assert_eq!(u.input_tokens, 100); // 1000 prompt - 600 read - 300 written
+        assert_eq!(u.context_tokens(), 1000);
+    }
+
+    /// The tiers arrive straight off the wire, so their SUM must be checked too, not just the
+    /// subtraction. A corrupt or hostile frame reporting a huge `cached_tokens` alongside any
+    /// non-zero write would otherwise overflow the addition — a panic inside the stream generator in
+    /// debug (killing the turn), and in release a wrap that makes the subtraction *succeed* and
+    /// publishes garbage as fresh input.
+    #[test]
+    fn prompt_tier_split_survives_an_overflowing_pair() {
+        assert_eq!(
+            split_prompt_tiers(1_000, u64::MAX, 1, "chat"),
+            (1_000, 0, 0)
+        );
+        assert_eq!(
+            split_prompt_tiers(1_000, u64::MAX, u64::MAX, "responses"),
+            (1_000, 0, 0)
+        );
+        // The ordinary case is untouched: both tiers are subsets of the total.
+        assert_eq!(split_prompt_tiers(1_000, 600, 300, "chat"), (100, 600, 300));
+        // Exactly consumed by the tiers — no fresh input, but a valid split.
+        assert_eq!(split_prompt_tiers(900, 600, 300, "chat"), (0, 600, 300));
+    }
+
+    /// The guard for a backend that reports the tiers *in addition* to the prompt total rather than
+    /// as subsets of it: a bare subtraction would clamp fresh input to 0 while the context total
+    /// over-counted the prompt — silent cost inflation. Trust the total, drop the breakdown.
+    #[tokio::test]
+    async fn chat_usage_keeps_the_prompt_total_when_the_tiers_are_not_subsets() {
+        let sse = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\
+             \"prompt_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":300}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let u = last_chat_usage(sse).await.expect("usage chunk");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cache_read_input_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.context_tokens(), 100);
+    }
+
+    /// Drive `map_chat_stream` with a fixture SSE body and return the last usage chunk.
+    async fn last_chat_usage(sse: &'static str) -> Option<flux_core::Usage> {
+        let byte_stream: ByteStream =
+            Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(sse)) },
+            ));
+        let mut usage = None;
+        let stream = map_chat_stream(byte_stream);
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let Chunk::Usage(u) = chunk.unwrap() {
+                usage = Some(u);
+            }
+        }
+        usage
     }
 
     /// C-34: the final chat-completions SSE usage frame carries OpenRouter's `cost` field — the

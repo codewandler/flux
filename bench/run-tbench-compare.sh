@@ -22,7 +22,7 @@
 #   FLUX_TBC_BASELINE  baseline git ref             (default b528772)
 #   FLUX_TBC_TASKS     comma-separated task ids     (default chess-best-move,fibonacci-server)
 #   FLUX_TBC_TRIALS    trials per task per leg      (default 3)
-#   FLUX_TBC_MODEL     provider/model spec          (default openrouter-anthropic/anthropic/claude-sonnet-4.6)
+#   FLUX_TBC_MODEL     provider/model spec          (default openrouter/anthropic/claude-sonnet-4.6)
 #   FLUX_TBC_DATASET   tb dataset                   (default terminal-bench-core==0.1.1)
 #   FLUX_TBC_TIMEOUT   per-agent timeout, secs      (default 600)
 #   FLUX_TBC_OUT       results dir                  (default bench/tbench-compare/results/<ts>)
@@ -35,7 +35,7 @@ ts="$(date +%Y%m%d-%H%M%S)"
 baseline_ref="${FLUX_TBC_BASELINE:-b528772}"
 tasks="${FLUX_TBC_TASKS:-chess-best-move,fibonacci-server}"
 trials="${FLUX_TBC_TRIALS:-3}"
-model="${FLUX_TBC_MODEL:-openrouter-anthropic/anthropic/claude-sonnet-4.6}"
+model="${FLUX_TBC_MODEL:-openrouter/anthropic/claude-sonnet-4.6}"
 dataset="${FLUX_TBC_DATASET:-terminal-bench-core==0.1.1}"
 agent_timeout="${FLUX_TBC_TIMEOUT:-600}"
 out="${FLUX_TBC_OUT:-bench/tbench-compare/results/$ts}"

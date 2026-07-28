@@ -12,6 +12,23 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **Claude models through OpenRouter got much cheaper.** They were being billed at full price on
+  every request because prompt caching never applied to them — the reuse discount other providers
+  got simply was not being asked for. It is now, and OpenRouter models also return their tool calls
+  cleanly instead of occasionally emitting them as stray text.
+
+### Action needed
+
+- **`openrouter-anthropic` is now just `openrouter`.** If you use a model spec, config entry, or
+  role that starts with `openrouter-anthropic/`, drop the `-anthropic`: `openrouter-anthropic/z-ai/glm-4.6`
+  becomes `openrouter/z-ai/glm-4.6`. The model name itself does not change. There was never a real
+  difference between the two — but because `openrouter/anthropic/…` is the spelling people reach
+  for, the one that cached properly was the one nobody used. Now there is only one, and it is the
+  good one. A spec still using the old name fails immediately and tells you the new spelling; past
+  usage and cost history are unaffected.
+
 ## [0.30.1] - 2026-07-28
 
 ### New

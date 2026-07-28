@@ -10,14 +10,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
 
-use crate::messages::{build_messages_body, map_messages_stream, MessagesQuirks, ProviderProfile};
+use crate::anthropic::AnthropicMessages;
+use crate::messages::{MessagesQuirks, ProviderProfile};
 use flux_core::Result;
-use flux_provider::{ByteStream, ChunkStream, Credential, NativeProvider, Request, WireCodec};
+use flux_provider::{Credential, NativeProvider};
 
 const DEFAULT_MESSAGES_ENDPOINT: &str = "http://localhost:11434/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 // ---------------------------------------------------------------------------
 // Quirks profile
@@ -46,20 +45,11 @@ impl ProviderProfile for OllamaProfile {
 // ---------------------------------------------------------------------------
 
 /// Ollama's Anthropic-Messages-compatible wire (`POST {host}/v1/messages`, SSE streaming).
-pub struct OllamaMessages;
-
-impl WireCodec for OllamaMessages {
-    fn build_body(&self, req: &Request) -> Result<Value> {
-        build_messages_body(req, &OllamaProfile.quirks_for(&req.model))
-    }
-
-    fn map_stream(&self, bytes: ByteStream) -> ChunkStream {
-        map_messages_stream(bytes)
-    }
-
-    fn wire_headers(&self) -> Vec<(&'static str, String)> {
-        vec![("anthropic-version", ANTHROPIC_VERSION.to_string())]
-    }
+///
+/// No codec of its own since C-168 — the shared [`AnthropicMessages`] under [`OllamaProfile`], with
+/// tool schemas forwarded verbatim (local models take the registered schema as-is).
+pub fn ollama_messages_codec() -> AnthropicMessages {
+    AnthropicMessages::new(Arc::new(OllamaProfile))
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +97,7 @@ fn ollama_messages_endpoint() -> String {
 pub fn ollama_anthropic_api() -> NativeProvider {
     NativeProvider::new(
         "ollama-anthropic",
-        Arc::new(OllamaMessages),
+        Arc::new(ollama_messages_codec()),
         Arc::new(NoAuthOllama {
             endpoint: ollama_messages_endpoint(),
         }),
@@ -117,6 +107,7 @@ pub fn ollama_anthropic_api() -> NativeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_provider::{Request, WireCodec};
 
     #[test]
     fn profile_omits_anthropic_only_fields() {
@@ -133,7 +124,7 @@ mod tests {
         let req = Request::new("qwen2.5-coder:7b", "hi")
             .with_system(big)
             .with_effort(flux_provider::Effort::High);
-        let body = OllamaMessages.build_body(&req).unwrap();
+        let body = ollama_messages_codec().build_body(&req).unwrap();
         assert!(body["system"].is_string()); // no cache_control array
         assert!(body.get("output_config").is_none());
         assert!(body.get("provider").is_none());

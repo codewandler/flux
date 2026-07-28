@@ -1393,8 +1393,13 @@ mod tests {
         assert_eq!(super::auth_row_for_spec("fable"), Some("anthropic"));
         assert_eq!(super::auth_row_for_spec("claude"), Some("claude"));
         assert_eq!(super::auth_row_for_spec("claude/sonnet"), Some("claude"));
+        // C-169: one OpenRouter key, one row, for every model the gateway proxies.
         assert_eq!(
-            super::auth_row_for_spec("openrouter-anthropic/x"),
+            super::auth_row_for_spec("openrouter/anthropic/claude-opus-4.6"),
+            Some("openrouter")
+        );
+        assert_eq!(
+            super::auth_row_for_spec("openrouter/google/gemini-3.5-flash"),
             Some("openrouter")
         );
         assert_eq!(super::auth_row_for_spec("ollama/llama"), None);

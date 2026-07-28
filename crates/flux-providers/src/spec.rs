@@ -21,10 +21,22 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "codex",
     "aws",
     "openrouter",
-    "openrouter-anthropic",
     "ollama",
     "ollama-anthropic",
 ];
+
+/// Providers retired in favour of a gateway that now serves their traffic, mapped to the
+/// replacement, so a stale spec fails with the new spelling instead of a bare "unknown provider"
+/// list (C-169).
+const RETIRED_PROVIDERS: &[(&str, &str)] = &[("openrouter-anthropic", "openrouter")];
+
+/// The gateway that replaced a retired provider name, if `provider` names one.
+fn retired_provider(provider: &str) -> Option<&'static str> {
+    RETIRED_PROVIDERS
+        .iter()
+        .find(|(retired, _)| *retired == provider)
+        .map(|(_, gateway)| *gateway)
+}
 
 /// The provider prefix a `provider/model` spec resolves to — the part before `/`, or a bare short
 /// alias mapped to its provider (`sonnet`/`opus`/`haiku`/`fable`/`mock` → `anthropic`, bare
@@ -66,6 +78,16 @@ pub fn parse_model_spec(spec: &str) -> Result<(String, String)> {
                 )));
             }
             Ok((p.to_string(), m.to_string()))
+        }
+        // A provider that used to exist gets its replacement named, not a bare list to scan: the
+        // model id is unchanged, only the prefix moved (C-169). The two names always addressed the
+        // same endpoint, so this is a pure rename — nothing about the request changes.
+        Some((p, m)) if retired_provider(p).is_some() => {
+            let gateway = retired_provider(p).expect("guarded by the arm");
+            Err(Error::Other(format!(
+                "provider `{p}` was retired — `{gateway}` now serves every model over that same \
+                 endpoint, so write `{gateway}/{m}`"
+            )))
         }
         Some((p, _)) => Err(Error::Other(format!(
             "unknown provider `{p}` — use one of: {}",
@@ -168,12 +190,13 @@ fn build_parsed(
             .map_err(|e| Error::Other(format!("anthropic provider: {e}")))?,
         "openai" => crate::openai::openai_from_env()
             .map_err(|e| Error::Other(format!("openai provider: {e}")))?,
-        "openrouter" => crate::openai::openrouter_from_env()
+        // OpenRouter speaks the Anthropic Messages protocol for every model it proxies, so that is
+        // the wire flux uses (C-169). It is strictly better on both axes that matter: Anthropic-
+        // served slugs honour `cache_control` breakpoints (the Chat wire emits none, which ran them
+        // at 0% cache), and every vendor returns structured `tool_use` blocks instead of leaking
+        // `<tool_call>` markup as text. Reaching it used to require a second provider name.
+        "openrouter" => crate::openrouter::openrouter_messages_from_env()
             .map_err(|e| Error::Other(format!("openrouter provider: {e}")))?,
-        // OpenRouter over its native Anthropic Messages endpoint — tool calls come back as
-        // structured `tool_use` blocks instead of leaking as `<tool_call>` text on the Chat path.
-        "openrouter-anthropic" => crate::openrouter::openrouter_anthropic_from_env()
-            .map_err(|e| Error::Other(format!("openrouter-anthropic provider: {e}")))?,
         "ollama" => crate::openai::ollama_api(),
         // Local ollama over its Anthropic Messages endpoint (latest ollama), for native tool calls.
         "ollama-anthropic" => crate::ollama::ollama_anthropic_api(),
@@ -495,6 +518,43 @@ mod tests {
         let err = parse_model_spec("gpt-5.5").unwrap_err().to_string();
         assert!(err.contains("claude/sonnet"), "unexpected: {err}");
         assert!(!err.contains("claude/gpt-5.5"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn openrouter_specs_keep_the_vendor_segment_in_the_model_id() {
+        // C-169: an OpenRouter spec is a triple — `openrouter/<vendor>/<model_id>` — because the
+        // vendor prefix is part of OpenRouter's own model id. The parser splits once, so the vendor
+        // segment must survive into the model rather than being eaten as a second provider.
+        for (spec, model) in [
+            (
+                "openrouter/anthropic/claude-opus-4.6",
+                "anthropic/claude-opus-4.6",
+            ),
+            ("openrouter/z-ai/glm-4.6", "z-ai/glm-4.6"),
+            (
+                "openrouter/deepseek/deepseek-v4-flash:nitro",
+                "deepseek/deepseek-v4-flash:nitro",
+            ),
+        ] {
+            let (provider, parsed) = parse_model_spec(spec).unwrap();
+            assert_eq!(provider, "openrouter", "{spec}");
+            assert_eq!(parsed, model, "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_retired_openrouter_anthropic_provider_names_its_replacement() {
+        // C-169: the model id is unchanged, only the prefix moved — so say that, rather than
+        // dumping the known-provider list and leaving the reader to guess the new spelling.
+        let err = parse_model_spec("openrouter-anthropic/anthropic/claude-sonnet-4.6")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was retired"), "unexpected: {err}");
+        assert!(
+            err.contains("`openrouter/anthropic/claude-sonnet-4.6`"),
+            "names the new spelling: {err}"
+        );
+        assert!(!KNOWN_PROVIDERS.contains(&"openrouter-anthropic"));
     }
 
     #[test]

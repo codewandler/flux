@@ -45,16 +45,24 @@ if [ ! -x "$FLUX" ]; then
 fi
 
 # The control arm's kill switch depends on the wire, because the two wires cache differently:
-#   Anthropic Messages (anthropic/claude/bedrock/openrouter-anthropic) — explicit breakpoints, so the
-#     variable is the conversation-tail breakpoint: FLUX_CACHE_TAIL=off.
+#   Anthropic Messages (anthropic/claude/aws/openrouter/ollama-anthropic) — explicit breakpoints, so
+#     the variable is the conversation-tail breakpoint: FLUX_CACHE_TAIL=off.
 #   OpenAI Responses (codex/openai) — automatic prefix caching, so the variables are the routing key
 #     and keeping per-turn text out of `instructions`: FLUX_RESPONSES_CACHE=off.
 # A spec with no `provider/` prefix leaves ${MODEL%%/*} equal to the whole string, so match the
 # bare model id too — otherwise a Responses model picks the Anthropic kill switch, which does
 # nothing on that wire, and BOTH arms run the identical body while reporting "no difference".
+#
+# C-169/C-172: `openrouter*` used to be a lie here. It matched the plain chat path, which emitted no
+# breakpoints at all, so FLUX_CACHE_TAIL did nothing and both arms ran byte-identical bodies while
+# the harness dutifully reported "no difference" — the same failure the unprefixed-spec guard below
+# exists to prevent, one level up. It is now true: every OpenRouter model rides the Messages wire.
+# Ordering matters if a variant ever needs a DIFFERENT switch from its parent: a bare `openrouter*`
+# /`ollama*` glob swallows every longer form, so the specific arm has to come first. Today both
+# ollama spellings want FLUX_CACHE_TAIL, so one glob covers them.
 case "$MODEL" in
   codex/*|openai/*|gpt-*|o[0-9]*|*-codex) KILL_SWITCH="FLUX_RESPONSES_CACHE" ;;
-  anthropic/*|claude/*|aws/*|openrouter*|ollama*) KILL_SWITCH="FLUX_CACHE_TAIL" ;;
+  anthropic/*|claude/*|aws/*|openrouter/*|ollama*) KILL_SWITCH="FLUX_CACHE_TAIL" ;;
   *)
     echo "unrecognised model spec '$MODEL' — prefix it with its provider (claude/…, codex/…) so the" >&2
     echo "control arm can pick the right kill switch; otherwise both arms run the same body." >&2

@@ -120,8 +120,7 @@ flux auth login claude   # optional opt-in OAuth path
 | --- | --- | --- |
 | `anthropic` | Anthropic Messages | `ANTHROPIC_API_KEY` |
 | `openai` | OpenAI Chat | `OPENAI_API_KEY` |
-| `openrouter` | OpenAI Chat | `OPENROUTER_API_KEY` |
-| `openrouter-anthropic` | Anthropic Messages | `OPENROUTER_API_KEY` |
+| `openrouter` | Anthropic Messages | `OPENROUTER_API_KEY` |
 | `ollama` | OpenAI Chat | local |
 | `ollama-anthropic` | Anthropic Messages | local |
 | `claude` | Anthropic Messages | Claude subscription OAuth (`~/.claude/.credentials.json`) |

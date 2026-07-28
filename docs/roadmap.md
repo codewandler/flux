@@ -83,7 +83,46 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
 > and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### MariaDB / MySQL in the `sql` plugin (epic) — ✅ **IMPLEMENTED 2026-07-28 (D-196…D-198, all three stories; unreleased)**
+### Unify the Anthropic Messages provider — gateways become config (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-168…C-172, all five stories; unreleased)**
+
+The [LLM cache review](designs/llm-cache-review.md) closed with one finding it deliberately left
+unfiled, because the epic was scoped to `claude` and `codex`: `openrouter/anthropic/*` runs at
+**literally 0% cached**. Ninety days of `flux usage` sharpens it — `openrouter/anthropic/claude-fable-5`
+($13.76) and `openrouter/anthropic/claude-opus-4.6` ($11.10), **$24.86 across 3.1M tokens in 32 days**,
+and unlike the subscription-billed `claude/*` and `codex/*` rows this is metered cash: ~82% of real
+spend. The same vendor one row down, via `openrouter-anthropic`, hits **69%**. So the fix already
+exists — it just lives behind a *second provider name* that nobody types, while the obvious spelling
+lands on the chat codec, which consults no `ProviderProfile` and therefore emits no `cache_control`
+(and, per `spec.rs:174`, leaks tool calls as `<tool_call>` text instead of returning structured
+blocks). The root cause is structural: a `WireCodec` **hardcodes** its quirks profile, so "the same
+protocol over a different gateway" can only be said by writing another codec — and `OpenRouterMessages`
+and `OllamaMessages` differ from `AnthropicMessages` by exactly one line each. The epic collapses
+them: **C-168** makes the profile a constructor argument and deletes both duplicates (`BedrockAnthropic`
+stays — version-in-body, field stripping and binary event-stream decoding are real wire behaviour, not
+config); **C-169** makes OpenRouter's Messages endpoint the *only* wire flux uses for that gateway and
+deletes `OpenRouterChat`, retiring `openrouter-anthropic` outright (BREAKING — a public const and a
+user-facing name ⇒ next MINOR). That last decision changed mid-implementation: routing by vendor
+segment would have stranded the GLM/qwen/deepseek-over-Messages route the docs already recommend,
+since the endpoint is model-agnostic and returns structured `tool_use` for every vendor — one wire is
+both simpler and strictly better. The retired name stays recognised by the *pricing parser* (the event
+store is append-only, so historical rows must keep splitting the same way) while leaving the set of
+selectable providers; **C-170** verifies then enables the 1h stable-prefix
+TTL through the gateways, currently off and commented "Unverified"; **C-171** decodes the cache-write
+tokens the chat wire drops for every OpenRouter row; **C-172** repairs the A/B harness, whose
+`openrouter*` glob picks a kill switch that does nothing on the chat wire, so both arms run identical
+bodies while reporting "no difference". Done means the spelling users type is the one that caches, one
+codec implements the protocol for every non-Bedrock transport, and the win carries a measured
+before/after. **Result:** on the identical prompt back to back, `openrouter/anthropic/claude-opus-4.6`
+goes 0% → **62%** cached and **$0.0473 → $0.0194** — and that understates it, because the control is
+not a flag but 32 days of history in which the old path wrote *zero* cache tokens across 91 calls, so
+there was never anything to read. The 1h TTL was verified before being enabled (a probe put 7725
+tokens in `ephemeral_1h_input_tokens` where the plain form put them in the 5m tier, even with
+OpenRouter routing to Bedrock upstream); Bedrock-direct stays off, deliberately unverified. Two
+follow-ups are recorded rather than assumed: Bedrock's own 1h probe, and why DeepSeek reports no cache
+split on the Messages wire. Design:
+[designs/messages-provider-unification.md](designs/messages-provider-unification.md).
+
+### MariaDB / MySQL in the `sql` plugin (epic) — ✅ **SHIPPED v0.30.1 (2026-07-28; D-196…D-198, all three stories)**
 
 An external user pointed a MariaDB endpoint at the `sql` plugin and got
 `mysql is not yet supported by the flux sql plugin (residual)`. The message is accurate — `mariadb`
@@ -158,7 +197,7 @@ the wire, `host-kit` publishes with the pack instead of the flux closure, and a 
 the tree instead of leaving it half-rolled. Design:
 [designs/plugin-protocol-decoupling.md](designs/plugin-protocol-decoupling.md) (see "As built").
 
-### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-133…C-140 + A-95, all nine stories; unreleased)**
+### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — ✅ **SHIPPED v0.30.0 (2026-07-28; C-133…C-140 + A-95, all nine stories)**
 
 A-03 made the planner *prefix* cache-stable and live-verified a 99% cross-process hit. That fix
 still works — and it is also the entire extent of prompt caching in flux. Reading the request path

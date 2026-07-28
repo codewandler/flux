@@ -48,7 +48,7 @@ all sessions:
 Rows are keyed by the canonical spec, so aliases (`sonnet`), Bedrock regional routing prefixes
 (`us.anthropic.…`), and bare model ids all fold into stable per-provider keys. An OpenRouter
 passthrough call keeps the *serving* provider as the outer prefix — e.g.
-`openrouter-anthropic/anthropic/claude-sonnet-4.6` — so spend always lands under the provider that
+`openrouter/anthropic/claude-sonnet-4.6` — so spend always lands under the provider that
 bills for it, while pricing still resolves through the embedded model id.
 
 ## Unpriced models

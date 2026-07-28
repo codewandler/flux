@@ -13,7 +13,7 @@
           { "kind": "lit", "value": {
             "adapter": "synthetic",
             "trials": 1,
-            "model": "openrouter-anthropic/anthropic/claude-sonnet-4.6"
+            "model": "openrouter/anthropic/claude-sonnet-4.6"
           } }
         ]
       }

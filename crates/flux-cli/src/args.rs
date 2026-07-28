@@ -82,8 +82,9 @@ pub(super) struct AgentFlags {
     /// Fully-qualified `provider/model` spec. Provider must be one of:
     ///   `anthropic` (API key), `claude` (OAuth/subscription), `openai`, `codex`, `aws` (Claude
     ///   via AWS Bedrock; credentials from the AWS chain — env, `aws sso login` + `AWS_PROFILE`,
-    ///   IRSA, or EKS Pod Identity — no `aws` CLI needed), `openrouter` (OpenAI Chat wire),
-    ///   `openrouter-anthropic` (OpenRouter's native Messages endpoint — leak-proof tool calls),
+    ///   IRSA, or EKS Pod Identity — no `aws` CLI needed), `openrouter` (every model over its
+    ///   native Anthropic Messages endpoint — structured tool calls, and prompt caching on
+    ///   `anthropic/…` slugs; specs read `openrouter/<vendor>/<model>`),
     ///   `ollama` (local, OpenAI Chat wire), `ollama-anthropic` (local Messages endpoint).
     ///   Short aliases `sonnet`, `opus`, `haiku`, `fable` are shorthands for `anthropic/<model>`;
     ///   bare `claude` is shorthand for `claude/sonnet` (the subscription's default model); bare
@@ -91,7 +92,7 @@ pub(super) struct AgentFlags {
     ///   legacy `*-codex` ids are rejected by the backend); bare `aws` (or `aws/sonnet`,
     ///   `aws/opus`, `aws/haiku`) resolves to the region's Bedrock inference profile.
     /// Examples: `claude/claude-sonnet-4-6`, `openai/gpt-5.6`, `codex/gpt-5.6-sol`,
-    ///   `aws/us.anthropic.claude-sonnet-4-6`, `openrouter-anthropic/z-ai/glm-4.6`.
+    ///   `aws/us.anthropic.claude-sonnet-4-6`, `openrouter/anthropic/claude-opus-4.6`.
     /// Overrides `model` in `.flux/config.toml`; falls back to `sonnet` (= `anthropic/claude-sonnet-5`).
     #[arg(short = 'm', long)]
     pub(super) model: Option<String>,
@@ -303,13 +304,13 @@ pub(super) enum Commands {
     },
     /// Run a benchmark suite against flux and print a summary.
     #[command(
-        after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter-anthropic/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench"
+        after_help = "ADAPTERS:\n  synthetic       real-model coding riddles (fast, no Docker)\n  mock            offline CI fixture (drives -m mock)\n  terminal-bench  the real Docker benchmark\n  multi           several behind one combined score (with --members)\n\nEXAMPLES:\n  flux eval synthetic -m openrouter/anthropic/claude-sonnet-4.6 --watch --report r.md\n  flux eval multi --members synthetic,terminal-bench"
     )]
     Eval {
         /// Which suite to run.
         #[arg(value_enum)]
         adapter: EvalAdapter,
-        /// Model the suite's agent runs (e.g. `-m mock`, `-m openrouter-anthropic/anthropic/claude-sonnet-4.6`).
+        /// Model the suite's agent runs (e.g. `-m mock`, `-m openrouter/anthropic/claude-sonnet-4.6`).
         #[arg(short = 'm', long)]
         model: Option<String>,
         /// Restrict to these task ids (comma-separated).

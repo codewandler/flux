@@ -16,7 +16,8 @@ pub(super) fn auth_row_for_spec(spec: &str) -> Option<&'static str> {
         "claude" => Some("claude"),
         "openai" => Some("openai"),
         "codex" => Some("codex"),
-        "openrouter" | "openrouter-anthropic" => Some("openrouter"),
+        // One key, one row, for every model the gateway proxies (C-169).
+        "openrouter" => Some("openrouter"),
         // `aws` (not a listed status row) and local `ollama*` (keyless) have no row to mark active.
         _ => None,
     }
