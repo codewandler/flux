@@ -5,7 +5,6 @@ pillar: Agent
 status: done
 epic: deterministic-agent-lab
 design: docs/designs/deterministic-agent-lab.md
-priority: 1
 note: "review finding (2026-07-28): session-wide fold can fast-forward on a PREVIOUS turn's progress or serve a previous turn's cells"
 ---
 
