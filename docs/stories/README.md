@@ -98,6 +98,11 @@ _A read of `crates/flux-lsp/src/main.rs` (1800 lines, one file) against what `in
 ### Monetary Budgets
 - [C-130 — Monetary budgets & quotas — hard spend enforcement (epic)](C-130-monetary-budgets-epic.md) · Core · EPIC — cost is observed (usage events, pricing, OpenRouter reported cost) but never enforced; add [budget] config with per-session/per-agent/rolling-per-day currency caps: soft threshold warns into context, hard cap stops before the next model call with a resumable suspension; per-principal caps for A2A/serve; distinct from token turn-budgets (A-10/A-26)
 
+### plugin protocol decoupling — a release that leaves the plugin pack alone
+_The plugin pack pays a release tax it does not owe. `scripts/cut-release.sh` rewrites_
+- [C-166 — Keep the plugin compat test an ACROSS-TIME test, not a same-generation one](C-166-pin-an-old-pack-for-the-compat-test.md) · Core · check-plugin-compat.sh resolves the LATEST plugins-v* release, so a fresh pack release silently downgrades it from "yesterday's binary still works" to "today's binary works"
+- [C-167 — Fail loudly when host-kit lags the protocol version it is built against](C-167-guard-host-kit-protocol-drift.md) · Core · host-kit publishes only from a pack release, so a wire change can ship flux-plugin-protocol to crates.io while host-kit silently stays behind — the drift the old lockstep prevented by construction
+
 ### Quorum Approval
 - [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
 
