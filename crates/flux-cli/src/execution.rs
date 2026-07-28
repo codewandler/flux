@@ -2039,6 +2039,7 @@ mod execution_environment_conformance {
             None,
             Arc::new(EventStore::in_memory().unwrap()),
             HostPermissionRules::default(),
+            Vec::new(),
         )
         .expect("assemble App through explicit environment");
         assert_probe_contract(app.registry(), &expected_spec, "App");

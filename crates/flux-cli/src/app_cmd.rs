@@ -310,6 +310,13 @@ pub(super) async fn run_app(
                  `[server] introspect_url` for per-request principal auth), or bind 127.0.0.1"
             );
         }
+        // C-183: this is the whole surface of the old `flux serve` — `build_agent` here is the exact
+        // same call the interactive CLI path uses, so it already resolves + installs `[tools]
+        // disable` (C-162's `build_agent_with`) with no separate wiring needed. `flux_server::serve`
+        // just runs turns on the returned `agent`; it derives no second executor. Covered by C-162's
+        // own tests (`resolve_disabled_*` in flux-runtime, `disabled_ops_*` in flux-flow, and the
+        // real-binary `tools_disable_unmatched_entry_warns_at_startup` in flux-cli's mock_smoke.rs —
+        // that test drives `flux run`, which shares this exact function).
         let (agent, _session_id, _spec, _spawner) = build_agent(flags).await?;
         return flux_server::serve(&addr, agent, auth).await;
     };
@@ -491,6 +498,11 @@ pub(super) async fn run_app(
     )
     .with_workspace(app_workspace)
     .with_redactor(redactor);
+    // C-183: same `[tools] disable` config C-162 wires into the interactive path — the raw
+    // patterns are handed through so `flux_app::Engine` can resolve them (via
+    // `ToolRegistry::resolve_disabled`, C-162's one implementation) once against its own
+    // fully-assembled registry and install the result on every journey's and every per-agent
+    // engine's executor.
     let app = std::sync::Arc::new(flux_app::App::try_with_execution_environment(
         program,
         provider,
@@ -502,6 +514,7 @@ pub(super) async fn run_app(
             allow: cfg.permissions.allow.clone(),
             deny: cfg.permissions.deny.clone(),
         },
+        cfg.tools.disable.clone(),
     )?);
     let channels = flux_channels::build_channels(&channel_decls)?;
     // Serve stdin when an interactive `cli` channel is declared, or when the program declares no

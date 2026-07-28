@@ -341,6 +341,7 @@ impl App {
                 sub_agents,
                 events,
                 host_permissions,
+                Vec::new(),
             )?,
         })
     }
@@ -352,6 +353,16 @@ impl App {
     /// cognition, and orchestration ops onto that catalog while retaining the same system,
     /// redactor, approval posture, policy, and identity for both journeys and lazily-created agent
     /// engines. No process current-directory lookup occurs here or during lazy agent construction.
+    ///
+    /// `disabled` is the raw `[tools] disable` patterns (flux C-183) — exact op names or
+    /// `family.*` globs. Resolved exactly once here, against the fully assembled registry
+    /// (built-ins, cognition, orchestration ops, and the environment's contributed catalog), before
+    /// any journey or agent-target engine is constructed, so the resolved set can never churn
+    /// mid-run (the A-95 stability rule) and is installed identically on every derived executor —
+    /// both plain journeys (`build_executor`) and lazily-created per-agent engines
+    /// (`agent_engine`/`build_agent_engine`) share the one `execution` template this resolves onto.
+    /// An entry matching no known op prints a startup warning naming the entry, matching the
+    /// interactive CLI path's wording.
     #[allow(clippy::too_many_arguments)]
     pub fn try_with_execution_environment(
         program: Program,
@@ -361,6 +372,7 @@ impl App {
         sub_agents: Option<SubAgents>,
         events: Arc<EventStore>,
         host_permissions: HostPermissionRules,
+        disabled: Vec<String>,
     ) -> Result<Self> {
         let app = App {
             engine: Engine::new(
@@ -371,6 +383,7 @@ impl App {
                 sub_agents,
                 events,
                 host_permissions,
+                disabled,
             )?,
         };
         app.engine.validate()?;
@@ -786,6 +799,8 @@ fn validate_body_calls(
 }
 
 impl Engine {
+    /// `disabled` is the raw `[tools] disable` patterns (flux C-183), resolved here against the
+    /// fully-assembled registry — see [`App::try_with_execution_environment`] for the full contract.
     #[allow(clippy::too_many_arguments)]
     fn new(
         program: Program,
@@ -795,6 +810,7 @@ impl Engine {
         sub_agents: Option<SubAgents>,
         events: Arc<EventStore>,
         host_permissions: HostPermissionRules,
+        disabled: Vec<String>,
     ) -> Result<Arc<Self>> {
         let bus = Bus::new();
         let channels = Arc::new(program.channels.clone());
@@ -843,7 +859,22 @@ impl Engine {
                 }
                 sa.with_audit(events.clone()).into_spawner(system.clone())
             });
-            let mut execution = environment.clone().with_registry(registry.clone());
+            // C-183: resolve `[tools] disable` against the now-FULLY-assembled registry (built-ins +
+            // cognition + orchestration ops + the surface's contributed catalog + `task`) — the same
+            // `ToolRegistry::resolve_disabled` C-162 installs on the interactive CLI path, called
+            // exactly once here before any journey or agent-target engine exists. Installing it on
+            // `execution` (the shared per-run template every derived executor clones) is what makes
+            // BOTH plain journeys (`build_executor`) and lazily-built per-agent engines
+            // (`agent_engine`/`build_agent_engine`) enforce the identical set without a second
+            // resolution.
+            let resolved_disabled = registry.resolve_disabled(&disabled);
+            for pattern in &resolved_disabled.unmatched {
+                eprintln!("(warning: [tools] disable entry `{pattern}` matches no known op)");
+            }
+            let mut execution = environment
+                .clone()
+                .with_registry(registry.clone())
+                .with_disabled_ops(resolved_disabled.disabled);
             if let Some(spawner) = &spawner {
                 execution = execution.with_spawner(spawner.clone());
             }
@@ -2962,6 +2993,7 @@ journey pong
             None,
             events.clone(),
             HostPermissionRules::default(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -3027,6 +3059,72 @@ journey pong
         assert!(invalid.is_err(), "invalid cwd unexpectedly built an App");
 
         std::fs::remove_dir_all(base).ok();
+    }
+
+    /// C-183: `flux app run`'s per-agent executors must resolve + install `[tools] disable`
+    /// exactly like the interactive CLI path (C-162) — the app-run assembly seam
+    /// (`App::try_with_execution_environment` → `Engine::agent_engine`) is where this story wires
+    /// the resolution that was previously only reached by the CLI's `build_agent_with`.
+    #[tokio::test]
+    async fn app_run_agent_target_executor_installs_tools_disable() {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-c183-agent-disable-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&dir).unwrap()));
+        let environment = ExecutionEnvironment::new(
+            system,
+            ToolRegistry::new(),
+            PermissionManager::new(),
+            Arc::new(DenyApprover),
+            ExecutionAuthorization::local(),
+        );
+        let events = Arc::new(EventStore::in_memory().unwrap());
+        let program = Program {
+            agents: vec![AgentDecl {
+                name: "worker".into(),
+                model: None,
+                agent_loop: None,
+                tools: vec!["now".into()],
+                datasources: Vec::new(),
+                description: Some("uses now".into()),
+                permissions: None,
+                settings: Value::Null,
+            }],
+            ..Program::default()
+        };
+        let app = App::try_with_execution_environment(
+            program,
+            Some(Arc::new(ReplyProvider { reply: "ok".into() })),
+            "mock",
+            environment,
+            None,
+            events,
+            HostPermissionRules::default(),
+            vec!["now".to_string(), "no-such-op".to_string()],
+        )
+        .expect("assemble App with [tools] disable");
+
+        let engine = app.agent_engine("worker").await.unwrap();
+        assert!(
+            engine.executor.disabled_ops().contains("now"),
+            "the app-run agent-target executor must carry the resolved disabled set, not just \
+             the CLI's interactive executor"
+        );
+        let outcome = engine.executor.dispatch_outcome("now", json!({})).await;
+        assert!(
+            outcome.denied,
+            "a config-disabled op must be refused at dispatch on the app-run agent-target path too"
+        );
+        assert!(
+            outcome.result.content.contains("disabled by config"),
+            "{}",
+            outcome.result.content
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

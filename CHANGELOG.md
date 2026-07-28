@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **C-183: `[tools] disable` now applies to every execution path, not just the interactive one.**
+  C-162 resolved and installed the blocklist only on `build_agent_with` (the `flux run`/REPL/TUI
+  path) — `flux app run <program.flux>` built its own registry and never consulted
+  `cfg.tools.disable`, so a project-wide `browser.*` block silently stopped applying to any
+  program-driven agent. `flux-app`'s engine now resolves the same patterns once against its
+  fully-assembled registry (C-162's `ToolRegistry::resolve_disabled` — no second matcher), warns
+  on unmatched patterns like the interactive path, and installs the result on the one
+  `ExecutionEnvironment` template every journey and per-agent engine derives from (the environment
+  now carries the resolved set into `into_executor()`, so a shared template can't lose it). The
+  no-program `--serve` path already shared `build_agent` with the interactive path and needed no
+  change — verified by tracing, not assumed.
+
 ### Added
 
 - **C-128: `flux doctor` — end-to-end install diagnostics.** Seven data-driven checks, each

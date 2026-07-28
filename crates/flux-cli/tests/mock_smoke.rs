@@ -134,6 +134,44 @@ fn tools_disable_unmatched_entry_warns_at_startup() {
     );
 }
 
+/// C-183: `flux app run` builds its own registry (separately from the interactive `build_agent_with`
+/// path C-162 wired) — it must resolve `[tools] disable` too, including the same visible startup
+/// warning for an unmatched entry, on the previously-unwired app-run assembly seam.
+#[test]
+fn app_run_tools_disable_unmatched_entry_warns_at_startup() {
+    let tmp = TempDir::new("app-run-tools-disable-unmatched");
+    let work = tmp.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(work.join(".flux")).unwrap();
+    std::fs::write(
+        work.join(".flux/config.toml"),
+        "[tools]\ndisable = [\"no-such-op\"]\n",
+    )
+    .unwrap();
+    std::fs::write(work.join("noop.flux"), "flow noop\n  return \"ok\"\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_flux"))
+        .args(["app", "run", "noop.flux", "--yes", "-m", "mock"])
+        .current_dir(work)
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn flux");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "an unmatched disable entry must warn, not fail `flux app run` startup\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("[tools] disable entry `no-such-op` matches no known op"),
+        "{stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn malformed_config_stops_plugin_status_before_native_spawn() {

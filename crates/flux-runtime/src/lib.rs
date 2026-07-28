@@ -1937,6 +1937,13 @@ pub struct ExecutionEnvironment {
     // use the explicit `System` constructor above so every derived executor receives a fresh
     // evidence/read-set context over the same root.
     exact_context: Option<ToolContext>,
+    /// The resolved `[tools] disable` set (C-162/C-183) every executor derived from this
+    /// environment installs via [`Executor::with_disabled_ops`]. Empty by default. Carrying this
+    /// on the environment — rather than requiring every call site to re-apply it after
+    /// `into_executor()` — is what lets a shared environment (e.g. `flux-app`'s per-journey and
+    /// per-agent-target executors, both derived from one template) install the same resolved set
+    /// without a second matching implementation.
+    disabled_ops: HashSet<String>,
 }
 
 impl ExecutionEnvironment {
@@ -1960,6 +1967,7 @@ impl ExecutionEnvironment {
             hooks: Vec::new(),
             workspace: None,
             exact_context: None,
+            disabled_ops: HashSet::new(),
         }
     }
 
@@ -1987,6 +1995,7 @@ impl ExecutionEnvironment {
             hooks: Vec::new(),
             workspace: None,
             exact_context: Some(context),
+            disabled_ops: HashSet::new(),
         }
     }
 
@@ -2076,6 +2085,21 @@ impl ExecutionEnvironment {
         self
     }
 
+    /// Install the resolved `[tools] disable` set (C-162's [`ToolRegistry::resolve_disabled`]) on
+    /// every executor this environment builds. Empty by default (nothing disabled). Callers that
+    /// derive several executors from one cloned environment (surface-contributed catalogs share
+    /// this template) only need to call this once on the shared template — every clone carries it
+    /// through [`Self::into_executor`].
+    pub fn with_disabled_ops(mut self, disabled: HashSet<String>) -> Self {
+        self.disabled_ops = disabled;
+        self
+    }
+
+    /// The resolved `[tools] disable` set this environment will install on derived executors.
+    pub fn disabled_ops(&self) -> &HashSet<String> {
+        &self.disabled_ops
+    }
+
     /// Build the guarded executor. No ambient path lookup or policy defaulting occurs here.
     pub fn into_executor(mut self) -> Executor {
         let context = match self.exact_context.take() {
@@ -2105,6 +2129,7 @@ impl ExecutionEnvironment {
             self.authorization,
         )
         .with_hooks(self.hooks)
+        .with_disabled_ops(self.disabled_ops)
     }
 }
 
@@ -6166,6 +6191,38 @@ mod tests {
             verdict.reason().unwrap(),
             outcome.result.content,
             "authorize and dispatch must agree on the refusal wording"
+        );
+    }
+
+    /// C-183: [`ExecutionEnvironment::with_disabled_ops`] must survive `into_executor()` — this is
+    /// the seam a surface that derives several executors from ONE cloned environment template
+    /// (`flux-app`'s per-journey and per-agent-target executors) relies on to install the identically
+    /// resolved set everywhere without re-deriving it per executor.
+    #[tokio::test]
+    async fn execution_environment_carries_disabled_ops_into_executor() {
+        let fired = Arc::new(AtomicU64::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SideEffectTool(fired.clone())));
+        let executor = ExecutionEnvironment::new(
+            test_ctx().system(),
+            registry,
+            PermissionManager::from_rules(&["boom".to_string()], &[]),
+            Arc::new(DenyApprover),
+            ExecutionAuthorization::local(),
+        )
+        .with_disabled_ops(["boom".to_string()].into_iter().collect())
+        .into_executor();
+
+        assert!(executor.disabled_ops().contains("boom"));
+        let outcome = executor.dispatch_outcome("boom", json!({})).await;
+        assert!(
+            outcome.denied,
+            "an environment-level disabled set must still refuse dispatch once built into an executor"
+        );
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "the op must never actually run"
         );
     }
 
