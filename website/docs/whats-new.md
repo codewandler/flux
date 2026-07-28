@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.31.1] - 2026-07-28
+
 ### New
 
 - **Find a past session without scrolling for it.** `flux sessions` can now search: `--query`

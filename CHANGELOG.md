@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-07-28
+
 ### Fixed
 
 - **C-122: plugin operations now follow a worktree transition.** After `git_worktree_enter`,
