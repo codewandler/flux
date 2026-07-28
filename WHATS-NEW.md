@@ -23,6 +23,10 @@
   comes with a one-line hint for fixing it. `--json` for scripts; the exit code fails only on real
   failures, never on warnings.
 
+- **Send your runs to Grafana.** Builds with the `otel` feature can export a recorded run as
+  OpenTelemetry traces and metrics — the turn, its plans, and every operation as spans with real
+  latency, retry, and cost numbers, plus token/spend/error-rate metrics — to any OTLP collector.
+  Secrets are scrubbed from everything exported, and exporting never changes the run itself.
 - **Organizations can now pin a security baseline.** A managed config file
   (`/etc/flux/config.toml`, or wherever `FLUX_MANAGED_CONFIG` points) loads ahead of user and
   project config. Settings there are defaults users may change — unless the operator *pins* them,

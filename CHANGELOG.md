@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-129: OpenTelemetry export as a projection over the event log.** A new `otel` feature on
+  `codewandler-flux-events` renders a recorded run as OTLP traces and metrics: turn → plan →
+  per-op spans (plan windows from `PlanAttempted` boundaries; model-call spans carry the real
+  `duration_us`/`ttft_us`/retry/oauth/transport counters from C-180..182), plus `flux.tokens`,
+  `flux.spend_usd`, and `flux.ops.total`/`flux.ops.errors` metrics with session/account/agent
+  attributes. Every free-text attribute passes the caller's `Redactor`. The exporter is a pure
+  consumer — a behavior-lock test pins that exporting appends nothing to the stream — and the
+  transport is a hand-rolled OTLP/HTTP+JSON POST over `std::net::TcpStream`, so the feature adds
+  **zero new dependencies** (locked build shows no `Cargo.lock` diff; default build unchanged,
+  proven via `cargo tree`). Tested against an in-process collector stub, including the proto3
+  int64-as-string convention. v1 is replay/batch export of a recorded run; CLI/config wiring and
+  a live-tracing bridge (the C-124 subscriber gap) are recorded follow-ups.
+
 - **C-165: a managed config tier — the floor an operator sets and a local user cannot relax.**
   A third config layer loads ahead of user and project (`/etc/flux/config.toml` on Linux/macOS,
   or exactly the file `$FLUX_MANAGED_CONFIG` names), turning the two-layer everything-is-advisory

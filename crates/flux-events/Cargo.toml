@@ -11,6 +11,13 @@ description = "flux unified append-only event store: one ordered log projected i
 # Opt-in Postgres backend for the EventStore (D-73). The default build stays DB-free and
 # rusqlite-only: `flux-pg` (the sole sqlx owner) is pulled in only when this feature is on.
 postgres = ["dep:flux-pg"]
+# Opt-in OpenTelemetry export (C-129): a pure-consumer projection of the event log into an OTLP
+# span tree + metrics. Adds NO new Cargo dependency at all (gated or not) — see `src/otel.rs`'s
+# module doc for why the OTLP/HTTP-JSON client is hand-rolled over `std::net::TcpStream` rather
+# than the official `opentelemetry`/`opentelemetry-otlp` crates. The only thing this feature turns
+# on is `flux-secret` (already an L0 leaf, already a dev-dependency below) as a REAL dependency, so
+# span/metric attributes can be redacted the same way every other observation surface is.
+otel = ["dep:flux-secret"]
 
 [lib]
 name = "flux_events"
@@ -29,6 +36,10 @@ ulid.workspace = true
 tracing.workspace = true
 # The Postgres driver-owner (sqlx + pool + sync↔async bridge). Optional: gated behind `postgres`.
 flux-pg = { workspace = true, optional = true }
+# The Redactor the `otel` exporter scrubs span/metric attributes through. Optional: gated behind
+# `otel`. (Already present as a dev-dependency below for the C-164 test; this makes it a real,
+# feature-gated production dependency too — flux-secret is an L0 leaf, so no layering concern.)
+flux-secret = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For the PG-only concurrent-append conformance test, which drives `store.append` from a
