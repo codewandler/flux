@@ -7344,6 +7344,82 @@ mod tests {
         );
     }
 
+    /// C-152: queue, session-picker, and help now go through one shared panel helper, so a panel
+    /// whose content doesn't overflow its window is sized EXACTLY `header + body (+ counter)` rows
+    /// tall — no reserved-but-unused row. Before the shared helper, the queue and session panels
+    /// each hand-rolled `visible + 2`, always reserving a counter row even when the counter was
+    /// never rendered; help (which never had a counter) was already exact. Counting `panel_bg`
+    /// rows pins that all three now share the identical, waste-free sizing rule.
+    #[test]
+    fn queue_session_and_help_overlays_size_exactly_to_their_content() {
+        fn panel_bg_rows(terminal: &Terminal<TestBackend>, theme: &Theme) -> usize {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .filter(|&y| {
+                    (0..buffer.area.width)
+                        .any(|x| buffer.cell((x, y)).is_some_and(|c| c.bg == theme.panel_bg))
+                })
+                .count()
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+
+        // Queue: one item, nowhere near the 10-row window — no overflow counter, so the panel is
+        // exactly 2 rows (header + the one item), never 3.
+        let mut state = ChatState::new("mock".into());
+        state.enqueue("only item".into());
+        state.queue_open = true;
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(!screen(&terminal).contains('┌'), "queue overlay: no border");
+        assert_eq!(
+            panel_bg_rows(&terminal, &state.theme),
+            2,
+            "queue overlay: header + 1 row, no reserved blank row"
+        );
+        state.queue_open = false;
+
+        // Session picker: one session, same story.
+        state.session_picker = Some(vec![flux_events::SessionSummary {
+            id: "s_1".into(),
+            model: "mock".into(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            messages: 1,
+            context: Default::default(),
+        }]);
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            !screen(&terminal).contains('┌'),
+            "session overlay: no border"
+        );
+        assert_eq!(
+            panel_bg_rows(&terminal, &state.theme),
+            2,
+            "session overlay: header + 1 row, no reserved blank row"
+        );
+        state.session_picker = None;
+
+        // Help was already exact-fit before C-152; pinned here so all three share one rule going
+        // forward rather than the queue/session pair drifting back to a reserved blank row. A
+        // tall terminal so the panel's full content fits with no height-clipping to muddy the count.
+        let mut tall_terminal = Terminal::new(TestBackend::new(70, 40)).unwrap();
+        state.help_open = true;
+        tall_terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            !screen(&tall_terminal).contains('┌'),
+            "help overlay: no border"
+        );
+        let expected_help_rows = 1 // " help · Esc close " header
+            + HELP_KEYS.len()
+            + 1 // "commands" sub-header
+            + all_slash_commands(&state.file_commands).chunks(2).count();
+        assert_eq!(
+            panel_bg_rows(&tall_terminal, &state.theme),
+            expected_help_rows,
+            "help overlay: exact-fit, unchanged by the shared helper"
+        );
+    }
+
     #[test]
     fn slash_matches_ranks_subsequence_like_at_path_completion() {
         // C-153: slash matching now shares `fuzzy_rank`'s tiering, so a subsequence query finds a

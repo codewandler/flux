@@ -14,6 +14,51 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
+/// A `cap`-row scroll window over `total` items such that `selected` (clamped into range) is
+/// always inside the returned `(start, count)` — the windowing math the queue, session-picker,
+/// and help overlays each used to hand-roll separately (C-152). `count <= cap` and
+/// `count <= total`; never panics at `total == 0` or `total == 1`.
+fn overlay_window(selected: usize, total: usize, cap: usize) -> (usize, usize) {
+    let count = cap.min(total);
+    if count == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(total - 1);
+    let start = selected.saturating_sub(count - 1).min(total - count);
+    (start, count)
+}
+
+/// Shared chrome for the queue, session-picker, and help overlays (C-152): an accent-on-`panel_bg`
+/// header row, the caller's already-styled/windowed body rows, and an optional trailing `n/m`
+/// overflow counter — one `Clear` + `Paragraph` pane sized exactly to its content instead of three
+/// hand-rolled copies. Selection styling and row content stay with the caller; only the shape
+/// (header style, no border, exact-fit sizing) is shared.
+fn render_overlay_panel(
+    frame: &mut Frame,
+    theme: &Theme,
+    header: impl Into<String>,
+    body: Vec<Line<'static>>,
+    counter: Option<(usize, usize)>,
+    max_width: u16,
+) {
+    let width = frame.area().width.min(max_width);
+    let mut lines = vec![Line::styled(
+        header.into(),
+        theme.accent_style().bg(theme.panel_bg),
+    )];
+    lines.extend(body);
+    if let Some((position, total)) = counter {
+        lines.push(Line::styled(
+            format!(" {position}/{total} "),
+            theme.muted_style().bg(theme.panel_bg),
+        ));
+    }
+    let height = (lines.len() as u16).min(frame.area().height);
+    let area = centered(frame.area(), width, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).style(theme.panel_style()), area);
+}
+
 /// Minimum transcript width the empty-state card renders into (C-157) — narrower than this it
 /// would need to wrap onto more lines than a short orientation card is worth, so it is skipped
 /// rather than added as noise (the same narrow-width posture C-102 established for the
@@ -266,64 +311,49 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     );
 
     if state.queue_open && !queued.is_empty() {
-        let visible = queued.len().min(10);
-        let height = (visible as u16 + 2).min(frame.area().height);
-        let area = centered(frame.area(), frame.area().width.min(76), height);
-        frame.render_widget(Clear, area);
+        let (start, visible) = overlay_window(state.queue_sel, queued.len(), 10);
         let selected = state.queue_sel.min(queued.len() - 1);
-        let start = selected
-            .saturating_sub(visible.saturating_sub(1))
-            .min(queued.len().saturating_sub(visible));
-        let mut rows = vec![Line::styled(
+        let rows: Vec<Line> = queued
+            .iter()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+            .map(|(offset, prompt)| {
+                let index = start + offset;
+                let style = if index == selected {
+                    Style::default()
+                        .fg(state.theme.accent)
+                        .bg(state.theme.sel_bg)
+                } else {
+                    state.theme.panel_style()
+                };
+                Line::styled(
+                    format!(
+                        " {}  {}",
+                        index + 1,
+                        truncate(&prompt.replace('\n', " "), 68)
+                    ),
+                    style,
+                )
+            })
+            .collect();
+        let counter = (queued.len() > visible).then_some((selected + 1, queued.len()));
+        render_overlay_panel(
+            frame,
+            &state.theme,
             " queued · Enter edit · Delete remove · Alt-↑/↓ reorder · Esc close ",
-            state.theme.accent_style().bg(state.theme.panel_bg),
-        )];
-        rows.extend(
-            queued
-                .iter()
-                .skip(start)
-                .take(visible)
-                .enumerate()
-                .map(|(offset, prompt)| {
-                    let index = start + offset;
-                    let style = if index == selected {
-                        Style::default()
-                            .fg(state.theme.accent)
-                            .bg(state.theme.sel_bg)
-                    } else {
-                        state.theme.panel_style()
-                    };
-                    Line::styled(
-                        format!(
-                            " {}  {}",
-                            index + 1,
-                            truncate(&prompt.replace('\n', " "), 68)
-                        ),
-                        style,
-                    )
-                }),
+            rows,
+            counter,
+            76,
         );
-        if queued.len() > visible {
-            rows.push(Line::styled(
-                format!(" {}/{} ", selected + 1, queued.len()),
-                state.theme.muted_style().bg(state.theme.panel_bg),
-            ));
-        }
-        frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
     }
 
     if state.session_picker.is_some() {
         // C-153: filtered/ranked through the shared fuzzy matcher, not the raw loaded list.
         let sessions = state.session_picker_matches();
-        let visible = sessions.len().min(12);
-        let height = (visible as u16 + 2).min(frame.area().height);
         let width = frame.area().width.min(76);
-        let area = centered(frame.area(), width, height);
-        frame.render_widget(Clear, area);
+        let (start, visible) = overlay_window(state.session_sel, sessions.len(), 12);
         let selected = state.session_sel.min(sessions.len().saturating_sub(1));
-        let start = selected
-            .saturating_sub(visible.saturating_sub(1))
-            .min(sessions.len().saturating_sub(visible));
         let header = if state.session_query.is_empty() {
             " sessions · type to filter · Enter resume · Esc close ".to_string()
         } else {
@@ -332,10 +362,6 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 state.session_query
             )
         };
-        let mut rows = vec![Line::styled(
-            header,
-            state.theme.accent_style().bg(state.theme.panel_bg),
-        )];
         // C-151: current wall time for each row's relative "… ago" — `humanize::fmt_age` itself
         // stays deterministic (it takes `now_ms` as a parameter); only this live call site reads
         // the clock.
@@ -343,8 +369,12 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        rows.extend(sessions.iter().skip(start).take(visible).enumerate().map(
-            |(offset, session)| {
+        let rows: Vec<Line> = sessions
+            .iter()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+            .map(|(offset, session)| {
                 let index = start + offset;
                 let marker = if session.id == state.session_id {
                     "●"
@@ -364,15 +394,10 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                     state.theme.panel_style()
                 };
                 Line::styled(truncate(&label, width as usize), style)
-            },
-        ));
-        if sessions.len() > visible {
-            rows.push(Line::styled(
-                format!(" {}/{} ", selected + 1, sessions.len()),
-                state.theme.muted_style().bg(state.theme.panel_bg),
-            ));
-        }
-        frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
+            })
+            .collect();
+        let counter = (sessions.len() > visible).then_some((selected + 1, sessions.len()));
+        render_overlay_panel(frame, &state.theme, header, rows, counter, 76);
     }
 
     // C-140: `/usage` overlay — the turn in progress, per round, from the same per-call data
@@ -508,11 +533,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // command-file table (no drift).
     if state.help_open {
         let t = &state.theme;
-        let width = frame.area().width.min(76);
-        let mut rows = vec![Line::styled(
-            " help · Esc close ",
-            t.accent_style().bg(t.panel_bg),
-        )];
+        let mut rows = Vec::new();
         let key_w = HELP_KEYS
             .iter()
             .map(|(k, _)| k.chars().count())
@@ -537,10 +558,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             }
             rows.push(Line::from(spans));
         }
-        let height = (rows.len() as u16).min(frame.area().height);
-        let area = centered(frame.area(), width, height);
-        frame.render_widget(Clear, area);
-        frame.render_widget(Paragraph::new(rows).style(t.panel_style()), area);
+        render_overlay_panel(frame, t, " help · Esc close ", rows, None, 76);
     }
 
     if let Some(view) = &state.approval {
@@ -688,5 +706,57 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 .title(Span::styled(tier_title, tier_style)),
         );
         frame.render_widget(sheet, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C-152: `selected` (clamped into range) is always inside the returned window, for every
+    /// combination of a small `total`/`cap`/`selected` — including `total == 0` and `total == 1`,
+    /// which the three overlays' hand-rolled `saturating_sub` math used to have to get right on
+    /// their own.
+    #[test]
+    fn overlay_window_keeps_selection_visible_and_never_panics() {
+        for total in 0..=6usize {
+            for cap in 0..=6usize {
+                for selected in 0..=8usize {
+                    let (start, count) = overlay_window(selected, total, cap);
+                    assert!(count <= cap, "count <= cap");
+                    assert!(count <= total, "count <= total");
+                    assert!(start + count <= total, "window stays in bounds");
+                    if total > 0 && count > 0 {
+                        let clamped = selected.min(total - 1);
+                        assert!(
+                            clamped >= start && clamped < start + count,
+                            "selected {selected} (clamped {clamped}) not in window \
+                             [{start}, {}) for total={total} cap={cap}",
+                            start + count
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A window smaller than the total scrolls to keep `selected` as the LAST visible row rather
+    /// than clamping to `[0, cap)` and losing it off the bottom.
+    #[test]
+    fn overlay_window_scrolls_to_keep_a_far_selection_visible() {
+        assert_eq!(overlay_window(0, 20, 6), (0, 6));
+        assert_eq!(overlay_window(2, 20, 6), (0, 6));
+        assert_eq!(overlay_window(10, 20, 6), (5, 6));
+        // Near the tail the window pins to the last `cap` items instead of overhanging past it.
+        assert_eq!(overlay_window(19, 20, 6), (14, 6));
+    }
+
+    #[test]
+    fn overlay_window_at_len_zero_and_one_never_panics() {
+        assert_eq!(overlay_window(0, 0, 10), (0, 0));
+        assert_eq!(overlay_window(5, 0, 10), (0, 0));
+        assert_eq!(overlay_window(0, 1, 10), (0, 1));
+        assert_eq!(overlay_window(5, 1, 10), (0, 1));
+        assert_eq!(overlay_window(0, 1, 0), (0, 0));
     }
 }
