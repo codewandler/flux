@@ -129,6 +129,10 @@ model support · features · safety/permissions · extensibility · status/diffe
 
 ## Amp — Sourcegraph → Amp Inc.
 
+> ⚠️ **Superseded 2026-07-28** — the surface below is the 2026-06-25 snapshot and is materially
+> incomplete (plugins, review checks, skills, `--stream-json`, orbs/runners, agent-set schedules).
+> Current read + flux feature extraction: [`../../research/amp.md`](../../research/amp.md).
+
 - **Popularity:** **Closed** — no public source repo (only a small examples repo). Metric is funding:
   Sourcegraph raised ~$245M (a16z-led Series D, ~$2.6B valuation).
 - **Vendor:** Built at **Sourcegraph**; in Dec 2025 **Amp and Sourcegraph split into two independent

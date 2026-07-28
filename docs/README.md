@@ -42,6 +42,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | **Improvement pillar** (deep) | [self-improvement/](self-improvement/) |
 | Public docs site source | [../website](../website) — Docusaurus docs for users and integrators |
 | Design records — active work **and** shipped-epic references (the design of a shipped epic stays here as its record) | [designs/](designs/) |
+| Competitor deep-dives — dated, living, mined for features worth having | [research/](research/) |
 | Fully finished / superseded material (post-mortems, retired research) | [archive/](archive/) |
 | Schema-migration drift ledger (D-31/D-34/D-36..D-45) | [archive/drift-reports.md](archive/drift-reports.md) |
 

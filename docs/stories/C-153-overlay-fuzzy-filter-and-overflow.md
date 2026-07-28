@@ -34,3 +34,9 @@ arrow key alone, and neither popup signals that more rows exist below the window
 
 ## Notes
 - Land after C-152 so the query row and overflow indicator are added once in the shared chrome.
+- **Scope note (2026-07-28 Amp feature-mining pass, [../research/amp.md](../research/amp.md)):** Amp
+  ships a single fuzzy **command palette** (Ctrl+O) over every command and action, rather than
+  per-overlay filtering. That is a superset of this story: once slash matching and the session
+  picker share one ranker, a unified palette is mostly a third caller plus a keybinding. Deliberately
+  *not* filed as a separate story — decide here whether the shared ranker's callers are the two
+  existing pickers or a palette that subsumes them, and widen the acceptance if so.

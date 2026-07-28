@@ -104,6 +104,10 @@ Every profile and matrix uses these nine categories:
 \* FSL = Functional Source License (source-available, converts to MIT after 2y). "unclear" = license
 not clearly stated. ✅ = supported · ❌ = not supported · ➖ = partial/unverified.
 
+> **Amp row superseded 2026-07-28** — re-read against the current manual, with a feature extraction
+> for flux, in [`../../research/amp.md`](../../research/amp.md). The rest of this matrix is still
+> the 2026-06-25 snapshot.
+
 ## Matrix B — IDE-integrated agents & completion platforms
 
 | Tool | Repo / metric | Stars/installs | License | Surface | Models | MCP | Status |
