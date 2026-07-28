@@ -723,13 +723,23 @@ mod tests {
     /// The plugin pack's build graph must stay clear of the host-only crates above. Resolving the
     /// nested workspace is the honest check — a manifest read would miss an edge inherited through
     /// `host-kit`, which is exactly how `flux-lang` reached all 21 plugins.
+    ///
+    /// `--locked` but NOT `--offline`: this resolves the FULL dependency graph, which needs every
+    /// package in the registry cache, and the CI job that runs this test never builds the plugins
+    /// workspace — so plugins-only third-party deps (`pulldown-cmark`, via `confluence`) simply are
+    /// not there and an offline resolve fails with "no matching package found". It passes on a
+    /// developer machine only because their cache happens to be warm, which is exactly the kind of
+    /// works-for-me that this gate exists to prevent. `--locked` is what actually matters: it
+    /// forbids the resolve from mutating `plugins/Cargo.lock`. Contrast
+    /// [`publish_script_covers_a_registry_resolvable_closure`], which passes `--offline` safely
+    /// because `--no-deps` means it never resolves a graph at all.
     #[test]
     fn plugin_builds_exclude_host_only_crates() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let repo_root = crates_dir.parent().unwrap();
         let metadata = MetadataCommand::new()
             .manifest_path(repo_root.join("plugins/Cargo.toml"))
-            .other_options(vec!["--locked".into(), "--offline".into()])
+            .other_options(vec!["--locked".into()])
             .exec()
             .expect("resolve plugins workspace metadata");
 
