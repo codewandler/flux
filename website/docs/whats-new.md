@@ -12,6 +12,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **The pickers got faster to drive.** Type into the session picker to filter it — matching is the
+  same fuzzy style as path completion, so a few characters land on the right session, and each row
+  now shows how old the session is (`2h ago`). Slash-command matching uses the same fuzzy ranking
+  (`/thm` finds `/theme`), and long lists say ` 3/14 ` so you know there's more below the window.
+
 ## [0.31.1] - 2026-07-28
 
 ### New

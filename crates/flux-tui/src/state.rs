@@ -71,6 +71,10 @@ pub struct ChatState {
     pub(super) queue_edit: Option<u64>,
     pub(super) session_picker: Option<Vec<flux_events::SessionSummary>>,
     pub(super) session_sel: usize,
+    /// Typed filter over the open session picker (C-153) — ranked through the same `fuzzy_rank`
+    /// as `@`-path completion via [`ChatState::session_picker_matches`]. Empty while the picker is
+    /// closed or untouched; Esc clears this before it closes the overlay.
+    pub(super) session_query: String,
     pub(super) scroll: u16,
     pub(super) follow: bool,
     /// Whether the terminal's mouse capture is on (Ctrl-T toggles it live so terminal-native

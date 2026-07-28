@@ -42,7 +42,10 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     } else {
         Vec::new()
     };
-    let menu_h = slash.len().max(paths.len()).min(6) as u16;
+    // C-153: reserve one extra row for the `n/m` overflow counter once the candidate list runs
+    // past the 6-row window — otherwise a long slash/`@` menu gives no more-below signal at all.
+    let menu_len = slash.len().max(paths.len());
+    let menu_h = menu_len.min(6) as u16 + if menu_len > 6 { 1 } else { 0 };
     // A point-in-time copy: the engine may drain the shared steering queue mid-render (A-94).
     let queued = state.queue_texts();
     let queue_h = if queued.is_empty() {
@@ -116,7 +119,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let theme = &state.theme;
         let sel = state.slash_sel.min(slash.len() - 1);
         let start = sel.saturating_sub(5).min(slash.len().saturating_sub(6));
-        let rows: Vec<Line> = slash
+        let mut rows: Vec<Line> = slash
             .iter()
             .skip(start)
             .take(6)
@@ -135,6 +138,13 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 ])
             })
             .collect();
+        // C-153: a rendered counter, matching the queue/session overlays' overflow signal.
+        if slash.len() > 6 {
+            rows.push(Line::styled(
+                format!(" {}/{} ", sel + 1, slash.len()),
+                theme.muted_style(),
+            ));
+        }
         frame.render_widget(Paragraph::new(rows), menu_area);
     }
 
@@ -142,7 +152,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let theme = &state.theme;
         let sel = state.path_sel.min(paths.len() - 1);
         let start = sel.saturating_sub(5).min(paths.len().saturating_sub(6));
-        let rows: Vec<Line> = paths
+        let mut rows: Vec<Line> = paths
             .iter()
             .skip(start)
             .take(6)
@@ -160,6 +170,12 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 ])
             })
             .collect();
+        if paths.len() > 6 {
+            rows.push(Line::styled(
+                format!(" {}/{} ", sel + 1, paths.len()),
+                theme.muted_style(),
+            ));
+        }
         frame.render_widget(Paragraph::new(rows), menu_area);
     }
 
@@ -230,7 +246,9 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         frame.render_widget(Paragraph::new(rows).style(state.theme.panel_style()), area);
     }
 
-    if let Some(sessions) = state.session_picker.as_ref() {
+    if state.session_picker.is_some() {
+        // C-153: filtered/ranked through the shared fuzzy matcher, not the raw loaded list.
+        let sessions = state.session_picker_matches();
         let visible = sessions.len().min(12);
         let height = (visible as u16 + 2).min(frame.area().height);
         let width = frame.area().width.min(76);
@@ -240,10 +258,25 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         let start = selected
             .saturating_sub(visible.saturating_sub(1))
             .min(sessions.len().saturating_sub(visible));
+        let header = if state.session_query.is_empty() {
+            " sessions · type to filter · Enter resume · Esc close ".to_string()
+        } else {
+            format!(
+                " sessions · filter: {} · Enter resume · Esc close ",
+                state.session_query
+            )
+        };
         let mut rows = vec![Line::styled(
-            " sessions · Enter resume · Esc close ",
+            header,
             state.theme.accent_style().bg(state.theme.panel_bg),
         )];
+        // C-151: current wall time for each row's relative "… ago" — `humanize::fmt_age` itself
+        // stays deterministic (it takes `now_ms` as a parameter); only this live call site reads
+        // the clock.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         rows.extend(sessions.iter().skip(start).take(visible).enumerate().map(
             |(offset, session)| {
                 let index = start + offset;
@@ -252,8 +285,9 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
                 } else {
                     " "
                 };
+                let age = fmt_age(now_ms, session.updated_at_ms);
                 let label = format!(
-                    " {marker} {}  · {} msg · {}",
+                    " {marker} {}  · {} msg · {} · {age}",
                     session.id, session.messages, session.model
                 );
                 let style = if index == selected {

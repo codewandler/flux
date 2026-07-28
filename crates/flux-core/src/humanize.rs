@@ -31,6 +31,21 @@ pub fn fmt_elapsed(d: Duration) -> String {
     }
 }
 
+/// A compact "… ago" string from two millisecond epoch timestamps (C-151): `5s ago` / `3m ago` /
+/// `2h ago` / `4d ago`. `now_ms` is a caller-supplied parameter rather than read from the wall
+/// clock in here, so every call site — and every test of one — is deterministic. Shared by every
+/// surface that lists sessions (`flux sessions`, the TUI session picker) so the tiers stay in one
+/// place instead of drifting the way `fmt_count` once did.
+pub fn fmt_age(now_ms: i64, then_ms: i64) -> String {
+    let secs = ((now_ms - then_ms) / 1000).max(0);
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +70,17 @@ mod tests {
     fn fmt_elapsed_scales() {
         assert_eq!(fmt_elapsed(Duration::from_millis(12)), "12ms");
         assert_eq!(fmt_elapsed(Duration::from_millis(1400)), "1.4s");
+    }
+
+    #[test]
+    fn fmt_age_scales() {
+        // C-151: fully deterministic — fixed `now_ms`/`then_ms` inputs, no wall clock involved.
+        assert_eq!(fmt_age(10_000, 5_000), "5s ago");
+        assert_eq!(fmt_age(200_000, 5_000), "3m ago");
+        assert_eq!(fmt_age(3_600_000 * 2 + 5_000, 5_000), "2h ago");
+        assert_eq!(fmt_age(86_400_000 * 4 + 5_000, 5_000), "4d ago");
+        // A `then_ms` at or after `now_ms` (clock skew, or "just created") never goes negative.
+        assert_eq!(fmt_age(5_000, 5_000), "0s ago");
+        assert_eq!(fmt_age(5_000, 9_000), "0s ago");
     }
 }

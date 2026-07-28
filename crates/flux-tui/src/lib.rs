@@ -46,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use flux_core::humanize::{fmt_count, fmt_elapsed};
+use flux_core::humanize::{fmt_age, fmt_count, fmt_elapsed};
 use flux_core::Usage;
 use flux_flow::engine::FlowEngine;
 use flux_flow::{AgentSink, SteeringQueue};
@@ -185,6 +185,7 @@ enum Sev {
 }
 
 /// A slash command shown in the `/` menu — a fixed built-in or a discovered command file (D-186).
+#[derive(Clone)]
 struct SlashCmd {
     name: String,
     desc: String,
@@ -232,16 +233,20 @@ fn all_slash_commands(file_commands: &[flux_runtime::metadata::CommandFile]) -> 
     out
 }
 
-/// Commands matching `query` (lowercased, no leading `/`): prefix matches first, then substring.
+/// Commands matching `query` (lowercased, no leading `/`), ranked through the same `fuzzy_rank`
+/// tiering as `@`-path completion (C-153): prefix beats substring beats subsequence, so `/thm`
+/// finds `/theme`. Exact-prefix behavior is unchanged — a prefix query still ranks every
+/// prefix-matching command ahead of any substring/subsequence one.
 fn slash_matches(
     query: &str,
     file_commands: &[flux_runtime::metadata::CommandFile],
 ) -> Vec<SlashCmd> {
     let all = all_slash_commands(file_commands);
-    let (mut prefix, substring): (Vec<SlashCmd>, Vec<SlashCmd>) =
-        all.into_iter().partition(|c| c.name.starts_with(query));
-    prefix.extend(substring.into_iter().filter(|c| c.name.contains(query)));
-    prefix
+    let names: Vec<String> = all.iter().map(|c| c.name.clone()).collect();
+    fuzzy_rank_indices(&names, query)
+        .into_iter()
+        .map(|i| all[i].clone())
+        .collect()
 }
 
 /// The help overlay's keybinding rows (C-110): `(keys, what)`. The slash-command half of the
@@ -530,9 +535,19 @@ fn workspace_file_inventory(root: &std::path::Path, cap: usize) -> Vec<String> {
     out
 }
 
-/// Rank workspace paths against a fuzzy query (C-112): path-segment prefix beats substring
-/// beats subsequence; ties go to the shorter path. Case-insensitive. Pure and unit-tested.
-fn fuzzy_rank<'a>(paths: &'a [String], query: &str) -> Vec<&'a str> {
+/// Rank positions into `items` against a fuzzy `query` (C-112, shared by C-153's slash-command
+/// and session-picker matching): path-segment prefix beats substring beats subsequence; ties go
+/// to the shorter candidate. Case-insensitive. Returns indices rather than borrowed strings so any
+/// caller can map back to its own parallel type (a `SlashCmd`, a `SessionSummary`, …) instead of
+/// only a `&str`. An empty query is the identity permutation — `items` in its original order —
+/// rather than every entry tying at tier 0 and falling back to the length tie-break; that would
+/// reshuffle the slash menu's hand-curated command order (and a bare `@`'s alphabetical file
+/// listing) into a length sort the moment the popup opens, before the user has typed anything.
+/// Pure and unit-tested (via `fuzzy_rank` below, its `&str`-returning wrapper).
+fn fuzzy_rank_indices(items: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..items.len()).collect();
+    }
     fn is_subsequence(hay: &str, needle: &str) -> bool {
         let mut chars = needle.chars();
         let mut want = chars.next();
@@ -544,14 +559,14 @@ fn fuzzy_rank<'a>(paths: &'a [String], query: &str) -> Vec<&'a str> {
         want.is_none()
     }
     let query = query.to_lowercase();
-    let mut scored: Vec<(u8, usize, &str)> = paths
+    let mut scored: Vec<(u8, usize, usize)> = items
         .iter()
-        .filter_map(|path| {
-            let lower = path.to_lowercase();
-            let score = if query.is_empty()
-                || lower
-                    .split(['/', '\\'])
-                    .any(|segment| segment.starts_with(&query))
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let lower = item.to_lowercase();
+            let score = if lower
+                .split(['/', '\\'])
+                .any(|segment| segment.starts_with(&query))
             {
                 0
             } else if lower.contains(&query) {
@@ -561,11 +576,20 @@ fn fuzzy_rank<'a>(paths: &'a [String], query: &str) -> Vec<&'a str> {
             } else {
                 return None;
             };
-            Some((score, path.len(), path.as_str()))
+            Some((score, item.len(), i))
         })
         .collect();
     scored.sort();
-    scored.into_iter().map(|(_, _, p)| p).collect()
+    scored.into_iter().map(|(_, _, i)| i).collect()
+}
+
+/// Rank workspace paths against a fuzzy query (C-112): path-segment prefix beats substring
+/// beats subsequence; ties go to the shorter path. Case-insensitive. Pure and unit-tested.
+fn fuzzy_rank<'a>(paths: &'a [String], query: &str) -> Vec<&'a str> {
+    fuzzy_rank_indices(paths, query)
+        .into_iter()
+        .map(|i| paths[i].as_str())
+        .collect()
 }
 
 /// Wrapped-row indices whose flattened text contains `query` (case-insensitive). A match that
@@ -918,6 +942,7 @@ impl ChatState {
             queue_edit: None,
             session_picker: None,
             session_sel: 0,
+            session_query: String::new(),
             scroll: 0,
             follow: true,
             last_max_scroll: Cell::new(0),
@@ -1320,6 +1345,41 @@ impl ChatState {
             .take(50)
             .map(str::to_string)
             .collect()
+    }
+
+    /// Sessions in the open picker filtered/ranked by `session_query` (C-153), through the same
+    /// `fuzzy_rank` tiering as `@`-path completion and slash-command matching — the ranker stays
+    /// one implementation, its callers three. The label ranked against is `"<id> <model>"`, so a
+    /// query can find a session by either. An empty query returns every loaded session in its
+    /// original (newest-active-first) order, unchanged from before this story. `EventStore::search`
+    /// (C-164) is a separate, complementary seam for full conversation-CONTENT search — this
+    /// method only ranks/filters the summaries already loaded into the picker (id/model), it does
+    /// not re-query the store on every keystroke.
+    fn session_picker_matches(&self) -> Vec<&flux_events::SessionSummary> {
+        let sessions: &[flux_events::SessionSummary] =
+            self.session_picker.as_deref().unwrap_or(&[]);
+        if self.session_query.is_empty() {
+            return sessions.iter().collect();
+        }
+        let labels: Vec<String> = sessions
+            .iter()
+            .map(|s| format!("{} {}", s.id, s.model))
+            .collect();
+        fuzzy_rank_indices(&labels, &self.session_query)
+            .into_iter()
+            .map(|i| &sessions[i])
+            .collect()
+    }
+
+    /// Esc while the session picker is open (C-153): a non-empty typed query is cleared first —
+    /// one Esc, one undo step — and the overlay itself only closes on a second Esc once the query
+    /// is already empty.
+    fn session_esc(&mut self) {
+        if !self.session_query.is_empty() {
+            self.session_query.clear();
+        } else {
+            self.session_picker = None;
+        }
     }
 
     /// Replace the active `@token` with `path` (C-112). The composer is rebuilt via the
@@ -2411,6 +2471,7 @@ impl ChatState {
         self.retry = None;
         self.session_picker = None;
         self.session_sel = 0;
+        self.session_query.clear();
         self.plan_phase = None;
         self.execute_rounds = 0;
         self.gather_mode = false;
@@ -3035,28 +3096,34 @@ async fn event_loop(
                 }
 
                 if state.session_picker.is_some() {
+                    // C-153: rows/selection always go through the same filtered/ranked view the
+                    // renderer draws — typing narrows the set, so Up/Down/Enter must clamp and
+                    // resolve against it rather than the raw loaded list.
+                    let matches_len = state.session_picker_matches().len();
+                    let sel = state.session_sel.min(matches_len.saturating_sub(1));
                     match key.code {
-                        KeyCode::Esc => state.session_picker = None,
+                        KeyCode::Esc => state.session_esc(),
                         KeyCode::Up => {
-                            state.session_sel = state.session_sel.saturating_sub(1);
+                            state.session_sel = sel.saturating_sub(1);
                         }
                         KeyCode::Down => {
-                            let last = state
-                                .session_picker
-                                .as_ref()
-                                .map_or(0, |sessions| sessions.len().saturating_sub(1));
-                            state.session_sel = (state.session_sel + 1).min(last);
+                            state.session_sel = (sel + 1).min(matches_len.saturating_sub(1));
+                        }
+                        KeyCode::Backspace => {
+                            state.session_query.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            state.session_query.push(c);
                         }
                         KeyCode::Enter if state.running() => state.push(Entry::Notice {
                             text: "session switching waits for the active action to finish".into(),
                             sev: Sev::Warn,
                         }),
                         KeyCode::Enter => {
-                            let selected = state.session_picker.as_ref().and_then(|sessions| {
-                                sessions
-                                    .get(state.session_sel.min(sessions.len().saturating_sub(1)))
-                                    .map(|session| session.id.clone())
-                            });
+                            let selected = state
+                                .session_picker_matches()
+                                .get(sel)
+                                .map(|session| session.id.clone());
                             if let Some(session_id) = selected {
                                 let engine = agent.read().await;
                                 let active_model = engine.model.clone();
@@ -3665,6 +3732,7 @@ async fn handle_command(
                         .position(|session| session.id == state.session_id)
                         .unwrap_or(0);
                     state.session_picker = Some(sessions);
+                    state.session_query.clear();
                     state.queue_open = false;
                 }
                 Err(error) => state.push(Entry::Notice {
@@ -6460,6 +6528,152 @@ mod tests {
         assert!(content.contains("sessions"));
         assert!(content.contains("● s_2"));
         assert!(!content.contains('┌'));
+    }
+
+    #[test]
+    fn session_picker_shows_relative_age_on_one_truncated_line() {
+        // C-151: each row renders a compact "… ago" derived from `updated_at_ms`, on the SAME
+        // line as the existing marker/id/msg-count/model — never a second row, never untruncated
+        // past the overlay width. Ages are set relative to "now" so the assertion never depends
+        // on which day the suite happens to run (no wall-clock value baked into the expectation).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut state = ChatState::for_session("mock".into(), "s_2".into());
+        state.session_picker = Some(vec![
+            flux_events::SessionSummary {
+                id: "s_2".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: now_ms - 2 * 3_600_000, // 2h ago
+                messages: 4,
+                context: Default::default(),
+            },
+            flux_events::SessionSummary {
+                id: "s_1".into(),
+                model: "anthropic/sonnet".into(),
+                created_at_ms: 0,
+                updated_at_ms: now_ms - 60_000, // 1m ago
+                messages: 2,
+                context: Default::default(),
+            },
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("2h ago"), "{content}");
+        assert!(content.contains("1m ago"), "{content}");
+        // Still one line per row: the active marker and msg count are unchanged and share the
+        // same row as the new age text.
+        assert!(content.contains("● s_2"));
+        assert!(content.contains("4 msg"));
+    }
+
+    #[test]
+    fn session_picker_query_filters_and_ranks_via_the_shared_fuzzy_matcher() {
+        // C-153: the session picker gained a typed query, ranked through the same `fuzzy_rank`
+        // tiering as `@`-path completion (segment-prefix beats substring beats subsequence).
+        let mut state = ChatState::for_session("mock".into(), "s_none".into());
+        state.session_picker = Some(vec![
+            flux_events::SessionSummary {
+                id: "alpha".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                messages: 1,
+                context: Default::default(),
+            },
+            flux_events::SessionSummary {
+                id: "gamma-test".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                messages: 1,
+                context: Default::default(),
+            },
+            flux_events::SessionSummary {
+                id: "beta".into(),
+                model: "mock".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                messages: 1,
+                context: Default::default(),
+            },
+        ]);
+        assert_eq!(
+            state.session_picker_matches().len(),
+            3,
+            "empty query keeps everything"
+        );
+
+        state.session_query = "gam".into();
+        {
+            let matches = state.session_picker_matches();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].id, "gamma-test");
+        }
+
+        // A stale out-of-range selection clamps to the filtered set's last valid row rather than
+        // panicking or pointing past the end (the same `.min(len - 1)` idiom the slash/path
+        // popups already use).
+        state.session_sel = 99;
+        let matches = state.session_picker_matches();
+        let sel = state.session_sel.min(matches.len().saturating_sub(1));
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn session_picker_esc_clears_query_before_closing_overlay() {
+        // C-153: Esc is a two-step undo — first clears a non-empty typed query, only closing the
+        // overlay on a second Esc once the query is already empty.
+        let mut state = ChatState::for_session("mock".into(), "s_1".into());
+        state.session_picker = Some(vec![flux_events::SessionSummary {
+            id: "s_1".into(),
+            model: "mock".into(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            messages: 0,
+            context: Default::default(),
+        }]);
+        state.session_query = "s".into();
+
+        state.session_esc();
+        assert!(state.session_query.is_empty());
+        assert!(
+            state.session_picker.is_some(),
+            "first Esc only clears the query"
+        );
+
+        state.session_esc();
+        assert!(
+            state.session_picker.is_none(),
+            "second Esc closes the overlay"
+        );
+    }
+
+    #[test]
+    fn slash_matches_ranks_subsequence_like_at_path_completion() {
+        // C-153: slash matching now shares `fuzzy_rank`'s tiering, so a subsequence query finds a
+        // command whose name merely contains its letters in order.
+        assert!(slash_matches("thm", &[]).iter().any(|c| c.name == "theme"));
+        // Exact-prefix behavior is preserved: "se" still finds both "session" and "sessions".
+        let prefix = slash_matches("se", &[]);
+        assert!(prefix.iter().any(|c| c.name == "session"));
+        assert!(prefix.iter().any(|c| c.name == "sessions"));
+    }
+
+    #[test]
+    fn slash_menu_shows_overflow_counter_past_the_window() {
+        // C-153: the slash menu only ever renders 6 rows; with the 16 built-ins visible on a bare
+        // `/`, it must signal that more rows exist below rather than silently hiding them.
+        let mut state = ChatState::new("mock".into());
+        state.set_input("/");
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("/help"));
+        assert!(content.contains("1/16"), "{content}");
     }
 
     #[test]

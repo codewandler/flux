@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **C-153: one fuzzy ranker for every TUI picker, with overflow counters.** `fuzzy_rank_indices`
+  (the ranker already serving `@`-path completion) now also drives the slash-command menu (so
+  `/thm` finds `/theme`) and a new typed query in the session picker (ranking `<id> <model>`
+  labels; Esc clears the query first, closes the overlay second). The slash and `@`-path popups
+  gained the ` n/m ` overflow counter the session picker already had. Bug fixed en route: an empty
+  query used to fall through ranking and tie-break by string length, silently reshuffling the
+  slash menu's curated order — now the identity permutation. Deliberate scope call recorded in the
+  story: picker ranking stays label-based; full content search remains `EventStore::search`'s job
+  (C-164), not merged into the overlay.
+- **C-151: the session picker shows relative age.** Rows render `● <id> · <n> msg · <model> ·
+  <age>` via a new deterministic `flux_core::humanize::fmt_age(now_ms, then_ms)` (clock is a
+  parameter, clock skew clamps to `0s ago`), one truncated line per session.
+
 - **C-124: event-store append contention is visible before it becomes a failure.** An append that
   waits on the SQLite busy handler now emits a `tracing` warning once the wait crosses ~1s, naming
   the wait and the threshold — previously the only signal was the terminal busy error after the
