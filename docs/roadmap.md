@@ -83,6 +83,30 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
 > and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
+### Plugin protocol decoupling — a release that leaves the plugin pack alone (epic) — 🔜 **PLANNED 2026-07-28 (C-141…C-147, seven stories)**
+
+Cutting 0.28.0 made the plugin pack's release tax visible. `scripts/cut-release.sh` rewrites
+`plugins/Cargo.toml`'s pins, bumps `plugins/host-kit/Cargo.toml` in lockstep, and re-locks the
+nested workspace on **every** flux cut — `plugins/Cargo.lock` changed in five of the last eight
+commits that touched it, all release cuts — while the wire contract those plugins speak has changed
+twice in its history, additively both times. Reading the seam end to end found the reason the
+lockstep exists and why it is the wrong instrument: **nothing enforces compatibility at all.**
+`protocol.rs:10` defines `PROTOCOL = "flux.plugin.v1"` and stamps it into every frame, but no host
+code reads it back and the pack index records nothing — matching version numbers are a ritual
+standing in for a contract nobody wrote down. Worse, **every plugin compiles `flux-lang`**: the
+guest wire surface names exactly one type from it (`FlowEffect`, `protocol.rs:7`/`:140`, a *tag
+vocabulary*), and that one edge drags a 75-crate subtree through
+`flux-lang → flux-plugin → host-kit → all 21 plugins`. The epic extracts the wire contract into
+`codewandler-flux-plugin-protocol` on its own `1.x` semver line, moves the serde-only leaves it
+needs onto that line, and takes `plugins/` out of the cut entirely — with the guards that make the
+split honest: the host validates the protocol marker, golden JSON fixtures pin the wire rather
+than the Rust signatures, a snapshot guard forces a deliberate version bump, and CI runs the
+*previously released* plugin binary against the current host. Publishing then only touches what
+moved, and the cut becomes transactional (0.28.0's gate failure left both changelogs rolled and had
+to be finished by hand). C-141 lands first and alone is worth shipping: it deletes the 75-crate
+subtree with no version-line change. Design:
+[designs/plugin-protocol-decoupling.md](designs/plugin-protocol-decoupling.md).
+
 ### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — 🔜 **PLANNED 2026-07-28 (C-133…C-140 + A-95, nine stories)**
 
 A-03 made the planner *prefix* cache-stable and live-verified a 99% cross-process hit. That fix

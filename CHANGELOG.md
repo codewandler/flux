@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The promoted release keeps its `dist-manifest.json`.** `release.yml`'s `Cleanup` step removes
+  the per-target manifests with `rm -f artifacts/*-dist-manifest.json`, which in the
+  candidate-promotion path also deleted the plan job's `plan-dist-manifest.json`; the host job's
+  own manifest was written to the workspace root, outside `artifacts/`. So
+  `gh release create … artifacts/*` uploaded everything except the manifest and
+  `scripts/verify-github-release.sh` failed the run — v0.27.0 and v0.28.0 are the first
+  candidate-promoted tags and both hit it. The host manifest is now copied into `artifacts/`
+  before the release is created (C-47).
+
+### Documentation
+
+- **C-141…C-147: plugin protocol decoupling epic filed.** The plugin pack's release tax is written
+  up in `docs/designs/plugin-protocol-decoupling.md` with the three findings behind it: nothing
+  enforces host↔plugin compatibility (`PROTOCOL = "flux.plugin.v1"` is stamped into every frame at
+  `protocol.rs:10` but never read back), every plugin compiles `flux-lang` because the guest wire
+  surface names one type from it (`FlowEffect`), and `host-kit` republishes unchanged on every
+  flux release. Seven stories: relocate `FlowEffect` and cut the `flux-lang` edge (C-141), extract
+  `codewandler-flux-plugin-protocol` (C-142), independent protocol version line + a cut that
+  leaves `plugins/` alone (C-143), protocol-marker enforcement and wire fixtures (C-144),
+  old-binary compatibility CI (C-145), publish-only-what-changed (C-146), and a transactional cut
+  script (C-147). Docs/board only; no behavior change.
+
 ## [0.28.0] - 2026-07-28
 
 **Breaking (pub surface, embedders only — no CLI or config break).** Five API changes ride this
