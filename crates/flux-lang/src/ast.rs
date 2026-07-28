@@ -128,78 +128,13 @@ impl TypeRef {
     }
 }
 
-/// A first-class *semantic* effect, declared on operations. Distinct from the host-resource
-/// [`flux_spec::Effect`] (Read/Write/Network/…): a `FlowEffect` expresses execution *meaning*
-/// (this op sends mail, costs money, touches a calendar) and lowers onto the host effect + a policy
-/// action via [`FlowEffect::lower`](crate). Policy decides allow / deny / require-approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FlowEffect {
-    /// No effect — deterministic, side-effect free.
-    Pure,
-    /// Reads external state.
-    Read,
-    /// Invokes a model (non-deterministic unless cached).
-    Model,
-    /// General network egress.
-    Network,
-    /// Writes to the filesystem.
-    WriteFile,
-    /// Writes to a database / persistent store.
-    WriteDb,
-    /// Sends something externally (email, message, webhook).
-    SendExternal,
-    /// Irreversibly deletes.
-    Delete,
-    /// Moves money.
-    Money,
-    /// Mutates a calendar.
-    Calendar,
-    /// Produces output a human will see.
-    HumanVisible,
-}
-
-impl FlowEffect {
-    /// The stable lowercase tag for this semantic effect — matches the serde `snake_case` wire tag
-    /// and the `!tag` bind/memo syntax (see [`FlowEffect::from_tag`] for the inverse). The single
-    /// source of truth for the tag vocabulary: `format`/`render`'s pretty-printers and `parse`'s
-    /// `@effect`/`!tag` readers all resolve through this pair rather than keeping their own tables.
-    pub fn tag(self) -> &'static str {
-        match self {
-            FlowEffect::Pure => "pure",
-            FlowEffect::Read => "read",
-            FlowEffect::Model => "model",
-            FlowEffect::Network => "network",
-            FlowEffect::WriteFile => "write_file",
-            FlowEffect::WriteDb => "write_db",
-            FlowEffect::SendExternal => "send_external",
-            FlowEffect::Delete => "delete",
-            FlowEffect::Money => "money",
-            FlowEffect::Calendar => "calendar",
-            FlowEffect::HumanVisible => "human_visible",
-        }
-    }
-
-    /// Parse a semantic-effect tag (the inverse of [`FlowEffect::tag`]), or `None` for an unknown
-    /// tag. Used both by the text-syntax reader and by anything reconstructing a [`FlowEffect`] from
-    /// a catalog's serialized tag strings (e.g. a plugin-manifest-declared op, D-138).
-    pub fn from_tag(tag: &str) -> Option<Self> {
-        Some(match tag {
-            "pure" => FlowEffect::Pure,
-            "read" => FlowEffect::Read,
-            "model" => FlowEffect::Model,
-            "network" => FlowEffect::Network,
-            "write_file" => FlowEffect::WriteFile,
-            "write_db" => FlowEffect::WriteDb,
-            "send_external" => FlowEffect::SendExternal,
-            "delete" => FlowEffect::Delete,
-            "money" => FlowEffect::Money,
-            "calendar" => FlowEffect::Calendar,
-            "human_visible" => FlowEffect::HumanVisible,
-            _ => return None,
-        })
-    }
-}
+/// A first-class *semantic* effect, declared on operations.
+///
+/// Defined in `flux-spec` (with `tag`/`from_tag`/`lower`) because it is part of the plugin wire
+/// vocabulary — a guest plugin names it in its manifest and must not have to compile the language
+/// front-end to do so (C-141). Re-exported here so `flux_lang::ast::FlowEffect`, the path used
+/// across the codebase and in the docs, keeps resolving.
+pub use flux_spec::FlowEffect;
 
 /// How visible a session symbol is to the model when projecting `view(Session)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1044,7 +1044,6 @@ dependencies = [
  "codewandler-flux-credentials",
  "codewandler-flux-datasource",
  "codewandler-flux-evidence",
- "codewandler-flux-lang",
  "codewandler-flux-runtime",
  "codewandler-flux-secret",
  "codewandler-flux-spec",
@@ -1193,6 +1192,7 @@ dependencies = [
 name = "codewandler-flux-spec"
 version = "0.28.0"
 dependencies = [
+ "codewandler-flux-policy",
  "schemars",
  "serde",
  "serde_json",

@@ -11,6 +11,9 @@ description = "flux tool/operation specs: JSON-schema I/O, effects, risk, idempo
 name = "flux_spec"
 
 [dependencies]
+# `FlowEffect::lower` maps a semantic effect onto the policy `Action` it requires. flux-policy is
+# an L0 serde-only leaf, so the wire vocabulary stays cheap for guest plugins (C-141).
+flux-policy.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- **C-141: plugin builds no longer compile the Flux-Lang front-end.** `flux-plugin` depended on
+  `flux-lang` for exactly one type — `FlowEffect`, the semantic-effect *tag vocabulary* carried in
+  `PluginManifest`'s `semantic_effects` — and that single edge pulled the parser, CST, and
+  analyzer through `flux-plugin → host-kit` into all 21 plugins. `FlowEffect` (with `tag`,
+  `from_tag`, and `lower`) now lives in `flux-spec` alongside the rest of the wire vocabulary, and
+  `flux_lang::ast` re-exports it, so every `flux_lang::ast::FlowEffect` path and `.lower()` call
+  site is unchanged. `flux-spec` gains `flux-policy` (an L0 serde-only leaf) for the `Action` half
+  of `lower`. A plugin's build graph drops from **74 to 30** crates (measured on `gitlab`);
+  `plugins/Cargo.lock` shrinks by 366 lines. A new architecture guard,
+  `flux_codegate::tests::plugin_builds_exclude_host_only_crates`, resolves the plugins workspace
+  and fails if a host-only crate reappears in it — the edge arrived *through* `host-kit`, which a
+  manifest-level check would have missed. First story of the
+  [plugin-protocol-decoupling](docs/designs/plugin-protocol-decoupling.md) epic.
+
 ### Fixed
 
 - **The promoted release keeps its `dist-manifest.json`.** `release.yml`'s `Cleanup` step removes
@@ -19,6 +35,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Documentation
 
+- **L-85…L-91: flux-lsp round 2 epic filed.** A review of `crates/flux-lsp/src/main.rs` against
+  what its `initialize` advertises is written up in `docs/designs/flux-lsp-round-2.md`: completion
+  never reads the cursor position (`main.rs:256-261`) and sources `$vars` from a byte scan
+  (`scan_symbols:709`) while go-to-definition is scope-correct; hover resolves words with a raw line
+  scan (`word_at:686`) so comments and string literals hover as code, and `$vars` never hover;
+  `references`/`rename` are unimplemented despite the L-68 scope model; formatting returns no edit
+  for modules (`main.rs:93-96`) and only re-indents commented flows (`:97-102`); the catalog never
+  loads `.flux/flows` composites, so a runnable call squiggles as an unknown operation, and every
+  analyzer finding is a bare `WARNING` with no code (`lsp_warning:553`); `didChange` applies edits
+  then full-reparses, and every handler re-parses per request. Seven stories: cursor-aware
+  completion (L-85), CST-precise hover (L-86), references + rename (L-87), a CST-driven formatter
+  (L-88), diagnostic truth (L-89), parse cache + incrementality (L-90), and the module split +
+  protocol-level harness that closes the epic (L-91). Docs/board only; no behavior change.
+- **Stale flux-lsp status corrected.** The roadmap's CST + LSP epic section still listed L-59/L-68/
+  L-69/L-70 as "Remaining backlog" after all four shipped, and `AGENTS.md` still described
+  `flux-lsp` as `dist = false` although L-70 flipped it (`crates/flux-lsp/Cargo.toml:12`).
 - **C-141…C-147: plugin protocol decoupling epic filed.** The plugin pack's release tax is written
   up in `docs/designs/plugin-protocol-decoupling.md` with the three findings behind it: nothing
   enforces host↔plugin compatibility (`PROTOCOL = "flux.plugin.v1"` is stamped into every frame at

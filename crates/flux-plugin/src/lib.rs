@@ -21,13 +21,11 @@ use sha2::{Digest as _, Sha256};
 #[cfg(feature = "host")]
 use flux_core::{Error, Result};
 #[cfg(feature = "host")]
-use flux_lang::ast::FlowEffect;
-#[cfg(feature = "host")]
 use flux_runtime::{
     authority_requirements_from_declaration, AuthorityRequirement, Tool, ToolContext, ToolResult,
 };
 #[cfg(feature = "host")]
-use flux_spec::{AccessKind, Effect, Idempotency, Risk, StagingDisposition, ToolSpec};
+use flux_spec::{AccessKind, Effect, FlowEffect, Idempotency, Risk, StagingDisposition, ToolSpec};
 #[cfg(feature = "host")]
 use flux_system::net::PrivateNetAllow;
 

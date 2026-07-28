@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use flux_evidence::{SignalMatch, ToolGroup, KIND_TURN_INTENT};
-use flux_lang::ast::FlowEffect;
-use flux_spec::{Effect, Idempotency, Risk, StagingDisposition};
+use flux_spec::{Effect, FlowEffect, Idempotency, Risk, StagingDisposition};
 
 pub const PROTOCOL: &str = "flux.plugin.v1";
 
@@ -129,7 +128,7 @@ pub struct OperationSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// The op's declared SEMANTIC effects (`money`, `delete`, `send_external`, …) — the
-    /// `flux_lang::ast::FlowEffect` tag vocabulary — carried alongside `effects` above instead of
+    /// [`FlowEffect`] tag vocabulary — carried alongside `effects` above instead of
     /// being erased the way lowering a Flux-Lang `OpSpec` to a host [`ToolSpec`] necessarily erases
     /// them (D-138). [`PluginTool`] projects these onto its [`Tool::semantic_effects`] hook, and
     /// `flux-flow`'s catalog adapter folds them into the op's `OpSignature` and, from there, into

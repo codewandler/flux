@@ -703,6 +703,43 @@ mod tests {
         );
     }
 
+    /// Crates a guest plugin build must never pull in. A plugin is a subprocess that speaks NDJSON
+    /// over stdio: its contract is the wire format, not flux's internals. `flux-lang` in
+    /// particular is the language front-end (parser, CST, analyzer) and drags a ~75-crate subtree
+    /// through `flux-plugin → host-kit → every plugin`, so any change to it rebuilds the whole
+    /// pack. Keep this list to crates whose presence in a plugin build is a design error, not
+    /// merely undesirable (C-141).
+    const GUEST_FORBIDDEN: &[&str] = &["codewandler-flux-lang"];
+
+    /// The plugin pack's build graph must stay clear of the host-only crates above. Resolving the
+    /// nested workspace is the honest check — a manifest read would miss an edge inherited through
+    /// `host-kit`, which is exactly how `flux-lang` reached all 21 plugins.
+    #[test]
+    fn plugin_builds_exclude_host_only_crates() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let metadata = MetadataCommand::new()
+            .manifest_path(repo_root.join("plugins/Cargo.toml"))
+            .other_options(vec!["--locked".into(), "--offline".into()])
+            .exec()
+            .expect("resolve plugins workspace metadata");
+
+        let present: Vec<String> = metadata
+            .packages
+            .iter()
+            .map(|package| package.name.to_string())
+            .filter(|name| GUEST_FORBIDDEN.contains(&name.as_str()))
+            .collect();
+
+        assert!(
+            present.is_empty(),
+            "the plugin build graph pulls host-only crate(s): {}\n\
+             a plugin's contract is the wire format, not flux's internals — find the edge with \
+             `cd plugins && cargo tree -i <crate>` and move the shared type to a serde-only crate",
+            present.join(", ")
+        );
+    }
+
     /// A vanity-prefixed package is part of the crates.io closure. Every production path
     /// dependency in that closure needs a registry version, and the ordered publisher must include
     /// every closure member. Otherwise `cargo publish` fails only after a release tag is pushed.

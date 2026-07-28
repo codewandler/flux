@@ -6,6 +6,7 @@
 //! [`IntentSet`] — concrete (target, behavior) pairs the runtime classifies for approval. None of
 //! this performs IO; the runtime maps these specs onto policy requests and the safety envelope.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod schema;
@@ -74,6 +75,112 @@ pub enum Effect {
     Browser,
     Filesystem,
     LocalSystem,
+}
+
+/// A first-class *semantic* effect, declared on operations. Distinct from the host-resource
+/// [`Effect`] (Read/Write/Network/…): a `FlowEffect` expresses execution *meaning* (this op sends
+/// mail, costs money, touches a calendar) and lowers onto the host effect + a policy action via
+/// [`FlowEffect::lower`]. Policy decides allow / deny / require-approval.
+///
+/// Lives here rather than in `flux-lang` because it is part of the **plugin wire vocabulary**
+/// (`PluginManifest`'s `semantic_effects`), and a guest plugin must be able to name it without
+/// compiling the language front-end (C-141). `flux_lang::ast` re-exports it, so the
+/// `flux_lang::ast::FlowEffect` path used across the codebase keeps working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowEffect {
+    /// No effect — deterministic, side-effect free.
+    Pure,
+    /// Reads external state.
+    Read,
+    /// Invokes a model (non-deterministic unless cached).
+    Model,
+    /// General network egress.
+    Network,
+    /// Writes to the filesystem.
+    WriteFile,
+    /// Writes to a database / persistent store.
+    WriteDb,
+    /// Sends something externally (email, message, webhook).
+    SendExternal,
+    /// Irreversibly deletes.
+    Delete,
+    /// Moves money.
+    Money,
+    /// Mutates a calendar.
+    Calendar,
+    /// Produces output a human will see.
+    HumanVisible,
+}
+
+impl FlowEffect {
+    /// The stable lowercase tag for this semantic effect — matches the serde `snake_case` wire tag
+    /// and the `!tag` bind/memo syntax (see [`FlowEffect::from_tag`] for the inverse). The single
+    /// source of truth for the tag vocabulary: `format`/`render`'s pretty-printers and `parse`'s
+    /// `@effect`/`!tag` readers all resolve through this pair rather than keeping their own tables.
+    pub fn tag(self) -> &'static str {
+        match self {
+            FlowEffect::Pure => "pure",
+            FlowEffect::Read => "read",
+            FlowEffect::Model => "model",
+            FlowEffect::Network => "network",
+            FlowEffect::WriteFile => "write_file",
+            FlowEffect::WriteDb => "write_db",
+            FlowEffect::SendExternal => "send_external",
+            FlowEffect::Delete => "delete",
+            FlowEffect::Money => "money",
+            FlowEffect::Calendar => "calendar",
+            FlowEffect::HumanVisible => "human_visible",
+        }
+    }
+
+    /// Parse a semantic-effect tag (the inverse of [`FlowEffect::tag`]), or `None` for an unknown
+    /// tag. Used both by the text-syntax reader and by anything reconstructing a [`FlowEffect`] from
+    /// a catalog's serialized tag strings (e.g. a plugin-manifest-declared op, D-138).
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "pure" => FlowEffect::Pure,
+            "read" => FlowEffect::Read,
+            "model" => FlowEffect::Model,
+            "network" => FlowEffect::Network,
+            "write_file" => FlowEffect::WriteFile,
+            "write_db" => FlowEffect::WriteDb,
+            "send_external" => FlowEffect::SendExternal,
+            "delete" => FlowEffect::Delete,
+            "money" => FlowEffect::Money,
+            "calendar" => FlowEffect::Calendar,
+            "human_visible" => FlowEffect::HumanVisible,
+            _ => return None,
+        })
+    }
+
+    /// Lower this semantic effect to the host-resource [`Effect`] it implies (if any) and the
+    /// additional policy [`Action`](flux_policy::Action) it requires (if any).
+    ///
+    /// Host effects reuse the existing `effect_requests` bridge in `flux-runtime`; semantic-only
+    /// effects (`SendExternal`, `Money`, `Calendar`, …) carry a dedicated `flow.*` action a policy
+    /// `Grant` can allow / deny / require-approval (`flow.delete` / `flow.money` are denied by
+    /// default in policy).
+    pub fn lower(self) -> (Option<Effect>, Option<flux_policy::Action>) {
+        use flux_policy::Action;
+        use FlowEffect::*;
+        match self {
+            Pure => (None, None),
+            Read => (Some(Effect::Read), None),
+            Model => (None, Some(Action::from("model.invoke"))),
+            Network => (Some(Effect::Network), None),
+            WriteFile => (Some(Effect::Write), None),
+            WriteDb => (Some(Effect::Network), Some(Action::from("flow.write_db"))),
+            SendExternal => (
+                Some(Effect::Network),
+                Some(Action::from("flow.send_external")),
+            ),
+            Delete => (Some(Effect::Write), Some(Action::from("flow.delete"))),
+            Money => (None, Some(Action::from("flow.money"))),
+            Calendar => (None, Some(Action::from("flow.calendar"))),
+            HumanVisible => (None, None),
+        }
+    }
 }
 
 /// Coarse risk classification, driving approval thresholds.
