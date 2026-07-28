@@ -45,7 +45,13 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-47 — Release-publication reliability — a tag must yield a downloadable GitHub Release](C-47-release-publication-reliability.md) · Core · N-001: `/releases/latest` reported an older version than the newest `vX.Y.Z` tag with no release object for the newer tag, so users asking for 'latest' get a stale binary — the release workflow can push a tag without producing the Release/assets (cf. the earlier v0.4.2 macOS-upload flake)
 
 ## Backlog
+- [A-94 — Mid-turn steering — queue user guidance into a running turn](A-94-mid-turn-steering.md) · Agent · a running turn is take-it-or-Ctrl-C today; let the user type while the agent executes — the message queues and injects at the next planner consultation as a steering block, without cancelling in-flight ops or losing the turn; the multipass loop already re-consults, so the seam exists
 - [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
+- [C-128 — flux doctor — environment & install diagnostics command](C-128-flux-doctor-diagnostics.md) · Core · one command that checks credentials/OAuth expiry, plugin hash drift (D-48 machinery), sandbox backend availability, events.db + WAL health, egress config sanity, and version skew — each with a fix-it hint; cheap (every check exists as an internal predicate), high leverage for external-beta users
+- [C-129 — OpenTelemetry export — turns, ops, and model calls as OTLP spans + metrics](C-129-opentelemetry-export.md) · Core · a feature-gated projection over the event store emitting OTLP traces (turn → plan → per-op spans with latency/retry/cost attributes) and metrics (tokens, spend, op error rates); serves the PG-backend server audience — OTel is just another projection, per the event-store-unification canon
+- [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
+- [C-132 — Shareable run export — flux export <run> → one self-contained HTML file](C-132-shareable-run-export.md) · Core · render a session/run (plan visuals via flow_render/render_styled, op results redacted per the evidence rules, diffs, cost, timeline) into a single static HTML file for bug reports, PR links, and demos — the read-only sibling of the Time Machine; no server, no viewer app
+- [D-195 — Semantic eval assertions — LLM-judge grading in the SDK test-kit](D-195-semantic-eval-assertions.md) · Agent · Scenario asserts on the canonical plan (exact, deterministic); add the complementary axis — rubric-based judge assertions for text outputs (assert_judge), with the judge call itself recorded/replayed through the cassette so CI stays $0 and hermetic after first record; bridges the Deterministic Agent Lab and flux-eval into a user-facing quality-regression harness
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 - [I-05 — Sharpen the improve round — stable scored task set, severity-ordered planner picks](I-05-sharpen-improve-round.md) · Improve · ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate
 
@@ -65,14 +71,26 @@ _Agents that mutate a repository while the user (or another agent) works in the 
 ### Evidence Pinned Memory
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 
+### Flow Package Registry
+- [D-194 — Flow package registry — flux flow install (epic)](D-194-flow-package-registry-epic.md) · Language · EPIC — flows/journeys are shareable artifacts with no distribution story; reuse the signed plugin-pack channel (D-46/D-47: signed index, sha256, versioned store) for .flux flow packages: flux flow install <name> fetches into ~/.flux/flows/, flow_list surfaces them, the analyzer runs at install time so a broken pack fails at install
+
 ### flux-planner: from trained-and-usable to shippable
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
 
 ### Habit Compiler
 - [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
 
+### Mcp Interop
+- [D-193 — MCP interop — consume and expose Model Context Protocol (epic)](D-193-mcp-interop-epic.md) · Agent · EPIC — mount MCP servers as guarded tool sources through the existing envelope/schema/surfacing pipeline, and expose flux ops/flows as an MCP server; completes the interop dialect the Claude epic (D-186..D-192) started
+
+### Monetary Budgets
+- [C-130 — Monetary budgets & quotas — hard spend enforcement (epic)](C-130-monetary-budgets-epic.md) · Core · EPIC — cost is observed (usage events, pricing, OpenRouter reported cost) but never enforced; add [budget] config with per-session/per-agent/rolling-per-day currency caps: soft threshold warns into context, hard cap stops before the next model call with a resumable suspension; per-principal caps for A2A/serve; distinct from token turn-budgets (A-10/A-26)
+
 ### Quorum Approval
 - [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
+
+### Remote Approvals
+- [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
 
 ### Taint Flow Policy
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
