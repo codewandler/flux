@@ -680,9 +680,14 @@ fn highlight_matches(line: &Line<'static>, query: &str, current: Option<Style>) 
     out
 }
 
-/// One tool-card header row: `→ verb  arg … badge` with the arg truncated so the badge sits
+/// One tool-card header row: `→ verb  [▸/▾ ]arg … badge` with the arg truncated so the badge sits
 /// flush right. Shared by the cached build (`tool_lines`) and the per-tick running-badge patch
 /// (C-109) so the pad math cannot drift between the two.
+///
+/// `marker` is the C-155 collapse/expand affordance (`▸` collapsed, `▾` expanded), rendered
+/// between the verb and the arg — never last, so it cannot be mistaken for the C-109 running
+/// badge (the running-badge pairing matches the LAST span). `None` when the card has nothing
+/// expandable, so no false affordance is shown.
 fn tool_header_line(
     t: &Theme,
     verb: &str,
@@ -690,29 +695,79 @@ fn tool_header_line(
     badge: String,
     badge_style: Style,
     width: u16,
+    marker: Option<char>,
 ) -> Line<'static> {
     let badge_w = UnicodeWidthStr::width(badge.as_str());
-    let fixed = 2 + UnicodeWidthStr::width(verb) + 2; // "→ " + verb + "  "
+    let marker_w = marker.map_or(0, |_| 2); // glyph + trailing space
+    let fixed = 2 + UnicodeWidthStr::width(verb) + 2 + marker_w; // "→ " + verb + "  " + optional "▸ "
     let arg_room = (width as usize).saturating_sub(fixed + badge_w + 1);
     let arg = truncate(arg_full, arg_room.max(4));
     let used = fixed + UnicodeWidthStr::width(arg.as_str());
     let pad = (width as usize).saturating_sub(used + badge_w).max(1);
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("→ ", t.tool_style()),
         Span::styled(
             verb.to_string(),
             t.tool_style().add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(arg, t.muted_style()),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(badge, badge_style),
-    ])
+    ];
+    if let Some(m) = marker {
+        spans.push(Span::styled(format!("{m} "), t.muted_style()));
+    }
+    spans.push(Span::styled(arg, t.muted_style()));
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(badge, badge_style));
+    Line::from(spans)
+}
+
+/// Whether `tool` has anything to show when expanded (C-155): a running card (no result yet) or
+/// a finished card whose diff/detail projection is empty has nothing to expand, so
+/// [`tool_header_line`]'s marker must stay `None` rather than promise a detail view that turns
+/// out blank.
+fn tool_has_detail(tool: &ToolEntry) -> bool {
+    let Some(o) = &tool.result else {
+        return false;
+    };
+    if !o.is_error {
+        if let Some(diff) = toolview::format_diff(&tool.name, &tool.input) {
+            return !diff.is_empty();
+        }
+    }
+    !toolview::format_detail(&tool.name, &tool.input, &o.content, o.is_error).is_empty()
 }
 
 /// The static in-flight badge recorded into the cached layout (C-109 patches it per tick in the
 /// viewport only, so the cache stays untouched across animation frames).
 const RUNNING_BADGE: &str = "◌ running";
+
+/// C-149: the transcript's one-column turn-boundary rail — a glyph, not a background tint, so it
+/// survives `Theme::MONO` (which zeroes every color field). One trailing space separates it from
+/// the entry's own content; [`GUTTER_COLS`] is its total display width, budgeted out of `width`
+/// wherever `entry_lines` sizes content so the rail never pushes a row past its wrap boundary.
+const GUTTER: &str = "│ ";
+const GUTTER_COLS: u16 = 2;
+
+/// The rail style for one entry: bold/accent for the user's own turn, dim for everything the
+/// assistant/runtime produced (assistant text, tool cards, notices, and the rest) — a modifier
+/// distinction (`user_style` adds `BOLD`), not just a color one, so it still reads under
+/// `Theme::MONO`.
+fn gutter_style(entry: &Entry, t: &Theme) -> Style {
+    match entry {
+        Entry::User(_) => t.user_style(),
+        _ => t.muted_style(),
+    }
+}
+
+/// Prepend the [`GUTTER`] rail span to every line, styled per entry kind (C-149). Applied once at
+/// the end of `entry_lines` so every downstream consumer (wrap, row-span recording, the C-111
+/// focus `sel_bg` patch, the C-109 running-badge pairing) sees it as an ordinary leading span.
+fn prepend_gutter(mut lines: Vec<Line<'static>>, style: Style) -> Vec<Line<'static>> {
+    for line in &mut lines {
+        line.spans.insert(0, Span::styled(GUTTER, style));
+    }
+    lines
+}
 
 /// Max text size accepted for an OSC 52 clipboard write (C-111). Terminals commonly cap the
 /// whole sequence around 100 KB; base64 inflates by 4/3, so cap the raw payload at 72 KiB.
@@ -1531,8 +1586,15 @@ impl ChatState {
     /// One entry's styled logical lines (pre-wrap) — the per-entry unit
     /// [`Self::ensure_transcript_layout`] wraps chunk-by-chunk (with a blank separator line
     /// between entries) so it can record per-entry row spans (C-111).
+    ///
+    /// C-149: every line gets a one-column gutter rail (`GUTTER`) prepended as its first span, so
+    /// turn boundaries are scannable without adding rows. It's produced here — content generators
+    /// below size against `content_width` (`width` minus the rail) — so the rail always lands
+    /// inside the row budget `ensure_transcript_layout` wraps at; the wrap + row-span recording
+    /// there stays untouched.
     fn entry_lines(&self, entry: &Entry, width: u16) -> Vec<Line<'static>> {
         let t = &self.theme;
+        let content_width = width.saturating_sub(GUTTER_COLS);
         let mut out: Vec<Line> = Vec::new();
         {
             match entry {
@@ -1545,7 +1607,7 @@ impl ChatState {
                         ]));
                     }
                 }
-                Entry::Assistant(a) => out.extend(a.lines(width, t)),
+                Entry::Assistant(a) => out.extend(a.lines(content_width, t)),
                 Entry::Thinking { body, call } => {
                     if !body.text.is_empty() {
                         let count = body.text.lines().count().max(1);
@@ -1561,7 +1623,7 @@ impl ChatState {
                             t.muted_style(),
                         ));
                         if self.expand_tools {
-                            out.extend(body.lines(width, t).into_iter().map(|mut l| {
+                            out.extend(body.lines(content_width, t).into_iter().map(|mut l| {
                                 for span in &mut l.spans {
                                     span.style = span.style.patch(t.muted_style());
                                 }
@@ -1575,7 +1637,7 @@ impl ChatState {
                         out.push(Line::from(model_call_spans(call, t)));
                     }
                 }
-                Entry::Tool(tool) => out.extend(self.tool_lines(tool, width)),
+                Entry::Tool(tool) => out.extend(self.tool_lines(tool, content_width)),
                 Entry::Notice { text, sev } => {
                     let style = match sev {
                         Sev::Info => t.muted_style(),
@@ -1587,7 +1649,7 @@ impl ChatState {
                     }
                 }
                 Entry::Intent(intent) => {
-                    let intent_cap = usize::from(width).saturating_sub(12).clamp(24, 160);
+                    let intent_cap = usize::from(content_width).saturating_sub(12).clamp(24, 160);
                     out.push(Line::from(vec![
                         Span::styled("◆ ", t.accent_style()),
                         Span::styled("intent: ", t.accent_style().add_modifier(Modifier::BOLD)),
@@ -1634,7 +1696,7 @@ impl ChatState {
                 Entry::GatherPlan(data) => out.extend(plan::render_compact(data, t)),
             }
         }
-        out
+        prepend_gutter(out, gutter_style(entry, t))
     }
 
     fn ensure_transcript_layout(&self, width: u16) {
@@ -1777,14 +1839,25 @@ impl ChatState {
             };
             let elapsed = tool.started.elapsed();
             let frame = SPINNER[(elapsed.as_millis() / 80) as usize % SPINNER.len()];
-            visible[slot] = tool_header_line(
+            let mut header = tool_header_line(
                 &self.theme,
                 &tool.call.verb,
                 &tool.call.arg,
                 format!("{frame} running · {}", fmt_elapsed(elapsed)),
                 self.theme.warn_style(),
-                width,
+                // C-149: same content budget entry_lines used to build the cached row, so the
+                // patched row's total width (rail + header) doesn't drift from its neighbors.
+                width.saturating_sub(GUTTER_COLS),
+                // A running card has no result yet, so no expandable detail — never a marker.
+                None,
             );
+            // C-149: the cached row carries the rail as its first span (`entry_lines`); the patch
+            // rebuilds the whole line, so it must re-add the same span or the row would shift left
+            // and lose its rail on every animation frame.
+            header
+                .spans
+                .insert(0, Span::styled(GUTTER, self.theme.muted_style()));
+            visible[slot] = header;
         }
         // C-108: highlight matches on the cloned visible slice only — the cache stays untouched.
         if let Some(search) = self.search.as_ref().filter(|s| !s.query.is_empty()) {
@@ -1952,6 +2025,13 @@ impl ChatState {
             Some(o) => (format!("✓ {}", fmt_tool_timing(o)), t.ok_style()),
         };
 
+        // C-155: `▸`/`▾` advertises that the card has detail to expand, and which state it's in
+        // — a card with nothing expandable (checked via `tool_has_detail`) gets no marker at all,
+        // so the affordance is never a false promise.
+        let effective_expanded = tool.expanded.unwrap_or(self.expand_tools);
+        let marker =
+            tool_has_detail(tool).then_some(if effective_expanded { '▾' } else { '▸' });
+
         out.push(tool_header_line(
             t,
             &tool.call.verb,
@@ -1959,6 +2039,7 @@ impl ChatState {
             badge,
             badge_style,
             width,
+            marker,
         ));
 
         // One-line summary (always, once the result is in).
@@ -1981,7 +2062,7 @@ impl ChatState {
             // Full detail, when expanded. Verbose (`-v`/`FLUX_VERBOSE`) lifts the line cap —
             // "tool output in full (no truncation)" is the flag's promise. C-111: a per-card
             // override (Enter on the focused card) beats the global Ctrl-E state.
-            if tool.expanded.unwrap_or(self.expand_tools) {
+            if effective_expanded {
                 // C-115: edit/write get a real hunk view (headers, line-number gutter, word-level
                 // intraline emphasis); everything else keeps the flat classified detail.
                 let diff = if o.is_error {
@@ -4677,6 +4758,211 @@ mod tests {
             .borrow()
             .as_ref()
             .is_some_and(|l| l.running_rows.is_empty()));
+    }
+
+    /// C-155: a collapsed card with expandable detail shows a `▸` marker in the header, rendered
+    /// through `tool_header_line` so the pad/width math is shared with the C-109 badge patch. The
+    /// marker must not be the header row's last span — the C-109 running-badge pairing matches
+    /// the last span against `RUNNING_BADGE`.
+    #[test]
+    fn collapsed_tool_card_shows_a_collapse_marker() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "echo hi"}),
+        )));
+        state.finish_tool("bash", "hi".into(), false);
+
+        let lines = state.transcript_lines(72);
+        let header = &lines[0];
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('▸'), "collapsed header must carry ▸: {text}");
+        assert_ne!(
+            header.spans.last().unwrap().content.as_ref(),
+            "▸",
+            "the marker must never be the header row's last span"
+        );
+    }
+
+    /// C-155: an expanded card shows `▾` instead, so the marker doubles as the current state.
+    #[test]
+    fn expanded_tool_card_shows_an_expand_marker() {
+        let mut state = ChatState::new("mock".into());
+        state.expand_tools = true;
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "echo hi"}),
+        )));
+        state.finish_tool("bash", "hi".into(), false);
+
+        let lines = state.transcript_lines(72);
+        let header = &lines[0];
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('▾'), "expanded header must carry ▾: {text}");
+        assert!(!text.contains('▸'), "must not carry both markers: {text}");
+    }
+
+    /// C-155: a card with no expandable detail (empty content, no diff) shows no marker at all —
+    /// a marker with nothing behind it would be a false affordance.
+    #[test]
+    fn tool_card_without_detail_shows_no_marker() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "true"}),
+        )));
+        state.finish_tool("bash", String::new(), false);
+
+        let lines = state.transcript_lines(72);
+        let header = &lines[0];
+        let text: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains('▸'), "{text}");
+        assert!(!text.contains('▾'), "{text}");
+    }
+
+    /// C-155: the new marker span must not break the C-109 running-badge pairing, which matches
+    /// each header row's LAST span against `RUNNING_BADGE` by content and style.
+    #[test]
+    fn running_card_still_pairs_with_running_badge() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "sleep 5"}),
+        )));
+
+        let lines = state.transcript_lines(72);
+        let header = &lines[0];
+        assert_eq!(
+            header.spans.last().unwrap().content.as_ref(),
+            RUNNING_BADGE,
+            "running badge must stay the header row's last span"
+        );
+        assert!(
+            state
+                .transcript_layout
+                .borrow()
+                .as_ref()
+                .is_some_and(|l| l.running_rows.len() == 1),
+            "running-badge pairing must still find the row"
+        );
+    }
+
+    /// C-149: a running tool card's per-tick spinner/elapsed patch (`transcript_viewport`) rebuilds
+    /// the whole header row, so it must re-add the same rail span `entry_lines` gave the cached
+    /// row — otherwise the row would visibly shift left on every animation frame.
+    #[test]
+    fn running_card_animation_keeps_the_gutter_rail() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "sleep 5"}),
+        )));
+
+        let mut terminal = Terminal::new(TestBackend::new(72, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains(GUTTER.trim_end()), "{content}");
+    }
+
+    /// C-149: `entry_lines` prepends a one-column rail per entry kind — the user's own turn reads
+    /// distinctly from what the assistant produced (bold/user-colored vs. dim), and the badge
+    /// pairing (C-109) still holds since the rail is a leading span, never the last one.
+    #[test]
+    fn transcript_gutter_marks_user_and_assistant_entries() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::User("hello there".into()));
+        state.stream_text("hi back");
+        state.end_stream();
+
+        let row_text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let lines = state.transcript_lines(60);
+        let user_row = lines
+            .iter()
+            .find(|l| row_text(l).contains("hello there"))
+            .expect("user row");
+        let assistant_row = lines
+            .iter()
+            .find(|l| row_text(l).contains("hi back"))
+            .expect("assistant row");
+
+        let first = |l: &Line<'static>| l.spans.first().cloned().expect("gutter span");
+        let user_gutter = first(user_row);
+        let assistant_gutter = first(assistant_row);
+
+        assert_eq!(user_gutter.content.as_ref(), GUTTER);
+        assert_eq!(assistant_gutter.content.as_ref(), GUTTER);
+        assert_eq!(user_gutter.style, state.theme.user_style(), "user rail");
+        assert_eq!(
+            assistant_gutter.style,
+            state.theme.muted_style(),
+            "assistant rail"
+        );
+        assert_ne!(
+            user_gutter.style, assistant_gutter.style,
+            "the two turns must read differently"
+        );
+    }
+
+    /// C-149: the C-111 focus highlight paints `sel_bg` over every span of the focused entry's
+    /// rows, including the new leading rail span — the rail must not defeat the focus read.
+    #[test]
+    fn focused_entry_reads_as_focused_with_gutter_present() {
+        let mut state = ChatState::new("mock".into());
+        state.push_user("first message");
+        state.push_user("second message");
+        state.focus_move(-1); // lands on the newest entry
+        assert_eq!(state.focused, Some(1));
+
+        let rows = state.transcript_lines(40);
+        let sel_bg = state.theme.sel_bg;
+        let focused_row = rows
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("second message")))
+            .expect("focused row");
+        let gutter = focused_row.spans.first().expect("gutter span");
+        assert_eq!(gutter.content.as_ref(), GUTTER, "rail still present");
+        assert_eq!(
+            gutter.style.bg,
+            Some(sel_bg),
+            "rail span must carry the focus background too"
+        );
+    }
+
+    /// C-149: `Theme::MONO` zeroes every color field, so the rail must still read via a
+    /// non-color attribute — `user_style()`'s `BOLD` modifier survives `NO_COLOR` even though the
+    /// glyph and every fg/bg collapse to `Reset`.
+    #[test]
+    fn transcript_gutter_usable_in_mono() {
+        let mut state = ChatState::new("mock".into());
+        state.theme = Theme::MONO;
+        state.push_user("hello there");
+        state.stream_text("hi back");
+        state.end_stream();
+
+        let row_text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let lines = state.transcript_lines(60);
+        let user_row = lines
+            .iter()
+            .find(|l| row_text(l).contains("hello there"))
+            .expect("user row");
+        let assistant_row = lines
+            .iter()
+            .find(|l| row_text(l).contains("hi back"))
+            .expect("assistant row");
+        let user_gutter = user_row.spans.first().expect("gutter span");
+        let assistant_gutter = assistant_row.spans.first().expect("gutter span");
+        assert_eq!(user_gutter.content.as_ref(), GUTTER);
+        assert_eq!(assistant_gutter.content.as_ref(), GUTTER);
+        assert!(
+            user_gutter.style.add_modifier.contains(Modifier::BOLD),
+            "user rail stays distinguishable via BOLD, not color, in MONO"
+        );
+        assert!(
+            !assistant_gutter.style.add_modifier.contains(Modifier::BOLD),
+            "assistant rail is not bold"
+        );
     }
 
     /// C-104: `Theme::by_name` — NO_COLOR forces mono, truecolor picks the RGB tuning, unknown
