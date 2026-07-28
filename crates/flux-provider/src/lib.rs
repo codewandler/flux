@@ -118,6 +118,14 @@ pub struct Request {
     pub trace: Option<RequestTrace>,
     /// Catch-all for provider-specific parameters.
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Ask the codec to place a prompt-cache breakpoint on the **last content block of the last
+    /// message** (C-134), so the conversation itself is cached and a multi-round turn stops
+    /// re-paying full input rate for a transcript it already sent.
+    ///
+    /// A flag rather than a field on `ContentBlock`: the breakpoint is an Anthropic wire concern,
+    /// and putting it on the L0 content type would push a vendor detail into every codec.
+    /// Codecs without a breakpoint notion (OpenAI Chat/Responses, ollama) ignore it entirely.
+    pub cache_tail: bool,
 }
 
 impl Request {
@@ -137,6 +145,7 @@ impl Request {
             effort: None,
             trace: None,
             metadata: serde_json::Map::new(),
+            cache_tail: false,
         }
     }
 

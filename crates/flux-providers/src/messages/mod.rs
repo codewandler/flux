@@ -68,9 +68,21 @@ pub fn build_messages_body(req: &Request, q: &MessagesQuirks) -> Result<Value> {
         "stream": true,
     });
 
+    // C-134: the conversation tail claims a breakpoint before the system segments are laid out, so
+    // the union stays within Anthropic's hard maximum of four. It is claimed first because it is
+    // worth more than the smallest system segment: the transcript grows every round while the
+    // system prefix does not.
+    let tail_cached = q.prompt_caching && req.cache_tail && stamp_tail_breakpoint(&mut messages);
+    body["messages"] = Value::Array(messages);
+    let reserved = usize::from(tail_cached);
+
     if !req.system_segments.is_empty() {
-        body["system"] =
-            segmented_system_field(&req.system_segments, system.as_deref(), q.prompt_caching);
+        body["system"] = segmented_system_field(
+            &req.system_segments,
+            system.as_deref(),
+            q.prompt_caching,
+            reserved,
+        );
     } else if let Some(s) = system {
         body["system"] = system_field(&s, q.prompt_caching);
     }
@@ -122,14 +134,79 @@ const CACHE_MIN_CHARS: usize = 4096;
 /// Anthropic accepts at most **4** `cache_control` breakpoints per request; a 5th → HTTP 400. The
 /// subscription-claude planner layout already stamps exactly 4 cache:true segments (transport prefix
 /// + planner-A + phase + base-B), so any future cache:true segment would tip it over (A-23).
+///
+/// C-134 made this a **union** budget: the conversation-tail breakpoint competes with the system
+/// segments for the same four slots, so [`cache_breakpoints`] is told how many are already spoken
+/// for and trims the system side to fit.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// How far Anthropic walks back from a breakpoint (in content blocks) looking for an existing cache
+/// entry. A round that appends more blocks than this leaves the previous round's tail breakpoint out
+/// of range, and the tail is re-written instead of read.
+///
+/// Not worked around, deliberately: with the budget above already full on subscription-claude there
+/// is no slot for intermediate breakpoints, and a miss costs one round's tail (the next round
+/// re-establishes it). It is made *observable* rather than silent — the model trace reports the
+/// per-request block count, and [`tail_breakpoint_out_of_lookback`] pins the shape.
+const CACHE_LOOKBACK_BLOCKS: usize = 20;
+
+/// The cache-control value for the **stable** tools+system prefix (C-135).
+///
+/// A one-hour TTL rather than the five-minute default: this prefix is byte-stable across the turns
+/// of a session, and interactive use — a human reading output between turns — routinely outlives
+/// five minutes, cold-starting the whole prefix on the next turn. The 1h write premium (2x base vs
+/// 1.25x) pays back in three requests, which a single multi-round turn already clears.
+fn stable_cache_control() -> Value {
+    json!({ "type": "ephemeral", "ttl": "1h" })
+}
+
+/// The cache-control value for the **rolling** conversation tail (C-134/C-135).
+///
+/// Deliberately the five-minute default: the tail moves every round, so a 1h write premium would
+/// buy retention the entry never lives to use.
+fn rolling_cache_control() -> Value {
+    json!({ "type": "ephemeral" })
+}
 
 fn system_field(s: &str, caching: bool) -> Value {
     if caching && s.len() >= CACHE_MIN_CHARS {
-        json!([{ "type": "text", "text": s, "cache_control": { "type": "ephemeral" } }])
+        json!([{ "type": "text", "text": s, "cache_control": stable_cache_control() }])
     } else {
         json!(s)
     }
+}
+
+/// Stamp the rolling breakpoint on the last content block of the last message. Returns whether one
+/// was placed — a conversation with no messages, or whose final message has no content blocks, has
+/// nothing to cache and must not consume a slot.
+fn stamp_tail_breakpoint(messages: &mut [Value]) -> bool {
+    let Some(last) = messages.last_mut() else {
+        return false;
+    };
+    // A message whose content serialized to a plain string carries no block to stamp.
+    let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    // The final message alone exceeding the window means the previous round's tail entry is
+    // certainly out of Anthropic's backward search range, so this tail will be written rather than
+    // read. Nothing to do about it inside a full breakpoint budget — but say so, because the whole
+    // point of C-134 is that a cache miss should never be silent.
+    if blocks.len() > CACHE_LOOKBACK_BLOCKS {
+        tracing::debug!(
+            blocks = blocks.len(),
+            window = CACHE_LOOKBACK_BLOCKS,
+            "conversation tail exceeds the prompt-cache lookback window; this round's tail is a \
+             cache write, not a read"
+        );
+    }
+    let Some(block) = blocks.last_mut() else {
+        return false;
+    };
+    let Some(object) = block.as_object_mut() else {
+        return false;
+    };
+    object.insert("cache_control".to_string(), rolling_cache_control());
+    true
 }
 
 /// A segmented system prompt (A-03 cache-first layout): with caching, one text block per segment,
@@ -141,16 +218,17 @@ fn segmented_system_field(
     segments: &[flux_provider::SystemSegment],
     folded: Option<&str>,
     caching: bool,
+    reserved: usize,
 ) -> Value {
     if caching {
-        let keep = cache_breakpoints(segments);
+        let keep = cache_breakpoints(segments, reserved);
         let mut blocks: Vec<Value> = segments
             .iter()
             .enumerate()
             .map(|(i, seg)| {
                 let mut b = json!({ "type": "text", "text": seg.text });
                 if keep.contains(&i) {
-                    b["cache_control"] = json!({ "type": "ephemeral" });
+                    b["cache_control"] = stable_cache_control();
                 }
                 b
             })
@@ -170,19 +248,27 @@ fn segmented_system_field(
 
 /// Which segment indices should actually carry a `cache_control` breakpoint. Every cache:true
 /// segment is stamped while the total stays within Anthropic's [`MAX_CACHE_BREAKPOINTS`] ceiling; if
-/// more segments than that ask to be cached, only the `MAX` **largest** are stamped and the smaller
-/// ones drop their breakpoint (A-23). Keeping the biggest cache:true segments preserves the stable
+/// more segments than that ask to be cached, only the largest are stamped and the smaller ones drop
+/// their breakpoint (A-23).
+///
+/// `reserved` is how many of the four slots are already claimed outside the system array — today
+/// the conversation-tail breakpoint (C-134), which takes its slot first. Subscription-claude's
+/// intent layout stamps exactly four cache:true segments, so on that path the tail's slot always
+/// costs the smallest system segment its breakpoint; the dropped segment's bytes still ride inside
+/// the next cached segment's prefix, so the cached prefix is unchanged in extent — only the number
+/// of resume points shrinks. Keeping the biggest cache:true segments preserves the stable
 /// planner prefix (the bulk of the prompt) — so the cache hit isn't regressed — while a dropped
 /// small segment's bytes still ride inside a later segment's cached prefix. This makes the ≤4
 /// invariant hold no matter how many cache:true segments a future layout adds.
-fn cache_breakpoints(segments: &[flux_provider::SystemSegment]) -> Vec<usize> {
+fn cache_breakpoints(segments: &[flux_provider::SystemSegment], reserved: usize) -> Vec<usize> {
+    let budget = MAX_CACHE_BREAKPOINTS.saturating_sub(reserved);
     let cached: Vec<usize> = segments
         .iter()
         .enumerate()
         .filter(|(_, s)| s.cache)
         .map(|(i, _)| i)
         .collect();
-    if cached.len() <= MAX_CACHE_BREAKPOINTS {
+    if cached.len() <= budget {
         return cached;
     }
     // Too many breakpoints: keep the largest `MAX` cache:true segments. Ties break toward the earlier
@@ -195,7 +281,7 @@ fn cache_breakpoints(segments: &[flux_provider::SystemSegment]) -> Vec<usize> {
             .cmp(&segments[a].text.len())
             .then(a.cmp(&b))
     });
-    by_size.truncate(MAX_CACHE_BREAKPOINTS);
+    by_size.truncate(budget);
     by_size.sort_unstable();
     by_size
 }
@@ -724,6 +810,178 @@ mod tests {
         assert!(
             stable_prefix.get("cache_control").is_some(),
             "the largest stable-prefix segment must keep its breakpoint: {body}"
+        );
+    }
+
+    /// C-134's named failing-first test: the conversation tail must carry a breakpoint, so the
+    /// cached prefix no longer stops where the system prompt ends. Before this, every
+    /// `cache_control` in a request lived in the `system` array and the whole growing transcript was
+    /// re-priced at full input rate on every round.
+    #[test]
+    fn conversation_tail_carries_a_cache_breakpoint() {
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.cache_tail = true;
+        req.messages = vec![
+            Message::user_text("read the file"),
+            Message::assistant(vec![ContentBlock::text("on it")]),
+            Message::user(vec![
+                ContentBlock::tool_result_text("t1", "line one", false),
+                ContentBlock::tool_result_text("t2", "line two", false),
+            ]),
+        ];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+
+        // Exactly one message-side breakpoint, on the LAST block of the LAST message.
+        assert_eq!(count_cache_control(&body["messages"]), 1, "{body}");
+        let last = messages.last().unwrap()["content"].as_array().unwrap();
+        assert!(
+            last.last().unwrap().get("cache_control").is_some(),
+            "the final content block must carry it: {body}"
+        );
+        assert!(
+            last[0].get("cache_control").is_none(),
+            "no other block may: {body}"
+        );
+        // C-135: the rolling tail stays on the 5-minute default — it is rewritten every round, so a
+        // 1h write premium would buy retention the entry never lives to use.
+        assert_eq!(last.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert!(
+            last.last().unwrap()["cache_control"].get("ttl").is_none(),
+            "the tail must NOT take the 1h TTL: {body}"
+        );
+    }
+
+    /// Opting out (or a provider without caching) leaves the messages untouched.
+    #[test]
+    fn conversation_tail_is_opt_in() {
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.messages = vec![Message::user_text("hello")];
+        let off = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        assert_eq!(count_cache_control(&off["messages"]), 0, "{off}");
+
+        // Even asked for, a profile with caching disabled must not stamp one.
+        req.cache_tail = true;
+        let no_caching = build_messages_body(&req, &MessagesQuirks::default()).unwrap();
+        assert_eq!(
+            count_cache_control(&no_caching["messages"]),
+            0,
+            "{no_caching}"
+        );
+    }
+
+    /// C-134: the ≤4 ceiling is a UNION budget. Subscription-claude's intent layout already stamps
+    /// exactly four cache:true segments, so the tail's slot must cost a system segment its
+    /// breakpoint rather than pushing the request to five and 400ing every planner call.
+    #[test]
+    fn tail_breakpoint_shares_the_four_slot_budget_with_the_system_segments() {
+        use flux_provider::SystemSegment;
+        let seg = |name: &str, chars: usize| SystemSegment {
+            text: format!("{name} {}", "x".repeat(chars)),
+            cache: true,
+        };
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.cache_tail = true;
+        // The subscription-claude intent layout: identity prefix (tiny) + INTENT_SYSTEM + index + base.
+        req.system_segments = vec![
+            seg("claude-code-identity-prefix", 8),
+            seg("intent-system", 2_000),
+            seg("family-index", 3_000),
+            seg("base-system", 9_000),
+        ];
+        req.messages = vec![Message::user_text("hello")];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+
+        assert_eq!(
+            count_cache_control(&body),
+            MAX_CACHE_BREAKPOINTS,
+            "the union must be exactly the ceiling, never over: {body}"
+        );
+        assert_eq!(
+            count_cache_control(&body["messages"]),
+            1,
+            "tail kept: {body}"
+        );
+
+        // Which system breakpoint is dropped is pinned, not incidental: the SMALLEST cache:true
+        // segment loses it, so the large stable prefix keeps its resume point. The dropped
+        // segment's bytes still ride inside the next cached segment's prefix.
+        let sys = body["system"].as_array().unwrap();
+        let stamped = |prefix: &str| {
+            sys.iter()
+                .find(|b| b["text"].as_str().is_some_and(|t| t.starts_with(prefix)))
+                .unwrap_or_else(|| panic!("segment {prefix} present"))
+                .get("cache_control")
+                .is_some()
+        };
+        assert!(
+            !stamped("claude-code-identity-prefix"),
+            "smallest drops: {body}"
+        );
+        assert!(stamped("intent-system"), "{body}");
+        assert!(stamped("family-index"), "{body}");
+        assert!(stamped("base-system"), "{body}");
+    }
+
+    /// C-135: the stable tools+system prefix takes the 1-hour TTL so an interactive pause between
+    /// turns — routinely longer than five minutes — no longer cold-starts it.
+    #[test]
+    fn stable_system_prefix_takes_the_one_hour_ttl() {
+        use flux_provider::SystemSegment;
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.system_segments = vec![SystemSegment {
+            text: "x".repeat(CACHE_MIN_CHARS),
+            cache: true,
+        }];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h", "{body}");
+
+        // The unsegmented path (a plain long `system`) is the same prefix and takes the same TTL.
+        let mut plain = Request::new("claude-opus-4-8", "hi");
+        plain.system = Some("y".repeat(CACHE_MIN_CHARS));
+        let body = build_messages_body(&plain, &anthropic_quirks()).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h", "{body}");
+    }
+
+    /// C-135: a profile without prompt caching (ollama-anthropic) must not leak a TTL — or any
+    /// `cache_control` — onto the wire.
+    #[test]
+    fn no_ttl_leaks_into_a_non_caching_profile() {
+        use flux_provider::SystemSegment;
+        let mut req = Request::new("some-local-model", "hi");
+        req.cache_tail = true;
+        req.system_segments = vec![SystemSegment {
+            text: "x".repeat(CACHE_MIN_CHARS),
+            cache: true,
+        }];
+        req.messages = vec![Message::user_text("hello")];
+        let body = build_messages_body(&req, &MessagesQuirks::default()).unwrap();
+        assert_eq!(count_cache_control(&body), 0, "{body}");
+        assert!(!body.to_string().contains("1h"), "{body}");
+    }
+
+    /// C-134: a round that appends more than [`CACHE_LOOKBACK_BLOCKS`] content blocks leaves the
+    /// previous round's tail out of Anthropic's backward search window, so that round's tail is
+    /// re-written rather than read. With the four-slot budget already full on subscription-claude
+    /// there is no room for intermediate breakpoints, so the behaviour is accepted — and pinned here
+    /// so it stays a known, observable property rather than a silent regression.
+    #[test]
+    fn tail_breakpoint_out_of_lookback() {
+        let wide: Vec<ContentBlock> = (0..CACHE_LOOKBACK_BLOCKS + 5)
+            .map(|i| ContentBlock::tool_result_text(format!("t{i}"), "out", false))
+            .collect();
+        let appended = wide.len();
+        let mut req = Request::new("claude-opus-4-8", "hi");
+        req.cache_tail = true;
+        req.messages = vec![Message::user_text("go"), Message::user(wide)];
+        let body = build_messages_body(&req, &anthropic_quirks()).unwrap();
+
+        // Still exactly one tail breakpoint — we do not spend extra slots trying to bridge the gap.
+        assert_eq!(count_cache_control(&body["messages"]), 1, "{body}");
+        assert!(
+            appended > CACHE_LOOKBACK_BLOCKS,
+            "this round appends {appended} blocks, beyond the {CACHE_LOOKBACK_BLOCKS}-block window: \
+             the previous round's tail entry is out of range and this tail is written, not read"
         );
     }
 

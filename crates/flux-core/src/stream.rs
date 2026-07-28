@@ -111,6 +111,60 @@ impl Usage {
     }
 }
 
+/// Cumulative prompt-cache accounting across the model calls of a turn (or a session).
+///
+/// [`Usage::accumulate`] deliberately **replaces** the input/cache side on every call, because the
+/// figure it maintains is *context-window occupancy* — in an agent loop each round re-sends the
+/// growing conversation, so the latest prompt size is the occupancy and summing would multiply-count
+/// the re-sent prefix. That is the right answer for "how full is the window" and the wrong one for
+/// "how much of what we sent was served from cache": under it, a twelve-round turn reports round
+/// twelve only — the round with the longest message tail and therefore the *worst* ratio of the turn.
+///
+/// This is the other accumulator. It sums each call's prompt tiers, so [`Self::hit_rate`] is the
+/// token-weighted share across every call, matching what `flux usage` computes offline from the
+/// per-call `CallUsage` event log. The two coexist on purpose: `ctx` stays occupancy, cache stays
+/// efficiency (C-133).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEfficiency {
+    /// Prompt tokens served from cache, summed across calls.
+    #[serde(default)]
+    pub read: u64,
+    /// Prompt tokens written into the cache, summed across calls.
+    #[serde(default)]
+    pub write: u64,
+    /// Prompt tokens billed at full input rate — neither read from nor written to cache.
+    #[serde(default)]
+    pub fresh: u64,
+}
+
+impl CacheEfficiency {
+    /// Fold one model call's prompt tiers in. Output/reasoning/audio are not prompt and are ignored.
+    pub fn add(&mut self, call: &Usage) {
+        self.read += call.cache_read_input_tokens;
+        self.write += call.cache_creation_input_tokens;
+        self.fresh += call.input_tokens;
+    }
+
+    /// Every prompt token accounted for, across all folded calls. Equals the sum of each call's
+    /// [`Usage::context_tokens`].
+    pub fn prompt_tokens(&self) -> u64 {
+        self.read + self.write + self.fresh
+    }
+
+    /// The share of prompt tokens served from cache, in `0.0..=1.0`. Zero when nothing was folded.
+    pub fn hit_rate(&self) -> f64 {
+        match self.prompt_tokens() {
+            0 => 0.0,
+            total => self.read as f64 / total as f64,
+        }
+    }
+
+    /// True when no call has been folded in yet — the empty state a surface renders as "no usage".
+    pub fn is_empty(&self) -> bool {
+        self.prompt_tokens() == 0
+    }
+}
+
 /// Why the model stopped generating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -385,5 +439,77 @@ mod tests {
             let back: Chunk = serde_json::from_str(&json).expect("chunk deserializes");
             assert_eq!(chunk, back, "round-trip mismatch via {json}");
         }
+    }
+
+    /// C-133: the two accumulators answer different questions and must not be conflated.
+    /// `Usage::accumulate` reports context-window occupancy (last round wins); `CacheEfficiency`
+    /// reports the token-weighted cache share across every call. A three-round turn whose rounds hit
+    /// 90% / 60% / 20% must report the weighted turn figure, not round three's 20%.
+    #[test]
+    fn cache_efficiency_is_token_weighted_across_calls_not_the_last_round() {
+        let round = |read: u64, fresh: u64| Usage {
+            input_tokens: fresh,
+            output_tokens: 10,
+            cache_read_input_tokens: read,
+            ..Default::default()
+        };
+        // 90k/100k, 60k/100k, 20k/100k prompts.
+        let calls = [
+            round(90_000, 10_000),
+            round(60_000, 40_000),
+            round(20_000, 80_000),
+        ];
+
+        let mut occupancy = Usage::default();
+        let mut efficiency = CacheEfficiency::default();
+        for call in &calls {
+            occupancy.accumulate(call);
+            efficiency.add(call);
+        }
+
+        // Occupancy keeps its replace semantics: the last round's prompt IS the window occupancy.
+        assert_eq!(occupancy.context_tokens(), 100_000);
+        assert_eq!(occupancy.cache_read_input_tokens, 20_000);
+        // …and reading a hit rate off it would report the turn's worst round.
+        let last_round_ratio =
+            occupancy.cache_read_input_tokens as f64 / occupancy.context_tokens() as f64;
+        assert!((last_round_ratio - 0.20).abs() < 1e-9);
+
+        // Efficiency sums all three: (90k + 60k + 20k) / 300k.
+        assert_eq!(efficiency.prompt_tokens(), 300_000);
+        assert_eq!(efficiency.read, 170_000);
+        assert_eq!(efficiency.fresh, 130_000);
+        assert!((efficiency.hit_rate() - 170_000.0 / 300_000.0).abs() < 1e-9);
+        // The turn figure is materially better than the last round's — that gap is the bug C-133 closes.
+        assert!(efficiency.hit_rate() > last_round_ratio + 0.3);
+    }
+
+    /// Output, reasoning, and audio are not prompt tokens; folding a call must not count them.
+    #[test]
+    fn cache_efficiency_counts_only_the_prompt_tiers() {
+        let mut eff = CacheEfficiency::default();
+        eff.add(&Usage {
+            input_tokens: 100,
+            output_tokens: 5_000,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 700,
+            reasoning_tokens: 4_000,
+            audio_input_tokens: 50,
+            audio_output_tokens: 60,
+            reported_cost_usd: Some(1.0),
+        });
+        assert_eq!(eff.read, 700);
+        assert_eq!(eff.write, 200);
+        assert_eq!(eff.fresh, 100);
+        // The three tiers reconstruct exactly one call's context_tokens().
+        assert_eq!(eff.prompt_tokens(), 1_000);
+    }
+
+    #[test]
+    fn cache_efficiency_empty_state_is_zero_not_a_division_by_zero() {
+        let eff = CacheEfficiency::default();
+        assert!(eff.is_empty());
+        assert_eq!(eff.prompt_tokens(), 0);
+        assert_eq!(eff.hit_rate(), 0.0);
     }
 }

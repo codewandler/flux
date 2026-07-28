@@ -24,7 +24,7 @@ use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
 pub use rendering::render;
 pub use state::ChatState;
-use state::Phase;
+use state::{Phase, RoundUsage};
 use terminal_io::{TerminalGuard, Tui};
 
 pub mod theme;
@@ -138,6 +138,12 @@ const CURSOR: &str = "▍";
 /// `FLUX_VERBOSE`), whose promise is tool output in full, no truncation.
 const MAX_DETAIL: usize = 30;
 
+/// How many per-call rows the `/usage` overlay keeps for the turn in progress (C-140). A turn is
+/// bounded by the adaptive model-call budget well below this; the cap exists so a runaway loop can't
+/// grow the row list without bound. The session-level cache totals are unaffected — they keep
+/// folding every call.
+pub(crate) const MAX_TURN_ROUNDS: usize = 256;
+
 /// The footer's model-stage spinner label (mirrors the CLI's `phase_spinner_label`). Current turns
 /// use `intent`/`explore`; the older `orient`/`gather`/`execute` labels remain readable when a
 /// historical session is projected. A phase-less turn falls back to a neutral label.
@@ -193,6 +199,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or switch model"),
     ("effort", "show or set reasoning effort"),
     ("quit", "exit flux"),
+    ("usage", "tokens, cache hit rate, and cost"),
     ("compact", "compact session context"),
     ("shell", "toggle the generic bash op"),
     ("tools", "list registered tools"),
@@ -870,6 +877,7 @@ impl ChatState {
             history_search: None,
             search: None,
             help_open: false,
+            usage_open: false,
             focused: None,
             file_inventory: None,
             path_sel: 0,
@@ -879,11 +887,11 @@ impl ChatState {
             expand_tools: false,
             verbose: false,
             slash_sel: 0,
-            tokens_in: 0,
             tokens_out: 0,
-            tokens_cache_read: 0,
-            tokens_cache_write: 0,
             tokens_reasoning: 0,
+            cache: flux_core::CacheEfficiency::default(),
+            turn_cache: flux_core::CacheEfficiency::default(),
+            turn_rounds: Vec::new(),
             cost_usd: None,
             cost_model: None,
             cost_unpriced: false,
@@ -994,11 +1002,13 @@ impl ChatState {
     /// `cost_unpriced` instead of silently skipping the turn; otherwise the cumulative header
     /// total would under-report once any turn went unpriced. A local/mock spec (`ollama*`, `mock`)
     /// never sets it — nothing is billed there, so silence stays correct.
+    /// C-139: the prompt side is **not** folded here. `u` is the turn's accumulated `Usage`, whose
+    /// input/cache fields `Usage::accumulate` leaves holding the last round's snapshot — summing
+    /// those across turns under-counts a multi-round session badly. Prompt tiers arrive per model
+    /// call through [`Self::record_call_usage`] instead. Generated output and cost stay here: output
+    /// is genuinely summed by `accumulate`, and cost is turn spend.
     fn record_usage(&mut self, u: &Usage) {
-        self.tokens_in += u.input_tokens;
         self.tokens_out += u.output_tokens;
-        self.tokens_cache_read += u.cache_read_input_tokens;
-        self.tokens_cache_write += u.cache_creation_input_tokens;
         self.tokens_reasoning += u.reasoning_tokens;
         if let Some((spec, pricing)) = &self.cost_model {
             match pricing.cost(u, spec) {
@@ -1007,6 +1017,27 @@ impl ChatState {
                 None => {}
             }
         }
+    }
+
+    /// Fold one model call's prompt tiers into the session and current-turn cache accounting, and
+    /// record it as a round for the `/usage` overlay (C-139/C-140).
+    fn record_call_usage(&mut self, model: &str, stage: &str, operations: usize, u: &Usage) {
+        self.cache.add(u);
+        self.turn_cache.add(u);
+        if self.turn_rounds.len() < MAX_TURN_ROUNDS {
+            self.turn_rounds.push(RoundUsage {
+                model: model.to_string(),
+                stage: stage.to_string(),
+                operations,
+                usage: u.clone(),
+            });
+        }
+    }
+
+    /// Reset the per-turn cache accounting at the start of a turn. The session totals persist.
+    fn begin_turn_usage(&mut self) {
+        self.turn_cache = flux_core::CacheEfficiency::default();
+        self.turn_rounds.clear();
     }
 
     fn push(&mut self, entry: Entry) {
@@ -1915,19 +1946,28 @@ impl ChatState {
         if self.auto_approve {
             right.push(vec![Span::styled("auto-ok", t.warn_style())]);
         }
-        let cache = self.tokens_cache_read + self.tokens_cache_write;
-        if self.tokens_in + self.tokens_out + cache > 0 {
+        // C-139: `↑` is now every prompt token the session sent (fresh + both cache tiers, summed
+        // per model call), so the cache segment's hit % is a share OF it. The old `↑` was the
+        // fresh-input side of each turn's last round, and `cache` was read+write added together —
+        // which rendered a session reading 3.2M from cache identically to one writing 3.2M into it.
+        let prompt = self.cache.prompt_tokens();
+        if prompt + self.tokens_out > 0 {
             right.push(vec![Span::styled(
                 format!(
                     "Σ ↑{} ↓{} tok",
-                    fmt_count(self.tokens_in),
+                    fmt_count(prompt),
                     fmt_count(self.tokens_out)
                 ),
                 t.muted_style(),
             )]);
-            if cache > 0 {
+            if !self.cache.is_empty() && (self.cache.read > 0 || self.cache.write > 0) {
                 right.push(vec![Span::styled(
-                    format!("cache {}", fmt_count(cache)),
+                    format!(
+                        "cache {:.0}% ↺{} ✎{}",
+                        self.cache.hit_rate() * 100.0,
+                        fmt_count(self.cache.read),
+                        fmt_count(self.cache.write)
+                    ),
                     t.muted_style(),
                 )]);
             }
@@ -2094,6 +2134,9 @@ impl ChatState {
         let id = self.next_action_id;
         self.next_action_id = self.next_action_id.saturating_add(1);
         self.active_action_id = Some(id);
+        // C-140: a new action is a new turn — the overlay's per-turn view starts empty. Session
+        // totals are deliberately untouched.
+        self.begin_turn_usage();
         id
     }
 
@@ -2291,19 +2334,29 @@ impl ChatState {
         self.scroll = 0;
         self.follow = true;
         self.unread = 0;
-        self.tokens_in = 0;
         self.tokens_out = 0;
-        self.tokens_cache_read = 0;
-        self.tokens_cache_write = 0;
         self.tokens_reasoning = 0;
+        self.cache = flux_core::CacheEfficiency::default();
+        self.turn_cache = flux_core::CacheEfficiency::default();
+        self.turn_rounds.clear();
         self.cost_usd = None;
         self.cost_unpriced = false;
         for usage in &turn_usage {
-            self.tokens_in += usage.input_tokens;
             self.tokens_out += usage.output_tokens;
-            self.tokens_cache_read += usage.cache_read_input_tokens;
-            self.tokens_cache_write += usage.cache_creation_input_tokens;
             self.tokens_reasoning += usage.reasoning_tokens;
+        }
+        // C-139: prompt tiers come from the per-call rows, matching the live path and `flux usage`.
+        // Only when a session predates `CallUsage` (or recorded none) do we fall back to the turn
+        // snapshots — under-counted, but the best the log holds. Same precedence the cost fold below
+        // already uses.
+        if call_usage.is_empty() {
+            for usage in &turn_usage {
+                self.cache.add(usage);
+            }
+        } else {
+            for (_, usage) in &call_usage {
+                self.cache.add(usage);
+            }
         }
         if let Some((_, pricing)) = &self.cost_model {
             if call_usage.is_empty() {
@@ -2670,6 +2723,12 @@ async fn event_loop(
                     is_error,
                 } => state.finish_tool(&name, content, is_error),
                 UiEvent::Usage(u) => state.record_usage(&u),
+                UiEvent::CallUsage {
+                    model,
+                    stage,
+                    operations,
+                    usage,
+                } => state.record_call_usage(&model, &stage, operations, &usage),
                 UiEvent::Notice { text, sev } => state.push(Entry::Notice { text, sev }),
                 UiEvent::Approval {
                     tool,
@@ -2806,6 +2865,14 @@ async fn event_loop(
                             state.approval = None;
                             show_next_approval(state, &mut pending_reply, &mut approval_queue);
                         }
+                    }
+                    continue;
+                }
+
+                // C-140: usage overlay — Esc/q/Enter close, everything else is swallowed.
+                if state.usage_open {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+                        state.usage_open = false;
                     }
                     continue;
                 }
@@ -3360,6 +3427,7 @@ async fn handle_command(
 
     match name {
         "" | "help" => state.help_open = true,
+        "usage" => state.usage_open = true,
         "quit" | "exit" => return Ok(true),
         "queue" => {
             if state.queue.is_empty() {
@@ -5193,7 +5261,7 @@ mod tests {
     #[test]
     fn header_and_footer_show_identity_and_metrics() {
         let mut state = ChatState::new("anthropic/opus".into());
-        state.tokens_in = 12_300;
+        state.cache.fresh = 12_300;
         state.tokens_out = 840;
         state.steps = 3;
         state.last_elapsed = Some(Duration::from_millis(4200));
@@ -5245,15 +5313,191 @@ mod tests {
     #[test]
     fn narrow_header_keeps_tokens_drops_cost() {
         let mut state = ChatState::new("m".into());
-        state.tokens_in = 12_300;
+        state.cache.fresh = 11_300;
+        state.cache.read = 1_000;
         state.tokens_out = 840;
-        state.tokens_cache_read = 1_000;
         state.cost_usd = Some(1.2345);
         let mut terminal = Terminal::new(TestBackend::new(46, 10)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         let content = screen(&terminal);
         assert!(content.contains("12.3k"), "tokens must survive: {content}");
         assert!(!content.contains("$1.2345"), "cost drops first: {content}");
+    }
+
+    /// C-139: the header used to fold `TurnEnded.usage`, which `Usage::accumulate` leaves holding
+    /// the turn's LAST round — so a multi-round turn contributed one round's cache read and the
+    /// header under-counted. The named failing-first test: three calls of a single turn must all
+    /// land in the session total.
+    #[test]
+    fn header_cache_counts_every_model_call_not_just_the_last_round() {
+        let call = |read: u64, fresh: u64| Usage {
+            input_tokens: fresh,
+            output_tokens: 10,
+            cache_read_input_tokens: read,
+            ..Default::default()
+        };
+        let calls = [
+            call(90_000, 10_000),
+            call(60_000, 40_000),
+            call(20_000, 80_000),
+        ];
+
+        let mut state = ChatState::new("claude/claude-sonnet-5".into());
+        // What the engine actually delivers: one `model.call` observation per call, then one
+        // turn-end usage carrying the accumulated (last-round) snapshot.
+        let mut turn = Usage::default();
+        for c in &calls {
+            state.record_call_usage("claude/claude-sonnet-5", "explore", 12, c);
+            turn.accumulate(c);
+        }
+        state.record_usage(&turn);
+
+        // The pre-C-139 header would have shown the turn snapshot: 20k read of a 100k prompt.
+        assert_eq!(turn.cache_read_input_tokens, 20_000);
+        // The fixed header shows all three calls.
+        assert_eq!(state.cache.read, 170_000);
+        assert_eq!(state.cache.fresh, 130_000);
+        assert_eq!(state.cache.prompt_tokens(), 300_000);
+        // Output still comes from the turn usage and is still summed exactly once.
+        assert_eq!(state.tokens_out, 30);
+    }
+
+    /// C-139: read and write are separate figures. A session that only READS from cache and one that
+    /// only WRITES to it used to render the identical `cache N` segment.
+    #[test]
+    fn header_distinguishes_cache_reads_from_cache_writes() {
+        let render = |usage: Usage| -> String {
+            let mut state = ChatState::new("claude/claude-sonnet-5".into());
+            state.record_call_usage("claude/claude-sonnet-5", "explore", 12, &usage);
+            let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+            terminal.draw(|f| render(f, &state)).unwrap();
+            screen(&terminal)
+        };
+        let reader = render(Usage {
+            cache_read_input_tokens: 3_200_000,
+            ..Default::default()
+        });
+        let writer = render(Usage {
+            cache_creation_input_tokens: 3_200_000,
+            ..Default::default()
+        });
+        assert_ne!(
+            reader, writer,
+            "a cache-reading session must not render identically to a cache-writing one"
+        );
+        // The reader is at 100% hit and shows its read tier; the writer is at 0% and shows its write.
+        assert!(reader.contains("100%"), "{reader}");
+        assert!(reader.contains("↺3.2M"), "{reader}");
+        assert!(writer.contains("0%"), "{writer}");
+        assert!(writer.contains("✎3.2M"), "{writer}");
+    }
+
+    /// C-140: the `/usage` overlay renders the turn per round, so a mid-turn cache collapse is
+    /// visible while it happens.
+    #[test]
+    fn usage_overlay_shows_per_round_hit_rates_and_session_totals() {
+        let call = |read: u64, fresh: u64, ops: usize| {
+            (
+                ops,
+                Usage {
+                    input_tokens: fresh,
+                    output_tokens: 10,
+                    cache_read_input_tokens: read,
+                    ..Default::default()
+                },
+            )
+        };
+        let mut state = ChatState::new("claude/claude-fable-5".into());
+        // 91% → 61% → 42%, with the tool set widening at round 3 (12 → 19 operations).
+        for (ops, usage) in [
+            call(91_000, 9_000, 12),
+            call(61_000, 39_000, 12),
+            call(42_000, 58_000, 19),
+        ] {
+            state.record_call_usage("claude/claude-fable-5", "explore", ops, &usage);
+        }
+        state.usage_open = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+
+        assert!(
+            content.contains("usage · "),
+            "titled with the session: {content}"
+        );
+        assert!(content.contains("this turn"), "{content}");
+        assert!(content.contains("per round"), "{content}");
+        // Each round's own hit rate, not the turn average.
+        for pct in ["91%", "61%", "42%"] {
+            assert!(content.contains(pct), "missing round {pct}: {content}");
+        }
+        // The three-way split reconstructs the prompt exactly.
+        assert_eq!(state.turn_cache.prompt_tokens(), 300_000);
+        assert!(content.contains("read 194.0k"), "{content}");
+        assert!(content.contains("fresh 106.0k"), "{content}");
+        // The churn marker is derived from the operation count, and only marks the round that changed.
+        assert!(content.contains("← tools 19"), "churn marked: {content}");
+        assert_eq!(
+            content.matches("← tools").count(),
+            1,
+            "only the changed round: {content}"
+        );
+        assert!(content.contains("session Σ"), "{content}");
+    }
+
+    /// C-140: a session with no model calls yet renders an empty state, not a bare frame or a
+    /// division by zero.
+    #[test]
+    fn usage_overlay_empty_state() {
+        let mut state = ChatState::new("mock".into());
+        state.usage_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("no model calls recorded yet"), "{content}");
+        assert!(content.contains("esc to close"), "{content}");
+    }
+
+    /// C-140: the overlay must fit its frame on a small terminal — the per-round list sheds oldest
+    /// rows with a count rather than overflowing.
+    #[test]
+    fn usage_overlay_degrades_on_a_short_terminal() {
+        let mut state = ChatState::new("claude/claude-fable-5".into());
+        for round in 0..40u64 {
+            state.record_call_usage(
+                "claude/claude-fable-5",
+                "explore",
+                12,
+                &Usage {
+                    input_tokens: 1_000,
+                    cache_read_input_tokens: round * 100,
+                    ..Default::default()
+                },
+            );
+        }
+        state.usage_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(
+            content.contains("earlier"),
+            "elision is counted, not silent: {content}"
+        );
+        // The newest round survives the squeeze; the oldest are the ones elided.
+        assert!(content.contains(" 40 "), "newest round kept: {content}");
+        assert!(!content.contains("  1 █"), "oldest round elided: {content}");
+        // The overlay fits: the composer hint below it still renders, so nothing overflowed the frame.
+        assert!(content.contains("esc to close"), "{content}");
+        assert!(
+            content.contains("Enter send"),
+            "overlay overflowed the frame: {content}"
+        );
+        // No row is clipped mid-token at this width (the read/write/fresh line used to be).
+        assert!(
+            !content.contains("fresh 40.") || content.contains("fresh 40.0k"),
+            "a row is clipped mid-token: {content}"
+        );
     }
 
     /// C-06 cache-aware surfacing: the TUI header must show cache tokens (previously ignored
@@ -5265,20 +5509,24 @@ mod tests {
             "anthropic/claude-sonnet-4-6".into(),
             flux_core::PricingTable::builtin(),
         );
-        state.record_usage(&Usage {
+        let usage = Usage {
             input_tokens: 1_000_000,
             output_tokens: 100_000,
             cache_creation_input_tokens: 200_000,
             cache_read_input_tokens: 500_000,
             reasoning_tokens: 0,
             ..Default::default()
-        });
+        };
+        // C-139 split the fold: output + cost ride the turn usage, prompt tiers ride the per-call
+        // one. A real turn delivers both; this test drives them the same way the event loop does.
+        state.record_call_usage("anthropic/claude-sonnet-4-6", "explore", 12, &usage);
+        state.record_usage(&usage);
 
         // Tokens are accumulated across EVERY tier, not just input/output.
-        assert_eq!(state.tokens_in, 1_000_000);
+        assert_eq!(state.cache.fresh, 1_000_000);
         assert_eq!(state.tokens_out, 100_000);
-        assert_eq!(state.tokens_cache_read, 500_000);
-        assert_eq!(state.tokens_cache_write, 200_000);
+        assert_eq!(state.cache.read, 500_000);
+        assert_eq!(state.cache.write, 200_000);
         // cost = 1·3 + 0.1·15 + 0.2·3.75 + 0.5·0.30 = 3 + 1.5 + 0.75 + 0.15 = 5.4
         assert!(
             (state.cost_usd.unwrap() - 5.4).abs() < 1e-9,
@@ -5301,11 +5549,16 @@ mod tests {
         // Without `with_cost`, no cost segment appears (no model spec/pricing to compute from) —
         // tokens (incl. cache) still show.
         let mut plain = ChatState::new("mock".into());
-        plain.record_usage(&Usage {
-            input_tokens: 100,
-            cache_read_input_tokens: 50,
-            ..Default::default()
-        });
+        plain.record_call_usage(
+            "mock",
+            "explore",
+            12,
+            &Usage {
+                input_tokens: 100,
+                cache_read_input_tokens: 50,
+                ..Default::default()
+            },
+        );
         assert!(plain.cost_usd.is_none());
         let mut terminal2 = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal2.draw(|f| render(f, &plain)).unwrap();

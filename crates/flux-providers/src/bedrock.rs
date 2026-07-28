@@ -1519,6 +1519,7 @@ mod tests {
             model: "us.anthropic.claude-sonnet-4-6".to_string(),
             system: None,
             system_segments: Vec::new(),
+            cache_tail: false,
             messages: vec![flux_core::Message::user(vec![
                 flux_core::ContentBlock::Text {
                     text: "say ok".to_string(),

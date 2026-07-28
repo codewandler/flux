@@ -440,6 +440,11 @@ pub(super) struct CliSink {
         Arc<std::sync::Mutex<SpinnerState>>,
         tokio::task::JoinHandle<()>,
     )>,
+    /// Per-call prompt-cache accounting for the turn in progress (C-139). Folded from the engine's
+    /// `model.call` observations, because the turn-end `Usage` carries `Usage::accumulate`'s
+    /// occupancy snapshot — the last round only — and a hit rate read off that reports the turn's
+    /// worst round. Reset at each turn boundary.
+    pub(super) turn_cache: flux_core::CacheEfficiency,
     /// Iteration counter: how many tool round-trips have completed this turn.
     pub(super) iter: usize,
     /// Max iterations cap (threaded from `Agent::max_iterations` for display).
@@ -492,6 +497,7 @@ impl CliSink {
             pending: None,
             pending_timing: None,
             spinner: None,
+            turn_cache: flux_core::CacheEfficiency::default(),
             iter: 0,
             max_iter,
             model_spec: None,
@@ -703,7 +709,15 @@ impl AgentSink for CliSink {
         // the prompt line is already open — printing them would garble it. The approval prompt
         // itself (`plan_prompt`, built from the same risk data) carries the batch content with
         // correct ordering.
-        if o.kind == flux_evidence::KIND_DESTRUCTIVE {
+        if o.kind == "model.call" {
+            if let Some(usage) = o
+                .data
+                .get("usage")
+                .and_then(|value| serde_json::from_value::<Usage>(value.clone()).ok())
+            {
+                self.turn_cache.add(&usage);
+            }
+        } else if o.kind == flux_evidence::KIND_DESTRUCTIVE {
             eprintln!(
                 "{}",
                 style::yellow("⚠ destructive operation — approval required")
@@ -789,7 +803,12 @@ impl AgentSink for CliSink {
             .map(|t| style::fmt_elapsed(t.elapsed()))
             .unwrap_or_default();
         // The right-hand token annotation: context-window occupancy, generated tokens, cache + hit-rate.
-        let token_inline = usage.as_ref().map(usage_annotation).unwrap_or_default();
+        // `ctx` comes from the turn usage (occupancy); the cache tiers come from the per-call fold,
+        // so the hit rate is the turn's, not its last round's (C-139).
+        let token_inline = usage
+            .as_ref()
+            .map(|u| usage_annotation_with_cache(u, &self.turn_cache))
+            .unwrap_or_default();
         // The dollar cost of this turn's tokens, when a model spec + pricing table were attached.
         let cost_inline = self.cost_inline(usage.as_ref());
         // Always print a rule so the turn boundary is visible even for prose-only replies.
@@ -805,6 +824,7 @@ impl AgentSink for CliSink {
         };
         let rule_len = self.width.saturating_sub(summary.chars().count() + 2);
         eprintln!("{} {}", style::rule(rule_len), style::dim(&summary));
+        self.turn_cache = flux_core::CacheEfficiency::default();
     }
 }
 
@@ -815,6 +835,21 @@ impl AgentSink for CliSink {
 /// caller via `CliSink::cost_inline`) — this function is only the token breakdown. Empty when nothing
 /// was billed (e.g. an offline `-m mock` turn).
 pub(super) fn usage_annotation(u: &Usage) -> String {
+    // No per-call fold available (a caller outside the turn loop, or a session that recorded none):
+    // fall back to the turn snapshot, which is what this function always used.
+    let mut fallback = flux_core::CacheEfficiency::default();
+    fallback.add(u);
+    usage_annotation_with_cache(u, &fallback)
+}
+
+/// [`usage_annotation`] with the cache tiers supplied separately.
+///
+/// C-139: `ctx` must stay the turn's context-window occupancy — `Usage::accumulate`'s replace
+/// semantics are exactly right for that — but the cache tiers must be the per-call sum, or the
+/// rendered hit rate is the turn's LAST round: the round with the longest message tail and so the
+/// worst ratio of the turn. `cache` is folded from the engine's `model.call` observations and is the
+/// same figure `flux usage` computes offline from the `CallUsage` event log.
+pub(super) fn usage_annotation_with_cache(u: &Usage, cache: &flux_core::CacheEfficiency) -> String {
     let context = u.context_tokens();
     if context == 0 && u.output_tokens == 0 {
         return String::new();
@@ -824,17 +859,17 @@ pub(super) fn usage_annotation(u: &Usage) -> String {
         style::fmt_tokens(context),
         style::fmt_tokens(u.output_tokens)
     );
-    if u.cache_read_input_tokens > 0 && context > 0 {
-        let pct = (u.cache_read_input_tokens as f64 / context as f64 * 100.0).round() as u64;
+    if cache.read > 0 {
+        let pct = (cache.hit_rate() * 100.0).round() as u64;
         s.push_str(&format!(
             " · cache {} ({pct}% hit)",
-            style::fmt_tokens(u.cache_read_input_tokens)
+            style::fmt_tokens(cache.read)
         ));
     }
-    if u.cache_creation_input_tokens > 0 {
+    if cache.write > 0 {
         s.push_str(&format!(
             " · cache write {}",
-            style::fmt_tokens(u.cache_creation_input_tokens)
+            style::fmt_tokens(cache.write)
         ));
     }
     if u.reasoning_tokens > 0 {

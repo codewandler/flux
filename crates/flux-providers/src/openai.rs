@@ -2011,3 +2011,29 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cache_tail_tests {
+    use super::*;
+    use flux_provider::Request;
+
+    /// C-134: `cache_tail` is an Anthropic-wire concern. The Responses path shares `Request`, so it
+    /// must ignore the flag entirely — same bytes with and without it.
+    #[test]
+    fn responses_body_ignores_the_anthropic_cache_tail_flag() {
+        let mut off = Request::new("gpt-5.6-sol", "hi");
+        off.messages = vec![flux_core::Message::user_text("hello")];
+        let mut on = off.clone();
+        on.cache_tail = true;
+
+        for codex in [false, true] {
+            let a = build_responses_body(&off, codex).unwrap();
+            let b = build_responses_body(&on, codex).unwrap();
+            assert_eq!(
+                a, b,
+                "cache_tail must not reach the Responses wire (codex={codex})"
+            );
+            assert!(!a.to_string().contains("cache_control"), "{a}");
+        }
+    }
+}

@@ -2994,6 +2994,42 @@ mod tests {
         assert_eq!(format!("{s}{cost}"), format!("{s} · $0.0456"));
     }
 
+    /// C-139: the rendered hit rate must be the TURN's, folded per model call — not the last
+    /// round's, which is what `Usage::accumulate` leaves in the turn snapshot and therefore the
+    /// worst ratio of the turn.
+    #[test]
+    fn usage_annotation_hit_rate_is_the_turn_not_the_last_round() {
+        let call = |read: u64, fresh: u64| flux_core::Usage {
+            input_tokens: fresh,
+            output_tokens: 10,
+            cache_read_input_tokens: read,
+            ..Default::default()
+        };
+        let calls = [
+            call(90_000, 10_000),
+            call(60_000, 40_000),
+            call(20_000, 80_000),
+        ];
+
+        let mut turn = flux_core::Usage::default();
+        let mut cache = flux_core::CacheEfficiency::default();
+        for c in &calls {
+            turn.accumulate(c);
+            cache.add(c);
+        }
+
+        // The old shape: hit rate read straight off the turn snapshot ⇒ round three's 20%.
+        let last_round = crate::rendering::usage_annotation(&turn);
+        assert!(last_round.contains("(20% hit)"), "{last_round}");
+
+        // The fixed shape: 170k of 300k prompt tokens ⇒ 57%.
+        let turn_level = crate::rendering::usage_annotation_with_cache(&turn, &cache);
+        assert!(turn_level.contains("(57% hit)"), "{turn_level}");
+        assert!(turn_level.contains("cache 170.0k"), "{turn_level}");
+        // `ctx` keeps its occupancy meaning — the last round's prompt size, not the sum.
+        assert!(turn_level.contains("ctx 100.0k"), "{turn_level}");
+    }
+
     /// `cost_annotation` formats metered spend as `$X`, subscription spend (claude/codex) as the
     /// *equivalent metered cost* `~$X (sub)` (it bills against a flat sub, not the API), and a
     /// zero-cost turn as empty (C-05).

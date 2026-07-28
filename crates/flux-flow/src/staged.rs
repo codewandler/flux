@@ -2179,6 +2179,9 @@ fn base_request(ctx: &StagedContext, messages: Vec<Message>, max_tokens: u32) ->
     req.max_tokens = max_tokens.max(1);
     req.thinking = ctx.opts.thinking;
     req.effort = ctx.opts.effort;
+    // C-134: every staged call re-sends the turn's growing transcript, so the conversation tail is
+    // where the cache pays. Codecs without a breakpoint notion ignore the flag.
+    req.cache_tail = true;
     req
 }
 
