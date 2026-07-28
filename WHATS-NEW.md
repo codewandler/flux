@@ -15,6 +15,41 @@
 
 ## [Unreleased]
 
+### New
+
+- **Share a run as a single file.** `flux export <run> -o run.html` turns a recorded session into
+  one self-contained web page — the plan, every operation and its result, diffs, cost and a
+  timeline, with sub-agent work nested where it belongs. No server and no viewer app: open it in a
+  browser, attach it to a bug report, or link it from a pull request. Secrets are scrubbed before
+  anything reaches the page, and exporting never changes the run.
+- **Three new looks.** `/theme` now offers `dracula`, `nord`, and — if you need maximum
+  legibility — `high-contrast`, alongside the existing dark, light, and mono. Your choice is
+  remembered, and `NO_COLOR` is still respected everywhere.
+
+### Improved
+
+- **The conversation is easier to scan.** Each entry in the transcript now carries a subtle
+  colored rail on its left edge — your messages, the agent's replies, and tool activity each read
+  differently at a glance, so finding "where my turn started" in a long session no longer means
+  reading.
+- **Approvals show how risky the action is.** The approval sheet's frame and title now say
+  whether the pending action only reads, writes, or destroys — a destructive action is
+  unmistakably marked, including single-action approvals that previously looked identical to
+  harmless ones.
+- **Tool cards tell you they can expand.** A card with more detail behind it shows a `▸` marker
+  (`▾` while expanded), so the detail view is discoverable without reading the help screen.
+- **A fresh session greets you.** Opening flux on an empty conversation now shows a small card
+  with your model, your project folder, and the three things worth knowing (`/help`, `/`
+  commands, `@` to reference files) instead of a blank screen.
+- **The queue, session, and help panels share one look.** Same header, same counters, same
+  feel — and each panel now sizes exactly to its content.
+- **Ctrl-C won't end your session by accident.** Quitting now takes two presses in quick
+  succession, announced in the footer; a single stray Ctrl-C no longer closes flux. Interrupting
+  a running turn and clearing a typed draft work exactly as before.
+- **Long-lived servers keep their session database tidy.** A served agent now compacts the
+  database's write-ahead log periodically, so disk use stays bounded on busy shared stores —
+  with zero impact on running work.
+
 ## [0.32.0] - 2026-07-28
 
 ### New

@@ -6,6 +6,86 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **C-132: `flux export <run>` — a recorded run as one self-contained HTML file.** The read-only
+  sibling of the Time Machine verbs: plan tree, per-op results, diffs, cost and a timeline in a
+  single static file (inline CSS, no JS, no network references, light/dark via
+  `prefers-color-scheme`), with sub-agent children nested under their parent per A-59. Plan
+  visuals reuse the `flux_lang` highlight spans rather than a second renderer, and run addressing
+  matches the existing verbs (`s_42`, or `last`). Every rendered string passes a `Redactor`
+  first — pinned failing-first by a test that seeds a credential into the conversation, which
+  matters because conversation text and turn summaries are never redacted at write time anywhere
+  in the engine, so the export's own redactor is the only control. Export is a pure read: a test
+  asserts the store's event count is unchanged and no provider is constructed.
+
+- **C-150: three new TUI themes — `dracula`, `nord`, and a `high-contrast` accessibility
+  palette.** All resolve through the existing `Theme::by_name` truecolor/`NO_COLOR` precedence
+  and the C-104 persistence path (`/theme` lists them; no new persistence code). Every new
+  palette paints an explicit `base_bg` so it stays correct on a mismatched terminal background,
+  and `NO_COLOR` still forces MONO for every name — the MONO fallback now derives from
+  `Theme::names()` itself, so a future palette cannot forget it.
+
+- **C-149: transcript gutter rail.** Every transcript entry now carries a one-column per-kind
+  left glyph (accent for user turns, dim for assistant/tool/notice), giving long sessions visual
+  rhythm at zero extra rows. The rail is an ordinary leading span produced inside `entry_lines`,
+  so wrap math, the C-111 focus paint, and the C-109 running-badge last-span pairing needed no
+  changes — including the per-tick running-card patch, which re-inserts the rail so an animating
+  card never loses it. MONO stays usable: the rail is a glyph, not a color.
+
+- **C-152: one shared overlay chrome.** The queue modal, session picker, and help overlay now
+  render through a single panel helper (header, body, key hints, ` n/m ` counter) with the
+  scroll-window math in one unit-tested place — three hand-rolled copies deleted, and the C-153
+  fuzzy-filter query row and overflow counter absorbed into the same chrome. Overlays now size
+  exactly to their content: the queue/session panels' permanently reserved blank counter row is
+  gone.
+
+- **C-154: the approval sheet encodes risk.** Border and title now derive from the pending
+  call's effect tier — destructive → error style + BOLD with an explicit `approval · destructive`
+  title, mutating → warn + `approval · write`, read-only → the familiar accent; in MONO the
+  modifier and title text carry the distinction, not color. Derived entirely from data the
+  approver already had — and fixing that surfaced real dead plumbing: the per-op approval path
+  received its `IntentSet` and discarded it, so a single-op destructive call never disclosed as
+  destructive before (only whole-plan approvals did). That disclosure is now live. (**breaking**:
+  `flux_tui::controller::ApprovalRequest` gained a `mutating` field — next release is a MINOR
+  per the pre-1.0 rule.)
+
+- **C-155: tool cards advertise expansion.** Collapsed cards with detail show `▸` (`▾` when
+  expanded) in the header, rendered through `tool_header_line` so pad/width math stays shared
+  with the running-badge patch; a card with nothing to expand shows no marker (no false
+  affordance), and the marker is never the row's last span, so the C-109 running-badge pairing
+  holds by construction. Discoverability only — no new key binding.
+
+- **C-157: empty-state orientation card.** A fresh session no longer opens onto a blank
+  transcript: a small centered card names the active model, the workspace root, and the primary
+  affordances (`/help`, `/` commands, `@` files). It is structurally outside the transcript
+  pipeline (never enters the layout cache, focus, or scroll), disappears with the first entry,
+  and is skipped entirely on narrow terminals per the C-102 posture.
+
+- **C-125: the multi-process event-store claim is now proven by real processes.** A
+  spawned-subprocess stress test (test-binary re-exec, no helper binary) hammers four writer
+  processes × 25 appends across shared streams of one `events.db` and asserts gapless per-stream
+  `stream_seq` and an exact total; a second test races the same stable `NewEvent.id` from three
+  processes and asserts exactly one stored event. Failing-first proven by reverting C-25's
+  `BEGIN IMMEDIATE` — the test reliably catches that regression. Runs in ~30 ms, no `#[ignore]`
+  gate.
+
+- **C-126: WAL checkpoint hygiene for long-lived daemons.** New additive
+  `EventStore::checkpoint()` (SQLite: `PRAGMA wal_checkpoint(TRUNCATE)` on a dedicated
+  zero-busy-timeout connection; Postgres: no-op), invoked every five minutes by the built-in
+  coding-agent `flux app run --serve` loop. `SQLITE_BUSY` is swallowed — a checkpoint can never
+  surface as a turn-visible failure — pinned by a contention test proving the zero-timeout
+  connection is load-bearing. The premise was verified before implementing: a pinned reader
+  really does hold `events.db-wal` growth unreclaimed (recorded in the design doc).
+
+### Changed
+
+- **C-156: Ctrl-C no longer quits on the first press.** With an idle, blank composer the first
+  Ctrl-C arms a transient "Ctrl-C again to quit" state announced in the footer (slotting after
+  the unread and mouse-off hints); a second press within the two-second window quits, and any
+  other key — or the timeout — disarms. The interrupt arm (running turn) and the clear arm
+  (non-blank composer) are unchanged.
+
 ## [0.32.0] - 2026-07-28
 
 ### Added

@@ -80,9 +80,55 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.31.0** is released — that MINOR retired the `openrouter-anthropic` provider name (the wire is
-> now per-model on plain `openrouter`) and carried the embedder-only `ApprovalView` reshape. See
-> [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> **v0.32.0** is released — that MINOR grew the deliberately-exhaustive `EventKind` for agent-set
+> wake-ups, and also carried the NDJSON stdio protocol, `flux doctor`, the managed-config tier and
+> OpenTelemetry export. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+
+### TUI polish round 2 — legibility, discoverability, one overlay language (epic) — ✅ **SHIPPED v0.33.0 (2026-07-29; C-149…C-158; nine implemented, C-158 retired with cause)**
+
+The first wave (C-101…C-116) delivered the TUI's *capabilities* — dense transcript, themes, approval
+sheet with diffs, focus/yank, search, live tool cards. A read of `crates/flux-tui/src` said the
+residual was not capability but *presentation*: every entry flush-left plain text, three list
+overlays each hand-rolling their own chrome, pickers that could not filter, an approval sheet that
+encoded no risk, and two states — empty transcript, blank-line Ctrl-C — that said nothing at all.
+Ten bounded stories, no new capability surface. **C-151** and **C-153** shipped early in v0.32.0 (one
+fuzzy ranker behind every picker, relative session ages); this release closes the rest. **C-149**
+gives the transcript a per-kind gutter rail — an ordinary leading span, so wrap math, the C-111 focus
+paint and the C-109 running-badge pairing needed no changes at all. **C-150** adds `dracula`, `nord`
+and a `high-contrast` accessibility palette, with the MONO fallback now derived from `Theme::names()`
+so a future palette cannot forget it. **C-152** collapses the queue, session and help overlays onto
+one panel helper with the scroll-window math in a single unit-tested place, absorbing C-153's query
+row and counter — and, as a side effect of exact-fit sizing, deleting a permanently reserved blank
+row. **C-154** tints the approval sheet by effect tier, and *that* turned up the epic's one real
+defect: the per-op approval path received its `IntentSet` and discarded it, so a single-op
+destructive call had never disclosed as destructive — only whole-plan approvals did. **C-155** makes
+per-card expansion discoverable, **C-156** requires a second Ctrl-C to quit, **C-157** greets an
+empty session with a card naming model, workspace and the three affordances worth knowing.
+**C-158** (streaming partial tool output onto running cards) is **retired with cause, not deferred
+vaguely**: the investigation established that no seam inside the TUI/CLI/runtime boundary can observe
+in-flight *content* — `bash` and `task` live in other crates and are awaited as one opaque unit, and
+the one live relay that already reaches a running op deliberately carries no content field, a
+security boundary rather than an oversight. Widening it is a different and larger decision; the exact
+installation seam is recorded on the story for whoever files it. The breaking change is
+`ApprovalRequest` gaining `mutating` ⇒ MINOR per the pre-1.0 rule.
+
+### Event-store concurrent use — visibility, proof, hygiene (epic) — ✅ **SHIPPED v0.33.0 (2026-07-29; C-124…C-126, all three stories)**
+
+Multiple flux processes sharing one `~/.flux/events.db` was supported by design — WAL, `busy_timeout`,
+`BEGIN IMMEDIATE`, idempotent appends, PG advisory locks — but the envelope's edges were invisible and
+the SQLite side was only ever tested inside one process. **C-124** shipped in v0.32.0: the one
+`begin_write` seam now times its wait and warns past a threshold, so contention is observable before
+it becomes a 5s failure. **C-125** replaces the two-connection in-process test with real operating
+system processes — four writers × 25 appends across shared streams, asserting gapless per-stream
+sequence and an exact total, plus a second test racing one stable event id from three processes and
+asserting exactly one stored event. Its failing-first proof is the useful part: reverting C-25's
+`BEGIN IMMEDIATE` makes it fail reliably, so the test genuinely guards the fix. **C-126** bounds the
+WAL sidecar for long-lived daemons — but only after verifying the premise rather than assuming it, by
+pinning a reader and watching `events.db-wal` grow unreclaimed. The hook runs
+`wal_checkpoint(TRUNCATE)` on a dedicated zero-busy-timeout connection every five minutes from the
+served coding-agent loop, and swallows `SQLITE_BUSY`: a checkpoint can never surface as a turn-visible
+failure. Design:
+[designs/event-store-concurrent-use.md](designs/event-store-concurrent-use.md).
 
 ### Turn latency visibility — where the wall clock actually went (epic) — ✅ **SHIPPED v0.31.0 (2026-07-28; C-180…C-182, all three stories)**
 

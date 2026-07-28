@@ -2,7 +2,7 @@
 id: C-148
 title: "TUI polish round 2 — legibility, discoverability, and one overlay language (epic)"
 pillar: Core
-status: backlog
+status: done
 epic: tui-polish-round-2
 design:
 note: "EPIC — the C-101…C-116 wave made the TUI dense and capable; this wave makes it legible and discoverable: a transcript gutter rail, more themes, one shared overlay chrome, fuzzy pickers, risk-colored approval, and an honest empty/quit state"
@@ -30,6 +30,22 @@ raise appeal and everyday usability without adding a new capability surface.
 
 ## Progress
 - 2026-07-28 epic filed from a TUI UI/UX review pass over `crates/flux-tui/src`.
+- 2026-07-28 C-151 and C-153 shipped early in v0.32.0 (one fuzzy ranker behind every picker,
+  relative session ages) — the pair the epic's own tiering put first.
+- 2026-07-29 **epic CLOSED.** C-149, C-150, C-152, C-154, C-155, C-156 and C-157 landed together
+  in v0.33.0, so nine of the ten stories are delivered. The epic's acceptance held: no story
+  changed what the TUI *can* do, and both pinned contracts (the C-109 running-badge row pairing,
+  the C-111 focus repaint) stayed green — C-149 in particular needed no change to either, because
+  the rail is an ordinary leading span by the time layout sees it. One story exceeded its own
+  premise: C-154 set out to tint a border and uncovered that the per-op approval path received an
+  `IntentSet` and discarded it, so single-op destructive calls had never disclosed as destructive.
+- 2026-07-29 **C-158 closes the epic as blocked, per this epic's "done or explicitly retired with
+  a recorded reason" clause.** It is not deferred for cost: the investigation established that no
+  in-flight tool *content* is observable from the TUI/CLI/runtime crates at all, and that the one
+  live relay which does reach a running op withholds content deliberately as a security boundary.
+  Streaming it is a boundary decision about where redacted progress may cross, not a rendering
+  story — the reasoning and the confirmed installation seam are recorded on C-158 for whoever
+  files that decision.
 
 ## Notes
 - Tiering from the review (highest value first): tier 1 = C-149, C-150, C-151, C-152, C-153;
