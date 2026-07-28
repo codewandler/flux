@@ -36,3 +36,8 @@ every spec.
   into one deterministic data-flow gate.
 - The security story reviewers will cite; everything routes through `Executor::dispatch` and
   `flux-system`, so the chokepoints already exist.
+- Code-reading re-assessment confirmed the gap and a proven cousin: nothing tags tool results with
+  origin today (`flux-evidence` Observations record only that a tool was called), but the
+  undisclosed-destructive re-fire gate in `Executor::dispatch` already shows the dispatcher can
+  distrust args based on *how they were assembled* — extend that pattern to origin, e.g. "a batch
+  whose arguments derive from web-fetched bytes can never auto-approve, regardless of risk tier."

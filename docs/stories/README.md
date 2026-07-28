@@ -75,6 +75,9 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 ### Transactional Turns
 - [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 
+### Typed Session Log
+- [A-93 — Typed session log — session-shape validity by construction (epic)](A-93-typed-session-log-epic.md) · Agent · EPIC — make the invalid provider-history shapes (split tool_use/tool_result, empty assistant, user-after-user) unrepresentable in the session log's type; the thrice-recurred bug class becomes unwritable instead of test-guarded
+
 ## Done
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
 - [A-02 — A2A client — talk to a remote agent like a local one (flux a2a <URL>)](A-02-a2a-client.md) · Agent · consume a remote A2A agent like a local one; server clean-cutover to the current spec (see [CHANGELOG](../../CHANGELOG.md))
