@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-28
+
 **Breaking (pub surface, embedders only — no CLI or config break).** Five API changes ride this
 release; each is detailed in its entry below:
 

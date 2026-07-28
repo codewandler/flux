@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-28
+
 ### New
 
 - **You can talk to the agent while it's working.** In the TUI, type while a turn is running and
