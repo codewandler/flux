@@ -55,6 +55,40 @@ pub(super) fn tool_preview(s: &str, full: bool) -> String {
     out
 }
 
+/// Below this many columns of room the animated bar falls back to the braille glyph.
+const MIN_BAR_WIDTH: usize = 8;
+/// The animated bar never grows past this, keeping the label adjacent and readable.
+const MAX_BAR_WIDTH: usize = 24;
+
+/// Columns available for the animated spinner bar: terminal width minus the label,
+/// a fixed elapsed reserve (so `59s → 1m 0s` doesn't jitter the bar), and separators.
+fn spinner_bar_width(term_cols: u16, label_width: usize) -> usize {
+    const ELAPSED_RESERVE: usize = 8;
+    (term_cols as usize)
+        .saturating_sub(label_width + ELAPSED_RESERVE + 3)
+        .min(MAX_BAR_WIDTH)
+}
+
+/// Visible columns of a label that may carry SGR escapes (e.g. a dimmed phase label).
+fn visible_width(s: &str) -> usize {
+    let mut in_escape = false;
+    s.chars()
+        .filter(|&c| {
+            if in_escape {
+                if c == 'm' {
+                    in_escape = false;
+                }
+                false
+            } else if c == '\x1b' {
+                in_escape = true;
+                false
+            } else {
+                true
+            }
+        })
+        .count()
+}
+
 /// Shared between [`CliSink`] and its spinner ticker task.
 pub(super) struct SpinnerState {
     pub(super) active: bool,
@@ -431,6 +465,9 @@ pub(super) struct CliSink {
     pub(super) gather_mode: bool,
     /// Stderr-line ownership coordinator shared with interactive prompts — see [`PromptGate`].
     pub(super) gate: Arc<PromptGate>,
+    /// Model round-trips started this turn; cycles the truecolor thinking-bar effect
+    /// (`flux_tui::spinners::by_round`) so long turns walk through the catalog.
+    pub(super) spin_round: usize,
 }
 
 impl CliSink {
@@ -463,6 +500,7 @@ impl CliSink {
             execute_rounds: 0,
             gather_mode: false,
             gate: PromptGate::global(),
+            spin_round: 0,
         }
     }
 
@@ -499,7 +537,13 @@ impl CliSink {
     }
 
     /// Start an animated spinner on the op's line (a background ticker rewriting it via `\r`).
-    fn start_spinner(&mut self, label: String) {
+    /// With an `effect`, the leading glyph becomes a full-width truecolor animated bar
+    /// (`flux_tui::spinners`); without one it stays the braille glyph.
+    fn start_spinner(
+        &mut self,
+        label: String,
+        effect: Option<&'static flux_tui::spinners::Spinner>,
+    ) {
         let state = Arc::new(std::sync::Mutex::new(SpinnerState {
             active: true,
             label,
@@ -509,6 +553,10 @@ impl CliSink {
         let start = std::time::Instant::now();
         self.gate.painter_started();
         let gate = self.gate.clone();
+        let period = std::time::Duration::from_millis(match effect {
+            Some(_) => flux_tui::spinners::FPS_MS,
+            None => 80,
+        });
         let task = tokio::spawn(async move {
             const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             loop {
@@ -521,19 +569,26 @@ impl CliSink {
                     // Skip the frame while a prompt owns the stderr line (lock order is
                     // spinner-state → gate everywhere; `acquire` takes only the gate).
                     if let Some(_line) = gate.begin_paint() {
-                        let frame = FRAMES[st.frame % FRAMES.len()];
+                        let tick = st.frame;
                         st.frame += 1;
+                        // The bar is re-sized every frame so a resize mid-wait can't wrap
+                        // the line (wrap would defeat the `\r\x1b[K` clear).
+                        let cols = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
+                        let bar_w = effect
+                            .map(|_| spinner_bar_width(cols, visible_width(&st.label)))
+                            .unwrap_or(0);
+                        let lead = match effect {
+                            Some(sp) if bar_w >= MIN_BAR_WIDTH => {
+                                flux_tui::spinners::ansi_line(&(sp.frame)(tick, bar_w))
+                            }
+                            _ => style::cyan(&FRAMES[tick % FRAMES.len()].to_string()),
+                        };
                         let elapsed = style::fmt_elapsed(start.elapsed());
-                        eprint!(
-                            "\r\x1b[K{} {}  {}",
-                            style::cyan(&frame.to_string()),
-                            st.label,
-                            style::dim(&elapsed)
-                        );
+                        eprint!("\r\x1b[K{} {}  {}", lead, st.label, style::dim(&elapsed));
                         let _ = std::io::stderr().flush();
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                tokio::time::sleep(period).await;
             }
         });
         self.spinner = Some((state, task));
@@ -575,7 +630,12 @@ impl AgentSink for CliSink {
             self.commit();
             let label = phase_spinner_label(self.phase.as_deref(), self.execute_rounds);
             if self.use_spinner() {
-                self.start_spinner(style::dim(&label));
+                // Truecolor terminals get the animated bar, cycling one effect per model
+                // round-trip (flai-style); others keep the braille glyph.
+                let effect =
+                    style::truecolor().then(|| flux_tui::spinners::by_round(self.spin_round));
+                self.spin_round += 1;
+                self.start_spinner(style::dim(&label), effect);
             } else if matches!(self.phase.as_deref(), Some("intent" | "explore")) {
                 // Redirected runs have no animated line to rewrite. Preserve one stable
                 // phase marker per provider consultation so logs and CI output do not reproduce
@@ -601,7 +661,8 @@ impl AgentSink for CliSink {
             base_label
         };
         if self.use_spinner() {
-            self.start_spinner(label.clone());
+            // Tool lines keep the braille glyph — their labels are long and a bar would crowd them.
+            self.start_spinner(label.clone(), None);
         } else {
             eprintln!("\n{} {label}", style::blue("→"));
         }

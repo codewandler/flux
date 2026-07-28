@@ -618,6 +618,9 @@ impl TurnCost {
 }
 
 pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
+    // Decorative boot splash, before any other output. Blocks the runtime thread for a
+    // few seconds at most — nothing else is in flight this early in the REPL.
+    crate::splash::maybe_splash();
     let (mut agent, mut session_id, _spec, spawner) = build_agent(&flags).await?;
     let cost = TurnCost::load();
     let initial_rules = agent.executor.allow_rules();
