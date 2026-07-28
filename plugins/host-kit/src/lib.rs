@@ -49,7 +49,7 @@ pub use preflight::schema_preflight;
 
 // Re-export the protocol vocabulary so a plugin depends only on host-kit.
 pub use flux_datasource::{Declaration, EntitySchema, Link, Record, SchemaField, Source};
-pub use flux_plugin::{
+pub use flux_plugin_protocol::{
     AuthMethod, AuthScheme, ConfigSpec, EndpointSpec, GuestHost, OAuth2Spec, OAuthGrant,
     OAuthRedirect, OperationSpec, PluginCapabilities as Caps, PluginHandler, PluginManifest,
     SignalMatch, ToolGroup, KIND_TURN_INTENT, VALIDATE_OP,
@@ -1141,7 +1141,7 @@ impl PluginBuilder {
             ));
         }
 
-        if let Err(error) = flux_plugin::validate_manifest_operations(&manifest) {
+        if let Err(error) = flux_plugin_protocol::validate_manifest_operations(&manifest) {
             problems.push(error);
         }
         for operation in &manifest.operations {
@@ -1195,7 +1195,7 @@ impl PluginBuilder {
     /// Fallibly build and run the stdio serve loop (call from `main`).
     pub fn try_serve(self) -> Result<(), String> {
         let plugin = self.try_build()?;
-        flux_plugin::serve(plugin);
+        flux_plugin_protocol::serve(plugin);
         Ok(())
     }
 
@@ -1403,9 +1403,9 @@ pub fn write_op_typed<T: schemars::JsonSchema + 'static>(
 /// A **host-only** op (C-09a): not advertised to the LLM as a callable tool. The canonical case is
 /// the `aws-bedrock` plugin's `auth` op, which returns raw AWS credentials — the model must never
 /// call it, or the keys would appear in the tool result. The op stays dispatchable by the host via
-/// the shared `PluginHost` handle; [`flux_plugin::visible_ops`] excludes it from the projected tool
+/// the shared `PluginHost` handle; [`flux_plugin_protocol::visible_ops`] excludes it from the projected tool
 /// catalog. Effects default to `Process`+`Network` (the conservative authorization floor
-/// [`flux_plugin::PluginTool::new`] applies to an undeclared op) — override via the returned spec.
+/// [`flux_plugin_protocol::PluginTool::new`] applies to an undeclared op) — override via the returned spec.
 pub fn internal_op(name: &str, description: &str, input_schema: Value) -> OperationSpec {
     OperationSpec {
         public_name: None,
@@ -2478,7 +2478,7 @@ mod tests {
             )
             .build()
             .manifest;
-        let visible: Vec<&str> = flux_plugin::visible_ops(&manifest)
+        let visible: Vec<&str> = flux_plugin_protocol::visible_ops(&manifest)
             .map(|o| o.name.as_str())
             .collect();
         assert_eq!(visible, vec!["aws-bedrock.chat"]);
@@ -2505,7 +2505,7 @@ mod tests {
             .find(|o| o.name == VALIDATE_OP)
             .expect("validate op registered");
         assert!(spec.internal, "validate op is host-only");
-        let visible: Vec<&str> = flux_plugin::visible_ops(&m)
+        let visible: Vec<&str> = flux_plugin_protocol::visible_ops(&m)
             .map(|o| o.name.as_str())
             .collect();
         assert_eq!(visible, vec!["acme.ping"]);

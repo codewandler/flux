@@ -76,6 +76,133 @@ at 2x base input. Per flux's SemVer rule this rides the next MINOR.
   - `bench/cache-ab.sh` A/Bs the tail breakpoint against the kill switch, and the model trace reports
     the realized breakpoint layout.
 
+## [0.29.0] - 2026-07-28
+
+### Changed
+
+- **C-142 (BREAKING for guest crates): the plugin wire contract is its own crate.** All 856 lines
+  of `crates/flux-plugin/src/protocol.rs` — `Frame`/`FrameKind`, `PluginManifest`,
+  `OperationSpec`, `PluginCapabilities`, `AuthMethod`, `EndpointSpec`, `ConfigSpec`,
+  `process_grant_allows`, the `PluginHandler`/`GuestHost` traits, and the synchronous `serve` stdio
+  loop — moved to **`codewandler-flux-plugin-protocol`** (`flux_plugin_protocol`), an L0 serde-only
+  crate. `flux-plugin` re-exports it, so every `flux_plugin::{Frame, PluginManifest, …}` path still
+  resolves and no host call site changed. **The `guest` feature on `flux-plugin` is gone**: a guest
+  now depends on the protocol crate directly, which is the point — a plugin no longer compiles
+  flux's host half to reach the types on its own pipe. `plugins/host-kit` is built on the protocol
+  crate. `flux-codegate` places the new crate at L0.
+- **C-143 (BREAKING, release mechanics): the plugin protocol is on its own version line.** The
+  crates a plugin binary compiles against — `flux-plugin-protocol` plus the serde-only leaves it
+  needs (`flux-spec`, `flux-policy`, `flux-secret`, `flux-evidence`, `flux-datasource`) and
+  `codewandler-flux-host-kit` — leave `version.workspace = true` and start at **1.0.0**. Their
+  version answers one question, *does a plugin built against it still speak to this host?*, and a
+  flux release does not change that answer. `scripts/cut-release.sh` therefore **no longer edits,
+  re-locks, or stages anything under `plugins/`** (it previously `sed`ed two manifests, ran a
+  second `cargo update`, and staged both — `plugins/Cargo.lock` changed in 5 of the last 8 commits
+  that touched it, every one a release cut); the plugins-workspace `cargo fmt --check` stays in the
+  gate. The documented exception to the single-version rule is recorded in AGENTS.md. Consumers
+  pinning `codewandler-flux-host-kit = "0.28"` must move to `"1"`.
+- **C-146: a release publishes what moved.** `scripts/publish-crates-io.sh` asks the crates.io API
+  whether `<crate>@<version>` is already live and skips without invoking `cargo publish` at all —
+  previously each of the 28 crates paid a full `cargo package` just to learn it was already
+  published (~13 min for the closure). With the protocol line no longer tracking flux, most
+  releases now skip those six crates outright. `codewandler-flux-host-kit` **leaves the flux
+  closure** and publishes with the pack from `release-plugins.yml`, which pre-checks that its
+  protocol dependency is live and fails with that instruction rather than an opaque resolution
+  error. `flux_codegate::tests::publish_script_covers_a_registry_resolvable_closure` now checks
+  both publishers, so no crate can fall between them.
+- **C-147: cutting a release is transactional.** `scripts/cut-release.sh` snapshots every file it
+  touches and an EXIT trap restores them on any non-zero exit before the commit, so a red gate no
+  longer leaves the changelogs half-rolled for a re-run to roll a second time into a phantom
+  version section (the 0.14.3 gap; it recurred on 0.28.0 and was finished by hand). The commit is
+  now by pathspec (`git commit --only`) so another session's staged work cannot ride along, and
+  `docs/roadmap.md`'s "Status as of **X.Y.Z (DATE)**" line is restamped mechanically — included in
+  the release commit only when its sole change is that stamp.
+
+- **C-141: plugin builds no longer compile the Flux-Lang front-end.** `flux-plugin` depended on
+  `flux-lang` for exactly one type — `FlowEffect`, the semantic-effect *tag vocabulary* carried in
+  `PluginManifest`'s `semantic_effects` — and that single edge pulled the parser, CST, and
+  analyzer through `flux-plugin → host-kit` into all 21 plugins. `FlowEffect` (with `tag`,
+  `from_tag`, and `lower`) now lives in `flux-spec` alongside the rest of the wire vocabulary, and
+  `flux_lang::ast` re-exports it, so every `flux_lang::ast::FlowEffect` path and `.lower()` call
+  site is unchanged. `flux-spec` gains `flux-policy` (an L0 serde-only leaf) for the `Action` half
+  of `lower`. A plugin's build graph drops from **74 to 30** crates (measured on `gitlab`);
+  `plugins/Cargo.lock` shrinks by 366 lines. A new architecture guard,
+  `flux_codegate::tests::plugin_builds_exclude_host_only_crates`, resolves the plugins workspace
+  and fails if a host-only crate reappears in it — the edge arrived *through* `host-kit`, which a
+  manifest-level check would have missed. First story of the
+  [plugin-protocol-decoupling](docs/designs/plugin-protocol-decoupling.md) epic.
+
+### Added
+
+- **C-144: plugin compatibility is a checked contract, not a convention.** `PROTOCOL =
+  "flux.plugin.v1"` was stamped into every `Frame` and read back by nobody — an incompatible plugin
+  surfaced as an opaque serde failure. The host now validates the marker at the load seam
+  (`crates/flux-plugin/src/host/loading.rs`) and rejects a mismatch with a message naming **both**
+  sides; a `future_protocol_plugin` fixture announcing `flux.plugin.v99` proves it. The wire itself
+  is pinned by golden JSON (`crates/flux-plugin-protocol/tests/golden/{frame,manifest}.json`)
+  asserted round-trip in both directions, in the style of `website_in_sync`: the maximal instances
+  are built with **exhaustive struct literals and no `..Default::default()`**, so adding a wire
+  field fails to compile there, and changing one fails the golden with instructions to either
+  re-record with `UPDATE=1` and bump the protocol MINOR, or bump `PROTOCOL` and the MAJOR.
+- **C-145: CI runs a previously released plugin binary against the current host.** Every other test
+  in the repo builds host and guest from the same commit, so none of them can catch "today's host
+  stopped understanding yesterday's binary" — which is the entire claim the decoupling makes.
+  `scripts/check-plugin-compat.sh` (CI job `plugin-compat`) resolves the latest `plugins-v*`
+  release, installs those real binaries into a throwaway `FLUX_HOME`, and asserts manifests load
+  over the wire and one read-shaped operation round-trips. A genuinely absent release is a logged
+  skip; an incompatibility fails the job.
+- **C-146: a changed crate must change its version.** The dropped lockstep was implicitly
+  guaranteeing this. `scripts/check-crate-versions.sh` (CI job `crate-versions`) now says it
+  outright: for every crate that sets its own version, a source change since the previous `v*` tag
+  must come with a moved version — otherwise the edit would ship under a version already on
+  crates.io, where `cargo publish` skips it and consumers keep the old code. Workspace-inherited
+  crates are out of scope (the cut sweeps them). `--self-test` is the failing-first proof.
+- **C-147: the roadmap status line is guarded.**
+  `flux_codegate::tests::roadmap_status_line_matches_the_workspace_version` fails when
+  `docs/roadmap.md`'s "Status as of" line drifts from the workspace version — the same shape as the
+  existing `website_in_sync` guard, and what makes the cut script's new restamp trustworthy rather
+  than something someone remembers to hand-edit.
+
+### Fixed
+
+- **The promoted release keeps its `dist-manifest.json`.** `release.yml`'s `Cleanup` step removes
+  the per-target manifests with `rm -f artifacts/*-dist-manifest.json`, which in the
+  candidate-promotion path also deleted the plan job's `plan-dist-manifest.json`; the host job's
+  own manifest was written to the workspace root, outside `artifacts/`. So
+  `gh release create … artifacts/*` uploaded everything except the manifest and
+  `scripts/verify-github-release.sh` failed the run — v0.27.0 and v0.28.0 are the first
+  candidate-promoted tags and both hit it. The host manifest is now copied into `artifacts/`
+  before the release is created (C-47).
+
+### Documentation
+
+- **L-85…L-91: flux-lsp round 2 epic filed.** A review of `crates/flux-lsp/src/main.rs` against
+  what its `initialize` advertises is written up in `docs/designs/flux-lsp-round-2.md`: completion
+  never reads the cursor position (`main.rs:256-261`) and sources `$vars` from a byte scan
+  (`scan_symbols:709`) while go-to-definition is scope-correct; hover resolves words with a raw line
+  scan (`word_at:686`) so comments and string literals hover as code, and `$vars` never hover;
+  `references`/`rename` are unimplemented despite the L-68 scope model; formatting returns no edit
+  for modules (`main.rs:93-96`) and only re-indents commented flows (`:97-102`); the catalog never
+  loads `.flux/flows` composites, so a runnable call squiggles as an unknown operation, and every
+  analyzer finding is a bare `WARNING` with no code (`lsp_warning:553`); `didChange` applies edits
+  then full-reparses, and every handler re-parses per request. Seven stories: cursor-aware
+  completion (L-85), CST-precise hover (L-86), references + rename (L-87), a CST-driven formatter
+  (L-88), diagnostic truth (L-89), parse cache + incrementality (L-90), and the module split +
+  protocol-level harness that closes the epic (L-91). Docs/board only; no behavior change.
+- **Stale flux-lsp status corrected.** The roadmap's CST + LSP epic section still listed L-59/L-68/
+  L-69/L-70 as "Remaining backlog" after all four shipped, and `AGENTS.md` still described
+  `flux-lsp` as `dist = false` although L-70 flipped it (`crates/flux-lsp/Cargo.toml:12`).
+- **C-141…C-147: plugin protocol decoupling epic filed.** The plugin pack's release tax is written
+  up in `docs/designs/plugin-protocol-decoupling.md` with the three findings behind it: nothing
+  enforces host↔plugin compatibility (`PROTOCOL = "flux.plugin.v1"` is stamped into every frame at
+  `protocol.rs:10` but never read back), every plugin compiles `flux-lang` because the guest wire
+  surface names one type from it (`FlowEffect`), and `host-kit` republishes unchanged on every
+  flux release. Seven stories: relocate `FlowEffect` and cut the `flux-lang` edge (C-141), extract
+  `codewandler-flux-plugin-protocol` (C-142), independent protocol version line + a cut that
+  leaves `plugins/` alone (C-143), protocol-marker enforcement and wire fixtures (C-144),
+  old-binary compatibility CI (C-145), publish-only-what-changed (C-146), and a transactional cut
+  script (C-147). Docs/board only; no behavior change.
+
 ## [0.28.0] - 2026-07-28
 
 **Breaking (pub surface, embedders only — no CLI or config break).** Five API changes ride this

@@ -14,10 +14,10 @@ name = "flux_plugin"
 dist = false
 
 [features]
-# Root hosts retain the historical all-in build. Guest plugins should opt out of defaults and select
-# `guest`; that surface contains only wire/manifest types plus the synchronous stdio SDK.
+# This crate is the plugin HOST. The wire contract a guest compiles against moved to
+# `codewandler-flux-plugin-protocol` (C-142), which this crate re-exports — so there is no longer a
+# `guest` feature to select: a guest depends on the protocol crate directly.
 default = ["host", "hooks", "pack"]
-guest = []
 host = [
     "dep:flux-core",
     "dep:flux-runtime",
@@ -46,7 +46,7 @@ pack = [
 [dependencies]
 flux-core = { workspace = true, optional = true }
 flux-datasource.workspace = true
-flux-lang.workspace = true
+flux-plugin-protocol.workspace = true
 flux-runtime = { workspace = true, optional = true }
 flux-spec.workspace = true
 flux-system = { workspace = true, optional = true }

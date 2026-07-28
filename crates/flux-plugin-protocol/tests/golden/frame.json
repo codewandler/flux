@@ -1,0 +1,14 @@
+{
+  "command": "call",
+  "error": "fixture error",
+  "id": "r1",
+  "ok": true,
+  "payload": {
+    "operation": "fixture.op"
+  },
+  "protocol": "flux.plugin.v1",
+  "result": {
+    "value": 1
+  },
+  "type": "response"
+}

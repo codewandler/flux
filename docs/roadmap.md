@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.28.0 (2026-07-28)**: public + installable at
+Status as of **0.29.0 (2026-07-28)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
@@ -82,6 +82,39 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.28.0** is released — that MINOR carried the pub-surface breaks from C-97/C-103/C-104/C-117
 > and the D-192 flux-skill removals. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+
+### Plugin protocol decoupling — a release that leaves the plugin pack alone (epic) — ✅ **SHIPPED 2026-07-28 (C-141…C-147, all seven stories)**
+
+Cutting 0.28.0 made the plugin pack's release tax visible. `scripts/cut-release.sh` rewrites
+`plugins/Cargo.toml`'s pins, bumps `plugins/host-kit/Cargo.toml` in lockstep, and re-locks the
+nested workspace on **every** flux cut — `plugins/Cargo.lock` changed in five of the last eight
+commits that touched it, all release cuts — while the wire contract those plugins speak has changed
+twice in its history, additively both times. Reading the seam end to end found the reason the
+lockstep exists and why it is the wrong instrument: **nothing enforces compatibility at all.**
+`protocol.rs:10` defines `PROTOCOL = "flux.plugin.v1"` and stamps it into every frame, but no host
+code reads it back and the pack index records nothing — matching version numbers are a ritual
+standing in for a contract nobody wrote down. Worse, **every plugin compiles `flux-lang`**: the
+guest wire surface names exactly one type from it (`FlowEffect`, `protocol.rs:7`/`:140`, a *tag
+vocabulary*), and that one edge drags a 75-crate subtree through
+`flux-lang → flux-plugin → host-kit → all 21 plugins`. The epic extracts the wire contract into
+`codewandler-flux-plugin-protocol` on its own `1.x` semver line, moves the serde-only leaves it
+needs onto that line, and takes `plugins/` out of the cut entirely — with the guards that make the
+split honest: the host validates the protocol marker, golden JSON fixtures pin the wire rather
+than the Rust signatures, a snapshot guard forces a deliberate version bump, and CI runs the
+*previously released* plugin binary against the current host. Publishing then only touches what
+moved, and the cut becomes transactional (0.28.0's gate failure left both changelogs rolled and had
+to be finished by hand). C-141 landed first and alone was worth shipping: it deleted the 75-crate
+subtree with no version-line change (a plugin's build graph went from **74 to 30** crates).
+
+**As shipped:** the wire contract is `codewandler-flux-plugin-protocol` at `1.0.0`, the `guest`
+feature on `flux-plugin` is gone, and `scripts/cut-release.sh` touches nothing under `plugins/`.
+What the lockstep was implicitly guaranteeing is now checked explicitly, in CI:
+`scripts/check-plugin-compat.sh` runs the *previously released* plugin binaries against a host
+built from the tree, and `scripts/check-crate-versions.sh` fails a crate that changed content
+without moving its version. The host rejects a foreign protocol marker by name, golden JSON pins
+the wire, `host-kit` publishes with the pack instead of the flux closure, and a failed cut restores
+the tree instead of leaving it half-rolled. Design:
+[designs/plugin-protocol-decoupling.md](designs/plugin-protocol-decoupling.md) (see "As built").
 
 ### LLM cache review — prompt-cache correctness for `claude` and `codex` (epic) — ✅ **IMPLEMENTED 2026-07-28 (C-133…C-140 + A-95, all nine stories; unreleased)**
 
@@ -372,7 +405,7 @@ deterministic map/filter, and (b) bespoke Rust boolean-emitter ops that only exi
 L-51 native conditions → L-52 docs/examples. Design:
 [designs/data-transforms.md](designs/data-transforms.md).
 
-### Flux-Lang CST front-end + LSP (epic) — **core SHIPPED 2026-07-09 (L-57/58, L-60…L-67)**
+### Flux-Lang CST front-end + LSP (epic) — ✅ **SHIPPED 2026-07-09 (L-57…L-70, L-73; closed)**
 
 Editor-grade language support for Flux-Lang, in two coupled workstreams done as one parser pass.
 **(1) Front-end:** a lossless concrete syntax tree (CST) on `rowan` (the rust-analyzer model) —
@@ -387,12 +420,36 @@ standalone `flux-lsp` (tower-lsp) server wired into Helix (`hx`) config-only —
 the CST parser, completion (ops/keywords/prelude/`$vars`), hover (op signatures + node-kind docs),
 and formatting (L-64–L-67). Syntax **highlighting** ships separately as the sibling
 [`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) grammar
-(Helix/Neovim/Zed — Helix renders tree-sitter only, not LSP semantic tokens). Remaining backlog:
-L-59 (re-point `parse` onto the CST via `cst_to_draft` — until then the proven legacy front-end
-stays authoritative and the CST powers the LSP), L-68 (symbols/go-to-def), L-69 (semantic tokens,
-re-scoped to clients that render them), L-70 (incremental reparse + comment-preserving format,
-epic closeout). Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
+(Helix/Neovim/Zed — Helix renders tree-sitter only, not LSP semantic tokens). The epic then closed
+out in full: L-59 (`parse` re-pointed onto the CST), L-68 (symbols/go-to-def), L-69 (semantic
+tokens, re-scoped to clients that render them), L-70 (incremental sync + comment-preserving format +
+`dist = true`), and L-73 (the public editor-setup page). What each capability is worth *in practice*
+is the subject of the follow-up epic below. Designs: [designs/flux-lang-cst.md](designs/flux-lang-cst.md),
 [designs/flux-lsp.md](designs/flux-lsp.md).
+
+### flux-lsp round 2 — from "capability present" to "capability correct" (epic) — 🔜 **PLANNED 2026-07-29 (L-85…L-91, seven stories)**
+
+The first LSP epic answered *"does `.flux` have editor support at all?"* — yes, and the binary
+ships. Reading `crates/flux-lsp/src/main.rs` against what its `initialize` advertises answers the
+next question less happily: several capabilities are advertised at full strength and implemented at
+a fraction of it, always because a feature was built on the cheapest substrate that passed its test
+while the lossless CST and the L-68 scope model sat next to it. **Completion never reads the cursor
+position** (`main.rs:256-261`) — every request returns the union of every op, every node kind, every
+prelude type, and every `$` byte-scanned out of the buffer, including variables from other flows and
+from inside string literals, while go-to-definition on the same buffer is scope-correct. **Hover
+resolves a word by scanning the raw line** (`word_at`, `main.rs:686`), so `read` inside a comment
+renders the op card, and a `$var` never hovers at all. **References and rename don't exist**, though
+the shadowing-aware resolution they need shipped with L-68. **Formatting is opt-out in two of three
+cases**: modules return no edit (declaration order isn't recoverable from `Program`), and a
+commented flow gets an indentation-only re-indent. **The catalog stops at the file edge**, so calling
+a composite stored in `.flux/flows` — which the real host loads — squiggles as an unknown operation,
+and every analyzer finding is a bare `WARNING` with no code. **"Incremental" is edit application,
+not incremental reparse**, and each handler re-parses from text per request. Round 2 moves each
+feature onto the tree that is already paid for: L-90 (parse cache + real incrementality) and L-85
+(completion) first, then L-86/L-87/L-88/L-89, with L-91 splitting the 1800-line `main.rs` into the
+modules the original design named and adding the in-memory-duplex harness that makes "advertised
+capability without a handler" a test failure. Design:
+[designs/flux-lsp-round-2.md](designs/flux-lsp-round-2.md).
 
 ### A2A protocol conformance (epic) — ✅ **SHIPPED (Tier 1 v0.4.2/0.4.3; Tier 3 v0.6.0; A-49…A-57 all done)**
 

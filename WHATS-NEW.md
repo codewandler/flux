@@ -15,6 +15,23 @@
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-28
+
+### Improved
+
+- **Plugins keep working across flux upgrades, and now say so when they don't.** The protocol a
+  plugin speaks to flux is versioned separately from flux itself, so upgrading flux no longer means
+  reinstalling the plugin pack — a plugin built today keeps working against much later versions.
+  Every release runs the previously published plugin binaries against the new flux to prove it. If a
+  plugin genuinely does speak a different protocol, flux now tells you which version each side
+  speaks instead of failing with an unreadable parsing error.
+
+### Action needed
+
+- **If you build your own flux plugins**, the shared plugin SDK has moved to its own version line
+  and starts at `1.0`: change your dependency on `codewandler-flux-host-kit` from `"0.28"` to `"1"`.
+  It will stay on `1.x` across flux releases and only move when the plugin protocol itself changes.
+
 ## [0.28.0] - 2026-07-28
 
 ### New

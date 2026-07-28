@@ -21,18 +21,18 @@ use sha2::{Digest as _, Sha256};
 #[cfg(feature = "host")]
 use flux_core::{Error, Result};
 #[cfg(feature = "host")]
-use flux_lang::ast::FlowEffect;
-#[cfg(feature = "host")]
 use flux_runtime::{
     authority_requirements_from_declaration, AuthorityRequirement, Tool, ToolContext, ToolResult,
 };
 #[cfg(feature = "host")]
-use flux_spec::{AccessKind, Effect, Idempotency, Risk, StagingDisposition, ToolSpec};
+use flux_spec::{AccessKind, Effect, FlowEffect, Idempotency, Risk, StagingDisposition, ToolSpec};
 #[cfg(feature = "host")]
 use flux_system::net::PrivateNetAllow;
 
-mod protocol;
-pub use protocol::*;
+// The wire contract lives in its own crate on its own version line (C-142/C-143) so a guest plugin
+// can depend on the protocol without depending on flux's host half. Re-exported here so every
+// existing `flux_plugin::{Frame, PluginManifest, OperationSpec, …}` path keeps resolving.
+pub use flux_plugin_protocol::*;
 
 /// JavaScript pre-tool hooks (QuickJS via `rquickjs`).
 #[cfg(feature = "hooks")]

@@ -99,6 +99,54 @@ jobs:
         working-directory: plugins
         run: cargo test --workspace
 
+  crate-versions:
+    name: independently-versioned crates moved their version
+    runs-on: ubuntu-latest
+    # The other half of dropping the lockstep (C-146). Crates on the 1.x protocol line are NOT swept
+    # by `scripts/cut-release.sh`, so nothing else stops an edit shipping under a version already on
+    # crates.io — where `cargo publish` would skip it and every consumer would keep the old code.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the check diffs against the previous v* tag
+
+      - name: A changed crate on an independent version line changed its version
+        run: |
+          ./scripts/check-crate-versions.sh --self-test
+          ./scripts/check-crate-versions.sh
+
+  plugin-compat:
+    name: released plugin binaries vs this host
+    runs-on: ubuntu-latest
+    # flux and the plugin pack no longer share a version line (C-143): plugins depend on the 1.x
+    # wire contract and are rebuilt only when it changes. Every other job builds host and guest from
+    # the same commit, so none of them can catch "today's host stopped understanding yesterday's
+    # binary". This one points a real, already-shipped artifact at the current host.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Released plugin binaries still speak this host's protocol
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Exit 2 means the pack release genuinely could not be obtained — reported, not failed.
+        # An actual incompatibility exits 1 and fails the job.
+        run: |
+          # GitHub runs this block under `bash -e`, which would abort on the script's own non-zero
+          # exit before the status could be read at all — turning a skip into a failed job.
+          set +e
+          ./scripts/check-plugin-compat.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::plugin compatibility check skipped — no pack release available"
+            exit 0
+          fi
+          exit "$status"
+
   postgres:
     name: postgres backend · flux-events · flux-capabilities · flux-pg
     runs-on: ubuntu-latest

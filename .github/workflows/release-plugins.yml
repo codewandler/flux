@@ -206,3 +206,56 @@ jobs:
             --target "${GITHUB_SHA}" \
             --title "flux plugin pack v${{ inputs.version }}" \
             --notes "Prebuilt \`flux-plugin-*\` binaries for the five core targets, plus the minisign-signed \`plugins-index.json\`. Install with \`flux plugin install <name>\` (D-47). This release series is consumed by the flux CLI — it is not the flux core release."
+
+      # host-kit ships HERE, not with the flux closure (C-146). It is the plugin-side SDK on the
+      # 1.x protocol line, so a flux release has nothing to say about its version — publishing it
+      # from `scripts/publish-crates-io.sh` only meant republishing an unchanged crate every cut.
+      #
+      # Ordering: host-kit's dependencies (`codewandler-flux-plugin-protocol` and the serde-only
+      # leaves) are published by the FLUX closure, so a wire change must ship a flux release before
+      # this step can resolve it. The preflight turns that into a named error instead of an opaque
+      # `cargo publish` resolution failure.
+      - name: Publish codewandler-flux-host-kit to crates.io
+        if: ${{ inputs.publish }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN not set — skipping the host-kit publish"
+            exit 0
+          fi
+
+          # Both crates carry an explicit `version = "…"` in their [package] section (they are on
+          # the 1.x protocol line, not `version.workspace = true`), so read it directly rather than
+          # paying a `cargo metadata` resolve.
+          pkg_version() {
+            awk '/^\[package\]/{p=1;next} /^\[/{p=0} p' "$1" \
+              | sed -nE 's/^version *= *"([^"]+)".*/\1/p' | head -1
+          }
+          on_crates_io() {
+            curl -sS --max-time 20 -H "User-Agent: flux-release (codewandler/flux)" \
+              "https://crates.io/api/v1/crates/$1/$2" | grep -q "\"num\":\"$2\""
+          }
+
+          version="$(pkg_version plugins/host-kit/Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the host-kit version from plugins/host-kit/Cargo.toml"
+            exit 1
+          fi
+
+          if on_crates_io codewandler-flux-host-kit "$version"; then
+            echo "codewandler-flux-host-kit@$version already on crates.io — nothing to publish"
+            exit 0
+          fi
+
+          protocol="$(pkg_version crates/flux-plugin-protocol/Cargo.toml)"
+          if ! on_crates_io codewandler-flux-plugin-protocol "$protocol"; then
+            echo "::error::codewandler-flux-plugin-protocol@$protocol is not on crates.io yet — cut and publish a flux release first, then re-run this workflow"
+            exit 1
+          fi
+
+          if ! cargo publish --manifest-path plugins/host-kit/Cargo.toml; then
+            echo "::error::host-kit publish failed"
+            exit 1
+          fi
