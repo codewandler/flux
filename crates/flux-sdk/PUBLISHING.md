@@ -1,7 +1,7 @@
 # Publishing to crates.io — runbook
 
 The publish closure is **29 crates**: the `flux-sdk` + `flux-providers` SDK surface, the plugin
-authoring surface (`flux-datasource`, `flux-credentials`, `flux-plugin`, `host-kit`), and the
+authoring surface (`flux-datasource`, `flux-credentials`, `flux-plugin`, `flux-plugin-protocol`), and the
 standalone contracts and capabilities that external consumers depend on directly — `flux-a2a`,
 `flux-audio`, `flux-config`, `flux-capabilities`, and `flux-web` (the web pack: `http.request`,
 `web.fetch`, `web.crawl`, `browser.*`). Publishing in dependency order means every dependent resolves
@@ -9,7 +9,8 @@ its deps from the index.
 The authoritative list is the `CRATES` array in `scripts/publish-crates-io.sh` — this doc mirrors it.
 
 > Status: **live.** The SDK closure (20 crates) shipped in v0.9.3. The plugin authoring surface (4
-> crates: datasource, credentials, plugin, host-kit) ships with v0.9.4. All vanity-prefixed
+> crates: datasource, credentials, plugin, host-kit) ships with v0.9.4; host-kit left the closure in
+> 0.29.0 (C-146) and `flux-plugin-protocol` joined it. All vanity-prefixed
 > `codewandler-*` (§1), automated in CI on a version tag (§5).
 
 ## 1. Naming — resolved: `codewandler-flux-*` vanity prefix
@@ -41,8 +42,8 @@ path. `flux-codegate` strips the `codewandler-` prefix before layer classificati
 
 ## 2. The closure & topological publish order
 
-**29 crates.** Each crate's dependencies precede it (verified against `cargo tree`). This list mirrors
-the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two in sync. Publish the
+**29 crates.** Each crate's dependencies precede it (machine-verified — see the guard noted
+below). This list mirrors the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two in sync. Publish the
 `codewandler-*` package for each:
 
 ```
@@ -51,24 +52,25 @@ the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two i
 3.  flux-a2a            (pure leaf — no flux-* deps)
 4.  flux-markdown       (pure leaf — no flux-* deps; enters via flux-skill/flux-agent)
 5.  flux-datasource     (pure leaf — no flux-* deps; enters via flux-plugin + host-kit)
-6.  flux-spec
-7.  flux-policy
-8.  flux-secret
-9.  flux-evidence
-10. flux-config         (→ core, policy, evidence; required by flux-runtime)
-11. flux-skill          (→ markdown)
-12. flux-system
-13. flux-provider       (the abstraction, singular)
-14. flux-credentials    (→ core, provider)
-15. flux-pg             (→ core)   — the sole sqlx owner; flux-events' optional `postgres` backend
-16. flux-lang
-17. flux-events         (→ core, lang; optional → flux-pg behind `postgres`)
-18. flux-runtime        (→ config)
-19. flux-tools
-20. flux-cognition
-21. flux-plugin         (→ datasource, credentials, runtime, system, spec, secret, evidence, core)
-22. flux-capabilities   (→ core, datasource, pg, plugin, runtime, secret, spec, system)
-23. host-kit            (→ plugin, datasource, spec)  — in the nested plugins/ workspace
+6.  flux-policy         (before flux-spec: C-141's FlowEffect move took `Action` with it)
+7.  flux-secret
+8.  flux-evidence
+9.  flux-spec           (→ policy)
+10. flux-plugin-protocol (→ spec, evidence, datasource)  — the plugin WIRE CONTRACT, on the
+    independent 1.x line (C-143); publishes from this workspace, unlike host-kit
+11. flux-config         (→ core, policy, evidence; required by flux-runtime)
+12. flux-skill          (→ markdown)
+13. flux-system
+14. flux-provider       (the abstraction, singular)
+15. flux-credentials    (→ core, provider)
+16. flux-pg             (→ core)   — the sole sqlx owner; flux-events' optional `postgres` backend
+17. flux-lang
+18. flux-events         (→ core, lang; optional → flux-pg behind `postgres`)
+19. flux-runtime        (→ config)
+20. flux-tools
+21. flux-cognition
+22. flux-plugin         (→ datasource, credentials, runtime, system, spec, secret, evidence, core)
+23. flux-capabilities   (→ core, datasource, pg, plugin, runtime, secret, spec, system)
 24. flux-flow           (→ lang, events, runtime, provider, skill, evidence, system, spec, secret, core)
 25. flux-agent          (→ flow, markdown, skill, tools, runtime, provider, events, evidence, core)
 26. flux-orchestrate    (→ agent, flow, …)
@@ -78,15 +80,25 @@ the `CRATES` array in `scripts/publish-crates-io.sh` in order — keep the two i
 29. flux-web            (→ core, runtime, spec, system, plugin, markdown, datasource, evidence)  — the web pack
 ```
 
+**Not in this list: `host-kit`.** Since C-146 it ships with the plugin pack from
+`.github/workflows/release-plugins.yml`, not with a flux release — it sits on the independent 1.x
+protocol line, so a flux cut cannot change its version. It depends on `flux-plugin-protocol`, which
+IS published here, so the pack workflow refuses to publish until that version is live on crates.io.
+
+`flux_codegate::tests::publish_script_covers_a_registry_resolvable_closure` checks this list's
+membership **and its order** against real `cargo metadata` dependencies, for both publishers.
+Ordering matters because `cargo publish` rejects a crate whose dependency is not yet on the index —
+and it does so only after the release tag is pushed.
+
 Why `flux-pg` is in the closure: crates.io requires **every** dependency — including optional ones — to
 be published. `flux-events` (which `flux-agent` needs) has an optional `postgres` feature that pulls
 `flux-pg`, so `flux-pg` must ship too. `sqlx` is only compiled when a consumer enables `postgres`, so
 default SDK users pay nothing for it.
 
-Why `flux-plugin` + `host-kit` are in the closure: third-party plugins (outside this repo) depend on
-`host-kit` which transitively pulls `flux-plugin` and `flux-datasource`. Without publishing these, every
-external plugin needs a git-SSH dep + deploy key. `host-kit` lives in the nested `plugins/` workspace and
-is published via `--manifest-path` (see `scripts/publish-crates-io.sh`).
+Why `flux-plugin` + `flux-plugin-protocol` are in the closure: third-party plugins (outside this repo)
+depend on `host-kit`, which pulls `flux-plugin-protocol` and `flux-datasource`. Without publishing
+these, every external plugin needs a git-SSH dep + deploy key. `host-kit` itself lives in the nested
+`plugins/` workspace and ships with the pack (C-146), so it is no longer published from here.
 
 ## 3. Version metadata (already applied)
 
@@ -94,8 +106,10 @@ Every closure crate carries `version` alongside `package`+`path` in `[workspace.
 refactors that pulled `flux-markdown`, `flux-orchestrate`, and `flux-pg` into the closure had left them
 path-only; all three now carry a `version` (the last packaging blockers). `scripts/cut-release.sh` keeps
 these in lockstep with `[workspace.package].version` on every release. The plugin surface
-(`flux-datasource`, `flux-credentials`, `flux-plugin`) was added to the closure in v0.9.4; `host-kit`
-uses an explicit version that the release script keeps in lockstep with the root workspace.
+(`flux-datasource`, `flux-credentials`, `flux-plugin`) was added to the closure in v0.9.4. The
+protocol-line crates (`flux-plugin-protocol`, `flux-spec`, `flux-policy`, `flux-secret`,
+`flux-evidence`, `flux-datasource`, and `host-kit`) carry an explicit `1.x` version that the release
+script deliberately does NOT touch (C-143).
 
 ## 4. Pre-flight (no registry writes)
 

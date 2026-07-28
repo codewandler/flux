@@ -31,11 +31,14 @@ CRATES=(
   codewandler-flux-a2a
   codewandler-flux-markdown
   codewandler-flux-datasource
-  codewandler-flux-plugin-protocol
-  codewandler-flux-spec
+  # flux-policy before flux-spec: C-141 moved `FlowEffect` into flux-spec, which took `Action` from
+  # flux-policy with it. flux-spec before flux-plugin-protocol, and flux-evidence before it too —
+  # the wire contract names types from all three.
   codewandler-flux-policy
   codewandler-flux-secret
   codewandler-flux-evidence
+  codewandler-flux-spec
+  codewandler-flux-plugin-protocol
   codewandler-flux-config
   codewandler-flux-skill
   codewandler-flux-system

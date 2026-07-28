@@ -812,6 +812,8 @@ mod tests {
         let mut closure = BTreeSet::new();
         let mut pack_closure = BTreeSet::new();
         let mut path_only = Vec::new();
+        // name -> its vanity-prefixed production dependencies, for the ordering check below.
+        let mut vanity_deps: Vec<(String, Vec<String>)> = Vec::new();
 
         for (index, manifest) in manifests.into_iter().enumerate() {
             let is_pack = index == 1;
@@ -833,14 +835,19 @@ mod tests {
                 } else {
                     closure.insert(package.name.to_string());
                 }
+                let mut deps = Vec::new();
                 for dependency in &package.dependencies {
-                    if dependency.kind != DependencyKind::Development
-                        && dependency.path.is_some()
-                        && dependency.req.to_string() == "*"
-                    {
+                    if dependency.kind == DependencyKind::Development {
+                        continue;
+                    }
+                    if dependency.path.is_some() && dependency.req.to_string() == "*" {
                         path_only.push(format!("{} -> {}", package.name, dependency.name));
                     }
+                    if dependency.name.starts_with("codewandler-") {
+                        deps.push(dependency.name.clone());
+                    }
                 }
+                vanity_deps.push((package.name.to_string(), deps));
             }
         }
 
@@ -857,18 +864,50 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("\n)"))
             .map(|(array, _)| array)
             .expect("find CRATES array in publish script");
-        let scripted = array
+        let scripted_order = array
             .lines()
             .map(str::trim)
             .filter(|line| line.starts_with("codewandler-"))
             .filter_map(|line| line.split_whitespace().next())
             .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        let scripted = scripted_order.iter().cloned().collect::<BTreeSet<_>>();
 
         assert_eq!(
             scripted, closure,
             "scripts/publish-crates-io.sh must list every vanity-prefixed package of the ROOT \
              workspace exactly once (packages in plugins/ ship with the pack — see C-146)"
+        );
+
+        // ORDER, not just membership. `cargo publish` refuses a crate whose dependency is not yet
+        // on crates.io, and the closure is published strictly in the scripted sequence — so a crate
+        // listed before one of its own dependencies fails the release AFTER the tag is pushed,
+        // which is the most expensive moment to find out. Two such inversions were live at once
+        // (flux-spec before flux-policy, from C-141's `FlowEffect` move; flux-plugin-protocol
+        // before flux-spec/flux-evidence, from C-142's insert) and the membership check above saw
+        // neither, because both sets were identical.
+        let position = |name: &str| scripted_order.iter().position(|n| n == name);
+        let mut inversions = Vec::new();
+        for (name, deps) in &vanity_deps {
+            let Some(own) = position(name) else { continue };
+            for dep in deps {
+                if let Some(dep_at) = position(dep) {
+                    if dep_at > own {
+                        inversions.push(format!(
+                            "{name} (#{own}) is published before its dependency {dep} (#{dep_at})"
+                        ));
+                    }
+                }
+            }
+        }
+        inversions.sort();
+        inversions.dedup();
+        assert!(
+            inversions.is_empty(),
+            "scripts/publish-crates-io.sh publishes in order, so every crate must come after its \
+             own dependencies — `cargo publish` would reject these, and only after the release tag \
+             is pushed:\n{}",
+            inversions.join("\n")
         );
 
         // The pack half: every vanity-prefixed package in plugins/ must be named by the workflow
