@@ -8,6 +8,41 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Metadata coherence is gated over the full production catalog, not just the built-ins (C-208).**
+  C-191's build-time gate covered `try_register_builtins`. The registry a running agent actually
+  dispatches against also carries the cognition pack, eval ops, `reflect`/`flows`/`render`, web ops,
+  datasource + endpoint ops, `TaskTool` and config-authored model stages — all reaching the same
+  `Executor::dispatch` and the same approver. The new census
+  (`crates/flux-cli/src/catalog_coherence.rs`, a `#[cfg(test)]` module inside the binary so it drives
+  the real `register_tool_packs` rather than a copy) found **22 violations across 19 ops** — the 11
+  carried in the story plus two nobody had listed: `explore` (a billable provider call at
+  `Risk::Low`) and `grade` (`[Read, Process]` at `Risk::Low` + `Idempotent`, on an op that runs a
+  *caller-supplied* command). All 13 are corrected in place; `flux_spec::coherence::EXEMPT` gained
+  **no** entries.
+  **The `Network`-without-`Read` posture is now decided and written down** in
+  `docs/designs/security-assurance.md`, which was the point of the story: 8 of the violators declared
+  `[Network]` at `Risk::Low` with no `Read`, and making them honest is a product decision, not a
+  mechanical fix. The sorting test is **cost, not mutation** — genuine retrievals (`web.fetch`,
+  `web.crawl`) gain `Effect::Read`, because a read over the network is a read and the declaration was
+  simply incomplete; billable model calls (`consult`, `ai.*`/`synth`, `detect_intent`, `explore`,
+  config stages) rise to `Risk::Medium`, because `Low` understates a call that spends money.
+  `detect_intent` moved groups during implementation: its description reads local, but it runs
+  `detect_intent_stage`, a provider call that records usage. `Risk::Medium` adds no approval prompts
+  — `RiskApprover` gates writes at ≥ `High` and only `Destructive` forces approval — what it buys is
+  exclusion from `gather_safe` and an honest tier in `PlanRisk::summary`, the sentence a human reads
+  before approving.
+  A **drift guard** scans `execution.rs` for registration seams and fails on any not classified,
+  including by source label — so adding a pack without adding it to the census is a build failure
+  rather than a silent coverage loss. A latent shadowing bug fell out of the same pass:
+  `CognitionOp::spec` re-declared `Risk::Low` after lowering `OpKind::opspec()`, overriding the typed
+  contract; the tier is now declared once and pinned by a test.
+  Found in review and fixed before merge: correcting only the risk floor on `web.fetch`/`web.crawl`
+  moved them out of `is_consequence_bearing`, which silenced the repeatability floor that had been
+  flagging their inherited `Idempotency::Idempotent` — the untruth became undetectable rather than
+  fixed. Both are now `Conditional` with explicit assertions, since no invariant backstops them. The
+  generalisation is recorded in the design doc: **when a fix narrows what an invariant classifies,
+  re-check every invariant that was firing before the narrowing.**
+
 - **Operation metadata is checked for coherence on every build, and plugin drift is reported at load
   (C-191).** Approval gating is driven by each operation's self-declared `effects`, `risk`,
   `idempotency` and `access`. Those declarations were trusted and never cross-checked, so an op that

@@ -2,7 +2,7 @@
 id: C-208
 title: "Extend ToolSpec coherence to the full production catalog, and settle the Network-without-Read posture"
 pillar: Core
-status: in-progress
+status: done
 priority: 16
 epic: security-assurance
 design: docs/designs/security-assurance.md

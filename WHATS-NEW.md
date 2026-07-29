@@ -17,6 +17,13 @@
 
 ### Improved
 
+- **Operations that call a model are now labelled as costing something.** Fetching a web page and
+  asking a model a question were both labelled "low risk", which made a billable call look as
+  harmless as reading a file — and that label is what flux shows you in the summary you approve. Ops
+  that spend money (second opinions, the built-in AI helpers, intent detection) are now labelled
+  medium, and genuine page fetches are correctly marked as reads. This adds no new approval prompts;
+  it makes the description you are shown before approving match what will actually happen.
+
 - **flux now tells you when an integration understates what its operations do.** Every operation
   declares how risky it is and whether it only reads — and that declaration is what decides whether
   you get asked before it runs. Nothing checked those declarations against each other, so an
