@@ -652,3 +652,347 @@ fn support_bot_example_covers_the_module_surface() {
         "the trigger is agent-bound — no journey to run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A-112 — per-delivery bus isolation.
+//
+// Deliveries used to be serialized by the single delivery supervisor: one root ran to completion,
+// cascade and all, before the next was dequeued. The tests below pin the concurrent contract —
+// each delivery sees only its own cascade, and a blocked delivery does not hold the queue.
+// ---------------------------------------------------------------------------
+
+/// A rendezvous a journey can block on, so a test can prove one delivery is genuinely *in flight*
+/// while another one runs — deterministically, with no wall-clock sleeps. `hold` parks the calling
+/// journey until some other journey calls `release`.
+#[derive(Default)]
+struct Gate {
+    entered: tokio::sync::Notify,
+    open: tokio::sync::Notify,
+}
+
+struct HoldOp(Arc<Gate>);
+
+#[async_trait]
+impl Tool for HoldOp {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec::read_only(
+            "hold",
+            "block this journey until another journey releases the gate",
+            json!({ "type": "object", "properties": { "at": { "type": "string" } } }),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _params: serde_json::Value,
+    ) -> flux_core::Result<ToolResult> {
+        self.0.entered.notify_one();
+        self.0.open.notified().await;
+        Ok(ToolResult::ok("held"))
+    }
+}
+
+struct ReleaseOp(Arc<Gate>);
+
+#[async_trait]
+impl Tool for ReleaseOp {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec::read_only(
+            "release",
+            "release a journey blocked on the gate",
+            json!({ "type": "object", "properties": { "at": { "type": "string" } } }),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _params: serde_json::Value,
+    ) -> flux_core::Result<ToolResult> {
+        self.0.open.notify_one();
+        Ok(ToolResult::ok("released"))
+    }
+}
+
+/// A generous deadlock backstop. Nothing in these tests waits on the clock for its *assertion* —
+/// the timeout only turns "serialized forever" into a readable failure instead of a hung test.
+const DEADLOCK_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn gate_ops(gate: &Arc<Gate>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(HoldOp(gate.clone())) as Arc<dyn Tool>,
+        Arc::new(ReleaseOp(gate.clone())) as Arc<dyn Tool>,
+    ]
+}
+
+/// Two labels, two independent cascade trees, one blocking rendezvous forcing them to overlap.
+const CONCURRENT_CASCADES: &str = r#"permissions
+  allow [emit, send, hold, release]
+
+channel cli
+
+trigger t_alpha
+  on "alpha"
+  run alpha
+
+trigger t_alpha_cascade
+  on "alpha_cascade"
+  run alpha-followup
+
+trigger t_beta
+  on "beta"
+  run beta
+
+trigger t_beta_cascade
+  on "beta_cascade"
+  run beta-followup
+
+journey alpha
+  flow
+    emit({ "event": "alpha_cascade" })
+    hold({ "at": "gate" })
+
+journey alpha-followup
+  flow
+    send({ "channel": "cli", "message": "alpha cascade ran" })
+
+journey beta
+  flow
+    emit({ "event": "beta_cascade" })
+    release({ "at": "gate" })
+
+journey beta-followup
+  flow
+    send({ "channel": "cli", "message": "beta cascade ran" })
+"#;
+
+#[tokio::test]
+async fn concurrent_deliveries_each_collect_only_their_own_cascade() {
+    let gate = Arc::new(Gate::default());
+    let app = Arc::new(
+        App::try_with_tools(
+            program(CONCURRENT_CASCADES),
+            None,
+            "test-model",
+            false,
+            gate_ops(&gate),
+        )
+        .expect("valid app"),
+    );
+
+    let alpha = tokio::spawn({
+        let app = app.clone();
+        async move { app.deliver("alpha", json!({})).await }
+    });
+    // `alpha` has emitted its cascade event and is now parked mid-delivery.
+    tokio::time::timeout(DEADLOCK_BACKSTOP, gate.entered.notified())
+        .await
+        .expect("the alpha delivery reached its blocking op");
+
+    let beta = tokio::time::timeout(DEADLOCK_BACKSTOP, app.deliver("beta", json!({})))
+        .await
+        .expect("a second delivery must not queue behind an in-flight one")
+        .expect("beta delivery");
+    let alpha = tokio::time::timeout(DEADLOCK_BACKSTOP, alpha)
+        .await
+        .expect("the alpha delivery completed once released")
+        .expect("alpha task")
+        .expect("alpha delivery");
+
+    let alpha_names: Vec<&str> = alpha.iter().map(|r| r.journey.as_str()).collect();
+    let beta_names: Vec<&str> = beta.iter().map(|r| r.journey.as_str()).collect();
+    assert_eq!(
+        alpha_names,
+        vec!["alpha", "alpha-followup"],
+        "alpha collected exactly its own root and cascade"
+    );
+    assert_eq!(
+        beta_names,
+        vec!["beta", "beta-followup"],
+        "beta collected exactly its own root and cascade"
+    );
+    assert!(
+        alpha_names.iter().all(|name| !beta_names.contains(name)),
+        "no journey run appears in both results: {alpha_names:?} / {beta_names:?}"
+    );
+
+    // Each cascade event was processed exactly once overall — no broadcast double-processing.
+    let messages: Vec<String> = app.bus().sent().into_iter().map(|s| s.message).collect();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| *m == "alpha cascade ran")
+            .count(),
+        1,
+        "alpha's cascade ran once: {messages:?}"
+    );
+    assert_eq!(
+        messages.iter().filter(|m| *m == "beta cascade ran").count(),
+        1,
+        "beta's cascade ran once: {messages:?}"
+    );
+}
+
+/// A sweep-shaped journey (long-running, blocking) and a short one that must overtake it.
+const SWEEP_AND_INTAKE: &str = r#"permissions
+  allow [send, hold, release]
+
+channel cli
+
+trigger t_sweep
+  on "sweep"
+  run sweep
+
+trigger t_intake
+  on "intake"
+  run intake
+
+journey sweep
+  flow
+    hold({ "at": "gate" })
+    send({ "channel": "cli", "message": "sweep finished" })
+
+journey intake
+  flow
+    release({ "at": "gate" })
+    send({ "channel": "cli", "message": "intake finished" })
+"#;
+
+#[tokio::test]
+async fn a_long_running_delivery_does_not_delay_the_next_one() {
+    let gate = Arc::new(Gate::default());
+    let app = Arc::new(
+        App::try_with_tools(
+            program(SWEEP_AND_INTAKE),
+            None,
+            "test-model",
+            false,
+            gate_ops(&gate),
+        )
+        .expect("valid app"),
+    );
+
+    let sweep = tokio::spawn({
+        let app = app.clone();
+        async move { app.deliver("sweep", json!({})).await }
+    });
+    tokio::time::timeout(DEADLOCK_BACKSTOP, gate.entered.notified())
+        .await
+        .expect("the sweep delivery reached its blocking op");
+
+    // The intake delivery is submitted while the sweep is still running, and it is the sweep that
+    // depends on the intake — not the other way round. Ordering, not elapsed time, is the assertion.
+    tokio::time::timeout(DEADLOCK_BACKSTOP, app.deliver("intake", json!({})))
+        .await
+        .expect("intake must run while the sweep is still in flight")
+        .expect("intake delivery");
+    tokio::time::timeout(DEADLOCK_BACKSTOP, sweep)
+        .await
+        .expect("the sweep completed once the intake released it")
+        .expect("sweep task")
+        .expect("sweep delivery");
+
+    let messages: Vec<String> = app.bus().sent().into_iter().map(|s| s.message).collect();
+    assert_eq!(
+        messages,
+        vec!["intake finished", "sweep finished"],
+        "the second delivery completed while the first was still blocked"
+    );
+}
+
+/// One journey whose `emit` re-triggers itself: the per-delivery cascade bound is what stops it.
+const SELF_CASCADE: &str = r#"channel cli
+
+trigger t
+  on "tick"
+  run tick
+
+journey tick
+  flow
+    emit({ "event": "tick" })
+"#;
+
+#[tokio::test]
+async fn a_self_feeding_cascade_stays_bounded_within_one_delivery() {
+    let app = App::new(program(SELF_CASCADE), None, "test-model");
+
+    let runs = app.deliver("tick", json!({})).await.expect("delivery");
+
+    // `MAX_CASCADE` (256) roots per synchronous delivery — the bound is per delivery, and it holds.
+    assert_eq!(
+        runs.len(),
+        256,
+        "the cascade tree stayed bounded inside one delivery"
+    );
+    assert!(runs.iter().all(|run| run.journey == "tick"));
+}
+
+/// Every journey blocks on a shared barrier: the wave only completes if all of the deliveries are
+/// genuinely in flight at the same time.
+const WAVE: &str = r#"permissions
+  allow [send, rendezvous]
+
+channel cli
+
+trigger t
+  on "wave"
+  run wave
+
+journey wave
+  flow
+    rendezvous({ "at": "wave" })
+    send({ "channel": "cli", "message": "wave done" })
+"#;
+
+/// Wider than `MAX_SPAWN_DEPTH` (16): concurrent deliveries must not consume one another's nesting
+/// budget, only their own.
+const WAVE_WIDTH: usize = 24;
+
+struct RendezvousOp(Arc<tokio::sync::Barrier>);
+
+#[async_trait]
+impl Tool for RendezvousOp {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec::read_only(
+            "rendezvous",
+            "wait until every journey in the wave has arrived",
+            json!({ "type": "object", "properties": { "at": { "type": "string" } } }),
+        )
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _params: serde_json::Value,
+    ) -> flux_core::Result<ToolResult> {
+        self.0.wait().await;
+        Ok(ToolResult::ok("arrived"))
+    }
+}
+
+#[tokio::test]
+async fn a_wave_of_deliveries_does_not_share_one_nesting_budget() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(WAVE_WIDTH));
+    let rendezvous: Arc<dyn Tool> = Arc::new(RendezvousOp(barrier));
+    let app = Arc::new(
+        App::try_with_tools(program(WAVE), None, "test-model", false, vec![rendezvous])
+            .expect("valid app"),
+    );
+
+    let wave: Vec<_> = (0..WAVE_WIDTH)
+        .map(|_| {
+            let app = app.clone();
+            tokio::spawn(async move { app.deliver("wave", json!({})).await })
+        })
+        .collect();
+    for handle in wave {
+        tokio::time::timeout(DEADLOCK_BACKSTOP, handle)
+            .await
+            .expect("every delivery in the wave ran concurrently")
+            .expect("wave task")
+            .expect("wave delivery");
+    }
+
+    assert_eq!(app.bus().sent().len(), WAVE_WIDTH);
+}

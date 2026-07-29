@@ -25,19 +25,44 @@ The mechanism already exists — `DeliveryOrigin`, a task-local (`crates/flux-ap
 delivery and making `deliver` re-entrant, not inventing a mechanism.
 
 ## Acceptance
-- [ ] Failing-first test: two `App::deliver` calls issued concurrently on labels with distinct
+- [x] Failing-first test: two `App::deliver` calls issued concurrently on labels with distinct
       journeys each observe **only their own** cascade events — no journey run appears in both
       results, and no event is processed twice. This test fails on today's broadcast fan-out.
-- [ ] Failing-first test: a long-running delivery (a sweep-shaped journey) does not delay a second
+- [x] Failing-first test: a long-running delivery (a sweep-shaped journey) does not delay a second
       delivery submitted while it runs — asserted on ordering/completion, not wall-clock sleeps.
-- [ ] Cascade depth/bound semantics are unchanged per delivery: the existing bounded cascade-tree
+- [x] Cascade depth/bound semantics are unchanged per delivery: the existing bounded cascade-tree
       guarantees still hold within one delivery's scope.
-- [ ] `crates/flux-channels/src/lib.rs`'s `## Concurrency` module doc is updated to describe what is
+- [x] `crates/flux-channels/src/lib.rs`'s `## Concurrency` module doc is updated to describe what is
       now true, rather than leaving the serialization note in place.
-- [ ] Full gate green in both workspaces (`cargo fmt --check`, clippy, `cargo test --workspace`).
+- [x] Full gate green in both workspaces (`cargo fmt --check`, clippy, `cargo test --workspace`).
 
 ## Progress
-- (not started)
+- **Done.** `DeliverySupervisor`'s actor loop no longer processes inline — it only dequeues, and
+  spawns each `DeliveryMessage` into a `JoinSet` (`supervisor.rs`, new `process()` fn; the three
+  match arms moved verbatim, `continue` → `return`, cancellation and run-lease semantics unchanged
+  but now per task). `process_root` already gave every root its own cascade queue, so isolation
+  followed once roots stopped queueing behind one another.
+- The non-obvious half: `Engine::depth` (the `MAX_SPAWN_DEPTH` guard) was an engine-wide
+  `AtomicU32` that was only *accidentally* per-delivery, because deliveries were serialized. Under
+  concurrency 17 simultaneous deliveries would trip the recursion guard on work that never
+  recursed. The budget moved into `DeliveryOrigin` (`depth: Arc<AtomicU32>`), with the engine
+  counter kept as the fallback for journey runs outside any delivery scope.
+- Tests (`crates/flux-app/tests/integration.rs`), all four new — a `hold`/`release` `Notify` gate
+  makes a journey block deterministically, so overlap is proven by ordering, not by sleeping:
+  `concurrent_deliveries_each_collect_only_their_own_cascade`,
+  `a_long_running_delivery_does_not_delay_the_next_one`,
+  `a_self_feeding_cascade_stays_bounded_within_one_delivery` (MAX_CASCADE regression guard, passed
+  before and after), `a_wave_of_deliveries_does_not_share_one_nesting_budget` (24 concurrent
+  deliveries on a shared `Barrier`, wider than `MAX_SPAWN_DEPTH`'s 16).
+- **Nested self-delivery still fails fast.** `DeliverySupervisor::deliver` keeps its
+  `origin.supervisor == self.id` guard. Per-message spawning removes the deadlock that motivated
+  it, but lifting it would open an unbounded `deliver → journey → deliver` recursion that no
+  `MAX_CASCADE` covers. Out of scope here; behaviour unchanged.
+- **Deliberately not fixed, filed separately:** delivery concurrency is now unbounded (the `mpsc`
+  `CAPACITY` bound was the only backpressure and the loop drains it instantly), and `App::run` no
+  longer strictly orders `startup` before bus events (the run lease activates before the `Start`
+  response is awaited). Both are consequences of removing serialization, not regressions inside it.
+- Breaking for `flux-app` embedders who relied on `App::deliver` being globally serialized.
 
 ## Notes
 - Likely a breaking change for `flux-app` embedders (delivery/bus surface) ⇒ pre-1.0 SemVer makes it

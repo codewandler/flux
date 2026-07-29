@@ -38,7 +38,7 @@ use flux_runtime::{
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
 
-use crate::bus::Bus;
+use crate::bus::{delivery_origin, Bus};
 use crate::ops::{self, JourneyHost};
 use crate::park::{self, ParkedAsk};
 use crate::supervisor::DeliverySupervisor;
@@ -498,6 +498,13 @@ impl App {
     /// run's result. Events the journeys `emit` are processed too as a bounded cascade tree. This is
     /// the unit of work tests and the CLI channels drive; [`App::run`] is the long-running form. The
     /// App's sole delivery supervisor keeps each request and its cascades correlated.
+    ///
+    /// **Concurrent, not serialized (A-112).** Calls from different tasks run at the same time and
+    /// each one sees only its own cascade tree and its own nesting budget, so a long sweep does not
+    /// delay the deliveries submitted behind it. Journeys still share the App's mutable state —
+    /// agent sessions, ask-parks, the recorded-send log — so two deliveries that touch the same
+    /// conversation interleave rather than queue. A journey may not re-enter `deliver` on the App
+    /// it is itself running under; that still fails fast.
     pub async fn deliver(
         &self,
         label: impl Into<String>,
@@ -542,8 +549,10 @@ pub(crate) struct Engine {
     /// The sole trigger-routing owner. Public bus receivers are observation-only; direct deliveries
     /// and the long-running run lease submit roots to this coordinator.
     delivery: DeliverySupervisor,
-    /// Active `spawn` recursion depth (guards against unbounded self-spawn).
-    depth: AtomicU32,
+    /// Fallback `spawn` recursion depth, used only by a journey run with no delivery scope around
+    /// it. A run reached through the delivery supervisor counts against its own delivery's budget
+    /// ([`crate::bus::DeliveryOrigin::depth`]) so concurrent deliveries stay independent.
+    depth: Arc<AtomicU32>,
     /// Monotonic counter giving each journey run a distinct session id.
     runs: AtomicU64,
     /// Shared mechanical execution template. Per-journey/per-agent capability decisions replace
@@ -883,7 +892,7 @@ impl Engine {
                 registry,
                 bus,
                 delivery: DeliverySupervisor::new(),
-                depth: AtomicU32::new(0),
+                depth: Arc::new(AtomicU32::new(0)),
                 runs: AtomicU64::new(0),
                 execution,
                 provider,
@@ -1163,9 +1172,14 @@ impl Engine {
         // Lower top-level `ask` calls onto the suspension seam (ask + await) — see `crate::park`.
         ast.body = park::rewrite_asks(std::mem::take(&mut ast.body));
 
-        // Depth guard: increment, ensure we decrement on every exit, then check.
-        let prev = self.depth.fetch_add(1, Ordering::SeqCst);
-        let _guard = DepthGuard(&self.depth);
+        // Depth guard: increment, ensure we decrement on every exit, then check. The budget belongs
+        // to the delivery that caused this run, so two deliveries in flight at once never spend
+        // each other's nesting allowance; a run outside any delivery falls back to the engine's.
+        let budget = delivery_origin()
+            .map(|origin| origin.depth)
+            .unwrap_or_else(|| self.depth.clone());
+        let prev = budget.fetch_add(1, Ordering::SeqCst);
+        let _guard = DepthGuard(budget);
         if prev >= MAX_SPAWN_DEPTH {
             return Err(Error::Other(format!(
                 "spawn recursion exceeded max depth {MAX_SPAWN_DEPTH}"
@@ -2015,9 +2029,9 @@ fn other(e: impl std::fmt::Display) -> Error {
 }
 
 /// Decrements the active spawn depth when a journey run unwinds (success, error, or early return).
-struct DepthGuard<'a>(&'a AtomicU32);
+struct DepthGuard(Arc<AtomicU32>);
 
-impl Drop for DepthGuard<'_> {
+impl Drop for DepthGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
