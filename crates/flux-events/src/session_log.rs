@@ -266,24 +266,27 @@ mod tests {
 
     // ---- the transition the raw API cannot refuse -----------------------------------------
 
-    /// The failing-first test. `record_message` accepts any message unexamined, so the equivalent
-    /// double-append through it **silently** produces `user`-after-`user` — the exact shape a
+    /// The failing-first test (A-100). A bare `append` takes any message unexamined, so the
+    /// equivalent double-append **silently** produces `user`-after-`user` — the exact shape a
     /// provider rejects with a 400 on the next turn. Through the handle it is an `Err` with nothing
     /// appended.
+    ///
+    /// A-102 removed the `record_message` helper this half used to call; the raw append below is
+    /// the store primitive it was a wrapper around, kept here because the contrast *is* the test.
     #[test]
-    fn double_open_turn_is_rejected_where_record_message_silently_breaks_shape() {
-        // What today's unguarded seam does with the same two writes.
+    fn double_open_turn_is_rejected_where_a_raw_append_silently_breaks_shape() {
+        // What an unguarded append does with the same two writes.
         let (store, raw) = store_with_session();
         store
-            .record_message(&raw, &Message::user_text("first"))
+            .append(&raw, NewEvent::message(Message::user_text("first")))
             .unwrap();
         store
-            .record_message(&raw, &Message::user_text("second"))
+            .append(&raw, NewEvent::message(Message::user_text("second")))
             .unwrap();
         assert_eq!(
             roles(&store, &raw),
             vec![Role::User, Role::User],
-            "the raw API appends a second user message without a word"
+            "a raw append adds a second user message without a word"
         );
         assert!(
             ValidHistory::new(store.conversation(&raw).unwrap()).is_err(),

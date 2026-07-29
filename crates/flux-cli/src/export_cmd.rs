@@ -21,7 +21,7 @@
 //!
 //! Conversation `Message` text and `TurnSummary.user_input`/`answer` are the one place that
 //! guarantee does **not** hold: `flux-flow/src/engine.rs::begin_turn_lifecycle` calls
-//! `record_message`/`begin_turn` with the raw prompt, with no redactor in the path. For those
+//! `SessionLog::open_turn`/`begin_turn` with the raw prompt, no redactor in the path. For those
 //! fields the fresh, per-export `Redactor` is the ONLY control available — and it is shape-based
 //! only (`sk-…`/`ghp_…`/a JWT/…; see `flux_secret::SECRET_PREFIXES`), since a pure read has no way
 //! to learn which arbitrary values were live secrets during that historical run. Still, every
@@ -650,12 +650,11 @@ mod tests {
 
     fn seed_session(events: &EventStore, prompt: &str) -> String {
         let sid = events.create_session("mock").unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::user_text(prompt))
+        let mut log = flux_events::SessionLog::open(events, &sid).unwrap();
+        log.open_turn(flux_core::Message::user_text(prompt))
             .unwrap();
         let turn_id = events.begin_turn(&sid, prompt, "mock").unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::assistant_text("done"))
+        log.close_turn(flux_events::AssistantMessage::text("done").unwrap())
             .unwrap();
         events
             .end_turn(&sid, turn_id, "chat", 1, "done", None)
@@ -665,7 +664,7 @@ mod tests {
 
     /// Failing-first (C-132 acceptance #2): a run whose CONVERSATION carries a seeded,
     /// credential-shaped secret must export with the secret redacted. Conversation text is the one
-    /// field C-22/L-38 never covers (see the module doc) — `record_message` stores it verbatim, so
+    /// field C-22/L-38 never covers (see the module doc) — the session log stores it verbatim, so
     /// this genuinely fails until `flux export` routes rendered text through a `Redactor` itself.
     #[test]
     fn seeded_secret_in_conversation_is_redacted_in_the_export() {
@@ -779,8 +778,9 @@ mod tests {
         let child = events
             .create_session_with_context("mock", &child_ctx)
             .unwrap();
-        events
-            .record_message(&child, &flux_core::Message::user_text("review this"))
+        flux_events::SessionLog::open(&events, &child)
+            .unwrap()
+            .open_turn(flux_core::Message::user_text("review this"))
             .unwrap();
 
         let pricing = flux_core::PricingTable::builtin();

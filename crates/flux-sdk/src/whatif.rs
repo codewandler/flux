@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use flux_core::{PricingTable, Result};
-use flux_events::{DiffRow, EventContext, ModelCost, RunDiff};
+use flux_events::{DiffRow, EventContext, ModelCost, RunDiff, SessionLog, ValidHistory};
 use flux_flow::cassette::{CassetteScope, FrozenTape, RecordScope, ReplayTape};
 use flux_flow::host::OpOutcome;
 use flux_flow::AgentSink;
@@ -492,9 +492,10 @@ impl WhatIf {
 
         // Re-plan path: copy the conversation so the re-planned turn sees the same history, rebuild
         // every earlier turn hermetically, then drive exactly one LIVE turn under the pinned scope.
-        for m in events.conversation(&src)? {
-            variant.events.record_message(&dst, &m)?;
-        }
+        // The copy is one checked rewrite (A-102) — the variant's live turn goes to a real provider,
+        // so a source history that is not a valid provider history must fail here, not there.
+        let history = ValidHistory::new(events.conversation(&src)?)?;
+        SessionLog::open(&variant.events, &dst)?.rewrite(history)?;
         let turns = events.turns(&src)?;
         let target_turn = self.turn.unwrap_or(turns.len().max(1));
         let user_input = turns

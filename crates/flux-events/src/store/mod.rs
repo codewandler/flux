@@ -824,17 +824,10 @@ impl EventStore {
 
     // --- ergonomic event-native helpers (used at call sites) ----------------
 
-    /// Record one conversation message.
-    pub fn record_message(&self, stream: &str, m: &Message) -> Result<()> {
-        self.append(stream, NewEvent::message(m.clone()))?;
-        Ok(())
-    }
-
-    /// Record a context-compaction snapshot (the append-only `rewrite_messages`).
-    pub fn record_compaction(&self, stream: &str, messages: &[Message]) -> Result<()> {
-        self.append(stream, NewEvent::compacted(messages.to_vec()))?;
-        Ok(())
-    }
+    // Conversation writes deliberately have no helper here (A-102). `record_message` /
+    // `record_compaction` used to sit in this list and appended any `Message` unexamined, which is
+    // how the session-shape invariant broke three times. Every conversation write now goes through
+    // [`crate::SessionLog`], whose transitions cannot express an invalid shape.
 
     /// Record a flow run-trace event.
     pub fn record_run_event(&self, stream: &str, ev: &RunEvent) -> Result<()> {
@@ -1201,7 +1194,28 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shape::{AssistantMessage, ValidHistory};
+    use crate::SessionLog;
     use flux_core::Message;
+
+    /// A whole turn through the typed seam. Since A-102 this is the only way a conversation message
+    /// reaches a log — the store carries no unguarded `record_message` for a fixture to reach for
+    /// either, so these fixtures write exactly the shapes production can.
+    fn say(store: &EventStore, stream: &str, user: &str, assistant: &str) {
+        let mut log = SessionLog::open(store, stream).unwrap();
+        log.open_turn(Message::user_text(user)).unwrap();
+        log.close_turn(AssistantMessage::text(assistant).unwrap())
+            .unwrap();
+    }
+
+    /// Open a turn — the `user` half alone, for the many fixtures that only need a session to be
+    /// non-empty.
+    fn ask(store: &EventStore, stream: &str, user: impl Into<String>) {
+        SessionLog::open(store, stream)
+            .unwrap()
+            .open_turn(Message::user_text(user))
+            .unwrap();
+    }
 
     /// C-81: the single serde-decode point must survive an undecodable row — an unknown event
     /// variant written by a newer build, or a corrupt payload — by skipping it, not aborting the
@@ -1252,12 +1266,7 @@ mod tests {
         let id = store.create_session("claude-sonnet-4-6").unwrap();
         assert!(id.starts_with("s_"));
 
-        store
-            .record_message(&id, &Message::user_text("hello"))
-            .unwrap();
-        store
-            .record_message(&id, &Message::assistant_text("hi there"))
-            .unwrap();
+        say(store, &id, "hello", "hi there");
 
         let msgs = store.conversation(&id).unwrap();
         assert_eq!(msgs.len(), 2);
@@ -1270,9 +1279,7 @@ mod tests {
         let id = store.create_session("m").unwrap();
         let created = store.info(&id).unwrap().updated_at_ms;
         std::thread::sleep(std::time::Duration::from_millis(2));
-        store
-            .record_message(&id, &Message::user_text("hi"))
-            .unwrap();
+        ask(store, &id, "hi");
         let after = store.info(&id).unwrap().updated_at_ms;
         assert!(after >= created, "updated_at must not go backwards");
         assert_eq!(store.list(1).unwrap()[0].updated_at_ms, after);
@@ -1310,12 +1317,7 @@ mod tests {
             }
         };
 
-        store
-            .record_message(&sid, &Message::user_text("u1"))
-            .unwrap();
-        store
-            .record_message(&sid, &Message::assistant_text("a1"))
-            .unwrap();
+        say(store, &sid, "u1", "a1");
         fold(store, &mut msgs, &mut cursor);
         assert_eq!(
             msgs,
@@ -1324,12 +1326,7 @@ mod tests {
         );
 
         // A second batch is picked up incrementally (only the new events are read).
-        store
-            .record_message(&sid, &Message::user_text("u2"))
-            .unwrap();
-        store
-            .record_message(&sid, &Message::assistant_text("a2"))
-            .unwrap();
+        say(store, &sid, "u2", "a2");
         fold(store, &mut msgs, &mut cursor);
         assert_eq!(
             msgs,
@@ -1343,15 +1340,16 @@ mod tests {
             Message::user_text("[summary]"),
             Message::assistant_text("a2"),
         ];
-        store.record_compaction(&sid, &snapshot).unwrap();
+        SessionLog::open(store, &sid)
+            .unwrap()
+            .rewrite(ValidHistory::new(snapshot.clone()).unwrap())
+            .unwrap();
         fold(store, &mut msgs, &mut cursor);
         assert_eq!(msgs, store.conversation(&sid).unwrap(), "after compaction");
         assert_eq!(msgs, snapshot);
 
         // A message after the compaction appends onto the snapshot, not the pre-compaction history.
-        store
-            .record_message(&sid, &Message::user_text("u3"))
-            .unwrap();
+        ask(store, &sid, "u3");
         fold(store, &mut msgs, &mut cursor);
         assert_eq!(
             msgs,
@@ -1363,28 +1361,32 @@ mod tests {
 
     fn compaction_replaces_the_live_view_but_keeps_history(store: &EventStore) {
         let id = store.create_session("m").unwrap();
+        let mut log = SessionLog::open(store, &id).unwrap();
         for i in 0..5 {
-            store
-                .record_message(&id, &Message::user_text(format!("m{i}")))
-                .unwrap();
+            if i % 2 == 0 {
+                log.open_turn(Message::user_text(format!("m{i}"))).unwrap();
+            } else {
+                log.close_turn(AssistantMessage::text(format!("m{i}")).unwrap())
+                    .unwrap();
+            }
         }
         assert_eq!(store.conversation(&id).unwrap().len(), 5);
 
-        store
-            .record_compaction(
-                &id,
-                &[Message::user_text("summary"), Message::user_text("recent")],
-            )
-            .unwrap();
+        log.rewrite(
+            ValidHistory::new(vec![
+                Message::user_text("summary"),
+                Message::assistant_text("recent"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
         let msgs = store.conversation(&id).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].text(), "summary");
         assert_eq!(msgs[1].text(), "recent");
 
         // appending after a compaction continues from the snapshot
-        store
-            .record_message(&id, &Message::user_text("more"))
-            .unwrap();
+        log.open_turn(Message::user_text("more")).unwrap();
         assert_eq!(store.conversation(&id).unwrap().len(), 3);
 
         // history is retained: the 5 superseded Message events are still on disk
@@ -1425,15 +1427,10 @@ mod tests {
 
     fn list_returns_newest_first_with_counts(store: &EventStore) {
         let a = store.create_session("m1").unwrap();
-        store.record_message(&a, &Message::user_text("hi")).unwrap();
-        store
-            .record_message(&a, &Message::user_text("there"))
-            .unwrap();
+        say(store, &a, "hi", "there");
         let b = store.create_session("m2").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        store
-            .record_message(&a, &Message::user_text("last"))
-            .unwrap();
+        ask(store, &a, "last");
 
         let list = store.list(10).unwrap();
         assert_eq!(list.len(), 2);
@@ -1461,9 +1458,7 @@ mod tests {
 
         // Session A (oldest): mentions "pandas", touched src/animals.rs.
         let a = store.create_session("m").unwrap();
-        store
-            .record_message(&a, &Message::user_text("let's talk about pandas today"))
-            .unwrap();
+        ask(store, &a, "let's talk about pandas today");
         store
             .record_observation(
                 &a,
@@ -1486,9 +1481,7 @@ mod tests {
 
         // Session B: mentions "flask", touched src/web/routes.py.
         let b = store.create_session("m").unwrap();
-        store
-            .record_message(&b, &Message::user_text("deploying the flask app"))
-            .unwrap();
+        ask(store, &b, "deploying the flask app");
         store
             .record_observation(
                 &b,
@@ -1507,9 +1500,7 @@ mod tests {
 
         // Session C (newest): no matching content or file — proves exclusion.
         let c = store.create_session("m").unwrap();
-        store
-            .record_message(&c, &Message::user_text("unrelated chit chat"))
-            .unwrap();
+        ask(store, &c, "unrelated chit chat");
 
         // --- query: case-insensitive, selects only the matching session ---
         let by_query = store
@@ -1576,9 +1567,7 @@ mod tests {
         let id = store.create_session("m").unwrap();
         // Exactly the C-22 seam: redact BEFORE the store ever sees the payload.
         let raw = format!("the deploy passphrase is: {secret}");
-        store
-            .record_message(&id, &Message::user_text(redactor.redact(&raw)))
-            .unwrap();
+        ask(store, &id, redactor.redact(&raw));
 
         // The secret's own plaintext must not confirm the session's existence.
         assert!(
@@ -1871,7 +1860,7 @@ mod tests {
 
     fn prune_empty_removes_zero_message_sessions(store: &EventStore) {
         let a = store.create_session("m").unwrap();
-        store.record_message(&a, &Message::user_text("hi")).unwrap();
+        ask(store, &a, "hi");
         let _b = store.create_session("m").unwrap();
         let _c = store.create_session("m").unwrap();
 
@@ -1888,9 +1877,7 @@ mod tests {
         let active = store.create_session("active-model").unwrap();
         let abandoned = store.create_session("old-model").unwrap();
         let populated = store.create_session("kept-model").unwrap();
-        store
-            .record_message(&populated, &Message::user_text("keep me"))
-            .unwrap();
+        ask(store, &populated, "keep me");
 
         assert_eq!(
             store
@@ -2083,9 +2070,8 @@ mod tests {
     fn projections_read_only_their_kinds_from_a_mixed_stream(store: &EventStore) {
         let id = store.create_session("m").unwrap();
         let turn = store.begin_turn(&id, "go", "m").unwrap();
-        store
-            .record_message(&id, &Message::user_text("u1"))
-            .unwrap();
+        let mut log = SessionLog::open(store, &id).unwrap();
+        log.open_turn(Message::user_text("u1")).unwrap();
         store
             .record_run_event(
                 &id,
@@ -2117,8 +2103,7 @@ mod tests {
                 },
             )
             .unwrap();
-        store
-            .record_message(&id, &Message::assistant_text("a1"))
+        log.close_turn(AssistantMessage::text("a1").unwrap())
             .unwrap();
 
         // conversation() sees only the two messages, in order — not the run/turn/usage/observation
@@ -2140,10 +2125,7 @@ mod tests {
 
     fn roles_round_trip_through_the_conversation(store: &EventStore) {
         let id = store.create_session("m").unwrap();
-        store.record_message(&id, &Message::user_text("q")).unwrap();
-        store
-            .record_message(&id, &Message::assistant_text("a"))
-            .unwrap();
+        say(store, &id, "q", "a");
         let roles: Vec<_> = store
             .conversation(&id)
             .unwrap()
@@ -2155,9 +2137,11 @@ mod tests {
 
     fn append_is_transactional_and_sequences_monotonically(store: &EventStore) {
         let id = store.create_session("m").unwrap();
+        // `append` is this test's subject, so it is driven directly rather than through the typed
+        // session log — what is under test is the stream's sequencing, not a conversation's shape.
         for i in 0..10 {
             store
-                .record_message(&id, &Message::user_text(format!("m{i}")))
+                .append(&id, NewEvent::message(Message::user_text(format!("m{i}"))))
                 .unwrap();
         }
         assert_eq!(store.conversation(&id).unwrap().len(), 10);
@@ -2203,9 +2187,7 @@ mod tests {
                 },
             )
             .unwrap();
-        store
-            .record_message(&id, &Message::user_text("hi"))
-            .unwrap();
+        ask(store, &id, "hi");
         store
             .end_turn(
                 &id,
@@ -2280,9 +2262,7 @@ mod tests {
             correlation_id: Some("corr-1".into()),
         };
         let id = store.create_session_with_context("m", &ctx).unwrap();
-        store
-            .record_message(&id, &Message::user_text("hi"))
-            .unwrap();
+        ask(store, &id, "hi");
 
         // Every event read back from the stream carries the run context (SessionStarted + msg).
         let events = store.load_stream(&id, None).unwrap();
@@ -2305,8 +2285,8 @@ mod tests {
         let b = store
             .create_session_with_context("m", &EventContext::for_account("b"))
             .unwrap();
-        store.record_message(&a, &Message::user_text("ax")).unwrap();
-        store.record_message(&b, &Message::user_text("bx")).unwrap();
+        ask(store, &a, "ax");
+        ask(store, &b, "bx");
 
         // list_for_account returns only that account's run.
         let a_list = store.list_for_account("a", 10).unwrap();
@@ -2323,9 +2303,7 @@ mod tests {
 
     fn single_tenant_session_has_empty_context(store: &EventStore) {
         let id = store.create_session("m").unwrap();
-        store
-            .record_message(&id, &Message::user_text("hi"))
-            .unwrap();
+        ask(store, &id, "hi");
 
         // The single-tenant path is unchanged: every surface carries an empty envelope.
         assert!(store.info(&id).unwrap().context.is_empty());
@@ -2455,9 +2433,8 @@ mod tests {
     fn custom_events_append_and_read_back_scoped_by_account(store: &EventStore) {
         let ctx = EventContext::for_account("acme");
         let id = store.create_session_with_context("m", &ctx).unwrap();
-        store
-            .record_message(&id, &Message::user_text("hi"))
-            .unwrap();
+        let mut log = SessionLog::open(store, &id).unwrap();
+        log.open_turn(Message::user_text("hi")).unwrap();
 
         let payload = serde_json::json!({"tool": "read_file", "path": "src/lib.rs", "bytes": 128});
         let stored = store
@@ -2474,8 +2451,7 @@ mod tests {
             "a Custom row carries the run's account scoping like any other event"
         );
 
-        store
-            .record_message(&id, &Message::assistant_text("done"))
+        log.close_turn(AssistantMessage::text("done").unwrap())
             .unwrap();
 
         // Read back through the account-scoped path (the downstream-consumer surface) and find the
@@ -2630,9 +2606,7 @@ mod tests {
     /// the same shape) already deletes the wake-up along with everything else in the stream.
     fn deleting_a_session_clears_its_pending_wakeups(store: &EventStore) {
         let id = store.create_session("m").unwrap();
-        store
-            .record_message(&id, &Message::user_text("hi"))
-            .unwrap();
+        ask(store, &id, "hi");
         store
             .schedule_wakeup(&id, 9_999_999_999_999, "far future", None)
             .unwrap();
@@ -2666,9 +2640,7 @@ mod tests {
 
         // Two old streams with DIFFERENT tags — prune_older_than is tag-agnostic (unlike prune_inactive).
         let old = store.create_session("m").unwrap();
-        store
-            .record_message(&old, &Message::user_text("old"))
-            .unwrap();
+        ask(store, &old, "old");
         let tagged_old = store
             .create_session_with_context(
                 "m",
@@ -2678,9 +2650,7 @@ mod tests {
                 },
             )
             .unwrap();
-        store
-            .record_message(&tagged_old, &Message::user_text("old2"))
-            .unwrap();
+        ask(store, &tagged_old, "old2");
 
         std::thread::sleep(std::time::Duration::from_millis(3));
         let cutoff = now_ms(); // everything above is now strictly older than this
@@ -2688,9 +2658,7 @@ mod tests {
 
         // A fresh stream created after the cutoff — must survive.
         let fresh = store.create_session("m").unwrap();
-        store
-            .record_message(&fresh, &Message::user_text("new"))
-            .unwrap();
+        ask(store, &fresh, "new");
 
         assert_eq!(
             store.prune_older_than(cutoff).unwrap(),
@@ -2735,9 +2703,7 @@ mod tests {
         // …and an aged REGISTERED session — registry rows are prune_older_than's territory, so
         // this primitive must leave it alone regardless of age.
         let aged_registered = store.create_session("m").unwrap();
-        store
-            .record_message(&aged_registered, &Message::user_text("old"))
-            .unwrap();
+        ask(store, &aged_registered, "old");
 
         std::thread::sleep(std::time::Duration::from_millis(15));
         let cutoff = now_ms(); // everything above is now strictly older than this
@@ -2746,9 +2712,7 @@ mod tests {
         // Inside the horizon: the second ad-hoc stream stays active, and a fresh session appears.
         store.append("audit-fresh", fact(4)).unwrap();
         let fresh_registered = store.create_session("m").unwrap();
-        store
-            .record_message(&fresh_registered, &Message::user_text("new"))
-            .unwrap();
+        ask(store, &fresh_registered, "new");
 
         assert_eq!(
             store.prune_adhoc_older_than(cutoff).unwrap(),
@@ -2795,8 +2759,8 @@ mod tests {
         let sid = src.create_session_with_context("model-a", &ctx).unwrap();
 
         let t1 = src.begin_turn(&sid, "hello", "model-a").unwrap();
-        src.record_message(&sid, &Message::user_text("hello"))
-            .unwrap();
+        let mut log = SessionLog::open(&src, &sid).unwrap();
+        log.open_turn(Message::user_text("hello")).unwrap();
         src.record_run_event(
             &sid,
             &RunEvent::OpRecorded {
@@ -2827,15 +2791,14 @@ mod tests {
             },
         )
         .unwrap();
-        src.record_message(&sid, &Message::assistant_text("hi"))
+        log.close_turn(AssistantMessage::text("hi").unwrap())
             .unwrap();
         src.end_turn(&sid, t1, "answered", 1, "hi", None).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(2));
 
         let t2 = src.begin_turn(&sid, "again", "model-a").unwrap();
-        src.record_message(&sid, &Message::user_text("again"))
-            .unwrap();
+        log.open_turn(Message::user_text("again")).unwrap();
         src.record_run_event(
             &sid,
             &RunEvent::OpRecorded {
@@ -2866,7 +2829,7 @@ mod tests {
             },
         )
         .unwrap();
-        src.record_message(&sid, &Message::assistant_text("again reply"))
+        log.close_turn(AssistantMessage::text("again reply").unwrap())
             .unwrap();
         src.end_turn(&sid, t2, "answered", 1, "again reply", None)
             .unwrap();
@@ -2942,8 +2905,7 @@ mod tests {
         // Give `dst` some unrelated prior history so its next-minted global_seqs are guaranteed to
         // differ from the source's — the remap must not accidentally "work" only because both
         // stores' sequences happen to line up.
-        dst.record_message(&new_id, &Message::user_text("unrelated"))
-            .unwrap();
+        ask(&dst, &new_id, "unrelated");
 
         let copied_id = src.copy_session_to(&sid, &dst).unwrap();
         let dst_events = dst.load_stream(&copied_id, None).unwrap();
@@ -3009,7 +2971,7 @@ mod tests {
         let src = EventStore::in_memory().unwrap();
         let sid = src.create_session("model-a").unwrap();
         let t1 = src.begin_turn(&sid, "hi", "model-a").unwrap();
-        src.record_message(&sid, &Message::user_text("hi")).unwrap();
+        ask(&src, &sid, "hi");
         src.end_turn(&sid, t1, "answered", 1, "hi back", None)
             .unwrap();
 
@@ -3183,7 +3145,10 @@ mod tests {
 
             // With busy_timeout set this append waits ~300ms for the lock and succeeds; without it the
             // write returns SQLITE_BUSY at once → Err.
-            let res = s2.record_message(&sid, &Message::user_text("under contention"));
+            let res = s2.append(
+                &sid,
+                NewEvent::message(Message::user_text("under contention")),
+            );
             releaser.join().unwrap();
 
             assert!(
@@ -3270,7 +3235,10 @@ mod tests {
                 messages: messages.clone(),
             };
             let res = tracing::subscriber::with_default(subscriber, || {
-                s2.record_message(&sid, &Message::user_text("under contention"))
+                s2.append(
+                    &sid,
+                    NewEvent::message(Message::user_text("under contention")),
+                )
             });
             releaser.join().unwrap();
 
@@ -3299,7 +3267,10 @@ mod tests {
             };
             tracing::subscriber::with_default(subscriber, || {
                 store
-                    .record_message(&sid, &Message::user_text("no contention here"))
+                    .append(
+                        &sid,
+                        NewEvent::message(Message::user_text("no contention here")),
+                    )
                     .unwrap();
             });
 
@@ -3344,7 +3315,10 @@ mod tests {
             let big_text = "x".repeat(4096);
             for i in 0..200 {
                 store
-                    .record_message(&sid, &Message::user_text(format!("{i}:{big_text}")))
+                    .append(
+                        &sid,
+                        NewEvent::message(Message::user_text(format!("{i}:{big_text}"))),
+                    )
                     .unwrap();
             }
             let grown = std::fs::metadata(&wal_path).unwrap().len();

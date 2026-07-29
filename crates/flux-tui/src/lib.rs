@@ -6520,13 +6520,13 @@ mod tests {
 
     #[test]
     fn resumed_session_projects_full_durable_activity() {
-        use flux_events::{EventStore, NewEvent, PlanAttempt};
+        use flux_events::{AssistantMessage, EventStore, NewEvent, PlanAttempt, SessionLog};
         use flux_flow::ast::{RunEvent, StepId};
 
         let events = EventStore::in_memory().unwrap();
         let sid = events.create_session("mock").unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::user_text("inspect it"))
+        let mut log = SessionLog::open(&events, &sid).unwrap();
+        log.open_turn(flux_core::Message::user_text("inspect it"))
             .unwrap();
         let turn = events.begin_turn(&sid, "inspect it", "mock").unwrap();
         events
@@ -6572,8 +6572,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::assistant_text("done"))
+        log.close_turn(AssistantMessage::text("done").unwrap())
             .unwrap();
 
         let mut state = ChatState::for_session("mock".into(), String::new());
@@ -6689,13 +6688,14 @@ mod tests {
     fn compaction_snapshot_does_not_duplicate_visible_messages() {
         let events = flux_events::EventStore::in_memory().unwrap();
         let sid = events.create_session("mock").unwrap();
-        let old = flux_core::Message::user_text("old request");
-        events.record_message(&sid, &old).unwrap();
-        events
-            .record_compaction(&sid, &[flux_core::Message::assistant_text("summary")])
+        let mut log = flux_events::SessionLog::open(&events, &sid).unwrap();
+        log.open_turn(flux_core::Message::user_text("old request"))
             .unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::assistant_text("new answer"))
+        log.rewrite(
+            flux_events::ValidHistory::new(vec![flux_core::Message::user_text("summary")]).unwrap(),
+        )
+        .unwrap();
+        log.close_turn(flux_events::AssistantMessage::text("new answer").unwrap())
             .unwrap();
         let mut state = ChatState::new("mock".into());
         state.project_session(&events, &sid).unwrap();
@@ -6746,10 +6746,14 @@ mod tests {
                 },
             )
             .unwrap();
+        // A log that opens on an assistant message: a legacy shape the typed seam cannot produce,
+        // and precisely what this projection must still render — so it is appended raw.
         events
-            .record_message(
+            .append(
                 &sid,
-                &flux_core::Message::assistant_text("Proposed plan:\nflow\n└─ read(\"README.md\")"),
+                flux_events::NewEvent::message(flux_core::Message::assistant_text(
+                    "Proposed plan:\nflow\n└─ read(\"README.md\")",
+                )),
             )
             .unwrap();
 
@@ -7633,14 +7637,18 @@ mod tests {
     fn durable_history_keeps_prompts_superseded_by_compaction() {
         let events = flux_events::EventStore::in_memory().unwrap();
         let sid = events.create_session("mock").unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::user_text("before compact"))
+        let mut log = flux_events::SessionLog::open(&events, &sid).unwrap();
+        log.open_turn(flux_core::Message::user_text("before compact"))
             .unwrap();
-        events
-            .record_compaction(&sid, &[flux_core::Message::assistant_text("summary")])
-            .unwrap();
-        events
-            .record_message(&sid, &flux_core::Message::user_text("after compact"))
+        log.rewrite(
+            flux_events::ValidHistory::new(vec![
+                flux_core::Message::user_text("summary"),
+                flux_core::Message::assistant_text("summarised"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        log.open_turn(flux_core::Message::user_text("after compact"))
             .unwrap();
         assert_eq!(load_history(&events), ["before compact", "after compact"]);
     }

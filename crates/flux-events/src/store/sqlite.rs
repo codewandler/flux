@@ -308,7 +308,7 @@ impl SqliteEvents {
         // C-25: coordinate cross-process writers on the shared `~/.flux/events.db`. WAL permits a
         // single writer at a time; without a busy handler a second process (a `flux app run --serve`
         // daemon + a CLI turn on the same file) gets `SQLITE_BUSY` immediately and the write is lost
-        // — `record_message` `?`-propagates and aborts the turn. A ~5s busy_timeout makes a contended
+        // — the conversation write `?`-propagates and aborts the turn. A ~5s busy_timeout makes a contended
         // writer WAIT for the lock instead of failing; the in-process `Mutex` still serializes one
         // process's own writers, so this only ever matters across processes.
         conn.busy_timeout(std::time::Duration::from_secs(5))

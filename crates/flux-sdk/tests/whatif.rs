@@ -648,6 +648,7 @@ async fn replan_with_an_identical_plan_is_fully_served_and_diffs_identical() {
     client.run("go").await.unwrap();
     let src = client.session_id().unwrap();
     let session = client.open_session(&src).unwrap();
+    let source_history = session.history().unwrap();
 
     let cf = session
         .what_if()
@@ -655,6 +656,17 @@ async fn replan_with_an_identical_plan_is_fully_served_and_diffs_identical() {
         .run()
         .await
         .unwrap();
+
+    // A-102: the re-plan path seeds the variant with the source's conversation through a single
+    // checked `rewrite`. It must land intact and in order — a rewrite that dropped or reordered
+    // messages would silently change what the re-planned turn is answering.
+    assert!(
+        cf.session()
+            .history()
+            .unwrap()
+            .starts_with(source_history.as_slice()),
+        "the counterfactual's history must open on the source's, unchanged"
+    );
 
     assert!(
         cf.hermetic(),

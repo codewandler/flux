@@ -173,6 +173,14 @@ Call sites to migrate (the complete set, from `grep record_message`):
 Note the fork/`whatif` sites currently replay message-by-message; `rewrite` is both the correct
 shape guarantee *and* one append instead of N.
 
+**Landed in A-102** (the deletion had to wait for the last caller — see that story). One caveat
+worth stating, because it bounds what the deletion buys: `EventStore::append` and
+`NewEvent::message` are public and together do exactly what `record_message` did. Removing the
+helper takes away the *short, conversation-shaped* name a writer reaches for — it does not make an
+unguarded conversation append unrepresentable. Closing that would mean restricting `NewEvent`'s
+conversation constructors to the crate, which the store's own event-log tests and the C-124/C-126
+contention tests still need. That is a separate story, not something A-102 could smuggle in.
+
 ### 3. The provider-wire seam is unchanged
 
 The typed log projects to `Vec<Message>` exactly as today (`projection::conversation`), and each
