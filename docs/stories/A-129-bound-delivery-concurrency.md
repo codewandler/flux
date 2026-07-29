@@ -2,7 +2,8 @@
 id: A-129
 title: Bound delivery concurrency — the mpsc capacity was the only backpressure
 pillar: Agent
-status: backlog
+status: ready
+priority: 32
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
 areas: [flux-app]

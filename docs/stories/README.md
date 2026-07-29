@@ -66,6 +66,13 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ### Evidence-pinned memory — cross-session memory with provenance
 - [C-231 — Ad-hoc stream pruning would silently delete cross-session memory](C-231-prune-must-not-evaporate-memory.md) · Core · memory:* streams are ad-hoc (no `streams` registry row), which is exactly what prune_adhoc_older_than targets; D-77's prune has NO caller today, so nothing is at risk yet — the whole value is landing the guard before the first retention job exists
 
+### Fleet coordinator — flux orchestrating flux across repos
+- [A-111 — Fleet coordinator — flux orchestrating flux across repos (epic)](A-111-fleet-coordinator-epic.md) · Agent · EPIC — the coordinator is a .flux Program on flux-app, not a new binary: a write-capable WorkBoard port (Jira/markdown/GitLab swappable), outbound A2A dispatch to remote workers, and per-delivery bus isolation as the blocker
+- [A-114 — MarkdownBoard — file-per-item with a derived index, IO via flux-system](A-114-markdown-board.md) · Agent · the track-style backend flux already dogfoods; write contention resolved structurally (file-per-item + atomic rename), never a lock
+- [A-117 — The coordinator.flux reference Program + offline end-to-end journey test](A-117-coordinator-program.md) · Agent · the epic's headline proof — intake → dispatch → sweep → done against MemoryBoard and a stub A2A worker, no credentials, no network
+- [A-129 — Bound delivery concurrency — the mpsc capacity was the only backpressure](A-129-bound-delivery-concurrency.md) · Agent · filed from A-112's implementor report — concurrency was the point of A-112, but it removed the one thing that bounded it
+- [A-130 — Board write-back of runner and task_id — make "the board is the run registry" true](A-130-board-run-state-writeback.md) · Agent · filed from A-116's implementor report — design §5 says the board IS the run registry, but no op can write the two fields that make it one
+
 ### Cross-harness session history as a datasource
 _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 2919 lines) locates,_
 - [C-212 — Cross-harness session history — search what was already said, in any local harness (epic)](C-212-harness-history-epic.md) · Core · flux usage already parses codex/claude-code/opencode state and discards the message text one field short; the new work is not acquisition but containment — this is the first datasource whose input is out-of-jail, secret-bearing and injection-shaped
@@ -120,13 +127,8 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 - [A-110 — flux memory list/show/forget — the inspect surface and the --stale review queue](A-110-flux-memory-cli.md) · Agent · `--stale` is the maintenance loop — the review queue for knowledge whose evidence moved; flux never silently forgets on the agent's behalf, pruning is a user verb
 
 ### Fleet coordinator — flux orchestrating flux across repos
-- [A-111 — Fleet coordinator — flux orchestrating flux across repos (epic)](A-111-fleet-coordinator-epic.md) · Agent · EPIC — the coordinator is a .flux Program on flux-app, not a new binary: a write-capable WorkBoard port (Jira/markdown/GitLab swappable), outbound A2A dispatch to remote workers, and per-delivery bus isolation as the blocker
-- [A-114 — MarkdownBoard — file-per-item with a derived index, IO via flux-system](A-114-markdown-board.md) · Agent · the track-style backend flux already dogfoods; write contention resolved structurally (file-per-item + atomic rename), never a lock
 - [A-115 — JiraBoard over the existing jira plugin, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · the status↔State mapping is config, not code — Jira workflows differ per project, and a hardcoded transition name makes the backend work at exactly one company
-- [A-117 — The coordinator.flux reference Program + offline end-to-end journey test](A-117-coordinator-program.md) · Agent · the epic's headline proof — intake → dispatch → sweep → done against MemoryBoard and a stub A2A worker, no credentials, no network
 - [A-118 — GitlabBoard — a second real tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · deferrable past the epic's first release — its value is the proof that WorkBoard is not 'Jira with a trait on top'
-- [A-129 — Bound delivery concurrency — the mpsc capacity was the only backpressure](A-129-bound-delivery-concurrency.md) · Agent · filed from A-112's implementor report — concurrency was the point of A-112, but it removed the one thing that bounded it
-- [A-130 — Board write-back of runner and task_id — make "the board is the run registry" true](A-130-board-run-state-writeback.md) · Agent · filed from A-116's implementor report — design §5 says the board IS the run registry, but no op can write the two fields that make it one
 
 ### Flow Package Registry
 - [D-194 — Flow package registry — flux flow install (epic)](D-194-flow-package-registry-epic.md) · Language · EPIC — flows/journeys are shareable artifacts with no distribution story; reuse the signed plugin-pack channel (D-46/D-47: signed index, sha256, versioned store) for .flux flow packages: flux flow install <name> fetches into ~/.flux/flows/, flow_list surfaces them, the analyzer runs at install time so a broken pack fails at install

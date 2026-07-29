@@ -2,7 +2,8 @@
 id: A-117
 title: The coordinator.flux reference Program + offline end-to-end journey test
 pillar: Agent
-status: backlog
+status: ready
+priority: 31
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
 areas: [flux-app, flux-channels]
