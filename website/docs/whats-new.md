@@ -14,6 +14,7 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Action needed
 
+
 - **Querying a SQLite database now accepts only read statements.** The check that was supposed to
   keep these queries read-only listed the statements to reject, and missed some — including one that
   could write a file anywhere on disk, outside every path guard. It now works the other way round:
@@ -26,6 +27,7 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   to and handle the result.
 
 ### Improved
+
 
 - **An unauthenticated server can no longer be exposed beyond your own machine.** flux already
   refused to start an unauthenticated server on a public address, but the refusal lived in one entry
@@ -44,8 +46,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   commands, setup guides for the Kubernetes and SQL integrations, a real plugin-authoring guide, and
   a corrected Flux-Lang syntax reference — it previously stated that text could not span multiple
   lines, which has not been true for some time.
+- **A running command shows what it is doing.** A shell command that takes a while used to display
+  nothing but a spinner, so a command working steadily looked identical to one that had hung. Its
+  output now appears beneath the command as it arrives, and is replaced by the usual summary once
+  the command finishes. Commands that print nothing look exactly as they did before, and the same
+  scrubbing that keeps secrets out of the final output also covers the live view. Work handed to a
+  sub-agent still shows no live output.
 
 ### Fixed
+
 
 - **A credential at the start of a diff line is no longer shown in full.** Where a line began with
   `+`, `-`, `*` or `#`, the marker ran into the credential that followed it and the redactor did not
@@ -60,20 +69,6 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 - **An interrupted turn no longer wedges its session.** A turn that died partway through left the
   conversation waiting forever for an answer that never came. The next turn now closes it and
   carries on. Nothing already recorded is altered.
-
-## [0.33.1] - 2026-07-29
-
-### Improved
-
-- **A running command shows what it is doing.** A shell command that takes a while used to display
-  nothing but a spinner, so a command working steadily looked identical to one that had hung. Its
-  output now appears beneath the command as it arrives, and is replaced by the usual summary once
-  the command finishes. Commands that print nothing look exactly as they did before, and the same
-  scrubbing that keeps secrets out of the final output also covers the live view. Work handed to a
-  sub-agent still shows no live output.
-
-### Fixed
-
 - **Asking for the latest download always gives you the newest version.** A released version could
   end up with no downloadable release attached to it, which left the "latest" download quietly
   serving an older build. The missing release has been restored, and a check now runs continuously

@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Documentation
 
+
 - **The public website tells the truth about the shipped surface, and is guarded against drifting
   again (C-196 epic; C-197…C-204).** A page-by-page audit of `website/docs` against the tree found
   four claims a reader would act on and be wrong: the syntax page stated *"strings are single-line"*
@@ -33,7 +34,7 @@ All notable changes to this project are documented in this file. The format is b
   `process` capability as an exact `argv[0]` allow-list (it is an argv-**prefix** matcher since
   C-90 — the property that lets `kubectl get` be granted without `kubectl delete`),
   `plugins/using-plugins.md` called the `sql` plugin PostgreSQL-only (MySQL/MariaDB shipped in
-  D-196…D-198), and `sdk/datasources.md` pinned a 0.25 SDK against a 0.33.1 workspace.
+  D-196…D-198), and `sdk/datasources.md` pinned a 0.25 SDK against a 0.33 workspace.
 - **The site now looks like the same product as the README (C-197).** `assets/README.md` fixes a
   brand — the execution-gate mark, signal green `#0bbf83`/`#2be6a5`, ink `#141a18` — that the README
   hero and its badges follow and the website ignored entirely: no favicon key at all, no navbar
@@ -51,6 +52,7 @@ All notable changes to this project are documented in this file. The format is b
   `sdk/flow-client.md`).
 
 ### Security
+
 
 - **The "tools never touch `std::fs`/`std::process` directly" invariant is now enforced mechanically
   (C-194).** `docs/architecture.md` stated that all real IO in model-facing tool crates goes through
@@ -128,6 +130,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+
 - **A leading diff/list marker no longer hides a credential from the redactor (C-185).**
   `flux_secret::redact_patterns` tokenizes on a fixed boundary set and only redacts a token that
   *starts with* a known credential prefix. `+`/`-`/`*`/`#` were not boundary characters, so on a
@@ -157,8 +160,24 @@ All notable changes to this project are documented in this file. The format is b
   writes and was not resurrected left the log owing an assistant answer forever; the next turn is
   now able to close it as `(turn interrupted)` and proceed. Append-only — the crashed turn's
   telemetry and run trace are untouched.
+- **A version tag can no longer sit silently without a downloadable GitHub Release (C-47/N-001).**
+  `scripts/verify-github-release.sh` runs inside the Release workflow and guards only the one tag
+  being cut, so a tag whose workflow died *before* that step never reached it — which is how
+  `/releases/latest` came to serve a stale binary without CI noticing. The new
+  `scripts/check-release-tags.sh` audits the whole tag/release fleet on every push to `main` (CI job
+  `release-tags`) and additionally pins the invariant nothing checked at all: `/releases/latest`
+  must be the newest released version. `v0.9.3`, whose builds all succeeded and whose release
+  creation alone 403'd, is backfilled with its canonical 16 assets. `v0.11.1`, `v0.12.0` and
+  `v0.17.0` never produced a complete asset set and are recorded as a reasoned allowlist — each was
+  superseded within hours by a patch that did publish.
+- **Backfilling a GitHub Release no longer hijacks `/releases/latest`.** GitHub ranks "latest" by
+  `published_at`, not by tag date or semver, so publishing an old tag's Release makes that old
+  version "latest" — reintroducing the exact bug the backfill repairs. The runbook in
+  `crates/flux-sdk/PUBLISHING.md` now passes `--latest=false` and the CI audit above fails if the
+  pointer ever drifts.
 
 ### Changed
+
 
 - **flux-flow writes the conversation only through the typed session log (A-101).** The engine's
   turn start and `finish_turn`, compaction, and the resurrect path all go through `SessionLog`
@@ -169,6 +188,7 @@ All notable changes to this project are documented in this file. The format is b
   lands with A-102.
 
 ### Added
+
 
 - **The persisted conversation has a typed write seam (A-100).** A turn's two writes — the user
   message that opens it, the assistant message that closes it — sit ~750 lines apart in the engine
@@ -185,11 +205,6 @@ All notable changes to this project are documented in this file. The format is b
   in one `BEGIN IMMEDIATE` transaction, so two handles racing `open_turn` leave exactly one user
   message. Additive: no call site moves yet, and `record_message`/`record_compaction` are still
   there. The migration onto the handle (and the removal of the unguarded pair) is A-101…A-102.
-
-## [0.33.1] - 2026-07-29
-
-### Added
-
 - **Running `bash` cards show what the command is doing (C-158).** A long op used to show an
   animated `◌ running` badge and nothing else, so a multi-second command was indistinguishable from
   a stuck one. A running card now carries a bounded tail of the command's own output, updating as it
@@ -210,24 +225,6 @@ All notable changes to this project are documented in this file. The format is b
   surfacing as a provider 400 seconds later. `ValidHistory::snap` absorbs compaction's ad-hoc
   boundary walk-back into the type. Additive only — no call site moves yet, and
   `record_message`/`record_compaction` are untouched; the migration is A-100…A-102.
-
-### Fixed
-
-- **A version tag can no longer sit silently without a downloadable GitHub Release (C-47/N-001).**
-  `scripts/verify-github-release.sh` runs inside the Release workflow and guards only the one tag
-  being cut, so a tag whose workflow died *before* that step never reached it — which is how
-  `/releases/latest` came to serve a stale binary without CI noticing. The new
-  `scripts/check-release-tags.sh` audits the whole tag/release fleet on every push to `main` (CI job
-  `release-tags`) and additionally pins the invariant nothing checked at all: `/releases/latest`
-  must be the newest released version. `v0.9.3`, whose builds all succeeded and whose release
-  creation alone 403'd, is backfilled with its canonical 16 assets. `v0.11.1`, `v0.12.0` and
-  `v0.17.0` never produced a complete asset set and are recorded as a reasoned allowlist — each was
-  superseded within hours by a patch that did publish.
-- **Backfilling a GitHub Release no longer hijacks `/releases/latest`.** GitHub ranks "latest" by
-  `published_at`, not by tag date or semver, so publishing an old tag's Release makes that old
-  version "latest" — reintroducing the exact bug the backfill repairs. The runbook in
-  `crates/flux-sdk/PUBLISHING.md` now passes `--latest=false` and the CI audit above fails if the
-  pointer ever drifts.
 
 ## [0.33.0] - 2026-07-29
 
