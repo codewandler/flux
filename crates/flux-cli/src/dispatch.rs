@@ -509,6 +509,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
+            Some(Commands::Policy { action }) => run_policy(action),
             Some(Commands::Skill {
                 type_,
                 install,

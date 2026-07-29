@@ -45,6 +45,7 @@ and [Safety & approvals](./safety.md).
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
+| `flux policy simulate <proposed.toml>` | replay a proposed authorization policy against recorded op history — a diff of what it would have newly blocked and newly allowed, before you adopt it; a pure read, `--sessions N` / `--json` |
 | `flux skill …` | render or install generated Flux skills; see [Skills & roles](./skills-and-roles.md) |
 | `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
 | `flux changelog [version]` | read the embedded customer changelog (`--all` / `--unreleased`) |
