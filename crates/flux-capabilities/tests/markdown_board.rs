@@ -1,4 +1,4 @@
-//! [`MarkdownBoard`] against the shared [`WorkBoard`] contract suite, plus the three properties a
+//! [`MarkdownBoard`] against the shared [`WorkBoard`] contract suite, plus the properties a
 //! file-backed board has to earn that an in-memory one gets for free (A-114).
 //!
 //! 1. **Two workers claiming the same item resolve to exactly one winner.** The loser is told it
@@ -7,11 +7,15 @@
 //!    file — its own item — and the derived index is refreshed only on read.
 //! 3. **A refused write never starts**, and a committed write replaces the file by rename rather
 //!    than truncating it in place.
+//! 4. **A dispatch record outlives the board that wrote it** (A-130). The shared suite drives the
+//!    write and the read-back through one `Arc<dyn WorkBoard>`, so it cannot tell durable bytes from
+//!    an in-memory cache; this backend is the first that can, by dropping the writer entirely and
+//!    reopening the directory. That is what makes the board a restart-survivable run registry.
 
 mod board_contract;
 
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -57,7 +61,7 @@ fn draft(title: &str) -> ItemDraft {
 }
 
 /// Every entry under `items/`, so a test can assert nothing but item files survives a write.
-fn item_dir_entries(root: &PathBuf) -> Vec<String> {
+fn item_dir_entries(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root.join("items"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -146,7 +150,13 @@ async fn concurrent_writes_to_different_items_never_contend_and_the_index_is_der
     let (board, ctx, root) = board_and_ctx("markdown-board-parallel");
     let mut ids = Vec::new();
     for n in 0..WORKERS {
-        ids.push(board.create(&ctx, draft(&format!("item {n}"))).await.unwrap().id);
+        ids.push(
+            board
+                .create(&ctx, draft(&format!("item {n}")))
+                .await
+                .unwrap()
+                .id,
+        );
     }
 
     let barrier = Arc::new(tokio::sync::Barrier::new(WORKERS));
@@ -188,7 +198,11 @@ async fn concurrent_writes_to_different_items_never_contend_and_the_index_is_der
         )
         .await
         .unwrap();
-    assert_eq!(page.rows.len(), WORKERS, "every item survived the parallel run");
+    assert_eq!(
+        page.rows.len(),
+        WORKERS,
+        "every item survived the parallel run"
+    );
     let index = std::fs::read_to_string(root.join("index.md")).unwrap();
     for id in &ids {
         assert!(index.contains(id.as_str()), "{id} missing from the index");
@@ -202,7 +216,13 @@ async fn a_stale_or_missing_index_is_never_authoritative() {
     let (board, ctx, root) = board_and_ctx("markdown-board-index");
     let mut ids = Vec::new();
     for n in 0..3 {
-        ids.push(board.create(&ctx, draft(&format!("item {n}"))).await.unwrap().id);
+        ids.push(
+            board
+                .create(&ctx, draft(&format!("item {n}")))
+                .await
+                .unwrap()
+                .id,
+        );
     }
     let all = |board: Arc<MarkdownBoard>, ctx: ToolContext| async move {
         let page = board
@@ -216,7 +236,10 @@ async fn a_stale_or_missing_index_is_never_authoritative() {
             )
             .await
             .unwrap();
-        page.rows.into_iter().map(|item| item.id).collect::<Vec<_>>()
+        page.rows
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>()
     };
     assert_eq!(all(board.clone(), coordinator_ctx()).await, ids);
 
@@ -301,7 +324,10 @@ async fn a_committed_write_replaces_the_item_file_instead_of_truncating_it() {
     use std::io::Read as _;
 
     let (board, ctx, root) = board_and_ctx("markdown-board-atomic");
-    let item = board.create(&ctx, draft("replaced in place")).await.unwrap();
+    let item = board
+        .create(&ctx, draft("replaced in place"))
+        .await
+        .unwrap();
     let path = root.join("items").join(format!("{}.md", item.id));
 
     let before = std::fs::read_to_string(&path).unwrap();
@@ -338,11 +364,8 @@ async fn the_board_root_is_configurable_and_independent_of_the_coordinator_cwd()
     let ctx = ToolContext::new(Arc::new(coordinator));
 
     // Constructed from the coordinator's own `System`, so the board inherits its access posture.
-    let board = MarkdownBoard::rooted_in(
-        &System::new(Workspace::new(&cwd).unwrap()),
-        &elsewhere,
-    )
-    .unwrap();
+    let board =
+        MarkdownBoard::rooted_in(&System::new(Workspace::new(&cwd).unwrap()), &elsewhere).unwrap();
     assert_eq!(board.root(), elsewhere.canonicalize().unwrap());
 
     let item = board.create(&ctx, draft("lives elsewhere")).await.unwrap();
@@ -404,5 +427,103 @@ async fn a_hand_written_item_file_is_read_and_a_broken_one_is_reported() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("A-115") && error.contains("malformed"), "{error}");
+    assert!(
+        error.contains("A-115") && error.contains("malformed"),
+        "{error}"
+    );
+}
+
+/// **The assertion nothing else in-tree can make.** A dispatch record is durable across board
+/// *instances*, not merely across a `get` on the board that wrote it.
+///
+/// The shared suite cannot express this: it takes one `Arc<dyn WorkBoard>` and drives both the write
+/// and the read-back through it, so a backend that cached the record in memory would satisfy
+/// `a_dispatch_is_recorded_and_survives_a_fresh_read` while a real restart recovered nothing.
+/// `MemoryBoard` cannot close the gap either — its storage *is* the instance. This backend is the
+/// first whose durability outlives the object, so this is the first place the design's headline
+/// claim ("the board is the run registry", hence restart → sweep → re-derive) is actually testable.
+///
+/// The writer instance is therefore **dropped** before the reader is opened: the only thing the two
+/// share is the directory.
+#[tokio::test]
+async fn a_recorded_dispatch_survives_dropping_the_board_that_wrote_it() {
+    let root = fixture_dir("markdown-board-dispatch");
+    let ctx = coordinator_ctx();
+
+    // --- The coordinator that dispatches, and then dies. ---
+    let (id, path, before, before_inode, mut open_across_the_write) = {
+        let board = MarkdownBoard::new(&root).unwrap();
+        let item = board
+            .create(&ctx, draft("handed to a worker"))
+            .await
+            .unwrap();
+        board.claim(&ctx, &item.id, "worker-1").await.unwrap();
+
+        let path = root.join("items").join(format!("{}.md", item.id));
+        let before = std::fs::read_to_string(&path).unwrap();
+        let before_inode = std::fs::metadata(&path).unwrap().ino();
+        // Opened *before* the record and read *after* it: a concurrent reader must never observe a
+        // torn file, which is what committing through the reserved-update primitive buys.
+        let open_across_the_write = std::fs::File::open(&path).unwrap();
+
+        board
+            .record_dispatch(&ctx, &item.id, "https://worker-1.internal:8787", "t_1")
+            .await
+            .unwrap();
+        (item.id, path, before, before_inode, open_across_the_write)
+    };
+    // Nothing of the writer survives but the bytes under `root`.
+
+    assert_ne!(
+        std::fs::metadata(&path).unwrap().ino(),
+        before_inode,
+        "the record must be committed by rename, like every other write on this backend"
+    );
+    let mut through_old_handle = String::new();
+    std::io::Read::read_to_string(&mut open_across_the_write, &mut through_old_handle).unwrap();
+    assert_eq!(
+        through_old_handle, before,
+        "a reader holding the file across the record saw a whole item, never a torn one"
+    );
+
+    // --- The restart: a second, independent board over the same directory. ---
+    let restarted = MarkdownBoard::new(&root).unwrap();
+    let recovered = restarted
+        .get(&coordinator_ctx(), &id)
+        .await
+        .unwrap()
+        .expect("the restarted board must still see the item");
+    assert_eq!(
+        recovered.runner.as_deref(),
+        Some("https://worker-1.internal:8787"),
+        "a restarted coordinator must recover the run, not only the item's state"
+    );
+    assert_eq!(
+        recovered.task_id.as_deref(),
+        Some("t_1"),
+        "the worker-minted handle is what the sweep needs; losing it orphans the run"
+    );
+    // Recording a dispatch is a field write, not an edge: nothing else moved.
+    assert_eq!(recovered.state, State::Claimed);
+    assert_eq!(recovered.assignee.as_deref(), Some("worker-1"));
+    assert_eq!(recovered.attempts, 0);
+
+    // Replacing, not appending: a retried item is dispatched again, and a stale task id would send
+    // the sweep after a run that no longer exists.
+    restarted
+        .record_dispatch(&ctx, &id, "https://worker-2.internal:8787", "t_2")
+        .await
+        .unwrap();
+    let stored = std::fs::read_to_string(&path).unwrap();
+    assert!(stored.contains("worker-2.internal:8787"), "{stored}");
+    assert!(stored.contains("t_2"), "{stored}");
+    assert!(
+        !stored.contains("worker-1.internal") && !stored.contains("t_1"),
+        "a stale dispatch record must not survive a re-dispatch: {stored}"
+    );
+    assert_eq!(
+        item_dir_entries(&root),
+        vec![format!("{id}.md")],
+        "the record left no staging debris behind"
+    );
 }
