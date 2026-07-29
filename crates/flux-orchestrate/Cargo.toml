@@ -22,6 +22,9 @@ flux-events.workspace = true
 flux-agent.workspace = true
 flux-flow.workspace = true
 flux-system.workspace = true
+# A-116: outbound A2A dispatch to REMOTE workers. `flux-a2a` is L1 and this crate is L3, so this
+# is a legal downward edge — no new crate and no `flux-codegate` `layer()` change.
+flux-a2a.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

@@ -196,6 +196,23 @@ impl A2aClient {
             .await
     }
 
+    /// `tasks/cancel` — ask the remote agent to abort a live task, returning it in its requested
+    /// `canceled` state. This is the client half of the server's A-55 cancel path: it fires the
+    /// token the run observes between plan rounds, so it aborts work that is genuinely still in
+    /// flight rather than merely detaching this client from it.
+    ///
+    /// A task that is already terminal, or whose run lives on another replica, answers the A2A
+    /// `TaskNotCancelable` error (`-32002`) as [`A2aError::Rpc`] — a benign outcome for a caller
+    /// that is cancelling opportunistically, not a transport failure.
+    ///
+    /// Only the **served** dispatch implements this. `flux_a2a::server::is_unsupported_a2a_method`
+    /// still classifies `tasks/cancel` as unsupported in the reduced *embeddable* dispatch, so a
+    /// remote agent must be served by `flux serve` / flux-server for this to resolve.
+    pub async fn cancel_task(&self, id: &str) -> Result<Task> {
+        self.rpc("tasks/cancel", TaskGetParams { id: id.to_string() })
+            .await
+    }
+
     /// Poll `tasks/get` until the task reaches a terminal state (or `max_polls` is hit).
     pub async fn await_task(&self, id: &str, interval: Duration, max_polls: usize) -> Result<Task> {
         let mut task = self.get_task(id).await?;
@@ -327,5 +344,115 @@ mod tests {
         let c = A2aClient::new("http://127.0.0.1:8787").unwrap();
         let adopted = c.adopt_endpoint(Url::parse("http://127.0.0.1:8787/a2a").unwrap());
         assert_eq!(adopted.as_str(), "http://127.0.0.1:8787/a2a");
+    }
+
+    /// A one-shot loopback JSON-RPC stub: accepts one connection, captures the full request
+    /// (headers + `Content-Length` body), and answers with `body` as a JSON-RPC `result`. Returns
+    /// its base URL and the join handle whose output is the captured raw request. tokio + std only
+    /// — offline, like every other transport fixture in the workspace.
+    async fn one_shot_rpc(body: serde_json::Value) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": body }).to_string();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // Read until the full request (headers + Content-Length body) is in `buf`.
+            loop {
+                let n = match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(hdr_end) = text.find("\r\n\r\n") {
+                    let content_len = text[..hdr_end]
+                        .lines()
+                        .find_map(|l| {
+                            let low = l.to_ascii_lowercase();
+                            low.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= hdr_end + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn cancel_task_posts_tasks_cancel_for_the_id() {
+        // A-116: the client half of the server's A-55 cancel path. Proves the method name and the
+        // `id` param on the wire — a `tasks/cancel` that silently posted the wrong method would
+        // leave a remote worker running after the caller believed it had stopped it.
+        let canceled = serde_json::json!({
+            "kind": "task",
+            "id": "t_1",
+            "status": { "state": "canceled" },
+        });
+        let (base, handle) = one_shot_rpc(canceled).await;
+        let client = A2aClient::new(&base).unwrap();
+
+        let task = client.cancel_task("t_1").await.unwrap();
+        assert_eq!(task.id, "t_1");
+        assert_eq!(task.status.state, crate::types::TaskState::Canceled);
+
+        let request = handle.await.unwrap();
+        assert!(
+            request.contains(r#""method":"tasks/cancel""#),
+            "expected a tasks/cancel JSON-RPC call, got: {request}"
+        );
+        assert!(
+            request.contains(r#""id":"t_1""#),
+            "expected the task id in params, got: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_task_surfaces_task_not_cancelable_as_an_rpc_error() {
+        // The server answers `-32002` for a task that is already terminal. That must arrive as a
+        // typed `Rpc` error the caller can treat as benign, not as a decode/transport failure.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32002, "message": "task is already in a terminal state" },
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let client = A2aClient::new(&format!("http://{addr}")).unwrap();
+        match client.cancel_task("t_done").await {
+            Err(A2aError::Rpc { code, .. }) => assert_eq!(code, -32002),
+            other => panic!("expected a -32002 Rpc error, got {other:?}"),
+        }
     }
 }
