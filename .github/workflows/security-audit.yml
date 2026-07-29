@@ -1,0 +1,88 @@
+name: security-audit
+
+# Standing supply-chain / vulnerability signal (C-188). CI already runs locked fetches, fmt,
+# warning-free clippy, full build/test and layering checks — but nothing that answers "does a crate
+# anywhere in the ~38-crate transitive tree carry a known advisory right now?". This workflow adds
+# that signal, and the license + source half of supply-chain hygiene, as a job that fails.
+#
+# Deliberately a SEPARATE workflow from ci.yml, not new jobs inside it: keeps the advisory gate
+# file-disjoint from unrelated CI edits, and lets it also run on a schedule (below) so a newly
+# disclosed advisory against an unchanged tree is caught without waiting for the next push.
+#
+# Two tools, on purpose (defense in depth):
+#   * cargo-deny  — config-driven (deny.toml): advisories + licenses + sources in one gate.
+#   * cargo-audit — the RustSec team's own scanner, as an independent second opinion. It is not
+#                   redundant: with `--deny warnings` it also fails on `unsound`/`notice` advisories,
+#                   and the two tools maintain separate advisory-db clones, so one catching what the
+#                   other's cache misses is a feature, not duplication.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, Monday 06:00 UTC: advisory databases move even when the tree does not. A vulnerability
+    # disclosed against a crate flux already ships would otherwise sit unseen until the next commit.
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny · advisories · licenses · sources (root + plugins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Prebuilt binary, not `cargo install` from source: seconds instead of minutes, and no extra
+      # toolchain build. install-action is SHA-pinned like every other third-party action (C-187);
+      # this workflow holds no secrets (no crates.io token, no MINISIGN_SECRET_KEY), so its blast
+      # radius is far smaller than release.yml's — but the pin costs nothing and keeps the guard green.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-deny
+
+      # Root workspace: advisories (RUSTSEC), licenses (permissive allow-list) and sources (every
+      # crate resolves to crates.io or the one declared first-party git source). Config + the full
+      # triage of every ignored advisory lives in deny.toml.
+      - name: cargo-deny (root workspace)
+        run: cargo deny check
+
+      # The nested `plugins/` workspace (D-08) is EXCLUDED from the root workspace — heavy vendor deps
+      # kept out of the main gate — so the run above never sees it. Scan it as a second graph, reusing
+      # the same deny.toml. The ignored advisories are root-tree crates absent here, so cargo-deny
+      # emits non-failing `advisory-not-detected` warnings for them; that is expected, not a failure.
+      - name: cargo-deny (plugins workspace)
+        run: cargo deny --manifest-path plugins/Cargo.toml --config deny.toml check
+
+  cargo-audit:
+    name: cargo-audit · RustSec advisories (root + plugins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-audit
+
+      # `--deny warnings` makes ANY advisory fail the job — including the informational
+      # unmaintained/unsound classes cargo-audit otherwise only warns on — so the only way to green is
+      # an explicit, justified ignore. The four `--ignore` ids below MIRROR deny.toml's
+      # [advisories].ignore; the reasoning for each (why it is not an exploitable vulnerability, and
+      # what would clear it) is documented there so there is a single source of truth. A NEW advisory,
+      # of any class, is not on this list and therefore turns the job red.
+      - name: cargo-audit (root lockfile)
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2026-0192 \
+            --ignore RUSTSEC-2026-0206 \
+            --ignore RUSTSEC-2026-0002
+
+      # Plugins lockfile: currently advisory-clean, so no ignores. If that changes, triage the finding
+      # (bump, or a justified ignore mirrored into deny.toml) rather than blanket-allowing it here.
+      - name: cargo-audit (plugins lockfile)
+        run: cargo audit --deny warnings --file plugins/Cargo.lock
