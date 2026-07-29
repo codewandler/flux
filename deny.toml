@@ -1,0 +1,120 @@
+# deny.toml — supply-chain and advisory policy for the flux workspace (C-188).
+#
+# Runs in CI (.github/workflows/security-audit.yml) on every push and PR. Three checks carry the
+# value of this file:
+#
+#   * advisories — a RUSTSEC advisory anywhere in the transitive tree of ~38 crates fails the build,
+#                  instead of shipping silently. This is the "unknown truth value" the story names:
+#                  an advisory either exists in the tree right now or does not, and nothing else in
+#                  CI can tell you which.
+#   * licenses   — every crate's license must be on the permissive allow-list below. A new dependency
+#                  under an unlisted (e.g. strong-copyleft) license fails here rather than at audit
+#                  time by a human.
+#   * sources    — the supply-chain half: every crate must come from crates.io (or an explicitly
+#                  declared source). An unknown registry or an un-allowlisted git source fails,
+#                  closing the "a dependency was silently repointed at attacker infrastructure" gap.
+#
+# The nested `plugins/` workspace (excluded from the root workspace: heavy vendor deps — k8s client,
+# cloud SDKs) is NOT covered by this invocation. CI runs cargo-deny a SECOND time against it with
+# `--manifest-path plugins/Cargo.toml` reusing this same config, so both trees are scanned. See the
+# workflow's `deny-plugins` step.
+#
+# `bans` is intentionally left at cargo-deny defaults (multiple-versions = warn, non-failing): this
+# story is scoped to advisory + license + source signal, not dependency-graph hygiene. Tightening
+# `bans` is a separate decision and should be argued on its own.
+
+[graph]
+# targets left empty on purpose: cargo-deny then walks the FULL graph across every target triple, so
+# a platform-specific dependency (a windows-only or wasm-only crate) is still advisory-scanned. A
+# non-empty list would prune other-target crates out of view — the opposite of what a security scan
+# wants.
+
+[advisories]
+# Lint levels are set explicitly rather than left to defaults, because two of the defaults are too
+# soft for a security gate:
+#   * unmaintained = "all"  — the 0.20 default; stated here so it is visibly a decision. Any crate,
+#                             transitive included, with an unmaintained advisory fails.
+#   * unsound      = "all"  — OVERRIDES the default "workspace", which only fails on unsound advisories
+#                             against direct workspace members and would silently pass a transitive one
+#                             (e.g. lru RUSTSEC-2026-0002 below — cargo-deny stays completely quiet on
+#                             it under the default). Vulnerabilities always error and cannot be softened.
+#   * yanked       = "deny" — OVERRIDES the default "warn": depending on a version that was yanked from
+#                             crates.io is a supply-chain smell and should fail, not merely warn.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+
+# Every ignore below is triaged, not a blanket allow: each carries the advisory ID, why it is not an
+# exploitable vulnerability in flux's usage, and what would clear it. All four are *informational*
+# (unmaintained / unsound), NOT vulnerabilities — a vulnerability advisory against any of these crates
+# carries a different RUSTSEC id and would still fail the build. An unexplained ignore is a silent
+# regression: do not add a bare RUSTSEC id here.
+ignore = [
+    # `paste` — proc-macro (token pasting) used at COMPILE time only; it contributes zero runtime
+    # code and therefore zero runtime attack surface. Unmaintained, no known flaw. What would change
+    # this: a vulnerability/unsound advisory against paste, or a real maintained drop-in replacement
+    # across the transitive users (currently pulled by several derive-heavy deps).
+    { id = "RUSTSEC-2024-0436", reason = "paste is a compile-time proc-macro with no runtime surface; unmaintained, not vulnerable" },
+    # `ttf-parser` — font-table parser, transitive through the resvg/usvg SVG->PNG rasterizer stack
+    # behind flux-tools' `png` feature. flux renders with bundled/system fonts, not attacker-supplied
+    # font files, so the parse surface is not reachable from untrusted input in normal usage. Its
+    # named successor is `skrifa`. What would change this: usvg/resvg migrating off ttf-parser, or a
+    # vulnerability advisory (memory-safety in the parser reachable from rendered input).
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; reached only via the SVG/PNG render path over trusted fonts, not vulnerable" },
+    # `rustybuzz` — text shaping, same resvg/usvg render stack, same reachability argument as
+    # ttf-parser. Unmaintained (successor: harfrust). What would change this: the render stack moving
+    # off rustybuzz, or a vulnerability advisory reachable from rendered input.
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained; reached only via the SVG/PNG render path, not vulnerable" },
+    # `lru` 0.12.5 — *unsound* (not vulnerable): `IterMut` can invalidate an internal pointer, a
+    # Stacked-Borrows soundness violation that is only reachable by code calling `LruCache::iter_mut`.
+    # It is a transitive dependency here, and the real fix is a version bump (`patched = >= 0.16.3`),
+    # which this story cannot make — Cargo.lock is out of its fence. Ignored with a standing follow-up
+    # to bump lru; the entry disappears the moment the lockfile moves to >= 0.16.3. What else would
+    # change it: the advisory being re-rated from unsound to a vulnerability.
+    { id = "RUSTSEC-2026-0002", reason = "lru IterMut unsound (not a vulnerability); fix is a lockfile bump to >=0.16.3 that this story cannot make" },
+]
+
+[licenses]
+# Permissive-only allow-list, derived from `cargo metadata` over the tree at 0.33.1. cargo-deny 0.20
+# denies any license not listed here, so a new dependency under an unlisted license (notably strong
+# copyleft: GPL / AGPL / LGPL-as-sole-license) fails CI and forces a conscious decision.
+#
+# Note the SPDX-expression semantics: for a conjunctive expression like "(Apache-2.0 OR MIT) AND
+# BSD-3-Clause", EVERY AND-term must be allowed, so BSD-3-Clause and Unicode-3.0 appear below even
+# though they only ever show up inside AND expressions.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is *weak*, file-scoped copyleft: it obliges publishing modifications to the MPL'd files
+    # themselves, not the whole binary, and imposes nothing on code that merely links the crate. flux
+    # links these deps unmodified, so the obligation is inert in our usage. Allowed deliberately; if a
+    # future MPL crate were forked and edited in-tree, that fork's changed files would need publishing.
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+# The supply-chain pin: crates must resolve to a known source. Unknown registries and un-allowlisted
+# git sources FAIL (the template default is a non-failing "warn" — deliberately overridden to "deny",
+# otherwise the sources check carries no teeth).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The only non-crates.io source in the tree: flux's OWN markdown crates (markdown-ratatui /
+# -stream / -terminal), first-party under the codewandler org and pinned in Cargo.lock to an
+# immutable commit rev, not a movable branch. This is a "declared source" in the story's sense —
+# allow-listing the exact repo (not the whole org) keeps the pin tight: a different codewandler repo
+# appearing as a git dependency would still fail this check.
+allow-git = ["https://github.com/codewandler/markdown"]
