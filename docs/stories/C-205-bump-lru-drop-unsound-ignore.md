@@ -2,7 +2,7 @@
 id: C-205
 title: "Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore"
 pillar: Core
-status: ready
+status: blocked
 priority: 5
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -38,6 +38,31 @@ exception.
 - 2026-07-29 — filed from C-188's adjacent finding during impl-coord integration. The other three
   C-188 ignores (paste / ttf-parser / rustybuzz, all unmaintained proc-macro or trusted-font render
   path) have no clean drop-in fix and are correctly left ignored; this one does.
+
+- 2026-07-29 — BLOCKED on the ratatui 0.29 hold; no lockfile change made. The Notes' "if a direct
+  dependency caps the major" case is what actually obtains, and the widening does not stop at one
+  dependency — it leaves this repo entirely.
+  - `lru` has exactly one path into the graph: `lru 0.12.5` ← `ratatui 0.29.0`, which requires
+    `lru = "^0.12.0"`. Nothing in the workspace depends on `lru` directly, so there is no manifest
+    of ours to bump. `cargo update -p lru` reports `Locking 0 packages`; `--precise 0.16.3` fails
+    with `failed to select a version for the requirement 'lru = "^0.12.0"' ... required by package
+    'ratatui v0.29.0'`.
+  - `ratatui` is deliberately held at `">=0.29, <0.30"` in the root `Cargo.toml`, and that hold is
+    load-bearing: the git-pinned `markdown-ratatui` 0.1.2 (codewandler/markdown @35c6db5, used by
+    flux-markdown) declares `ratatui = { version = "0.29" }`. Lifting ratatui here would resolve two
+    incompatible ratatui versions at the flux-markdown seam. The repo's own comment adds that
+    `crossterm` (0.28) and `ansi-to-tui` (7) must lift in the same move.
+  - So clearing this advisory is gated on an **external repository** adopting ratatui 0.30 — not on
+    anything editable from this story's fence, and not achievable as a lru-scoped lockfile bump.
+  - Confirmed the payoff is real once that unblocks: a scratch resolve of `ratatui 0.30.2` pulls
+    `lru 0.18.1` via `ratatui-core 0.1.2`, which is `>= 0.16.3` and clears RUSTSEC-2026-0002.
+  - `plugins/Cargo.lock` contains no `lru` at all and is already advisory-clean, so the plugins half
+    of acceptance item 3 needs no work.
+  - The two ignore sites were therefore left in place: removing them makes the gate red, not green
+    (`cargo audit` without the lru ignore ⇒ `error: 1 denied warning found!`). `cargo deny check` is
+    green as-is.
+  - Suggested re-scope: make this story depend on a ratatui 0.29→0.30 upgrade story (markdown-ratatui
+    pin move + crossterm + ansi-to-tui), and keep the RUSTSEC-2026-0002 ignore until then.
 
 ## Notes
 - Verify which crate pulls `lru` (`cargo tree -i lru`) before bumping — if a direct dependency caps
