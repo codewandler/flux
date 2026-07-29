@@ -15,6 +15,55 @@
 
 ## [Unreleased]
 
+### Action needed
+
+- **Querying a SQLite database now accepts only read statements.** The check that was supposed to
+  keep these queries read-only listed the statements to reject, and missed some — including one that
+  could write a file anywhere on disk, outside every path guard. It now works the other way round:
+  a query must begin with `SELECT`, `WITH`, `PRAGMA` or `EXPLAIN`, and anything else is refused.
+  Comments and whitespace in front of the statement no longer disguise it. If you have a flow that
+  relied on another statement type, it will now be refused rather than silently allowed.
+- **If you embed flux in your own Rust program, the HTTP server is built differently.** The two
+  functions that build the server now take the address you intend to serve on and can fail. This is
+  what makes the next item hold for every caller, not just the usual one — pass the address you bind
+  to and handle the result.
+
+### Improved
+
+- **An unauthenticated server can no longer be exposed beyond your own machine.** flux already
+  refused to start an unauthenticated server on a public address, but the refusal lived in one entry
+  point, so a program that assembled the server a different way inherited no protection. The refusal
+  now happens when the server is built, so there is no way to end up with one.
+- **The hosted agent bounds request size and request time.** A request body larger than the limit is
+  rejected outright, and a request that takes too long to produce a response is cut off rather than
+  holding the connection open. Streaming responses are deliberately exempt — a long-lived stream is
+  not a stuck request. Both bounds are generous by default and can be tuned per deployment.
+- **flux checks its own dependencies for published security advisories.** Every build, and once a
+  week regardless of changes, so an advisory disclosed against code that has not changed is still
+  caught. The third-party build steps flux relies on are now pinned to exact versions that cannot be
+  moved under it.
+- **The documentation site covers the parts that were missing.** New references for the HTTP API
+  (creating sessions, streaming a turn, webhooks, usage) and for the terminal UI's keys and
+  commands, setup guides for the Kubernetes and SQL integrations, a real plugin-authoring guide, and
+  a corrected Flux-Lang syntax reference — it previously stated that text could not span multiple
+  lines, which has not been true for some time.
+
+### Fixed
+
+- **A credential at the start of a diff line is no longer shown in full.** Where a line began with
+  `+`, `-`, `*` or `#`, the marker ran into the credential that followed it and the redactor did not
+  recognise it — so the key appeared unmasked anywhere a diff was displayed, including exported runs.
+- **A long conversation no longer breaks when it is condensed.** Once a session grew past the point
+  where flux summarizes earlier messages, it could store a conversation the model then refuses to
+  accept. Sessions that reached that size could fail to continue.
+- **Sessions started by an app, a flow, or by voice no longer begin invalidly.** These start without
+  anything typed by you, and the stored conversation began on the agent's reply — a shape providers
+  reject. Such a turn now opens with a short note of what triggered it, and its answer stays visible
+  to the next turn.
+- **An interrupted turn no longer wedges its session.** A turn that died partway through left the
+  conversation waiting forever for an answer that never came. The next turn now closes it and
+  carries on. Nothing already recorded is altered.
+
 ## [0.33.1] - 2026-07-29
 
 ### Improved
