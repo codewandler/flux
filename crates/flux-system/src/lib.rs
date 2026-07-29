@@ -3052,7 +3052,10 @@ mod tests {
             })
             .unwrap();
         assert!(committed);
-        assert_eq!(std::fs::read_to_string(dir.join("item.md")).unwrap(), "second");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("item.md")).unwrap(),
+            "second"
+        );
 
         // The reservation was consumed by the commit, so the next writer sails through.
         assert!(sys
@@ -3061,7 +3064,10 @@ mod tests {
                 Ok("third".into())
             })
             .unwrap());
-        assert_eq!(std::fs::read_to_string(dir.join("item.md")).unwrap(), "third");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("item.md")).unwrap(),
+            "third"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3107,7 +3113,10 @@ mod tests {
                 Ok("minted".into())
             })
             .unwrap());
-        assert_eq!(std::fs::read_to_string(dir.join("fresh.md")).unwrap(), "minted");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh.md")).unwrap(),
+            "minted"
+        );
         assert!(
             sys.update_file_reserved("../escape.md", |_| Ok("nope".into()))
                 .is_err(),

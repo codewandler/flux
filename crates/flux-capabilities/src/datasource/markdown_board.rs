@@ -24,6 +24,13 @@
 //!   byte-identical, and an interrupted write leaves either the old item or the new one — never a
 //!   truncated one.
 //!
+//! Being file-backed also makes this the first backend that can *prove* the durability
+//! [`WorkBoard::record_dispatch`] demands: a dispatch record leaves the process that wrote it, so a
+//! coordinator restarted against the same root re-reads the run it was executing rather than only
+//! the item's state. That is what lets the design call the board the run registry
+//! (`docs/designs/fleet-coordinator.md` §5), and it is why the record rides the same
+//! compare-and-set as every other write — a torn or lost record would orphan a live run.
+//!
 //! All IO goes through [`flux_system::System`], and the board owns its own — rerooted at the board
 //! directory, which may sit anywhere the host chooses and need not be the coordinator's cwd
 //! (`docs/designs/fleet-coordinator.md` §7). No [`WorkspaceContext`] change is implied: this is a
@@ -367,7 +374,12 @@ impl WorkBoard for MarkdownBoard {
             .into_iter()
             .filter(|item| wanted.is_none_or(|state| item.state == state))
             .collect();
-        let rows: Vec<Item> = matching.iter().skip(offset).take(page.limit).cloned().collect();
+        let rows: Vec<Item> = matching
+            .iter()
+            .skip(offset)
+            .take(page.limit)
+            .cloned()
+            .collect();
         let consumed = offset + rows.len();
         Ok(Page {
             next: (consumed < matching.len()).then(|| consumed.to_string()),
@@ -478,6 +490,25 @@ impl WorkBoard for MarkdownBoard {
         .await
     }
 
+    async fn record_dispatch(
+        &self,
+        _ctx: &ToolContext,
+        id: &str,
+        runner: &str,
+        task_id: &str,
+    ) -> Result<Item> {
+        self.edit_item(id, |item, _body| {
+            // Replace rather than append: a retried item is dispatched again, and a stale task id
+            // would send the sweep after a run that no longer exists.
+            item.runner = Some(runner.to_string());
+            item.task_id = Some(task_id.to_string());
+            // Nothing else moves. `transition` is the state machine's one entry point, so this
+            // write touches neither `state`, nor `attempts`, nor `assignee`.
+            Ok(())
+        })
+        .await
+    }
+
     async fn comment(&self, _ctx: &ToolContext, id: &str, text: &str) -> Result<()> {
         let note = format!("- {}\n", one_line(text));
         self.edit_item(id, |_item, body| {
@@ -549,7 +580,9 @@ mod tests {
     #[test]
     fn the_filename_is_the_identity_and_a_disagreeing_frontmatter_id_is_an_error() {
         let rendered = render_item(&item(), "").unwrap();
-        let error = parse_document("item-0009", &rendered).unwrap_err().to_string();
+        let error = parse_document("item-0009", &rendered)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("does not match the filename"), "{error}");
     }
 
