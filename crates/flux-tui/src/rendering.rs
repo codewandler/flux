@@ -566,6 +566,12 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         // C-115: a pending edit/write shows its hunk diff inside the sheet — the decision point
         // where eyes on the content matter most. Windowed to a handful of rows; absent entry or
         // non-diffable tool just means no preview.
+        //
+        // C-195: the preview is deliberately NOT redacted — a credential on an added line renders
+        // in full. That is the decision, not an oversight: hiding it would not stop the write, only
+        // stop the operator from catching it at the one moment they can still deny. Rationale and
+        // the conditions that would reopen it are on `toolview::format_diff` and in
+        // `docs/designs/security-assurance.md` ("The approval sheet does not redact").
         const PREVIEW_CAP: usize = 8;
         let diff = state
             .pending_approval_input(&view.request.tool)

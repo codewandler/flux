@@ -187,6 +187,19 @@ impl DiffLine {
 /// approval sheet can preview a pending call. Returns `None` for every other op (callers fall
 /// back to [`format_detail`]). Line numbers are relative to the diffed snippet: an `edit`'s
 /// `old_string` is a fragment, so its offset within the file is unknown here.
+///
+/// **C-195: this renders the input verbatim, and that is deliberate — do not add a `Redactor`
+/// here.** It was asked and settled; the argument is in `docs/designs/security-assurance.md`
+/// ("The approval sheet does not redact"). In short: redaction is a *boundary* control, applied
+/// where content crosses into persistence, a provider, or a machine consumer — the dispatch result
+/// (`flux_runtime`), the evidence flush, stream-json, the export, otel. This function feeds none of
+/// them. Its callers are the approval sheet's preview and the transcript tool card — live renders to
+/// the operator's own TTY of bytes the operator is being asked to authorize. Scrubbing a credential
+/// out of that preview would not stop the write, only hide it from the one person able to deny it —
+/// and since the redactor is a lossy heuristic, it would also make the sheet an unfaithful account
+/// of the pending effect. Reopen only if the TUI grows a persistence/sharing path (redact at the
+/// point of persistence, not here) or if the broader C-132/C-185 "redact conversation text at write
+/// time" question lands.
 pub fn format_diff(name: &str, input: &Value) -> Option<Vec<DiffLine>> {
     use similar::{ChangeTag, TextDiff};
     let s = |k: &str| input.get(k).and_then(Value::as_str);
@@ -444,6 +457,39 @@ mod tests {
         assert_eq!((adds[0].old_no, adds[0].new_no), (None, Some(1)));
         assert_eq!((adds[1].old_no, adds[1].new_no), (None, Some(2)));
         assert!(d.iter().all(|l| l.kind != DetailKind::Del));
+    }
+
+    /// C-195: the approval sheet's preview renders a credential on an added line **verbatim**, by
+    /// decision — see `format_diff`'s doc comment and `docs/designs/security-assurance.md`. This is
+    /// not a failing-first test (it pins behavior that already held); it exists so that adding a
+    /// `Redactor` to this path is a deliberate act that breaks a test pointing at the design doc,
+    /// rather than a silent "hardening" that blinds the operator at the approval gate.
+    #[test]
+    fn diff_does_not_redact_credentials_by_decision() {
+        // Deliberately the exact literal `flux_secret`'s own `redacts_credential_shapes` test
+        // asserts is scrubbed (`flux-secret/src/lib.rs:314-316`), and the marker-glued shape C-185
+        // taught `redact_patterns` to catch — so this test provably fails the moment a `Redactor`
+        // is threaded through here, rather than merely asserting today's output.
+        const CRED: &str = "sk-ant-abc123def456";
+        let text = |rows: &[DiffLine]| -> String {
+            rows.iter()
+                .flat_map(|r| r.spans.iter().map(|(_, s)| s.as_str()))
+                .collect()
+        };
+
+        let d = format_diff(
+            "write",
+            &json!({"path": ".env", "content": format!("KEY={CRED}\n")}),
+        )
+        .unwrap();
+        assert!(text(&d).contains(CRED), "write preview redacted: {:?}", d);
+
+        let d = format_diff(
+            "edit",
+            &json!({"path": ".env", "old_string": "KEY=\n", "new_string": format!("KEY={CRED}\n")}),
+        )
+        .unwrap();
+        assert!(text(&d).contains(CRED), "edit preview redacted: {:?}", d);
     }
 
     #[test]
