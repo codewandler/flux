@@ -43,6 +43,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   worker is running an item. A backend that quietly skipped this would look healthy until a restart
   recovered nothing, so it is required rather than optional.
 
+### Fixed
+
+- **Busy apps no longer start unlimited work at once.** The previous release made app event handling
+  concurrent but left it uncapped, so a burst of incoming events — a webhook storm, say — could start
+  a piece of work for every one of them. There is now a limit on how much runs at a time (64 by
+  default, or set `FLUX_MAX_INFLIGHT_DELIVERIES`). Work over the limit **waits rather than being
+  dropped**, so everything still runs; a slow background job still cannot starve incoming events; and
+  work that is queued behind the limit is now reported differently from work that is merely slow, so
+  "busy" and "stuck" no longer look the same.
+
 ## [0.35.0] - 2026-07-29
 
 ### New
