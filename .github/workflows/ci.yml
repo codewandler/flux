@@ -138,6 +138,22 @@ jobs:
           ./scripts/check-action-pins.sh --self-test
           ./scripts/check-action-pins.sh
 
+  no-direct-io:
+    name: model-facing tool crates do not reach IO behind flux-system
+    runs-on: ubuntu-latest
+    # C-194: architecture.md's "all IO goes through flux-system; tools never touch std::fs/std::process
+    # directly" was review-discipline only — which is how C-192's sqlite_query VACUUM INTO escape
+    # shipped. This makes it a gate: a direct std::fs/process/DB/socket open in a tool crate outside
+    # #[cfg(test)], without an explicit `// flux-allow-direct-io: <reason>`, fails here. Grep-only, so
+    # no Rust build is needed.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: No unannotated direct IO in flux-tools / flux-web / flux-capabilities
+        run: |
+          ./scripts/check-no-direct-io.sh --self-test
+          ./scripts/check-no-direct-io.sh
+
   host-kit-protocol-drift:
     name: published host-kit is not behind the live protocol version
     runs-on: ubuntu-latest

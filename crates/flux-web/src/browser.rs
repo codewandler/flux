@@ -537,6 +537,8 @@ impl BrowserSession {
             let _ = child.start_kill();
         }
         if let Some(dir) = self.0.profile_dir.lock().unwrap().take() {
+            // flux-allow-direct-io: ephemeral browser profile dir (host infra, not a model-directed
+            // path) — cleanup on session close.
             let _ = std::fs::remove_dir_all(dir);
         }
         Ok(())
@@ -735,6 +737,8 @@ fn ephemeral_profile_dir() -> Result<PathBuf> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("flux-browser-{}-{}", std::process::id(), n));
+    // flux-allow-direct-io: ephemeral browser profile dir under the system temp dir (host infra,
+    // not a model-directed path) — created for the guarded Chromium child spawned via flux-system.
     std::fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("browser profile dir: {e}")))?;
     Ok(dir)
 }
@@ -816,6 +820,8 @@ impl SessionRegistry {
                 let _ = child.start_kill();
             }
             if let Some(dir) = s.0.profile_dir.lock().unwrap().take() {
+                // flux-allow-direct-io: ephemeral browser profile dir (host infra, not a
+                // model-directed path) — cleanup on idle sweep.
                 let _ = std::fs::remove_dir_all(dir);
             }
         }

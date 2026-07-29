@@ -166,7 +166,10 @@ observations (tool calls, destructive markers, skill activations, compaction) ar
 surfaced as events.
 
 ### Invariants worth never breaking
-- All IO goes through `flux-system`; tools never touch `std::fs`/`std::process` directly.
+- All IO goes through `flux-system`; tools never touch `std::fs`/`std::process` directly. Enforced by
+  `scripts/check-no-direct-io.sh` (CI job `no-direct-io`, C-194): a direct `std::fs`/`std::process`/
+  `tokio::fs`/`tokio::process`/DB/socket open in `flux-tools`, `flux-web` or `flux-capabilities`
+  outside `#[cfg(test)]` fails CI unless the call carries a `// flux-allow-direct-io: <reason>` marker.
 - Every tool runs through `Executor::dispatch`; nothing calls a tool's `execute` directly in prod.
 - A tool's `permission_subjects` must be accurate — a write that reports no subjects is forced to
   approval rather than silently authorized workspace-wide.

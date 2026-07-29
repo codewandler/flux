@@ -32,6 +32,8 @@ pub struct SqliteBackend {
 impl SqliteBackend {
     /// Open (creating if needed) a persistent index at `path`, WAL enabled.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        // flux-allow-direct-io: SqliteBackend owns its index store; `path` is host-configured when
+        // the datasource is built, never a model-supplied argument the way sqlite_query's `db` is.
         let conn = Connection::open(path).map_err(map_sql)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sql)?;
@@ -40,6 +42,7 @@ impl SqliteBackend {
 
     /// An in-memory index (tests / ephemeral use).
     pub fn in_memory() -> Result<Self> {
+        // flux-allow-direct-io: in-memory index (tests / ephemeral use) — no filesystem path.
         Self::init(Connection::open_in_memory().map_err(map_sql)?)
     }
 
