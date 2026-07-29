@@ -10,16 +10,20 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.28.0 (2026-07-28) — a MINOR carrying the **Claude interop** epic (commands +
-  skills from `.flux`/`.claude` trees; D-186…D-192), **context-local git worktrees**
-  (C-97…C-100, C-120…C-121), the full **TUI polish** epic (C-102…C-116) with the boot
-  splash/spinners (C-101), **mid-turn steering** (A-94), argv-prefix plugin process grants (C-90),
-  and composite pruning (C-117). Breaking (embedders only): `ToolContext.system` → accessor,
-  `ApprovalChoice::DenyWithReason`, `ChatState.modal` → `approval`, `TuiRunOptions.theme`,
-  `DynamicComposites::validate_base` removed, flux-skill API removals. See
+- **Released:** v0.33.0 (2026-07-29) — a MINOR closing the **TUI polish round 2** epic
+  (C-149…C-157: gutter rail, three new palettes, one overlay language, effect-tiered approval
+  sheet, empty-state card, double-Ctrl-C quit) and the **event-store concurrent use** epic
+  (C-124…C-126: contention warnings, a real multi-process proof, WAL truncation), plus
+  **`flux export <run>`** (C-132) — a recorded run as one self-contained, redacted HTML file.
+  Breaking (embedders only): `ApprovalRequest` gains `mutating`. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Focus:** the **LLM cache review** epic — start at C-133 (measure before fixing), then the
-  live-display stories (C-139, C-140) and the claude-side fixes (C-134, C-135, A-95).
+- **Unreleased on `main`:** C-158 (live output on running `bash` cards), C-47 (the release-tag
+  fleet audit that closes N-001), A-99 (session-shape rules as types), and A-100 (the `SessionLog`
+  typed write seam). Next cut is a MINOR.
+- **Focus:** the **typed session log** epic — A-99 and A-100 are in; next is **A-101** (migrate
+  flux-flow's engine/compaction/resurrect onto the handle and delete the unguarded
+  `record_message`/`record_compaction`, **breaking**), then A-102 for the SDK/CLI rewriters. C-185
+  (the redactor's diff-marker gap) is the standing ready story outside any epic.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
@@ -36,7 +40,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-185 — A leading diff/list marker must not hide a credential from the redactor](C-185-redactor-line-marker-boundary.md) · Core · `redact_patterns`' is_boundary set omits `+`/`-`/`*`/`#`, and the shape matcher requires token.starts_with(prefix) — so `+sk-ant-…` on an added diff line tokenizes with the marker glued on and is NOT redacted; every surface that renders a diff inherits the gap (found while building C-132, worked around locally there)
 
 ### Typed session log — session-shape validity by construction
-- [A-100 — SessionLog typed handle — a turn-lifecycle state machine at the write seam](A-100-session-log-typed-handle.md) · Agent · open/open_turn/close_turn/rewrite over a Tail state derived from the store; makes user-after-user an illegal transition rather than a silent append
+- [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
 
 ## Blocked
 _None._
@@ -93,7 +97,6 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-106 — Irreversibility disclosure — surface 'cannot be undone' at approval and to policy](A-106-irreversibility-disclosure-at-approval.md) · Agent · the risk signal that IS available at approval time because declaration is static; rides the C-182 op list + C-154 risk tint rather than adding a new sheet
 
 ### Typed session log — session-shape validity by construction
-- [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
 - [A-102 — Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()](A-102-migrate-sdk-cli-history-rewriters.md) · Agent · fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N
 
 ## Done
@@ -192,6 +195,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-97 — Path-scoped guidance fragments — load project conventions only when they apply](A-97-path-scoped-guidance-fragments.md) · Agent · DONE — `.flux/context.d/*.md` with `globs:` frontmatter, scoped against the git working set and resolved ONCE at context assembly; the story's original per-turn premise was wrong (the system prompt is built once at startup, so per-turn scoping was both unimplementable and would have churned the cache prefix)
 - [A-98 — Agent-set wake-up — let a turn schedule its own resumption](A-98-agent-set-wakeup.md) · Agent · the schedule adapter (flux-channels/src/adapters/schedule.rs) is cron-driven and AUTHOR-declared — nothing lets the agent say 'check this again in 20 minutes'; the substrate exists (await/suspension + durable journeys + the event log), so this is a new op over shipped machinery, not new machinery
 - [A-99 — ValidHistory + AssistantMessage smart constructors — the session-shape rules as types](A-99-valid-history-smart-constructors.md) · Agent · the shape rules become constructors that reject invalid input, unit-tested standalone before any call site moves; absorbs compaction's ad-hoc has_tool_result snapping (engine.rs:1629) into the type
+- [A-100 — SessionLog typed handle — a turn-lifecycle state machine at the write seam](A-100-session-log-typed-handle.md) · Agent · open/open_turn/close_turn/rewrite over a Tail state derived from the store; makes user-after-user an illegal transition rather than a silent append
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`

@@ -45,6 +45,17 @@ pub enum ShapeError {
     OrphanedToolResult { index: usize, tool_use_id: String },
     /// A `tool_use` whose `tool_result` is not in the immediately following message.
     OrphanedToolUse { index: usize, tool_use_id: String },
+    /// `open_turn` was called while the log already owes an assistant answer (A-100). The
+    /// alternation-level [`ConsecutiveRole`](Self::ConsecutiveRole) seen as a *transition* rather
+    /// than as a property of a finished sequence — this is the one the write seam reports, because
+    /// it is raised **before** anything is appended.
+    TurnAlreadyOpen,
+    /// `close_turn` was called with no turn open — the log is empty, or its last message is
+    /// already an assistant answer (A-100). Appending here would produce `assistant` after
+    /// `assistant`, or a history that does not open on a `user` message.
+    NoTurnOpen,
+    /// `open_turn` was handed a message that is not a `user` message (A-100).
+    NotAUserMessage { role: Role },
 }
 
 impl fmt::Display for ShapeError {
@@ -70,6 +81,18 @@ impl fmt::Display for ShapeError {
                 f,
                 "tool_use {tool_use_id} at index {index} is never answered by a tool_result"
             ),
+            Self::TurnAlreadyOpen => write!(
+                f,
+                "a turn is already open — the log's last message is a user message still awaiting \
+                 its assistant answer"
+            ),
+            Self::NoTurnOpen => write!(
+                f,
+                "no turn is open — an assistant answer needs a preceding user message"
+            ),
+            Self::NotAUserMessage { role } => {
+                write!(f, "a turn opens on a user message, not on {role:?}")
+            }
         }
     }
 }

@@ -2,7 +2,8 @@
 id: A-101
 title: "Migrate flux-flow onto the typed log and delete the unguarded write API"
 pillar: Agent
-status: backlog
+status: ready
+priority: 1
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
 note: "BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one"

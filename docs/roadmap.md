@@ -82,9 +82,10 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
 > **v0.33.0** is released — that MINOR closed the TUI polish round-2 and event-store epics and added
 > `flux export`. Work sitting in `[Unreleased]` is the C-158 live-output channel, the C-47 release-tag
-> audit and A-99's shape types. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
+> history.
 
-### Typed session log — session-shape validity by construction (epic) — 🔄 **IN PROGRESS (A-93; A-99 done, A-100…A-102 filed)**
+### Typed session log — session-shape validity by construction (epic) — 🔄 **IN PROGRESS (A-93; A-99 + A-100 done, A-101…A-102 filed)**
 
 The "session shape is always a valid provider history" invariant has broken three times — cancel,
 compaction, the iteration cap — each time on a newly added turn-termination path, and each time it
@@ -94,10 +95,13 @@ through one `finish_turn`, and compaction snaps its own boundary with a local he
 `ShapeError` in `flux-events`, neither constructible except through a checking constructor nor
 mutable afterwards, with rejections naming the failed invariant and the offending index. The design
 also turned up the predicted fourth path already in the tree: `resurrect.rs` closes a turn outside
-`finish_turn` and is correct only because its ordering was copied by hand. **A-100** (next, and the
-board's top `ready` story) puts a turn-lifecycle state machine at the write seam; **A-101** migrates
-`flux-flow` onto it and deletes the unguarded write API; **A-102** migrates the SDK/CLI history
-rewriters. Design: [designs/typed-session-log.md](designs/typed-session-log.md).
+`finish_turn` and is correct only because its ordering was copied by hand. **A-100** (also in
+`[Unreleased]`) puts the turn lifecycle itself at the write seam: `SessionLog` carries the log's
+`Tail` and offers only transitions that preserve the invariant, re-derived from the store on every
+open and appended *conditional on that derivation* — so two writers racing to open a turn leave one
+user message, not two. **A-101** (next, and the board's top `ready` story) migrates `flux-flow`
+onto it and deletes the unguarded write API; **A-102** migrates the SDK/CLI history rewriters.
+Design: [designs/typed-session-log.md](designs/typed-session-log.md).
 
 ### Transactional turns — a compensating undo for the world, not just the session (epic) — 🔄 **DESIGNED (A-91; A-103…A-106 filed, none started)**
 

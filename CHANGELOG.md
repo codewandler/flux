@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The persisted conversation has a typed write seam (A-100).** A turn's two writes — the user
+  message that opens it, the assistant message that closes it — sit ~750 lines apart in the engine
+  with nothing pairing them, which is why every past session-shape break was a newly added
+  termination path that did the first write and returned without the second. `flux-events` gains
+  `SessionLog`: a per-stream handle carrying the log's `Tail` (`Empty` | `AwaitingAssistant` |
+  `Closed`) and exposing only transitions that preserve the invariant. Opening a turn that is
+  already open is `ShapeError::TurnAlreadyOpen` with **nothing appended**, where the raw
+  `record_message` pair silently produces `user`-after-`user`; `close_turn` takes an
+  `AssistantMessage`, so an empty answer cannot reach the log; `rewrite` takes a `ValidHistory` and
+  lands it as one `Compacted` event. The tail is re-derived from the store on every `open` (through
+  the kind-filtered conversation read, so a long session's plan/run/usage payloads are never
+  decoded) and every append is conditional on the tail it was decided against — check and insert
+  in one `BEGIN IMMEDIATE` transaction, so two handles racing `open_turn` leave exactly one user
+  message. Additive: no call site moves yet, and `record_message`/`record_compaction` are still
+  there. The migration onto the handle (and the removal of the unguarded pair) is A-101…A-102.
+
 ## [0.33.1] - 2026-07-29
 
 ### Added

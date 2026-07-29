@@ -89,23 +89,34 @@ stream. The handle carries the log's **tail state** (what the last appended mess
 only transitions that preserve the invariant:
 
 ```rust
-pub struct SessionLog<'a> { store: &'a EventStore, stream: String, tail: Tail }
+pub struct SessionLog<'a> { store: &'a EventStore, stream: String, tail: Tail, head: i64 }
 
-enum Tail { Empty, AwaitingAssistant, Closed }   // the state machine, in one type
+pub enum Tail { Empty, AwaitingAssistant, Closed }   // the state machine, in one type
 
 impl<'a> SessionLog<'a> {
-    pub fn open(store: &'a EventStore, stream: &str) -> Result<Self>;
+    pub fn open(store: &'a EventStore, stream: &str) -> Result<Self, LogError>;
 
     /// Legal only from `Empty` | `Closed`. Moves to `AwaitingAssistant`.
-    pub fn open_turn(&mut self, user: UserMessage) -> Result<()>;
+    pub fn open_turn(&mut self, user: Message) -> Result<(), LogError>;
 
     /// Legal only from `AwaitingAssistant`. Moves to `Closed`.
-    pub fn close_turn(&mut self, answer: AssistantMessage) -> Result<()>;
+    pub fn close_turn(&mut self, answer: AssistantMessage) -> Result<(), LogError>;
 
     /// Replaces the whole projected history. Legal from any state; the *input* is validated.
-    pub fn rewrite(&mut self, history: ValidHistory) -> Result<()>;
+    pub fn rewrite(&mut self, history: ValidHistory) -> Result<(), LogError>;
 }
 ```
+
+As built (A-100), with three deviations from the sketch above:
+
+- **`LogError`, not a bare `ShapeError`.** The seam does IO, so "this write would have broken the
+  shape — nothing was appended" and "the store failed" are separate arms;
+  `LogError::shape()` matches the actionable one, and `From<LogError> for flux_core::Error` keeps
+  `?` working where a call site only wants to propagate.
+- **`open_turn` takes a `Message`**, rejecting a non-`user` role with
+  `ShapeError::NotAUserMessage`. The `UserMessage` newtype was never built: A-99 shipped the two
+  types the handle actually needs, and a third earns its place only once a second caller wants it.
+- **The append is a compare-and-append**, not a plain append after a fresh derivation — see below.
 
 The three invalid shapes map onto this cleanly:
 
@@ -123,6 +134,21 @@ index already serves it) and maintained in memory afterwards. It is a cache of t
 not a second source of it — `open` re-derives it every time, so a crash or a concurrent writer
 cannot leave a stale handle claiming a turn is closed. Concurrency is unchanged: the underlying
 `append` keeps its existing `BEGIN IMMEDIATE` semantics (C-25/C-125).
+
+**Re-deriving is necessary but not sufficient** (learned while building A-100). Derive-then-append
+is a check-then-act: two handles can both derive `Empty`, both find `open_turn` legal, and both
+append — `user`-after-`user` again, now with a type system that looked like it had ruled it out.
+So the handle keeps the `stream_seq` its tail was derived from and every transition appends
+*conditional on it*, through a new backend primitive `append_if_conversation_head`: the guard read
+and the insert run inside the same `BEGIN IMMEDIATE` transaction (Postgres: inside the same
+per-stream advisory-locked transaction), and a guard miss appends nothing. The handle then
+re-derives and decides again — a miss almost always turns into the honest answer
+(`TurnAlreadyOpen`), because the writer that beat us is the one that opened the turn. This is what
+the "two handles racing `open_turn` leave exactly one user message" test pins; neutering the guard
+makes it fail with two user messages, so the guard is load-bearing rather than defensive.
+
+`EventStore::append_if_conversation_head` is crate-private on purpose. Public, it would be a second
+raw way to write the conversation — exactly the bypass this design exists to close.
 
 ### 2. The unguarded API goes away — no parallel path
 

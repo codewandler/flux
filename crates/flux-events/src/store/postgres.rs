@@ -124,6 +124,23 @@ impl PgEvents {
     /// Mirrors `sqlite.rs`'s `append_with_ts` (same idempotent-id / registry-touch semantics,
     /// Postgres's advisory-lock serialization instead of the in-process `Mutex`).
     fn append_with_ts(&self, stream: &str, ev: NewEvent, ts: i64) -> Result<StoredEvent> {
+        self.append_guarded(stream, ev, ts, None)?.ok_or_else(|| {
+            Error::Other("event store: an unguarded append reported a guard miss".into())
+        })
+    }
+
+    /// [`append_with_ts`](Self::append_with_ts) with A-100's optional conversation-head guard: when
+    /// `expected_head` is `Some`, the newest message-affecting `stream_seq` is read **inside** the
+    /// write transaction — after the per-stream advisory lock, so no other appender to this stream
+    /// can be between the read and the insert — and the insert is skipped (`Ok(None)`, nothing
+    /// appended) unless it still matches. Mirrors `sqlite.rs`'s `append_guarded`.
+    fn append_guarded(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        ts: i64,
+        expected_head: Option<i64>,
+    ) -> Result<Option<StoredEvent>> {
         let pool = self.handle.pool().clone();
         let stream = stream.to_string();
         self.handle.block_on(async move {
@@ -131,7 +148,7 @@ impl PgEvents {
             // prior event. `UNIQUE(id)` is the durable backstop if two appenders race this window.
             if let Some(id) = &ev.id {
                 if let Some(existing) = load_by_id(&pool, id).await? {
-                    return Ok(existing);
+                    return Ok(Some(existing));
                 }
             }
             // The run context is immutable session metadata; read it once (a committed, separate
@@ -145,6 +162,20 @@ impl PgEvents {
                 .execute(&mut *tx)
                 .await
                 .map_err(map_sql)?;
+            if let Some(expected) = expected_head {
+                let head: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(stream_seq), -1) FROM events \
+                     WHERE stream = $1 AND kind IN ('message', 'compacted')",
+                )
+                .bind(stream.clone())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_sql)?;
+                if head != expected {
+                    tx.rollback().await.map_err(map_sql)?; // nothing was written
+                    return Ok(None);
+                }
+            }
             let next_seq: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(MAX(stream_seq), -1) + 1 FROM events WHERE stream = $1",
             )
@@ -165,7 +196,7 @@ impl PgEvents {
                     if let Some(id) = &ev.id {
                         let _ = tx.rollback().await; // clear the aborted transaction first
                         if let Some(existing) = load_by_id(&pool, id).await? {
-                            return Ok(existing);
+                            return Ok(Some(existing));
                         }
                     }
                     return Err(e);
@@ -213,7 +244,7 @@ impl PgEvents {
                 }
             }
             tx.commit().await.map_err(map_sql)?;
-            Ok(stored)
+            Ok(Some(stored))
         })
     }
 }
@@ -755,6 +786,15 @@ impl EventBackend for PgEvents {
 
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
         self.append_with_ts(stream, ev, now_ms())
+    }
+
+    fn append_if_conversation_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.append_guarded(stream, ev, now_ms(), Some(expected_seq))
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

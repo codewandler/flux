@@ -54,7 +54,14 @@ the pre-release live-provider gate stops being the only net that catches it.
   walk-back never moves, and `[user_summary] + [user, assistant]` goes to the store. Reachable
   whenever `total > compact_threshold_chars` and `len >= 4`. `ValidHistory::snap` computes the right
   split; the fix lands with A-101, which now carries a failing-first test for it.
-- Next: A-100 (`ready`, priority 1).
+- 2026-07-29 — **A-100 DONE**: `crates/flux-events/src/session_log.rs` ships `SessionLog`, `Tail`,
+  `LogError`; crate suite 98 → 112 green, full gate clean, no call sites moved yet. The build turned
+  up one thing the design had not: re-deriving the tail on `open` is not enough, because
+  derive-then-append is a check-then-act — the transitions now compare-and-append against the
+  `stream_seq` the tail came from, inside the write transaction (new backend primitive
+  `append_if_conversation_head`, SQLite + Postgres). Design doc updated.
+- Next: A-101 (`ready`, priority 1) — the flux-flow migration, which also carries the
+  compaction `user`-after-`user` fix below.
 
 ## Notes
 - Downgraded from "design smell" to "hardening opportunity" during the code review: both current

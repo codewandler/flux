@@ -386,13 +386,44 @@ impl SqliteEvents {
     /// used by `copy_session_to` (D-174/D-185) inserts directly on its own transaction instead, so
     /// it can span the session mint and every copied event as one unit).
     fn append_with_ts(&self, stream: &str, ev: NewEvent, ts: i64) -> Result<StoredEvent> {
+        self.append_guarded(stream, ev, ts, None)?.ok_or_else(|| {
+            Error::Other("event store: an unguarded append reported a guard miss".into())
+        })
+    }
+
+    /// [`append_with_ts`](Self::append_with_ts) with A-100's optional conversation-head guard: when
+    /// `expected_head` is `Some`, the newest message-affecting `stream_seq` is read **inside** the
+    /// write transaction and the insert is skipped (`Ok(None)`, nothing appended) unless it still
+    /// matches. Because `begin_write` is `BEGIN IMMEDIATE`, the guard read and the insert are one
+    /// atomic unit against every other writer — in this process and across processes on the shared
+    /// `events.db` — so a compare-and-append cannot be undercut by a racing writer.
+    fn append_guarded(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        ts: i64,
+        expected_head: Option<i64>,
+    ) -> Result<Option<StoredEvent>> {
         let conn = self.conn.lock().unwrap();
         if let Some(id) = &ev.id {
             if let Some(existing) = load_by_id(&conn, id)? {
-                return Ok(existing);
+                return Ok(Some(existing));
             }
         }
         let tx = begin_write(&conn, self.contention_warn_threshold)?;
+        if let Some(expected) = expected_head {
+            let head: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(stream_seq), -1) FROM events \
+                     WHERE stream = ?1 AND kind IN ('message', 'compacted')",
+                )
+                .map_err(map_sql)?
+                .query_row([stream], |r| r.get(0))
+                .map_err(map_sql)?;
+            if head != expected {
+                return Ok(None); // dropping `tx` rolls back — nothing was written
+            }
+        }
         // All events in a stream share its run context; read it once and stamp the stored event.
         let ctx = read_context(&tx, stream)?;
         let next_seq: i64 = tx
@@ -415,7 +446,7 @@ impl SqliteEvents {
                 if let Some(id) = &ev.id {
                     drop(tx); // release the aborted write transaction before the follow-up read
                     if let Some(existing) = load_by_id(&conn, id)? {
-                        return Ok(existing);
+                        return Ok(Some(existing));
                     }
                 }
                 return Err(e);
@@ -456,7 +487,7 @@ impl SqliteEvents {
             }
         }
         tx.commit().map_err(map_sql)?;
-        Ok(stored)
+        Ok(Some(stored))
     }
 }
 
@@ -824,6 +855,15 @@ impl EventBackend for SqliteEvents {
 
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
         self.append_with_ts(stream, ev, now_ms())
+    }
+
+    fn append_if_conversation_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.append_guarded(stream, ev, now_ms(), Some(expected_seq))
     }
 
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>> {

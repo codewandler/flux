@@ -26,6 +26,7 @@ mod kind;
 #[cfg(feature = "otel")]
 pub mod otel;
 mod projection;
+mod session_log;
 mod shape;
 mod store;
 
@@ -36,5 +37,6 @@ pub use projection::{
     run_diff, run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow, EfficiencySummary,
     ModelCost, PendingWakeup, PlanAttempt, RunDiff, StmtRow, TurnSummary,
 };
+pub use session_log::{LogError, SessionLog, Tail};
 pub use shape::{AssistantMessage, ShapeError, ValidHistory};
 pub use store::{EventStore, SessionFilter, SessionInfo, SessionSummary};

@@ -67,6 +67,8 @@ type RawEvent = (i64, i64, String, u32, i64, String, Option<i64>);
 /// only to stderr, not through the `Result`.
 fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Vec<StoredEvent>> {
     let mut out = Vec::with_capacity(raw.len());
+    #[cfg(test)]
+    let mut decoded_tags: Vec<&'static str> = Vec::new();
     for (global_seq, stream_seq, id, schema_version, ts, payload, turn_id) in raw {
         let kind: EventKind = match serde_json::from_str(&payload) {
             Ok(kind) => kind,
@@ -78,6 +80,8 @@ fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Ve
                 continue;
             }
         };
+        #[cfg(test)]
+        decoded_tags.push(kind.kind_tag());
         out.push(StoredEvent {
             global_seq,
             stream: stream.to_string(),
@@ -90,7 +94,30 @@ fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Ve
             context: ctx.clone(),
         });
     }
+    #[cfg(test)]
+    DECODED_KINDS.with(|seen| seen.borrow_mut().extend(decoded_tags));
     Ok(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only instrument: the `kind_tag()` of every event row decoded **on this thread**.
+    ///
+    /// A read that claims to be kind-filtered (`conversation`, `observations`, and A-100's
+    /// `SessionLog::open`) has no other honest witness — the filter lives in SQL, so the only way
+    /// to prove a large stream's bulky plan/run/usage payloads were never fetched *or decoded* is
+    /// to observe what actually reached the decoder. Thread-local, so tests running in parallel
+    /// never see each other's decodes.
+    pub(crate) static DECODED_KINDS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f`, returning its value alongside the event kinds the store decoded while it ran.
+#[cfg(test)]
+pub(crate) fn decoded_kinds_during<T>(f: impl FnOnce() -> T) -> (T, Vec<&'static str>) {
+    DECODED_KINDS.with(|seen| seen.borrow_mut().clear());
+    let out = f();
+    (out, DECODED_KINDS.with(|seen| seen.borrow().clone()))
 }
 
 /// Metadata about a session, projected from its events. (The session registry view —
@@ -258,6 +285,18 @@ trait EventBackend: Send + Sync {
         keep: &[String],
     ) -> Result<usize>;
     fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent>;
+    /// A-100: append `ev` **only if** the stream's newest message-affecting event
+    /// (`kind IN ('message','compacted')`) is still exactly `expected_seq` (`-1` when the stream
+    /// has none) — the compare-and-append behind [`SessionLog`](crate::SessionLog)'s turn
+    /// transitions. The guard is read inside the same write transaction as the insert, so a
+    /// concurrent writer cannot slip a message in between a handle deriving its tail and writing
+    /// against it. `Ok(None)` means the guard missed and **nothing** was appended.
+    fn append_if_conversation_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>>;
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>>;
     fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>>;
     fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>>;
@@ -672,6 +711,23 @@ impl EventStore {
     /// returning the prior event (idempotent retry).
     pub fn append(&self, stream: &str, ev: NewEvent) -> Result<StoredEvent> {
         self.backend().append(stream, ev)
+    }
+
+    /// Append `ev` only if the stream's newest message-affecting event is still `expected_seq`
+    /// (`-1` = none). `Ok(None)` means a concurrent writer moved the conversation on and
+    /// **nothing** was appended — see [`EventBackend::append_if_conversation_head`].
+    ///
+    /// Deliberately crate-private: the only intended caller is [`SessionLog`](crate::SessionLog),
+    /// which pairs it with a freshly-derived tail. A raw compare-and-append exposed publicly would
+    /// be a second, unguarded way to write the conversation — exactly what A-100 exists to close.
+    pub(crate) fn append_if_conversation_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.backend()
+            .append_if_conversation_head(stream, ev, expected_seq)
     }
 
     /// Append several events to a stream atomically (all-or-nothing, consecutive seqs).
