@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **`flux-system`'s test fixtures no longer race the sandbox tests for `TMPDIR` (C-209).**
+  `cargo test --workspace` reddened intermittently — a *different* test each run, roughly 1 in 6 to
+  1 in 20 — which is the worst shape a flake can take: it never looked systemic, and it cost two
+  implementors an afternoon each proving the failure was not their diff. `temp_workspace()` read
+  `std::env::temp_dir()` under the sandbox env lock and documented why (sandbox tests deliberately
+  mutate `TMPDIR`), but ~15 other call sites read it bare, so a victim rooted its fixture under a
+  transient value that was then restored and deleted underneath it. Reproduced on the untouched tree
+  and pinned to the exact mutator: `wrap_argv_rejects_root_from_automatic_tmpdir_too` sets
+  `TMPDIR=/`, and the victim's `create_dir_all` was refused with `PermissionDenied`.
+  Every fixture root now goes through one helper (`sandbox::fixture_path`/`fixture_dir`). The design
+  turn is a `HOLDS_ENV_LOCK` thread-local set by `EnvGuard` plus `env_lock_if_free()`: because the
+  helper can tell whether the calling thread already holds the non-reentrant mutex, **one signature
+  covers every call site** — no locked/unlocked pair, no per-site analysis, and the pre-existing
+  deadlock footgun is gone. A guard test fails if a bare `std::env::temp_dir()` reappears in a test
+  module, and assembles its own needle at runtime so it cannot match its own source.
+  A **second leg of the same race** was found and fixed that the story had not identified:
+  `SpawnPolicy::for_workspace` reads `TMPDIR`/`CARGO_HOME`/`RUSTUP_HOME`/`HOME`, and 12 sandbox tests
+  called it unlocked — `TMPDIR=/` observed through production code rather than through a fixture
+  root, which still failed 1 run in 40 after the first leg was fixed. Verified at 20 consecutive
+  green runs on the integration branch, on top of 80 in the implementor's tree. All changes are
+  `#[cfg(test)]`; no production code moved.
+
 ### Added
 
 - **Metadata coherence is gated over the full production catalog, not just the built-ins (C-208).**

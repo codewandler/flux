@@ -2,7 +2,7 @@
 id: C-209
 title: "flux-system tests build fixtures under a transient TMPDIR, reddening the gate at random"
 pillar: Core
-status: in-progress
+status: done
 priority: 3
 epic:
 design:
