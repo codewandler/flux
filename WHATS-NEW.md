@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-07-29
+
 ### New
 
 - **See what a permission change would have done, before you adopt it.** `flux policy simulate
