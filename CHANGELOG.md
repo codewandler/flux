@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The TUI has somewhere to put a pane (C-221).** Second story of the **agent-authored surface**
+  epic, and still not reachable by the model — rendering lands before reachability on purpose, so
+  C-223 wires the `pane.*` ops onto a surface that already draws. Today a host (or a test) can push
+  a pane into one of four slots: `left`/`right` carve columns off the transcript row, `bottom` takes
+  one extra vertical constraint, and `overlay` reuses the shared overlay chrome C-152 consolidated
+  rather than growing a second one. Header, footer and composer keep their full width in every slot.
+  **Every bound is a surface constant, never the payload's choice** — pane count, body rows, column
+  width, the bottom strip's height and tree depth are all decided by `flux-tui` from the terminal's
+  geometry, and content that exceeds one is truncated by the surface behind an explicit elision
+  marker. A pane can never push the transcript below its width floor, and below a minimum width no
+  pane is drawn at all: the narrow-terminal posture `EMPTY_CARD_MIN_WIDTH` established, where the
+  aside is dropped rather than the conversation squeezed.
+  Panes are deliberately outside the transcript machinery — no layout-cache entry, no `focused`
+  index, no scroll bookkeeping, and invisible to transcript search — the same rule the orientation
+  card follows, for the same reason: anything drawn into the transcript area that is not a transcript
+  row must stay out of it entirely. Each `kind` renders through machinery the TUI already owns
+  (`markdown` via `flux-markdown`, `tree` via the plan DAG's renderer, kept beside it so the glyphs
+  and theme roles cannot drift apart), so **no dependency was added** and `ratatui` stays pinned at
+  0.29. Panes always draw before the approval sheet, which is the ordering C-222's trust invariant
+  will rest on. A session with no panes renders cell for cell as it did before, pinned by every
+  pre-existing TUI layout test passing unchanged.
+
 ## [0.35.0] - 2026-07-29
 
 ### Fixed
