@@ -2,7 +2,7 @@
 id: A-114
 title: MarkdownBoard — file-per-item with a derived index, IO via flux-system
 pillar: Agent
-status: in-progress
+status: done
 priority: 30
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md

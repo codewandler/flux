@@ -46,6 +46,18 @@ All notable changes to this project are documented in this file. The format is b
   held by a new `DispatchLedger` seam at L2, so the L3 fleet op never names the L5 board port; the
   two halves join only at L6.
 
+- **`MarkdownBoard` — the first file-backed `WorkBoard` (A-114).** One markdown file per item with a
+  derived index, every read and write routed through `flux-system`'s guarded surface rather than
+  `std::fs`, and a compare-and-set claim so concurrent claims on one item resolve to exactly one
+  winner while different items never contend. It is the first backend that can actually demonstrate
+  what the design's recovery story needs, and it carries the test that proves it: a dispatch recorded
+  through one board instance is recovered by a **second, independent instance opened over the same
+  directory**. That property is one the shared contract suite structurally cannot check — the suite
+  receives an already-constructed board, so a backend caching in memory passes it in full while
+  recovering nothing across a restart. `record_dispatch` is implemented by reusing the existing
+  reserved-update primitive, so durability, atomicity and no-tearing come from the audited write path
+  instead of a reimplementation.
+
 ### Fixed
 
 - **`fleet.dispatch` could never be registered at all (A-116, found via A-130/A-131).** It declared
