@@ -53,6 +53,19 @@ declare that they persist state.
 ## Notes
 - Seams: `gather_safe` at `crates/flux-flow/src/staged.rs:2447-2475`; `is_consequence_bearing` at
   `crates/flux-spec/src/coherence.rs:135-152`.
+- **A proposed shape, from C-208's implementor — worth starting from, not binding.** Do *not* simply
+  teach both functions to read `semantic_effects`: that widens the same blindness into three call
+  sites instead of two, and `semantic_effects` is a `Vec<String>` from a trait hook deliberately kept
+  free of the language crate. Better is to make the **tag vocabulary carry its consequence class
+  once**, the way `FlowEffect::lower` already maps a tag to `(Option<Effect>, Option<Action>)`.
+  `write_db` lowers to `Network` + `flow.write_db` today — a policy action with no host effect, which
+  is precisely how it slips past both classifiers. A `FlowEffect::is_consequential()` derived from
+  that same lowering, consulted by both `gather_safe` and `is_consequence_bearing`, would close the
+  gap in one place and keep the C-191 correspondence both exact *and* complete.
+- The product question this story must answer, and cannot dodge: if the gap closes that way,
+  **should `web.fetch` stop being gather-safe?** That is a behavioural trade-off (losing pre-approval
+  retrieval in the adaptive loop) and not a mechanical consequence — decide it explicitly and record
+  it alongside the C-208 posture note in the same design doc.
 - ⚠ `flux-spec` is on the **independent protocol line** (`1.x`). If `is_consequence_bearing` changes,
   that crate needs its own version bump or `scripts/check-crate-versions.sh` reds CI — this has bitten
   twice already. See [[protocol-line-crates-need-own-bump]] in the operator's notes; the mechanical
