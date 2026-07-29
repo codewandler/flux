@@ -1886,6 +1886,19 @@ impl System {
             // it and skips re-wrapping (`Sandbox::resolve`) instead of attempting to nest inside
             // its own containment.
             "FLUX_SANDBOXED",
+            // C-207: the path to the kubeconfig, forwarded because the *surfacing* side already
+            // honors it — `flux_runtime`'s `kubeconfig_present` surfaces the `endpoint` group when
+            // `KUBECONFIG` is set — and a probe that reads a variable the executor drops offers ops
+            // that cannot work. Dropping it here meant every surfaced `kubernetes.*` op ran a
+            // `kubectl` that silently fell back to `~/.kube/config`. The alternative (stop honoring
+            // `KUBECONFIG` when deciding to surface) was rejected: it hides the group from users
+            // whose setup is fine to avoid mis-surfacing for users whose setup is unusual.
+            // On the allow-list posture: this is a *path* to a config file, the same category as
+            // `PATH` and `HOME` above, not a secret value — the deny-by-default rule is that flux
+            // never forwards a credential from the host env, and a filename is not one. The file it
+            // names does hold credentials, but reading it is precisely what `kubectl` needs, and is
+            // no more than the `~/.kube/config` it already reads through the forwarded `HOME`.
+            "KUBECONFIG",
         ];
         for key in SAFE_ENV {
             if let Ok(val) = std::env::var(key) {
@@ -2928,6 +2941,31 @@ mod tests {
         assert!(
             out.stdout.contains("FLUX_SANDBOXED=1"),
             "FLUX_SANDBOXED did not survive the env-clear: {}",
+            out.stdout
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-207: `KUBECONFIG` is in `SAFE_ENV`, so a kubeconfig at a non-default path reaches the
+    /// child. The `kubernetes` discovery signal surfaces the `endpoint` group when `KUBECONFIG` is
+    /// set (`flux_runtime`'s `kubeconfig_present`); if the executor then dropped it, every op that
+    /// signal surfaced would run a `kubectl` that silently fell back to `~/.kube/config`. The
+    /// surfacing signal and the execution environment have to read the same source of truth.
+    #[tokio::test]
+    async fn kubeconfig_survives_env_clear_so_surfacing_and_execution_agree() {
+        let (dir, sys) = temp_workspace();
+        // Same lock the other env-mutating tests take, so a concurrent test can't race the value
+        // this one depends on; the guard restores KUBECONFIG on drop.
+        let _env = sandbox::EnvGuard::new(&["KUBECONFIG"]);
+        std::env::set_var("KUBECONFIG", "/tmp/flux-c207-nondefault/kubeconfig.yaml");
+        let out = sys
+            .run(&["env".to_string()], Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            out.stdout
+                .contains("KUBECONFIG=/tmp/flux-c207-nondefault/kubeconfig.yaml"),
+            "KUBECONFIG did not survive the env-clear: {}",
             out.stdout
         );
         std::fs::remove_dir_all(&dir).ok();

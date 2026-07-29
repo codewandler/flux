@@ -1786,6 +1786,10 @@ fn agent_triggerable_target_present(cwd: &std::path::Path) -> bool {
 
 /// Whether a kubeconfig is reachable: `KUBECONFIG` is set (non-empty) OR `~/.kube/config` exists. This
 /// is ambient (host environment / home dir), independent of `cwd` — kubectl finds its config this way.
+/// Both halves of that check reach the spawned `kubectl`: `KUBECONFIG` and `HOME` are on
+/// `flux_system`'s `SAFE_ENV` allow-list (C-207), so what this probe reads is what the executor
+/// forwards. Adding a signal here that the guarded process path drops would surface ops that
+/// cannot work.
 fn kubeconfig_present() -> bool {
     if std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty()) {
         return true;

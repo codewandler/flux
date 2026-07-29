@@ -49,20 +49,18 @@ own verbs, and that narrowing is what approval prompts and audit records disclos
 
 ## 2. Point kubectl at a cluster
 
-There is no plugin-side configuration step. The plugin runs `kubectl`, and `kubectl` reads
-`~/.kube/config`.
+There is no plugin-side configuration step. The plugin runs `kubectl`, and `kubectl` finds its
+config the way it always does: `KUBECONFIG` if set, otherwise `~/.kube/config`.
 
 ```bash
 kubectl config get-contexts        # what you already have
 ```
 
-:::caution
-`KUBECONFIG` is **not** forwarded to the plugin's subprocess. flux spawns it through the guarded
-process path, which clears the environment and re-adds only a minimal non-secret allow-list —
-`KUBECONFIG` is not on it. A kubeconfig at a non-default path is therefore invisible to the plugin
-even when your own shell resolves it. Merge it into `~/.kube/config` (or symlink it there) and
-select with `context` instead.
-:::
+flux spawns the plugin through the guarded process path, which clears the environment and re-adds
+only a minimal non-secret allow-list. `KUBECONFIG` is on that list, alongside `PATH` and `HOME`, so
+a kubeconfig at a non-default path resolves for the plugin exactly as it does in your own shell.
+What is forwarded is the *path*; the plugin reads the file through `kubectl`, and nothing else from
+your environment crosses over.
 
 Every operation takes an optional `context` naming a kubeconfig context; omitting it uses the
 current one. The cluster inventory is available without any further grant — the plugin reaches the

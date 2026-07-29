@@ -2,7 +2,7 @@
 id: C-207
 title: "KUBECONFIG decides the kubernetes group is surfaced, then is not forwarded to kubectl"
 pillar: Core
-status: ready
+status: in-progress
 priority: 18
 epic:
 design:
@@ -30,18 +30,36 @@ confusing rather than clear: it surfaces as a kubectl connection or context erro
 Make the two halves agree.
 
 ## Acceptance
-- [ ] Failing-first: a test that sets `KUBECONFIG` to a non-default path and asserts the value
+- [x] Failing-first: a test that sets `KUBECONFIG` to a non-default path and asserts the value
       reaches the spawned subprocess's environment, failing against the tree as it stands.
-- [ ] The surfacing signal and the execution environment use the same source of truth — either
+- [x] The surfacing signal and the execution environment use the same source of truth — either
       `KUBECONFIG` is forwarded, or surfacing stops honouring it. See Notes: forwarding is the
       likely answer, but it is a real allow-list decision, not an obvious one.
-- [ ] If forwarded, the `:::caution` currently in `website/docs/plugins/kubernetes.md` step 2
+- [x] If forwarded, the `:::caution` currently in `website/docs/plugins/kubernetes.md` step 2
       (documenting the workaround: merge or symlink into `~/.kube/config`) is removed, since it
       stops being true.
-- [ ] Whatever is decided is recorded in `SAFE_ENV`'s comment block, which already explains why each
+- [x] Whatever is decided is recorded in `SAFE_ENV`'s comment block, which already explains why each
       entry is on the list.
 
 ## Progress
+- 2026-07-29 — **implemented by forwarding.** `KUBECONFIG` joins `SAFE_ENV`
+  (`crates/flux-system/src/lib.rs:1901`) with the allow-list rationale written into the comment
+  block above it: it is a *path*, the same category as the already-forwarded `PATH`/`HOME`, and the
+  file it names is exactly what `kubectl` needs — no more than the `~/.kube/config` the forwarded
+  `HOME` already reaches. The alternative (stop honouring `KUBECONFIG` when surfacing) was rejected
+  for the reason in Notes. Failing-first test
+  `kubeconfig_survives_env_clear_so_surfacing_and_execution_agree`
+  (`crates/flux-system/src/lib.rs:2955`) runs `env` through `System::run` and asserts the
+  non-default path survives `env_clear()`; verified to fail on the pre-fix allow-list with
+  `KUBECONFIG did not survive the env-clear:` and the child env listing no `KUBECONFIG`.
+  `kubeconfig_present`'s doc comment (`crates/flux-runtime/src/lib.rs:1790`) now records that both
+  halves of the probe reach the spawned `kubectl`, and the website `:::caution` documenting the
+  symlink workaround is gone.
+- 2026-07-29 — swept the other discovery probes for the same shape (Notes, last bullet). The only
+  other ambient env-reading probe is `chromium_present` (`FLUX_BROWSER_BIN`,
+  `crates/flux-runtime/src/lib.rs:1805`), and its executor `flux_web::discover_chrome` reads the
+  same variable **in-process** rather than through `apply_safe_env`, so there is no probe/executor
+  divergence there. `kubeconfig_reachable` was a one-off, not a class.
 - 2026-07-29 — found while writing the public kubernetes plugin guide under the
   [website-truth-and-identity](../designs/website-truth-and-identity.md) epic (C-203). Both halves
   verified against the tree at `0.33.1` before filing.
