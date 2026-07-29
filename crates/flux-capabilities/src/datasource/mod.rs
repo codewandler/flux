@@ -14,7 +14,7 @@
 //! [`WorkBoard`] is the **write-capable** sibling of that contract, and follows it exactly:
 //! [`try_register_work_board`] snapshots the schema and [`LiveAccess`], validates once, and installs
 //! generated `<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment`
-//! operations atomically on a clone. The difference is that four of the six write, so they carry
+//! operations atomically on a clone. The difference is that five of the seven write, so they carry
 //! `Effect::Write`, a non-`Low` risk tier, and **concrete** `<domain>/item/<id>` permission
 //! subjects — never `*`, never empty (AGENTS.md:98). Items move through a closed state machine and
 //! an illegal edge is an error, not a write. [`MemoryBoard`] is the offline double.
@@ -47,7 +47,8 @@ mod embeddings;
 mod embeddings_local;
 
 pub use board::{
-    try_register_work_board, validate_board_contract, work_board_tools, WorkBoard, WorkBoardSurface,
+    try_register_work_board, validate_board_contract, work_board_tools, BoardLedger, WorkBoard,
+    WorkBoardSurface,
 };
 pub use host_caps::DatasourceHostCaps;
 pub use ingest::{

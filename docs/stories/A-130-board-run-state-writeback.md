@@ -2,7 +2,7 @@
 id: A-130
 title: Board write-back of runner and task_id — make "the board is the run registry" true
 pillar: Agent
-status: ready
+status: in-progress
 priority: 33
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
@@ -23,20 +23,87 @@ As both implementors reported, that write path does not exist: A-113 lands `Work
 them. Until this lands, the design's crash-recovery story is a claim, not a property.
 
 ## Acceptance
-- [ ] A board operation that records a dispatch — either a seventh op or an extension of `claim` to
+- [x] A board operation that records a dispatch — either a seventh op or an extension of `claim` to
       carry `runner` + `task_id` atomically with the claim. **Decide it in this story and say why**;
       atomicity with `claim` is the argument for the extension, and a distinct op is the argument for
       keeping `claim`'s contract narrow.
-- [ ] Failing-first test: after `fleet.dispatch`, a fresh reader of the board can recover the
+- [x] Failing-first test: after `fleet.dispatch`, a fresh reader of the board can recover the
       dispatch — worker address and task id — with no in-memory state whatsoever.
-- [ ] Failing-first test: crash recovery end-to-end — a new process over the same board re-derives
+- [x] Failing-first test: crash recovery end-to-end — a new process over the same board re-derives
       every in-flight item and its worker, and the sweep resumes. This is A-117's headline claim, so
       the test belongs here or is shared with it.
-- [ ] Concrete `permission_subjects` on whatever op results, consistent with A-113's `<domain>/item/<id>`.
-- [ ] The design doc's §5 is updated to describe the op that actually exists.
+- [x] Concrete `permission_subjects` on whatever op results, consistent with A-113's `<domain>/item/<id>`.
+- [x] The design doc's §5 is updated to describe the op that actually exists.
 
 ## Progress
-- (not started)
+
+**Decision (Acceptance 1): a seventh op, `record_dispatch`, not an extension of `claim`.**
+The atomicity argument for folding it into `claim` does not survive the ordering: the `task_id` does
+not exist until the worker answers the send, so the record is necessarily written *after* the claim
+either way. Extending `claim` would buy atomicity of `(assignee, runner, task_id)` with the state
+change while leaving the only window that matters — worker accepted, board not yet written — exactly
+as wide. It would also make `claim`'s `Idempotency::Conditional` incoherent ("same assignee,
+different `task_id`" has no answer). `transition` likewise stays the single edge-checked entry into
+the state machine, so `record_dispatch` writes those two fields and moves nothing else.
+
+**What landed**
+
+- `flux-runtime` (L2): the `DispatchLedger` port — `subject()` (sync, for the gating path) +
+  `record_dispatch()`. It lives at L2 for the same reason `Spawner` does: `fleet.dispatch` is L3 and
+  `WorkBoard` is L5, so neither may name the other, and both already depend on flux-runtime.
+- `flux-capabilities` (L5): `WorkBoard::record_dispatch` (a required trait method), the generated
+  seventh op `<domain>.record_dispatch` (`Effect::Write`, `Risk::Medium`,
+  `Idempotency::Conditional`, subject `<domain>/item/<id>` from the shared `item_subject` helper),
+  `BoardLedger` as the adapter, and the `MemoryBoard` implementation.
+- `flux-orchestrate` (L3): `FleetDispatchTool::with_ledger` and an optional `item` param. The
+  write-back is contractual, not best-effort — see the three decided paths below.
+- Design `fleet-coordinator.md` §5 gains "The op that performs the write-back", §2 the method.
+
+**The accepted-but-unrecorded window, decided explicitly**
+
+- `item` named with no ledger wired → refused **before any network call**. Dispatching first and
+  discovering the gap afterwards is precisely how an orphan is made.
+- Board write fails after the worker accepted → a compensating `tasks/cancel` stops the run nothing
+  could sweep; if that also fails the op reports `ORPHANED RUN` with the task id and a manual
+  `fleet.cancel` recovery line.
+- A worker answering synchronously has no task, so nothing is recorded and `"recorded": false` is
+  reported — storing a dead id would send the next sweep after a run that no longer exists.
+
+**Deliberately left open:** recording a dispatch against a `Done` item is not refused. Terminal-state
+policy belongs to the sweep's semantics, which this epic has not settled; noted in §5 so it is not
+re-litigated as an oversight.
+
+**Follow-up owed:** A-114's `MarkdownBoard` is being written against the six-method trait and will
+need a `record_dispatch` impl plus the contract-suite property. The coordinator is sequencing that
+as a short follow-up after A-114 merges — not done here.
+
+**Gate, second session (the first died mid-flight, leaving the above as a WIP commit plus an
+uncommitted diff).** Picked up in place; nothing was discarded or rewritten. Verified the whole gate
+green from a cold `target/`: `cargo build --workspace`, `cargo test --workspace` (no failures),
+`cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt --all` (reformatted
+`fleet.rs` + `fleet_board_recovery.rs`; `--check` clean after), `cargo test -p flux-codegate`
+(13 passed — the L2 `DispatchLedger` seam is a legal edge, no `layer()` change needed).
+
+**Failing-first, demonstrated rather than asserted.** At the merge base (`6418ef81`) `runner` and
+`task_id` are only ever written as `None` at item creation and rendered read-only — `git grep` finds
+no `record_dispatch` / `DispatchLedger` / `BoardLedger` anywhere under `crates/`. A throwaway witness
+reproducing that world (dispatch with no ledger, then ask the board who is running the item) failed
+exactly where the acceptance says it must:
+
+```
+assertion `left == right` failed: design §5: the board is the run registry, so it must know the runner
+  left: None
+ right: Some("http://127.0.0.1:45835")
+```
+
+**Design tightened to match the code (Acceptance 5).** §5's opening still claimed `fleet.dispatch`
+writes the two fields unconditionally; it now points at the op that does it. Added that
+`record_dispatch` is a *required* `WorkBoard` method — a defaulted one would let a backend look
+healthy until a restart recovered nothing — and that wiring the ledger is the assembler's job, which
+nothing in-tree does yet (`FleetDispatchTool` is exported but never registered; that gap is A-131's).
+
+**Breaking, and deliberately so:** `WorkBoard` is public API of `codewandler-flux-capabilities`, so
+the new required method breaks any out-of-tree implementor. `MemoryBoard` is the only in-tree one.
 
 ## Notes
 - Filed 2026-07-29 from A-116's handoff, corroborated by A-113's. Both implementors independently

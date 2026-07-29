@@ -12,6 +12,13 @@
 //!   case, which [`Spawner`]'s fire-and-await signature cannot express: `fleet.dispatch` returns a
 //!   `task_id` immediately, and `fleet.status` / `fleet.cancel` act on it later.
 //!
+//! ## Where a dispatch is remembered (A-130)
+//!
+//! "Track" needs somewhere to track *in*. `fleet.dispatch` records the worker address and the task
+//! id through [`DispatchLedger`] — in the fleet coordinator, the work board — so a restarted
+//! process re-derives every in-flight run from the board alone and no second store exists to fall
+//! out of sync. The ledger is an L2 port precisely so this L3 crate never has to name the L5 board.
+//!
 //! **Workers must be served by `flux serve` / flux-server.** The stateful task surface
 //! (`message/send` non-blocking, `tasks/get`, `tasks/cancel`) lives in `flux-server`;
 //! `flux_a2a::server::is_unsupported_a2a_method` still classifies those methods as unsupported in
@@ -24,6 +31,7 @@
 //! model-named URL is an SSRF hole. `permission_subjects` reports the worker's **origin**, never
 //! `*`, so a `network.fetch` grant scopes to the exact worker.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,7 +40,9 @@ use tokio_util::sync::CancellationToken;
 
 use flux_a2a::{A2aClient, A2aError, Message, Part, SendOutcome, Task};
 use flux_core::{Error, Result};
-use flux_runtime::{SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext, ToolResult};
+use flux_runtime::{
+    DispatchLedger, SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext, ToolResult,
+};
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::net::{guard_url_scoped, PrivateNetAllow};
 
@@ -272,6 +282,10 @@ struct DispatchInput {
     /// Existing conversation id to continue on the worker
     #[serde(default)]
     context_id: Option<String>,
+    /// Board item this run belongs to. Naming one makes recording the dispatch part of this call:
+    /// the worker's address and task id are written onto the item before success is reported.
+    #[serde(default)]
+    item: Option<String>,
 }
 
 /// Arguments for `fleet.status` and `fleet.cancel` — both act on a task the worker already owns.
@@ -288,15 +302,79 @@ struct TaskRefInput {
 ///
 /// This is the half [`Spawner`] cannot express: `spawn` is fire-and-await, so a coordinator that
 /// wants to run ten workers concurrently and reconcile them later needs a non-blocking send.
+///
+/// ## Recording the dispatch (A-130)
+///
+/// A `task_id` that exists only in this op's return value is a run nothing can find again. With a
+/// [`DispatchLedger`] wired in via [`with_ledger`](Self::with_ledger), a call naming an `item`
+/// writes the worker's address and the task id onto that item **before reporting success**, which
+/// is what makes `docs/designs/fleet-coordinator.md` §5's "the board is the run registry" a
+/// property rather than a claim.
+///
+/// The write-back is a contract, not an attempt. Three paths, each observable:
+///
+/// * **No ledger, but an `item` was named** — refused *before* the worker is contacted. Dispatching
+///   first and discovering afterwards that the run cannot be recorded is precisely how an orphan is
+///   made.
+/// * **Recorded** — success, with `"recorded": true`.
+/// * **Accepted but not recordable** — the worker took the run and the board write then failed. The
+///   op compensates by cancelling the task it cannot track and reports an error either way; see
+///   [`unrecordable`].
 pub struct FleetDispatchTool {
     private_net: PrivateNetAllow,
     token: Option<String>,
+    /// Where a dispatch is recorded. `None` means this op is not board-backed: it may still
+    /// dispatch, but a call naming an `item` is refused rather than silently unrecorded.
+    ledger: Option<Arc<dyn DispatchLedger>>,
 }
 
 impl FleetDispatchTool {
     /// Build the op with the operator's private-network grant and an optional worker bearer token.
     pub fn new(private_net: PrivateNetAllow, token: Option<String>) -> Self {
-        Self { private_net, token }
+        Self {
+            private_net,
+            token,
+            ledger: None,
+        }
+    }
+
+    /// Bind the op to the ledger that records what it dispatches — in the fleet coordinator, a
+    /// [`BoardLedger`](https://docs.rs/codewandler-flux-capabilities) over the registered work
+    /// board. Doing so adds `Effect::Write` to the op's declared effects and the item's subject to
+    /// the subjects it reports, because from here on it genuinely writes.
+    pub fn with_ledger(mut self, ledger: Arc<dyn DispatchLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+}
+
+/// The board write failed **after** the worker had already accepted the run.
+///
+/// This is the one path that can leave invisible work behind, so it is handled rather than
+/// reported: the run is untrackable by construction (its id reached no durable store), and an
+/// untracked run consumes a worker forever because no sweep will ever look for it. Cancelling it is
+/// strictly better than leaking it — the dispatch can simply be retried once the board is back.
+///
+/// Both outcomes name the task id, which after a failed record is the only handle anyone has left.
+async fn unrecordable(
+    client: &A2aClient,
+    item: &str,
+    worker: &str,
+    task_id: &str,
+    cause: Error,
+) -> String {
+    match client.cancel_task(task_id).await {
+        Ok(_) => format!(
+            "fleet.dispatch: task {task_id} on {worker} could not be recorded against item \
+             `{item}` ({cause}); it was cancelled on the worker, so nothing is left running — \
+             fix the board and dispatch again"
+        ),
+        Err(cancel) => format!(
+            "fleet.dispatch: ORPHANED RUN — task {task_id} on {worker} was accepted but could not \
+             be recorded against item `{item}` ({cause}), and the compensating cancel also failed \
+             ({cancel}). The worker may still be running it and no sweep will find it; stop it by \
+             hand with fleet.cancel worker={worker} task_id={task_id}"
+        ),
     }
 }
 
@@ -314,7 +392,12 @@ impl Tool for FleetDispatchTool {
             output_schema: None,
             // Network is the carrier; Process is the consequence — the worker runs arbitrary agent
             // work of its own choosing on the other end, exactly as the local `task` op declares.
-            effects: vec![Effect::Network, Effect::Process],
+            // `Write` joins them only when a ledger is wired, because only then does this op write
+            // anything locally; declaring it unconditionally would overstate an op that cannot.
+            effects: match self.ledger {
+                Some(_) => vec![Effect::Network, Effect::Process, Effect::Write],
+                None => vec![Effect::Network, Effect::Process],
+            },
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Network, AccessKind::Provider],
@@ -323,30 +406,86 @@ impl Tool for FleetDispatchTool {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        let endpoint = serde_json::from_value::<DispatchInput>(params.clone())
-            .ok()
-            .map(|args| args.worker);
-        endpoint_subjects(endpoint.as_deref())
+        let args = serde_json::from_value::<DispatchInput>(params.clone()).ok();
+        let mut subjects = endpoint_subjects(args.as_ref().map(|args| args.worker.as_str()));
+        // The board item is a second, independently grantable subject: an operator may allow
+        // dispatch to a worker without allowing this coordinator to rewrite arbitrary items. Only
+        // the ledger can name it, since only it knows the board's domain — which is also why the
+        // subject cannot drift from the one `<domain>.record_dispatch` reports for the same item.
+        if let (Some(ledger), Some(item)) = (
+            self.ledger.as_ref(),
+            args.and_then(|args| args.item)
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty()),
+        ) {
+            subjects.push(ledger.subject(&item));
+        }
+        subjects
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: DispatchInput = parse_params(params, "fleet.dispatch")?;
+        let item = args
+            .item
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty());
+        // Refuse before touching the network. A run dispatched against an item this op cannot write
+        // is invisible work: no sweep will find it, and it holds a worker until someone notices by
+        // hand. Never having dispatched it is strictly the better failure.
+        let ledger = match (item, self.ledger.as_ref()) {
+            (Some(item), None) => {
+                return Err(Error::Other(format!(
+                    "fleet.dispatch: `item` names `{item}`, but this op has no dispatch ledger to \
+                     record the run in — refusing to dispatch work nothing could sweep"
+                )))
+            }
+            (Some(_), Some(ledger)) => Some(ledger),
+            (None, _) => None,
+        };
+
         let client = worker_client(&args.worker, &self.private_net)?.with_token(self.token.clone());
         let role = args.role.as_deref().unwrap_or("worker");
         let message = delegation_message(role, &args.task, args.context_id);
         match client.send(message, false).await {
-            Ok(SendOutcome::Task(t)) => Ok(ToolResult::ok(
-                serde_json::json!({
-                    "task_id": t.id,
-                    "context_id": t.context_id,
-                    "state": t.status.state,
-                })
-                .to_string(),
-            )),
+            Ok(SendOutcome::Task(t)) => {
+                if let (Some(item), Some(ledger)) = (item, ledger) {
+                    // The recorded runner is the endpoint as dialled, not the origin the grant is
+                    // scoped to: a later sweep has to reach the worker, and an origin may have
+                    // dropped a path the worker needs.
+                    if let Err(cause) = ledger.record_dispatch(ctx, item, &args.worker, &t.id).await
+                    {
+                        return Ok(ToolResult::error(
+                            unrecordable(&client, item, &args.worker, &t.id, cause).await,
+                        ));
+                    }
+                }
+                Ok(ToolResult::ok(
+                    serde_json::json!({
+                        "task_id": t.id,
+                        "context_id": t.context_id,
+                        "state": t.status.state,
+                        "recorded": item.is_some(),
+                    })
+                    .to_string(),
+                ))
+            }
             // A worker that answered synchronously left nothing to track; say so rather than
             // inventing a task id the caller would then poll forever.
+            //
+            // **This is the one path where naming an `item` writes nothing to the board**, and it
+            // is deliberate: there is no run to sweep. The whole point of the record is to give a
+            // restarted coordinator a handle on work still executing somewhere, and this work
+            // finished inside the send. Recording a dead task id would send the next sweep after a
+            // run that no longer exists — worse than recording nothing. `"recorded": false` is
+            // reported either way, so a caller that expected a write can see it did not happen.
             Ok(SendOutcome::Message(m)) => Ok(ToolResult::ok(
-                serde_json::json!({ "task_id": Value::Null, "answer": m.text() }).to_string(),
+                serde_json::json!({
+                    "task_id": Value::Null,
+                    "answer": m.text(),
+                    "recorded": false,
+                })
+                .to_string(),
             )),
             Err(e) => Ok(ToolResult::error(format!("fleet.dispatch: {e}"))),
         }
@@ -825,6 +964,179 @@ mod tests {
             json!(false),
             "fleet.dispatch must not block: {:?}",
             calls[0].1
+        );
+    }
+
+    // ── the board write-back (A-130) ────────────────────────────────────────
+
+    /// A [`DispatchLedger`] double. Records what it was handed, or fails on demand to exercise the
+    /// window where the worker has already accepted a run the board could not record.
+    struct RecordingLedger {
+        records: Mutex<Vec<(String, String, String)>>,
+        fail: bool,
+    }
+
+    impl RecordingLedger {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                records: Mutex::new(Vec::new()),
+                fail,
+            })
+        }
+
+        fn records(&self) -> Vec<(String, String, String)> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl DispatchLedger for RecordingLedger {
+        fn subject(&self, item: &str) -> String {
+            format!("board/item/{item}")
+        }
+
+        async fn record_dispatch(
+            &self,
+            _ctx: &ToolContext,
+            item: &str,
+            runner: &str,
+            task_id: &str,
+        ) -> Result<()> {
+            if self.fail {
+                return Err(Error::Other("work board: unreachable".into()));
+            }
+            self.records.lock().unwrap().push((
+                item.to_string(),
+                runner.to_string(),
+                task_id.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    /// A-130 Acceptance 1+2, the named failing-first test: the `task_id` a worker mints is written
+    /// back onto the board **as part of the op**, not as a caller's follow-up. Without this the
+    /// sweep has nothing to find and design §5's "the board is the run registry" is a claim.
+    #[tokio::test]
+    async fn fleet_dispatch_records_the_runner_and_task_id_before_reporting_success() {
+        let (base, _seen) = worker_stub(|_m, _p| task_json("t_11", "submitted", "")).await;
+        let ledger = RecordingLedger::new(false);
+        let ctx = ToolContext::new(temp_system());
+
+        let out = FleetDispatchTool::new(PrivateNetAllow::Any, None)
+            .with_ledger(ledger.clone())
+            .execute(
+                &ctx,
+                json!({ "worker": base.clone(), "task": "sweep", "item": "PROJ-42" }),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let body: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(body["task_id"], "t_11");
+        assert_eq!(
+            body["recorded"],
+            json!(true),
+            "the write-back is part of the reported outcome, not a side effect"
+        );
+        assert_eq!(
+            ledger.records(),
+            // The recorded runner is the FULL endpoint, not the origin: a later sweep has to dial
+            // it, and the origin is only the permission subject.
+            vec![("PROJ-42".to_string(), base.clone(), "t_11".to_string())],
+        );
+    }
+
+    /// The window that matters: the worker accepted the run, then the board write failed. A
+    /// dispatched task whose id was lost is strictly worse than one never dispatched, because
+    /// nothing will ever sweep it — so the op compensates by cancelling the run it cannot track.
+    #[tokio::test]
+    async fn a_board_write_that_fails_after_acceptance_cancels_the_untracked_run() {
+        let (base, seen) = worker_stub(|method, _p| match method {
+            "message/send" => task_json("t_12", "submitted", ""),
+            "tasks/cancel" => task_json("t_12", "canceled", ""),
+            _ => Value::Null,
+        })
+        .await;
+        let ctx = ToolContext::new(temp_system());
+
+        let out = FleetDispatchTool::new(PrivateNetAllow::Any, None)
+            .with_ledger(RecordingLedger::new(true))
+            .execute(
+                &ctx,
+                json!({ "worker": base, "task": "sweep", "item": "PROJ-43" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "an unrecorded dispatch must not report success: {}",
+            out.content
+        );
+        // The id is in the message even though the record failed — it is the only handle a human
+        // has left.
+        assert!(out.content.contains("t_12"), "{}", out.content);
+        assert!(out.content.contains("PROJ-43"), "{}", out.content);
+
+        let calls = seen.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(m, p)| m == "tasks/cancel" && p["id"] == "t_12"),
+            "the untracked run was left going: {calls:?}"
+        );
+    }
+
+    /// Naming a board item this op cannot write is a configuration error, and it is caught
+    /// **before** the worker is contacted. Dispatching first and discovering the gap afterwards is
+    /// exactly how an orphan is created.
+    #[tokio::test]
+    async fn naming_a_board_item_with_no_ledger_refuses_before_dispatching() {
+        let (base, seen) = worker_stub(|_m, _p| task_json("t_13", "submitted", "")).await;
+        let ctx = ToolContext::new(temp_system());
+
+        let error = FleetDispatchTool::new(PrivateNetAllow::Any, None)
+            .execute(
+                &ctx,
+                json!({ "worker": base, "task": "sweep", "item": "PROJ-44" }),
+            )
+            .await
+            .expect_err("an unrecordable dispatch is refused");
+        assert!(error.to_string().contains("PROJ-44"), "{error}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused dispatch must reach the worker zero times"
+        );
+    }
+
+    /// A-130 Acceptance 4: the op now writes to the board, so it must **name** what it writes —
+    /// `<domain>/item/<id>`, the subject shape A-113 generates, beside the worker's origin.
+    #[test]
+    fn a_dispatch_that_records_names_the_board_item_it_writes() {
+        let plain = FleetDispatchTool::new(PrivateNetAllow::None, None);
+        assert!(!plain.spec().effects.contains(&Effect::Write));
+
+        let recording = FleetDispatchTool::new(PrivateNetAllow::None, None)
+            .with_ledger(RecordingLedger::new(false));
+        assert!(
+            recording.spec().effects.contains(&Effect::Write),
+            "an op wired to a board declares the write it performs"
+        );
+        assert_eq!(
+            recording.permission_subjects(&json!({
+                "worker": "https://worker-1.internal:8787/a2a",
+                "task": "build",
+                "item": "PROJ-42",
+            })),
+            vec![
+                "https://worker-1.internal:8787".to_string(),
+                "board/item/PROJ-42".to_string(),
+            ],
+        );
+        // No item named, no board subject invented — and never a wildcard.
+        assert_eq!(
+            recording.permission_subjects(&json!({ "worker": "https://w.example", "task": "x" })),
+            vec!["https://w.example".to_string()],
         );
     }
 

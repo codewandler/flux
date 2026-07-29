@@ -925,6 +925,37 @@ pub trait Spawner: Send + Sync {
     ) -> flux_core::Result<SpawnOutcome>;
 }
 
+/// Where a **dispatched** run is recorded so it can be re-derived after a restart (A-130).
+///
+/// `fleet.dispatch` hands work to a remote worker and gets back a worker-minted task id. That id
+/// plus the worker's address are the only handles a later reconciliation sweep has, so they must
+/// reach durable storage before the dispatch reports success: a task whose id was lost is strictly
+/// worse than one never dispatched, because nothing will ever sweep it and it silently consumes a
+/// worker.
+///
+/// The port lives here (L2) for exactly the reason [`Spawner`] does. The recorder is a work board
+/// in `flux-capabilities` (L5) and the caller is `flux-orchestrate` (L3); neither may depend on the
+/// other, and both already depend on this crate.
+#[async_trait]
+pub trait DispatchLedger: Send + Sync {
+    /// The permission subject one item's record occupies — e.g. `board/item/PROJ-42`.
+    ///
+    /// Synchronous and infallible because it runs on the **gating** path, before execution: an op
+    /// declaring a write must be able to name what it writes. Implementations must return a
+    /// concrete subject, never `*` and never empty, so a grant scoped to one item cannot widen.
+    fn subject(&self, item: &str) -> String;
+
+    /// Bind `item` to the worker running it. Must be durable by the time this returns — a caller
+    /// treats `Ok(())` as "a restarted process will find this run".
+    async fn record_dispatch(
+        &self,
+        ctx: &ToolContext,
+        item: &str,
+        runner: &str,
+        task_id: &str,
+    ) -> flux_core::Result<()>;
+}
+
 /// Host capabilities used by model-backed stages inside an authored Flux-Lang outer loop. Defined
 /// here (L2) so guarded tools can delegate without depending on the L3 engine. Models return typed
 /// stage values and provider-native calls; only caller-authored Flux reaches deterministic execution.
