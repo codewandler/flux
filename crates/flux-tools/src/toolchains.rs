@@ -394,7 +394,9 @@ pub struct GoBuildTool;
 #[async_trait]
 impl Tool for GoBuildTool {
     fn spec(&self) -> ToolSpec {
-        go_tool_spec("go_build", "build", Idempotency::Idempotent)
+        // C-191: `Conditional`, not `Idempotent` — re-running `go build` is safe, but the result
+        // follows the sources and the build cache, so it must not be served from a replay cache.
+        go_tool_spec("go_build", "build", Idempotency::Conditional)
     }
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
         go_subjects("go_build", params)
@@ -430,7 +432,8 @@ pub struct GoVetTool;
 #[async_trait]
 impl Tool for GoVetTool {
     fn spec(&self) -> ToolSpec {
-        go_tool_spec("go_vet", "vet", Idempotency::Idempotent)
+        // C-191: as `go_build` — safe to repeat, but not a function of the input alone.
+        go_tool_spec("go_vet", "vet", Idempotency::Conditional)
     }
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
         go_subjects("go_vet", params)

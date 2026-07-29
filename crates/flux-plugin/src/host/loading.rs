@@ -315,6 +315,47 @@ impl PluginTool {
     }
 }
 
+/// Refuse a manifest whose projected [`ToolSpec`]s contradict themselves (C-191).
+///
+/// A plugin's `effects` / `risk` / `idempotency` / `access` are authored outside this repo and are
+/// then trusted verbatim by every downstream gate — the gather path, the op cache, the risk
+/// approver, and the sentence a human reads at the approval prompt. Built-in ops are held to the
+/// same invariants by a build-time test over the registry (`flux-tools`'
+/// `toolspec_invariants.rs`); a plugin has no build of ours to run, so for plugin-supplied specs
+/// the check has to happen where the declaration enters — here, at load, before any op reaches the
+/// model-facing catalog.
+///
+/// Fails closed on the whole manifest rather than dropping the offending op: a plugin that
+/// mis-declares one operation has not earned per-op trust, and silently shrinking its surface
+/// would be a confusing partial load. The invariants and their allowlist live in
+/// [`flux_spec::coherence`].
+///
+/// Scope is [`visible_ops`] — the ops that actually become agent tools. An `internal: true` op
+/// never reaches a [`ToolRegistry`] and so never reaches the gates these invariants protect; the
+/// host dispatches it directly through the shared [`PluginHost`] handle.
+///
+/// Free function over the manifest so it is unit-testable without spawning a subprocess, like
+/// [`plugin_tool_spec`] and [`visible_ops`] beside it.
+pub(super) fn validate_op_coherence(manifest: &PluginManifest) -> std::result::Result<(), String> {
+    let mut violations = Vec::new();
+    for op in visible_ops(manifest) {
+        let (_, spec) = plugin_tool_spec(&manifest.name, op, &manifest.capabilities);
+        violations.extend(flux_spec::metadata_violations(
+            &spec,
+            &semantic_effect_tags(&op.semantic_effects),
+        ));
+    }
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "plugin `{}` declares {} incoherent operation metadata combination(s):\n  {}",
+        manifest.name,
+        violations.len(),
+        violations.join("\n  ")
+    ))
+}
+
 pub(super) fn plugin_tool_spec(
     plugin: &str,
     op: &OperationSpec,
@@ -613,6 +654,7 @@ pub async fn load_plugin_tools(
     let mut host = PluginHost::spawn_verified(system, name, descriptor).await?;
     let manifest = host.manifest().await?;
     validate_manifest_operations(&manifest).map_err(Error::Other)?;
+    validate_op_coherence(&manifest).map_err(Error::Other)?;
     let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));
     // Project only the non-`internal` ops as agent tools (C-09a). A host-only op (`internal: true`,

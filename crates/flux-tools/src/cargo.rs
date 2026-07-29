@@ -1,8 +1,10 @@
 //! Rust toolchain tools: cargo_check, cargo_build, cargo_test, cargo_clippy, cargo_fmt.
 //!
 //! These are argv-only invocations through the guarded System — no shell strings.
-//! Risk is Medium (they mutate build artefacts / the local filesystem) except cargo_fmt
-//! which is Idempotent.
+//! Risk is Medium throughout (they run a program and mutate build artefacts / the local
+//! filesystem). Idempotency is `Conditional` for the ones that are safe to re-run
+//! (check/build/clippy/fmt) and `NonIdempotent` for `cargo_test`: safe to repeat, but never a
+//! deterministic function of the input, so never replayable from cache (C-191).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -331,7 +333,10 @@ impl Tool for CargoCheckTool {
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // C-191: running the toolchain again is safe, so this is not `NonIdempotent` — but
+            // the outcome is a function of the sources and the target dir at call time, not of the
+            // input, and `Idempotent` is the claim that licenses a cached replay in place of a run.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: Some("rust".into()),
         }
@@ -388,7 +393,10 @@ impl Tool for CargoBuildTool {
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // C-191: running the toolchain again is safe, so this is not `NonIdempotent` — but
+            // the outcome is a function of the sources and the target dir at call time, not of the
+            // input, and `Idempotent` is the claim that licenses a cached replay in place of a run.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: Some("rust".into()),
         }
@@ -503,7 +511,10 @@ impl Tool for CargoClippyTool {
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // C-191: running the toolchain again is safe, so this is not `NonIdempotent` — but
+            // the outcome is a function of the sources and the target dir at call time, not of the
+            // input, and `Idempotent` is the claim that licenses a cached replay in place of a run.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: Some("rust".into()),
         }
@@ -556,7 +567,10 @@ impl Tool for CargoFmtTool {
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // C-191: running the toolchain again is safe, so this is not `NonIdempotent` — but
+            // the outcome is a function of the sources and the target dir at call time, not of the
+            // input, and `Idempotent` is the claim that licenses a cached replay in place of a run.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: Some("rust".into()),
         }

@@ -1761,7 +1761,7 @@ mod loading;
 pub(crate) use loading::invalid_plugin_name;
 pub use loading::*;
 #[cfg(test)]
-use loading::{plugin_tool_spec, semantic_effect_tags};
+use loading::{plugin_tool_spec, semantic_effect_tags, validate_op_coherence};
 
 #[cfg(test)]
 mod tests {
@@ -2204,6 +2204,42 @@ mod tests {
                 "effects {effects:?} must be gated by the named program",
             );
         }
+    }
+
+    /// C-191: a plugin's `effects` / `risk` / `idempotency` are authored outside this repo and are
+    /// then trusted verbatim by every approval gate. A manifest that declares a mutating operation
+    /// while keeping the read-only risk class must not load at all.
+    #[test]
+    fn a_mis_declared_plugin_operation_is_refused_at_load() {
+        let drifted = OperationSpec {
+            name: "acme.deploy".into(),
+            description: "ship the current build".into(),
+            effects: vec![Effect::Write, Effect::Network],
+            risk: Some(Risk::Low),
+            idempotency: Some(Idempotency::NonIdempotent),
+            ..Default::default()
+        };
+        let manifest = PluginManifest {
+            name: "acme".into(),
+            operations: vec![drifted.clone()],
+            ..Default::default()
+        };
+
+        let error = validate_op_coherence(&manifest).unwrap_err();
+        assert!(error.contains("acme.deploy"), "{error}");
+        assert!(error.contains("I1 "), "{error}");
+
+        // Raising the tier — the correction the manifest actually needs — loads. The rule is a
+        // floor on the declaration, not a ban on plugins that mutate.
+        let corrected = PluginManifest {
+            name: "acme".into(),
+            operations: vec![OperationSpec {
+                risk: Some(Risk::Medium),
+                ..drifted
+            }],
+            ..Default::default()
+        };
+        assert!(validate_op_coherence(&corrected).is_ok());
     }
 
     #[test]
