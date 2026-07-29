@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Security
+
+- **Every third-party GitHub Action is pinned to an immutable commit SHA (C-187).** The workflows
+  that hold `MINISIGN_SECRET_KEY` (plugin-index signing, `release-plugins.yml`) and crates.io publish
+  rights (`release.yml`, `crates-io.yml`) referenced actions by movable tags
+  (`dtolnay/rust-toolchain@stable`, `actions/checkout@v4`, …), so whoever controlled an upstream tag
+  could run code beside those secrets — the softest path to the plugin trust model's root of trust.
+  All 55 third-party `uses:` references now name a 40-char SHA with the version as a trailing
+  comment; version skew is unified (`checkout` → v6.1.0, `upload-artifact` → v7.0.1,
+  `download-artifact` → v8.0.1); and `dtolnay/rust-toolchain` (whose `stable`/`1.97.0` are *branches*
+  designed to move) is pinned to a master SHA with the toolchain passed as an explicit input. A new
+  `scripts/check-action-pins.sh` guard, wired as the `action-pins` CI job, fails the build on any
+  unpinned or comment-less `uses:` so the tree cannot regress.
+
 ### Fixed
 
 - **A leading diff/list marker no longer hides a credential from the redactor (C-185).**

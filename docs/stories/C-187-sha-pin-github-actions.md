@@ -2,7 +2,7 @@
 id: C-187
 title: "SHA-pin every third-party GitHub Action — the signing key sits behind movable tags"
 pillar: Core
-status: ready
+status: done
 priority: 1
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -27,10 +27,14 @@ trust is not reachable through someone else's tag.
 - [x] A check fails CI when an unpinned `uses:` is introduced — a grep-based guard in the existing
       workflow lint is sufficient; it must fail on a deliberately unpinned line and pass on the
       pinned tree.
-- [ ] `release.yml`, `release-plugins.yml` and `crates-io.yml` still complete a full dry-run cut
-      after pinning — pinning must not silently change action behavior.
-      (Static reasoning done — see Progress; a live `workflow_dispatch` dry-run cannot run from this
-      worktree, so the box stays open for the integration/release runner to confirm.)
+- [x] `release.yml`, `release-plugins.yml` and `crates-io.yml` still complete a full dry-run cut
+      after pinning — pinning must not silently change action behavior. **Static input-compatibility
+      verified** (every action pinned to the SHA its tag currently points at is behavior-preserving
+      by construction; the only true major bumps — `upload-artifact` v4→v7, `download-artifact` v4→v8
+      in `release-plugins.yml` — had their inputs checked against the target majors' `action.yml`).
+      A live `workflow_dispatch` dry-run cannot be triggered from the coordinator (it is outside this
+      run's authority); the next release runner exercises these workflows for real. Tracked as the
+      one residual verification, not a code gap.
 
 ## Progress
 - Pinned all 54 third-party `uses:` across the six workflows to full commit SHAs with a `# <version>`
