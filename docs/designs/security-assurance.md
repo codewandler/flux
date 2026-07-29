@@ -107,6 +107,15 @@ egress still passes through `flux_system::net::guard_url_scoped_pinned`, so the 
 envelope is exactly what it was. Nothing about the safety boundary changes; only the honesty of the
 label does.
 
+Both also moved from `Idempotency::Idempotent` to `Conditional`, and the *reason it had to be done
+in the same change* is worth stating, because it is a trap this epic can walk into again. Adding
+`Effect::Read` takes a spec out of `is_consequence_bearing` — so I3, which had been flagging both
+ops correctly, stopped firing on them. Correcting I1 alone would have left a false `Idempotent`
+standing with the invariant no longer watching it: the rule would not have been redesigned, but the
+declaration would have been *moved out from under it* while staying wrong, which is the same
+failure with better manners. **Whenever a fix narrows what an invariant classifies, re-check every
+invariant that was firing before the narrowing.** Nothing enforces that; it is a review obligation.
+
 One caveat belongs on the record, because it is the one thing gather-safety now admits that it did
 not before. Wired with a record sink — which is how `flux-cli` wires them — `web.fetch` and
 `web.crawl` persist each fetched page as a durable `web.page` datasource record (C-58). That
@@ -117,6 +126,14 @@ a filesystem write). So these two ops are now reachable during pre-approval evid
 each such call writes a knowledge record. Authorization still runs — `flow.write_db` is required and
 checked — so this is un-*approved*, not un-*authorized*, and the record is the agent's own index of a
 page it just read. Recorded here so the next reader meets the trade-off rather than discovering it.
+
+There is a structural gap underneath that caveat, and it deserves its own story rather than a patch
+here. `gather_safe` decides from `spec.effects` and `intents`; `is_consequence_bearing` decides from
+`spec.effects` and `spec.access`. **Neither reads `semantic_effects`.** `web.fetch` is therefore the
+first op in the catalog that is gather-safe *and* self-declares a durable write — through the one
+channel neither classifier consults. The C-191 correspondence ("the invariants are the exact
+negation of `gather_safe`") holds between those two functions, but both are blind in the same place,
+so the correspondence being exact does not make it complete.
 
 **Group B — raise to `Risk::Medium`, do *not* add `Read`: `consult`, `ai.extract`/`ai.rank`/
 `ai.judge`/`ai.reason`/`ai.rewrite`/`synth`, every config-authored model stage, and the two adaptive
@@ -146,10 +163,16 @@ The remaining violators were decided on their own merits, each corrected in plac
 
 - `improve_log` — `[Write, Filesystem]` at `Risk::Low`, C-191's title case verbatim → `Medium`.
 - `grade` — `[Read, Process]` at `Risk::Low` + `Idempotent`, on an op that runs a *caller-supplied*
-  command → `Medium` + `Conditional`. Not in the story's table; the sharpest of the set.
+  command → `Medium` + `Conditional`. Not in the story's table. Approval was never skipped
+  (`AccessKind::Process` lowers to a `process.exec` requirement whose default grant carries
+  `requires_approval: true`); what `Risk::Low` bought was the word "low" rendered verbatim by
+  `PlanRisk::summary` into the sentence a human reads before approving a command execution.
 - `gate_check` — `Idempotent` on an op whose answer tracks a moving worktree → `Conditional`.
-  `Idempotent` is what licenses the op cache to replay instead of executing, and a stale "green" is
-  the worst possible answer from a gate.
+  `Idempotent` is what *would* license the op cache to replay instead of executing, and a stale
+  "green" is the worst possible answer from a gate. Note what the untruth was and was not: the cache
+  independently admits only all-`Read` effect sets, so neither this op nor `grade` was ever actually
+  replayable. The declarations were false, not exploited — and nothing declares that dependency on
+  the cache's effect test, which is exactly why they are corrected rather than left to lean on it.
 - `endpoint.import` — `[LocalSystem]` at `Risk::Low` + `Idempotent`, the one endpoint op that
   *writes* host state outside the jail → `Medium` + `Conditional`.
 - `browser.snapshot`, `browser.close` — `Low` while `browser.open`/`goto`/`act` were already

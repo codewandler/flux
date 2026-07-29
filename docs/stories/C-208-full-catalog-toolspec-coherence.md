@@ -80,6 +80,33 @@ invariants to fit the catalog.
 - `crates/flux-flow/docs/ops-reference.md` updated for the three risk-column rows that moved
   (`browser.snapshot`, `browser.close`, `consult`).
 
+### Rework after review (REWORK → addressed)
+
+- **Blocking, fixed.** `web.fetch` / `web.crawl` kept `Idempotency::Idempotent` from
+  `ToolSpec::read_only`. The table above lists both as violating **I1 and I3**; only I1 was
+  corrected, and adding `Effect::Read` took them out of `is_consequence_bearing`, so I3 stopped
+  firing and the untruth became undetectable — the declaration moved out from under the rule while
+  staying wrong. Both are now `Conditional`, with the reasoning this commit already applied to
+  `gate_check`, `grade` and `endpoint.import`. Each is pinned by an explicit assertion, since no
+  invariant backstops it any more.
+  - **Generalised lesson, recorded in the design doc:** when a fix narrows what an invariant
+    classifies, re-check every invariant that was firing before the narrowing.
+- Comment accuracy on `grade` / `gate_check`: neither was ever auto-approved
+  (`AccessKind::Process` → a `process.exec` requirement whose default grant sets
+  `requires_approval: true`) nor cache-replayable (the op cache admits only all-`Read` effect sets).
+  The real defect is the declaration untruth plus `PlanRisk::summary` rendering "low" verbatim to a
+  human. Both comments now claim only what is true, and say why the declaration is still corrected
+  rather than left leaning on an undeclared dependency.
+- Drift-guard hole **closed**, not just documented. `try_register_from` sat in `COVERED` by
+  function name, so a new `registry.try_register_from("new pack", …)` inherited an approved name
+  and escaped the census. The guard now also classifies the **source label** (the first argument),
+  with `TaskTool`'s entry derived from the same constant the census registers with. Verified by
+  injecting `registry.try_register_from("a brand new pack nobody classified", …)` into
+  `execution.rs`: the guard fails on it and passed before the fix. The residual limits (only
+  `execution.rs` is scanned; a reused label still passes) are now stated in the docstring.
+- `RiskApprover` docstring inaccuracy fixed: the CLI installs `StdinApprover` / `AllowApprover` via
+  `resolve_permissions`.
+
 ## Notes
 Known violations, inherited verbatim from the C-191 review (verified `path:line`):
 

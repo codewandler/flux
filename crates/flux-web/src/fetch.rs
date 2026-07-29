@@ -86,7 +86,7 @@ impl Tool for WebFetchTool {
                  durable datasource write).",
             );
         }
-        ToolSpec::read_only(
+        let mut spec = ToolSpec::read_only(
             "web.fetch",
             description,
             json!({
@@ -103,7 +103,18 @@ impl Tool for WebFetchTool {
         // `flux_spec::coherence` while it carried `Risk::Low`. The egress envelope is unchanged:
         // every request still goes through `guard_url_scoped_pinned` below.
         .with_effects(vec![Effect::Read, Effect::Network])
-        .with_access(vec![AccessKind::Network])
+        .with_access(vec![AccessKind::Network]);
+        // `read_only()` also supplied `Idempotent`, and that claim is false independently of the
+        // effect set: `Idempotent` is what licenses the op cache to serve a stored result *instead
+        // of executing*, and with a record sink wired each call upserts a `web.page` record. A
+        // replayed fetch would skip a durable contribution the caller asked for, and skip the live
+        // page. Repeating is safe, replaying is not — which is exactly `Conditional`.
+        //
+        // Adding `Read` above moved this spec out of `is_consequence_bearing`, so I3 no longer
+        // fires on it. That makes fixing it here load-bearing rather than optional: the invariant
+        // stopped watching, so the declaration has to be right on its own.
+        spec.idempotency = Idempotency::Conditional;
+        spec
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
@@ -879,6 +890,12 @@ mod tests {
         assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);
         assert!(flux_spec::metadata_violations(&t.spec(), &t.semantic_effects()).is_empty());
+        // Pinned explicitly, and this assertion carries more weight than it looks: declaring
+        // `Read` above takes the spec out of `is_consequence_bearing`, so `metadata_violations`
+        // no longer checks idempotency here. This is the only thing standing between
+        // `read_only()`'s inherited `Idempotent` and an op-cache replay that would skip both the
+        // live fetch and the `web.page` record it contributes.
+        assert_eq!(t.spec().idempotency, Idempotency::Conditional);
     }
 
     #[tokio::test]

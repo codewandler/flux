@@ -26,8 +26,8 @@ use flux_core::{Error, Result};
 use flux_datasource::{Record, Source};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{
-    AccessKind, Effect, Intent, IntentBehavior, IntentCertainty, IntentRole, IntentSet,
-    IntentTarget, ToolSpec,
+    AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
+    IntentSet, IntentTarget, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
 
@@ -151,7 +151,7 @@ impl Tool for WebCrawlTool {
                  (a durable datasource write).",
             );
         }
-        ToolSpec::read_only(
+        let mut spec = ToolSpec::read_only(
             "web.crawl",
             description,
             json!({
@@ -181,7 +181,17 @@ impl Tool for WebCrawlTool {
         // alone declares an unread egress. Same reasoning as `web.fetch`; every hop still passes
         // through the `web` egress scope.
         .with_effects(vec![Effect::Read, Effect::Network])
-        .with_access(vec![AccessKind::Network])
+        .with_access(vec![AccessKind::Network]);
+        // `Conditional`, not the `Idempotent` `read_only()` supplies. A crawl fetches up to 50
+        // pages and, with a record sink wired, upserts a `web.page` record per HTML response;
+        // `Idempotent` is the word that lets the op cache return a stored result *instead of
+        // executing*, which would silently skip all of that. Repeatable, never replayable.
+        //
+        // Adding `Read` above took this spec out of `is_consequence_bearing`, so I3 no longer
+        // fires here — the declaration has to stand on its own now that the invariant stopped
+        // watching it.
+        spec.idempotency = Idempotency::Conditional;
+        spec
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
@@ -730,6 +740,11 @@ mod tests {
         assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);
         assert!(flux_spec::metadata_violations(&t.spec(), &t.semantic_effects()).is_empty());
+        // Pinned explicitly: declaring `Read` above takes the spec out of
+        // `is_consequence_bearing`, so `metadata_violations` no longer checks idempotency here.
+        // A crawl replayed from the op cache would skip up to 50 live fetches and every
+        // `web.page` record they contribute.
+        assert_eq!(t.spec().idempotency, Idempotency::Conditional);
     }
 
     #[tokio::test]

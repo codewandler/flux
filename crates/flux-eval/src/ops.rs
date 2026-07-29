@@ -642,13 +642,18 @@ impl Tool for GradeTool {
         .with_effects(vec![Effect::Read, Effect::Process])
         .with_access(vec![AccessKind::Filesystem, AccessKind::Process])
         // …and equally honest about the tier (C-208). `read_only()` supplies `Risk::Low`, which
-        // survived the effect correction above: an op that runs a caller-supplied command was
-        // declaring itself auto-approvable.
+        // survived the effect correction above. Approval was never actually skipped —
+        // `AccessKind::Process` lowers to a `process.exec` requirement whose default grant is
+        // `requires_approval: true`, so a prompt already fired. What `Risk::Low` did do is render
+        // verbatim into the sentence `PlanRisk::summary` shows a human at the plan-approval
+        // prompt: an op that runs a caller-supplied command described as low risk.
         .with_risk(Risk::Medium);
         // `Conditional` rather than `NonIdempotent`: re-grading the same criterion IS safe to
         // repeat — it just must never be served from a stored result, since the workspace it
-        // grades moves underneath it, and `Idempotent` is exactly the word that licenses the op
-        // cache to replay instead of executing.
+        // grades moves underneath it. The op cache also excludes this op on its effect set alone
+        // (it requires every effect to be `Read`, and `Process` is not), so `Idempotent` was an
+        // untrue claim rather than an exploited one — but it was the claim that would license a
+        // replay the moment anything else came to rely on it.
         spec.idempotency = Idempotency::Conditional;
         spec
     }
