@@ -28,7 +28,6 @@ mod board;
 mod host_caps;
 mod ingest;
 mod live;
-mod markdown_board;
 mod memory;
 mod memory_board;
 mod ops;
@@ -57,7 +56,6 @@ pub use live::{
     live_datasource_tools, try_register_live_datasource, validate_live_contract, LiveAccess,
     LiveDatasource, LiveDatasourceSurface,
 };
-pub use markdown_board::MarkdownBoard;
 pub use memory::MemoryBackend;
 pub use memory_board::MemoryBoard;
 pub use ops::{datasource_tools, register_datasource_ops, try_register_datasource_ops};
