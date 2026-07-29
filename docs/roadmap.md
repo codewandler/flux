@@ -116,6 +116,35 @@ addressable message returned from a real opencode database — and a test provin
 performs **zero** reads outside the workspace. Design:
 [designs/harness-history.md](designs/harness-history.md).
 
+### Agent fleet runtime — starting, stopping and finding agents (epic) — 🔄 **DESIGNED (A-119; A-120…A-128 filed, none started)**
+
+The fleet coordinator assumes workers exist at known URLs. Two exhaustive sweeps of the tree
+established that both halves of that assumption are unbacked, and the answers are blunter than
+expected. **Who starts an A2A-reachable agent? A human, in a shell.** Every one is an
+`Arc<FlowEngine>` inside a single foreground `flux` process; `flux-channels/src/host.rs:63-78` is the
+entire supervision story and a fatal channel error kills the process with no restart; there is no
+Dockerfile, no unit file, no manifest, no `--daemon`, and flux never spawns `flux`. `GET /health`
+exists and nothing consumes it; D-63's multi-agent mount is implemented and has no production
+caller. **How does an agent learn a peer exists? It doesn't** — the A2A card answers "what is at
+this URL", never "which agents exist", there is no index route, and roles (`.flux/agents/*.md`) are
+a local persona catalog in a namespace disjoint from A2A entirely. The design's leverage is that the
+missing mechanism is only missing *for agents*: the endpoint broker (D-25…D-32) already fans a
+"which endpoints exist for product X" query out to provider plugins and returns weak refs with
+labels and a `credential_ref` and never a secret — so agents become a **product** on it, and the
+kubernetes plugin can enumerate live pods as fleet members with no config edit and no second
+discovery path. The rest is a new L5 crate, **`flux-fleet`**, built on two axes the design refuses to
+conflate: the **runtime** owns the process (`external` · `proc` · `docker` · `k8s`) and the
+**transport** owns the conversation (`a2a` over HTTP · `ndjson` over stdio), carried in one URI whose
+scheme picks the runtime — `k8s://prod/deploy/flux-worker`, `proc://flux?program=w.flux`,
+`proc://claude?proto=ndjson`. Readiness is `status()`, never `start()` returning, because a
+scheduled pod is not an agent that can take a turn. Two things carry the review weight: `fleet.start`
+on a `proc://` address is **`bash`-class power** and is gated as such, and unifying roles with the
+fleet (a role gains an optional `address`) means `cap_scope` — enforced today by constructing the
+child's registry in-process — becomes a *request* across a trust boundary, which the design surfaces
+as a divergence rather than papering over. Done looks like a coordinator discovering a worker,
+starting it, dispatching to it, watching it through `Ready → Busy → Exited`, and reclaiming its work
+— offline, in CI. Design: [designs/agent-fleet-runtime.md](designs/agent-fleet-runtime.md).
+
 ### Fleet coordinator — flux orchestrating flux across repos (epic) — 🔄 **DESIGNED (A-111; A-112…A-118 filed, none started)**
 
 The ask was a first-level orchestration harness: cross-repo work, Jira, a global board, remote
