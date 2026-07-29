@@ -21,23 +21,32 @@ existing family's risk/access/intent declarations and concrete `permission_subje
 - [ ] A Program can create a branch, merge it with `--no-ff`, assert the result, then revert the
       merge. **Failing-first test**: drive all three from a real `.flux` journey or the equivalent
       op-call harness; prove the ops are absent at the merge base.
-- [ ] `git_merge` on a conflict is a clean recoverable error naming the conflicting files, and the
+      *(branch + merge halves done — `tests::git_ops_branch_create_merge_no_ff_journey`; the revert
+      leg is BLOCKED, see Progress.)*
+- [x] `git_merge` on a conflict is a clean recoverable error naming the conflicting files, and the
       tree is left consistent (not silently half-merged).
+      → `tests::git_merge_conflict_is_recoverable_and_names_the_files`
 - [ ] `git_revert -m 1` reverts a merge commit and the pre-merge tree is restored (verify with a
-      tree diff).
+      tree diff). **BLOCKED** — see Progress.
 - [ ] Concrete `permission_subjects` on all three, consistent with the git family.
+      *(done for `git_branch` / `git_merge` — `git_branch:impl/x`, `git_merge:impl/x`, pinned in the
+      journey test; `git_revert` pending the naming decision.)*
 - [ ] Both op references list all three; the catalog-coherence and website-contract tests stay green.
-- [ ] Standard gate green in both workspaces.
+      *(both references list the two shipped ops; `operations_reference_covers_the_registered_public_catalog`
+      and `the_published_risk_column_matches_the_registry` are green; `git_revert` pending.)*
+- [x] Standard gate green in both workspaces.
 
 ## Progress
-- 2026-07-30 — implementor (worktree `flux-impl-C-238`): `git_branch` + `git_merge` implemented with
-  failing-first tests (registry-driven journey, compiles against the merge base and fails there on
-  the ops' absence). **`git_revert` is BLOCKED**: `crates/flux-eval/src/git.rs` already registers a
-  public op named `git_revert` with *different* semantics (`git reset --hard <snapshot>` + `git
-  clean -fd`, `Risk::Destructive`, used by `examples/improve-*.flux`). `execution.rs` registers both
-  packs into one registry and a duplicate name is a hard startup error, so the story's name cannot
-  be taken without either a registration collision or an unsanctioned breaking rename of the eval
-  op. Options reported to the coordinator: (a) rename the eval op to `git_reset` (honest — it runs
+- 2026-07-30 — implementor (worktree `flux-impl-C-238`, branch `flux-impl-C-238`): `git_branch` +
+  `git_merge` implemented with failing-first tests (registry-driven journey, compiles against the
+  merge base and fails there on the ops' absence). Full gate green: build, 3083 tests across 153
+  suites, clippy `-D warnings`, fmt (root + plugins), flux-codegate, check-crate-versions.
+  **`git_revert` is BLOCKED**: `crates/flux-eval/src/git.rs` already registers a public op named
+  `git_revert` with *different* semantics (`git reset --hard <snapshot>` + `git clean -fd`,
+  `Risk::Destructive`, used by `examples/improve-*.flux`). `execution.rs` registers both packs into
+  one registry and a duplicate name is a hard startup error, so the story's name cannot be taken
+  without either a registration collision or an unsanctioned breaking rename of the eval op.
+  Options reported to the coordinator: (a) rename the eval op to `git_reset` (honest — it runs
   `git reset --hard`), freeing `git_revert` for the true revert semantics (breaking: shipped example
   flows + website docs name it); (b) ship the new op under a different name (e.g.
   `git_revert_commit`) — the catalog then carries two similarly-named ops with opposite history

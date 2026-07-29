@@ -6314,7 +6314,13 @@ mod tests {
         );
 
         // Land work on the branch through the existing family.
-        let r = call_op(&registry, &c, "git_checkout", json!({"branch": "impl/item-1"})).await;
+        let r = call_op(
+            &registry,
+            &c,
+            "git_checkout",
+            json!({"branch": "impl/item-1"}),
+        )
+        .await;
         assert!(!r.is_error, "{}", r.content);
         WriteTool
             .execute(
@@ -6323,9 +6329,21 @@ mod tests {
             )
             .await
             .unwrap();
-        let r = call_op(&registry, &c, "git_stage", json!({"paths": ["feature.txt"]})).await;
+        let r = call_op(
+            &registry,
+            &c,
+            "git_stage",
+            json!({"paths": ["feature.txt"]}),
+        )
+        .await;
         assert!(!r.is_error, "{}", r.content);
-        let r = call_op(&registry, &c, "git_commit", json!({"message": "add feature.txt"})).await;
+        let r = call_op(
+            &registry,
+            &c,
+            "git_commit",
+            json!({"message": "add feature.txt"}),
+        )
+        .await;
         assert!(!r.is_error, "{}", r.content);
         let r = call_op(&registry, &c, "git_checkout", json!({"branch": "main"})).await;
         assert!(!r.is_error, "{}", r.content);
@@ -6344,8 +6362,14 @@ mod tests {
         .await;
         assert!(!r.is_error, "{}", r.content);
         let merges = raw_git(&dir, &["log", "--oneline", "--merges"]);
-        assert!(!merges.is_empty(), "a --no-ff merge commit exists: {merges}");
-        assert!(dir.join("feature.txt").exists(), "the merge landed the work");
+        assert!(
+            !merges.is_empty(),
+            "a --no-ff merge commit exists: {merges}"
+        );
+        assert!(
+            dir.join("feature.txt").exists(),
+            "the merge landed the work"
+        );
         assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
 
         // Concrete subjects name the merged ref.
@@ -6466,7 +6490,10 @@ mod tests {
             let r = call_op(&registry, &c, "git_branch", json!({"name": bad})).await;
             assert!(r.is_error, "name {bad:?} must be refused");
         }
-        assert_eq!(raw_git(&dir, &["branch", "--format=%(refname:short)"]), "main");
+        assert_eq!(
+            raw_git(&dir, &["branch", "--format=%(refname:short)"]),
+            "main"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
