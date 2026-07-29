@@ -39,21 +39,17 @@ and the server.
 
 ## What flux includes
 
-Flux is one platform with three co-equal pillars:
+Three co-equal pillars:
 
-- **Agent**: local CLI/TUI, Rust SDK, HTTP server, and A2A support.
-- **Flux-Lang**: typed, authored flows for orchestration and reliable structure, with editor support — the in-repo
+- **Agent** — local CLI/TUI, Rust SDK, HTTP server, A2A support.
+- **Flux-Lang** — typed, authored flows for orchestration and reliable structure, with the in-repo
   `flux-lsp` language server (diagnostics, completion, hover, formatting) and a
-  [tree-sitter grammar](https://github.com/codewandler/flux-tree-sitter) for Helix/Neovim/Zed
-  highlighting.
-- **Improvement loop**: evidence-driven eval and self-improvement tooling.
+  [tree-sitter grammar](https://github.com/codewandler/flux-tree-sitter) for Helix/Neovim/Zed.
+- **Improvement loop** — evidence-driven eval and self-improvement tooling.
 
-Use flux when you want:
-
-- an action batch you can inspect and approve before execution
-- guardrails that are explicit and consistent
-- deterministic replay/fork/diff workflows
-- an embeddable agent surface inside your own product
+Reach for flux when you want an action batch you can inspect and approve before it runs, guardrails
+that are explicit rather than implied, deterministic replay/fork/diff, or an embeddable agent
+surface inside your own product.
 
 ## Install
 
@@ -178,18 +174,18 @@ Sub-agents inherit the same safety chain; their loops and operation calls are va
 
 ## Capabilities and operations
 
-- Built-in tools include file, search, web, and delegation operations.
-- Optional shell support (`bash`) is available behind the `shell` signal.
-- Skills and markdown slash-command files load from both the `.flux/` and `.claude/` trees
-  (project and user-global, including nested multi-file skills); skills stay manual-only by
-  default, with an opt-in model-invoked mode.
-- Plugin operations are manifest-scoped; privileges are explicit and enforced.
-- Approval and policy hooks (`.flux/hooks/*.js`) can validate/transform/deny calls.
+- Built-in tools cover file, search, web, and delegation operations. Optional shell (`bash`) sits
+  behind the `shell` signal.
+- Skills and markdown slash-commands load from both the `.flux/` and `.claude/` trees (project and
+  user-global, nested multi-file skills included). Skills are manual-only by default, with an
+  opt-in model-invoked mode.
+- Plugin operations are manifest-scoped, with explicit enforced privileges. Approval and policy
+  hooks (`.flux/hooks/*.js`) can validate, transform, or deny calls.
 - REPL slash commands include `/tools`, `/sessions`, `/compact`, `/evidence`, and more.
-- `flux tui` provides the same daily-driver controls in a dense borderless UI: mid-turn steering
-  (type while a turn runs; queued messages stay editable in `/queue` until the agent picks them
-  up), themes (`/theme`), history and transcript search (Ctrl-R / Ctrl-F), `@` file-path
-  completion, hunk-view diffs, session picker/replay, multiline paste, and live model switching.
+- `flux tui` is the same daily driver in a dense borderless UI — mid-turn steering (type while a
+  turn runs; queued messages stay editable in `/queue`), themes, history and transcript search
+  (Ctrl-R / Ctrl-F), `@` path completion, hunk-view diffs, session picker/replay, and live model
+  switching.
 
 ## HTTP API
 
@@ -243,36 +239,32 @@ The plugin release index is minisign-checked and each archive hash is verified b
 
 ## Documentation
 
-- Public docs: [codewandler.github.io/flux](https://codewandler.github.io/flux/)
-- Getting started: [Getting started](https://codewandler.github.io/flux/docs/getting-started)
-- Agent loop: [The agent loop](https://codewandler.github.io/flux/docs/agent/agent-loop)
-- Language guide: [Flux-Lang overview](https://codewandler.github.io/flux/docs/language/overview)
-- Editor support: [Editor setup](https://codewandler.github.io/flux/docs/language/editors)
-- SDK: [SDK overview](https://codewandler.github.io/flux/docs/sdk/overview)
-- Plugins: [Using plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins)
+Full docs: **[codewandler.github.io/flux](https://codewandler.github.io/flux/)** —
+[getting started](https://codewandler.github.io/flux/docs/getting-started) ·
+[the agent loop](https://codewandler.github.io/flux/docs/agent/agent-loop) ·
+[Flux-Lang](https://codewandler.github.io/flux/docs/language/overview) ·
+[editor setup](https://codewandler.github.io/flux/docs/language/editors) ·
+[SDK](https://codewandler.github.io/flux/docs/sdk/overview) ·
+[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins).
 
-See `docs/usage.md` for the internal command surface map and additional CLI details.
-
-## Architecture
-
-flux is a layered Rust workspace from contracts to extensions. The safety guarantees are enforced by the
-runtime layer and checked by a dedicated architecture gate (`flux-codegate`). For full detail:
-
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/vision.md`](docs/vision.md)
-- [AGENTS.md](AGENTS.md) (agent operating instructions)
+In-repo: [`docs/architecture.md`](docs/architecture.md) ·
+[`docs/vision.md`](docs/vision.md) · [`docs/usage.md`](docs/usage.md) (command surface map).
 
 ## Development
 
-For contributors:
+flux is a layered Rust workspace from contracts to extensions; the safety guarantees are enforced by
+the runtime layer and checked by an architecture gate (`flux-codegate`).
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
-cargo test -p flux-codegate
+cargo test -p flux-codegate                              # architecture layering lint
 ```
+
+**[AGENTS.md](AGENTS.md) is the authoritative contributor contract** — architecture boundaries,
+safety invariants, conventions, and release mechanics.
 
 ## License
 

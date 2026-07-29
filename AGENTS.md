@@ -1,42 +1,52 @@
 # AGENTS.md — operating contract for agents in flux
 
-This file is written for **coding agents and automation** working in this repository. Human contributors may use it too, but the human product entry point is [README.md](README.md). **Read this before making any change.** It is the authoritative reference for repo workflow, architecture boundaries, safety invariants, and the dev loop. When in doubt, this file and the docs it links are the tie-breaker.
+For **coding agents and automation**. Human product entry point: [README.md](README.md).
+**Read this before making any change.** When in doubt, this file and the docs it links are the
+tie-breaker.
+
+This file holds only what you must know *before* acting. Anything a test, script, or CI job already
+catches is a pointer, not an essay.
 
 ---
 
 ## Agent mandate
 
-- **Serve the newest user request first.** If the user named a task, story, file, or command, that scopes the work. If they did not name work, open the board and take the top `ready` story by priority.
-- **Protect the user's worktree.** Start with `git status --short --branch`; assume uncommitted changes are user-owned unless you made them. Do not reset, discard, rebase, rewrite history, or force-push unless the user explicitly asks.
-- **Keep the architecture honest.** The LLM is not the runtime; all real effects flow through authorization → approval → guarded IO. Never add bypass paths, even for convenience.
-- **Make changes auditable.** Non-trivial behavior needs a story or design trail, a failing-first test, and a CHANGELOG entry. If the work is purely docs/metadata, keep the scope tight and still note user-visible documentation changes in the changelog.
-- **Finish the loop.** Implement, verify with the relevant gate, report any command you could not run, and only commit when explicitly instructed.
+- **Serve the newest user request first.** If the user named a task, story, file, or command, that scopes the work. If not, open the board and take the top `ready` story by priority.
+- **Protect the user's worktree.** Start with `git status --short --branch`; assume uncommitted changes are user-owned unless you made them. Never reset, discard, rebase, rewrite history, or force-push unless explicitly asked.
+- **Keep the architecture honest.** The LLM is not the runtime; all real effects flow through authorization → approval → guarded IO. **There are no bypass paths. Don't add one.**
+- **Make changes auditable.** Non-trivial behavior needs a story or design trail, a failing-first test, and a CHANGELOG entry.
+- **Finish the loop.** Implement, verify with the gate, report any command you could not run, and **only commit when explicitly instructed**.
 
 ---
 
 ## Start here (every session)
 
-1. **Orient** — read the latest user request, then run `git status --short --branch`. If you are resuming prior work, also read the relevant local plan in [`.flux/plans/`](.flux/plans/) when one exists.
-2. **Product** — flux is a deterministic agent platform on one thesis (*the LLM is not the runtime*) with three co-equal pillars: the **Agent**, the **Language** (Flux-Lang), and the **Improvement** loop. If you don't already hold this, skim [docs/README.md](docs/README.md) and [docs/vision.md](docs/vision.md).
-3. **What to work on** — if the user named work, do that. Otherwise open the board: **[docs/stories/README.md](docs/stories/README.md)** and take the top `ready` story by priority.
-4. **The contract** — for story work, read `docs/stories/<id>-*.md`; its **Goal + Acceptance** define what "done" means.
-5. **Do the work** — non-trivial design goes in [docs/designs/](docs/designs/); implement; satisfy Acceptance with a **failing-first test**; run the relevant dev loop below until the gate is green.
-6. **On done** — for story work, set the story's `status: done`, remove its row from the board, add a CHANGELOG entry, and keep design/plan docs in sync. For direct user requests, update only the docs/changelog/tests that the change actually warrants.
-7. **New or unscoped work?** Create a story first from [docs/stories/_TEMPLATE.md](docs/stories/_TEMPLATE.md) so the next agent inherits the context.
+1. **Orient** — read the request, run `git status --short --branch`. Resuming? Read the relevant plan in [`.flux/plans/`](.flux/plans/).
+2. **What to work on** — the user's named work, else the board: **[docs/stories/README.md](docs/stories/README.md)**, top `ready` story by priority.
+3. **The contract** — for story work read `docs/stories/<id>-*.md`; its **Goal + Acceptance** define "done".
+4. **Do the work** — non-trivial design goes in [docs/designs/](docs/designs/); satisfy Acceptance with a **failing-first test**; run the gate until green.
+5. **On done** — set `status: done`, remove the board row, add a CHANGELOG entry (+ `WHATS-NEW.md` if user-visible), keep design/plan docs in sync.
+6. **New or unscoped work?** Create a story from [docs/stories/_TEMPLATE.md](docs/stories/_TEMPLATE.md) first.
 
 ---
 
 ## What flux is
 
-A Rust **agent SDK, harness, and coding agent** built as one Cargo workspace of small, strictly-layered crates. The defining idea: **the LLM is not the runtime.** Typed model stages detect intent, gather evidence through exact native operation schemas, ask questions, and propose literal calls; authored Flux-Lang owns control flow, while a deterministic runtime freezes effects into action batches and executes them through one mandatory safety envelope — authorization → approval → guarded IO. The model never authors executable Flux. Every operation, whether a file read, a shell command, a sub-agent call, or a plugin operation, traverses that envelope. **There are no bypass paths. Don't add one.**
+A Rust **agent SDK, harness, and coding agent** — one Cargo workspace of small, strictly-layered
+crates. **The LLM is not the runtime:** typed model stages detect intent, gather evidence, and
+propose literal calls; authored Flux-Lang owns control flow; a deterministic runtime freezes effects
+into action batches and executes them through one safety envelope — authorization → approval →
+guarded IO. The model never authors executable Flux. Every operation traverses that envelope.
 
-For the *why*, read [docs/vision.md](docs/vision.md). For the full design, [docs/architecture.md](docs/architecture.md). For status and next steps, [docs/roadmap.md](docs/roadmap.md). Active work-in-progress plans live in [`.flux/plans/`](.flux/plans/) (local, gitignored) — read the relevant plan before continuing that work.
+Why: [docs/vision.md](docs/vision.md) · design: [docs/architecture.md](docs/architecture.md) ·
+status: [docs/roadmap.md](docs/roadmap.md).
 
-**The headline principle that governs review: quality over quantity. flux is deliberately not a sprawling, bug-ridden codebase. Every behavioral change ships with a test, and the gate stays green.**
+**The principle that governs review: quality over quantity.** Every behavioral change ships with a
+test, and the gate stays green.
 
 ---
 
-## Dev loop — run this before calling a change done
+## Dev loop — run before calling a change done
 
 ```bash
 cargo build --workspace
@@ -46,107 +56,72 @@ cargo fmt --all                                          # then commit the resul
 cargo test -p flux-codegate                              # architecture layering lint
 ```
 
-CI enforces all of these. A change is not finished until every command above is green.
-
-Docs-only changes may use a narrower check, but be explicit in the final report about what was and was not run. If you touched generated docs, language catalogs, tool catalogs, or skills, run the sync tests named in the relevant section below.
-
----
-
-## Worktree discipline
-
-- Use `rg` / `rg --files` for repo search and read the surrounding code before editing.
-- Prefer `apply_patch` for manual edits. Do not rewrite unrelated files or normalize formatting outside the scope of the task.
-- Ignored build/dependency output (`target/`, `plugins/target/`, `website/node_modules/`) is disposable local state; never add it to Git.
-- If history rewrite or force-push is explicitly requested, make a local backup first, use `--force-with-lease` when updating branches, and audit affected tags before pushing them.
-- Commit only on explicit user instruction. Use the semantic commit format in the **Commits** section.
+CI enforces all of these. Docs-only changes may use a narrower check — say explicitly in the final
+report what was and was not run. `cargo fmt --check` must also be clean in the **nested `plugins/`
+workspace** if you touched it.
 
 ---
 
-## Architecture & the layering rule
+## Architecture — the layering rule
 
-Crates are stratified into layers (0 = innermost contracts, 6 = outermost surfaces). **A crate may depend only on its own layer or lower ones.** This is enforced by a test in `flux-codegate` (`crates/flux-codegate/src/lib.rs`) — it is not a convention, it is a gate.
+Crates are stratified L0 (innermost contracts) → L6 (outermost surfaces): **L0** contracts ·
+**L1** providers · **L2** runtime · **L3** agent · **L4** extensibility · **L5** capabilities ·
+**L6** surfaces. **A crate may depend only on its own layer or lower.** This is a gate, not a
+convention — enforced by `cargo test -p flux-codegate`; the authoritative map is that crate's
+`layer()` function. Full topology: [docs/architecture.md](docs/architecture.md).
 
-| Layer | Crates | Role |
-|---|---|---|
-| **L0 contracts** (pure, no IO¹) | `flux-core` `flux-policy` `flux-secret` `flux-spec` `flux-config` `flux-evidence` `flux-skill` `flux-markdown` `flux-datasource` `flux-audio` `flux-lang` | types, authorization, secrets, tool specs, config, evidence, skills, markdown/frontmatter, datasource record/retrieval contract, PCM16 audio sample math, the Flux-Lang language + reference interpreter |
-| **L1 providers** | `flux-provider` `flux-providers` `flux-credentials` `flux-a2a` `flux-pg` | the `Provider` abstraction + the concrete clients (`flux-providers` modules: `messages` core, `anthropic`, `openai`, `openrouter`, `ollama`, `bedrock`, `codex`, plus `realtime/`) + credential store + the A2A agent-protocol client/wire types + the Postgres driver-owner (`flux-pg`: the sole `sqlx` dep + pool + a panic-safe sync↔async bridge, backing the opt-in `postgres` feature on `flux-events`/`flux-capabilities`) |
-| **L2 runtime** | `flux-system` `flux-runtime` `flux-tools` `flux-events` | guarded IO, the safety envelope (+ the `context` projector module), built-in tools, the event store (embedded SQLite by default; opt-in Postgres) |
-| **L3 agent** | `flux-agent` `flux-orchestrate` `flux-flow` `flux-eval` `flux-cognition` | agent definitions (`AgentSpec`/`Role`) + multi-agent orchestration + the Flux-Lang engine (the one turn loop) + the eval harness + the model-op cognition pack |
-| **L4 extensibility** | `flux-plugin` | subprocess plugins + the JS pre-tool `hooks` module |
-| **L5 capabilities** | `flux-capabilities` `flux-auth` `flux-web` | web + datasource/RAG tools; native web request/read/browse (`flux-web`); caller identity (kept separate) |
-| **L6 surfaces** | `flux-sdk` `flux-server` `flux-tui` `flux-cli` `flux-app` `flux-channels` `flux-lsp` | SDK, HTTP server, TUI, the `flux` binary, the multi-agent program runtime host (`flux run app.flux`), event-trigger channels (cron/webhook/Slack), the Flux-Lang language server (`flux-lsp` binary; diagnostics/completion/hover/formatting) |
-
-Key rules:
-- **`flux-runtime` (L2) must not depend on `flux-auth` (L5).** Surfaces resolve identity
-  (`LocalIdentity` / `OidcIdentity`) into a `(Caller, Trust)`, pair it with the policy in an atomic
-  `ExecutionAuthorization`, and pass that through `ExecutionEnvironment`.
-- `flux-evidence`, `flux-skill`, `flux-config`, `flux-markdown`, and `flux-lang` are L0 leaves — no flux deps beyond other L0 — so runtime/agent crates may depend on them without a layering violation. `flux-skill` builds on `flux-markdown` (frontmatter); both stay L0. `flux-markdown`'s render wrappers (over `codewandler/markdown`) are behind off-by-default `ratatui`/`terminal` features, so its default build pulls no UI deps. `flux-flow` (L3, the Flux-Lang engine) builds on `flux-lang` and re-exports it as a facade.
 - **If you add a crate, classify it in `flux-codegate`'s `layer()` map** or the lint fails.
-- **The conversational text-agent loop is itself Flux-Lang, and it is the one loop on every text surface** — `crates/flux-flow::FlowEngine` runs `crates/flux-flow/assets/agent-loop.flux`. Its typed stages detect intent, resolve the live capability ceiling, explore through provider-native operation schemas, freeze effectful calls into an `ActionBatch`, approve and execute that exact batch, then present results. The model never emits executable Flux. `FlowEngine::run_turn_cancellable` is a thin bootstrap, not the loop. The SDK and sub-agent spawner assemble the same engine through `flux_agent::AgentSpec`; `flux-agent` owns definitions (`AgentSpec` + markdown `Role`) and `AgentSink` lives in `flux-flow`. Flow-driven voice selects an explicit authored flow; the lower-level model-driven realtime mode is an explicit provider-owned exception whose effects still traverse `Executor`.
-
-> ¹ `flux-lang` is the language **and its reference interpreter**, so it uses `tokio`/async; its L0-purity means "no L1+ flux deps; all effects (op dispatch, value store, observation sink) injected via traits", not "no async". Every other L0 crate is genuinely IO-free.
-
----
-
-## Binaries — what builds to an executable, and why
-
-The repo deliberately ships **one** product binary. Every other executable is either dev tooling or exists because a protocol demands a separate process. Don't add a new binary without the same kind of justification.
-
-- **`flux`** (`crates/flux-cli`) — the product: agent CLI/REPL, flow/app runner, plugin manager, server, replay, auth, usage. The **only** binary in the release artifacts (everything else is `dist = false` or lives outside the dist workspace).
-- **`fluxlang`** (`crates/flux-lang/src/bin/fluxlang.rs`) — the language workbench: `skill` / `schema [--merged]` / `render` / `compile` over the pure language core. It proves Flux-Lang stands alone without the engine. It builds from `flux-lang` only, is feature-gated behind `cli`, and is `dist = false`. Users get everything through `flux`; `fluxlang` is for language developers inspecting schemas, authored JSON ASTs, and `compile(format(ast))` round-trips.
-- **`flux-lsp`** (`crates/flux-lsp`) — the Flux-Lang language server. A separate binary because LSP requires one: editors spawn it as a child process speaking JSON-RPC over stdio. Deliberately unprefixed and unpublished, but `dist = true` since L-70 — it is built for every release target alongside `flux` so editors can install it without a Rust toolchain.
-- **`echo_plugin` / `caps_plugin`** (`crates/flux-plugin/src/bin/`) — minimal test/example plugins that let the plugin host's process protocol be integration-tested without a real external service.
-- **`flux-plugin-*`** (`plugins/`, the nested workspace) — every integration plugin (gitlab, slack, kubernetes, …) is its own binary by design: plugins run as env-cleared child processes spawned by the host, so each one must be an executable. They ship via the signed plugins release, not the main `flux` release.
+- **`flux-runtime` (L2) must not depend on `flux-auth` (L5).** Surfaces resolve identity into a `(Caller, Trust)`, pair it with policy in an atomic `ExecutionAuthorization`, and pass that through `ExecutionEnvironment`.
+- **The conversational text-agent loop is itself Flux-Lang, and it is the one loop on every text surface** — `flux-flow::FlowEngine` runs `crates/flux-flow/assets/agent-loop.flux`. `run_turn_cancellable` is a thin bootstrap, not the loop. The SDK and sub-agent spawner assemble the same engine via `flux_agent::AgentSpec`.
 
 ---
 
 ## Non-negotiable conventions
 
-- **All real filesystem / process / network IO goes through `flux-system`** (`System` / `Workspace`). Tools never touch `std::fs` or `std::process::Command` directly. The guarded surface enforces workspace confinement, symlink/escape rejection, and **argv-only** execution — never build a shell string from model input.
+- **All real filesystem / process / network IO goes through `flux-system`** (`System` / `Workspace`). Tools never touch `std::fs` or `std::process::Command` directly. **argv-only** execution — never build a shell string from model input.
 - **Every tool runs through `Executor::dispatch`** (`flux-runtime`). Don't call a tool's `execute` directly outside tests; the dispatcher is the policy/approval/redaction gate.
-- **Secrets never appear in logs or model-visible output as raw values.** Register them with the `Redactor` (`flux-secret`) and let `dispatch` scrub results. Use `secret:env/KEY` refs, not literals.
-- **Errors:** library crates return `flux_core::Result<T>` / `flux_core::Error` (`thiserror`); the `flux` binary uses `anyhow`. Don't `unwrap()` in non-test code on fallible IO. **Wire-seam exception:** where the error crosses a protocol boundary as the payload itself — a plugin frame's `err` field, an A2A JSON-RPC error object, a `HostCapabilities`/`ReferenceResolver` host-capability callback result — `Result<_, String>` is correct, and an internal helper whose only job is feeding that seam may keep the same shape; every other signature follows the `flux_core::Result` convention.
-- **Async** is `tokio`. Long-running agent work must stay cancellable — thread the `tokio_util::sync::CancellationToken` through the agent loop, `Spawner::spawn`, and the orchestration functions.
-- **Match the surrounding code** — comment density, naming, module layout. Keep doc comments on public items.
+- **Secrets never appear in logs or model-visible output as raw values.** Register them with the `Redactor` (`flux-secret`). Use `secret:env/KEY` refs, not literals.
+- **Errors:** library crates return `flux_core::Result<T>`/`Error` (`thiserror`); the `flux` binary uses `anyhow`. No `unwrap()` in non-test code on fallible IO. *Wire-seam exception:* where the error crosses a protocol boundary as the payload itself (plugin frame `err`, A2A JSON-RPC error, host-capability callback), `Result<_, String>` is correct.
+- **Async is `tokio`, and long-running agent work stays cancellable** — thread `CancellationToken` through the agent loop, `Spawner::spawn`, and orchestration.
+- **Match the surrounding code** — comment density, naming, module layout. Doc comments on public items.
 
 ---
 
 ## Safety invariants — never regress these
 
-Each invariant below was established (and several re-learned the hard way) during security review. Each is covered by a test. **A regression here is a release blocker, not a nit.**
+Each was established during security review and is covered by a test. **A regression here is a
+release blocker, not a nit.** Read these before adding a turn-termination path, a process launch, a
+network call, or a plugin capability.
 
-- **Session shape is always a valid provider history.** Every turn-termination path (normal stop, cancel, compaction, *max-iterations*) must leave the log free of: an empty assistant message, a split tool_use/tool_result pair, or a user-after-user sequence. This bug class has recurred three times (cancel, compaction, iteration cap) — treat any new termination path as suspect. The mock provider does **not** catch it; only a live provider 400 does (see the pre-release gate in [docs/roadmap.md](docs/roadmap.md)).
-- **Caller identity is immutable for a live turn.** Multi-principal surfaces pass a request-owned
-  `TurnIdentity` through `FlowEngine::run_turn_as` / `run_turn_cancellable_as`; never reintroduce a
-  mutable executor identity cell or an outer-surface swap. The engine gate, lexical runtime context,
-  policy/receipt/audit reads, and supervised child spawn must all observe the same frozen identity.
-- **`permission_subjects` must be accurate.** A tool that declares a `Write` effect but reports no subjects is forced to approval — an unscoped write would otherwise match a `*` path grant. Don't return empty subjects to dodge gating.
-- **Plugin host capabilities are deny-by-default and manifest-scoped.** A plugin may only run programs / read secret keys / reach HTTP hosts / dial connection targets that its manifest declares; `SystemHostCaps` checks every callback. Private/loopback egress also requires an operator config grant for that plugin. Never widen this to "all plugins get everything."
-- **All web egress goes through `flux_system::net::guard_url_scoped` / `guard_url`.** It resolves hostnames to IPs and blocks private/loopback/link-local/unique-local/CGNAT/IPv4-mapped ranges + internal hostnames unless the caller has a scoped private-net grant. Don't hand-roll a second URL guard.
-- **The HTTP server is authenticated.** `flux-server` requires a bearer token on every route except `/health` and the A2A discovery card; a non-loopback bind without `FLUX_SERVER_TOKEN` is refused. The daemon auto-approves tools, so an open listener is RCE.
-- **One guarded path starts every OS process.** All process creation — `run`, `spawn_background`, the streamed runner, **and launching a plugin binary** — goes through `flux_system::System` (built by one `build_command`): argv-only (no shell), workspace-pinned cwd, env **cleared** to a minimal non-secret allow-list, output byte-capped. Don't add a second `Command::new`; route through `System`. Because the plugin process itself is env-cleared, a plugin cannot read the host's secrets via `std::env` — the gated `secret` capability is the only path. Untrusted bytes (HTTP bodies, plugin frames) are truncated on char boundaries — never `String::truncate` at a byte offset.
-- **Provider bytes never error a chunk stream.** Every codec in `flux-providers` skips + counts an unparseable SSE/frame envelope (surfacing a `Chunk::StreamDiagnostic` at stream end) instead of `?`-propagating a parse error; only *declared* provider failures (`response.failed`, `StreamEvent::Error`, bedrock `exception` frames) stay fatal. Enforced structurally: `crates/flux-providers/clippy.toml` bans bare `serde_json::from_*` (disallowed-methods), and `envelope_corpus.rs` proves it under systematic truncation/junk-injection/corruption. See [docs/designs/stream-resilience.md](docs/designs/stream-resilience.md).
+- **Session shape is always a valid provider history.** Every turn-termination path (normal stop, cancel, compaction, *max-iterations*) must leave the log free of: an empty assistant message, a split tool_use/tool_result pair, or a user-after-user sequence. This class has recurred three times — treat any new termination path as suspect. **The mock provider does not catch it**; only a live provider 400 does.
+- **Caller identity is immutable for a live turn.** Multi-principal surfaces pass a request-owned `TurnIdentity` through `run_turn_as`/`run_turn_cancellable_as`. Never reintroduce a mutable executor identity cell or an outer-surface swap.
+- **`permission_subjects` must be accurate.** A tool declaring a `Write` effect but reporting no subjects is forced to approval — an unscoped write would otherwise match a `*` path grant. Don't return empty subjects to dodge gating.
+- **Plugin host capabilities are deny-by-default and manifest-scoped.** A plugin may only run programs / read secret keys / reach HTTP hosts / dial targets its manifest declares. Private/loopback egress additionally needs an operator config grant. Never widen to "all plugins get everything".
+- **All web egress goes through `flux_system::net::guard_url_scoped`/`guard_url`** — resolves hostnames to IPs and blocks private/loopback/link-local/ULA/CGNAT/IPv4-mapped ranges unless the caller holds a scoped private-net grant. Don't hand-roll a second URL guard.
+- **The HTTP server is authenticated.** `flux-server` requires a bearer token on every route except `/health` and the A2A discovery card; a non-loopback bind without `FLUX_SERVER_TOKEN` is refused. The daemon auto-approves tools — an open listener is RCE.
+- **One guarded path starts every OS process.** All process creation — including launching a plugin binary — goes through `flux_system::System` (one `build_command`): argv-only, workspace-pinned cwd, env **cleared** to a minimal non-secret allow-list, output byte-capped. Don't add a second `Command::new`. Because the plugin process is env-cleared, a plugin cannot read host secrets via `std::env`. Truncate untrusted bytes on **char** boundaries, never `String::truncate` at a byte offset.
+- **Provider bytes never error a chunk stream.** Codecs skip + count an unparseable SSE/frame envelope (surfacing `Chunk::StreamDiagnostic` at stream end) instead of `?`-propagating; only *declared* provider failures stay fatal. Enforced structurally: `crates/flux-providers/clippy.toml` bans bare `serde_json::from_*`. See [docs/designs/stream-resilience.md](docs/designs/stream-resilience.md).
 
 ---
 
 ## Where to make a change
 
-- **Add a built-in tool:** implement `flux_runtime::Tool` (spec + `permission_subjects` + `intents` + `execute`) in `flux-tools`, do IO via `ctx.system`, register it in `register_builtins`. Declare accurate `effects` so the policy layer gates it correctly. Tools with a `group` field are only surfaced when that group's signal is detected (e.g. `"rust"` tools appear only in Rust workspaces) — add the op to the group's `tools` list in `groups.rs` and to the `builtins_register` test's expected name list. Keep the catalog docs in sync: `crates/flux-flow/docs/ops-reference.md` (and `crates/flux-lang/docs/reference.md` for language nodes).
-- **The generic `bash` op is opt-in.** It lives in the off-by-default `shell` group, so it is *not* advertised unless the workspace opts in — config `enable_shell = true`, env `FLUX_ENABLE_BASH=1`, or the `/shell` REPL toggle (each injects the `shell` signal via `detect_signals`). Prefer adding a dedicated, accurately-gated op over widening reliance on `bash`; the dedicated ops (`now`/`cwd`/`sys_info`, `git_*`, the `cargo_*`/`go_*`/`python`/`node`/`make` toolchains, the pure `expr`/`jq`/`fmt` + cognition list ops) exist to keep `bash` unnecessary.
-- **Add a provider:** a provider = `WireCodec` × `Credential` composed by `NativeProvider` (`flux-provider`). Add the codec/credential in the relevant `flux-providers` module (`anthropic`/`openai`/`openrouter`/`ollama`, or a new one) — Messages-protocol providers reuse `crate::messages`; wire model routing in `flux-cli`'s `build_provider`.
-- **Define an agent:** an agent = a `flux_agent::AgentSpec` (model, persona/system prompt, skills, tool selection, permissions, settings) assembled onto a `FlowEngine` (`AgentSpec::assemble`/`into_engine`). The markdown **`Role`** format (`flux_agent::Role`, parsed from `.flux/agents/<role>.md`) is the file-defined form — `Role::to_spec` turns it into an `AgentSpec`.
-- **Add a sub-agent role:** drop a markdown file in `.flux/agents/<role>.md` (frontmatter `description`/`model`/`tools`, body = system prompt), or add to the CLI defaults. `model:` accepts the same spec form as `-m` (bare id, or `provider/model`), but the leading provider must be the parent's own — sub-agents inherit the parent's provider, so a different provider prefix fails fast at spawn time instead of reaching the wire (`flux_core::resolve_role_model`).
-- **Add a skill:** drop a `.md` (or a dir with `SKILL.md`) in `.flux/skills` (project) or a user-global dir (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`; project wins on a name clash). Both the flux-native (`triggers:` frontmatter) and Agent-Skills/Claude (`name` + `description`, no triggers) formats are read by `flux-skill` (which parses frontmatter via `flux-markdown`). Discovery does not activate a skill: the CLI requires repeatable `--skill <name>`, and embedded agents explicitly populate `AgentSpec.skills`. Metadata triggers remain inert compatibility data until a measured router justifies enabling them.
-- **Write a plugin:** **read [`plugins/AUTHORING.md`](plugins/AUTHORING.md) first** — the canonical guide (lifecycle, the host-does-all-IO invariant, the capability set, the rules). In short: any executable speaking the framed NDJSON protocol in `flux-plugin` (the Rust SDK `serve` + `PluginHandler` + `GuestHost`, or `host-kit`'s `PluginBuilder`, is the reference). Operations are projected as policy-gated tools; privileged IO is requested back from the host via declared capability callbacks; the plugin process is env-cleared, so host secrets are available only through gated callbacks. Plugin binaries are trusted dependencies, not OS-sandboxed code.
-- **Rebuild/install the plugin pack:** the native plugins are a nested Cargo workspace excluded from the root workspace. Use `task plugins:install` to build every `flux-plugin-*` binary in release mode and register them under `~/.flux/plugins`; use `task plugins:build` when you only need the binaries. The direct form is `cargo build --manifest-path plugins/Cargo.toml --workspace --release` followed by `flux plugin install "$PWD/plugins/target/release"`.
+- **Add a built-in tool:** implement `flux_runtime::Tool` (spec + `permission_subjects` + `intents` + `execute`) in `flux-tools`, IO via `ctx.system`, register in `register_builtins`. Declare accurate `effects`. Tools with a `group` are surfaced only when that group's signal is detected — add the op to `groups.rs` and to the `builtins_register` test's expected names. Mirror the catalog in `crates/flux-flow/docs/ops-reference.md`.
+- **The generic `bash` op is opt-in** (off-by-default `shell` group; `enable_shell = true`, `FLUX_ENABLE_BASH=1`, or `/shell`). Prefer a dedicated, accurately-gated op over widening reliance on `bash`.
+- **Add a provider:** a provider = `WireCodec` × `Credential` composed by `NativeProvider`. Add the codec/credential in the relevant `flux-providers` module — Messages-protocol providers reuse `crate::messages` — and wire routing in `flux-cli`'s `build_provider`.
+- **Define an agent:** an `AgentSpec` (model, persona, skills, tools, permissions) assembled onto a `FlowEngine`. The markdown `Role` (`.flux/agents/<role>.md`) is the file-defined form.
+- **Add a sub-agent role:** markdown in `.flux/agents/<role>.md`. `model:` takes the same spec form as `-m`, but the provider prefix **must be the parent's own** — sub-agents inherit the parent's provider and a foreign prefix fails fast at spawn.
+- **Add a skill:** `.md` (or dir with `SKILL.md`) in `.flux/skills` or a user-global dir (`~/.flux/skills`, `~/.agents/skills`, `~/.claude/skills`; project wins). Both flux-native (`triggers:`) and Claude/Agent-Skills formats are read. **Discovery does not activate a skill** — the CLI requires `--skill <name>`; embedded agents populate `AgentSpec.skills` explicitly.
+- **Write a plugin:** **read [`plugins/AUTHORING.md`](plugins/AUTHORING.md) first.** Any executable speaking the framed NDJSON protocol in `flux-plugin`. Operations project as policy-gated tools; privileged IO is requested back via declared capability callbacks. Plugin binaries are trusted dependencies, not OS-sandboxed code.
+- **Rebuild/install the plugin pack:** `task plugins:install` (or `plugins:build`). `plugins/` is a **nested workspace excluded from the root** — build it with `--manifest-path plugins/Cargo.toml`.
+- **Binaries:** the repo ships **one** product binary, `flux`. Everything else is dev tooling (`fluxlang`), protocol-mandated (`flux-lsp`, plugin binaries), or a test fixture. Don't add a binary without that kind of justification.
 
 ---
 
 ## Testing
 
-- **Offline-first.** The built-in `mock` provider (`flux run -m mock`) drives the full agent loop without network. CLI test hooks via env vars (`FLUX_MOCK_TOOL`, `FLUX_MOCK_TOOL_INPUT`, `FLUX_MOCK_BASH`, `FLUX_MOCK_HANG`) exercise specific tools and cancellation end-to-end.
-- **Pure crates** (`flux-policy`, `flux-spec`, `flux-secret`, …) get exhaustive unit tests.
-- **The safety envelope** has no-bypass tests (default-deny, destructive escalation under permissive rules, secret redaction, hook-deny short-circuit) — keep them passing and add to them when you touch the dispatcher.
+- **Offline-first.** The `mock` provider (`flux run -m mock`) drives the full loop without network. Env hooks: `FLUX_MOCK_TOOL`, `FLUX_MOCK_TOOL_INPUT`, `FLUX_MOCK_BASH`, `FLUX_MOCK_HANG`.
+- **Pure crates** get exhaustive unit tests. **The safety envelope** has no-bypass tests — keep them passing and add to them when you touch the dispatcher.
 - **A new behavior ships with a test that fails before the change.**
 
 ---
@@ -154,83 +129,34 @@ Each invariant below was established (and several re-learned the hard way) durin
 ## Commits
 
 - **Never commit without an explicit instruction to do so.**
-- **Stay on the current branch.** Don't create feature branches or git worktrees as a matter of course — do the work in place on the checked-out branch. Only create a branch or worktree when the user explicitly asks for one.
-- Use **semantic commit** titles: `type(scope): short imperative description` where type is one of `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore`, `style`. Scope is the primary crate or surface (e.g. `cli`, `tools`, `runtime`, `agent`, `flow`). Example: `feat(cli): expose /compact slash command in the REPL`.
-- A blank line after the title; then a bulleted body explaining **what** changed and **why** — title-only commits are not acceptable.
-- Ticket references go in a trailing `Refs:` line, not the title.
+- **Stay on the current branch.** Don't create feature branches or git worktrees as a matter of course — work in place. Only branch when the user asks.
+- **Semantic titles:** `type(scope): short imperative description` — `feat` `fix` `refactor` `perf` `test` `docs` `chore` `style`; scope is the primary crate/surface. Breaking: `type(scope)!:`.
+- Blank line, then a **bulleted body explaining what and why** — title-only commits are not acceptable. Ticket refs go in a trailing `Refs:` line, not the title.
 - Don't discard uncommitted changes or run destructive `git` operations on files you didn't change.
+- Ignored build output (`target/`, `plugins/target/`, `website/node_modules/`) is disposable — never add it to Git.
 
 ---
 
 ## Releases
 
-- **Versioning follows Cargo's pre-1.0 SemVer semantics.** For `0.y.z` the **minor** position is
-  the breaking-change signal (`^0.y` ranges resolve across `z` only). Before choosing the bump,
-  scan the `[Unreleased]` CHANGELOG section and the commits since the last tag for anything
-  breaking (`!` commit titles, "BREAKING" entries):
-  - **any breaking change → bump minor** (`0.2.x` → `0.3.0`);
-  - **additive features / fixes only → bump patch.**
-  Do not use the patch position as a rolling release counter. (Established 2026-07-07 when v0.2.24
-  shipped a breaking realtime-seam change and had to be re-cut as v0.3.0.)
-- Release mechanics: bump every `version = "..."` occurrence in the root `Cargo.toml`, run
-  `cargo update --workspace`, roll `[Unreleased]` into a dated version section in `CHANGELOG.md`
-  **and in `WHATS-NEW.md`**, run the full dev-loop gate, then commit `chore(release): cut X.Y.Z`,
-  tag `vX.Y.Z`, and push the branch **and** the tag — the tag triggers the Release workflow (verify
-  it completes with all assets). `scripts/cut-release.sh` does all of this and is transactional: a
-  red gate restores the tree, so a failed cut is safe to re-run (C-147).
-- **The one documented exception to the single-version rule: the plugin PROTOCOL LINE** (C-143).
-  Everything flux ships moves together on `0.y.z` — except the crates a plugin binary compiles
-  against, which carry an independent `1.x`: `codewandler-flux-plugin-protocol` (the wire contract),
-  the serde-only leaves it needs (`flux-spec`, `flux-policy`, `flux-secret`, `flux-evidence`,
-  `flux-datasource`), and `codewandler-flux-host-kit` in `plugins/`. Their version answers one
-  question — *does a plugin built against it still speak to this host?* — which a flux release does
-  not change the answer to. So **`scripts/cut-release.sh` never edits, re-locks, or stages anything
-  under `plugins/`**, and bumping a `1.x` crate is a deliberate act: SemVer over the **wire**, not
-  over the Rust API. The lockstep was doing one useful thing implicitly — guaranteeing a changed
-  crate shipped under a changed version — so two checks now do it explicitly:
-  `scripts/check-crate-versions.sh` (a changed crate on the 1.x line must move its version) and
-  `scripts/check-plugin-compat.sh` (a previously released plugin binary still speaks to today's
-  host). Both run in CI. **A wire change implies a pack release is owed**: publishing a newer
-  `codewandler-flux-plugin-protocol` from the flux closure without also running
-  `release-plugins.yml` with `publish: true` leaves the published `codewandler-flux-host-kit`
-  behind it on crates.io — the published advice ("depend on host-kit 1.x") becomes unfollowable
-  for that window, which is exactly what happened at v0.29.0. `scripts/check-host-kit-protocol-drift.sh`
-  (CI job `host-kit-protocol-drift`, C-167) enforces this: it compares the live crates.io versions
-  directly and fails loudly, naming the pack version to cut, if host-kit's published protocol
-  dependency has fallen behind. Design: `docs/designs/plugin-protocol-decoupling.md`.
-- **Two changelogs, two audiences.** `CHANGELOG.md` is the engineering log (story IDs, crates,
-  invariants). `WHATS-NEW.md` at the repo root is the CUSTOMER changelog: every **user-visible**
-  change adds a plain-language entry to its `[Unreleased]` section alongside the CHANGELOG entry —
-  feature-first wording, no story IDs, no crate names (`### New/Improved/Fixed/Action needed`).
-  Internal-only changes (refactors, CI, test fixtures) skip it. **Before cutting a release, review
-  `WHATS-NEW.md [Unreleased]`**: `scripts/cut-release.sh` rolls and stages both files and warns
-  loudly when the customer section is empty — an empty section is legal only for internal-only
-  releases. The file is embedded in the binary and shown by `flux changelog`.
-- Breaking changes must be flagged in the CHANGELOG entry and the commit title (`type(scope)!:`).
+`scripts/cut-release.sh` does the mechanics and is **transactional** (a red gate restores the tree,
+so a failed cut is safe to re-run). Full runbook: `crates/flux-sdk/PUBLISHING.md`. What you must
+decide *before* running it:
+
+- **The bump.** Cargo pre-1.0 SemVer: for `0.y.z` the **minor** position is the breaking signal. Scan `[Unreleased]` and the commits since the last tag for `!` titles / "BREAKING": **any breaking change → minor**; additive/fixes only → patch. Never use patch as a rolling counter.
+- **Two changelogs, two audiences.** `CHANGELOG.md` is the engineering log (story IDs, crates). **`WHATS-NEW.md` is the CUSTOMER changelog** — every user-visible change adds a plain-language entry (no story IDs, no crate names). Internal-only changes skip it. An empty customer section is legal only for internal-only releases. *A bare `WHATS-NEW.md` edit reds the gate* until you regenerate the tracked website mirror in the same commit.
+- **The plugin PROTOCOL LINE is the one exception to single-version** (C-143): the crates a plugin compiles against carry an independent `1.x`, so `cut-release.sh` **never touches anything under `plugins/`**, and a pack release is cut separately by hand. A wire change implies a pack release is owed. CI enforces this (`check-crate-versions.sh`, `check-plugin-compat.sh`, `check-host-kit-protocol-drift.sh`). Design: `docs/designs/plugin-protocol-decoupling.md`.
 
 ---
 
-## Keeping the Flux-Lang language and its docs in sync
+## Flux-Lang & its docs
 
-The Flux-Lang **language + reference interpreter** lives in **`flux-lang`** (L0: `crates/flux-lang/src/` — `ast.rs`, `render.rs`, `analyze.rs` (`lower` → typed HIR), `opspec.rs`, `schema.rs`, `runtime.rs` behind injected `host`/`store`/`sink` traits, plus `prelude.rs` (artifact types), `program.rs` (multi-agent Program), `parse.rs`/`format.rs` (text syntax), `optimize.rs` (optimizer/`PhysicalPlan`), the `fluxlang` CLI and `skill.rs`). `flux-flow` is the L3 **engine** (engine/state + typed adaptive stages + the `Executor`/`FlowStore`/`AgentSink` adapters and the thin `execute_flow`/`plan_risk` wrappers) and re-exports `flux-lang` as a facade, so `flux_flow::{ast, render, analyze, host, store, runtime, …}` still resolve. The language's own docs live in `crates/flux-lang/docs/` (`reference.md`, `syntax.md`, `PRD.md`, `STATUS.md`, `evolution-impl-plan.md`, `design-review.md`) + `crates/flux-lang/{README,AGENTS}.md` + the forward design `docs/designs/flux-lang-evolution.md`; the engine's ops live in `crates/flux-flow/docs/ops-reference.md`. See [`crates/flux-lang/AGENTS.md`](crates/flux-lang/AGENTS.md) for the full flux-lang design/plan docs map.
+`flux-lang` (L0) is the **language + reference interpreter**; `flux-flow` (L3) is the **engine** and
+re-exports it as a facade. Docs map: [`crates/flux-lang/AGENTS.md`](crates/flux-lang/AGENTS.md).
 
-**The node-kind tables are a single source of truth and are auto-generated — do not hand-edit them.** The `Node` enum's doc-comments in `crates/flux-lang/src/ast.rs` flow through `flux_lang::schema::node_kind_catalog()` into the "Node kinds at a glance" table in `crates/flux-lang/docs/reference.md`, the explicitly installable **flux-lang** language skill (`crates/flux-lang/skill/SKILL.md`), and the public website's `website/docs/language/node-reference.md`. The language skill is manual-only; it helps author durable programs and is not injected into ordinary agent turns. The **artifact-type prelude** has a parallel SSOT: the `flux_lang::prelude` struct doc-comments flow through `prelude_type_catalog()` into the generated blocks in the reference, skill, and website. Regenerate with `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `UPDATE=1 cargo test -p codewandler-flux-lang --test website_in_sync`.
-
-What still needs manual updates in the same commit:
-
-- **New node kind** → write its doc-comment on the `Node` variant (the summary tables regenerate), and add a detailed hand-written section under the appropriate group in `crates/flux-lang/docs/reference.md` (primitive, control-flow, …) plus an example in the skill if helpful.
-- **Changed semantics** → update the relevant prose section and the Key invariants list in `crates/flux-lang/docs/reference.md`.
-
-**Editor-tooling mirrors of the text syntax are manual.** `crates/flux-lsp` derives its completion
-keywords/docs from `flux_lang::schema` at build time so it tracks automatically, but three
-highlighting grammars are hand-maintained mirrors that a **new keyword or spelling change** must be
-propagated to: the website's Prism grammar
-(`website/src/theme/prism-include-languages.js`), the external tree-sitter grammar
-([`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) — Helix/Neovim/
-Zed colour; also declared in the repo-local `.helix/languages.toml`), and the TextMate/IntelliJ
-grammars in [`codewandler/flux-editors`](https://github.com/codewandler/flux-editors). None have
-drift guards — grep them after syntax work.
-- **New built-in tool in `flux-tools`** → the op catalog the model sees is built dynamically from the live `ToolRegistry`, so the prompt needs nothing; update the hand-written table in `crates/flux-flow/docs/ops-reference.md`.
+- **Node-kind and prelude tables are auto-generated — never hand-edit.** They flow from `Node`/`prelude` doc-comments through `schema::node_kind_catalog()`/`prelude_type_catalog()` into the reference, the flux-lang skill, and the website. Regenerate: `UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `--test website_in_sync`.
+- **Still manual in the same commit:** a **new node kind** needs a hand-written section in `crates/flux-lang/docs/reference.md`; **changed semantics** need the prose + Key invariants updated.
+- ⚠ **Editor-tooling mirrors are manual and have NO drift guard** — a new keyword or spelling change must be propagated by hand to the website Prism grammar (`website/src/theme/prism-include-languages.js`), [`codewandler/flux-tree-sitter`](https://github.com/codewandler/flux-tree-sitter) (Helix/Neovim/Zed; also `.helix/languages.toml`), and the TextMate/IntelliJ grammars in [`codewandler/flux-editors`](https://github.com/codewandler/flux-editors). **Grep them after syntax work** — nothing else will tell you.
 
 ---
 
@@ -240,4 +166,5 @@ drift guards — grep them after syntax work.
 - Don't introduce an inner→outer crate dependency (the layering lint will fail).
 - Don't log or surface secret values; don't build shell command strings from model input.
 - Don't leave `clippy -D warnings` or `fmt` dirty.
-- Don't create new branches or git worktrees unless the user explicitly asks — work on the current branch.
+- Don't create new branches or git worktrees unless the user explicitly asks.
+- Don't commit without an explicit instruction.
