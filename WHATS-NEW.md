@@ -15,6 +15,17 @@
 
 ## [Unreleased]
 
+### New
+
+- **Hand work to a flux agent running somewhere else.** flux can now delegate a task to a remote
+  flux worker over the network instead of running it in-process, and the everyday way you delegate
+  work is unchanged — the same delegation step now simply works against a remote worker. For work you
+  want to start and check on later rather than wait for, there are three new operations: send the
+  work and get a task id back, ask how it is going, and cancel it. Cancelling genuinely stops the
+  remote run; previously a remote run could only be walked away from. Remote worker addresses are
+  checked against your network rules before any request is made, and the worker you are dispatching
+  to is named on the approval prompt rather than a blanket wildcard.
+
 ### Improved
 
 - **Operations that call a model are now labelled as costing something.** Fetching a web page and
