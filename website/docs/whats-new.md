@@ -14,6 +14,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **flux can now stage just its own changes in a file you are also editing.** Previously, if the
+  agent and you had both edited the same file, staging was all-or-nothing: it either swept your
+  unfinished edits into its commit or gave the job back to you. It can now list a file's individual
+  changes and stage only the ones it made, leaving yours untouched in your working copy — the
+  equivalent of picking changes by hand, without the prompting. If the file moves underneath a
+  selection, it refuses and asks for a fresh look rather than staging the wrong lines, and it will
+  not quietly stage a whole-file deletion when you asked for one change.
+
 - **Hand work to a flux agent running somewhere else.** flux can now delegate a task to a remote
   flux worker over the network instead of running it in-process, and the everyday way you delegate
   work is unchanged — the same delegation step now simply works against a remote worker. For work you

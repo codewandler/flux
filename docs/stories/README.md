@@ -54,7 +54,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
-- [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
 
 ### The agent-authored surface — panes the model opens, config it can safely change
 - [C-219 — The agent-authored surface — panes the model opens, config it can safely change (epic)](C-219-agent-authored-surface-epic.md) · Core · the tool→surface seam already exists twice (ToolProgressSink/SpawnActivitySink) and op.register already lets the model extend the harness one layer down — what's missing is the surface layer, and the whole risk is that a model-drawn region can imitate the approval sheet
@@ -357,6 +356,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [C-89 — Let process access carry network and write effects in the authority contract](C-89-process-authority-carrier.md) · Core · the typed-authority validator rejected every process-mediated plugin op (kubernetes/aws), so `flux run` aborted at registration with "declares a network effect without network, browser, or provider access"
 - [C-90 — Constrain plugin process capabilities by argument, not just program](C-90-process-capability-argument-constraints.md) · Core · the `process.run` gate matches argv[0] only, so granting `kubectl` grants delete/apply/exec — a read-only op's `Risk::Read` label is advisory, not enforced
 - [C-91 — Make approval prompts visible in the plain CLI](C-91-visible-approval-prompts-plain-cli.md) · Core
+- [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
 - [C-93 — Let an agent invoke registered commands and skills when permitted, accessible, and agent-triggerable](C-93-agent-invoke-commands-skills.md) · Core · SUPERSEDED by D-187 (claude-interop epic) — contract carried over unchanged, extended to file-based commands
 - [C-97 — WorkspaceContext — a context-local, swappable active System](C-97-workspace-context-runtime-seam.md) · Core · runtime seam for the worktree ops: per-agent active-System accessor replaces direct ctx.system; no set_current_dir anywhere
 - [C-98 — git_worktree_enter — guarded op that moves this context into a temp worktree](C-98-git-worktree-enter-op.md) · Core · clean main → generated flux/worktree/* branch → /tmp worktree → context root transition; argv-only git

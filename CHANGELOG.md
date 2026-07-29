@@ -108,6 +108,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Hunk-level git staging — an agent can stage part of a file another author is editing (C-92).**
+  `git_stage` operates on whole paths, so a file touched by two authors could only be staged in full:
+  the agent either swept a coworker's uncommitted hunks into its own commit or handed the task back.
+  Two new guarded ops close that — `git_hunks` lists a file's addressable hunks, `git_stage_hunks`
+  stages a chosen subset. Both route through the same `flux_system` guarded spawn as the rest of the
+  `git_*` family (no second `Command::new`, argv-only, workspace-pinned), which grew
+  `System::run_with_stdin` to feed `git apply` its patch — same `build_command` choke point, same
+  `Confinement::Sandboxed`, and `Stdio::null()` still for every existing caller.
+  Selectors are **content-addressed** (`h{ordinal}-{hash}`), re-verified against a freshly recomputed
+  diff at stage time, so a stale selector refuses rather than staging the wrong region. A positional
+  index was rejected in the design note precisely because it fails *silently*: a coworker's save
+  between the read and the stage would redirect the selection onto their hunk — the exact bug the
+  story exists to prevent.
+  **An independent review found two silent-misapply paths behind a green gate, and both are closed.**
+  `context: 0` produced a patch `git apply` placed at end-of-file while exiting 0 (reported as
+  success); it is now refused with a floor of 1, chosen over `--unidiff-zero` because that flag fixes
+  placement only by disabling the verification a zero-context patch has nothing to verify with —
+  `context: 1` keeps the check and still splits adjacent changes. And `--recount` was masking corrupt
+  patches: a truncated stdin write applied as a *partial* stage reporting full success. The two
+  proved independent under the implementor's own repro, which sharpened the diagnosis. A third defect
+  surfaced from a review question: staging "one hunk" of a deleted file committed a whole-file
+  deletion the caller never selected — preambles carrying `deleted file mode`, renames, copies or
+  mode changes are now refused.
+  One limitation is stated rather than papered over: surviving renumbering and distinguishing two
+  byte-identical hunks are not jointly achievable — the first needs hash-only matching, the second
+  needs position. Full-string matching fails *safe*, and the design note now records that trade
+  instead of two claims that were not true of the shipped code.
+
 - **Outbound A2A dispatch — flux can hand work to a remote flux agent (A-116).** The A2A server has
   implemented `tasks/cancel` since A-55, but no client could reach it, so a remote run could only be
   detached from, never stopped. `A2aClient::cancel_task` closes that asymmetry. On top of it,
