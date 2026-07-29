@@ -493,7 +493,13 @@ pub(super) async fn run_app(
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
-    let backend = build_datasources(&program.datasources, &program_dir, &system).await?;
+    // A-131: a `datasource` declaration resolves to either the shared knowledge index or a
+    // write-capable `WorkBoard` (`kind = "board:<backend>"`), so the coordinator Program can name
+    // the board it works. The boards are registered below, once the integration registry exists.
+    let ProgramDatasources {
+        knowledge: backend,
+        boards,
+    } = build_datasources(&program.datasources, &program_dir, &system).await?;
     let mut extra_tools: Vec<(String, Arc<dyn flux_runtime::Tool>)> =
         flux_capabilities::datasource_tools(backend.clone())
             .into_iter()
@@ -538,6 +544,15 @@ pub(super) async fn run_app(
     for (source, tool) in extra_tools {
         integration_registry.try_register_from(source, tool)?;
     }
+    // The declared work boards (A-113's port). `try_register_work_board` *derives* the generated op
+    // set from the port itself, so an operation added to `WorkBoard` reaches a Program through this
+    // line unchanged — nothing here enumerates or counts them.
+    for (domain, board) in boards {
+        flux_capabilities::try_register_work_board(&mut integration_registry, &domain, board)?;
+    }
+    // Outbound A2A dispatch (A-116). Registered through the same helper the agent assembly uses, so
+    // `flux app run` and `flux run` offer the identical fleet catalog under the identical grant.
+    try_register_fleet(&mut integration_registry)?;
     let approver: Arc<dyn Approver> = if auto_approve {
         Arc::new(AllowApprover)
     } else {

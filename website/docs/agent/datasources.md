@@ -6,19 +6,20 @@ description: "The agent's governed data layer: indexed knowledge and async live 
 # Datasources
 
 A **datasource** is a governed data boundary the agent reaches through
-[operations](../language/ops.md). Flux supports two complementary forms:
+[operations](../language/ops.md). Flux supports three complementary forms:
 
-| | Indexed knowledge | Live system of record |
-|---|---|---|
-| Data lives | In a flux-owned index of records | In an external API, database, or in-process backend |
-| Best for | Searchable docs and contributed knowledge | Current tickets, customers, inventory, and similar domain data |
-| Read shape | Search, address lookup, relations, offset paging | Typed entity filters, cursor paging, stable-id lookup |
-| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` |
+| | Indexed knowledge | Live system of record | [Work board](#work-boards) |
+|---|---|---|---|
+| Data lives | In a flux-owned index of records | In an external API, database, or in-process backend | In a board backend flux writes to |
+| Best for | Searchable docs and contributed knowledge | Current tickets, customers, inventory, and similar domain data | Work the agent hands out, claims, and finishes |
+| Read shape | Search, address lookup, relations, offset paging | Typed entity filters, cursor paging, stable-id lookup | State-filtered item paging, stable-id lookup |
+| Writes | No | No | Yes—`create`, `transition`, `claim`, `comment` |
+| Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` | `<domain>.list`/`.get`/`.create`/`.transition`/`.claim`/`.comment` |
 
 The split is intentional. A stable local snapshot benefits from indexing and ranked search; a
-changing system of record needs async calls and backend-owned continuation cursors. Neither form is
-a side channel: both are projected into the ordinary operation catalog and cross authorization →
-approval → guarded IO.
+changing system of record needs async calls and backend-owned continuation cursors; work that is
+claimed and moved needs an enforced state machine. No form is a side channel: all three are projected
+into the ordinary operation catalog and cross authorization → approval → guarded IO.
 
 ## Datasources vs. operations
 
@@ -77,6 +78,11 @@ Three routes feed the index:
 
    A relative path resolves against the program file's own directory, not the directory from which
    `flux app run` was launched. An absolute path is used as-is.
+
+   Only knowledge kinds are ingested here. A kind that names neither a knowledge ingester nor a
+   [work board](#work-boards) is a startup error naming the kinds that exist—a misspelled kind never
+   falls back to a default, because a datasource silently bound to the wrong port is worse than one
+   that refuses to start.
 3. **Plugin records.** A [plugin](../plugins/authoring.md) declares datasources in its manifest and
    emits records through the gated `datasource.*` host capability. Integration records become
    searchable beside local docs without the plugin touching index files directly.
@@ -183,6 +189,35 @@ cargo run -p codewandler-flux-sdk --example live_datasource
 
 For embedding code and the indexed `try_register_pack` recipe, see
 [SDK datasources](../sdk/datasources.md).
+
+## Work boards
+
+A **work board** is the write-capable third form: a typed item state machine—`Ready`, `Claimed`,
+`Done`, `Failed`—behind a swappable backend. A read-only knowledge index cannot express work that is
+claimed, moved, retried, and commented on, which is what a coordinator agent needs in order to hand
+tasks out and reconcile them after a crash.
+
+A program declares one the same way it declares knowledge, with a `board:` kind:
+
+```flux
+datasource board
+  kind "board:memory"
+```
+
+The declaration's **name** becomes the operation prefix, so this one generates `board.list`,
+`board.get`, `board.create`, `board.transition`, `board.claim`, and `board.comment`. Board kinds live
+in their own `board:` namespace on purpose: `markdown` already means *a directory of docs to index*,
+so a board that happens to be backed by markdown files needs a name that cannot be confused with it.
+A knowledge kind is never promoted to a board, a board kind is never ingested as knowledge, and a
+`board:` kind naming a backend that does not exist is an error rather than a fall-through.
+
+`board:memory` is the in-process backend, useful for a single run and for tests. Durable backends
+land with their own stories.
+
+The four mutating operations are gated like any other write: each reports a concrete
+`<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant
+scoped to one item can never move another. `transition` validates the edge against the state machine
+*before* writing, so an illegal move is a clean error and leaves the item byte-identical.
 
 ## Related docs
 

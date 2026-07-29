@@ -170,16 +170,68 @@ pub(super) async fn build_doc_index(
     backend
 }
 
-/// Build the knowledge backend from a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s
-/// — the `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index. Each declared
-/// source is ingested under its own name by the matching ingester (`markdown` walks a docs directory;
-/// `openapi` reads a JSON spec file). An unknown `kind` is a clean error. Returns the shared backend the
-/// retrieval ops dispatch against.
+/// The `kind` prefix that names a **board** declaration (A-131).
+///
+/// Naming this was a real decision, not a detail. `markdown` is already taken by the *knowledge*
+/// ingester, and a board backed by markdown files (A-114) is a different port entirely — so board
+/// kinds live in their own namespace: `board:memory` today, `board:markdown` / `board:jira` /
+/// `board:gitlab` as those backends land. Two properties follow, and both are the point:
+///
+/// * `kind = "markdown"` keeps meaning exactly what it has always meant. A knowledge declaration is
+///   never silently promoted to a board, and a board declaration is never silently ingested as
+///   knowledge — the prefix, not a lookup table, decides which port is bound.
+/// * A kind *under* this prefix that names no backend is a hard error, never a fall-through. The
+///   failure mode this closes is a user pointing `kind = "markdown"` at a board file store and
+///   getting a silently wrong, read-only knowledge index instead of a diagnostic.
+const BOARD_KIND_PREFIX: &str = "board:";
+
+/// The board backends bindable from a `datasource` declaration today, for the error message that
+/// names them. `MemoryBoard` is the offline backend A-113 shipped with the port; the file- and
+/// issue-tracker-backed ones arrive with their own stories.
+const BOARD_BACKENDS: &str = "memory";
+
+/// What a Program's `datasource` declarations resolve to: one shared knowledge backend, plus the
+/// work boards declared alongside it.
+pub(super) struct ProgramDatasources {
+    /// The shared index every `markdown` / `openapi` declaration ingested into, and the backend the
+    /// retrieval ops (`search`/`get`/`list`/…) dispatch against.
+    pub(super) knowledge: Arc<dyn flux_capabilities::DatasourceBackend>,
+    /// `(domain, backend)` per declared board, in declaration order. The caller installs each with
+    /// [`flux_capabilities::try_register_work_board`], which *derives* the generated op set from the
+    /// port — so an operation added to `WorkBoard` surfaces here with no change to this module.
+    pub(super) boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)>,
+}
+
+/// Resolve one `board:<backend>` declaration into a [`WorkBoard`](flux_capabilities::WorkBoard).
+///
+/// An unrecognized backend names itself and the ones that exist. It is deliberately NOT tolerant:
+/// falling back to the knowledge ingester here would reintroduce exactly the silent, wrong behaviour
+/// [`BOARD_KIND_PREFIX`] exists to prevent.
+fn build_work_board(name: &str, backend: &str) -> Result<Arc<dyn flux_capabilities::WorkBoard>> {
+    match backend {
+        "memory" => Ok(Arc::new(flux_capabilities::MemoryBoard::new())),
+        "" => Err(anyhow::anyhow!(
+            "datasource `{name}` declares a board but names no backend — write \
+             `kind = \"{BOARD_KIND_PREFIX}memory\"` (available: {BOARD_BACKENDS})"
+        )),
+        other => Err(anyhow::anyhow!(
+            "datasource `{name}`: unknown board backend `{other}` (available: {BOARD_BACKENDS})"
+        )),
+    }
+}
+
+/// Build a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s — the
+/// `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index.
+///
+/// The `kind` dispatch is **total**, which is the whole safety property here: a knowledge kind
+/// ingests under its own name by the matching ingester (`markdown` walks a docs directory; `openapi`
+/// reads a JSON spec file), a `board:<backend>` kind binds a write-capable [`WorkBoard`] instead,
+/// and anything else is a clean error. Nothing falls through to a default.
 pub(super) async fn build_datasources(
     decls: &[flux_lang::program::DatasourceDecl],
     program_dir: &std::path::Path,
     system: &System,
-) -> Result<Arc<dyn flux_capabilities::DatasourceBackend>> {
+) -> Result<ProgramDatasources> {
     // A datasource path is relative to the PROGRAM FILE's directory (absolute paths pass through), so
     // `path "./docs"` means "beside the .flux file" regardless of the launch cwd. `program_dir` is a
     // read-only root of `system`, so the resulting absolute path is walkable/readable.
@@ -193,8 +245,17 @@ pub(super) async fn build_datasources(
     }
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
+    let mut boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for d in decls {
         match d.kind.as_str() {
+            // A board, not a knowledge source. `board` on its own is the shape a bare
+            // `datasource board { … }` lowers to (native text defaults `kind` to the decl name), so
+            // it is routed here to get the "names no backend" diagnostic rather than the generic
+            // unknown-kind one.
+            kind if kind == "board" || kind.starts_with(BOARD_KIND_PREFIX) => {
+                let backend = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("").trim();
+                boards.push((d.name.clone(), build_work_board(&d.name, backend)?));
+            }
             "markdown" => {
                 let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
                 let docs = walk_docs(system, &base, 1000, 200_000).await;
@@ -218,13 +279,17 @@ pub(super) async fn build_datasources(
             }
             other => {
                 return Err(anyhow::anyhow!(
-                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi)",
+                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi | \
+                     {BOARD_KIND_PREFIX}<backend>)",
                     d.name
                 ))
             }
         }
     }
-    Ok(backend)
+    Ok(ProgramDatasources {
+        knowledge: backend,
+        boards,
+    })
 }
 
 /// Wrap a keyword backend in the semantic (embeddings) backend when built with `--features embeddings`
@@ -980,6 +1045,55 @@ pub(super) async fn resolve_agent_loop(
 /// ONLY — never on a worker sub-agent's scoped toolset, so a child can't run eval/git ops or the
 /// model-facing cognition/consult ops.
 #[allow(clippy::too_many_arguments)]
+/// The private-network egress grant the `fleet.*` ops run under.
+///
+/// Deliberately **not** the `[private_net] web` scope. That grant names the native web family
+/// (`http.request`, `web.fetch`, `browser.*`); quietly extending it to cover outbound dispatch to a
+/// remote worker would widen a grant an operator already made, for a family they did not grant it
+/// to. Only the blanket `--allow-private-net` / `FLUX_ALLOW_PRIVATE_NET` override — already
+/// documented as a private-net `*` grant for native ops — admits a private worker; otherwise the
+/// full SSRF guard applies and a `worker-1.internal` endpoint is refused until an operator says
+/// otherwise.
+///
+/// This is a bound on the *grant*, never a substitute for the guard: every `fleet.*` op resolves its
+/// caller-supplied endpoint through `guard_url_scoped` before any request either way (A-116), and
+/// each reports the worker's origin as its permission subject.
+fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
+    if private_net_cli_override() {
+        flux_system::net::PrivateNetAllow::Any
+    } else {
+        flux_system::net::PrivateNetAllow::None
+    }
+}
+
+/// Outbound A2A dispatch (A-116): `fleet.dispatch` / `fleet.status` / `fleet.cancel` — hand a task
+/// to a remote flux worker without waiting, poll it, stop it.
+///
+/// A-116 landed the ops; nothing constructed them, so a Program could not call one. This is the one
+/// construction site, shared by the agent assembly below and the `flux app run` path, so the two
+/// surfaces cannot offer different fleet catalogs — and a fourth fleet op is added here alone.
+///
+/// The worker bearer token is `None`: a token for an authenticated worker is operator configuration
+/// that does not exist yet, and inventing an env var for it here would add public surface this
+/// story does not own. A worker behind `flux serve`'s required auth is therefore not yet reachable;
+/// an unauthenticated one is.
+pub(super) fn try_register_fleet(registry: &mut ToolRegistry) -> Result<()> {
+    let private_net = fleet_private_net();
+    let tools: Vec<Arc<dyn flux_runtime::Tool>> = vec![
+        Arc::new(flux_orchestrate::FleetDispatchTool::new(
+            private_net.clone(),
+            None,
+        )),
+        Arc::new(flux_orchestrate::FleetStatusTool::new(
+            private_net.clone(),
+            None,
+        )),
+        Arc::new(flux_orchestrate::FleetCancelTool::new(private_net, None)),
+    ];
+    registry.try_register_all_from("flux-cli fleet dispatch", tools)?;
+    Ok(())
+}
+
 pub(super) fn register_tool_packs(
     registry: &mut ToolRegistry,
     cog_provider: Option<Box<dyn Provider>>,
@@ -1037,6 +1151,10 @@ pub(super) fn register_tool_packs(
         )
         .try_register(registry)?;
     }
+    // Outbound A2A dispatch to remote flux workers (A-116, wired by A-131). Unconditional: the
+    // worker endpoint is a per-call argument, not configuration, so there is nothing to switch on —
+    // and the ops carry no authority of their own beyond the egress guard they each run first.
+    try_register_fleet(registry)?;
     // Eval / self-improvement ops (the ones the improve flows orchestrate).
     flux_eval::try_register_eval_ops(registry)?;
     // Authored-loop stages are registered for `agent-loop.flux` but tagged to the never-surfaced
@@ -2126,5 +2244,149 @@ mod execution_environment_conformance {
         );
 
         std::fs::remove_dir_all(base).ok();
+    }
+}
+
+#[cfg(test)]
+mod fleet_and_board_wiring {
+    use super::*;
+
+    use flux_lang::program::DatasourceDecl;
+    use flux_system::Workspace;
+
+    /// A throwaway workspace root. `build_datasources` needs a guarded [`System`] even for a
+    /// declaration that touches no file, so every case here gets its own root.
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "flux-cli-a131-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    fn decl(name: &str, kind: &str) -> Vec<DatasourceDecl> {
+        vec![DatasourceDecl {
+            name: name.into(),
+            kind: kind.into(),
+            path: None,
+            settings: serde_json::Value::Null,
+        }]
+    }
+
+    /// A-131 Acceptance 4, the named failing-first test: a Program declaring a board must resolve to
+    /// a `WorkBoard`-backed set of generated ops. Before this story `build_datasources` knew only
+    /// `markdown` and `openapi`, so a board declaration errored as an unknown kind and a board could
+    /// not be named from configuration at all.
+    #[tokio::test]
+    async fn a_declared_board_binds_a_work_board_instead_of_erroring() {
+        let root = temp_root("board-binds");
+        let system = System::new(Workspace::new(&root).unwrap());
+
+        let bound = build_datasources(&decl("board", "board:memory"), &root, &system).await;
+        assert!(
+            bound.is_ok(),
+            "a `board:memory` datasource must bind a WorkBoard, got: {:?}",
+            bound.as_ref().err().map(ToString::to_string)
+        );
+        let bound = bound.unwrap();
+
+        // Not ingested as knowledge — the failure mode the board kind namespace exists to prevent.
+        assert!(
+            bound.knowledge.is_empty(),
+            "a board declaration must not be ingested into the knowledge index"
+        );
+
+        // ...and it resolves to a `WorkBoard`-backed set of GENERATED ops, under the decl's name as
+        // the domain. The expected set is read off the port's own registration rather than listed
+        // here, so a board operation added to `WorkBoard` (A-130) is covered without editing this.
+        let [(domain, board)] = <[_; 1]>::try_from(bound.boards).ok().expect("one board");
+        assert_eq!(domain, "board");
+        let mut registry = ToolRegistry::new();
+        let surface = flux_capabilities::try_register_work_board(&mut registry, &domain, board)
+            .expect("the board registers");
+        assert!(
+            !surface.group.tools.is_empty(),
+            "the port generated no operations"
+        );
+        for op in &surface.group.tools {
+            assert!(
+                registry.get(op).is_some(),
+                "the declared board did not generate `{op}`"
+            );
+        }
+        // The write half is what distinguishes a board from a read-only knowledge source.
+        assert!(
+            registry.get("board.claim").is_some(),
+            "a bound board must offer its mutating ops: {:?}",
+            registry.names()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A-131 Acceptance 3: wiring the fleet must not widen A-116's egress posture. The registered
+    /// ops still report the worker's **origin** as their permission subject — never `*` — and report
+    /// **no** subject for an endpoint they cannot name, which forces approval instead of matching a
+    /// broad grant. Asserted against the ops as the CLI actually registers them, not against
+    /// freshly-constructed ones, so a registration that handed them a different posture fails here.
+    #[test]
+    fn registration_preserves_the_fleet_egress_posture() {
+        let mut registry = ToolRegistry::new();
+        try_register_fleet(&mut registry).expect("the fleet ops register");
+
+        let dispatch = registry.get("fleet.dispatch").expect("fleet.dispatch");
+        assert_eq!(
+            dispatch.permission_subjects(&serde_json::json!({
+                "worker": "https://worker-1.internal:8787/a2a",
+                "task": "build",
+            })),
+            vec!["https://worker-1.internal:8787".to_string()],
+        );
+        for op in ["fleet.dispatch", "fleet.status", "fleet.cancel"] {
+            let tool = registry.get(op).expect("a registered fleet op");
+            let subjects = tool.permission_subjects(&serde_json::json!({ "worker": "not a url" }));
+            assert!(
+                subjects.is_empty(),
+                "`{op}` must report no subject for an unnameable worker, got {subjects:?}"
+            );
+            assert!(!subjects.iter().any(|s| s == "*"), "`{op}` reported `*`");
+        }
+
+        // The default grant is the full SSRF guard: a private worker is refused until an operator
+        // opts in. Registration must not hand the ops a blanket `Any`.
+        assert_eq!(
+            fleet_private_net(),
+            flux_system::net::PrivateNetAllow::None,
+            "the fleet ops must not be registered with a standing private-network grant"
+        );
+    }
+
+    /// A-131 Acceptance 5: the wrong board kind fails **loudly**. `markdown` stays the knowledge
+    /// ingester (it is not silently promoted to a board), a bare `board` names no backend, and a
+    /// board backend that does not exist yet is an error rather than a fall-through to knowledge
+    /// ingestion — which is the silent, wrong behaviour this story closes.
+    #[tokio::test]
+    async fn an_unnameable_board_backend_is_a_loud_error() {
+        let root = temp_root("board-loud");
+        let system = System::new(Workspace::new(&root).unwrap());
+
+        for kind in ["board", "board:", "board:nope"] {
+            let bound = build_datasources(&decl("board", kind), &root, &system).await;
+            assert!(
+                bound.is_err(),
+                "a board kind naming no backend (`{kind}`) must error, not fall through to \
+                 knowledge ingestion"
+            );
+            let text = bound.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(
+                text.contains("board"),
+                "the error must name the board kind, got: {text}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }

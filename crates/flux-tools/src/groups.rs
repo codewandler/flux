@@ -152,6 +152,20 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             surface_when: when("consult"),
         },
         ToolGroup {
+            name: "fleet".into(),
+            description: "Outbound A2A dispatch to remote flux workers (A-116): hand a task to a \
+                          worker without waiting (`fleet.dispatch`), poll it (`fleet.status`), stop \
+                          it (`fleet.cancel`). The worker endpoint is a per-call argument, not \
+                          configuration, so there is no workspace signal that could gate these — a \
+                          predicate nothing emits would leave them registered but never advertised, \
+                          which is the unreachability A-131 closed. Force-on like `cognition`; the \
+                          group exists so `.flux/groups.toml` can reassign or gate them."
+                .into(),
+            tools: names(&["fleet.dispatch", "fleet.status", "fleet.cancel"]),
+            // Force-on (empty predicate) — see the description.
+            surface_when: Vec::new(),
+        },
+        ToolGroup {
             name: "cognition".into(),
             description: "Pure cognition helpers: needs/gaps, list shaping (compare, dedupe, sort, \
                           top, merge, cite, len, first, last, filter), aggregation & predicates \
