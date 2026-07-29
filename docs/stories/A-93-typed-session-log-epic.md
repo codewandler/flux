@@ -2,9 +2,9 @@
 id: A-93
 title: "Typed session log — session-shape validity by construction (epic)"
 pillar: Agent
-status: backlog
+status: in-progress
 epic: typed-session-log
-design:
+design: docs/designs/typed-session-log.md
 note: "EPIC — make the invalid provider-history shapes (split tool_use/tool_result, empty assistant, user-after-user) unrepresentable in the session log's type; the thrice-recurred bug class becomes unwritable instead of test-guarded"
 ---
 
@@ -33,7 +33,28 @@ the pre-release live-provider gate stops being the only net that catches it.
       caught all three past regressions without a live provider 400.
 
 ## Progress
-- (not started — epic filed from a code-reading re-assessment of the engine's termination paths)
+- 2026-07-29 — **design done**: [typed-session-log.md](../designs/typed-session-log.md). Grounded in
+  the current code; two findings sharpened the plan:
+  - The write seam is `EventStore::record_message` (`store/mod.rs:766`), which appends any `Message`
+    unexamined. The turn's two writes are 750 lines apart (`engine.rs:422` user,
+    `engine.rs:1177` assistant) with no type pairing them.
+  - **The predicted fourth termination path already exists**: `resurrect.rs:425-438` closes a turn
+    outside `finish_turn`, with a comment stating it "Mirrors `finish_turn_lifecycle`'s ordering".
+    It is correct only because someone copied the ordering by hand — and it writes
+    `assistant_text(answer)` with no non-empty check, so an empty resurrect answer would write
+    invalid shape #1 today.
+- Decomposed into A-99 (shape types) → A-100 (typed handle) → A-101 (flux-flow migration + delete
+  the unguarded API, **breaking**) → A-102 (SDK/CLI rewriters). A-99 is `ready`, priority 1.
+- 2026-07-29 — **A-99 DONE**: `crates/flux-events/src/shape.rs` ships `ShapeError`,
+  `AssistantMessage`, `ValidHistory`, `ValidHistory::snap`; crate suite 77 → 98 green, fmt + clippy
+  clean, no call sites moved yet.
+- **A third finding, and this one is a live bug**: compaction can already write `user`-after-`user`
+  today. The persisted log is a strict `user, assistant, …` alternation, so `split = len - keep`
+  (keep = 2) always lands on a **`user`** message; `has_tool_result` is false for it so the
+  walk-back never moves, and `[user_summary] + [user, assistant]` goes to the store. Reachable
+  whenever `total > compact_threshold_chars` and `len >= 4`. `ValidHistory::snap` computes the right
+  split; the fix lands with A-101, which now carries a failing-first test for it.
+- Next: A-100 (`ready`, priority 1).
 
 ## Notes
 - Downgraded from "design smell" to "hardening opportunity" during the code review: both current

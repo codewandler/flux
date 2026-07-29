@@ -2,9 +2,9 @@
 id: A-91
 title: "Transactional turns — a compensating undo for the world, not just the session (epic)"
 pillar: Agent
-status: backlog
+status: in-progress
 epic: transactional-turns
-design:
+design: docs/designs/transactional-turns.md
 note: "EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects"
 ---
 
@@ -28,7 +28,23 @@ turn-level rollback of real effects.
       synthesized reverse batch, executed through the same approval + guarded-IO envelope.
 
 ## Progress
-- (not started — epic filed from the 2026-07-28 out-of-the-box ideas session)
+- 2026-07-29 — **design done**: [transactional-turns.md](../designs/transactional-turns.md). It
+  makes one deliberate correction to this story's Goal, recorded here so the change is not silent:
+  - **"synthesize a reverse-batch at approval time" is not implementable** for the dominant case.
+    The reverse of `write(path, new)` is `write(path, prior)`, and `prior` is not knowable at
+    approval time — an earlier action in the same batch, a concurrent process, or the user can
+    change it between approval and execution. Capturing then would confidently restore the *wrong*
+    bytes, which is worse than no undo.
+  - The design therefore splits **declaration** (static, on `ToolSpec`, available at approval time —
+    this is what powers the risk signal) from **materialization** (execution time, inside the
+    guarded boundary at `Executor::dispatch_outcome`, immediately before the write).
+- Also settled: reverse actions are stored as a new `EventKind::Compensated` (breaking — `EventKind`
+  is a closed set, `kind.rs:32` ⇒ MINOR); undo runs LIFO through the **ordinary** approval envelope
+  (so it is itself undoable) and **stops at the first failure** rather than half-applying.
+- Decomposed into A-103 (contract) → A-104 (capture + event) → A-105 (`flux undo`) and A-106
+  (disclosure, which needs only A-103 and can land first).
+- Next: A-103, after the A-93 chain lands (both touch published crate surfaces and should share one
+  MINOR).
 
 ## Notes
 - Builds on the frozen `ActionBatch` invariant and the C-43 cassette capture (prior op outputs are
