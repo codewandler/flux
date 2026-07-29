@@ -2,7 +2,7 @@
 id: C-190
 title: "Make the non-loopback auth invariant hold by construction, not only inside serve_on"
 pillar: Core
-status: ready
+status: in-progress
 priority: 7
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -19,19 +19,48 @@ it and is silently responsible for re-deriving the invariant. `AGENTS.md` is exp
 no bypass paths; this is one that already exists. Make the invariant structural.
 
 ## Acceptance
-- [ ] The unauthenticated + non-loopback combination is unrepresentable or refused at **router
+- [x] The unauthenticated + non-loopback combination is unrepresentable or refused at **router
       construction**, not only at `serve_on`. Options to weigh in the design: a bind-address-aware
       constructor, or an explicit opt-out type (e.g. `UnauthenticatedLoopbackOnly`) a caller must
-      name to get the open router.
-- [ ] Failing-first test: a caller that mounts the router directly and serves it on a non-loopback
+      name to get the open router. → chose the **bind-address-aware constructor**: `router`/
+      `router_multi` now take `bind: SocketAddr` and return `anyhow::Result<Router>`, refusing
+      `ServerAuth::Open` on a non-loopback bind via the one `guard_open_bind` helper
+      (`crates/flux-server/src/lib.rs`).
+- [x] Failing-first test: a caller that mounts the router directly and serves it on a non-loopback
       address cannot reach a protected route unauthenticated. This test must fail against the
-      current tree — that failure is the proof the gap is real.
-- [ ] `ServerAuth::Open`'s doc comments (`lib.rs:49,:56,:70,:90`) are updated to describe the
-      enforced guarantee rather than the caller's responsibility.
-- [ ] Any intentional escape hatch is explicit, named, and logged loudly at startup.
+      current tree — that failure is the proof the gap is real. →
+      `unauthenticated_non_loopback_router_is_refused_at_construction` drives the REAL `router(...)`
+      construction path (not the hand-built `guarded_app`).
+- [x] `ServerAuth::Open`'s doc comments are updated to describe the enforced guarantee rather than
+      the caller's responsibility (the `Open` variant doc + `from_token`; the stale
+      "prefer serve_multi … a caller wiring axum::serve must enforce itself" caveat on `router_multi`
+      is likewise rewritten now that construction enforces it).
+- [x] Any intentional escape hatch is explicit, named, and logged loudly at startup. → **no escape
+      hatch was added** (the safe default): `Open` off-loopback is refused outright, matching the
+      pre-existing `serve_on` behavior, so there is nothing to name or log. A network-facing
+      deployment fronts the loopback daemon with an authenticating proxy or configures
+      shared-secret/principal auth.
 
 ## Progress
-- (not started)
+- Done. Design choice: **bind-address-aware constructor**, not an opt-out marker type. Rationale:
+  the marker (`UnauthenticatedLoopbackOnly`) only witnesses "a caller named this type", not "this
+  listener is loopback" — the address and the auth mode must be checked *together*, and the only
+  place both are known is where the bind address is in hand. `router(engine, auth, card, bind)`
+  makes that check unavoidable and keeps ONE enforcement point (`guard_open_bind`) that both
+  `serve_on`/`serve_multi_on` and every direct mounter (the `a2a` channel) share. Public API break
+  is sanctioned by the story (commit uses `!`).
+- The real bypass caller was `flux-channels`' a2a adapter (`crates/flux-channels/src/adapters/a2a.rs`):
+  it built `flux_server::router(...)` and served it with raw `axum::serve`, re-deriving the loopback
+  refusal itself in `from_decl_and_app`. That early check stays (nice config-time error, same
+  `addr.ip().is_loopback()` predicate) but is now backstopped by construction.
+- Loopback semantics vs `a2a.rs`: confirmed they answer **different questions** and are correctly
+  separate. The server bind check is IP-classification (`SocketAddr::ip().is_loopback()`, covers all
+  of `127.0.0.0/8` + `::1`) on the *inbound* listen address. `a2a.rs:configured_push_private_net`'s
+  "three loopback spellings" is a hostname allow-list for the *outbound* push-notification SSRF guard
+  (`FLUX_A2A_PUSH_ALLOW_LOCAL`), routed through the DNS-aware `guard_url`. Unifying them would be
+  wrong (an IP-classification bind check must not degrade to a 3-string allow-list that misses
+  `127.0.0.2`; the egress guard must resolve hostnames, not classify a literal IP). Documented the
+  divergence in `unauthenticated_bind_allowed`'s doc comment; no code change — out of scope, by design.
 
 ## Notes
 - Verified: `crates/flux-server/src/lib.rs:457` — `"refusing unauthenticated non-loopback bind on

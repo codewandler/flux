@@ -25,7 +25,12 @@ fn two_agent_app() -> Router {
     let resolver = StaticResolver::new()
         .with_agent("support", support, CardInfo::for_agent("support", None))
         .with_agent("sales", sales, CardInfo::for_agent("sales", None));
-    router_multi(Arc::new(resolver), ServerAuth::Open)
+    router_multi(
+        Arc::new(resolver),
+        ServerAuth::Open,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn send_body(text: &str, context_id: Option<&str>) -> Value {
@@ -115,7 +120,12 @@ async fn agents_are_isolated_by_path() {
     let resolver = StaticResolver::new()
         .with_agent("support", support, CardInfo::for_agent("support", None))
         .with_agent("sales", sales, CardInfo::for_agent("sales", None));
-    let app = router_multi(Arc::new(resolver), ServerAuth::Open);
+    let app = router_multi(
+        Arc::new(resolver),
+        ServerAuth::Open,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
 
     let (status, body) = post_a2a(app, "support", send_body("hi", Some("ctx-1"))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -141,7 +151,12 @@ async fn contextid_continuity_within_an_agent() {
     let events = support.events.clone();
     let resolver =
         StaticResolver::new().with_agent("support", support, CardInfo::for_agent("support", None));
-    let app = router_multi(Arc::new(resolver), ServerAuth::Open);
+    let app = router_multi(
+        Arc::new(resolver),
+        ServerAuth::Open,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
 
     for _ in 0..2 {
         let (status, _) = post_a2a(app.clone(), "support", send_body("hi", Some("ctx-42"))).await;
@@ -191,7 +206,7 @@ async fn auth_is_one_layer_over_the_mount() {
     let resolver =
         StaticResolver::new().with_agent("support", support, CardInfo::for_agent("support", None));
     let auth = ServerAuth::Principal(PrincipalAuth::new(Arc::new(OneUser), "https://x.example"));
-    let app = router_multi(Arc::new(resolver), auth);
+    let app = router_multi(Arc::new(resolver), auth, "127.0.0.1:0".parse().unwrap()).unwrap();
 
     // No token → 401 on the RPC endpoint.
     let (status, _) = post_a2a(app.clone(), "support", send_body("hi", None)).await;

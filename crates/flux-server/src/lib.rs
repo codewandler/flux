@@ -48,7 +48,12 @@ pub(crate) type TurnGate = Arc<tokio::sync::Mutex<()>>;
 /// How the server authenticates requests — three explicit modes.
 #[derive(Clone)]
 pub enum ServerAuth {
-    /// No authentication. [`serve_on`] refuses this mode on a non-loopback bind.
+    /// No authentication. This mode is **guaranteed loopback-only by construction**: [`router`]
+    /// (and [`router_multi`]) refuse to build an `Open` router for a non-loopback bind, so every
+    /// serving path — including a lower-level caller that mounts the router into its own
+    /// `axum::serve` — inherits the refusal rather than being trusted to re-derive it. The
+    /// auto-approving daemon behind an open listener is remote code execution off loopback; there
+    /// is no escape hatch (front it with an authenticating proxy instead).
     Open,
     /// One static shared secret for the whole deployment (the pre-D-69 mode): every request
     /// presents `Authorization: Bearer <secret>`, compared in constant time. There is no
@@ -69,8 +74,9 @@ pub enum ServerAuth {
 
 impl ServerAuth {
     /// The pre-D-69 token knob mapped onto the explicit modes: `Some` → shared secret, `None` →
-    /// open (loopback-only). Kept for the surfaces whose config still speaks "optional token"
-    /// (the CLI's `FLUX_SERVER_TOKEN`, the `a2a` channel adapter).
+    /// open (loopback-only, enforced at router construction — see [`ServerAuth::Open`]). Kept for
+    /// the surfaces whose config still speaks "optional token" (the CLI's `FLUX_SERVER_TOKEN`, the
+    /// `a2a` channel adapter).
     pub fn from_token(token: Option<String>) -> Self {
         Self::shared_secret(token, None)
     }
@@ -454,23 +460,42 @@ pub async fn serve_on(
     auth: ServerAuth,
 ) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
-    if matches!(auth, ServerAuth::Open) && !unauthenticated_bind_allowed(addr) {
-        anyhow::bail!(
-            "refusing unauthenticated non-loopback bind on {addr}; set FLUX_SERVER_TOKEN or bind \
-             to 127.0.0.1/::1"
-        );
-    }
-    axum::serve(
-        listener,
-        router(Arc::new(agent), auth, CardInfo::flux_coding()),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    // The non-loopback refusal now lives in `router` (construction-time, C-190); `serve_on` simply
+    // propagates it, so there is one enforcement point every caller shares.
+    let router = router(Arc::new(agent), auth, CardInfo::flux_coding(), addr)?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
+/// The one predicate that decides whether an *unauthenticated* server may bind `addr`: loopback
+/// only. IP-classification based (`is_loopback` covers all of `127.0.0.0/8` and `::1`), which is a
+/// deliberately different question from the `a2a` push-notification target guard's hostname
+/// allow-list (`a2a.rs` `configured_push_private_net`): that one governs *outbound* SSRF egress and
+/// is routed through the DNS-aware `guard_url`, this one governs the *inbound* listen address. Two
+/// layers, two questions — they are not, and should not be, the same check.
 fn unauthenticated_bind_allowed(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+/// The construction-time guard behind the safety invariant *"an unauthenticated server is never
+/// exposed off loopback"* (`AGENTS.md`: *there are no bypass paths — don't add one*). Enforced HERE,
+/// at router build, rather than only inside [`serve_on`]: a lower-level caller that mounts the router
+/// into its own `axum::serve` (the `a2a` channel does exactly this) inherits the refusal by
+/// construction instead of being silently responsible for re-deriving it. [`ServerAuth::Open`] on a
+/// non-loopback bind is remote code execution against the auto-approving daemon, so it is refused
+/// outright — there is deliberately no escape hatch. A deployment that must face the network fronts
+/// the loopback daemon with an authenticating reverse proxy (or configures shared-secret/principal
+/// auth), it does not open the listener itself.
+fn guard_open_bind(auth: &ServerAuth, addr: SocketAddr) -> anyhow::Result<()> {
+    if matches!(auth, ServerAuth::Open) && !unauthenticated_bind_allowed(addr) {
+        anyhow::bail!(
+            "refusing to build an unauthenticated router for non-loopback bind {addr}; set \
+             FLUX_SERVER_TOKEN (shared-secret auth) or bind to 127.0.0.1/::1"
+        );
+    }
+    Ok(())
 }
 
 /// Serve a resolver-keyed multi-agent mount (D-63) until shutdown — the guarded entry point for
@@ -494,13 +519,10 @@ pub async fn serve_multi_on(
     auth: ServerAuth,
 ) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
-    if matches!(auth, ServerAuth::Open) && !unauthenticated_bind_allowed(addr) {
-        anyhow::bail!(
-            "refusing unauthenticated non-loopback bind on {addr} for the multi-agent mount; \
-             configure auth or bind to 127.0.0.1/::1"
-        );
-    }
-    axum::serve(listener, router_multi(resolver, auth))
+    // Same construction-time refusal as the single-agent mount (C-190): `router_multi` enforces it,
+    // `serve_multi_on` propagates it.
+    let router = router_multi(resolver, auth, addr)?;
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
@@ -616,8 +638,20 @@ fn request_timeout_layer(limits: ServerLimits) -> TimeoutLayer {
 /// authenticating per `auth` (every route except `/health` and the agent card). Public so the
 /// `a2a` channel ([`flux_channels`]) can mount it onto a program agent's engine with its own
 /// graceful-shutdown serve.
-pub fn router(engine: Arc<FlowEngine>, auth: ServerAuth, card: CardInfo) -> Router {
-    router_with_ttl(engine, auth, card, a2a_ttl_from_config())
+///
+/// `bind` is the address the caller will serve this router on. Construction **refuses**
+/// [`ServerAuth::Open`] on a non-loopback `bind` (see [`guard_open_bind`]): the unauthenticated +
+/// off-loopback combination is unrepresentable as a built router, so a caller that mounts this into
+/// its own `axum::serve` gets the safety invariant by construction rather than re-deriving it. That
+/// is why this returns a `Result` — the refusal is the error.
+pub fn router(
+    engine: Arc<FlowEngine>,
+    auth: ServerAuth,
+    card: CardInfo,
+    bind: SocketAddr,
+) -> anyhow::Result<Router> {
+    guard_open_bind(&auth, bind)?;
+    Ok(router_with_ttl(engine, auth, card, a2a_ttl_from_config()))
 }
 
 /// Resolve the A2A session TTL from the layered flux config (`[server] a2a_session_ttl_secs`,
@@ -862,11 +896,17 @@ impl FromRef<MultiState> for Arc<a2a::TaskRegistry> {
 /// the A2A protocol surface a multi-agent host actually needs; the single-agent [`router`] remains
 /// the way to expose the full REST surface for one engine.
 ///
-/// This only *builds* the router; prefer [`serve_multi`]/[`serve_multi_on`], which refuse an
-/// unauthenticated non-loopback bind. A caller wiring `axum::serve` directly must enforce that
-/// itself — an [`ServerAuth::Open`] mount on a public interface auto-approves every tool call.
-pub fn router_multi(resolver: Arc<dyn AgentResolver>, auth: ServerAuth) -> Router {
-    router_multi_with_ttl(resolver, auth, a2a_ttl_from_config())
+/// Construction **refuses** [`ServerAuth::Open`] on a non-loopback `bind` (C-190), exactly as the
+/// single-agent [`router`] does: an open mount on a public interface auto-approves every tool call,
+/// so the unauthenticated + off-loopback combination is refused at build time and a caller wiring
+/// `axum::serve` directly inherits the guarantee instead of re-deriving it. Hence the `Result`.
+pub fn router_multi(
+    resolver: Arc<dyn AgentResolver>,
+    auth: ServerAuth,
+    bind: SocketAddr,
+) -> anyhow::Result<Router> {
+    guard_open_bind(&auth, bind)?;
+    Ok(router_multi_with_ttl(resolver, auth, a2a_ttl_from_config()))
 }
 
 fn router_multi_with_ttl(
@@ -1521,7 +1561,13 @@ mod tests {
             .end_turn(&sid, turn_id, "accepted", 1, "done", None)
             .unwrap();
 
-        let app = router(engine, ServerAuth::Open, CardInfo::flux_coding());
+        let app = router(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let (status, body) = get_json(app.clone(), &format!("/sessions/{sid}/usage")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["session_id"], sid);
@@ -1834,5 +1880,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ── Non-loopback auth by construction (C-190) ────────────────────────────
+
+    /// C-190 failing-first: the invariant that an unauthenticated (`Open`) server may not be exposed
+    /// on a non-loopback address must hold at ROUTER CONSTRUCTION — not only inside `serve_on`. A
+    /// caller that mounts the real router and serves it itself (the `a2a` channel does exactly this,
+    /// via `flux_server::router` + `axum::serve`) must not be able to stand up an open router bound
+    /// to a routable address. This test drives the REAL construction path, not a hand-built
+    /// `guarded_app`, so it pins the construction-time guarantee the C-189 review flagged as untested.
+    ///
+    /// Pre-change, `router` took no bind address and always built a fully-permissive open router; a
+    /// direct mounter reached every protected route unauthenticated on any interface. After: `router`
+    /// refuses the unauthenticated + non-loopback combination, so the open router cannot be built for
+    /// a routable bind at all.
+    #[tokio::test]
+    async fn unauthenticated_non_loopback_router_is_refused_at_construction() {
+        let (engine, _events) = usage_test_engine();
+
+        // Unauthenticated + non-loopback: refused when the router is built.
+        let refused = router(
+            engine.clone(),
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            "0.0.0.0:8080".parse().unwrap(),
+        );
+        assert!(
+            refused.is_err(),
+            "Open + non-loopback must be refused at router construction, not only in serve_on"
+        );
+
+        // Authenticated + non-loopback is fine — the refusal is specifically the UNAUTHENTICATED
+        // case (a shared secret makes a routable bind safe).
+        assert!(
+            router(
+                engine.clone(),
+                ServerAuth::from_token(Some("s3cr3t".to_string())),
+                CardInfo::flux_coding(),
+                "0.0.0.0:8080".parse().unwrap(),
+            )
+            .is_ok(),
+            "an authenticated non-loopback router still builds"
+        );
+
+        // Open + loopback is the dev path — it builds, and (being open) serves a protected route
+        // without a token, which is exactly why the non-loopback refusal above matters.
+        let app = router(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("an open loopback router builds");
+        let res = app
+            .oneshot(HttpRequest::post("/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "an open loopback router reaches its protected routes without auth"
+        );
     }
 }

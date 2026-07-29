@@ -155,7 +155,11 @@ pub fn app(token: Option<String>) -> Router {
         engine,
         flux_server::ServerAuth::from_token(token),
         flux_server::CardInfo::flux_coding(),
+        // A loopback bind so the C-190 construction-time refusal admits the fixture (unauthenticated
+        // fixtures use `token = None` → `ServerAuth::Open`, which is loopback-only by construction).
+        "127.0.0.1:0".parse().unwrap(),
     )
+    .expect("loopback router builds")
 }
 
 /// `POST path` with a JSON body and no `Authorization` header; returns `(status, parsed JSON
