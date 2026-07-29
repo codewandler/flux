@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -23,10 +23,16 @@ tokio::task_local! {
     static ACTIVE_DELIVERY: DeliveryOrigin;
 }
 
+/// The delivery a piece of journey work belongs to. Everything a delivery must not share with a
+/// concurrently running one lives here: its cascade queue, and its `spawn` nesting budget.
 #[derive(Clone)]
 pub(crate) struct DeliveryOrigin {
     pub(crate) supervisor: u64,
     pub(crate) cascades: Arc<Mutex<VecDeque<Event>>>,
+    /// Active nested-journey depth for *this* delivery. Engine-wide it would be a shared budget,
+    /// and a wide enough burst of concurrent deliveries would trip the recursion guard on work that
+    /// never recursed (A-112).
+    pub(crate) depth: Arc<AtomicU32>,
 }
 
 impl DeliveryOrigin {

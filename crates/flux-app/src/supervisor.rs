@@ -3,13 +3,19 @@
 //! Public bus subscriptions are observation-only. This actor is the sole consumer that routes
 //! events into triggers, which keeps direct deliveries, long-running supervision, and public bus
 //! emission from duplicating or consuming one another's cascades.
+//!
+//! Single *owner*, not single *file*: the actor loop only dequeues, and runs each submitted root in
+//! its own task. Every root carries a [`DeliveryOrigin`] whose cascade queue and nesting budget are
+//! private to it (A-112), so concurrent deliveries neither collect one another's `emit`s nor wait
+//! behind one another — a nightly sweep no longer blocks webhook intake.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch, OnceCell};
+use tokio::task::JoinSet;
 
 use flux_core::{Error, Result};
 
@@ -220,81 +226,91 @@ async fn supervise(
     engine: Weak<Engine>,
     mut receiver: mpsc::Receiver<DeliveryMessage>,
 ) -> String {
+    // The loop dequeues and never processes: routing one root must not stall the next submission.
+    // Completed tasks are reaped opportunistically; the set is only a handle on the in-flight roots.
+    let mut roots = JoinSet::new();
     while let Some(message) = receiver.recv().await {
         let Some(engine) = engine.upgrade() else {
             return "App engine dropped".into();
         };
-        match message {
-            DeliveryMessage::Deliver {
-                event,
-                mut response,
-            } => {
-                if response.is_closed() {
-                    continue;
-                }
-                let work = process_root(&engine, supervisor, event, Some(MAX_CASCADE));
-                tokio::pin!(work);
-                let result = tokio::select! {
-                    biased;
-                    result = &mut work => Some(result),
-                    _ = response.closed() => None,
-                };
-                if let Some(result) = result {
-                    let _ = response.send(result);
-                }
+        while roots.try_join_next().is_some() {}
+        roots.spawn(process(engine, supervisor, message));
+    }
+    "delivery supervisor queue closed".into()
+}
+
+/// Run one submitted root to completion in its own task. A journey that blocks — a sweep, a parked
+/// `ask`, a slow tool — holds up this delivery and nothing else.
+async fn process(engine: Arc<Engine>, supervisor: u64, message: DeliveryMessage) {
+    match message {
+        DeliveryMessage::Deliver {
+            event,
+            mut response,
+        } => {
+            if response.is_closed() {
+                return;
             }
-            DeliveryMessage::Start {
-                event,
-                completed,
-                observed,
-                run,
-                mut response,
-            } => {
-                if response.is_closed() {
-                    run.cancel();
-                    continue;
-                }
-                if !observed.swap(true, Ordering::AcqRel) {
-                    engine.bus.observe(event.clone());
-                }
-                let work = process_root(&engine, supervisor, event, None);
-                tokio::pin!(work);
-                let result = tokio::select! {
-                    biased;
-                    result = &mut work => Some(result.map(|_| ())),
-                    _ = response.closed() => None,
-                };
-                if let Some(result) = result {
-                    if result.is_ok() {
-                        completed.store(true, Ordering::Release);
-                    } else {
-                        run.cancel();
-                    }
-                    let _ = response.send(result);
+            let work = process_root(&engine, supervisor, event, Some(MAX_CASCADE));
+            tokio::pin!(work);
+            let result = tokio::select! {
+                biased;
+                result = &mut work => Some(result),
+                _ = response.closed() => None,
+            };
+            if let Some(result) = result {
+                let _ = response.send(result);
+            }
+        }
+        DeliveryMessage::Start {
+            event,
+            completed,
+            observed,
+            run,
+            mut response,
+        } => {
+            if response.is_closed() {
+                run.cancel();
+                return;
+            }
+            if !observed.swap(true, Ordering::AcqRel) {
+                engine.bus.observe(event.clone());
+            }
+            let work = process_root(&engine, supervisor, event, None);
+            tokio::pin!(work);
+            let result = tokio::select! {
+                biased;
+                result = &mut work => Some(result.map(|_| ())),
+                _ = response.closed() => None,
+            };
+            if let Some(result) = result {
+                if result.is_ok() {
+                    completed.store(true, Ordering::Release);
                 } else {
                     run.cancel();
                 }
+                let _ = response.send(result);
+            } else {
+                run.cancel();
             }
-            DeliveryMessage::Event { event, run } => {
-                if run.is_cancelled() {
-                    continue;
-                }
-                let work = process_root(&engine, supervisor, event, None);
-                tokio::pin!(work);
-                tokio::select! {
-                    biased;
-                    _ = run.cancelled() => {}
-                    result = &mut work => {
-                        if let Err(error) = result {
-                            run.cancel();
-                            run.report(format!("delivery supervisor failed: {error}"));
-                        }
+        }
+        DeliveryMessage::Event { event, run } => {
+            if run.is_cancelled() {
+                return;
+            }
+            let work = process_root(&engine, supervisor, event, None);
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                _ = run.cancelled() => {}
+                result = &mut work => {
+                    if let Err(error) = result {
+                        run.cancel();
+                        run.report(format!("delivery supervisor failed: {error}"));
                     }
                 }
             }
         }
     }
-    "delivery supervisor queue closed".into()
 }
 
 async fn process_root(
@@ -304,6 +320,7 @@ async fn process_root(
     limit: Option<u32>,
 ) -> Result<Vec<JourneyRun>> {
     let cascades = Arc::new(Mutex::new(VecDeque::new()));
+    let depth = Arc::new(AtomicU32::new(0));
     let mut results = Vec::new();
     let mut handled = 0_u32;
     let mut next = Some(initial);
@@ -318,6 +335,7 @@ async fn process_root(
             DeliveryOrigin {
                 supervisor,
                 cascades: cascades.clone(),
+                depth: depth.clone(),
             },
             engine.run_triggers(&event.label, &event.payload, &mut sink),
         )
