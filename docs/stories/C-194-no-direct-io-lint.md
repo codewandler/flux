@@ -65,6 +65,18 @@ surfacing in the next adversarial review.
   prod caller — the source-scoping tool decorator `self.inner.execute(...)` in `flux-app/src/app.rs`
   — so a greppable form would be all-false-positive without per-call allowlisting disproportionate to
   this story. Left as a follow-up candidate.
+- **Round-2 security hardening (review rework).** The first cut did brace-counting, comment-stripping
+  and marker-matching over *raw text*, which an independent review showed could be fooled in the
+  UNSAFE direction — real non-test direct-IO calls passing `scan_file` silently: (1) a net-imbalanced
+  brace inside a string in a `#[cfg(test)]` region disarmed the rest of the file; (2) a `//` inside a
+  string truncated the code before matching; (3) a same-line marker exempted every call on the line;
+  (4) `flux-allow-direct-io` matched as an unanchored substring, so the text inside a path/string
+  exempted the call. `scan_file` is now a character-level tokenizer that blanks string/char literals
+  and comments before brace counting / pattern matching, and honours the marker only inside a real
+  comment on a line above the call (all 14 real annotations are written that way). `--self-test` pins
+  a fixture for each of the four; verified red-before (the naive version flagged *none* of the four)
+  and green-after. The real tree stays clean under the stricter scan — no pre-existing brace-in-string
+  was masking a real call.
 
 ## Notes
 - **Verified against the tree at `0.33.1` (f8e90d7).** Source review:

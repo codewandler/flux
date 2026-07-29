@@ -31,13 +31,19 @@
 #   TcpStream::connect   UnixStream::connect
 # A genuinely legitimate exception (a backend that owns its store, host-infra persistence, the
 # already-guarded sqlite read path) is admitted ONLY by an explicit, greppable annotation carrying a
-# reason — `// flux-allow-direct-io: <why>` — on the offending line or the line directly above it. An
-# unannotated match, or a silent omission of a file from scope, is a failure. Occurrences inside line
-# comments do not count (documentation may name the APIs it forbids).
+# reason — `// flux-allow-direct-io: <why>` — in the run of comment lines DIRECTLY ABOVE the call
+# (which is how every real exception is written). An unannotated match, or a silent omission of a
+# file from scope, is a failure.
+#
+# The scan is string/char/comment-aware (a small awk tokenizer). It matters for a *security* lint
+# that it cannot be fooled in the unsafe direction — a brace inside a string literal must not throw
+# off the `#[cfg(test)]` tracking, a `//` inside a string must not truncate the line, and the
+# allow-marker must be honoured only when it is a real comment, never text inside a string or path.
 #
 #   scripts/check-no-direct-io.sh              # scan the scoped crates
 #   scripts/check-no-direct-io.sh --self-test  # prove the check flags a direct open and honours the
-#                                              # cfg(test), comment and allow-annotation exemptions
+#                                              # cfg(test), comment and allow-annotation exemptions,
+#                                              # and resists the four known text-handling bypasses
 #
 # Exit 0 clean, 1 an unannotated direct-IO call (a real failure).
 #
@@ -51,50 +57,101 @@ fail() { printf '\033[31mFAIL\033[0m %s\n' "$1" >&2; }
 SCOPED_CRATES="flux-tools flux-web flux-capabilities"
 
 # scan_file <path> — print "<lineno>\t<snippet>" for every unannotated, non-test direct-IO call in
-# one Rust source file. The awk program tracks `#[cfg(test)]`-attributed item bodies by brace depth
-# so a match inside a test module (or a test-only fn) is exempt, strips line comments before matching
-# so prose that names these APIs never trips, and honours a `flux-allow-direct-io` marker on the
-# match line or the line directly above it.
+# one Rust source file.
+#
+# The awk program is a character-level tokenizer. For each line it produces two derived strings:
+#   code    — the line with every string/char literal and every comment blanked out, so brace
+#             counting, `#[cfg(test)]` detection and the IO-pattern match run over *real code only*;
+#   comment — the text of the comments on the line, so the allow-marker is recognised only inside an
+#             actual comment.
+# String (`"…"`, byte `b"…"`, raw `r#"…"#`), char (`'x'`, distinguished from a `'a` lifetime) and
+# block-comment (`/* … */`) states persist across lines where the language allows it, so no literal
+# or comment can leak a brace, a `//`, or the marker text into the code stream.
 scan_file() {
   awk '
-    BEGIN { depth = 0; in_test = 0; test_base = 0; pending = 0; allow = 0 }
+    function is_ident(ch) { return ch ~ /[A-Za-z0-9_]/ }
+    BEGIN {
+      depth = 0; in_test = 0; test_base = 0; pending = 0; allow = 0
+      st = 0; hashes = 0; prevcode = ""          # st: 0 code 1 //line 2 /* */ 3 "str" 4 char 5 raw
+      sq = sprintf("%c", 39); dq = sprintf("%c", 34); bs = sprintf("%c", 92)
+    }
     {
       raw = $0
-      code = raw
-      sub(/\/\/.*/, "", code)            # drop line comments for matching + brace counting
-
-      is_comment = (raw ~ /^[[:space:]]*\/\//)
-      is_blank   = (raw ~ /^[[:space:]]*$/)
-      has_marker = (raw ~ /flux-allow-direct-io/)
-
-      # A cfg(test) attribute arms the next item body as a test region.
-      if (code ~ /#\[cfg\(test\)\]/) pending = 1
-
-      t = code; opens  = gsub(/\{/, "", t)
-      t = code; closes = gsub(/\}/, "", t)
-
-      if (pending && opens > 0) {
-        in_test = 1; test_base = depth; pending = 0
-      } else if (pending && code ~ /;[[:space:]]*$/) {
-        # a bodyless test item (e.g. `#[cfg(test)] use ...;`) — skip just this line
-        pending = 0; depth += opens - closes; next
+      n = length(raw)
+      code = ""; comment = ""
+      if (st == 1) st = 0                         # line comments never cross a newline
+      if (st == 4) st = 0                         # an unterminated char literal is a misparse; reset
+      i = 1
+      while (i <= n) {
+        c = substr(raw, i, 1)
+        nc = (i < n) ? substr(raw, i + 1, 1) : ""
+        if (st == 0) {
+          if (c == "/" && nc == "/") { st = 1; i += 2; continue }
+          if (c == "/" && nc == "*") { st = 2; i += 2; continue }
+          if (c == dq)               { st = 3; i += 1; continue }
+          if (c == "r" && !is_ident(prevcode) && (nc == dq || nc == "#")) {
+            j = i + 1; h = 0
+            while (j <= n && substr(raw, j, 1) == "#") { h++; j++ }
+            if (j <= n && substr(raw, j, 1) == dq) { st = 5; hashes = h; i = j + 1; continue }
+            code = code c; prevcode = c; i += 1; continue           # a bare identifier `r…`
+          }
+          if (c == sq) {
+            if (nc == bs)                    { st = 4; i += 1; continue }   # char with escape
+            if (substr(raw, i + 2, 1) == sq) { st = 4; i += 1; continue }   # simple char literal
+            code = code c; prevcode = c; i += 1; continue                   # a lifetime tick
+          }
+          code = code c
+          if (c ~ /[^[:space:]]/) prevcode = c
+          i += 1; continue
+        }
+        if (st == 1) { comment = comment c; i += 1; continue }
+        if (st == 2) {
+          if (c == "*" && nc == "/") { st = 0; i += 2; continue }
+          comment = comment c; i += 1; continue
+        }
+        if (st == 3) {
+          if (c == bs) { i += 2; continue }
+          if (c == dq) { st = 0; i += 1; continue }
+          i += 1; continue
+        }
+        if (st == 4) {
+          if (c == bs) { i += 2; continue }
+          if (c == sq) { st = 0; i += 1; continue }
+          i += 1; continue
+        }
+        if (st == 5) {                              # raw string: close on the quote + hashes count
+          if (c == dq) {
+            ok = 1
+            for (k = 1; k <= hashes; k++) if (substr(raw, i + k, 1) != "#") { ok = 0; break }
+            if (ok) { st = 0; i += 1 + hashes; continue }
+          }
+          i += 1; continue
+        }
       }
 
-      # An allow-annotation may sit on the offending line or anywhere in the contiguous run of
-      # comment lines directly above it. Accumulate the marker across that comment block; a blank
-      # line or a plain code line ends the block and clears it.
-      if (is_comment) {
-        if (has_marker) allow = 1
-      } else if (is_blank) {
+      codetrim = code; gsub(/[[:space:]]/, "", codetrim)
+      purecomment = (codetrim == "" && comment != "")
+      blankline   = (codetrim == "" && comment == "")
+
+      # --- #[cfg(test)] region tracking, over real code only ---
+      if (code ~ /#\[cfg\(test\)\]/) pending = 1
+      t = code; opens  = gsub(/\{/, "", t)
+      t = code; closes = gsub(/\}/, "", t)
+      if (pending) {
+        if (opens > 0)                    { in_test = 1; test_base = depth; pending = 0 }
+        else if (code ~ /;[[:space:]]*$/) { pending = 0 }   # bodyless test item, e.g. `use …;`
+      }
+
+      # --- allow-annotation block + violation, honouring only comment-borne markers above the call ---
+      if (purecomment) {
+        if (comment ~ /flux-allow-direct-io/) allow = 1
+      } else if (blankline) {
         allow = 0
       } else {
         if (!in_test && code ~ /std::fs::|tokio::fs::|std::process::Command|tokio::process::Command|Connection::open|TcpStream::connect|UnixStream::connect/) {
-          if (!(has_marker || allow)) {
-            snip = raw; sub(/^[[:space:]]+/, "", snip)
-            printf "%d\t%s\n", NR, snip
-          }
+          if (!allow) { snip = raw; sub(/^[[:space:]]+/, "", snip); printf "%d\t%s\n", NR, snip }
         }
-        allow = 0                        # a code line ends the annotation block
+        allow = 0                                    # a code line ends the annotation block
       }
 
       depth += opens - closes
@@ -103,45 +160,70 @@ scan_file() {
   ' "$1"
 }
 
-# --self-test: the failing-first proof. A synthetic fixture file holds one unannotated direct open
-# (must be flagged), plus a comment mention, an allow-annotated call, a same-line-annotated call and
-# a call inside `#[cfg(test)] mod tests` (none of which may be flagged). Proves red on the bad line
-# and green on every exemption, without weakening any guard in shipped code.
+# --self-test: the failing-first proof. A synthetic fixture holds the calls that MUST be flagged
+# (an unannotated open; and one instance of each of the four known text-handling bypasses) and the
+# calls that MUST NOT (a real comment-above annotation, a cfg(test) call, a prose mention). It proves
+# red on every real call and green on every exemption, without weakening any guard in shipped code.
 if [ "${1:-}" = "--self-test" ]; then
   fixture="$(mktemp -t direct-io-selftest.XXXXXX.rs)"
   trap 'rm -f "$fixture"' EXIT
   cat > "$fixture" <<'RS'
-// This comment names std::fs::write and Connection::open but is prose, not a call.
-fn persist(path: &str) {
-    let bad = std::fs::write(path, b"x");          // MUST be flagged (line 4)
-    // flux-allow-direct-io: fixture — allowed via annotation on the line above
-    let ok1 = std::fs::create_dir_all(path);
-    let ok2 = Connection::open(path); // flux-allow-direct-io: fixture — same-line annotation
+// Prose that names std::fs::write and Connection::open but is a comment, not a call: MUST NOT flag.
+fn baseline(path: &str) {
+    // flux-allow-direct-io: fixture — a real comment-above annotation exempts the next call.
+    let ok_annotated = std::fs::create_dir_all(path);   // GOODANNOT — must stay green
 }
+
+// Bug #2: a // inside a string literal must not truncate the code after it (same line).
+fn bug2() {
+    let u = "http://example.test"; let _ = std::fs::write(u, b"y"); // BUG2 — must flag
+}
+
+// Bug #3: a same-line marker must not exempt other IO on the line (marker only counts above a call).
+fn bug3(p: &str) {
+    let _ = std::fs::write(p, b"BUG3"); let _ok = Connection::open(p); // flux-allow-direct-io: nope
+}
+
+// Bug #4: the marker text inside a string/path must not exempt the call.
+fn bug4() {
+    let _ = std::fs::read("flux-allow-direct-io-BUG4.txt");            // BUG4 — must flag
+}
+
+// Bug #1: a net-imbalanced brace inside a string in a cfg(test) region must not disarm the file.
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn t() {
-        let _ = std::fs::remove_dir_all("/tmp/x");  // in cfg(test): MUST NOT be flagged
-        let _ = Connection::open(":memory:");
-    }
+fn brace_in_test_string() {
+    let _brace = "{{{ unbalanced BUG1CFGTEST";
+    let _ = std::fs::remove_dir_all("GOODCFGTEST");     // in cfg(test): MUST NOT flag
+}
+
+// After the cfg(test) item above, prod code must still be scanned.
+fn after_test() {
+    let _ = std::fs::write("BUG1", b"x");               // BUG1 — must flag (the disarm is fixed)
 }
 RS
 
   out="$(scan_file "$fixture")"
-  count="$(printf '%s' "$out" | grep -c . || true)"
 
-  if [ "$count" -ne 1 ]; then
-    fail "self-test: expected exactly 1 violation, got $count:"
+  ok=1
+  # Every one of these real calls must appear in the output.
+  for needle in BUG1 BUG2 BUG3 BUG4; do
+    if ! printf '%s' "$out" | grep -q "$needle"; then
+      fail "self-test: expected a violation for $needle but it was not flagged"; ok=0
+    fi
+  done
+  # None of these exemptions may appear.
+  for needle in GOODANNOT GOODCFGTEST; do
+    if printf '%s' "$out" | grep -q "$needle"; then
+      fail "self-test: $needle was flagged but should be exempt"; ok=0
+    fi
+  done
+
+  if [ "$ok" -ne 1 ]; then
+    echo "self-test scan output was:" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
-  if ! printf '%s' "$out" | grep -q 'std::fs::write'; then
-    fail "self-test: the one flagged line was not the unannotated std::fs::write:"
-    printf '%s\n' "$out" >&2
-    exit 1
-  fi
-  printf '\033[32mPASS\033[0m self-test: unannotated direct open flagged; cfg(test), comment and allow-annotation exemptions honoured\n'
+  printf '\033[32mPASS\033[0m self-test: real opens flagged (incl. the 4 text-handling bypasses); cfg(test), comment and allow-annotation exemptions honoured\n'
   exit 0
 fi
 
@@ -165,8 +247,9 @@ if [ "$violations" -gt 0 ]; then
   echo >&2
   echo "$violations direct-IO call(s) above bypass flux-system's jail." >&2
   echo "Route the IO through flux-system (ctx.system() / flux_system::…), or — if the call is a" >&2
-  echo "genuine, contained exception — annotate the line with its reason:" >&2
-  echo "  let conn = Connection::open(&p)?; // flux-allow-direct-io: <why this is safe>" >&2
+  echo "genuine, contained exception — add a reasoned annotation on the line(s) directly above it:" >&2
+  echo "  // flux-allow-direct-io: <why this is safe>" >&2
+  echo "  let conn = Connection::open(&p)?;" >&2
   exit 1
 fi
 
