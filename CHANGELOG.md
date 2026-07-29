@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-29
+
 ### Documentation
 
 
