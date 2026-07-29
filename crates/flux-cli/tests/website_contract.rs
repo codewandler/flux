@@ -28,7 +28,7 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-fn markdown_files(root: &Path) -> Vec<PathBuf> {
+fn files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -36,13 +36,17 @@ fn markdown_files(root: &Path) -> Vec<PathBuf> {
             let path = entry.expect("directory entry").path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path.extension().and_then(|x| x.to_str()) == Some("md") {
+            } else if path.extension().and_then(|x| x.to_str()) == Some(extension) {
                 out.push(path);
             }
         }
     }
     out.sort();
     out
+}
+
+fn markdown_files(root: &Path) -> Vec<PathBuf> {
+    files_with_extension(root, "md")
 }
 
 fn fenced_blocks<'a>(markdown: &'a str, language: &str) -> Vec<&'a str> {
@@ -64,6 +68,14 @@ fn test_dir(label: &str) -> PathBuf {
         .expect("system time")
         .as_nanos();
     std::env::temp_dir().join(format!("flux-{label}-{}-{nonce}", std::process::id()))
+}
+
+/// A throwaway event store, so `WakeupTool` can be registered for a name-only catalog check.
+/// The store is never written to — only the registered spec matters here.
+fn wakeup_events_for_contract() -> Arc<flux_events::EventStore> {
+    let dir = test_dir("website-wakeup");
+    fs::create_dir_all(&dir).expect("create contract store dir");
+    Arc::new(flux_events::EventStore::open(dir.join("events.db")).expect("open contract store"))
 }
 
 /// A provider that records the cognition prompt and returns one deterministic answer. The tutorial
@@ -144,15 +156,172 @@ fn cli_reference_covers_every_public_subcommand() {
         .split("\n\n")
         .next()
         .expect("Commands body");
-    let docs = read("website/docs/agent/cli.md");
-    for name in commands
+    // Both surfaces that enumerate the CLI. `website/docs/agent/cli.md` is the public reference (a
+    // row per command); `docs/usage.md` is the in-repo surface map. Only the first was guarded, and
+    // that is the whole reason `usage.md` drifted five subcommands behind while the site did not
+    // (C-204). The check asserts *mention*, not option completeness, which suits both shapes.
+    // The two files spell commands differently: the reference uses inline code (`` `flux run` ``),
+    // the surface map uses bare lines inside annotated shell blocks (`flux run   # …`). Match each
+    // on its own convention — the assertion is "is it mentioned", not "is it formatted like this".
+    let surfaces = [
+        (
+            "website/docs/agent/cli.md",
+            read("website/docs/agent/cli.md"),
+            "`flux ",
+        ),
+        ("docs/usage.md", read("docs/usage.md"), "flux "),
+    ];
+    let names: Vec<&str> = commands
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter(|name| *name != "help")
-    {
+        .collect();
+    assert!(
+        names.len() >= 20,
+        "expected to parse the subcommand list from --help, found {names:?}"
+    );
+    for (rel, docs, prefix) in &surfaces {
+        let missing: Vec<&&str> = names
+            .iter()
+            .filter(|name| !docs.contains(&format!("{prefix}{name}")))
+            .collect();
         assert!(
-            docs.contains(&format!("`flux {name}")),
-            "website CLI reference omits `flux {name}`"
+            missing.is_empty(),
+            "{rel} omits {} shipped subcommand(s): {missing:?}",
+            missing.len()
+        );
+    }
+}
+
+/// The TUI page must document the keys the TUI actually binds.
+///
+/// `HELP_KEYS` in `crates/flux-tui/src/lib.rs` is the table the in-app F1 overlay renders, so it is
+/// the one list that cannot drift from the bindings without the overlay lying too. Tying the public
+/// page to it means a rebind shows up here rather than in a user's bug report. Selectable themes
+/// come from `Theme::names()` for the same reason — `reference/config.md` had listed three of six.
+#[test]
+fn tui_page_documents_the_bound_keys_and_themes() {
+    let tui_src = read("crates/flux-tui/src/lib.rs");
+    let help_table = tui_src
+        .split_once("const HELP_KEYS:")
+        .expect("HELP_KEYS table")
+        .1
+        .split_once("];")
+        .expect("terminated HELP_KEYS table")
+        .0;
+
+    // The chord spellings out of the overlay table, minus the prose glosses. Each entry may list
+    // alternatives ("Ctrl-J / Alt-↵ / Shift-↵"); requiring the first is enough to prove the
+    // binding is on the page, without pinning the page to the overlay's exact typography.
+    let mut chords: Vec<String> = Vec::new();
+    for (idx, _) in help_table.match_indices("        (\"") {
+        let after = &help_table[idx + "        (\"".len()..];
+        let literal = after.split('"').next().expect("terminated chord literal");
+        if let Some(first) = literal.split('/').next() {
+            let first = first.trim();
+            if !first.is_empty() {
+                chords.push(first.to_string());
+            }
+        }
+    }
+    for (idx, _) in help_table.match_indices("    (\"") {
+        let after = &help_table[idx + "    (\"".len()..];
+        let literal = after.split('"').next().expect("terminated chord literal");
+        if let Some(first) = literal.split('/').next() {
+            let first = first.trim();
+            if !first.is_empty() && !chords.iter().any(|c| c == first) {
+                chords.push(first.to_string());
+            }
+        }
+    }
+    assert!(
+        chords.len() >= 10,
+        "expected to recover the F1 overlay's chords, found {chords:?}"
+    );
+
+    // The overlay is width-constrained and uses glyphs; prose spells the same key out. Normalise
+    // the one that differs so the page is not forced into the overlay's typography.
+    let spell = |s: &str| s.replace('↵', "Enter");
+    let page = spell(&read("website/docs/agent/tui.md"));
+    let missing: Vec<&String> = chords
+        .iter()
+        .filter(|c| !page.contains(&spell(c)))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "website/docs/agent/tui.md omits {} key binding(s) the TUI's own F1 overlay lists: \
+         {missing:?}",
+        missing.len()
+    );
+
+    // Every selectable theme must be named where a reader looks for it.
+    let theme_src = read("crates/flux-tui/src/theme.rs");
+    let names_body = theme_src
+        .split_once("pub fn names() -> &'static [&'static str] {")
+        .expect("Theme::names")
+        .1
+        .split_once('}')
+        .expect("terminated Theme::names")
+        .0;
+    let themes: Vec<&str> = names_body
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    assert!(themes.len() >= 3, "expected the theme list, got {themes:?}");
+    let config = read("website/docs/reference/config.md");
+    for theme in themes {
+        assert!(
+            page.contains(theme),
+            "website/docs/agent/tui.md omits the `{theme}` theme"
+        );
+        assert!(
+            config.contains(theme),
+            "website/docs/reference/config.md omits the `{theme}` theme"
+        );
+    }
+}
+
+/// Every route the server actually mounts must appear in the public HTTP reference.
+///
+/// The site documented three of twelve for a long time — `agent/a2a.md` covered the A2A routes and
+/// nothing covered the session REST subtree, its SSE stream, the webhook, or either usage endpoint.
+/// Axum's `Router` cannot be enumerated at runtime, so the route set is read out of the source, the
+/// same way `cli_reference_covers_every_public_subcommand` reads `--help`.
+#[test]
+fn http_api_reference_covers_every_served_route() {
+    let src = read("crates/flux-server/src/lib.rs");
+    // Production mounts only: the file's `#[cfg(test)]` module builds throwaway routers of its own.
+    let production = src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("source ahead of the test module");
+
+    let mut routes: Vec<&str> = Vec::new();
+    for (idx, _) in production.match_indices(".route(") {
+        // The path literal is not always on the same line — rustfmt wraps longer `.route(` calls,
+        // so skip whitespace rather than assuming `.route("`.
+        let after = production[idx + ".route(".len()..].trim_start();
+        let Some(literal) = after.strip_prefix('"') else {
+            continue;
+        };
+        let path = literal.split('"').next().expect("terminated route literal");
+        routes.push(path);
+    }
+    routes.sort_unstable();
+    routes.dedup();
+    assert!(
+        routes.len() >= 12,
+        "expected to recover the full mounted route set, found {}: {routes:?}",
+        routes.len()
+    );
+
+    let docs = read("website/docs/agent/http-api.md");
+    for path in routes {
+        assert!(
+            docs.contains(path),
+            "website/docs/agent/http-api.md omits the served route `{path}`"
         );
     }
 }
@@ -171,6 +340,22 @@ fn operations_reference_covers_the_registered_public_catalog() {
         None,
         "mock",
         DEFAULT_CONSULT_MAX_CALLS,
+    )
+    .try_register(&mut registry)
+    .unwrap();
+    // The four packs above are NOT the catalog a real session assembles — `execution.rs` also
+    // registers these, and their absence here is why `ai_segment`, the eval family and
+    // `schedule_wakeup` sat undocumented while this test stayed green.
+    flux_tools::try_register_reflect(&mut registry).unwrap();
+    flux_tools::try_register_flows(&mut registry).unwrap();
+    flux_eval::try_register_eval_ops(&mut registry).unwrap();
+    // `schedule_wakeup` is config-gated (`[wakeup] enabled`) rather than absent, so it is
+    // registered unconditionally here: gated-off is still public surface a reader must be able to
+    // look up — that is precisely how it stayed undocumented.
+    flux_flow::wakeup::WakeupTool::new(
+        wakeup_events_for_contract(),
+        flux_flow::wakeup::DEFAULT_MAX_HORIZON_SECS,
+        flux_flow::wakeup::DEFAULT_MAX_PENDING_PER_SESSION,
     )
     .try_register(&mut registry)
     .unwrap();
@@ -197,10 +382,141 @@ fn operations_reference_covers_the_registered_public_catalog() {
     );
     names.sort();
     names.dedup();
-    for name in names {
+    // Report every omission at once: fixing a catalog gap one panic at a time is what let three
+    // whole families accumulate.
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|name| !docs.contains(&format!("`{name}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "website/docs/language/ops.md omits {} registered operation(s): {missing:?}",
+        missing.len()
+    );
+}
+
+/// Environment variables that are read by shipped code but are deliberately NOT public config.
+///
+/// Anything read from `crates/*/src` and absent from this list must appear in the reference —
+/// adding a user-facing variable without documenting it should fail the gate, and adding an
+/// internal one should require saying so here. The `FLUX_TEST_` prefix is excluded wholesale by
+/// naming convention; everything else is named, so an undocumented public variable cannot hide
+/// behind a broad substring rule.
+const NON_PUBLIC_ENV: &[&str] = &[
+    // Test doubles and fixtures reached from non-test code paths.
+    "FLUX_CASSETTE",
+    "FLUX_CASSETTE_MAX_BYTES",
+    "FLUX_GOLDEN",
+    "FLUX_MOCK_BASH",
+    "FLUX_MOCK_HANG",
+    "FLUX_MOCK_RESPONSE",
+    "FLUX_MOCK_TOOL",
+    "FLUX_MOCK_TOOL_INPUT",
+    "FLUX_LIVE_BROWSER_SMOKE",
+    "FLUX_LIVE_SANDBOX_SMOKE",
+    "FLUX_WEB_DEFINITELY_UNSET",
+    "FLUX_WEB_SECRET_ALLOW",
+    "FLUX_WEB_STOLEN_TOKEN",
+    "FLUX_WEB_TEST_TOKEN",
+    // A `format!` prefix, not a variable: the D-116 endpoint e2e mints a per-process credential
+    // key (`FLUX_D116_PGPASS_<pid>`) to prove a credential *location* is never part of the URL.
+    "FLUX_D116_PGPASS_",
+    // Markers flux sets for its own child processes — observable, but not knobs a user sets.
+    "FLUX_BG_MARKER",
+    "FLUX_C67_CWD_CHILD",
+    "FLUX_EVAL_MARKER",
+    "FLUX_SANDBOXED",
+    "FLUX_SECRET",
+    "FLUX_SYSTEM_ENV_TRUTHY_PROBE",
+    // Internal development toggles with no supported behaviour contract.
+    "FLUX_OP_CACHE",
+    "FLUX_RESPONSES_CACHE",
+    "FLUX_SURFACE_ALL",
+];
+
+/// Every `FLUX_*` variable shipped code reads is either documented or explicitly classified.
+///
+/// The reference listed 13 of them while the tree read far more — including the whole
+/// `FLUX_EMBEDDINGS_*` trio, which gates datasource embeddings, and `FLUX_ALLOW_ALL`, which widens
+/// the safety envelope. Both classes are exactly the kind a user needs to find.
+#[test]
+fn config_reference_documents_every_public_env_var() {
+    let mut sources = Vec::new();
+    for crate_dir in fs::read_dir(repo_path("crates")).expect("read crates/") {
+        let src = crate_dir.expect("crate entry").path().join("src");
+        if src.is_dir() {
+            for file in files_with_extension(&src, "rs") {
+                sources.push(fs::read_to_string(&file).expect("read source"));
+            }
+        }
+    }
+    let joined = sources.concat();
+
+    let mut vars: Vec<String> = Vec::new();
+    for (idx, _) in joined.match_indices("\"FLUX_") {
+        let rest = &joined[idx + 1..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        if name.len() > "FLUX_".len() {
+            vars.push(name);
+        }
+    }
+    vars.sort();
+    vars.dedup();
+    assert!(
+        vars.len() > 40,
+        "expected to recover the env-var surface, found {}",
+        vars.len()
+    );
+
+    let config = read("website/docs/reference/config.md");
+    let providers = read("website/docs/agent/providers.md");
+    let storage = read("website/docs/reference/storage.md");
+    let undocumented: Vec<&String> = vars
+        .iter()
+        .filter(|v| !v.starts_with("FLUX_TEST_"))
+        .filter(|v| !NON_PUBLIC_ENV.contains(&v.as_str()))
+        .filter(|v| {
+            !config.contains(v.as_str())
+                && !providers.contains(v.as_str())
+                && !storage.contains(v.as_str())
+        })
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "these FLUX_* variables are read by shipped code but documented nowhere on the site: \
+         {undocumented:?}\nDocument them in website/docs/reference/config.md, or add them to \
+         NON_PUBLIC_ENV with the reason."
+    );
+}
+
+/// Every public `[section]` of the config schema is named in the reference.
+#[test]
+fn config_reference_documents_every_public_section() {
+    let schema = read("crates/flux-config/src/lib.rs");
+    let docs = read("website/docs/reference/config.md");
+    // The serde field name of each table on `Config` is what a user actually writes.
+    for section in [
+        "agent",
+        "consult",
+        "limits",
+        "private_net",
+        "sandbox",
+        "server",
+        "skills",
+        "tools",
+        "wakeup",
+        "workspace",
+    ] {
         assert!(
-            docs.contains(&format!("`{name}`")),
-            "website operations reference omits `{name}`"
+            schema.contains(&format!("pub {section}:")),
+            "`[{section}]` is no longer a field on the config schema — update this list"
+        );
+        assert!(
+            docs.contains(&format!("[{section}]")),
+            "website/docs/reference/config.md never mentions the `[{section}]` table"
         );
     }
 }
@@ -281,6 +597,57 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
     assert!(
         checked >= 25,
         "expected a representative Flux example corpus"
+    );
+}
+
+/// The syntax page must document the `"""` string form, and the form it documents must be real.
+///
+/// This page previously asserted the opposite — "Strings are single-line; embed newlines with `\n`
+/// escapes" — while the lexer had supported triple-quoted verbatim strings since L-39
+/// (`crates/flux-lang/src/lexer.rs`, `crates/flux-lang/docs/syntax.md`). An omission costs a reader
+/// a search; a false statement costs them the belief that the workaround is necessary.
+#[test]
+fn syntax_page_documents_multiline_strings_and_the_examples_parse() {
+    let syntax = read("website/docs/language/flows-and-syntax.md");
+    assert!(
+        syntax.contains("## Multi-line strings") || syntax.contains("### Multi-line strings"),
+        "website/docs/language/flows-and-syntax.md must document the `\"\"\"` multi-line string \
+         form — it is the recommended spelling for prompts and embedded payloads"
+    );
+    assert!(
+        !syntax.contains("Strings are single-line;"),
+        "the retired claim that Flux-Lang strings are single-line is back on the syntax page; \
+         triple-quoted strings ship (crates/flux-lang/src/lexer.rs `scan_string`)"
+    );
+
+    // Documenting the form is not enough — at least one complete example in the public corpus
+    // must actually use it and parse, so the docs cannot drift away from the lexer.
+    let docs_root = repo_path("website/docs");
+    let mut demonstrated = 0;
+    for path in markdown_files(&docs_root) {
+        let markdown = fs::read_to_string(&path).expect("read website doc");
+        for (index, block) in fenced_blocks(&markdown, "flux").into_iter().enumerate() {
+            if !block.contains("\"\"\"") {
+                continue;
+            }
+            let complete = block
+                .lines()
+                .any(|line| line.len() == line.trim_start().len() && line.starts_with("flow "));
+            if complete {
+                flux_lang::parse::parse_program(block).unwrap_or_else(|e| {
+                    panic!(
+                        "{} Flux block {}: multi-line-string example does not parse: {e}",
+                        path.display(),
+                        index + 1
+                    )
+                });
+                demonstrated += 1;
+            }
+        }
+    }
+    assert!(
+        demonstrated >= 1,
+        "no complete Flux example on the site demonstrates a `\"\"\"` string"
     );
 }
 
