@@ -12,6 +12,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Fixed
+
+- **Kubernetes operations now work when your kubeconfig lives somewhere other than the default
+  location.** If you point `KUBECONFIG` at a custom path, flux used to notice it, offer you the full
+  set of Kubernetes operations — and then fail every one of them, because the value never reached
+  `kubectl`. It now does, so the operations you are offered are the operations that work. You no
+  longer need the old workaround of merging or symlinking your config into `~/.kube/config`.
+
 ## [0.34.0] - 2026-07-29
 
 ### Action needed

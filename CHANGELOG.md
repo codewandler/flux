@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A kubeconfig at a non-default path now reaches `kubectl` (C-207).** Two halves of the same
+  feature disagreed about where the kubeconfig comes from. Surfacing read `KUBECONFIG` from the host
+  environment to decide whether the `endpoint` discovery group — and with it the kubernetes plugin's
+  ~24 operations — was offered at all; execution spawned every plugin subprocess through
+  `System::apply_safe_env`, which clears the environment and re-adds a fixed allow-list that
+  `KUBECONFIG` was not on. A user whose kubeconfig lived anywhere other than `~/.kube/config` was
+  therefore offered the whole operation set and then had every one of them fail, as a confusing
+  `kubectl` connection error rather than as "flux did not pass your kubeconfig through".
+  `KUBECONFIG` joins `SAFE_ENV`, so the probe and the executor read one source of truth. Forwarding
+  was chosen over the alternative (stop honouring `KUBECONFIG` when surfacing) because the narrow
+  option fixes only one of the two broken cases: a user with `KUBECONFIG` set *and* a stale
+  `~/.kube/config` would still surface the group through the `HOME` half and then act on the wrong
+  cluster — trading a loud error for a silent wrong-cluster mutation. What crosses the boundary is a
+  *path*, the same disclosure class as the already-forwarded `HOME`; the credentials stay in the
+  file, which was already readable through `HOME` under the v1 whole-filesystem read policy.
+
 ## [0.34.0] - 2026-07-29
 
 ### Documentation

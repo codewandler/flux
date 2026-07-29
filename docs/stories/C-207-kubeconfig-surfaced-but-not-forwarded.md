@@ -2,7 +2,7 @@
 id: C-207
 title: "KUBECONFIG decides the kubernetes group is surfaced, then is not forwarded to kubectl"
 pillar: Core
-status: in-progress
+status: done
 priority: 18
 epic:
 design:
