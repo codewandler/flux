@@ -19,8 +19,9 @@ mod a2a;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{FromRef, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRef, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -29,6 +30,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures::Stream;
 use serde_json::{json, Value};
+use tower_http::timeout::TimeoutLayer;
 
 use flux_auth::request::{AuthContext, AuthError, RequestAuthenticator};
 use flux_core::Usage;
@@ -536,6 +538,80 @@ pub async fn shutdown_signal() {
     ctrl_c.await;
 }
 
+// ── Daemon resource limits (C-189) ───────────────────────────────────────────
+
+/// Default request-body cap: 1 MiB. Every body-buffering handler (`Json`/`Bytes`) rejects a body
+/// over this with `413 Payload Too Large` *during extraction* — before the handler runs. A2A
+/// JSON-RPC envelopes and session-message prompts sit far below it; a deployment that legitimately
+/// ships larger uploads raises it via `FLUX_SERVER_MAX_BODY_BYTES`.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Default request timeout: 300s. Generous enough for a full multi-tool agent turn on the
+/// blocking `message/send` / `POST /sessions/{id}/messages` / `/webhook` paths, finite enough that
+/// a wedged request cannot pin a connection forever. SSE/streaming routes are exempt (a long-lived
+/// stream is not a stuck request). Raise via `FLUX_SERVER_REQUEST_TIMEOUT_SECS`.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// The daemon's resource limits (C-189): `SECURITY.md` names denial of service in the `--serve`
+/// daemon as in scope, and without these every mounted router accepts an unbounded body and holds
+/// a connection for as long as a handler runs. Both close that gap for the two vectors that need
+/// no keying decision; rate limiting (which does — per token / principal / realm) is deliberately
+/// out of scope for C-189.
+///
+/// Both fields default conservatively and are overridable per deployment via env (the same knob
+/// style as `FLUX_A2A_MAX_INFLIGHT_PER_REALM`), read once at router-build time.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerLimits {
+    /// Max request-body bytes any body-buffering handler accepts before returning `413` during
+    /// extraction (see [`DEFAULT_MAX_BODY_BYTES`]).
+    pub max_body_bytes: usize,
+    /// Max wall-clock a non-streaming request may take to PRODUCE its response before `408` is
+    /// returned (see [`DEFAULT_REQUEST_TIMEOUT_SECS`]). Bounds response production, not body
+    /// streaming — which is exactly why an SSE response, produced promptly then streamed for the
+    /// life of the turn, is unharmed even where the layer is applied.
+    pub request_timeout: Duration,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl ServerLimits {
+    /// The limits in force, reading env overrides once (mirrors [`max_inflight_per_realm`]):
+    /// `FLUX_SERVER_MAX_BODY_BYTES` (positive integer bytes) and `FLUX_SERVER_REQUEST_TIMEOUT_SECS`
+    /// (positive integer seconds; `0`/missing/unparseable falls back to the documented default —
+    /// `0` is never read as "disable", so the daemon is never accidentally left unbounded).
+    fn from_env() -> Self {
+        let d = Self::default();
+        let max_body_bytes = std::env::var("FLUX_SERVER_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(d.max_body_bytes);
+        let request_timeout = std::env::var("FLUX_SERVER_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(d.request_timeout);
+        Self {
+            max_body_bytes,
+            request_timeout,
+        }
+    }
+}
+
+/// The request `TimeoutLayer` in force. `TimeoutLayer::with_status_code` (not the deprecated
+/// `::new`) so the timeout answers a real `408 Request Timeout`.
+fn request_timeout_layer(limits: ServerLimits) -> TimeoutLayer {
+    TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, limits.request_timeout)
+}
+
 /// Build the API router over `engine`, advertising `card` on the A2A discovery endpoint and
 /// authenticating per `auth` (every route except `/health` and the agent card). Public so the
 /// `a2a` channel ([`flux_channels`]) can mount it onto a program agent's engine with its own
@@ -570,6 +646,18 @@ fn router_with_ttl(
     card: CardInfo,
     a2a_ttl: A2aTtl,
 ) -> Router {
+    router_with_ttl_and_limits(engine, auth, card, a2a_ttl, ServerLimits::from_env())
+}
+
+/// [`router_with_ttl`] with explicit resource limits (C-189). Tests inject tiny limits to exercise
+/// the `413`/`408` paths; production reads them from the environment once at build time.
+fn router_with_ttl_and_limits(
+    engine: Arc<FlowEngine>,
+    auth: ServerAuth,
+    card: CardInfo,
+    a2a_ttl: A2aTtl,
+    limits: ServerLimits,
+) -> Router {
     let auth = Arc::new(auth);
     let state = ServerState {
         engine,
@@ -579,36 +667,69 @@ fn router_with_ttl(
         auth: auth.clone(),
         tasks: Arc::new(a2a::TaskRegistry::default()),
     };
+    let timeout = request_timeout_layer(limits);
+
     // Auth-exempt routes — registered outside the middleware layer so path-string comparison
-    // cannot be bypassed by percent-encoding or double-slash tricks.
+    // cannot be bypassed by percent-encoding or double-slash tricks. Constant-response liveness /
+    // discovery handlers, but they still carry the request timeout so every non-streaming route is
+    // bounded uniformly (C-189).
     let exempt = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/.well-known/agent-card.json", get(a2a::agent_card))
-        .route("/.well-known/agent.json", get(a2a::agent_card));
+        .route("/.well-known/agent.json", get(a2a::agent_card))
+        .layer(timeout);
 
-    // Session-addressed routes: ONE structural realm guard wraps the whole `/sessions/{id}/*`
-    // subtree — including the write path (`POST …/messages`) — so a route added here later is
-    // realm-guarded by construction, never by per-handler enumeration. (Session ids are guessable
-    // `s_<n>`; guarding reads while leaving a write route open would be cross-tenant read+write.)
-    let sessions = Router::new()
+    // Session-addressed REST routes: ONE structural realm guard over this subtree — including the
+    // write path (`POST …/messages`) — so a route added here later is realm-guarded by
+    // construction, never by per-handler enumeration. (Session ids are guessable `s_<n>`; guarding
+    // reads while leaving a write route open would be cross-tenant read+write.) The SSE stream
+    // route is deliberately NOT here — it lives in `sessions_stream` below so it can be exempted
+    // from the request timeout; both sub-routers apply `realm_guard`, so the whole `/sessions/{id}/*`
+    // subtree stays realm-guarded regardless of the split.
+    let sessions_rest = Router::new()
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/messages", post(post_message))
-        .route("/sessions/{id}/stream", get(stream_message))
         .route("/sessions/{id}/usage", get(get_session_usage))
         .route_layer(middleware::from_fn_with_state(state.clone(), realm_guard));
 
-    // Every other route requires auth per the configured mode. `require_auth` (the outer
-    // route_layer, applied after the merge) runs BEFORE `realm_guard`, so authentication always
-    // precedes any existence signal (A2A §13.1).
-    let protected = Router::new()
+    // Non-streaming protected routes + the REST session subtree carry the request TimeoutLayer: a
+    // wedged handler (or a blocking turn that overruns the generous default) yields `408` instead
+    // of pinning the connection. `/a2a` belongs here — its blocking `message/send` runs a full
+    // turn in-handler, exactly the unbounded hold the timeout bounds; its `message/stream` path
+    // returns the SSE response promptly, and the timeout bounds response PRODUCTION (not body
+    // streaming — tower-http `TimeoutLayer`), so an in-flight stream is never severed.
+    let timed = Router::new()
         .route("/a2a", post(a2a::a2a_handler))
         .route("/sessions", post(create_session))
         .route("/usage", get(get_usage_all))
         .route("/webhook", post(webhook))
-        .merge(sessions)
+        .merge(sessions_rest)
+        .layer(timeout);
+
+    // SSE routes: DELIBERATELY exempt from the request timeout. An SSE response holds the
+    // connection open for the whole turn by design — a long-lived stream is not a stuck request,
+    // and a request timeout is the wrong tool for it. (tower-http's `TimeoutLayer` would not
+    // actually fire here either — it bounds response production and the handler returns its `Sse`
+    // promptly — but the exemption is made structural so a future SSE route that does more work
+    // before returning stays safe too.) The body-size cap below still applies; an SSE request
+    // carries no large upload.
+    let sessions_stream = Router::new()
+        .route("/sessions/{id}/stream", get(stream_message))
+        .route_layer(middleware::from_fn_with_state(state.clone(), realm_guard));
+
+    // `require_auth` (the outer route_layer, applied after the merge) runs BEFORE `realm_guard`, so
+    // authentication always precedes any existence signal (A2A §13.1).
+    let protected = timed
+        .merge(sessions_stream)
         .route_layer(middleware::from_fn_with_state(auth, require_auth));
 
-    exempt.merge(protected).with_state(state)
+    // DefaultBodyLimit over the whole surface (C-189): a body over the cap is rejected with `413`
+    // during extraction, before any handler runs. Applied outermost so every route — exempt,
+    // timed, and streaming — is covered by construction, and no future route can forget it.
+    exempt
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(limits.max_body_bytes))
+        .with_state(state)
 }
 
 // ── Multi-agent A2A mount (D-63) ────────────────────────────────────────────────
@@ -753,6 +874,16 @@ fn router_multi_with_ttl(
     auth: ServerAuth,
     a2a_ttl: A2aTtl,
 ) -> Router {
+    router_multi_with_ttl_and_limits(resolver, auth, a2a_ttl, ServerLimits::from_env())
+}
+
+/// [`router_multi_with_ttl`] with explicit resource limits (C-189).
+fn router_multi_with_ttl_and_limits(
+    resolver: Arc<dyn AgentResolver>,
+    auth: ServerAuth,
+    a2a_ttl: A2aTtl,
+    limits: ServerLimits,
+) -> Router {
     let auth = Arc::new(auth);
     let state = MultiState {
         resolver,
@@ -761,6 +892,7 @@ fn router_multi_with_ttl(
         auth: auth.clone(),
         tasks: Arc::new(a2a::TaskRegistry::default()),
     };
+    let timeout = request_timeout_layer(limits);
     // Discovery card is public (structurally auth-exempt), exactly as in the single-agent mount.
     let exempt = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -771,11 +903,21 @@ fn router_multi_with_ttl(
         .route(
             "/{agent_id}/.well-known/agent.json",
             get(a2a::agent_card_multi),
-        );
+        )
+        .layer(timeout);
+    // The mount's one work route carries the request timeout (C-189): `/{agent_id}/a2a` bounds its
+    // blocking `message/send` full-turn hold, while its `message/stream` SSE — produced promptly,
+    // then streamed for the life of the turn — is unaffected, since the timeout bounds response
+    // production, not body streaming. There is no separate SSE-only route to exempt here.
     let protected = Router::new()
         .route("/{agent_id}/a2a", post(a2a::a2a_handler_multi))
+        .layer(timeout)
         .route_layer(middleware::from_fn_with_state(auth, require_auth));
-    exempt.merge(protected).with_state(state)
+    // DefaultBodyLimit over every route (C-189), applied outermost — see [`router_with_ttl_and_limits`].
+    exempt
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(limits.max_body_bytes))
+        .with_state(state)
 }
 
 /// The auth gate, per [`ServerAuth`] mode. Exempt routes (`/health`, the agent card) are
@@ -1551,5 +1693,146 @@ mod tests {
             0
         );
         assert!(events.info(&old).is_ok(), "ttl 0 means never prune");
+    }
+
+    // ── Daemon resource limits (C-189) ───────────────────────────────────────
+
+    /// A provider that sleeps before every stream call, then answers like [`ProseProvider`]
+    /// (declare_intent, then a one-word turn). Used to drive a handler PAST the request timeout so
+    /// the `TimeoutLayer` fires (C-189).
+    struct SlowProvider {
+        delay: Duration,
+    }
+    #[async_trait::async_trait]
+    impl flux_provider::Provider for SlowProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(
+            &self,
+            req: flux_provider::Request,
+        ) -> flux_core::Result<flux_provider::ChunkStream> {
+            tokio::time::sleep(self.delay).await;
+            let chunks = if req.tools.iter().any(|tool| tool.name == "declare_intent") {
+                vec![
+                    flux_core::Chunk::Block(flux_core::ContentBlock::ToolUse {
+                        id: "intent".into(),
+                        name: "declare_intent".into(),
+                        input: serde_json::json!({
+                            "intent": "answer the current message",
+                            "capability_families": [],
+                        }),
+                    }),
+                    flux_core::Chunk::Done {
+                        stop_reason: Some(flux_core::StopReason::ToolUse),
+                    },
+                ]
+            } else {
+                vec![
+                    flux_core::Chunk::TextDelta("ok".into()),
+                    flux_core::Chunk::Done {
+                        stop_reason: Some(flux_core::StopReason::EndTurn),
+                    },
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// C-189 failing-first: a request body over the configured cap is rejected with `413 Payload
+    /// Too Large` during extraction — before the handler runs. Pre-change (no `DefaultBodyLimit`,
+    /// axum's implicit 2 MiB default) an 8 KiB body is not rejected for size; with a 1 KiB cap it
+    /// is. `/a2a` buffers the body via `Json<JsonRpcRequest>`, so the reject precedes any dispatch.
+    #[tokio::test]
+    async fn body_over_limit_is_rejected_with_413() {
+        let (engine, _events) = usage_test_engine();
+        let limits = ServerLimits {
+            max_body_bytes: 1024,
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let oversized = "x".repeat(8 * 1024);
+        let res = app
+            .oneshot(
+                HttpRequest::post("/a2a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// C-189 failing-first: a handler that outlives the request timeout yields `408 Request
+    /// Timeout` instead of hanging. A 50 ms timeout against a provider that sleeps 500 ms per call
+    /// fires long before the turn could finish. Pre-change (no `TimeoutLayer`) the request runs the
+    /// turn to completion and returns `200`, never `408`.
+    #[tokio::test]
+    async fn slow_handler_times_out_with_408() {
+        let (engine, events) = test_engine(Arc::new(SlowProvider {
+            delay: Duration::from_millis(500),
+        }));
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let limits = ServerLimits {
+            request_timeout: Duration::from_millis(50),
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let res = app
+            .oneshot(
+                HttpRequest::post(format!("/sessions/{sid}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "input": "hi" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// C-189: the SSE stream route is EXEMPT from the request timeout — a long-lived stream is not
+    /// a stuck request. Even with a 50 ms timeout and a provider that sleeps 500 ms, the stream is
+    /// established (`200`) rather than severed with `408`: the handler returns its `Sse` response
+    /// promptly and the turn streams behind it. (This confirms the exemption's intent; the layer
+    /// would not fire on this fast-returning handler even if applied — see [`router_with_ttl`].)
+    #[tokio::test]
+    async fn sse_stream_route_is_exempt_from_the_request_timeout() {
+        let (engine, events) = test_engine(Arc::new(SlowProvider {
+            delay: Duration::from_millis(500),
+        }));
+        let sid = events.create_session("claude-sonnet-4-6").unwrap();
+        let limits = ServerLimits {
+            request_timeout: Duration::from_millis(50),
+            ..ServerLimits::default()
+        };
+        let app = router_with_ttl_and_limits(
+            engine,
+            ServerAuth::Open,
+            CardInfo::flux_coding(),
+            A2aTtl(0),
+            limits,
+        );
+        let res = app
+            .oneshot(
+                HttpRequest::get(format!("/sessions/{sid}/stream?input=hi"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }
