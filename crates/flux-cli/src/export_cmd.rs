@@ -420,31 +420,28 @@ fn render_op(
 /// plain context. Purely presentational (a CSS class per already-rendered line) — not a second diff
 /// engine.
 ///
-/// Redaction is applied to each line's CONTENT with its `+`/`-` marker split off first, not to the
-/// raw line: `flux_secret::Redactor`'s shape heuristic scans for a credential prefix at a *token
-/// boundary*, and `+`/`-` are not boundary characters (see `flux_secret::redact_patterns`), so
-/// `+sk-ant-…` on an added line would otherwise slip past it — the marker glues onto the secret and
-/// the whole thing reads as one non-matching token. Stripping the marker first re-exposes the
-/// secret at a real boundary (the start of the string) before it ever reaches the redactor.
+/// Redaction runs over the WHOLE line, marker included. C-132 used to split the `+`/`-` off first,
+/// because `flux_secret`'s shape heuristic matched a credential prefix only at a token boundary and
+/// a marker glued to the front hid it; C-185 moved that rule into `flux_secret::redact_patterns`
+/// itself, so every diff surface gets it and this renderer knows nothing about it.
 fn render_diff(redactor: &Redactor, view: &str) -> String {
     let mut out = String::from("<pre class=\"diff\">");
     for line in view.lines() {
-        let (class, marker, rest) = if line.starts_with("+++") || line.starts_with("---") {
-            ("diff-hdr", "", line)
+        let class = if line.starts_with("+++") || line.starts_with("---") {
+            "diff-hdr"
         } else if line.starts_with("@@") {
-            ("diff-hunk", "", line)
-        } else if let Some(rest) = line.strip_prefix('+') {
-            ("diff-add", "+", rest)
-        } else if let Some(rest) = line.strip_prefix('-') {
-            ("diff-del", "-", rest)
+            "diff-hunk"
+        } else if line.starts_with('+') {
+            "diff-add"
+        } else if line.starts_with('-') {
+            "diff-del"
         } else {
-            ("diff-ctx", "", line)
+            "diff-ctx"
         };
         let _ = writeln!(
             out,
-            "<span class=\"{class}\">{}{}</span>",
-            esc(marker),
-            redact_esc(redactor, rest)
+            "<span class=\"{class}\">{}</span>",
+            redact_esc(redactor, line)
         );
     }
     out.push_str("</pre>\n");

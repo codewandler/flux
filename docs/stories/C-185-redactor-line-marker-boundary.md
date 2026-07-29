@@ -40,6 +40,22 @@ the shape-based matcher only.
 ## Progress
 - 2026-07-29 filed from a finding in C-132: the export's golden test seeded a secret into a diff
   and it survived redaction until the renderer stripped the marker by hand.
+- 2026-07-29 fixed in `redact_patterns`. The markers were **not** added to the boundary set — `-`
+  occurs inside `sk-ant-…`/`xoxb-…`, so making it a boundary would split a key into fragments that
+  match no prefix and render in the clear (the opposite of the fix). Instead `flush` strips a
+  leading run of `LINE_MARKERS` (`+ - * #`) off the token, matches the prefix against the
+  remainder, and re-emits the markers verbatim: `+sk-ant-…` → `+[redacted]`. C-132's marker-split
+  workaround in `render_diff` (`crates/flux-cli/src/export_cmd.rs`) is gone; the renderer now hands
+  the whole line to the redactor and knows nothing about the rule.
+- **Open — acceptance item 4 (approval sheet) not done, blocked on scope.** The premise does not
+  hold: `flux-tui` performs **no redaction at all**. It has no `flux-secret` dependency
+  (`crates/flux-tui/Cargo.toml`), no `Redactor` anywhere in `crates/flux-tui/src/`, and the sheet's
+  preview reads raw tool input via `pending_approval_input` → `toolview::format_diff`
+  (`crates/flux-tui/src/rendering.rs:570-572`), which never sees a redactor. Covering it is not a
+  boundary-set change: it needs a new dependency edge plus a `Redactor` threaded into `ChatState`,
+  and it should first settle whether the approval sheet — a local, human-eyes decision surface
+  whose entire job is showing the user what is about to be written — *should* redact at all, or
+  whether redaction belongs only on log/model-facing paths. Worth its own story.
 
 ## Notes
 - Deliberately scoped to the boundary set. The broader question C-132 also raised — that

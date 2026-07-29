@@ -215,10 +215,21 @@ impl Redactor {
     }
 }
 
+/// Line markers that may be glued to the FRONT of a token on a rendered line: the `+`/`-` of a
+/// unified diff, a `*` bullet, a `#` comment or heading. They are stripped before the prefix match
+/// and re-emitted verbatim (C-185).
+///
+/// They deliberately are **not** boundary characters. `-` occurs *inside* nearly every credential
+/// shape we match (`sk-ant-…`, `xoxb-…`), so splitting on it would break a key into fragments that
+/// no longer start with a prefix — the token would render in the clear, which is the opposite of
+/// the fix. Leading-only stripping catches `+sk-ant-…` without widening what counts as a token.
+const LINE_MARKERS: &[char] = &['+', '-', '*', '#'];
+
 /// Redact credential-shaped tokens. A token is a maximal run of non-boundary characters; any run
-/// that begins with a known secret prefix is replaced. Boundaries include whitespace AND common
-/// delimiters (`= : " ' ` ( ) [ ] { } , ;`), so punctuation-glued forms like `api_key=sk-ant-…`
-/// and `"sk-ant-…"` are caught, not just whitespace-separated tokens.
+/// that begins with a known secret prefix — after any leading [`LINE_MARKERS`] are set aside — is
+/// replaced. Boundaries include whitespace AND common delimiters (`= : " ' ` ( ) [ ] { } , ;`), so
+/// punctuation-glued forms like `api_key=sk-ant-…` and `"sk-ant-…"` are caught, not just
+/// whitespace-separated tokens.
 fn redact_patterns(input: &str) -> String {
     fn is_boundary(c: char) -> bool {
         c.is_whitespace()
@@ -241,7 +252,11 @@ fn redact_patterns(input: &str) -> String {
             )
     }
     fn flush(token: &mut String, out: &mut String) {
-        if token.len() >= 8 && SECRET_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        // `body` is the token minus any leading diff/list marker; the markers are ASCII, so the
+        // byte split is always on a char boundary.
+        let body = token.trim_start_matches(LINE_MARKERS);
+        if body.len() >= 8 && SECRET_PREFIXES.iter().any(|p| body.starts_with(p)) {
+            out.push_str(&token[..token.len() - body.len()]);
             out.push_str(REDACTED);
         } else {
             out.push_str(token);
@@ -319,6 +334,50 @@ mod tests {
         assert!(!out.contains("sk-ant-abc123def456"), "leaked: {out}");
         assert!(out.contains("api_key="));
         assert!(out.contains("next"));
+    }
+
+    /// C-185 failing-first: a unified-diff or list marker glued to the front of a credential used
+    /// to hide it — `+`/`-`/`*`/`#` are not boundary characters, so `+sk-ant-…` tokenized with the
+    /// marker attached and never matched a prefix. Every surface that renders a diff (the approval
+    /// sheet's hunk preview, tool-card detail, the HTML export) reads through this one function.
+    #[test]
+    fn a_line_marker_does_not_hide_a_credential() {
+        let r = Redactor::new();
+        for marker in ["+", "-", "*", "#", "--", "##"] {
+            let line = format!("{marker}sk-ant-abc123def456");
+            let out = r.redact(&line);
+            assert!(!out.contains("sk-ant-abc123def456"), "leaked: {out}");
+            // The marker itself is structure, not secret — a diff must still read as a diff.
+            assert_eq!(out, format!("{marker}[redacted]"), "marker lost: {out}");
+        }
+        // The shape holds mid-line too, e.g. inside a rendered hunk.
+        let hunk = "@@ -0,0 +1 @@\n+api_key = sk-ant-abc123def456\n-ghp_0123456789abcdef\n";
+        let out = r.redact(hunk);
+        assert!(!out.contains("sk-ant-abc123def456"), "leaked: {out}");
+        assert!(!out.contains("ghp_0123456789abcdef"), "leaked: {out}");
+        assert!(out.contains("@@ -0,0 +1 @@"), "hunk header mangled: {out}");
+    }
+
+    /// The other direction (C-185): the markers may only be stripped from the FRONT of a token.
+    /// `-` occurs *inside* every `sk-ant-…`/`xoxb-…` key, so promoting it to a boundary character
+    /// would split a credential into fragments that no longer start with a prefix and would render
+    /// in the clear. Pin that a hyphenated credential still redacts as exactly one unit.
+    #[test]
+    fn a_hyphenated_credential_redacts_as_one_unit() {
+        let r = Redactor::new();
+        for secret in [
+            "sk-ant-api03-abc123def456",
+            "xoxb-1234-5678-abcdefghijkl",
+            "sk-proj-abc123def456",
+        ] {
+            let out = r.redact(&format!("key: {secret} done"));
+            assert_eq!(out, "key: [redacted] done", "split into fragments: {out}");
+        }
+        // A marker-led token that is NOT credential-shaped is untouched — no over-redaction.
+        assert_eq!(r.redact("- a bullet"), "- a bullet");
+        assert_eq!(r.redact("--- a/note.txt"), "--- a/note.txt");
+        assert_eq!(r.redact("+++ b/note.txt"), "+++ b/note.txt");
+        assert_eq!(r.redact("# heading-with-hyphens"), "# heading-with-hyphens");
     }
 
     #[test]
