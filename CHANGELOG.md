@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Security
 
+- **`sqlite_query` can no longer create a file outside guarded IO, and its SQL admission is now a
+  real allowlist (C-192, C-193).** `sqlite_query` is a default-registered `Risk::Low` / `Effect::Read`
+  op authorized as a workspace *read*, but its admission was a prefix *denylist* (`is_write_sql`) that
+  missed `VACUUM` — so a model-supplied `VACUUM INTO '<absolute path>'` (read-only w.r.t. the source
+  DB, hence not stopped by `SQLITE_OPEN_READ_ONLY`) created a file at an arbitrary path entirely
+  outside `flux-system`'s guarded IO: the envelope's only confirmed bypass. The denylist was also
+  bypassable by a leading `/* comment */`, which `trim_start()` did not strip. Admission is now a
+  statement-type **allowlist** — the first meaningful token, after stripping comments and whitespace
+  exactly as SQLite tokenizes, must be `SELECT` / `WITH` / `PRAGMA` / `EXPLAIN`; `VACUUM`, `ATTACH`
+  and every write are refused as a consequence, not by enumerated keyword. The op description and
+  refusal message now match the code, and the direct-`rusqlite` open carries an explicit
+  no-direct-IO deviation comment naming its three containing guards (pending the C-194 lint).
+  Verified by adversarial review (36k+ fuzzed inputs; `EXPLAIN VACUUM INTO` proven inert;
+  multi-statement executes only the first statement).
 - **Every third-party GitHub Action is pinned to an immutable commit SHA (C-187).** The workflows
   that hold `MINISIGN_SECRET_KEY` (plugin-index signing, `release-plugins.yml`) and crates.io publish
   rights (`release.yml`, `crates-io.yml`) referenced actions by movable tags

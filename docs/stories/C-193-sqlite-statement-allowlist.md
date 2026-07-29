@@ -2,7 +2,7 @@
 id: C-193
 title: "sqlite_query's SQL admission is a bypassable prefix denylist documented as an allowlist"
 pillar: Core
-status: ready
+status: done
 priority: 3
 epic: security-assurance
 design: docs/designs/security-assurance.md

@@ -2,7 +2,7 @@
 id: C-192
 title: "sqlite_query reaches arbitrary-path file creation outside guarded IO via VACUUM INTO"
 pillar: Core
-status: ready
+status: done
 priority: 2
 epic: security-assurance
 design: docs/designs/security-assurance.md
