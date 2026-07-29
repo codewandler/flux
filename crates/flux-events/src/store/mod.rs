@@ -339,6 +339,12 @@ trait EventBackend: Send + Sync {
 
 /// The concrete storage backend behind an [`EventStore`]. The default build carries only the
 /// embedded SQLite arm; a Postgres arm plugs in behind the `postgres` feature (D-73).
+// `large_enum_variant` fires only in a `--features postgres` build, where the 264-byte `Sqlite` arm
+// sits next to an 8-byte `Postgres` one. Boxing to close that gap is the wrong trade here: this enum
+// is constructed once when the store opens and thereafter only ever touched through `&self`, so the
+// size never costs a move — while boxing would put an allocation and a pointer hop on every
+// operation of the DEFAULT backend to satisfy a lint that the default build does not even raise.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Sqlite(SqliteEvents),
     #[cfg(feature = "postgres")]

@@ -177,6 +177,17 @@ All notable changes to this project are documented in this file. The format is b
   version "latest" — reintroducing the exact bug the backfill repairs. The runbook in
   `crates/flux-sdk/PUBLISHING.md` now passes `--latest=false` and the CI audit above fails if the
   pointer ever drifts.
+- **`ci` on `main` is green again after four red releases (0.32.0…0.34.0).** The tag-triggered
+  publish workflows are separate from `ci`, so releases kept shipping while the push job stayed red
+  — the failure was visible but not blocking, which is how it survived three cuts. Two independent
+  causes: `codewandler-flux-secret` carried the C-185 redaction fix above without moving off the
+  already-published `1.0.0`, which `check-crate-versions.sh` correctly refuses (the protocol line is
+  SemVer over the wire, C-143) — it is now `1.0.1`; and `clippy::large_enum_variant` failed the
+  `--features postgres` job on `flux-events`'s `Backend`, whose `Sqlite` arm is 264 bytes beside an
+  8-byte `Postgres` one. That lint is suppressed with its reasoning rather than satisfied by boxing:
+  `Backend` is built once when the store opens and thereafter only reached through `&self`, so the
+  size never costs a move, while boxing would put an allocation and a pointer hop on every operation
+  of the *default* backend to quiet a lint the default build does not raise.
 
 ### Changed
 

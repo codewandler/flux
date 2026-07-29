@@ -4,7 +4,7 @@ edition.workspace = true
 # PROTOCOL LINE (C-143), not the flux workspace version: secret purposes named by a plugin manifest,
 # so a plugin built against 1.x keeps resolving across flux releases. Moves only when the
 # wire vocabulary changes — scripts/cut-release.sh never touches it.
-version = "1.0.0"
+version = "1.0.1"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
