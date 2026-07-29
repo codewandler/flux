@@ -61,7 +61,9 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
-async fn worker_stub(respond: impl Fn(&str, &Value) -> Value + Send + Sync + 'static) -> (String, Seen) {
+async fn worker_stub(
+    respond: impl Fn(&str, &Value) -> Value + Send + Sync + 'static,
+) -> (String, Seen) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -80,9 +82,12 @@ async fn worker_stub(respond: impl Fn(&str, &Value) -> Value + Send + Sync + 'st
                 .unwrap_or_default()
                 .to_string();
             let params = req.get("params").cloned().unwrap_or(Value::Null);
-            recorder.lock().unwrap().push((method.clone(), params.clone()));
-            let payload =
-                json!({ "jsonrpc": "2.0", "id": 1, "result": respond(&method, &params) }).to_string();
+            recorder
+                .lock()
+                .unwrap()
+                .push((method.clone(), params.clone()));
+            let payload = json!({ "jsonrpc": "2.0", "id": 1, "result": respond(&method, &params) })
+                .to_string();
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{payload}",
@@ -255,7 +260,9 @@ async fn a_restarted_coordinator_rederives_every_dispatch_from_the_board_alone()
     // The address came off the board, and it worked — the sweep really reached the worker.
     let calls = seen.lock().unwrap();
     assert!(
-        calls.iter().any(|(m, p)| m == "tasks/get" && p["id"] == "t_recover"),
+        calls
+            .iter()
+            .any(|(m, p)| m == "tasks/get" && p["id"] == "t_recover"),
         "the sweep never reached the worker: {calls:?}"
     );
 }

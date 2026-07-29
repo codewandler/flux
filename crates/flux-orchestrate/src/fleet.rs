@@ -453,8 +453,7 @@ impl Tool for FleetDispatchTool {
                     // The recorded runner is the endpoint as dialled, not the origin the grant is
                     // scoped to: a later sweep has to reach the worker, and an origin may have
                     // dropped a path the worker needs.
-                    if let Err(cause) =
-                        ledger.record_dispatch(ctx, item, &args.worker, &t.id).await
+                    if let Err(cause) = ledger.record_dispatch(ctx, item, &args.worker, &t.id).await
                     {
                         return Ok(ToolResult::error(
                             unrecordable(&client, item, &args.worker, &t.id, cause).await,
@@ -472,8 +471,14 @@ impl Tool for FleetDispatchTool {
                 ))
             }
             // A worker that answered synchronously left nothing to track; say so rather than
-            // inventing a task id the caller would then poll forever. There is also nothing to
-            // record — the run is already over, so no sweep is owed one.
+            // inventing a task id the caller would then poll forever.
+            //
+            // **This is the one path where naming an `item` writes nothing to the board**, and it
+            // is deliberate: there is no run to sweep. The whole point of the record is to give a
+            // restarted coordinator a handle on work still executing somewhere, and this work
+            // finished inside the send. Recording a dead task id would send the next sweep after a
+            // run that no longer exists — worse than recording nothing. `"recorded": false` is
+            // reported either way, so a caller that expected a write can see it did not happen.
             Ok(SendOutcome::Message(m)) => Ok(ToolResult::ok(
                 serde_json::json!({
                     "task_id": Value::Null,
@@ -1038,11 +1043,7 @@ mod tests {
             ledger.records(),
             // The recorded runner is the FULL endpoint, not the origin: a later sweep has to dial
             // it, and the origin is only the permission subject.
-            vec![(
-                "PROJ-42".to_string(),
-                base.clone(),
-                "t_11".to_string()
-            )],
+            vec![("PROJ-42".to_string(), base.clone(), "t_11".to_string())],
         );
     }
 
@@ -1079,7 +1080,9 @@ mod tests {
 
         let calls = seen.lock().unwrap();
         assert!(
-            calls.iter().any(|(m, p)| m == "tasks/cancel" && p["id"] == "t_12"),
+            calls
+                .iter()
+                .any(|(m, p)| m == "tasks/cancel" && p["id"] == "t_12"),
             "the untracked run was left going: {calls:?}"
         );
     }
@@ -1093,7 +1096,10 @@ mod tests {
         let ctx = ToolContext::new(temp_system());
 
         let error = FleetDispatchTool::new(PrivateNetAllow::Any, None)
-            .execute(&ctx, json!({ "worker": base, "task": "sweep", "item": "PROJ-44" }))
+            .execute(
+                &ctx,
+                json!({ "worker": base, "task": "sweep", "item": "PROJ-44" }),
+            )
             .await
             .expect_err("an unrecordable dispatch is refused");
         assert!(error.to_string().contains("PROJ-44"), "{error}");
@@ -1110,8 +1116,8 @@ mod tests {
         let plain = FleetDispatchTool::new(PrivateNetAllow::None, None);
         assert!(!plain.spec().effects.contains(&Effect::Write));
 
-        let recording =
-            FleetDispatchTool::new(PrivateNetAllow::None, None).with_ledger(RecordingLedger::new(false));
+        let recording = FleetDispatchTool::new(PrivateNetAllow::None, None)
+            .with_ledger(RecordingLedger::new(false));
         assert!(
             recording.spec().effects.contains(&Effect::Write),
             "an op wired to a board declares the write it performs"
