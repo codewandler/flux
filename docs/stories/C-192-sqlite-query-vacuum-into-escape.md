@@ -18,24 +18,44 @@ close it in a way that makes the *class* harder to reintroduce rather than patch
 keyword that was missed.
 
 ## Acceptance
-- [ ] Failing-first test: dispatching `sqlite_query` with a workspace-relative `db` and
+- [x] Failing-first test: dispatching `sqlite_query` with a workspace-relative `db` and
       `sql: "VACUUM INTO '<absolute path outside the workspace>'"` must not create that file. This
       test must fail against the current tree — that failure is the proof the gap is real.
-- [ ] The `sql` input is admitted by a **statement-type allowlist**, not the `is_write_sql` keyword
+      → `crates/flux-tools/src/extra.rs` test `sqlite_query_vacuum_into_cannot_escape_the_workspace`
+      (red on merge base: the escape file was created; green after).
+- [x] The `sql` input is admitted by a **statement-type allowlist**, not the `is_write_sql` keyword
       denylist (see C-193, which should land in the same change).
-- [ ] Regression test: the same call with the target *inside* the workspace is either refused for the
+      → `is_allowed_sql` / `ALLOWED_STATEMENT_KEYWORDS` replace `is_write_sql`; called at the
+      admission gate in `execute`.
+- [x] Regression test: the same call with the target *inside* the workspace is either refused for the
       same reason or routed through `flux-system` — a workspace-internal write from an op declaring
       `Effect::Read` is still a misdeclaration, not an acceptable outcome.
-- [ ] Whichever disposition is chosen, the tool's `ToolSpec` matches it. If any write remains
+      → test `sqlite_query_vacuum_into_inside_the_workspace_is_refused`: VACUUM is refused for the
+      same reason (not on the allowlist); the internal target is never created.
+- [x] Whichever disposition is chosen, the tool's `ToolSpec` matches it. If any write remains
       reachable, `effects` gains `Effect::Write` so the derivation at
       `flux-runtime/src/lib.rs:2328` emits `workspace_write` and the `unscoped_write` approval
       trigger (`:3488`) can see it.
-- [ ] `docs/architecture.md:169`'s no-direct-IO invariant is either honoured by this tool (DB opened
+      → **Writes are fully closed**, so `Effect::Read` stays honest and no `Effect::Write` is added:
+      the only statements that reach the read-only connection are SELECT/WITH/PRAGMA/EXPLAIN (VACUUM,
+      ATTACH, INSERT, … are refused pre-open), so no write path is reachable.
+- [x] `docs/architecture.md:169`'s no-direct-IO invariant is either honoured by this tool (DB opened
       through `flux-system`) or the deviation is named explicitly in the code with the guard that
       replaces it — no silent hand-rolled jail.
+      → Opening the DB through `flux-system` is out of reach in this change (flux-system exposes no
+      sqlite-open primitive). The deviation is now named explicitly in a `DEVIATION` comment at the
+      `rusqlite::Connection::open_with_flags` call site, listing the three guards that contain the
+      primitive (`jail_sqlite_path` + `SQLITE_OPEN_READ_ONLY` + the allowlist) and pointing at C-194
+      for the mechanical lint.
 
 ## Progress
-- (not started)
+- Landed with C-193 in one change on `impl/C-192` (both stories are one change).
+- Allowlist set: `SELECT` / `WITH` / `PRAGMA` / `EXPLAIN` — rationale in the doc-comment on
+  `ALLOWED_STATEMENT_KEYWORDS`. `VACUUM` and `ATTACH` are refused as a consequence, not special cases.
+- ToolSpec disposition: no write path remains reachable → `effects` unchanged (`Effect::Read`,
+  `Effect::Filesystem`); no `Effect::Write` added, so the effect surface does not change.
+- No-direct-IO invariant: DB still opened via `rusqlite` directly (flux-system has no sqlite-open
+  seam); the deviation is named in code with its replacement guards; C-194 to add the lint.
 
 ## Notes
 - **Verified against the tree at `0.33.1` (f8e90d7).** Source review:

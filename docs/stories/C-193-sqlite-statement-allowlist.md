@@ -17,21 +17,38 @@ description and the refusal message both promise an allowlist; the code is a ten
 denylist that is bypassable where it matters and redundant where it works.
 
 ## Acceptance
-- [ ] Failing-first test: `sql` beginning with a comment — e.g. `/*x*/ INSERT INTO t VALUES(1)` —
+- [x] Failing-first test: `sql` beginning with a comment — e.g. `/*x*/ INSERT INTO t VALUES(1)` —
       is refused by flux's own admission check, not merely by SQLite's read-only flag. This must fail
       against the current tree.
-- [ ] Admission is an **allowlist** over the statement type: the first meaningful token after
+      → test `sqlite_query_refuses_a_comment_cloaked_write`. On the merge base the write was stopped
+      only by `SQLITE_OPEN_READ_ONLY` (surfaced as `attempt to write a readonly database`), not by
+      admission; after the change the refusal carries flux's own allowlist message.
+- [x] Admission is an **allowlist** over the statement type: the first meaningful token after
       comment- and whitespace-stripping must be one of `SELECT` / `WITH` / `PRAGMA` / `EXPLAIN`
       (final set to be decided in the change), and anything else is refused.
-- [ ] `VACUUM` is refused by that allowlist as a consequence, not as a special case — this is the
+      → `leading_statement_keyword` (strips whitespace + `--`/`/* */` comments) + `is_allowed_sql`
+      over `ALLOWED_STATEMENT_KEYWORDS = [SELECT, WITH, PRAGMA, EXPLAIN]`.
+- [x] `VACUUM` is refused by that allowlist as a consequence, not as a special case — this is the
       shared acceptance with [C-192](C-192-sqlite-query-vacuum-into-escape.md).
-- [ ] The op description (`extra.rs:269-271`) and the refusal message (`:322`) describe what the
+      → VACUUM is simply absent from the allowlist; no keyword is special-cased. Covered by the two
+      C-192 VACUUM tests and the case-insensitive `sqlite_query_allowlist_reads_past_comments_and_case`.
+- [x] The op description (`extra.rs:269-271`) and the refusal message (`:322`) describe what the
       code now actually does.
-- [ ] Test that the allowlist is applied to the statement *as SQLite will parse it*, so comment
+      → `spec().description` and the `ToolResult::error` message in `execute` both describe the
+      allowlist (SELECT/WITH/PRAGMA/EXPLAIN, leading comment stripped) and what is refused.
+- [x] Test that the allowlist is applied to the statement *as SQLite will parse it*, so comment
       forms, leading whitespace and case cannot separate the two.
+      → test `sqlite_query_allowlist_reads_past_comments_and_case`: a comment-cloaked, lower-case
+      `select` is admitted and returns its row; a comment-cloaked, lower-case `vacuum into` is refused.
 
 ## Progress
-- (not started)
+- Landed with C-192 in one change on `impl/C-192`.
+- Final allowlist set: `SELECT` / `WITH` / `PRAGMA` / `EXPLAIN`. `WITH`-fronted DML and side-effecting
+  PRAGMAs remain contained by the read-only connection; `EXPLAIN` never executes its inner statement;
+  none of the four can express `VACUUM INTO`. Rationale is in the `ALLOWED_STATEMENT_KEYWORDS` doc.
+- The check runs on the statement *as SQLite parses it* via `leading_statement_keyword`, which skips
+  leading whitespace, `-- …` line comments and `/* … */` block comments (including an unterminated
+  one to EOF) before reading the first identifier token and uppercasing it.
 
 ## Notes
 - **Verified against the tree at `0.33.1` (f8e90d7).** Source review:
