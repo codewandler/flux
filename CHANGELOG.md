@@ -108,6 +108,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Memory gets its own append-only stream and projection (A-107).** First story of the
+  **evidence-pinned memory** epic, and deliberately store-layer only — no op, no CLI (A-108 and A-110
+  add those). `MemoryEntry { id, claim, scope, receipt, git, learned_at_ms }` lives on a
+  `memory:<scope-key>` stream inside the existing `events.db`, projected to latest-state-per-id. An
+  edit appends, a forget appends a tombstone, and the projection reflects both — so *what the agent
+  believed* survives, which is the point when debugging a bad decision six sessions later.
+  `receipt.event_id` cites the **stable ULID event id, never `global_seq`** — a backend rowid that
+  would not survive a store migration and does not mean the same thing across the SQLite and Postgres
+  backends. Two tests pin it, one of which runs a migration that renumbers `global_seq` and asserts
+  the citation still resolves. The convenient-handle mistake is the one the story warned about, and
+  it is now the thing that reds the build.
+  Two deliberate design calls: memory facts ride `EventKind::Custom` under a reserved `memory.`
+  prefix rather than new enum variants, because `EventKind` is public and not `#[non_exhaustive]`, so
+  new variants would break every downstream `match` for a fact none of flux's closed projections
+  read — and an undecodable `memory.*` payload is *skipped* rather than failing the read, so one bad
+  event cannot take out the whole read model. Redaction stays a caller responsibility, as it is
+  throughout `flux-events` (C-22/C-164): `MemoryNote`'s claim field is private with exactly one
+  constructor taking the live turn's redactor, so no field-assignment path reaches the store with raw
+  model text.
+
 - **Hunk-level git staging — an agent can stage part of a file another author is editing (C-92).**
   `git_stage` operates on whole paths, so a file touched by two authors could only be staged in full:
   the agent either swept a coworker's uncommitted hunks into its own commit or handed the task back.

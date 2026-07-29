@@ -2,7 +2,7 @@
 id: A-107
 title: "The memory stream — MemoryEntry projection over an append-only memory:<scope> stream"
 pillar: Agent
-status: in-progress
+status: done
 priority: 15
 epic: evidence-pinned-memory
 design: docs/designs/evidence-pinned-memory.md
