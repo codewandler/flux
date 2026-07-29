@@ -1868,15 +1868,23 @@ impl System {
             .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
         // Write the payload from its own task: a patch can exceed the pipe buffer, and writing it
         // inline before draining stdout would deadlock the pair.
+        //
+        // The write result is *kept* rather than discarded. A short write closes the fd on drop and
+        // delivers a clean EOF, so the child sees a truncated-but-well-formed payload and can exit
+        // 0 on it — a partial `git apply` reported as a complete success. Callers cannot distinguish
+        // that from a real success by exit code, so a failed write has to become a hard error here.
+        let mut writer = None;
         if let Some(bytes) = stdin {
             match child.stdin.take() {
                 Some(mut sink) => {
                     let bytes = bytes.to_vec();
-                    tokio::spawn(async move {
+                    let expected = bytes.len();
+                    writer = Some(tokio::spawn(async move {
                         use tokio::io::AsyncWriteExt as _;
-                        let _ = sink.write_all(&bytes).await;
-                        let _ = sink.shutdown().await; // EOF, so the child stops reading.
-                    });
+                        sink.write_all(&bytes).await?;
+                        sink.shutdown().await?; // EOF, so the child stops reading.
+                        std::io::Result::Ok(expected)
+                    }));
                 }
                 None => {
                     let mut child = GuardedChild::new(child);
@@ -1904,15 +1912,39 @@ impl System {
                 return Err(Error::Other("child stderr unavailable".to_string()));
             }
         };
-        await_process(
+        let out = await_process(
             child,
             Some(stdout),
             Some(stderr),
-            program,
+            program.clone(),
             timeout,
             observer,
         )
-        .await
+        .await?;
+        // Only now is the write verdict meaningful. A child that rejects its input can exit before
+        // the payload is drained, which surfaces here as `EPIPE` — that is not our failure, and the
+        // non-zero exit already carries the real diagnosis, so let it through untouched. The case
+        // that must not pass is a failed write under a *successful* exit: that is precisely the
+        // "child acted on a truncated payload and was happy with it" shape.
+        if let Some(handle) = writer {
+            let wrote = match handle.await {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(Error::Other(format!(
+                        "{program}: stdin writer panicked: {e}"
+                    )))
+                }
+            };
+            if let Err(e) = wrote {
+                if out.exit_code == 0 {
+                    return Err(Error::Other(format!(
+                        "{program}: failed writing stdin ({e}); the child exited 0 on a partial \
+                         payload, so its result cannot be trusted"
+                    )));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Scrub a command's environment to the minimal non-secret allow-list, then apply caller
@@ -3113,6 +3145,54 @@ mod tests {
             .unwrap();
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert_eq!(out.stdout.len(), payload.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92 rework: an undelivered payload must not be reported as success. A child that exits
+    /// without draining stdin makes the write fail with `EPIPE`; the fd is then closed by drop and
+    /// delivers a *clean* EOF, so nothing downstream can tell a truncated payload from a complete
+    /// one by exit code alone. Discarding that write error is what made "partial `git apply`
+    /// reported as complete success" reachable, so it has to surface as a hard error.
+    ///
+    /// The payload exceeds the pipe buffer so the write is guaranteed to block and then fail,
+    /// rather than fitting entirely into the kernel buffer and succeeding.
+    #[tokio::test]
+    async fn run_with_stdin_fails_when_the_payload_is_not_delivered_but_the_child_exits_ok() {
+        let (dir, sys) = temp_workspace();
+        let payload = "x".repeat(1024 * 1024);
+        // `true` exits 0 immediately and never reads stdin.
+        let result = sys
+            .run_with_stdin(
+                &["true".to_string()],
+                payload.as_bytes(),
+                Duration::from_secs(30),
+            )
+            .await;
+        let err = result.expect_err("an undelivered payload under exit 0 must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stdin"),
+            "the error should name the stdin write: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92 rework: the converse — a child that *rejects* its input and exits non-zero also breaks
+    /// the pipe, but there the exit code carries the real diagnosis and the caller needs to see it.
+    /// That must stay a normal non-zero result, not be masked by the new stdin check.
+    #[tokio::test]
+    async fn run_with_stdin_reports_the_childs_exit_code_when_it_rejects_the_payload() {
+        let (dir, sys) = temp_workspace();
+        let payload = "x".repeat(1024 * 1024);
+        let out = sys
+            .run_with_stdin(
+                &["false".to_string()],
+                payload.as_bytes(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("a non-zero exit must surface as a result, not an error");
+        assert_ne!(out.exit_code, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

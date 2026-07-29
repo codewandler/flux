@@ -80,8 +80,8 @@ bounded by that plugin's manifest and its Tavily credential is injected host-sid
 | `git_status` | | low | Working tree status |
 | `git_diff` | `[path, staged]` | low | Unstaged (or staged) diff |
 | `git_log` | `[limit]` | low | Recent commits |
-| `git_hunks` | `[path, context]` | low | List the unstaged diff as individually addressable hunks |
-| `git_stage_hunks` | `hunks` | medium | Stage selected hunks by id, leaving the rest of the file unstaged |
+| `git_hunks` | `path[, context]` | low | List the unstaged diff as individually addressable hunks |
+| `git_stage_hunks` | `path, hunks[, context]` | medium | Stage selected hunks by id, leaving the rest of the file unstaged |
 | `git_stage` / `git_unstage` | `paths` | medium / low | Stage or unstage files |
 | `git_commit` | `message[, body]` | medium | Create a commit |
 | `git_push` | `[branch, remote]` | medium | Push to a remote |

@@ -488,8 +488,9 @@ struct GitUnstageInput {
 struct GitHunksInput {
     /// Workspace-relative path of the file whose unstaged hunks to list
     path: String,
-    /// Lines of context around each change (default 3). A smaller radius splits adjacent
-    /// changes into separate, individually stageable hunks.
+    /// Lines of context around each change (default 3, minimum 1). A smaller radius splits
+    /// adjacent changes into separate, individually stageable hunks. Zero is rejected: it leaves
+    /// `git apply` no context to verify against, which can stage a hunk at the wrong position.
     context: Option<u32>,
 }
 
@@ -501,7 +502,7 @@ struct GitStageHunksInput {
     /// Hunk ids to stage, exactly as `git_hunks` reported them (e.g. `h1-1a2b3c4d5e6f7a8b`)
     hunks: Vec<String>,
     /// Context radius used when the ids were listed — must match the `git_hunks` call they came
-    /// from (default 3)
+    /// from (default 3, minimum 1)
     context: Option<u32>,
 }
 
@@ -2742,6 +2743,44 @@ fn hunk_diff_argv(path: &str, context: u32) -> Vec<String> {
     .collect()
 }
 
+/// Smallest context radius either hunk op will accept.
+///
+/// Zero is rejected rather than supported. A `--unified=0` patch carries no context lines, so
+/// `git apply` has nothing to verify the hunk against and anchors on the line numbers alone: it
+/// then applies a pure insertion *at the wrong offset and exits 0* (observed against git 2.55.0 —
+/// a hunk requested at line 6 of a 30-line file lands at EOF), which is exactly the silent
+/// misapply these ops exist to prevent. `--unidiff-zero` makes that case land correctly, but only
+/// by switching the verification off, so it trades the guarantee for the granularity. One line of
+/// context restores the check and still splits far more finely than the default three.
+const MIN_HUNK_CONTEXT: u32 = 1;
+
+/// Validate a caller-supplied context radius, or explain the floor.
+fn checked_context(context: Option<u32>, op: &str) -> std::result::Result<u32, String> {
+    match context.unwrap_or(3) {
+        c if c < MIN_HUNK_CONTEXT => Err(format!(
+            "{op}: `context` must be at least {MIN_HUNK_CONTEXT} (got {c}). A zero-context diff \
+             gives `git apply` no context lines to verify against, so a hunk can be staged at the \
+             wrong position in the file without any error. Use `context: 1` for the finest \
+             splitting that is still safe."
+        )),
+        c => Ok(c),
+    }
+}
+
+/// Preamble markers that mean the diff is about the file's *existence or identity* rather than its
+/// contents. Partial staging is defined on content hunks; these headers are copied verbatim beside
+/// whatever hunk is selected, so honouring one while dropping the other hunks would stage a
+/// deletion or a rename the caller never selected. Whole-file operations belong to `git_stage`.
+const WHOLE_FILE_PREAMBLE_MARKERS: &[&str] = &[
+    "deleted file mode",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+    "old mode ",
+    "new mode ",
+];
+
 /// Guidance for selectors that name nothing in the current diff (C-32's repairable-failure
 /// pattern). Names the stale ids, what is actually there now, and the op to re-run — a bare
 /// "hunk not found" would leave the model with no move.
@@ -2757,9 +2796,31 @@ fn stale_hunk_guidance(path: &str, missing: &[String], live: &[Hunk]) -> String 
                 .join(", ")
         )
     };
+    // Distinguish the two ways an id can go stale, because they call for the same repair but a
+    // very different explanation. The hash half is content; the `h<n>-` half is position. If a
+    // missing id's hash is still present under a different ordinal, the *content* is untouched and
+    // the selection only lost its numbering — telling that caller "the file changed underneath" is
+    // simply false, and it sends them looking for an edit nobody made.
+    let renumbered: Vec<&String> = missing
+        .iter()
+        .filter(|want| {
+            want.split_once('-').is_some_and(|(_, hash)| {
+                live.iter()
+                    .any(|h| h.id.split_once('-').is_some_and(|(_, live)| live == hash))
+            })
+        })
+        .collect();
+    let cause = if renumbered.len() == missing.len() {
+        "these hunks still exist with the same content but under different ordinals — staging or \
+         reverting an earlier hunk renumbers the ones after it, and the ordinal is part of the id"
+    } else if renumbered.is_empty() {
+        "the file changed underneath this selection"
+    } else {
+        "some of these were renumbered by an earlier staging and the rest no longer match the file"
+    };
     format!(
-        "no such hunk in `{path}`: {} — the file changed underneath this selection, so {available}. \
-         Nothing was staged. Re-run git_hunks(\"{path}\") and select from the ids it returns.",
+        "no such hunk in `{path}`: {} — {cause}, so {available}. Nothing was staged. Re-run \
+         git_hunks(\"{path}\") and select from the ids it returns.",
         missing.join(", ")
     )
 }
@@ -2774,7 +2835,7 @@ impl Tool for GitHunksTool {
             description: "List the individually stageable hunks of one file's unstaged changes \
                           (index vs working tree). Each hunk gets a stable id to pass to \
                           `git_stage_hunks`. Optional `context` sets the context radius \
-                          (default 3); a smaller radius splits adjacent changes apart."
+                          (default 3, minimum 1); a smaller radius splits adjacent changes apart."
                 .into(),
             input_schema: tool_input_schema::<GitHunksInput>(),
             output_schema: None,
@@ -2811,7 +2872,10 @@ impl Tool for GitHunksTool {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: GitHunksInput = parse_params(params, "git_hunks")?;
-        let context = args.context.unwrap_or(3);
+        let context = match checked_context(args.context, "git_hunks") {
+            Ok(c) => c,
+            Err(why) => return Ok(ToolResult::error(why)),
+        };
         let argv = hunk_diff_argv(&args.path, context);
         let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
         if out.exit_code != 0 {
@@ -2906,7 +2970,10 @@ impl Tool for GitStageHunksTool {
                     .to_string(),
             ));
         }
-        let context = args.context.unwrap_or(3);
+        let context = match checked_context(args.context, "git_stage_hunks") {
+            Ok(c) => c,
+            Err(why) => return Ok(ToolResult::error(why)),
+        };
 
         // Recompute the diff HERE rather than trusting whatever the caller last saw. The ids are
         // matched against the working tree as of this call, which is what makes a concurrent edit
@@ -2924,6 +2991,22 @@ impl Tool for GitStageHunksTool {
             Ok(split) => split,
             Err(why) => return Ok(ToolResult::error(why)),
         };
+
+        // The preamble rides along with whichever hunks are selected, so a header describing a
+        // whole-file change would be honoured even though the caller only picked content hunks.
+        if let Some(marker) = WHOLE_FILE_PREAMBLE_MARKERS
+            .iter()
+            .find(|m| preamble.lines().any(|l| l.starts_with(**m)))
+        {
+            return Ok(ToolResult::error(format!(
+                "git_stage_hunks: the diff for `{}` carries `{}`, which is a whole-file change \
+                 (deletion, rename, copy or mode change) rather than a content edit. Staging part \
+                 of it is not meaningful — use git_stage(\"{}\") to stage the whole file.",
+                args.path,
+                marker.trim(),
+                args.path
+            )));
+        }
 
         let missing: Vec<String> = args
             .hunks
@@ -2949,11 +3032,15 @@ impl Tool for GitStageHunksTool {
             patch.push_str(&h.patch);
         }
 
+        // Deliberately NO `--recount`. Dropping earlier hunks does not invalidate the remaining
+        // hunks' old-side headers — the index is the preimage, so their counts stay true — and
+        // `--recount` would recompute the counts from the body it actually received, which turns
+        // git's corrupt-patch check off on a patch flux assembled. That check is the last thing
+        // standing between a truncated write and a partial stage reported as a complete success.
         let apply = vec![
             "git".to_string(),
             "apply".to_string(),
             "--cached".to_string(),
-            "--recount".to_string(),
             "--whitespace=nowarn".to_string(),
             "-".to_string(),
         ];
@@ -5305,6 +5392,252 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    /// C-92 rework, the blocking case: a zero-context diff carries no context lines, so `git apply`
+    /// anchors on line numbers alone and silently stages a pure insertion at the **wrong offset**
+    /// while exiting 0. Reproduced against git 2.55.0: a hunk requested at line 6 of a 30-line file
+    /// landed at EOF. The op must refuse the radius rather than stage anything at all.
+    ///
+    /// No earlier test passed a non-default `context`, which is exactly why the gate stayed green
+    /// over the defect.
+    #[tokio::test]
+    async fn zero_context_is_refused_instead_of_staging_at_the_wrong_position() {
+        let (dir, c) = git_ctx();
+        // A committed 30-line baseline with one insertion near the top and a coworker's far below,
+        // the shape that misapplies: at context 0 the first hunk landed past line 30.
+        let base: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        WriteTool
+            .execute(&c, json!({"path": "wide.txt", "content": base}))
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(&c, json!({"paths": ["wide.txt"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(&c, json!({"message": "baseline"}))
+            .await
+            .unwrap();
+        let edited = base
+            .replace("line 5\n", "line 5\nINSERT-OURS\n")
+            .replace("line 20\n", "line 20\nINSERT-THEIRS\n");
+        WriteTool
+            .execute(&c, json!({"path": "wide.txt", "content": edited}))
+            .await
+            .unwrap();
+
+        // The read op refuses the radius outright, so no id is ever minted at context 0.
+        let listed = GitHunksTool
+            .execute(&c, json!({"path": "wide.txt", "context": 0}))
+            .await
+            .unwrap();
+        assert!(
+            listed.is_error,
+            "git_hunks must refuse context 0, got:\n{}",
+            listed.content
+        );
+        assert!(
+            listed.content.contains("at least 1"),
+            "the refusal must name the floor: {}",
+            listed.content
+        );
+
+        // And the staging op refuses independently — it is reachable with ids listed at another
+        // radius, so it cannot rely on the read op having screened the value.
+        let ids = hunk_ids(
+            &GitHunksTool
+                .execute(&c, json!({"path": "wide.txt", "context": 1}))
+                .await
+                .unwrap()
+                .content,
+        );
+        assert_eq!(ids.len(), 2, "context 1 should still split the two edits");
+        let staged = GitStageHunksTool
+            .execute(
+                &c,
+                json!({"path": "wide.txt", "hunks": [&ids[0]], "context": 0}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            staged.is_error,
+            "git_stage_hunks must refuse context 0, got:\n{}",
+            staged.content
+        );
+
+        // The decisive assertion: nothing reached the index. At HEAD this failed with
+        // `INSERT-OURS` staged at end-of-file, a position the caller never selected.
+        let idx = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert!(
+            !idx.content.contains("INSERT-OURS"),
+            "a refused radius must stage nothing, but the index holds:\n{}",
+            idx.content
+        );
+        drop(dir);
+    }
+
+    /// C-92 rework: the same file staged at a *legal* non-default radius must land where the
+    /// caller pointed. Guards the fix from being "refuse everything" — context 1 is the finest
+    /// radius that still gives `git apply` something to verify against.
+    #[tokio::test]
+    async fn staging_at_the_minimum_context_lands_at_the_requested_position() {
+        let (dir, c) = git_ctx();
+        let base: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        WriteTool
+            .execute(&c, json!({"path": "wide.txt", "content": base}))
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(&c, json!({"paths": ["wide.txt"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(&c, json!({"message": "baseline"}))
+            .await
+            .unwrap();
+        let edited = base
+            .replace("line 5\n", "line 5\nINSERT-OURS\n")
+            .replace("line 20\n", "line 20\nINSERT-THEIRS\n");
+        WriteTool
+            .execute(&c, json!({"path": "wide.txt", "content": edited}))
+            .await
+            .unwrap();
+
+        let ids = hunk_ids(
+            &GitHunksTool
+                .execute(&c, json!({"path": "wide.txt", "context": 1}))
+                .await
+                .unwrap()
+                .content,
+        );
+        let staged = GitStageHunksTool
+            .execute(
+                &c,
+                json!({"path": "wide.txt", "hunks": [&ids[0]], "context": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(!staged.is_error, "{}", staged.content);
+
+        let idx = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert!(
+            idx.content.contains("INSERT-OURS") && !idx.content.contains("INSERT-THEIRS"),
+            "only our hunk should be staged:\n{}",
+            idx.content
+        );
+        // Position, not just presence: the insertion belongs right after `line 5`, and the hunk
+        // header must name a low line number rather than the end of the file.
+        let header = idx
+            .content
+            .lines()
+            .find(|l| l.starts_with("@@"))
+            .unwrap_or_default()
+            .to_string();
+        let old_start: u32 = header
+            .split(['-', ','])
+            .nth(1)
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(u32::MAX);
+        assert!(
+            old_start < 10,
+            "the hunk must land near line 5, not at EOF — header was `{header}`"
+        );
+        drop(dir);
+    }
+
+    /// C-92 rework: the diff preamble rides along with whichever hunks are selected, so a header
+    /// describing a whole-file change would be honoured even though only content hunks were
+    /// picked. Deleting the file makes `git diff` emit `deleted file mode`; staging "one hunk" of
+    /// that would stage the deletion the caller never selected.
+    #[tokio::test]
+    async fn whole_file_deletion_is_refused_rather_than_staged_as_a_hunk() {
+        let (dir, c) = git_ctx();
+        let base: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        WriteTool
+            .execute(&c, json!({"path": "doomed.txt", "content": base}))
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(&c, json!({"paths": ["doomed.txt"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(&c, json!({"message": "baseline"}))
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.join("doomed.txt")).unwrap();
+
+        let listed = GitHunksTool
+            .execute(&c, json!({"path": "doomed.txt"}))
+            .await
+            .unwrap();
+        let ids = hunk_ids(&listed.content);
+        if let Some(first) = ids.first() {
+            let staged = GitStageHunksTool
+                .execute(&c, json!({"path": "doomed.txt", "hunks": [first]}))
+                .await
+                .unwrap();
+            assert!(
+                staged.is_error,
+                "staging a hunk of a deleted file must be refused, got:\n{}",
+                staged.content
+            );
+            assert!(
+                staged.content.contains("whole-file"),
+                "the refusal should explain why: {}",
+                staged.content
+            );
+            let idx = GitDiffTool
+                .execute(&c, json!({"staged": true}))
+                .await
+                .unwrap();
+            assert!(
+                !idx.content.contains("deleted file"),
+                "nothing should have been staged:\n{}",
+                idx.content
+            );
+        }
+        drop(dir);
+    }
+
+    /// C-92 rework (minor): staging one hunk renumbers the ones after it, and the ordinal is part
+    /// of the id — so a still-valid selection can go stale by *position* while its content is
+    /// untouched. The refusal must say that, rather than blaming an edit nobody made.
+    #[tokio::test]
+    async fn renumbering_after_a_stage_is_reported_as_renumbering_not_as_an_edit() {
+        let (dir, c) = git_ctx();
+        split_author_file(&c).await;
+        let ids = hunk_ids(
+            &GitHunksTool
+                .execute(&c, json!({"path": "shared.txt"}))
+                .await
+                .unwrap()
+                .content,
+        );
+        assert_eq!(ids.len(), 2);
+        // Stage the first; the second keeps its content but becomes ordinal 1.
+        GitStageHunksTool
+            .execute(&c, json!({"path": "shared.txt", "hunks": [&ids[0]]}))
+            .await
+            .unwrap();
+        let stale = GitStageHunksTool
+            .execute(&c, json!({"path": "shared.txt", "hunks": [&ids[1]]}))
+            .await
+            .unwrap();
+        assert!(stale.is_error, "{}", stale.content);
+        assert!(
+            stale.content.contains("renumber"),
+            "the refusal must name renumbering, not a phantom edit: {}",
+            stale.content
+        );
+        drop(dir);
     }
 
     /// D-66: `git_push` end-to-end against a local bare "remote" (no network needed).

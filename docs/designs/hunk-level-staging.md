@@ -28,8 +28,9 @@ A hunk's identity is a hash of *what it changes*, not *where it sits*:
 id = "h{ordinal}-{16 hex of SipHash(path \x01 hunk-body-lines)}"
 ```
 
-- `ordinal` is the hunk's 1-based position in the current diff. It is a **readability and
-  duplicate-disambiguation device only** — never the integrity check.
+- `ordinal` is the hunk's 1-based position in the current diff. It is a readability and
+  duplicate-disambiguation device; the hash is the integrity check. **Both halves are compared**,
+  because matching is a full-string equality on the id — see the correction below.
 - The hash covers the path and the hunk body verbatim (each `+`/`-`/` ` line, including its
   prefix). It deliberately **excludes the `@@ -a,b +c,d @@` line numbers**.
 
@@ -49,14 +50,38 @@ from the working tree *as of the staging call*.
 
 If hunk 1 is staged (or edited), every later hunk's `@@` line numbers shift, even though nothing
 about those hunks changed. Including position in the identity would invalidate every ID in the file
-on any edit anywhere in the file — the agent could stage exactly one hunk per `git_hunks` call and
-would have to re-read after each. Content is the identity; position is not. This is what makes
-"stage hunk 1, then stage hunk 3" work in the split-author case without a re-read in between.
+on any edit anywhere in the file. Content is the identity; position is not.
 
-The cost is that two byte-identical hunks in one file hash the same. The `h{ordinal}-` prefix
-disambiguates them, and because the ordinal is compared only after the hash matches, a stale
-ordinal can never redirect a selection to unrelated content — worst case it fails to match and the
-op refuses.
+### Correction (C-92 rework): the ordinal *is* compared, so ids do not survive a stage
+
+An earlier draft of this note claimed the above bought "stage hunk 1, then stage hunk 3 without a
+re-read in between", and that "the ordinal is compared only after the hash matches". **Both were
+false for the shipped code**, and the code is what is right here. Matching is a plain equality on
+the whole `h{ordinal}-{hash}` string, and the ordinal is assigned from the hunk's position in the
+*current* diff — so staging hunk 1 renumbers hunk 3 to hunk 2 and its previously-issued id stops
+matching. A re-read is required after every stage.
+
+This is a real limitation, and it was left in place deliberately rather than fixed, because the two
+properties are not jointly achievable:
+
+- *Surviving renumbering* requires dropping the ordinal from the comparison, i.e. matching on the
+  hash alone.
+- *Distinguishing two byte-identical hunks* requires position, because their hashes are equal by
+  construction.
+
+Matching on the hash alone would close the first at the cost of the second, and the second is the
+safety-relevant one: with hash-only matching, reverting one of two identical hunks would let a
+stale id silently resolve to the surviving one — a redirect to a different region of the file.
+Keeping the ordinal in the comparison fails *safe* instead: the selection stops matching and the op
+refuses. The cost is a re-read per stage, which is cheap; the alternative costs a wrong stage.
+
+What was genuinely wrong was the *diagnosis*: the refusal used to say "the file changed underneath
+this selection" even when nothing had changed but the numbering. `stale_hunk_guidance` now compares
+the hash halves and reports renumbering as renumbering.
+
+Note also that the id excluding line numbers still earns its keep: it is what makes an id survive an
+edit *elsewhere in the file* between the read and the stage, which is the concurrent-coworker case
+the story is actually about.
 
 ## Why not the alternatives
 
@@ -92,7 +117,25 @@ The refusal path (Acceptance 3) is not one check but two, and they catch differe
    apply --cached` refuses, and its stderr is surfaced as a recoverable error too.
 
 Neither path raises a plan-halting `Err`. Both leave the index untouched: `git apply` is
-all-or-nothing across the hunks in a single patch, so a partial stage is not a reachable state.
+all-or-nothing across the hunks in a single patch.
+
+**That guarantee is conditional, and C-92's rework is what makes it hold.** `git apply` is
+all-or-nothing over the patch *it receives*, which is only the patch flux sent if the transfer was
+complete and well-formed. Two things had to change:
+
+- The apply invocation used to pass `--recount`, which tells git to recompute each hunk's line
+  counts from the body it actually read instead of trusting the header — and therefore to *stop*
+  rejecting a patch whose body and header disagree. `--recount` is unnecessary here (dropping
+  earlier hunks does not invalidate the remaining hunks' old-side counts, because the index is the
+  preimage), and with it a patch truncated at a line boundary applied cleanly with exit 0, staging
+  a partial result. Verified against git 2.55.0: dropping the last line of a two-hunk selection
+  gave `APPLIED exit=0` with `--recount` and `error: corrupt patch at <stdin>:20` without it. It is
+  now omitted, so git's corrupt-patch check is back on.
+- `System::run_with_stdin` discarded the result of its stdin write. A short write closes the pipe
+  on drop and delivers a *clean* EOF, so the child cannot tell truncation from completion. The
+  write result is now checked, and a failed write under a zero exit is a hard error. A failed write
+  under a *non-zero* exit is passed through untouched — that is the ordinary "git rejected the
+  patch and stopped reading" case, where the exit code carries the real diagnosis.
 
 ## Guarded-IO shape
 
@@ -136,7 +179,18 @@ specs are checked by `flux_spec::metadata_violations` in test rather than by ins
 - **Interactive `add -p` prompting.** No TTY in the guarded envelope; the selection is explicit.
 - **Splitting a hunk** (`add -p`'s `s`). A caller wanting finer granularity can lower the context
   radius; `git_hunks` exposes `context` for that, and a smaller radius splits adjacent changes into
-  separate hunks naturally.
+  separate hunks naturally. **The radius floor is 1, and 0 is rejected** (C-92 rework): a
+  zero-context diff has no context lines for `git apply` to verify against, so it anchors on line
+  numbers alone and will stage a pure insertion at the wrong offset while exiting 0 — observed
+  against git 2.55.0, where a hunk requested at line 6 of a 30-line file landed at EOF. That is the
+  precise failure this design exists to prevent, so the radius that enables it is refused rather
+  than supported. `--unidiff-zero` makes the case land correctly, but only by switching the
+  verification off, which trades the guarantee for granularity; `context: 1` keeps the check and
+  still splits far more finely than the default.
 - **Cross-file selection.** One path per call, which is what keeps `permission_subjects` exact.
 - **Staging *deletions* of whole files or renames.** Those have no hunk granularity to select; they
-  remain whole-path `git_stage` operations.
+  remain whole-path `git_stage` operations. This is now **enforced, not merely documented** (C-92
+  rework): the diff preamble is copied verbatim alongside whichever hunks are selected, so a
+  `deleted file mode` / `rename from` / `copy from` / mode-change header would otherwise be honoured
+  even though the caller only picked content hunks — staging a deletion nobody selected.
+  `git_stage_hunks` refuses such a diff and points at `git_stage`.
