@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-07-29
+
 ### Added
 
 - **The TUI has somewhere to put a pane (C-221).** Second story of the **agent-authored surface**

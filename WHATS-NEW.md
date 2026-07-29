@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-07-29
+
 ### New
 
 - **Hand work to other flux agents, and pick it back up after a restart.** A program can now declare
