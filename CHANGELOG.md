@@ -108,6 +108,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The `SurfaceSink` pane contract at L2 (C-220).** First story of the **agent-authored surface**
+  epic, and deliberately contract-only — no rendering, no op, nothing model-facing (C-221 and C-223
+  add those). A tool can now address the human surface without any crate below L6 knowing a surface
+  exists: `SurfaceSink` is a send-only trait in `flux-runtime`, installed by an L6 surface and
+  reachable by a tool only through `ToolContext::surface()`, which returns `None` when no host
+  installed one. It is the third instance of the `ToolProgressSink`/`SpawnActivitySink` pattern, and
+  it copies that shape deliberately rather than inventing one — including redaction **at the
+  reporter**, so every string crossing to a screen (pane id, title, and every payload field down to
+  a recursive tree node's label) is scrubbed on one path that `update` and `close` cannot route
+  around.
+  Two properties are enforced by construction rather than by convention, because the trusted-chrome
+  invariant (C-222) will rest on them. **`PaneSpec` carries no field that reaches a `Style`** — no
+  colour, width, rect or z-order — pinned by an exact-set assertion over its fields, so the model
+  supplies data and the surface keeps every trust marker. And **`surface_sink()` is `pub(crate)`**,
+  diverging from its public sibling `tool_progress_sink()`: a public getter paired with the public
+  `runtime_turn_context()` would let a tool emit unredacted bytes straight to the screen, which would
+  have made "the reporter is the only route" aspirational. Installing a sink stays public; only
+  reading one back is closed. `lifetime: "project"` parses but is rejected at the reporter until a
+  story claims it, so the field cannot quietly imply persistence it does not have.
+
 - **Memory gets its own append-only stream and projection (A-107).** First story of the
   **evidence-pinned memory** epic, and deliberately store-layer only — no op, no CLI (A-108 and A-110
   add those). `MemoryEntry { id, claim, scope, receipt, git, learned_at_ms }` lives on a

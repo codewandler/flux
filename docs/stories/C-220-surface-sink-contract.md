@@ -2,7 +2,7 @@
 id: C-220
 title: The SurfaceSink contract at L2 — typed pane commands, redacted at the reporter
 pillar: Core
-status: ready
+status: done
 priority: 11
 epic: agent-authored-surface
 design: docs/designs/agent-authored-surface.md
