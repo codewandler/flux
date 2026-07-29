@@ -155,7 +155,15 @@ fn call(tool: &str, subjects: &[&str]) -> Observation {
     Observation::new(
         "tool_call",
         Phase::Turn,
-        json!({ "tool": tool, "subjects": subjects, "caller": "tester" }),
+        json!({
+            "tool": tool,
+            "subjects": subjects,
+            "caller": "tester",
+            // As the recorder writes it. Subject matching discriminates on principal kind, so a
+            // record without this is genuinely undecidable against a `user`-subject grant — see
+            // `a_record_without_a_principal_kind_cannot_decide_a_floor_withdrawal`.
+            "caller_kind": "user",
+        }),
     )
 }
 
@@ -364,6 +372,48 @@ required_trust = "privileged"
     assert_eq!(
         report["newly_blocked"][0]["op"],
         json!("bash"),
+        "{report:#}"
+    );
+}
+
+/// End-to-end guard for the joint bracket, through the real binary.
+///
+/// A grant gated on a **group** and a **trust level** at once is satisfied by neither fact alone,
+/// so probing the omitted caller facts one axis at a time finds no movement and reports the op as
+/// confidently `unchanged` — while the proposal in fact converts an approval-gated process exec
+/// into a silent allow for a caller wholly consistent with the log. `group X at trust Y` is an
+/// ordinary policy shape, and precisely what approval distillation (C-94) would propose, so this
+/// must not be a case the simulator gets quietly wrong.
+#[test]
+fn a_grant_gated_on_two_omitted_facts_at_once_is_never_reported_as_decided() {
+    let fixture = Fixture::new("joint");
+    seed(&fixture);
+    fixture.active_config(ACTIVE_UNGATES_EXEC);
+
+    let proposed = fixture.proposal(
+        "proposed.toml",
+        r#"
+[[policy.grants]]
+subjects = [{ kind = "group", id = "ops" }]
+resources = [{ kind = "process" }]
+actions = ["process.exec"]
+required_trust = "privileged"
+"#,
+    );
+
+    let report = fixture.simulate_json(&[proposed.to_str().unwrap(), "--json"]);
+
+    let indeterminate = report["indeterminate"].as_array().expect("array");
+    assert!(
+        indeterminate.iter().any(|i| i["op"] == json!("bash")),
+        "a grant gated on group AND trust together must not be reported as decided: {report:#}"
+    );
+    assert!(
+        !report["unchanged"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|u| u["op"] == json!("bash")),
         "{report:#}"
     );
 }

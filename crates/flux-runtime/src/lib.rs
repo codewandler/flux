@@ -32,8 +32,9 @@ use flux_evidence::{
     DestructiveEscalation, EvidenceLog, Observation, Phase, Reaction, KIND_DESTRUCTIVE,
 };
 use flux_policy::{
-    default_local_grants, evaluate, local_identity, Action, AuthorizationPolicy, Caller, Decision,
-    Request as PolicyRequest, ResourceKind, ResourceRef, Trust,
+    default_local_grants, evaluate, local_identity, Action, AuthorizationPolicy, Caller,
+    CallerKind as PolicyCallerKind, Decision, Request as PolicyRequest, ResourceKind, ResourceRef,
+    Trust,
 };
 use flux_secret::Redactor;
 use flux_spec::{AccessKind, Effect, Idempotency, IntentSet, Risk, StagingDisposition, ToolSpec};
@@ -3470,6 +3471,16 @@ impl Executor {
                 "tool": name,
                 "subjects": subjects,
                 "caller": identity.caller().principal.id.as_str(),
+                // The principal's *kind*, not just its id: `flux policy simulate` re-evaluates this
+                // dispatch against a candidate policy, and subject matching discriminates on kind
+                // (a `user` subject never matches an `agent` caller). Without it the replay cannot
+                // tell the two apart and must report the op as indeterminate. Additive — records
+                // written before this key exists simply lack it.
+                "caller_kind": match identity.caller().principal.kind {
+                    PolicyCallerKind::User => "user",
+                    PolicyCallerKind::Agent => "agent",
+                    PolicyCallerKind::System => "system",
+                },
             }),
         )];
         if intents.is_destructive() {

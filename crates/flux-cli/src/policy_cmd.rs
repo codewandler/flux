@@ -79,9 +79,18 @@ const TOOL_CALL: &str = "tool_call";
 /// The one thing the replay assumes rather than reads. Surfaced in both renderings so an operator
 /// reading the diff knows the shape of the claim it makes; see the module docs.
 const REPLAY_ASSUMPTION: &str =
-    "the log records the caller's principal id but not its kind: every \
-                                 recorded caller is replayed as a `user` principal, which is what \
-                                 flux mints for a CLI-recorded session";
+    "only the mandatory authorization-policy floor is replayed: permission rules, the \
+     capability-scope floor, `[tools] disable` and the interactive approval gate are not, so \
+     `newly blocked` means \"this policy would have refused it\", not \"it would not have run\"";
+
+/// A second limit, and the one most likely to mislead: the diff is computed over dispatches that
+/// were *admitted*, because `Executor::gate` returns before the `tool_call` observation is written
+/// when the policy denies. An op the active policy denied outright therefore has no record, so
+/// `newly allowed` can only ever surface `approval_required -> allow` transitions, never
+/// `deny -> allow`. A `newly allowed 0` is not evidence that a proposal grants nothing new.
+const NEWLY_ALLOWED_LIMIT: &str =
+    "the log holds only admitted dispatches (a policy denial is never recorded), so `newly \
+     allowed` surfaces `approval_required -> allow` transitions only — never `deny -> allow`";
 
 /// The params a historical call is re-evaluated with: none.
 ///
@@ -274,11 +283,18 @@ fn simulation_registry() -> Result<ToolRegistry> {
 ///
 /// Each names an axis along which `evaluate` is **monotone** towards [`Verdict::Allow`]: more trust
 /// lets more grants apply, more held scopes turn escalations into allows, and more group memberships
-/// let more `group` subjects match — none of them can ever make a verdict more restrictive. That is
-/// what makes a two-point check sufficient: evaluate at the axis minimum (the recorded caller holds
-/// none of it) and at its maximum (everything either policy could possibly ask for); if the two
-/// agree, every caller in between agrees too and the op is decidable. If they disagree, the log does
-/// not determine the verdict and the op is `indeterminate`.
+/// let more `group` subjects match — none of them can ever make a verdict more restrictive, because
+/// a policy is default-deny and its grants only ever allow or escalate (`flux_policy::evaluate`).
+///
+/// Monotonicity is what makes a two-point check sufficient, but only if the two points are the
+/// **joint** minimum and the **joint** maximum over all three axes at once. Probing one axis at a
+/// time with the others held down is *not* sound: a grant gated on two omitted facts together (say
+/// `subjects = [group "ops"]` with `required_trust = "privileged"`) is satisfied by neither
+/// single-axis probe, so the op would be reported as confidently decided when the log does not
+/// determine it at all. That was a real defect here, and it failed in the direction this command
+/// exists to prevent — silently under-reporting a change. The bracket below therefore widens every
+/// axis simultaneously; these variants survive only to *name* which fact moved a verdict, never to
+/// bound the search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallerFact {
     Trust,
@@ -287,19 +303,12 @@ enum CallerFact {
 }
 
 impl CallerFact {
-    /// Why an op that moved along this axis cannot be decided — the operator-facing reason.
-    fn reason(self) -> &'static str {
+    /// The operator-facing name of this axis, composed into an [`Indeterminacy`] reason.
+    fn noun(self) -> &'static str {
         match self {
-            CallerFact::Trust => {
-                "the verdict depends on the caller's trust level, which the log does not record"
-            }
-            CallerFact::Scopes => {
-                "the verdict depends on the caller's scopes, which the log does not record"
-            }
-            CallerFact::Groups => {
-                "the verdict depends on the caller's group memberships, which the log does not \
-                 record"
-            }
+            CallerFact::Trust => "trust level",
+            CallerFact::Scopes => "scopes",
+            CallerFact::Groups => "group memberships",
         }
     }
 }
@@ -339,16 +348,37 @@ impl FactCeiling {
     }
 }
 
-/// The caller a recorded principal id replays as: the axis **minimum** of every fact the log omits —
-/// no trust beyond the floor, no scopes, no groups — plus the one declared assumption, `user` (see
-/// [`REPLAY_ASSUMPTION`]).
-fn replay_caller(principal_id: &str) -> (Caller, Trust) {
+/// Why an op could not be decided from what the log records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Indeterminacy {
+    /// A verdict moved between the joint minimum and joint maximum of the omitted caller facts.
+    CallerFacts(String),
+    /// Two principal kinds the record is consistent with disagree about the verdict.
+    PrincipalKind,
+}
+
+impl Indeterminacy {
+    fn reason(&self) -> String {
+        match self {
+            Indeterminacy::CallerFacts(which) => {
+                format!("the verdict depends on {which}, which the log does not record")
+            }
+            Indeterminacy::PrincipalKind => "the verdict depends on the caller's principal kind, \
+                 which this record does not carry (it predates the recorder writing `caller_kind`)"
+                .to_string(),
+        }
+    }
+}
+
+/// The caller a recorded principal id replays as at the **joint minimum** of every omitted fact:
+/// no trust beyond the floor, no scopes, no groups, at the given principal kind.
+fn replay_caller(principal_id: &str, kind: CallerKind) -> (Caller, Trust) {
     (
         Caller {
             principal: Principal {
                 id: principal_id.to_string(),
                 name: principal_id.to_string(),
-                kind: CallerKind::User,
+                kind,
             },
             groups: Vec::new(),
             source: "event-log".to_string(),
@@ -361,7 +391,18 @@ fn replay_caller(principal_id: &str) -> (Caller, Trust) {
     )
 }
 
-/// The same caller widened to the maximum of one omitted fact, leaving the others at their minimum.
+/// The same caller at the **joint maximum**: every omitted fact widened at once. This is the upper
+/// end of the bracket, and widening jointly is what makes it sound over the product space.
+fn joint_max(base: &(Caller, Trust), ceiling: &FactCeiling) -> (Caller, Trust) {
+    let (mut caller, mut trust) = base.clone();
+    trust.level = TrustLevel::System;
+    trust.scopes.clone_from(&ceiling.scopes);
+    caller.groups.clone_from(&ceiling.groups);
+    (caller, trust)
+}
+
+/// The same caller widened along exactly one axis — used only to attribute a reason once the joint
+/// bracket has already established that the op is indeterminate.
 fn widened(base: &(Caller, Trust), fact: CallerFact, ceiling: &FactCeiling) -> (Caller, Trust) {
     let (mut caller, mut trust) = base.clone();
     match fact {
@@ -370,25 +411,6 @@ fn widened(base: &(Caller, Trust), fact: CallerFact, ceiling: &FactCeiling) -> (
         CallerFact::Groups => caller.groups.clone_from(&ceiling.groups),
     }
     (caller, trust)
-}
-
-/// Whether either policy targets a subject kind whose match depends on the caller **kind**, which is
-/// the one fact the replay assumes rather than brackets. A `group` subject is not listed: it is
-/// bracketed properly by [`CallerFact::Groups`], since group membership is additive on top of the
-/// assumed `user` principal.
-fn kind_dependent_subject(policies: [&AuthorizationPolicy; 2]) -> Option<&'static str> {
-    for policy in policies {
-        for grant in &policy.grants {
-            for subject in &grant.subjects {
-                match subject.kind {
-                    SubjectKind::Agent => return Some("agent"),
-                    SubjectKind::System => return Some("system"),
-                    SubjectKind::User | SubjectKind::Group => {}
-                }
-            }
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -423,47 +445,136 @@ fn verdict(
     worst
 }
 
-/// Both policies' verdicts for one op — or the first omitted caller fact the verdict turns on.
+/// Both policies' verdicts for one op — or why the log does not determine them.
 ///
-/// The bracket is checked **per policy**: a fact that moves either side's verdict makes the *diff*
+/// Two nested brackets, because the log omits two *kinds* of fact:
+///
+/// 1. **Monotone facts** (trust, scopes, groups). For a fixed principal kind, evaluate at the joint
+///    minimum and the joint maximum. `evaluate` is monotone in all three, so if those two agree,
+///    every caller in between agrees. Widening jointly — not one axis at a time — is what makes
+///    this sound for a grant gated on several omitted facts at once.
+/// 2. **Principal kind**, which is categorical, not monotone, so it is *enumerated* rather than
+///    bracketed. A record that carries `caller_kind` pins it to one; an older record that does not
+///    is consistent with any kind, and `SubjectKind::User` itself discriminates on kind
+///    (`flux_policy::subject_matches` requires `CallerKind::User`), so this is load-bearing for
+///    every grant in the built-in floor — not just for `agent`/`system` subjects.
+///
+/// The check is over **both** policies: a fact that moves either side's verdict leaves the *diff*
 /// undetermined, so it makes the op indeterminate.
 fn decide(
     active: &AuthorizationPolicy,
     proposed: &AuthorizationPolicy,
-    identity: &(Caller, Trust),
+    principal_id: &str,
+    recorded_kind: Option<CallerKind>,
     ceiling: &FactCeiling,
     requirements: &[AuthorityRequirement],
-) -> std::result::Result<(Verdict, Verdict), CallerFact> {
-    let (caller, trust) = identity;
-    let floor = (
-        verdict(active, caller, trust, requirements),
-        verdict(proposed, caller, trust, requirements),
-    );
+) -> std::result::Result<(Verdict, Verdict), Indeterminacy> {
+    let feasible: &[CallerKind] = match recorded_kind {
+        Some(CallerKind::User) => &[CallerKind::User],
+        Some(CallerKind::Agent) => &[CallerKind::Agent],
+        Some(CallerKind::System) => &[CallerKind::System],
+        None => &[CallerKind::User, CallerKind::Agent, CallerKind::System],
+    };
+
+    let mut settled: Option<(Verdict, Verdict)> = None;
+    for kind in feasible {
+        let min = replay_caller(principal_id, *kind);
+        let max = joint_max(&min, ceiling);
+        let at = |(caller, trust): &(Caller, Trust)| {
+            (
+                verdict(active, caller, trust, requirements),
+                verdict(proposed, caller, trust, requirements),
+            )
+        };
+        let (lo, hi) = (at(&min), at(&max));
+        if lo != hi {
+            return Err(Indeterminacy::CallerFacts(attribute(
+                active,
+                proposed,
+                &min,
+                ceiling,
+                requirements,
+                lo,
+            )));
+        }
+        match settled {
+            None => settled = Some(lo),
+            Some(prev) if prev != lo => return Err(Indeterminacy::PrincipalKind),
+            Some(_) => {}
+        }
+    }
+    Ok(settled.expect("at least one feasible principal kind"))
+}
+
+/// Name the omitted fact(s) responsible for an op the joint bracket has already ruled
+/// indeterminate. Purely explanatory: it never decides *whether* an op is indeterminate, only how to
+/// describe it. A fact that moves the verdict on its own is named; when none does, the cause is a
+/// grant gated on several at once and the reason says so rather than blaming an arbitrary axis.
+fn attribute(
+    active: &AuthorizationPolicy,
+    proposed: &AuthorizationPolicy,
+    min: &(Caller, Trust),
+    ceiling: &FactCeiling,
+    requirements: &[AuthorityRequirement],
+    floor: (Verdict, Verdict),
+) -> String {
+    let mut movers = Vec::new();
     for fact in [CallerFact::Trust, CallerFact::Scopes, CallerFact::Groups] {
-        let (caller, trust) = widened(identity, fact, ceiling);
-        let ceilinged = (
+        let (caller, trust) = widened(min, fact, ceiling);
+        let moved = (
             verdict(active, &caller, &trust, requirements),
             verdict(proposed, &caller, &trust, requirements),
         );
-        if ceilinged != floor {
-            return Err(fact);
+        if moved != floor {
+            movers.push(fact.noun());
         }
     }
-    Ok(floor)
+    if movers.is_empty() {
+        "a combination of caller facts (trust level, scopes, group memberships) that no single one \
+         of them settles alone"
+            .to_string()
+    } else {
+        format!("the caller's {}", movers.join(" and "))
+    }
 }
 
-/// The recorded facts one `tool_call` observation carries, or `None` when the payload is missing one
+/// The recorded facts one `tool_call` observation carries.
+struct RecordedCall {
+    op: String,
+    subjects: Vec<String>,
+    caller: String,
+    /// `None` when the record predates the recorder writing the caller's principal kind.
+    kind: Option<CallerKind>,
+}
+
+/// Read one `tool_call` observation, or `None` when the payload is missing or malforms something
 /// the evaluation reads.
-fn recorded_call(data: &Value) -> Option<(String, Vec<String>, String)> {
+fn recorded_call(data: &Value) -> Option<RecordedCall> {
     let op = data.get("tool")?.as_str()?.to_string();
+    // A non-string subject makes the record unreadable rather than merely shorter: dropping it
+    // would silently shrink the requirement set, and fewer requirements is a *more permissive*
+    // verdict derived from a malformed record. Refuse the record instead.
     let subjects = data
         .get("subjects")?
         .as_array()?
         .iter()
-        .filter_map(|s| s.as_str().map(str::to_string))
-        .collect();
+        .map(|s| s.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()?;
     let caller = data.get("caller")?.as_str()?.to_string();
-    Some((op, subjects, caller))
+    // Absent on records written before the recorder carried it: `None` means "any kind", which
+    // `decide` enumerates rather than assumes.
+    let kind = match data.get("caller_kind").and_then(Value::as_str) {
+        Some("user") => Some(CallerKind::User),
+        Some("agent") => Some(CallerKind::Agent),
+        Some("system") => Some(CallerKind::System),
+        _ => None,
+    };
+    Some(RecordedCall {
+        op,
+        subjects,
+        caller,
+        kind,
+    })
 }
 
 /// Replay every recorded op in the `sessions` most recent sessions (`0` = all) against both
@@ -476,15 +587,6 @@ fn simulate(
     sessions: usize,
 ) -> Result<SimulationReport> {
     let ceiling = FactCeiling::of([active, proposed]);
-    // The one fact the replay assumes rather than brackets. When a policy actually reads it, the
-    // assumption would be doing the deciding — so nothing is decided.
-    let kind_gap = kind_dependent_subject([active, proposed]).map(|kind| {
-        format!(
-            "a grant targets a `{kind}` subject, and the log records the caller's principal id but \
-             not its kind"
-        )
-    });
-
     let limit = if sessions == 0 {
         ALL_SESSIONS
     } else {
@@ -498,7 +600,21 @@ fn simulate(
         ops: 0,
         active_grants: active.grants.len(),
         proposed_grants: proposed.grants.len(),
-        replay_assumptions: vec![REPLAY_ASSUMPTION.to_string()],
+        replay_assumptions: {
+            let mut limits = vec![
+                REPLAY_ASSUMPTION.to_string(),
+                NEWLY_ALLOWED_LIMIT.to_string(),
+            ];
+            // `sessions` in the report is how many were *replayed*, not how many were asked for.
+            // Without this an `--sessions 5` run over a 100-session store reads as complete.
+            if sessions != 0 && summaries.len() >= sessions {
+                limits.push(format!(
+                    "the replay window was bounded to the {sessions} most recent session(s); older \
+                     sessions were not read"
+                ));
+            }
+            limits
+        },
         counts: Counts::default(),
         newly_blocked: Vec::new(),
         newly_allowed: Vec::new(),
@@ -521,7 +637,13 @@ fn simulate(
                 });
             };
 
-            let Some((op, subjects, caller_id)) = recorded_call(&observation.data) else {
+            let Some(RecordedCall {
+                op,
+                subjects,
+                caller: caller_id,
+                kind,
+            }) = recorded_call(&observation.data)
+            else {
                 let op = observation
                     .data
                     .get("tool")
@@ -530,17 +652,13 @@ fn simulate(
                     .to_string();
                 indeterminate(
                     op,
-                    "the recorded dispatch is missing the op name, subjects, or caller the \
-                     evaluation reads"
+                    "the recorded dispatch is missing or malforms the op name, subjects, or caller \
+                     the evaluation reads"
                         .to_string(),
                 );
                 continue;
             };
 
-            if let Some(reason) = &kind_gap {
-                indeterminate(op, reason.clone());
-                continue;
-            }
             let Some(tool) = registry.get(&op) else {
                 let reason = format!(
                     "`{op}` has no authority contract in this build — a plugin, datasource, or \
@@ -557,15 +675,20 @@ fn simulate(
                 }
             };
 
-            let identity = replay_caller(&caller_id);
-            let (active_verdict, proposed_verdict) =
-                match decide(active, proposed, &identity, &ceiling, &requirements) {
-                    Ok(verdicts) => verdicts,
-                    Err(fact) => {
-                        indeterminate(op, fact.reason().to_string());
-                        continue;
-                    }
-                };
+            let (active_verdict, proposed_verdict) = match decide(
+                active,
+                proposed,
+                &caller_id,
+                kind,
+                &ceiling,
+                &requirements,
+            ) {
+                Ok(verdicts) => verdicts,
+                Err(why) => {
+                    indeterminate(op, why.reason());
+                    continue;
+                }
+            };
             let decided = DecidedOp {
                 session,
                 op,
@@ -703,12 +826,43 @@ mod tests {
         }
     }
 
+    /// A record as the current recorder writes it — carrying the caller's principal kind.
     fn tool_call(tool: &str, subjects: &[&str]) -> Observation {
+        tool_call_as(tool, subjects, "user")
+    }
+
+    /// A record from before the recorder carried the principal kind. The kind is genuinely unknown
+    /// for these, which is why they decide less.
+    fn legacy_tool_call(tool: &str, subjects: &[&str]) -> Observation {
         Observation::new(
             TOOL_CALL,
             Phase::Turn,
             json!({ "tool": tool, "subjects": subjects, "caller": "tester" }),
         )
+    }
+
+    /// A record written by a recorder that carries the caller's principal kind.
+    fn tool_call_as(tool: &str, subjects: &[&str], kind: &str) -> Observation {
+        Observation::new(
+            TOOL_CALL,
+            Phase::Turn,
+            json!({
+                "tool": tool,
+                "subjects": subjects,
+                "caller": "tester",
+                "caller_kind": kind,
+            }),
+        )
+    }
+
+    /// The built-in floor with every grant for `action` removed — a proposal that *withdraws*
+    /// something the floor allows.
+    fn floor_without(action: &str) -> AuthorizationPolicy {
+        let mut policy = with_local_floor(None);
+        policy
+            .grants
+            .retain(|g| !g.actions.iter().any(|a| a.0 == action));
+        policy
     }
 
     /// A store seeded with one session's worth of recorded dispatches.
@@ -900,33 +1054,92 @@ mod tests {
         assert_eq!(report.counts.unchanged, 1, "{report:?}");
     }
 
-    /// The caller's **kind** is the one fact the replay assumes rather than brackets — so a policy
-    /// that reads it makes every op indeterminate, and the assumption is stated in the report.
+    /// A grant gated on **two** omitted facts at once escapes every single-axis probe: neither the
+    /// group alone nor the trust alone satisfies it, so widening one axis at a time finds no change
+    /// and reports the op as confidently decided. Only a joint maximum catches it.
+    ///
+    /// This is the regression test for the real defect: the reviewer's single-axis control cases
+    /// passed throughout, so nothing narrower than this would have caught it.
     #[test]
-    fn a_kind_dependent_subject_refuses_the_whole_replay() {
-        let events = seeded(&[tool_call("read", &["src/main.rs"])]);
+    fn a_grant_gated_on_two_omitted_facts_at_once_is_indeterminate() {
+        let events = seeded(&[tool_call("bash", &["ls"])]);
         let active = with_local_floor(None);
-        let mut agent_subject = user_grant(vec!["workspace.read"], ResourceRef::path("*"));
-        agent_subject.subjects = vec![SubjectRef {
-            kind: SubjectKind::Agent,
-            id: "*".into(),
+        let mut both = user_grant(
+            vec!["process.exec"],
+            ResourceRef::any(ResourceKind::Process),
+        );
+        both.subjects = vec![SubjectRef {
+            kind: SubjectKind::Group,
+            id: "ops".into(),
         }];
+        both.required_trust = TrustLevel::Privileged;
         let proposed = with_local_floor(Some(AuthorizationPolicy {
-            grants: vec![agent_subject],
+            grants: vec![both],
         }));
 
         let report = run(&events, &active, &proposed);
 
-        assert_eq!(report.counts.indeterminate, 1, "{report:?}");
+        assert_eq!(
+            report.counts.indeterminate, 1,
+            "a grant gated on group AND trust together must not be reported as decided: {report:?}"
+        );
+        assert_eq!(report.counts.unchanged, 0, "{report:?}");
+    }
+
+    /// `SubjectKind::User` is itself kind-discriminating, so the floor's own grants depend on the
+    /// caller's principal kind. A record that does not carry the kind is consistent with an `agent`
+    /// principal, for which the floor never applied — so a proposal that withdraws a floor grant is
+    /// "newly blocked" for a user and "unchanged" for an agent, and the log cannot tell which.
+    #[test]
+    fn a_record_without_a_principal_kind_cannot_decide_a_floor_withdrawal() {
+        let events = seeded(&[legacy_tool_call("write", &["notes.md"])]);
+        let active = with_local_floor(None);
+        let proposed = floor_without("workspace.write");
+
+        let report = run(&events, &active, &proposed);
+
+        assert_eq!(
+            report.counts.indeterminate, 1,
+            "a kind-free record must not be replayed as a `user`: {report:?}"
+        );
+        assert_eq!(
+            report.counts.newly_blocked, 0,
+            "reporting `newly blocked` here asserts a user principal the log never recorded"
+        );
         assert!(
-            report.indeterminate[0].reason.contains("kind"),
+            report.indeterminate[0].reason.contains("principal kind"),
             "{:?}",
             report.indeterminate[0].reason
         );
-        assert!(
-            report.replay_assumptions.iter().any(|a| a.contains("user")),
-            "the assumed principal kind must be stated in the report"
-        );
+    }
+
+    /// ...and once the recorder writes the kind, the very same withdrawal is decided exactly. This
+    /// is what keeps the bracket from degenerating into "everything is indeterminate".
+    #[test]
+    fn a_recorded_principal_kind_decides_the_same_withdrawal() {
+        let events = seeded(&[tool_call_as("write", &["notes.md"], "user")]);
+        let active = with_local_floor(None);
+        let proposed = floor_without("workspace.write");
+
+        let report = run(&events, &active, &proposed);
+
+        assert_eq!(report.counts.indeterminate, 0, "{report:?}");
+        assert_eq!(report.counts.newly_blocked, 1, "{report:?}");
+    }
+
+    /// The mirrored case: an `agent` record is *not* affected by withdrawing a `user` grant, and
+    /// saying so is only possible because the kind is recorded.
+    #[test]
+    fn an_agent_principal_is_unaffected_by_withdrawing_a_user_grant() {
+        let events = seeded(&[tool_call_as("write", &["notes.md"], "agent")]);
+        let active = with_local_floor(None);
+        let proposed = floor_without("workspace.write");
+
+        let report = run(&events, &active, &proposed);
+
+        assert_eq!(report.counts.indeterminate, 0, "{report:?}");
+        assert_eq!(report.counts.newly_blocked, 0, "{report:?}");
+        assert_eq!(report.counts.unchanged, 1, "{report:?}");
     }
 
     /// Pure read: simulating leaves the log exactly as it was.
