@@ -200,6 +200,94 @@ Two registration seams stay open, deliberately:
   over. The C-208 gate asserts that directly rather than assuming it, because "the child registry is
   a subset" is a property that a future edit could quietly falsify.
 
+## The approval sheet does not redact (C-195)
+
+C-185 fixed the shared redactor and left one acceptance item behind — "the approval sheet's diff
+preview is covered" — because its premise did not hold: `flux-tui` performs no redaction anywhere.
+C-195 exists to settle whether that item was ever the right ask.
+
+**Decision: the approval sheet does not redact. No `flux-secret` edge is added to `flux-tui`.** This
+is a rejection on the merits, not a deferral, and the reasoning is recorded at the seam
+(`crates/flux-tui/src/toolview.rs`, `format_diff`) so it is not re-filed from the code side.
+
+The starting point is what the redactor is actually specified to do. Its own doc comment
+(`flux-secret/src/lib.rs:173-174`) says it "scrubs registered secret values and common credential
+shapes from text **before it is logged or shown to the model**"; `AGENTS.md` says secrets "never
+appear in **logs or model-visible output** as raw values"; `SECURITY.md` puts **secret
+exfiltration** in scope. Every one of those is a boundary condition — text leaving the operator's
+control, toward a log file, a provider, or a third party. The approval sheet is none of them: an
+in-process render, to the operator's own TTY, of bytes the operator is at that moment being asked to
+authorize. Not redacting it is the doctrine correctly applied, not a hole in it.
+
+Four reasons carry the decision, in descending order of weight.
+
+**1. Redaction would blind the operator to the exact thing the sheet exists to catch.** The sheet's
+job is adversarial review of the model's proposal: see the pending bytes, then allow or deny. The
+highest-value catch available on that surface is "this write puts a live credential into a file" —
+and that is precisely the line redaction would erase. The operator would read `+api_key=[redacted]`,
+conclude the secret is handled, approve, and the *real* value would land on disk, because redaction
+changes the render and not the write. That inverts the control: it converts a leak the operator
+could have caught into one they cannot see. The same render is also *diagnostic* — a raw credential
+in a proposed diff tells the operator a secret has already escaped into the model's context, which
+is a second signal redaction would suppress.
+
+**2. An approval surface must be WYSIWYG, and the redactor is a lossy heuristic.** It matches a
+fixed prefix list plus registered values by substring, with a 6-character registration floor
+(`add_secret`, `:195-201`). It under-matches by construction — an unknown credential shape is not in
+`SECRET_PREFIXES` — and it over-matches too: any registered value that happens to occur inside
+unrelated text is replaced wholesale. On a log line that is cosmetic. On the operator's last look at
+bytes about to be written it is a correctness defect, because the preview would no longer be a
+faithful account of the pending effect. A sheet that lies about what will be written is worse than
+one that shows a secret, since the second failure is visible and the first is not. The CLI's plan
+prompt already states this contract for its own surface: it "is the one place the user sees WHAT
+they are approving" (`flux-cli/src/session.rs:1231-1235`).
+
+**3. It would buy no confidentiality property, only the appearance of one.** `format_diff` is one
+function with three callers: the approval sheet (`rendering.rs:570-572`) and the transcript tool
+card, both live (`lib.rs:759`, `:2169`). Redacting only the sheet leaves the identical bytes on
+screen a second later in the card that records the completed call, and in `format_call`'s argument
+line before that. The other surfaces are the same: `CliSink::tool_call` renders raw input through
+`render_call_label` (`flux-cli/src/rendering.rs:655-665`), and `plan_prompt` renders a pending
+`process.exec` command verbatim (`session.rs:1273-1280`) — a `curl -H "Authorization: Bearer …"`
+shows in full at the CLI approval prompt today. Not redacting is therefore the consistent posture of
+every approval surface in flux, not a TUI-local omission. Redacting *all* of them is the broader
+"conversation text is never redacted at write time" question C-132/C-185 flagged; it is a different,
+larger decision and is deliberately not folded in here.
+
+**4. Redaction is already applied where a boundary is actually crossed — including to these exact
+bytes.** `Executor::dispatch` redacts a tool's *result* and never its *input* params
+(`flux-runtime/src/lib.rs:3637-3645`), and that gap is deliberate and known: `stream_json.rs:10-11`
+records that dispatch redaction "never covers a tool call's *input* arguments", which is why the
+stream-json writer redacts the **whole serialized line** at the point it is written
+(`flux-cli/src/stream_json.rs:103-114`). So the very content the approval sheet renders raw *is*
+scrubbed the moment it crosses to a machine consumer. The same split shows up cleanly in
+`whatif.rs`: `RerunRecordingSink` redacts into the **cassette** (`flux-flow/src/whatif.rs:172`,
+`:228`, `:269`) and passes the event to the live `inner` sink untouched (`:195`). Persistence gets
+the scrubber; the human watching does not. The evidence flush (`flux-flow/src/engine.rs:1245-1269`),
+otel, and the run export sit on the same side of that line — and `docs/architecture.md:164-166`
+already scopes the promise to tool *output*, not to every surface. The sheet is on the other side,
+and there is nothing downstream of the operator's eyes to protect.
+
+Worth stating plainly, since it is the fact that makes this a doctrine question rather than a bug:
+**every local human-eyes render path in flux is unredacted, uniformly.** TUI tool-card headers
+(`format_call`, raw `bash` commands and raw `k=v` argument dumps at `toolview.rs:24`, `:87-97`),
+expanded card detail (`lib.rs:2169`, `:2188`), approval subjects and plan detail lines
+(`rendering.rs:634-643`), the CLI's call labels and both its prompts. The approval sheet is not an
+oversight in an otherwise-redacted crate; it is one of five raw surfaces in `flux-tui`, and covering
+only it would be the single inconsistent case.
+
+### What would change this decision
+
+Two developments, and only these, should reopen it:
+
+- **The TUI grows a persistence or sharing path** — a transcript written to disk, a session
+  recording, a "copy sheet" that leaves the machine. That path crosses the boundary and must redact
+  at the point of persistence, exactly as `whatif.rs` does. Redacting the *render* would still be
+  the wrong place to do it.
+- **The broader C-132/C-185 question is settled in favour of redacting conversation text at write
+  time.** The sheet should then follow whatever that decision establishes, as one surface among many
+  rather than as a special case.
+
 ## Explicitly deferred: the sandbox default
 
 The review's headline finding — sandbox `Off` by default, network open — is **not** a story here,
