@@ -53,6 +53,25 @@ closure instead of re-deriving it.
   `authorize`, cap-scope checked before hooks, filesystem subjects normalized to physical identity,
   no production `Tool::execute` call, workspace root not model-reachable) — the failure came from
   outside the envelope, which is the argument for C-194 over more envelope hardening.
+- 2026-07-29 — **eight of the epic's children landed** in two impl-coord waves, each merged only
+  after its gate ran green and (for every envelope-touching change) an independent fresh-context
+  review passed: **C-187** (SHA-pin actions + a CI pin guard), **C-192**/**C-193** (the confirmed
+  `VACUUM INTO` guarded-IO bypass closed by a statement allowlist; review SOUND on 36k+ fuzzed
+  inputs), **C-189** (daemon body limits + timeouts; review SOUND incl. timeout-cancellation
+  leaving a valid session log), **C-188** (cargo-audit + cargo-deny advisory scanning; the real
+  gate verified locally), **C-190** (unauthenticated-non-loopback refusal now holds at router
+  construction, breaking; review SOUND, also closing the C-189 real-router auth-test gap), and
+  **C-194** (the mechanical no-direct-IO lint; first cut was review-caught as bypassable in the
+  unsafe direction, reworked into a string/comment-aware tokenizer, re-verified against a novel
+  bypass). Two adjacent items were split out as their own stories: **C-195** (approval-sheet
+  redaction, from C-185) and **C-205** (bump `lru`, drop its unsound-advisory ignore, from C-188).
+  Also landed earlier the same day: **C-185** (the shared-redactor diff-marker fix).
+- **Still open before this epic closes:** (1) **C-191** — the registry-wide `ToolSpec` invariant
+  test — remains `backlog` on purpose: its invariant set must be agreed and written down before it
+  is coded, so it was deliberately NOT fanned out. (2) The **re-run of the `adversarial-review`
+  skill** against the now-current tree to mark findings 1–4 + classification-trust **closed with
+  evidence**, diffed against the 2026-07-29 baseline. (3) The **sandbox-default deferral** (Notes
+  below) still needs to become its own story or be consciously dropped.
 
 ## Notes
 - **Why C-187 leads.** It is the only finding exploitable by a third party with no flux bug and no
