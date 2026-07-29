@@ -313,7 +313,9 @@ pub enum PaneLifetime {
 /// belong to the renderer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneNode {
+    /// The node's text, redacted with the rest of the payload before it reaches a sink.
     pub label: String,
+    /// Nested nodes, empty for a leaf. Depth is the model's; the renderer owns how it is drawn.
     #[serde(default)]
     pub children: Vec<PaneNode>,
 }
@@ -416,10 +418,15 @@ impl PaneData {
 pub struct PaneSpec {
     /// Model-chosen handle, used to address later `update`/`close` commands at this pane.
     pub id: String,
+    /// The pane's heading. Content only — the surface owns how (and whether) it is emphasized.
     pub title: String,
+    /// Where the pane asks to sit. A proposal: the surface may resolve, demote or suppress it.
     pub slot: PaneSlot,
+    /// Which renderer to use. Must agree with `data`; [`SurfaceReporter::send`] rejects a mismatch.
     pub kind: PaneKind,
+    /// How long the pane survives. `project` parses but is rejected at the reporter.
     pub lifetime: PaneLifetime,
+    /// The pane's content, typed per [`PaneKind`].
     pub data: PaneData,
 }
 
@@ -785,7 +792,15 @@ impl RuntimeTurnContext {
     }
 
     /// The turn-owned pane channel, when a surface installed one.
-    pub fn surface_sink(&self) -> Option<Arc<dyn SurfaceSink>> {
+    ///
+    /// `pub(crate)` on purpose, unlike the sibling [`RuntimeTurnContext::tool_progress_sink`]:
+    /// [`ToolContext::surface`] claims to be the ONLY way to reach a [`SurfaceSink`], and a public
+    /// getter here would make that false — a tool could pair it with
+    /// [`ToolContext::runtime_turn_context`] and emit unredacted bytes straight to the screen.
+    /// Installing a sink stays public ([`RuntimeTurnContext::with_surface_sink`]) because L6
+    /// surfaces must still be able to; only reading one back is crate-private. C-222's
+    /// trusted-chrome invariant leans on this being enforced by visibility, not by convention.
+    pub(crate) fn surface_sink(&self) -> Option<Arc<dyn SurfaceSink>> {
         self.surface.clone()
     }
 
@@ -4193,6 +4208,9 @@ mod tests {
     /// Field names anywhere in a serialized pane that would let a model reach a `Style`. A model
     /// that can paint a region inside a trusted terminal can imitate the approval sheet, so the
     /// absence of these is the trust property C-222 rests on.
+    ///
+    /// This is a **denylist of whole key names**, and it is the weaker half of the pin — see
+    /// [`pane_spec_carries_no_style_bearing_field`] for which half actually guarantees what.
     const STYLE_BEARING: &[&str] = &[
         "color",
         "colour",
@@ -4237,9 +4255,24 @@ mod tests {
         }
     }
 
-    /// C-220 acceptance: the pane vocabulary is content and structure only. This test is the pin —
-    /// widening `PaneSpec` or `PaneData` with anything style-bearing fails here, so C-222's trust
+    /// C-220 acceptance: the pane vocabulary is content and structure only, so C-222's trust
     /// property cannot be relaxed by accident in a later story.
+    ///
+    /// **The two halves of this test are not equally strong, and C-222 should not over-trust the
+    /// second one.**
+    ///
+    /// 1. The top-level assertion on `PaneSpec` is **exact-set**: the wire form must have precisely
+    ///    the six documented keys. This half is a real guarantee — any added field fails it, whatever
+    ///    it is called.
+    /// 2. The recursive walk over `PaneData` is a **denylist** of whole key names ([`STYLE_BEARING`]).
+    ///    It catches accidental widening, not determined widening: a style-bearing payload field
+    ///    named `tint`, `emphasis`, `indent`, `order` or `column_width` would pass, as would any
+    ///    `#[serde(skip)]` field, since this inspects the serialized form only.
+    ///
+    /// An exact-set assertion over the nested variants was considered and rejected: it fights
+    /// serde's tagging shapes for little gain, given that the payload types are defined in this
+    /// file and reviewed with it. If a future story lets a pane payload carry externally-authored
+    /// fields, that trade changes and this half needs to become exact too.
     #[test]
     fn pane_spec_carries_no_style_bearing_field() {
         let every_kind = vec![
