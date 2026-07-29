@@ -1,4 +1,4 @@
-//! The write-capable [`WorkBoard`] port and its six generated operations (A-113).
+//! The write-capable [`WorkBoard`] port and its seven generated operations (A-113, A-130).
 //!
 //! This is the sibling of [`super::live::LiveDatasource`], and deliberately the same shape: a
 //! backend declares a schema plus its external authority, the contract is snapshotted and validated
@@ -6,7 +6,7 @@
 //! subjects, a per-domain [`ToolGroup`] and an ambient signal, installed atomically on a clone.
 //! Everything a reader already knows about `try_register_live_datasource` transfers.
 //!
-//! What is new is that four of the six operations **write**. That changes two things and nothing
+//! What is new is that five of the seven operations **write**. That changes two things and nothing
 //! else:
 //!
 //! * **Permission subjects stay concrete.** `board.transition` on `PROJ-42` reports
@@ -34,7 +34,9 @@ use flux_core::{Error, Result};
 use flux_datasource::board::{BoardSchema, Item, ItemDraft, State, EDGE_DIAGRAM};
 use flux_datasource::live::{FilterKey, FilterType, Filters, Page, PageRequest, Reference};
 use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
-use flux_runtime::{AuthorityRequirement, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{
+    AuthorityRequirement, DispatchLedger, Tool, ToolContext, ToolRegistry, ToolResult,
+};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -74,12 +76,13 @@ const STATE_FILTER: &str = "state";
 /// URL or connection client must still pass the guards its [`LiveAccess`] declaration names.
 ///
 /// **Every implementation must pass the shared contract suite verbatim**
-/// (`crates/flux-capabilities/tests/board_contract/mod.rs`). In particular the three properties the
+/// (`crates/flux-capabilities/tests/board_contract/mod.rs`). In particular the four properties the
 /// generated operations cannot enforce for you:
 ///
 /// * an illegal edge errors and performs **no write** — the item is byte-identical afterwards;
 /// * the `Failed → Ready` retry edge increments [`Item::attempts`], and no other edge touches it;
-/// * `claim` is idempotent for the same assignee and conflicts for a different one.
+/// * `claim` is idempotent for the same assignee and conflicts for a different one;
+/// * a recorded dispatch is **durable** — `runner` and `task_id` survive a fresh read.
 #[async_trait]
 pub trait WorkBoard: Send + Sync {
     /// Model-facing filter contract and page bounds.
@@ -114,6 +117,28 @@ pub trait WorkBoard: Send + Sync {
     /// Take ownership of an item. Idempotent for the current holder; a conflict for anyone else.
     async fn claim(&self, ctx: &ToolContext, id: &str, assignee: &str) -> Result<Item>;
 
+    /// Record that `id` was dispatched to a worker: bind it to the worker's address (`runner`) and
+    /// the worker-minted handle (`task_id`). This is the write that makes the board a **run
+    /// registry** — see `docs/designs/fleet-coordinator.md` §5 — and without it a restarted
+    /// coordinator can re-derive an item's *state* but never the run executing it.
+    ///
+    /// Three obligations, all pinned by the contract suite:
+    ///
+    /// * **Durable, not returned-only.** A subsequent [`get`](WorkBoard::get) by an unrelated
+    ///   reader must see both fields.
+    /// * **Replacing, not appending.** A retried item is dispatched again; a stale `task_id` would
+    ///   send the sweep after a run that no longer exists.
+    /// * **Not a state change.** It writes those two fields and nothing else — no edge, no
+    ///   `attempts`, no assignee. [`transition`](WorkBoard::transition) stays the single entry
+    ///   point into the state machine, because a second one could not be edge-checked.
+    async fn record_dispatch(
+        &self,
+        ctx: &ToolContext,
+        id: &str,
+        runner: &str,
+        task_id: &str,
+    ) -> Result<Item>;
+
     /// Append a note to an item. An absent id is an error.
     async fn comment(&self, ctx: &ToolContext, id: &str, text: &str) -> Result<()>;
 }
@@ -125,14 +150,22 @@ pub trait WorkBoard: Send + Sync {
 /// [`ambient_signal`](Self::ambient_signal) whenever the configured backend is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkBoardSurface {
-    /// Per-domain group containing exactly the six generated operations.
+    /// Per-domain group containing exactly the seven generated operations.
     pub group: ToolGroup,
     /// Ambient project signal emitted because this board is configured.
     pub ambient_signal: String,
 }
 
-/// The six operation suffixes a board generates, in catalog order.
-const OPERATIONS: [&str; 6] = ["list", "get", "create", "transition", "claim", "comment"];
+/// The seven operation suffixes a board generates, in catalog order.
+const OPERATIONS: [&str; 7] = [
+    "list",
+    "get",
+    "create",
+    "transition",
+    "claim",
+    "comment",
+    "record_dispatch",
+];
 
 /// Build the uniform `<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment`
 /// operations for one board backend.
@@ -164,9 +197,9 @@ pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec
         .collect())
 }
 
-/// Atomically install exactly the six operations for one board domain.
+/// Atomically install exactly the seven operations for one board domain.
 ///
-/// All six share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on a
+/// All seven share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on a
 /// clone, so a collision or an invalid declaration leaves the caller's registry unchanged — there
 /// is no state in which a board is half-registered and three of its writes are reachable.
 pub fn try_register_work_board(
@@ -226,21 +259,29 @@ struct BoardProjection {
     backend: Arc<dyn WorkBoard>,
 }
 
+/// The subject one item occupies: `<domain>/item/<id>`.
+///
+/// The single spelling of that shape, so the generated operations and [`BoardLedger`] — which gates
+/// the *same* write from `fleet.dispatch` — cannot drift into naming the same item two ways. A
+/// blank id collapses to [`UNRESOLVED_ID`] rather than to something a wildcard could widen.
+fn item_subject(domain: &str, id: &str) -> String {
+    let id = match id.trim() {
+        "" => UNRESOLVED_ID,
+        id => id,
+    };
+    format!("{domain}/{ENTITY}/{id}")
+}
+
 impl BoardProjection {
     /// The subject one invocation touches. Never `*`, never empty — see [`UNRESOLVED_ID`].
     fn subject(&self, kind: OpKind, params: &Value) -> String {
         match kind {
             OpKind::List => format!("{}/{ENTITY}", self.domain),
             OpKind::Create => format!("{}/{ENTITY}/{NEW_ID}", self.domain),
-            _ => {
-                let id = params
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or(UNRESOLVED_ID);
-                format!("{}/{ENTITY}/{id}", self.domain)
-            }
+            _ => item_subject(
+                &self.domain,
+                params.get("id").and_then(Value::as_str).unwrap_or_default(),
+            ),
         }
     }
 
@@ -263,7 +304,7 @@ impl BoardProjection {
 // Operations
 // ---------------------------------------------------------------------------
 
-/// Which of the six an instance is. One `impl Tool` covers all of them because they differ only in
+/// Which of the seven an instance is. One `impl Tool` covers all of them because they differ only in
 /// their input contract and their one backend call — the subject, authority and spec derivation are
 /// shared, which is the whole point of generating them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +315,7 @@ enum OpKind {
     Transition,
     Claim,
     Comment,
+    RecordDispatch,
 }
 
 impl OpKind {
@@ -285,11 +327,12 @@ impl OpKind {
             "transition" => Self::Transition,
             "claim" => Self::Claim,
             "comment" => Self::Comment,
+            "record_dispatch" => Self::RecordDispatch,
             other => unreachable!("undeclared board operation `{other}`"),
         }
     }
 
-    /// Whether this operation mutates the board. The four that do carry `Effect::Write`, a
+    /// Whether this operation mutates the board. The five that do carry `Effect::Write`, a
     /// `datasource_write` requirement, and a non-`Low` risk tier.
     fn writes(&self) -> bool {
         !matches!(self, Self::List | Self::Get)
@@ -391,6 +434,15 @@ impl Tool for BoardOp {
                 backend.comment(ctx, id, text).await?;
                 ToolResult::ok(format!("commented on {id}"))
             }
+            OpKind::RecordDispatch => {
+                let input: RecordDispatchInput = parse(op, params)?;
+                let id = require(op, "id", &input.id)?;
+                let runner = require(op, "runner", &input.runner)?;
+                let task_id = require(op, "task_id", &input.task_id)?;
+                ToolResult::ok(render_full(
+                    &backend.record_dispatch(ctx, id, runner, task_id).await?,
+                ))
+            }
         })
     }
 }
@@ -462,6 +514,67 @@ struct CommentInput {
     id: String,
     #[serde(default)]
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordDispatchInput {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    runner: String,
+    #[serde(default)]
+    task_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// The dispatch ledger
+// ---------------------------------------------------------------------------
+
+/// One registered board, viewed as the [`DispatchLedger`] that `fleet.dispatch` writes to (A-130).
+///
+/// `fleet.dispatch` lives in `flux-orchestrate` (L3) and this port lives here (L5), so the caller
+/// can never name [`WorkBoard`] directly. [`DispatchLedger`] is the L2 seam both sides already see;
+/// this is the adapter that fills it, and it is deliberately the *whole* adapter — a fleet op holds
+/// one of these and nothing else about the board.
+///
+/// Wiring one to a `fleet.dispatch` is what turns the write-back from advice into a contract: an
+/// op with a ledger refuses to leave a dispatched run unrecorded.
+pub struct BoardLedger {
+    domain: String,
+    board: Arc<dyn WorkBoard>,
+}
+
+impl BoardLedger {
+    /// View `board`, registered under `domain`, as a dispatch ledger. `domain` must be the same one
+    /// passed to [`try_register_work_board`] — it is what makes the subject this ledger reports
+    /// match the subject the generated `<domain>.record_dispatch` reports for the same item.
+    pub fn new(domain: impl Into<String>, board: Arc<dyn WorkBoard>) -> Self {
+        Self {
+            domain: domain.into(),
+            board,
+        }
+    }
+}
+
+#[async_trait]
+impl DispatchLedger for BoardLedger {
+    fn subject(&self, item: &str) -> String {
+        item_subject(&self.domain, item)
+    }
+
+    async fn record_dispatch(
+        &self,
+        ctx: &ToolContext,
+        item: &str,
+        runner: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        self.board
+            .record_dispatch(ctx, item, runner, task_id)
+            .await
+            .map(|_| ())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,15 +720,39 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
                 &["id", "text"],
             ),
         ),
+        OpKind::RecordDispatch => (
+            format!(
+                "Bind a `{domain}` item to the worker running it, so a restarted coordinator can \
+                 find the run again. Records the worker address and its task id; does not move the \
+                 item's state."
+            ),
+            object(
+                json!({
+                    "id": {"type": "string", "description": "Stable item id"},
+                    "runner": {
+                        "type": "string",
+                        "description": "Address of the worker executing it, e.g. its A2A endpoint"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Handle the worker minted for the run, from fleet.dispatch"
+                    }
+                }),
+                &["id", "runner", "task_id"],
+            ),
+        ),
     };
 
     let spec = ToolSpec::read_only(name, description, schema);
     let mut spec = if kind.writes() {
         // C-191's coherence invariants: a `Write` may keep neither the `Risk::Low` tier nor the
-        // `Idempotent` claim. `claim` is the one that is genuinely safe to repeat — for its current
-        // holder — which is exactly what `Conditional` is for.
+        // `Idempotent` claim. Two are genuinely safe to repeat under a stated condition, which is
+        // exactly what `Conditional` is for: `claim` for its current holder, and `record_dispatch`
+        // for the same `(runner, task_id)` — replaying it rewrites the same two fields with the
+        // same values. Neither may be `Idempotent`, which would license the op cache to skip the
+        // call entirely and silently drop the write.
         let mut spec = spec.with_risk(Risk::Medium);
-        spec.idempotency = if kind == OpKind::Claim {
+        spec.idempotency = if matches!(kind, OpKind::Claim | OpKind::RecordDispatch) {
             Idempotency::Conditional
         } else {
             Idempotency::NonIdempotent

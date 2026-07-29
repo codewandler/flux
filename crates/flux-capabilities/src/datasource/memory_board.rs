@@ -214,6 +214,24 @@ impl WorkBoard for MemoryBoard {
         Ok(item.clone())
     }
 
+    async fn record_dispatch(
+        &self,
+        _ctx: &ToolContext,
+        id: &str,
+        runner: &str,
+        task_id: &str,
+    ) -> Result<Item> {
+        let mut entries = self.locked();
+        let index = Self::index_of(&entries, id)?;
+        let item = &mut entries[index].item;
+        // Replace rather than append: a retried item is dispatched again, and a stale task id would
+        // send the sweep after a run that no longer exists. Nothing else on the item moves — the
+        // state machine has exactly one entry point and this is not it.
+        item.runner = Some(runner.to_string());
+        item.task_id = Some(task_id.to_string());
+        Ok(item.clone())
+    }
+
     async fn comment(&self, _ctx: &ToolContext, id: &str, text: &str) -> Result<()> {
         let mut entries = self.locked();
         let index = Self::index_of(&entries, id)?;

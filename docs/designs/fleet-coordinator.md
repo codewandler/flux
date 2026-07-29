@@ -86,11 +86,13 @@ agent only ever sees the generated ops.
       async fn transition(&self, ctx: &ToolContext, id: &str, to: State) -> Result<Item>;
       async fn claim(&self, ctx: &ToolContext, id: &str, assignee: &str) -> Result<Item>;
       async fn comment(&self, ctx: &ToolContext, id: &str, text: &str) -> Result<()>;
+      // A-130, and the subject of §5: the write that makes the board a run registry.
+      async fn record_dispatch(&self, ctx: &ToolContext, id: &str, runner: &str, task_id: &str) -> Result<Item>;
   }
   ```
 
   `try_register_work_board(registry, domain, backend)` generates `board.list` / `.get` / `.create` /
-  `.transition` / `.claim` / `.comment`, following `live_datasource_tools` /
+  `.transition` / `.claim` / `.comment` / `.record_dispatch`, following `live_datasource_tools` /
   `try_register_live_datasource` exactly: snapshot the contract, validate once, register atomically
   on a clone, return a surface carrying the group and the ambient signal.
 
@@ -127,7 +129,7 @@ silently — the contract suite pins every edge above.
 
 ### The safety surface: concrete permission subjects
 
-`LiveDatasource` never had to answer this, and the board must. The four mutating ops need accurate
+`LiveDatasource` never had to answer this, and the board must. The five mutating ops need accurate
 `effects`, `Risk`, `Idempotency` and — critically — **concrete `permission_subjects`**
 (`<domain>/item/<id>`), never `*` and never empty. AGENTS.md:98 is explicit:
 
@@ -200,13 +202,78 @@ Two halves, because they answer different questions:
 ## 5. Run state — dissolved, not built
 
 There is **no second store**. `fleet.dispatch` writes the returned `task_id` and the worker's
-`runner` URL back into the board `Item`, so **the board is the run registry**. Monitoring is the
+`runner` URL back into the board `Item` — via `<domain>.record_dispatch`, the op the subsection below
+specifies — so **the board is the run registry**. Monitoring is the
 `sweep` journey on a `schedule` channel: for each `Claimed`/`InProgress` item, call `fleet.status`
 and `board.transition` accordingly — cron-driven reconciliation, not an in-memory supervisor table.
 
 Crash recovery is then free: restart, sweep, re-derive. Nothing was held in RAM that mattered. This
 is the concrete payoff for §2's typed state machine — reconciliation is only sound if the set of
 legal states is closed and every write went through an edge check.
+
+### The op that performs the write-back (A-130)
+
+The paragraph above was a claim until A-130: `Item` carried `runner` and `task_id` as *fields* that
+no operation could set. The board gains a **seventh operation** rather than an eighth field:
+
+```rust
+async fn record_dispatch(&self, ctx: &ToolContext, id: &str, runner: &str, task_id: &str) -> Result<Item>;
+```
+
+generated as `<domain>.record_dispatch` with the same `<domain>/item/<id>` subject as every other
+mutating op, `Effect::Write`, `Risk::Medium` and `Idempotency::Conditional` — replaying the same
+`(runner, task_id)` rewrites the same two fields with the same values, which is exactly the stated
+condition `Conditional` exists for and is *not* `Idempotent` (that would license the op cache to
+skip the call and silently drop the write).
+
+**Why a distinct op and not `claim(id, assignee, runner, task_id)`.** Atomicity with the claim is
+the obvious argument for folding it in, and it does not survive contact with the ordering: the
+`task_id` does not exist until the worker answers the send, so the record is necessarily written
+*after* `claim` either way. Extending `claim` would therefore buy atomicity of `(assignee, runner,
+task_id)` with the state change while leaving the only window that actually matters — between the
+worker accepting the run and the board recording its id — exactly as wide. It would also make
+`claim`'s `Conditional` idempotency incoherent: "same assignee, different `task_id`" has no answer.
+Keeping `transition` as the single edge-checked entry into the state machine is the same argument
+from the other side, which is why `record_dispatch` writes those two fields and moves nothing else —
+no edge, no `attempts`, no assignee.
+
+**Every backend owes it.** `record_dispatch` is a *required* `WorkBoard` method, not a defaulted one:
+a board that silently declines to record is indistinguishable from a working one until a coordinator
+restarts and recovers nothing, and the whole point of §5 is that this cannot happen. The shared
+contract suite pins the property (durable across a fresh read, replacing on a redispatch, moves no
+state), so a new backend either answers the question or fails the suite. `MemoryBoard` is the
+reference implementation; [A-114](../stories/A-114-markdown-board.md)'s `MarkdownBoard` and
+[A-118](../stories/A-118-gitlab-board.md)'s `GitlabBoard` each owe one.
+
+**The window that is left, and what happens in it.** `fleet.dispatch` takes an optional `item` and,
+wired to a ledger, records the dispatch before reporting success. Wiring is the assembler's job —
+whoever registers the fleet ops constructs `FleetDispatchTool::with_ledger(BoardLedger::new(domain,
+board))`; an op left un-wired still dispatches but refuses any call that names an `item`. A task
+whose id was lost is
+strictly worse than one never dispatched — nothing will ever sweep it and it holds a worker
+indefinitely — so the two failure paths are decided rather than left implicit:
+
+- **`item` named, no ledger wired** — refused *before* any network call. Dispatching first and
+  discovering afterwards that the run cannot be recorded is precisely how an orphan is made.
+- **Accepted, then the board write failed** — the op fires a compensating `tasks/cancel` on the run
+  it cannot track, so nothing is left executing. If even that fails it reports `ORPHANED RUN` with
+  the task id and a manual `fleet.cancel` recovery line, because at that point a human is the only
+  remaining sweep.
+- **A worker that answers synchronously** returns no task, so there is nothing to record and nothing
+  to sweep; the call reports `"recorded": false` rather than storing a dead id that would send the
+  next sweep after a run that no longer exists.
+
+**Layering.** `fleet.dispatch` is L3 (`flux-orchestrate`) and `WorkBoard` is L5
+(`flux-capabilities`), so the caller can never name the board. The seam is
+`flux_runtime::DispatchLedger` (L2, beside `Spawner`, which is there for the same reason); the
+adapter is `flux_capabilities::BoardLedger`. Both sides derive the item's permission subject from
+one helper, so the fleet op and `<domain>.record_dispatch` cannot name the same item two ways.
+
+**Deliberately unspecified:** recording a dispatch against a `Done` item is *not* refused. Refusing
+on terminal states is scheduling policy this epic has not settled — whether a late record is a bug
+or a benign echo of a race with the sweep depends on the sweep's own semantics — so the port stays
+minimal (the id must exist; the write is a replace) and the question is left open rather than
+answered by accident in one backend.
 
 ## 6. Per-delivery bus isolation — the load-bearing blocker
 
@@ -278,6 +345,7 @@ policy-gated tools. The reference Program ships with an **offline** end-to-end j
 | [A-116](../stories/A-116-a2a-outbound-dispatch.md) | `A2aClient::cancel_task` + `A2aSpawner` + `fleet.dispatch`/`.status`/`.cancel` | |
 | [A-117](../stories/A-117-coordinator-program.md) | The `coordinator.flux` reference Program + offline end-to-end journey test | |
 | [A-118](../stories/A-118-gitlab-board.md) | `GitlabBoard` — proves the port generalizes | deferrable |
+| [A-130](../stories/A-130-board-run-state-writeback.md) | Board write-back of `runner` + `task_id` — the op §5 assumed | filed from A-113/A-116 handoffs |
 
 Order: **A-112 first** (nothing works concurrently without it), then A-113 → A-114 / A-115 / A-116
 in parallel → A-117 → A-118.
