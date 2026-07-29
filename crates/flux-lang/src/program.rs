@@ -242,6 +242,46 @@ impl Program {
             .map(|j| &j.flow)
             .or_else(|| self.flows.iter().find(|f| f.name.as_deref() == Some(name)))
     }
+
+    /// **The** rule for what a `trigger` may dispatch to, stated once at L0 so every gate that
+    /// checks it agrees by construction. Two arms, mirroring how a trigger is authored (and how
+    /// [`crate::parse::parse_program`] lowers it):
+    ///
+    /// - **agent-bound** (`agent = "..."`) — the agent drives the turn, so `run` is not consulted at
+    ///   all and legitimately stays empty. The named agent must be declared.
+    /// - **flow-bound** (`run = "..."`) — `run` must name a declared journey or top-level flow.
+    ///
+    /// Returns the operator-facing diagnostic on the first offending trigger.
+    ///
+    /// Callers, which **must not** re-implement this: `flux_app::Engine::validate` (the runtime
+    /// gate) and `flux-eval`'s `examples/` sweep (`crates/flux-eval/tests/examples_validate.rs`).
+    /// Those two drifted apart once — the sweep asserted `flow_named(&t.run).is_some()`
+    /// unconditionally and so rejected the agent-bound shape the runtime accepts, which made an
+    /// agent-triggered Program unshippable as an example (C-232). Hence one function, not a rule
+    /// plus a copy of it.
+    pub fn validate_trigger_targets(&self) -> std::result::Result<(), String> {
+        for trigger in &self.triggers {
+            match trigger.agent.as_deref() {
+                Some(agent) => {
+                    if !self.agents.iter().any(|decl| decl.name == agent) {
+                        return Err(format!(
+                            "trigger `{}` names unknown agent `{agent}`",
+                            trigger.name
+                        ));
+                    }
+                }
+                None => {
+                    if self.flow_named(&trigger.run).is_none() {
+                        return Err(format!(
+                            "trigger `{}` names unknown journey/flow `{}`",
+                            trigger.name, trigger.run
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +385,67 @@ journey handle
         assert_eq!(p.channels[0].kind, "cli");
         assert_eq!(p.triggers[0].on, "user_input");
         assert!(p.flow_named("handle").is_some(), "journey resolves by name");
+    }
+
+    /// C-232: an **agent-bound** trigger parses with an empty `run` and is valid — `run` is simply
+    /// not the target. Both the runtime gate and the `examples/` sweep read this one function, so
+    /// neither can reject the shape on its own.
+    #[test]
+    fn an_agent_bound_trigger_target_is_valid_with_an_empty_run() {
+        let src = "\
+agent coordinator
+  model \"mock\"
+
+trigger fanout
+  on \"a2a_request\"
+  agent \"coordinator\"
+";
+        let Module::Program(program) = Module::parse_str(src).unwrap() else {
+            panic!("agent declarations make this a program")
+        };
+        assert_eq!(program.triggers[0].run, "", "`run` stays empty by design");
+        assert_eq!(program.validate_trigger_targets(), Ok(()));
+    }
+
+    #[test]
+    fn an_agent_bound_trigger_naming_an_undeclared_agent_is_rejected() {
+        let src = "\
+agent coordinator
+  model \"mock\"
+
+trigger fanout
+  on \"a2a_request\"
+  agent \"ghost\"
+";
+        let Module::Program(program) = Module::parse_str(src).unwrap() else {
+            panic!("agent declarations make this a program")
+        };
+        assert_eq!(
+            program.validate_trigger_targets(),
+            Err("trigger `fanout` names unknown agent `ghost`".to_string())
+        );
+    }
+
+    /// The other direction: sharing the rule must not make any caller *looser*. A flow-bound
+    /// trigger whose `run` names nothing declared is still an error.
+    #[test]
+    fn a_flow_bound_trigger_naming_no_declared_flow_is_rejected() {
+        let src = "\
+trigger dangling
+  on \"user_input\"
+  run nope
+
+journey handle
+  flow
+    return null
+";
+        let Module::Program(program) = Module::parse_str(src).unwrap() else {
+            panic!("module declarations make this a program")
+        };
+        assert_eq!(
+            program.validate_trigger_targets(),
+            Err("trigger `dangling` names unknown journey/flow `nope`".to_string())
+        );
     }
 
     #[test]
