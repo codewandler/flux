@@ -29,6 +29,24 @@ All notable changes to this project are documented in this file. The format is b
   boundary walk-back into the type. Additive only — no call site moves yet, and
   `record_message`/`record_compaction` are untouched; the migration is A-100…A-102.
 
+### Fixed
+
+- **A version tag can no longer sit silently without a downloadable GitHub Release (C-47/N-001).**
+  `scripts/verify-github-release.sh` runs inside the Release workflow and guards only the one tag
+  being cut, so a tag whose workflow died *before* that step never reached it — which is how
+  `/releases/latest` came to serve a stale binary without CI noticing. The new
+  `scripts/check-release-tags.sh` audits the whole tag/release fleet on every push to `main` (CI job
+  `release-tags`) and additionally pins the invariant nothing checked at all: `/releases/latest`
+  must be the newest released version. `v0.9.3`, whose builds all succeeded and whose release
+  creation alone 403'd, is backfilled with its canonical 16 assets. `v0.11.1`, `v0.12.0` and
+  `v0.17.0` never produced a complete asset set and are recorded as a reasoned allowlist — each was
+  superseded within hours by a patch that did publish.
+- **Backfilling a GitHub Release no longer hijacks `/releases/latest`.** GitHub ranks "latest" by
+  `published_at`, not by tag date or semver, so publishing an old tag's Release makes that old
+  version "latest" — reintroducing the exact bug the backfill repairs. The runbook in
+  `crates/flux-sdk/PUBLISHING.md` now passes `--latest=false` and the CI audit above fails if the
+  pointer ever drifts.
+
 ## [0.33.0] - 2026-07-29
 
 ### Added

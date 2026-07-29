@@ -2,7 +2,7 @@
 id: C-47
 title: Release-publication reliability — a tag must yield a downloadable GitHub Release
 pillar: Core
-status: blocked
+status: done
 priority:
 epic:
 design:
@@ -29,11 +29,51 @@ matters on both the binary and crate paths.
       reliably yields a Release with assets.
 - [x] A post-tag check (CI step or a `scripts/` verification) confirms a Release object exists for
       the tag and fails the pipeline if it does not — no silent "tag but no Release".
-- [ ] Backfill the missing Release object(s) for the affected recent tag(s) so `/releases/latest`
+- [x] Backfill the missing Release object(s) for the affected recent tag(s) so `/releases/latest`
       matches the newest shipped version.
 - [x] Documented in the release runbook alongside the crates.io publish flow.
 
 ## Progress
+- 2026-07-29 **DONE.** Audited the whole fleet: 5 tags had no Release. Classified each from its
+  workflow run rather than assuming they shared N-001's cause — and they did not:
+  | tag | why no Release | artifacts | disposition |
+  |---|---|---|---|
+  | `v0.9.3` | `host` job HTTP 403 — **the true N-001** | all 5 platforms + global ✓ | **backfilled** |
+  | `v0.11.1` | `plan` rejected the hand-edited `release.yml` as an out-of-date generated workflow | none | unshippable; `v0.11.2` released 16 assets |
+  | `v0.12.0` | Windows build failed to compile `codewandler-flux-web`, no `flux.exe` | 6 partial | unshippable; `v0.12.1` released 16 assets |
+  | `v0.17.0` | cargo-dist could not find bin `flux_sdk_plugin_fixture`; all 5 platforms failed identically (a config defect at that commit, not a flake — re-running fails the same way) | none | unshippable; `v0.17.1` released 16 assets |
+  | `v0.2.7-9a02b56cc73a` | pre-0.3 dev tag, never a shipped version | — | out of scope (not `vX.Y.Z`) |
+  Only `v0.9.3` was backfillable: the other three never produced a complete asset set, and a Release
+  with partial assets advertises downloads that do not exist — strictly worse than no Release, and
+  the same failure this story forbids. They are now recorded as a reasoned allowlist in
+  `scripts/check-release-tags.sh` rather than as folklore.
+- 2026-07-29 `v0.9.3` backfilled from run `28933549554`: all 6 archive checksums re-verified against
+  their `.sha256` sidecars, the extracted linux binary confirmed `flux 0.9.3`, and the exact
+  cargo-dist title/body recovered from `dist-manifest.json`'s `announcement_*` fields rather than
+  hand-written. Published with the canonical 16 assets; `scripts/verify-github-release.sh v0.9.3`
+  passes.
+- 2026-07-29 **NEW DEFECT FOUND, BY CAUSING IT.** The backfill immediately flipped
+  `/releases/latest` from `v0.33.0` to `v0.9.3` — i.e. performing this story's own documented
+  runbook *reintroduced N-001*. Root cause: GitHub ranks `/releases/latest` by **`published_at`**,
+  not by tag date or semver. It is invisible in `created_at`, which harmlessly inherits the tag date
+  (this is why the earlier `v0.11.0`/`v0.12.1` backfills *looked* safe and misled the prediction
+  that a backfill could not disturb `latest`). Repaired within the same session with
+  `gh release edit v0.33.0 --latest`; `/releases/latest` is `v0.33.0` again.
+  Neither `verify-github-release.sh` nor `release.yml` checked the latest pointer at all — the one
+  invariant N-001 is actually about. Fixed structurally:
+  - `scripts/check-release-tags.sh` (new) audits the **whole** tag/release fleet, not just the tag
+    being cut, and asserts `/releases/latest` == the newest released version. Carries `--self-test`
+    per the repo idiom, and exit 2 = "GitHub state unobtainable" is a logged skip so an outage does
+    not turn `main` red.
+  - Wired into `ci.yml` as the `release-tags` job on every push to `main`. This is the half
+    `verify-github-release.sh` structurally cannot cover: a tag whose workflow dies *before* the
+    verify step never runs the verify step, which is exactly how N-001 survived unnoticed until an
+    external tester reported it.
+  - `crates/flux-sdk/PUBLISHING.md`: the backfill recipe now passes `--latest=false`, warns about
+    the `published_at` ranking, and tells the maintainer to confirm the run actually built before
+    backfilling at all.
+  Self-test proven non-vacuous by mutation: lexical sort instead of `sort -V` (the case that
+  matters, `v0.9.3` vs `v0.33.0`) and dropping the allowlist skip both fail it.
 - 2026-07-09 ROOT CAUSE CONFIRMED on v0.12.0/v0.12.1: the Release workflow's host step fails with
   `HTTP 403: Resource not accessible by personal access token` on POST /releases — the scoped
   RELEASE_TOKEN (cf1612f) has lost/lacks Contents:write (expired or mis-scoped fine-grained PAT).

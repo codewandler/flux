@@ -141,6 +141,35 @@ jobs:
           fi
           exit "$status"
 
+  release-tags:
+    name: every version tag has a Release and /releases/latest is newest
+    runs-on: ubuntu-latest
+    # C-47/N-001: `scripts/verify-github-release.sh` runs inside the Release workflow and guards the
+    # ONE tag being cut — so a tag whose workflow died before that step never reaches it, and the
+    # drift then sits in history unnoticed (N-001 was found by an external tester, not by CI). This
+    # job audits the whole fleet on every push to main instead, and additionally pins the invariant
+    # nothing checked at all: `/releases/latest` is ranked by `published_at`, so publishing an old
+    # tag's Release repoints it at that old version. Backfilling v0.9.3 on 2026-07-29 did exactly
+    # that to v0.33.0 until it was repaired.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every version tag has a Release, and /releases/latest is the newest one
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Live GitHub state, not this tree's — see the script header for why exit 2 (data
+          # unobtainable, e.g. a GitHub outage) is a logged skip rather than a failure.
+          set +e
+          ./scripts/check-release-tags.sh --self-test && ./scripts/check-release-tags.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::release-tag audit skipped — GitHub release state unobtainable"
+            exit 0
+          fi
+          exit "$status"
+
   plugin-compat:
     name: released plugin binaries vs this host
     runs-on: ubuntu-latest

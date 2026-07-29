@@ -176,6 +176,14 @@ scripts/publish-crates-io.sh     # same ordered, idempotent loop
 ```
 
 **Backfill a missing binary Release** (tag exists, GitHub Release does not):
+
+> ⚠️ **Pass `--latest=false`.** GitHub ranks `/releases/latest` by **`published_at`**, not by the tag
+> date or by semver — so publishing an old tag's Release *now* makes that old version "latest",
+> which is precisely the N-001 bug this runbook exists to repair. Backfilling `v0.9.3` on 2026-07-29
+> flipped `/releases/latest` from `v0.33.0` to `v0.9.3` until it was repaired with
+> `gh release edit v0.33.0 --latest`. Note this is invisible in the release's `created_at`, which
+> harmlessly inherits the tag date and so looks correct.
+
 ```sh
 run_id=<failed Release workflow run id>
 tag=vX.Y.Z
@@ -183,10 +191,30 @@ rm -rf /tmp/flux-release-backfill
 gh run download "$run_id" --repo codewandler/flux --pattern 'artifacts-*' --dir /tmp/flux-release-backfill
 find /tmp/flux-release-backfill -name '*-dist-manifest.json' -delete
 gh release create "$tag" --repo codewandler/flux --target "$(git rev-list -n1 "$tag")" \
+  --latest=false \
   --title "${tag#v}" --notes "Backfilled release for $tag."
 find /tmp/flux-release-backfill -type f -print0 |
   xargs -0 gh release upload "$tag" --repo codewandler/flux
 scripts/verify-github-release.sh --repo codewandler/flux "$tag"
+scripts/check-release-tags.sh --repo codewandler/flux   # the latest pointer is still the newest version
+```
+
+First check the run actually *built* — only backfill a tag whose platform jobs all succeeded and
+whose `host` job was the step that failed. A run that died in `plan` or in the build matrix never
+produced a complete asset set, and a Release with partial assets advertises downloads that do not
+exist. Those tags belong in `ALLOWED_WITHOUT_RELEASE` in `scripts/check-release-tags.sh` instead:
+
+```sh
+gh run view "$run_id" --repo codewandler/flux --json jobs \
+  --jq '.jobs[] | select(.conclusion != "success") | "\(.name) -> \(.conclusion)"'
+```
+
+**Audit the whole fleet** (every `vX.Y.Z` tag has a Release; `/releases/latest` is the newest one).
+This runs in CI on every push to `main`, and is the standing guard against N-001 — `verify-github-release.sh`
+only ever inspects the single tag being cut, so it cannot see a tag whose workflow died before
+reaching it:
+```sh
+scripts/check-release-tags.sh
 ```
 
 - **Irreversible.** A published `name@version` can never be reused — only yanked.
