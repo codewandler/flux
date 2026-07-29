@@ -2,7 +2,7 @@
 id: C-188
 title: "Dependency advisory scanning in CI — cargo-audit + cargo-deny over the 38-crate tree"
 pillar: Core
-status: in-progress
+status: done
 priority: 5
 epic: security-assurance
 design: docs/designs/security-assurance.md

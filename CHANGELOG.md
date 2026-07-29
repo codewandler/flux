@@ -8,6 +8,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Security
 
+- **CI now carries a standing dependency-advisory and supply-chain signal (C-188).** The build ran
+  locked fetches, fmt, clippy, tests and layering checks — but nothing that answered "does any crate
+  in the ~38-crate transitive tree carry a known advisory right now?". A new `security-audit.yml`
+  workflow runs `cargo-deny` (advisories + a permissive license allow-list + a source pin that every
+  crate resolves to crates.io or one declared first-party git repo) and `cargo-audit` (the RustSec
+  scanner as an independent second opinion), over both the root and nested `plugins/` workspaces, on
+  every push/PR and weekly on a schedule so a newly disclosed advisory against unchanged code is
+  still caught. A committed `deny.toml` sets the policy; the only ignores are four *informational*
+  (unmaintained/unsound, zero vulnerabilities) advisories, each with an inline ID, why-not-exploitable,
+  and what-would-clear-it — a real vulnerability of any class fails the build. (`unsound` is raised
+  from the default `workspace` scope to `all` so a transitive unsound advisory can't slip through.)
 - **The `--serve` daemon now bounds request bodies and request time (C-189).** `SECURITY.md` lists
   denial of service in the `--serve` daemon as in scope, yet every mounted router accepted an
   unbounded request body and held a connection for as long as a handler ran. Every router now carries
