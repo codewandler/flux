@@ -17,6 +17,12 @@
 
 ### Fixed
 
+- **Project guidance files in subfolders no longer load.** `.flux/context.d/` is documented as a flat
+  folder — the whole point being that one look tells you everything that can reach the agent. It was
+  in fact being read recursively, so a file tucked in a subfolder quietly loaded too. It now behaves
+  as documented. If you had guidance nested in a subfolder and want to keep it, move the file up into
+  `.flux/context.d/` itself.
+
 - **Kubernetes operations now work when your kubeconfig lives somewhere other than the default
   location.** If you point `KUBECONFIG` at a custom path, flux used to notice it, offer you the full
   set of Kubernetes operations — and then fail every one of them, because the value never reached

@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Guidance-fragment discovery is flat, as its contract always claimed (C-206).**
+  `crates/flux-runtime/src/context.rs` documents `.flux/context.d` as a flat directory — the stated
+  point being that one `ls` enumerates everything that can reach the system prompt, without a tree
+  walk or a mention syntax. The implementation called `System::walk_files`, which recurses, and
+  filtered the result only on `.md`, so a fragment at `.flux/context.d/sub/deep/x.md` did load into
+  the system prompt from a path both the code's own contract and the public documentation said was
+  never scanned. Discovery now reads the top level only, constrained at the `context.rs` call site
+  rather than in `walk_files`, whose recursion is correct and is relied on by `glob`/`grep`. The
+  directory is still resolved through the project-pinned workspace, and because `DirEntry::file_type`
+  does not follow symlinks, the single file-type check drops subdirectories and symlinks together —
+  preserving the symlink-escape guard `walk_files` provided for free. `FRAGMENT_SCAN_CAP` and the
+  tolerated absent directory are each pinned by a test.
+
 - **A kubeconfig at a non-default path now reaches `kubectl` (C-207).** Two halves of the same
   feature disagreed about where the kubeconfig comes from. Surfacing read `KUBECONFIG` from the host
   environment to decide whether the `endpoint` discovery group — and with it the kubernetes plugin's

@@ -2,7 +2,7 @@
 id: C-206
 title: "Guidance-fragment discovery walks subdirectories while the contract promises a flat directory"
 pillar: Core
-status: in-progress
+status: done
 priority: 17
 epic:
 design:
