@@ -362,6 +362,10 @@ mod tests {
         assert_eq!(code(&missing[0]), "unknown-operation");
     }
 
+    /// The fixture's `summarize` declares `risk "medium"` because its body calls `ai.reason`, a
+    /// billable model call declared `Risk::Medium` since C-208 — a composite may not understate the
+    /// risk of what it invokes. This test is about forward composite resolution and error ranging,
+    /// so everything except the one deliberate unknown op has to be clean.
     #[test]
     fn module_resolves_forward_composite_and_ranges_later_flow_error() {
         let src = r#"flow first
@@ -370,7 +374,7 @@ mod tests {
 
 op summarize(text: String) -> String
   description "Summarize text"
-  risk "low"
+  risk "medium"
   idempotency "non_idempotent"
   effects [network]
   expose false

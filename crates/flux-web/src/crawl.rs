@@ -26,8 +26,8 @@ use flux_core::{Error, Result};
 use flux_datasource::{Record, Source};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{
-    AccessKind, Effect, Intent, IntentBehavior, IntentCertainty, IntentRole, IntentSet,
-    IntentTarget, ToolSpec,
+    AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
+    IntentSet, IntentTarget, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
 
@@ -151,7 +151,7 @@ impl Tool for WebCrawlTool {
                  (a durable datasource write).",
             );
         }
-        ToolSpec::read_only(
+        let mut spec = ToolSpec::read_only(
             "web.crawl",
             description,
             json!({
@@ -177,8 +177,21 @@ impl Tool for WebCrawlTool {
                 "required": ["url"]
             }),
         )
-        .with_effects(vec![Effect::Network])
-        .with_access(vec![AccessKind::Network])
+        // `Read` alongside the carrier (C-208): a crawl is a bounded read of a site, and `Network`
+        // alone declares an unread egress. Same reasoning as `web.fetch`; every hop still passes
+        // through the `web` egress scope.
+        .with_effects(vec![Effect::Read, Effect::Network])
+        .with_access(vec![AccessKind::Network]);
+        // `Conditional`, not the `Idempotent` `read_only()` supplies. A crawl fetches up to 50
+        // pages and, with a record sink wired, upserts a `web.page` record per HTML response;
+        // `Idempotent` is the word that lets the op cache return a stored result *instead of
+        // executing*, which would silently skip all of that. Repeatable, never replayable.
+        //
+        // Adding `Read` above took this spec out of `is_consequence_bearing`, so I3 no longer
+        // fires here — the declaration has to stand on its own now that the invariant stopped
+        // watching it.
+        spec.idempotency = Idempotency::Conditional;
+        spec
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
@@ -622,9 +635,11 @@ mod tests {
             ],
             "the datasource marker must not be interpreted as a network destination"
         );
-        // The host effect stays Network: a `write_db` lowers to Network + the `flow.write_db` policy
-        // action, deliberately NOT a filesystem `workspace.write`.
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // The host effects stay a network *read*: a `write_db` lowers to Network + the
+        // `flow.write_db` policy action, deliberately NOT a filesystem `workspace.write`. Wiring a
+        // record sink must not silently promote the host effect set — the durable contribution is
+        // carried by the semantic effect and the authority requirement asserted above.
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
 
         // Observed: the declaration matches a real contribution.
         let base = site_server(vec![("/", page("Seed", "SEEDMARKER", &[]))]).await;
@@ -721,8 +736,15 @@ mod tests {
                 .unwrap(),
             vec![AuthorityRequirement::network_fetch("http://example.com/")]
         );
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // `Read` + `Network` — a bounded read of a site, not an unread egress (C-208).
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);
+        assert!(flux_spec::metadata_violations(&t.spec(), &t.semantic_effects()).is_empty());
+        // Pinned explicitly: declaring `Read` above takes the spec out of
+        // `is_consequence_bearing`, so `metadata_violations` no longer checks idempotency here.
+        // A crawl replayed from the op cache would skip up to 50 live fetches and every
+        // `web.page` record they contribute.
+        assert_eq!(t.spec().idempotency, Idempotency::Conditional);
     }
 
     #[tokio::test]

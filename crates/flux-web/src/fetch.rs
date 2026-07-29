@@ -86,7 +86,7 @@ impl Tool for WebFetchTool {
                  durable datasource write).",
             );
         }
-        ToolSpec::read_only(
+        let mut spec = ToolSpec::read_only(
             "web.fetch",
             description,
             json!({
@@ -98,8 +98,23 @@ impl Tool for WebFetchTool {
                 "required": ["url"]
             }),
         )
-        .with_effects(vec![Effect::Network])
-        .with_access(vec![AccessKind::Network])
+        // `Read` is not decorative (C-208): a fetch *is* a read, and `Network` alone describes an
+        // unread egress — a POST. The omission made this op consequence-bearing under
+        // `flux_spec::coherence` while it carried `Risk::Low`. The egress envelope is unchanged:
+        // every request still goes through `guard_url_scoped_pinned` below.
+        .with_effects(vec![Effect::Read, Effect::Network])
+        .with_access(vec![AccessKind::Network]);
+        // `read_only()` also supplied `Idempotent`, and that claim is false independently of the
+        // effect set: `Idempotent` is what licenses the op cache to serve a stored result *instead
+        // of executing*, and with a record sink wired each call upserts a `web.page` record. A
+        // replayed fetch would skip a durable contribution the caller asked for, and skip the live
+        // page. Repeating is safe, replaying is not — which is exactly `Conditional`.
+        //
+        // Adding `Read` above moved this spec out of `is_consequence_bearing`, so I3 no longer
+        // fires on it. That makes fixing it here load-bearing rather than optional: the invariant
+        // stopped watching, so the declaration has to be right on its own.
+        spec.idempotency = Idempotency::Conditional;
+        spec
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
@@ -767,9 +782,11 @@ mod tests {
             ],
             "the datasource marker must not be interpreted as a network destination"
         );
-        // The host effect stays Network: a `write_db` lowers to Network + the `flow.write_db` policy
-        // action, deliberately NOT a filesystem `workspace.write`.
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // The host effects stay a network *read*: a `write_db` lowers to Network + the
+        // `flow.write_db` policy action, deliberately NOT a filesystem `workspace.write`. Wiring a
+        // record sink must not silently promote the host effect set — the durable contribution is
+        // carried by the semantic effect and the authority requirement asserted above.
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
 
         // Observed: the declaration matches a real contribution.
         let base = one_shot(
@@ -868,8 +885,17 @@ mod tests {
                 .unwrap(),
             vec![AuthorityRequirement::network_fetch("http://example.com/p")]
         );
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // `Read` + `Network` — a fetch, not an unread egress (C-208). The pair is what keeps the
+        // op coherent at `Risk::Low`; `Network` alone would declare a POST.
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);
+        assert!(flux_spec::metadata_violations(&t.spec(), &t.semantic_effects()).is_empty());
+        // Pinned explicitly, and this assertion carries more weight than it looks: declaring
+        // `Read` above takes the spec out of `is_consequence_bearing`, so `metadata_violations`
+        // no longer checks idempotency here. This is the only thing standing between
+        // `read_only()`'s inherited `Idempotent` and an op-cache replay that would skip both the
+        // live fetch and the `web.page` record it contributes.
+        assert_eq!(t.spec().idempotency, Idempotency::Conditional);
     }
 
     #[tokio::test]

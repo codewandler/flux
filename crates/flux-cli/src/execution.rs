@@ -980,7 +980,7 @@ pub(super) async fn resolve_agent_loop(
 /// ONLY — never on a worker sub-agent's scoped toolset, so a child can't run eval/git ops or the
 /// model-facing cognition/consult ops.
 #[allow(clippy::too_many_arguments)]
-fn register_tool_packs(
+pub(super) fn register_tool_packs(
     registry: &mut ToolRegistry,
     cog_provider: Option<Box<dyn Provider>>,
     model: &str,

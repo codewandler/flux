@@ -522,7 +522,10 @@ impl Tool for ImproveLogTool {
             input_schema: tool_input_schema::<ImproveLogInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
-            risk: Risk::Low,
+            // `Medium` (C-208). This is C-191's title case verbatim: a mutating op holding the
+            // read-only tier. It appends to a durable audit trail, and `Risk::Low` rendered that
+            // append as "nothing worth a gate" at the approval prompt.
+            risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Filesystem],
             group: None,
@@ -628,7 +631,7 @@ struct GradeInput {
 #[async_trait]
 impl Tool for GradeTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec::read_only(
+        let mut spec = ToolSpec::read_only(
             "grade",
             "Evaluate a pass/fail criterion against the current workspace; returns \"true\" or \
              \"false\". `criterion` is {kind: \"command\"|\"file_content\"|\"all\", …} — the same check \
@@ -638,6 +641,21 @@ impl Tool for GradeTool {
         // A `command` criterion shells out to a checker, so be honest about the process effect.
         .with_effects(vec![Effect::Read, Effect::Process])
         .with_access(vec![AccessKind::Filesystem, AccessKind::Process])
+        // …and equally honest about the tier (C-208). `read_only()` supplies `Risk::Low`, which
+        // survived the effect correction above. Approval was never actually skipped —
+        // `AccessKind::Process` lowers to a `process.exec` requirement whose default grant is
+        // `requires_approval: true`, so a prompt already fired. What `Risk::Low` did do is render
+        // verbatim into the sentence `PlanRisk::summary` shows a human at the plan-approval
+        // prompt: an op that runs a caller-supplied command described as low risk.
+        .with_risk(Risk::Medium);
+        // `Conditional` rather than `NonIdempotent`: re-grading the same criterion IS safe to
+        // repeat — it just must never be served from a stored result, since the workspace it
+        // grades moves underneath it. The op cache also excludes this op on its effect set alone
+        // (it requires every effect to be `Read`, and `Process` is not), so `Idempotent` was an
+        // untrue claim rather than an exploited one — but it was the claim that would license a
+        // replay the moment anything else came to rely on it.
+        spec.idempotency = Idempotency::Conditional;
+        spec
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {

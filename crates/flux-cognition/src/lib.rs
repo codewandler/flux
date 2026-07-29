@@ -14,7 +14,9 @@
 //! faithful named JSON Schema. That exercises P0 and yields planner signatures that read back
 //! (`required`/`properties`) exactly like the built-in tools. A model call is a [`FlowEffect::Model`]
 //! (semantic) that travels over the network, so the lowered host effect is [`Effect::Network`]; the
-//! op declares [`AccessKind::Provider`] and [`Risk::Low`].
+//! op declares [`AccessKind::Provider`] and [`Risk::Medium`] — `Medium` rather than `Low` because a
+//! model call is *billable*, and `Risk::Low` is the tier that would let the adaptive loop spend the
+//! operator's budget during pre-approval evidence gathering (C-208).
 //!
 //! The pack is L3 because it depends on the L1 [`Provider`] abstraction. It is *provider-injected*:
 //! construct [`CognitionPack::new`] with whatever provider/model the host has wired up and call
@@ -180,7 +182,12 @@ impl OpKind {
             inputs,
             output,
             effects,
-            risk: Risk::Low,
+            // `Medium`, not `Low` (C-208). Every op in this pack spends money on a provider call.
+            // `Risk::Low` would put them in the gather path, letting the adaptive loop bill the
+            // operator during exploration, before anything was approved. Deliberately NOT resolved
+            // by pairing `Network` with `Read`: what separates these from `web.fetch` is cost, not
+            // mutation. See docs/designs/security-assurance.md.
+            risk: Risk::Medium,
             // A model call is non-deterministic unless cached, so repeating it is not idempotent.
             idempotency: Idempotency::NonIdempotent,
         }
@@ -295,11 +302,14 @@ impl Tool for CognitionOp {
     fn spec(&self) -> ToolSpec {
         // P0: lower the typed, named OpSpec to a faithful JSON-Schema ToolSpec, then layer on the
         // host facts the envelope gates on — a model call needs provider access (network egress).
+        // The tier is NOT restated here. `OpSpec::lower` already carries `opspec()`'s `risk`, and a
+        // second `.with_risk(…)` at this seam silently shadowed it — the typed contract said one
+        // thing and the registered `ToolSpec` another. That is the exact drift shape C-191/C-208
+        // exist to catch, so the declaration now lives in one place: `OpKind::opspec`.
         self.kind
             .opspec()
             .lower()
             .with_access(vec![AccessKind::Provider])
-            .with_risk(Risk::Low)
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -759,10 +769,28 @@ mod tests {
                 !spec.input_schema["required"].as_array().unwrap().is_empty(),
                 "{name} should have at least one required param"
             );
-            // Host facts the envelope gates on: network egress + provider access, low risk.
+            // Host facts the envelope gates on: network egress + provider access, and — since
+            // C-208 — `Risk::Medium`, because every op here spends money on a provider call and
+            // `Risk::Low` would admit it to the pre-approval gather path.
             assert!(spec.has_effect(Effect::Network), "{name} effect");
             assert!(spec.access.contains(&AccessKind::Provider), "{name} access");
-            assert_eq!(spec.risk, Risk::Low, "{name} risk");
+            assert_eq!(spec.risk, Risk::Medium, "{name} risk");
+            assert!(
+                flux_spec::metadata_violations(&spec, &[]).is_empty(),
+                "{name} must satisfy the coherence invariants"
+            );
+        }
+        // The tier reaches the registered `ToolSpec` from the typed contract, not from a second
+        // declaration at the `Tool::spec` seam. Until C-208 those two disagreed — `opspec()` said
+        // one thing and a trailing `.with_risk(…)` silently overrode it — which is precisely the
+        // drift shape this invariant set exists to catch.
+        for kind in OpKind::ALL {
+            assert_eq!(
+                kind.opspec().risk,
+                reg.get(kind.name()).unwrap().spec().risk,
+                "{} declares its risk in one place",
+                kind.name()
+            );
         }
     }
 

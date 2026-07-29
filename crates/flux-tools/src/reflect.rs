@@ -85,7 +85,12 @@ pub fn try_register_model_stage(
                 input_schema,
                 output_schema: Some(output_schema),
                 effects: vec![Effect::Network],
-                risk: Risk::Low,
+                // `Medium`, not `Low` (C-208). A config-authored stage is a model call the
+                // operator pays for; `Risk::Low` would advertise a billable operation as free at
+                // the approval prompt and admit it to the pre-approval gather path. Not resolved
+                // by adding `Effect::Read` — cost, not mutation, is what sets these apart from a
+                // network fetch. See docs/designs/security-assurance.md.
+                risk: Risk::Medium,
                 idempotency: Idempotency::NonIdempotent,
                 access: vec![AccessKind::Provider],
                 group: None,
@@ -192,14 +197,20 @@ struct DetectIntentOp;
 #[async_trait]
 impl Tool for DetectIntentOp {
     fn spec(&self) -> ToolSpec {
-        adaptive_spec(
+        // `Medium` (C-208): the stage behind this op is a provider call
+        // (`LoopHost::detect_intent` → `flux_flow`'s `detect_intent_stage`, which records model
+        // usage), so it spends money on every invocation. That is the property that keeps it out
+        // of the gather path — see docs/designs/security-assurance.md.
+        let mut spec = adaptive_spec(
             "detect_intent",
             "Detect the current turn's intent and resolve capability signals into a durable IntentSet artifact. Signals narrow visibility only; they grant no authority.",
             flux_spec::empty_schema(),
             "IntentSet",
             vec![Effect::Network],
             vec![AccessKind::Provider],
-        )
+        );
+        spec.risk = Risk::Medium;
+        spec
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -218,14 +229,19 @@ struct ExploreOp;
 #[async_trait]
 impl Tool for ExploreOp {
     fn spec(&self) -> ToolSpec {
-        adaptive_spec(
+        // `Medium` (C-208), for the same reason as `detect_intent`: `LoopHost::explore` drives a
+        // provider-native stage, so each call is billable. It shares the shape of the eight
+        // `Network`-at-`Risk::Low` violations even though it predates the story's own table.
+        let mut spec = adaptive_spec(
             "explore",
             "Continue evidence gathering and native-schema action proposal from a durable exploration state. May return chat, decision, or ActionBatch.",
             flux_spec::tool_input_schema::<ExploreInput>(),
             "ExploreResult",
             vec![Effect::Network],
             vec![AccessKind::Provider],
-        )
+        );
+        spec.risk = Risk::Medium;
+        spec
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
