@@ -11,14 +11,25 @@
 //! stable `<domain>/<entity>` permission subjects and exact datasource plus network/connection
 //! authority through the ordinary runtime envelope.
 //!
+//! [`WorkBoard`] is the **write-capable** sibling of that contract, and follows it exactly:
+//! [`try_register_work_board`] snapshots the schema and [`LiveAccess`], validates once, and installs
+//! generated `<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment`
+//! operations atomically on a clone. The difference is that four of the six write, so they carry
+//! `Effect::Write`, a non-`Low` risk tier, and **concrete** `<domain>/item/<id>` permission
+//! subjects — never `*`, never empty (AGENTS.md:98). Items move through a closed state machine and
+//! an illegal edge is an error, not a write. [`MemoryBoard`] is the offline double.
+//!
 //! The record/retrieval contracts and pure live row, filter, page, and weak-reference types live in
-//! the L0 `flux-datasource` crate. Real IO remains host-owned and guarded; neither contract gives the
-//! model a credential, connection, or live handle.
+//! the L0 `flux-datasource` crate, as do the board's item and state-machine contracts. Real IO
+//! remains host-owned and guarded; no contract here gives the model a credential, connection, or
+//! live handle.
 
+mod board;
 mod host_caps;
 mod ingest;
 mod live;
 mod memory;
+mod memory_board;
 mod ops;
 mod semantic;
 mod sqlite;
@@ -34,6 +45,9 @@ mod embeddings;
 #[cfg(feature = "local-embeddings")]
 mod embeddings_local;
 
+pub use board::{
+    try_register_work_board, validate_board_contract, work_board_tools, WorkBoard, WorkBoardSurface,
+};
 pub use host_caps::DatasourceHostCaps;
 pub use ingest::{
     chunk_text, freshness, ingest_markdown, ingest_openapi, ingest_text, reindex, ChunkOptions,
@@ -43,6 +57,7 @@ pub use live::{
     LiveDatasource, LiveDatasourceSurface,
 };
 pub use memory::MemoryBackend;
+pub use memory_board::MemoryBoard;
 pub use ops::{datasource_tools, register_datasource_ops, try_register_datasource_ops};
 pub use semantic::SemanticIndex;
 pub use sqlite::SqliteBackend;
