@@ -70,6 +70,8 @@ optional arguments are in `[brackets]`.
 | `git_push` | `[branch, remote]` | Medium | Push to remote |
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
 | `git_unstage` | `paths` | Medium | Unstage files |
+| `git_hunks` | `path[, context]` | Low | List one file's individually stageable unstaged hunks, each with a stable id |
+| `git_stage_hunks` | `path, hunks[, context]` | Medium | Stage only the named hunks of one file (the `git add -p` equivalent) |
 | `git_worktree_enter` | | High | Move this context into an isolated temp git worktree (clean `main` only; generated `flux/worktree/*` branch) |
 | `git_worktree_leave` | | High | Merge the worktree back into `main` (`--no-ff`, trial-merge guarded), clean up, restore the original root |
 | `flow_list` | | Low | List reusable flows and composite ops under `.flux/flows` / `~/.flux/flows` (and the legacy `.flux/ops` / `@global_ops`) — each with its description and params |

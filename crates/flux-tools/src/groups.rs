@@ -47,6 +47,8 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
                 "git_push",
                 "git_checkout",
                 "git_unstage",
+                "git_hunks",
+                "git_stage_hunks",
                 "git_worktree_enter",
                 "git_worktree_leave",
             ]),
