@@ -52,9 +52,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ### Evidence-pinned memory — cross-session memory with provenance
 - [A-107 — The memory stream — MemoryEntry projection over an append-only memory:<scope> stream](A-107-memory-stream-and-projection.md) · Agent · cross-session memory needs its own stream in the SAME events.db, not a side table — inherits multi-process safety (C-25/C-125), WAL hygiene (C-126), the PG backend and flush-seam redaction for free
 
-### Fleet coordinator — flux orchestrating flux across repos
-- [A-116 — Outbound A2A dispatch — client cancel, A2aSpawner, and fleet.dispatch/status/cancel](A-116-a2a-outbound-dispatch.md) · Agent · the A2A server task surface is already done (A-53…A-57 in flux-server); this is the missing client half — A2aClient has no cancel, and only the flux a2a REPL can reach it
-
 ### Cross-harness session history as a datasource
 _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 2919 lines) locates,_
 - [C-212 — Cross-harness session history — search what was already said, in any local harness (epic)](C-212-harness-history-epic.md) · Core · flux usage already parses codex/claude-code/opencode state and discards the message text one field short; the new work is not acquisition but containment — this is the first datasource whose input is out-of-jail, secret-bearing and injection-shaped
@@ -247,6 +244,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-102 — Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()](A-102-migrate-sdk-cli-history-rewriters.md) · Agent · fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N
 - [A-112 — Per-delivery bus isolation — concurrent deliveries without cascade double-processing](A-112-per-delivery-bus-isolation.md) · Agent · blocks the whole fleet-coordinator epic; likely breaking for flux-app embedders ⇒ MINOR
 - [A-113 — The WorkBoard port — L0 contracts, L5 registration generating six ops, MemoryBoard](A-113-workboard-port.md) · Agent · ⚠ touches flux-datasource (protocol line) — obliges an explicit version decision; the mutating ops' concrete permission_subjects are the main safety surface
+- [A-116 — Outbound A2A dispatch — client cancel, A2aSpawner, and fleet.dispatch/status/cancel](A-116-a2a-outbound-dispatch.md) · Agent · the A2A server task surface is already done (A-53…A-57 in flux-server); this is the missing client half — A2aClient has no cancel, and only the flux a2a REPL can reach it
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`

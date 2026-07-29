@@ -2,7 +2,7 @@
 id: A-116
 title: Outbound A2A dispatch — client cancel, A2aSpawner, and fleet.dispatch/status/cancel
 pillar: Agent
-status: ready
+status: done
 priority: 4
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md

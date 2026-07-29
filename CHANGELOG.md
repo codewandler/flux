@@ -108,6 +108,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Outbound A2A dispatch — flux can hand work to a remote flux agent (A-116).** The A2A server has
+  implemented `tasks/cancel` since A-55, but no client could reach it, so a remote run could only be
+  detached from, never stopped. `A2aClient::cancel_task` closes that asymmetry. On top of it,
+  `A2aSpawner` (`flux-orchestrate`) is a `Spawner` backed by a remote worker rather than an
+  in-process sub-agent — so **the existing `task` op drives it verbatim** through the same
+  `ToolContext::spawner` seam, adding zero op surface for the blocking-delegate case while keeping
+  every depth and cap-scope bound the op already applies.
+  `fleet.dispatch` / `fleet.status` / `fleet.cancel` cover the fire-and-**track** case that
+  `Spawner`'s fire-and-await signature cannot express: `dispatch` sends non-blocking and returns the
+  `task_id`, `status` wraps `tasks/get`, `cancel` wraps the new `cancel_task`.
+  Egress is guarded on all three — the `worker` endpoint is caller-supplied and therefore
+  model-reachable, so each resolves it through `guard_url_scoped` before any request, and
+  `permission_subjects` reports the worker's origin: **never `*`**, and empty when the endpoint
+  cannot be named, which forces approval rather than matching a broad grant. Takes the L3 → L1 edge
+  the story sanctions (`flux-a2a` becomes a dependency of `flux-orchestrate`); no new crate and no
+  `flux-codegate` `layer()` change.
+
 - **The `WorkBoard` port — a write-capable state source with a closed state machine (A-113).**
   `LiveDatasource` is strictly read-only (`list` + `get`), so the fleet coordinator had no swappable
   way to *write* a board. This adds the sibling port following the same convention: a backend
