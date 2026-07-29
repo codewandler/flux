@@ -530,6 +530,12 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Work with the authorization policy — currently `simulate`, which replays a proposed policy
+    /// against the recorded op history before you adopt it.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Render or install generated Claude-format Flux skills.
     Skill {
         /// Which section to render/install: cli | lang | plugin | ops. Omit for the root skill.
@@ -703,6 +709,31 @@ pub(super) enum WakeupAction {
         session: String,
         /// The wake-up id (from `flux wakeups list`).
         wakeup_id: String,
+    },
+}
+
+/// `flux policy …`
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum PolicyAction {
+    /// Replay a proposed authorization policy against the recorded op history (C-131): a diff-style
+    /// report of which historical ops it would have newly blocked and newly allowed, relative to the
+    /// policy in force right now. A pure read — nothing is written to the event store, no provider is
+    /// constructed, and the proposal is never adopted.
+    ///
+    /// A recorded op the log cannot re-evaluate is reported as `indeterminate` with a reason, never
+    /// folded into blocked or allowed.
+    Simulate {
+        /// The proposed policy: a flux configuration document (the shape of `.flux/config.toml`)
+        /// whose `[policy]` grants are layered onto the built-in local floor, exactly as adopting
+        /// the file would compose them.
+        #[arg(value_name = "PROPOSED.TOML")]
+        proposed: String,
+        /// Replay only the N most recent sessions (0 = every recorded session).
+        #[arg(long, default_value_t = 0)]
+        sessions: usize,
+        /// Emit the report as one JSON object for tooling instead of the human rendering.
+        #[arg(long)]
+        json: bool,
     },
 }
 

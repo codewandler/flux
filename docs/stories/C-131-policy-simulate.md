@@ -2,7 +2,7 @@
 id: C-131
 title: flux policy simulate — replay a proposed policy against recorded history
 pillar: Core
-status: ready
+status: in-progress
 priority: 5
 epic:
 design:

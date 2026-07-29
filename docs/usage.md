@@ -253,6 +253,15 @@ flux endpoint list               # inspect the persisted endpoint store (~/.flux
                                  #   add <id> --url <bare-url> [--product/--protocol/--credential-ref/
                                  #   --label] · show <id> · resolve <id> (what a ref WOULD bind to) ·
                                  #   import <id> [--from-json <ref>]
+flux policy simulate p.toml      # POLICY SIMULATION (C-131): replay a proposed authorization policy over
+                                 #   the recorded op history and print a diff — newly blocked / newly
+                                 #   allowed / unchanged, with the deciding requirement per op. A pure
+                                 #   read: nothing is written to the event store and no provider is built.
+                                 #   Ops the log cannot re-evaluate (no authority contract in this build,
+                                 #   a record missing its caller, or a verdict that turns on caller trust/
+                                 #   scopes/groups the log never recorded) are reported "indeterminate"
+                                 #   with a reason — never folded into blocked or allowed.
+                                 #   --sessions N limits the replay window (0 = all), --json for tooling
 flux skill [cli|lang|plugin|ops] # print a generated Claude-format skill's SKILL.md to stdout (omit the
                                  #   type for the root skill); --install writes skill directories to
                                  #   .flux/skills instead, --global targets ~/.claude/skills
