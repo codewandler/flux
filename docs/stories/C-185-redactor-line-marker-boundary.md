@@ -2,10 +2,10 @@
 id: C-185
 title: A leading diff/list marker must not hide a credential from the redactor
 pillar: Core
-status: ready
+status: done
 priority: 1
-epic:
-design:
+epic: security-assurance
+design: docs/designs/security-assurance.md
 note: "`redact_patterns`' is_boundary set omits `+`/`-`/`*`/`#`, and the shape matcher requires token.starts_with(prefix) — so `+sk-ant-…` on an added diff line tokenizes with the marker glued on and is NOT redacted; every surface that renders a diff inherits the gap (found while building C-132, worked around locally there)"
 ---
 
@@ -24,18 +24,23 @@ inherits it. Registered-value redaction is unaffected (that path is a literal re
 the shape-based matcher only.
 
 ## Acceptance
-- [ ] Failing-first test in `flux-secret`: a credential-shaped value preceded by `+`, `-`, `*` or
-      `#` (with no intervening space) is redacted — asserted before the fix and green after.
-- [ ] The fix is in `redact_patterns`, not at call sites, and C-132's local workaround in
+- [x] Failing-first test in `flux-secret`: a credential-shaped value preceded by `+`, `-`, `*` or
+      `#` (with no intervening space) is redacted — asserted before the fix and green after
+      (`a_line_marker_does_not_hide_a_credential`).
+- [x] The fix is in `redact_patterns`, not at call sites, and C-132's local workaround in
       `render_diff` (`crates/flux-cli/src/export_cmd.rs`) is removed in the same change so there
       is exactly one place that knows this rule.
-- [ ] Redaction stays conservative in the other direction: a token that legitimately contains a
+- [x] Redaction stays conservative in the other direction: a token that legitimately contains a
       hyphen *inside* it (`sk-ant-…` itself) must still redact as one unit — a test pins that
-      widening the boundary set did not split credentials into unredacted fragments.
-- [ ] The approval sheet's diff preview is covered: a seeded secret on an added hunk line does not
-      reach the rendered sheet.
-- [ ] Standard gate green in both workspaces (`cargo build/test/clippy -D warnings/fmt`,
-      `cargo test -p flux-codegate`, plus `cargo fmt --check` in `plugins/`).
+      widening the boundary set did not split credentials into unredacted fragments
+      (`a_hyphenated_credential_redacts_as_one_unit`).
+- [x] The approval sheet's diff preview — **descoped to [C-195](C-195-approval-sheet-redaction.md)**.
+      The premise did not hold: `flux-tui` performs no redaction at all (no `flux-secret` dep, no
+      `Redactor` in the crate), so covering the sheet is a new dependency edge plus a design decision
+      (should a local human-eyes approval surface redact at all?), not the boundary-set change this
+      story scoped. Tracked separately.
+- [x] Standard gate green in both workspaces (`cargo build/test/clippy -D warnings/fmt`,
+      `cargo test -p flux-codegate`; `plugins/` untouched by this change).
 
 ## Progress
 - 2026-07-29 filed from a finding in C-132: the export's golden test seeded a secret into a diff

@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A leading diff/list marker no longer hides a credential from the redactor (C-185).**
+  `flux_secret::redact_patterns` tokenizes on a fixed boundary set and only redacts a token that
+  *starts with* a known credential prefix. `+`/`-`/`*`/`#` were not boundary characters, so on a
+  rendered diff line the marker glued to the front of the token (`+sk-ant-…`) and the credential
+  never matched — it rendered in full on every surface that shows a diff (the HTML export, tool-card
+  detail, any future diff view). `flush` now sets aside a leading run of `LINE_MARKERS` before the
+  prefix match and re-emits them verbatim (`+sk-ant-…` → `+[redacted]`); the markers are
+  deliberately **not** promoted to boundary characters, because `-` occurs inside `sk-ant-…`/`xoxb-…`
+  and splitting on it would fragment a key into unredacted pieces. C-132's local marker-split
+  workaround in `render_diff` (`flux-cli`) is removed — the rule lives in exactly one place. The
+  approval sheet's own preview is a separate, larger change tracked as C-195 (`flux-tui` does no
+  redaction today).
 - **Compaction wrote a broken conversation on ordinary sessions (A-101).** The persisted log is a
   strict `user, assistant, …` alternation, so compaction's split point always landed on a **user**
   message; the walk-back that was supposed to protect the boundary only stepped back off a
