@@ -30,16 +30,16 @@ optional arguments are in `[brackets]`.
 | `http.request` | `url[, method, headers, body, timeout]` | Medium | Make an arbitrary HTTP(S) request (any method/headers/body) → status + headers + capped body; non-2xx is a result. Header values may be `{"$secret": "ENV"}`. Private/loopback blocked unless the `web` egress scope grants them |
 | `browser.open` | `[url]` | Medium | Open a headless-Chromium session (evidence-gated on a discoverable browser) → `session` id + a non-visual page digest (condensed content + `e<N>` action refs). Every subrequest is guarded by the `web` egress scope |
 | `browser.goto` | `session, url` | Medium | Navigate a session; returns a delta of what changed |
-| `browser.snapshot` | `session[, view]` | Low | Re-observe a session as a digest (`view`: full \| actions \| content) |
+| `browser.snapshot` | `session[, view]` | Medium | Re-observe a session as a digest (`view`: full \| actions \| content) |
 | `browser.act` | `session, action[, ref, value, full]` | Medium | Act on a ref (click/type/fill/select/press/scroll/goto/back) → delta digest; `full` for a whole digest |
-| `browser.close` | `session` | Low | Close a session + its Chromium child |
+| `browser.close` | `session` | Medium | Close a session + its Chromium child |
 | `write` | `path, content` | Medium | Write (create/overwrite) a file |
 | `edit` | `path, old_string, new_string[, replace_all]` | Medium | Replace a string in a file (must match exactly once unless `replace_all`); if the exact text isn't found, progressively looser matching is tried (trailing whitespace → indentation drift → first/last-line anchor) and the result reports which strategy matched |
 | `patch` | `path, edits` | Medium | Apply several line-anchored edits in one call; each edit is `{op, line, end_line?, text?}` where op is `insert_before`, `insert_after`, `replace_range`, or `delete_range`; ALL line numbers refer to the original file |
 | `append` | `path, content` | Medium | Append to a file (creates it and parent dirs if absent); smaller blast radius than `write`, same approval tier |
 | `read_many` | `paths` | Low | Read several files at once (each section headed `==> path <==`); prefer single `read` when you need to embed a file's text into a later string |
 | `task` | `role, task` | Medium | Delegate to a sub-agent role |
-| `consult` | `question[, context, model]` | Low | Ask a DIFFERENT model for a second opinion — pure advice, no tools (only advertised once `[consult] model` is configured) |
+| `consult` | `question[, context, model]` | Medium | Ask a DIFFERENT model for a second opinion — pure advice, no tools (only advertised once `[consult] model` is configured) |
 | `bash` | `command[, timeout_secs]` | High | Run a shell command |
 | `proc.run` | `program[, args, timeout_secs]` | High | Run one argv-only process in the workspace root (no shell, env cleared by `flux-system`) |
 | `file_stat` | `path` | Low | File metadata: size, line count, mtime (replaces `wc -l`, `stat`, `ls -la`) |

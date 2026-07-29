@@ -119,7 +119,12 @@ impl Tool for ConsultTool {
             // A model call is network egress carried entirely by the provider call itself — no
             // separate filesystem/process authority (mirrors every other op in this crate).
             effects: vec![Effect::Network],
-            risk: Risk::Low,
+            // `Medium`, not `Low` (C-208). A consult is a *billable* call to another provider, and
+            // `Risk::Low` is the tier every consumer reads as "nothing here worth a gate" — which
+            // would make it runnable during pre-approval evidence gathering. It is not paired with
+            // `Effect::Read` for the same reason: the distinguishing property of a model call is
+            // cost, not mutation. See docs/designs/security-assurance.md.
+            risk: Risk::Medium,
             // A model call is non-deterministic unless cached; repeating it is not idempotent.
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Provider],
@@ -394,8 +399,13 @@ mod tests {
     }
 
     /// A-96 acceptance: the op declares no effect beyond the model call it makes — `Effect::Network`
-    /// paired with `AccessKind::Provider` only (mirrors every other op in this pack), `Risk::Low`,
-    /// and no filesystem/process access at all.
+    /// paired with `AccessKind::Provider` only (mirrors every other op in this pack), and no
+    /// filesystem/process access at all.
+    ///
+    /// C-208 raised the tier from `Low` to `Medium`. That is not a widening of authority — the
+    /// effect and access sets are unchanged, which is what "no authority beyond the model call"
+    /// asserts. It is a correction: the model call is billable, and `Risk::Low` is the tier that
+    /// makes an op runnable during pre-approval evidence gathering.
     #[test]
     fn consult_declares_no_authority_beyond_the_model_call() {
         let (_calls, factory) = spy_factory("noop", Usage::default());
@@ -404,8 +414,12 @@ mod tests {
         assert_eq!(spec.name, "consult");
         assert_eq!(spec.effects, vec![Effect::Network]);
         assert_eq!(spec.access, vec![AccessKind::Provider]);
-        assert_eq!(spec.risk, Risk::Low);
+        assert_eq!(spec.risk, Risk::Medium);
         assert_eq!(spec.idempotency, Idempotency::NonIdempotent);
+        assert!(
+            flux_spec::metadata_violations(&spec, &tool.semantic_effects()).is_empty(),
+            "a billable model call must satisfy the coherence invariants"
+        );
     }
 
     /// A-96: exactly one model call is made per `consult` invocation.

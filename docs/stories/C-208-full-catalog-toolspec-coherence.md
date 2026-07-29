@@ -2,7 +2,7 @@
 id: C-208
 title: "Extend ToolSpec coherence to the full production catalog, and settle the Network-without-Read posture"
 pillar: Core
-status: ready
+status: in-progress
 priority: 16
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -24,25 +24,61 @@ Close the gap — and settle the product question that closing it forces, rather
 invariants to fit the catalog.
 
 ## Acceptance
-- [ ] Failing-first: a test over the **production** registry (not `try_register_builtins`) asserts
+- [x] Failing-first: a test over the **production** registry (not `try_register_builtins`) asserts
       metadata coherence and fails against the tree as it stands, naming the violators.
-- [ ] The gate lives where it can see the full catalog. Note the layering constraint: it cannot live
+      → `every_operation_in_the_production_catalog_is_metadata_coherent`
+      (`crates/flux-cli/src/catalog_coherence.rs`). First run: **22 violations across 19 ops** —
+      the 11 in the table below plus `explore` and `grade`.
+- [x] The gate lives where it can see the full catalog. Note the layering constraint: it cannot live
       in `flux-tools`, because `flux-web` / `flux-eval` / `flux-cognition` sit above it — `flux-cli`
       is the natural home. Do not weaken `flux-codegate`'s layering rule to place it.
-- [ ] **The `Network`-without-`Read` posture is decided and written down** before any declaration is
+      → `crates/flux-cli/src/catalog_coherence.rs`, a `#[cfg(test)]` module inside the binary
+      (`flux-cli` has no lib target), so it can drive the private `register_tool_packs` production
+      registrar rather than a copy. `flux_codegate::layer` is untouched; `cargo test -p
+      flux-codegate` is green (13 passed).
+- [x] **The `Network`-without-`Read` posture is decided and written down** before any declaration is
       edited. 8 of the 11 known violators declare `[Network]` at `Risk::Low` with no `Read`. Adding
       `Read` makes them honest *and* gather-safe — the adaptive loop could then fetch URLs and call
       models pre-approval. Raising them to `Medium` puts an approval prompt in front of every model
       call. Both are product changes; pick one, state why, and record it in the design doc.
-- [ ] Each of the 11 known violations is either corrected or an explicit allowlist entry with a
+      → `docs/designs/security-assurance.md`, "The `Network`-without-`Read` posture (C-208)",
+      committed before any declaration was edited. Group A (`web.fetch`, `web.crawl`) gains `Read`;
+      Group B (billable model calls) rises to `Medium`. The sorting test is **cost, not mutation**.
+- [x] Each of the 11 known violations is either corrected or an explicit allowlist entry with a
       justification (`Exemption.reason` is load-bearing since C-191 — an entry with no reason or an
       unknown invariant id fails the build).
-- [ ] The two open registration seams are covered or explicitly scoped out with reasoning:
+      → all 13 (the 11 + `explore` + `grade`) **corrected in place**. `flux_spec::coherence::EXEMPT`
+      gained no entries, so `flux-spec` was not touched at all.
+- [x] The two open registration seams are covered or explicitly scoped out with reasoning:
       `flux_sdk::FlowClient::try_register_op`/`try_register_pack` (`crates/flux-sdk/src/flow.rs:313,331`)
       and the sub-agent `child_base` registry (`crates/flux-cli/src/execution.rs:1281`).
+      → `child_base` **covered**: it is exactly `try_register_builtins`, asserted a coherent subset
+      of the catalog by `the_sub_agent_base_registry_is_a_coherent_subset_of_the_catalog`. The SDK
+      seam is **scoped out** with written reasoning in the design doc and in the gate's `EXCLUDED`
+      list — it is the same generic-registration call C-191 declined to gate, and third-party
+      metadata is checked where it crosses the trust boundary (the plugin loader), not at a
+      registration call.
 
 ## Progress
-- (not started)
+- **Done.** The gate is `crates/flux-cli/src/catalog_coherence.rs` (4 tests): the coherence walk over
+  the production catalog, a width check proving the census is strictly wider than C-191's, the
+  sub-agent subset check, and a **drift guard** that scans `execution.rs` for `try_register*` seams
+  and fails on any it has not been told about — so adding a pack without adding it to the census is
+  a build failure rather than a silent coverage loss. That guard is the direct answer to this
+  story's own note that "a future gate should not assume crate proximity implies coverage".
+- Two violators were found that the table below does not list: `explore` (`[Network]` @ Low — a
+  billable `LoopHost::explore` provider call) and `grade` (`[Read, Process]` @ Low + `Idempotent`,
+  on an op that runs a **caller-supplied** command). Both corrected.
+- `detect_intent` was moved from the posture decision's Group A to Group B: despite its local-sounding
+  description it runs `flux-flow`'s `detect_intent_stage`, a provider call that records model usage,
+  so the "does it cost money?" test lands it with the model ops. Reasoning recorded in the design doc.
+- A latent shadowing bug fell out of the same pass: `CognitionOp::spec` re-declared `Risk::Low` after
+  lowering `OpKind::opspec()`, overriding the typed contract. Removed; the tier is declared once, and
+  a test now pins `opspec().risk == registered spec().risk`.
+- Gate green: `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo fmt --all --check`, `cargo test -p flux-codegate`.
+- `crates/flux-flow/docs/ops-reference.md` updated for the three risk-column rows that moved
+  (`browser.snapshot`, `browser.close`, `consult`).
 
 ## Notes
 Known violations, inherited verbatim from the C-191 review (verified `path:line`):

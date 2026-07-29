@@ -70,7 +70,12 @@ impl Tool for GateCheckTool {
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // `Conditional`, not `Idempotent` (C-208). Running the gate twice is safe, but
+            // `Idempotent` is the claim that licenses the op cache to serve a stored result
+            // *instead of executing* — and a cached "true" for a tree that has since changed is
+            // the worst possible answer from a gate. `Conditional` says "repeatable, never
+            // replayable", which is what this op actually is.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process, AccessKind::LocalSystem],
             group: None,
         }

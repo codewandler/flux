@@ -177,7 +177,10 @@ impl Tool for WebCrawlTool {
                 "required": ["url"]
             }),
         )
-        .with_effects(vec![Effect::Network])
+        // `Read` alongside the carrier (C-208): a crawl is a bounded read of a site, and `Network`
+        // alone declares an unread egress. Same reasoning as `web.fetch`; every hop still passes
+        // through the `web` egress scope.
+        .with_effects(vec![Effect::Read, Effect::Network])
         .with_access(vec![AccessKind::Network])
     }
 
@@ -622,9 +625,11 @@ mod tests {
             ],
             "the datasource marker must not be interpreted as a network destination"
         );
-        // The host effect stays Network: a `write_db` lowers to Network + the `flow.write_db` policy
-        // action, deliberately NOT a filesystem `workspace.write`.
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // The host effects stay a network *read*: a `write_db` lowers to Network + the
+        // `flow.write_db` policy action, deliberately NOT a filesystem `workspace.write`. Wiring a
+        // record sink must not silently promote the host effect set — the durable contribution is
+        // carried by the semantic effect and the authority requirement asserted above.
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
 
         // Observed: the declaration matches a real contribution.
         let base = site_server(vec![("/", page("Seed", "SEEDMARKER", &[]))]).await;
@@ -721,8 +726,10 @@ mod tests {
                 .unwrap(),
             vec![AuthorityRequirement::network_fetch("http://example.com/")]
         );
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // `Read` + `Network` — a bounded read of a site, not an unread egress (C-208).
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);
+        assert!(flux_spec::metadata_violations(&t.spec(), &t.semantic_effects()).is_empty());
     }
 
     #[tokio::test]

@@ -395,8 +395,14 @@ impl Tool for ImportOp {
             }),
             output_schema: None,
             effects: vec![flux_spec::Effect::LocalSystem],
-            risk: flux_spec::Risk::Low,
-            idempotency: flux_spec::Idempotency::Idempotent,
+            // `Medium` + `Conditional` (C-208). Unlike its four read-only siblings this op
+            // *persists* — it writes the endpoints store, host state outside the workspace jail,
+            // which is why it alone carries a `host_write` authority requirement below. `Low` +
+            // `Idempotent` described it as an auto-approvable, cache-replayable read.
+            // `Conditional` because re-importing the same id is a genuine no-op overwrite, but the
+            // write must still happen rather than being served from a stored result.
+            risk: flux_spec::Risk::Medium,
+            idempotency: flux_spec::Idempotency::Conditional,
             access: vec![AccessKind::LocalSystem],
             group: Some(ENDPOINT_GROUP.into()),
         }

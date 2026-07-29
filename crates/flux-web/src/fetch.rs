@@ -98,7 +98,11 @@ impl Tool for WebFetchTool {
                 "required": ["url"]
             }),
         )
-        .with_effects(vec![Effect::Network])
+        // `Read` is not decorative (C-208): a fetch *is* a read, and `Network` alone describes an
+        // unread egress — a POST. The omission made this op consequence-bearing under
+        // `flux_spec::coherence` while it carried `Risk::Low`. The egress envelope is unchanged:
+        // every request still goes through `guard_url_scoped_pinned` below.
+        .with_effects(vec![Effect::Read, Effect::Network])
         .with_access(vec![AccessKind::Network])
     }
 
@@ -767,9 +771,11 @@ mod tests {
             ],
             "the datasource marker must not be interpreted as a network destination"
         );
-        // The host effect stays Network: a `write_db` lowers to Network + the `flow.write_db` policy
-        // action, deliberately NOT a filesystem `workspace.write`.
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // The host effects stay a network *read*: a `write_db` lowers to Network + the
+        // `flow.write_db` policy action, deliberately NOT a filesystem `workspace.write`. Wiring a
+        // record sink must not silently promote the host effect set — the durable contribution is
+        // carried by the semantic effect and the authority requirement asserted above.
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
 
         // Observed: the declaration matches a real contribution.
         let base = one_shot(
@@ -868,8 +874,11 @@ mod tests {
                 .unwrap(),
             vec![AuthorityRequirement::network_fetch("http://example.com/p")]
         );
-        assert_eq!(t.spec().effects, vec![Effect::Network]);
+        // `Read` + `Network` — a fetch, not an unread egress (C-208). The pair is what keeps the
+        // op coherent at `Risk::Low`; `Network` alone would declare a POST.
+        assert_eq!(t.spec().effects, vec![Effect::Read, Effect::Network]);
         assert_eq!(t.spec().access, vec![AccessKind::Network]);
+        assert!(flux_spec::metadata_violations(&t.spec(), &t.semantic_effects()).is_empty());
     }
 
     #[tokio::test]

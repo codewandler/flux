@@ -1012,7 +1012,11 @@ impl Tool for BrowserSnapshotTool {
             }),
             output_schema: None,
             effects: vec![Effect::Browser],
-            risk: Risk::Low,
+            // `Medium` (C-208), matching `browser.open` / `goto` / `act`. Snapshotting reads, but
+            // what it reads is a live, session-bearing browser holding whatever authentication the
+            // session accumulated — which is why `Effect::Browser` is a consequence regardless of
+            // direction. Being the one tier below its own family was drift, not a decision.
+            risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Browser],
             group: Some(BROWSER_GROUP.into()),
@@ -1129,7 +1133,10 @@ impl Tool for BrowserCloseTool {
             }),
             output_schema: None,
             effects: vec![Effect::Process],
-            risk: Risk::Low,
+            // `Medium` (C-208), matching the rest of the family. Closing a session terminates a
+            // Chromium child process and discards whatever state that session held; `Effect::Process`
+            // at `Risk::Low` claimed a teardown was as inert as a read.
+            risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Process],
             group: Some(BROWSER_GROUP.into()),
