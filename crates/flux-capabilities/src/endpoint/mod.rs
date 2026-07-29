@@ -144,6 +144,8 @@ impl EndpointRegistry {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        // flux-allow-direct-io: endpoint registry persistence — `path` is the host-configured store
+        // (`self.path`), set at construction, not a model-directed path.
         let body = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -169,6 +171,8 @@ impl EndpointRegistry {
             return Ok(());
         };
         if let Some(dir) = path.parent() {
+            // flux-allow-direct-io: endpoint registry persistence — create the host-configured
+            // store dir (`self.path`'s parent), not a model-directed path.
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::Other(format!("create {}: {e}", dir.display())))?;
         }
@@ -178,8 +182,12 @@ impl EndpointRegistry {
         let body = toml::to_string_pretty(&persisted)
             .map_err(|e| Error::Other(format!("serialize endpoints: {e}")))?;
         let tmp = path.with_extension("toml.tmp");
+        // flux-allow-direct-io: endpoint registry persistence — atomic write to a temp beside the
+        // host-configured store (`self.path`), not a model-directed path.
         std::fs::write(&tmp, body.as_bytes())
             .map_err(|e| Error::Other(format!("write {}: {e}", tmp.display())))?;
+        // flux-allow-direct-io: endpoint registry persistence — atomic rename into the
+        // host-configured store (`self.path`), not a model-directed path.
         std::fs::rename(&tmp, path)
             .map_err(|e| Error::Other(format!("rename into {}: {e}", path.display())))?;
         Ok(())

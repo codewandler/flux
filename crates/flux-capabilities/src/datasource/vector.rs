@@ -142,12 +142,15 @@ mod sqlite_vec_store {
         /// Open (creating if needed) a store at `path` holding `dim`-dimensional vectors.
         pub fn open(path: impl AsRef<Path>, dim: usize) -> Result<Self> {
             register_extension();
+            // flux-allow-direct-io: SqliteVecStore owns its vector store; `path` is host-configured
+            // when the datasource is built, not a model-supplied argument.
             Self::init(Connection::open(path).map_err(map)?, dim)
         }
 
         /// An in-memory store (tests / ephemeral).
         pub fn in_memory(dim: usize) -> Result<Self> {
             register_extension();
+            // flux-allow-direct-io: in-memory vector store (tests / ephemeral use) — no filesystem path.
             Self::init(Connection::open_in_memory().map_err(map)?, dim)
         }
 

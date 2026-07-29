@@ -305,7 +305,11 @@ fn jail_sqlite_path(ctx: &ToolContext, raw: &str) -> Result<String> {
         )
     })?;
     let flux_home = std::path::Path::new(&home).join(".flux");
+    // flux-allow-direct-io: sqlite_query ~/.flux jail (C-78) — canonicalize the allowed base so the
+    // comparison below is against a real, symlink-resolved path. Path resolution only, no content IO.
     let flux_home = std::fs::canonicalize(&flux_home).unwrap_or(flux_home);
+    // flux-allow-direct-io: sqlite_query jail (C-78) — canonicalize the requested DB path to reject
+    // symlink/`..` escapes before the read-only open below. Path resolution only, no content IO.
     let canon = std::fs::canonicalize(&expanded)
         .map_err(|e| Error::Other(format!("sqlite_query: cannot open {expanded}: {e}")))?;
     if canon.starts_with(&flux_home) {
@@ -412,6 +416,9 @@ impl Tool for SqliteQueryTool {
         // lint that flags this call site so the deviation cannot spread silently.
         let result =
             tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Map<String, Value>>> {
+                // flux-allow-direct-io: sqlite_query read-only exception (C-192) — contained by
+                // jail_sqlite_path + SQLITE_OPEN_READ_ONLY + the SELECT/PRAGMA statement allowlist; see
+                // the DEVIATION note above. This is the call site C-194's lint exists to keep visible.
                 let conn = rusqlite::Connection::open_with_flags(
                     &db_path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY

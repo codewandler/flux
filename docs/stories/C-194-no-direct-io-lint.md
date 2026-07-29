@@ -19,24 +19,64 @@ a review-discipline promise into a gate, so the next violation fails CI at autho
 surfacing in the next adversarial review.
 
 ## Acceptance
-- [ ] A lint or test rejects `std::fs`, `std::process::Command`, `tokio::fs`, `tokio::process` and
+- [x] A lint or test rejects `std::fs`, `std::process::Command`, `tokio::fs`, `tokio::process` and
       direct database/socket opens (e.g. `rusqlite::Connection::open*`) in model-facing tool crates
-      outside `#[cfg(test)]`.
-- [ ] Scope decided and recorded: at minimum `flux-tools`, `flux-web`, `flux-capabilities`. Whether
+      outside `#[cfg(test)]`. → `scripts/check-no-direct-io.sh` (grep-based, cfg(test)-aware).
+- [x] Scope decided and recorded: at minimum `flux-tools`, `flux-web`, `flux-capabilities`. Whether
       it extends to the plugin host and `flux-eval` is a judgement call the change should state.
-- [ ] It runs in CI as a **named** step, the way the layering lint does
+      → scope = those three crates; `flux-eval` and `flux-plugin` deliberately OUT, rationale in the
+      script header (`SCOPED_CRATES`) and Progress below.
+- [x] It runs in CI as a **named** step, the way the layering lint does
       (`.github/workflows/ci.yml:54`), so a regression is an obvious named failure rather than a
-      buried assertion.
-- [ ] Failing-first demonstration: the lint flags `crates/flux-tools/src/extra.rs:341` (the direct
+      buried assertion. → CI job `no-direct-io` in `.github/workflows/ci.yml`, mirroring `action-pins`.
+- [x] Failing-first demonstration: the lint flags `crates/flux-tools/src/extra.rs:341` (the direct
       `rusqlite` open) against the pre-C-192 tree. If C-192 has already landed, the demonstration is
       a temporary reintroduction in a test fixture — not a weakened guard in shipped code.
-- [ ] Any legitimate exception is an explicit, greppable allow-annotation carrying a reason, not an
-      unlisted omission from the lint's scope.
-- [ ] `docs/architecture.md:169` gains a pointer to the enforcing check, so the invariant and its
+      → C-192 has landed; `--self-test` builds a throwaway fixture that reintroduces an unannotated
+      direct open and asserts it is the one line flagged (red), while cfg(test)/comment/annotation
+      exemptions stay green.
+- [x] Any legitimate exception is an explicit, greppable allow-annotation carrying a reason, not an
+      unlisted omission from the lint's scope. → `// flux-allow-direct-io: <reason>` on 14 genuine
+      non-test sites (the sqlite_query read path + jail, the ephemeral browser profile dir, three DB
+      backends that own their stores, the endpoint-registry persistence).
+- [x] `docs/architecture.md:169` gains a pointer to the enforcing check, so the invariant and its
       proof are findable together.
 
 ## Progress
-- (not started)
+- **Done (2026-07-29).** Invariant is now a gate.
+- **Mechanism:** `scripts/check-no-direct-io.sh` (follows the `check-*.sh` convention, no new Rust
+  dep, off `Cargo.lock`). A cfg(test)-aware, comment-stripping grep over `crates/{flux-tools,
+  flux-web,flux-capabilities}/src` rejects `std::fs`/`tokio::fs`/`std::process::Command`/
+  `tokio::process::Command`/`Connection::open*`/`TcpStream|UnixStream::connect` unless the line (or
+  the contiguous comment block directly above it) carries `// flux-allow-direct-io: <reason>`.
+  `--self-test` is the failing-first proof. CI job `no-direct-io` runs `--self-test` then the tree.
+- **Scope decision.** In: `flux-tools`, `flux-web`, `flux-capabilities` (the model-facing tool
+  crates). Out: `flux-eval` (a test/bench harness — fixture IO is its purpose, never model-driven)
+  and `flux-plugin` (the plugin *host*; spawning/supervising plugin subprocesses and brokering their
+  guarded IO is intrinsically its job — model-facing tool code does not live there).
+- **14 annotated exceptions** (all pre-existing, all legitimate; none is a bypass): extra.rs sqlite
+  jail canonicalize ×2 + the read-only `open_with_flags` (C-192), browser.rs ephemeral profile dir
+  ×3, capabilities sqlite/vector backend opens ×4, endpoint-registry persistence ×4. The dispatch
+  expected only the one sqlite open; the tree has more legitimate direct IO, each now made greppable
+  and justified rather than silently out of scope (which the Acceptance explicitly forbids).
+- **Sibling invariant (architecture.md:170, "nothing calls `execute` directly in prod") NOT
+  mechanically asserted** — it fails the story's "if cheap" bar: the `.execute(` token collides with
+  sqlx's `Query::execute` (false positives in `flux-capabilities`), and there is a real non-test
+  prod caller — the source-scoping tool decorator `self.inner.execute(...)` in `flux-app/src/app.rs`
+  — so a greppable form would be all-false-positive without per-call allowlisting disproportionate to
+  this story. Left as a follow-up candidate.
+- **Round-2 security hardening (review rework).** The first cut did brace-counting, comment-stripping
+  and marker-matching over *raw text*, which an independent review showed could be fooled in the
+  UNSAFE direction — real non-test direct-IO calls passing `scan_file` silently: (1) a net-imbalanced
+  brace inside a string in a `#[cfg(test)]` region disarmed the rest of the file; (2) a `//` inside a
+  string truncated the code before matching; (3) a same-line marker exempted every call on the line;
+  (4) `flux-allow-direct-io` matched as an unanchored substring, so the text inside a path/string
+  exempted the call. `scan_file` is now a character-level tokenizer that blanks string/char literals
+  and comments before brace counting / pattern matching, and honours the marker only inside a real
+  comment on a line above the call (all 14 real annotations are written that way). `--self-test` pins
+  a fixture for each of the four; verified red-before (the naive version flagged *none* of the four)
+  and green-after. The real tree stays clean under the stricter scan — no pre-existing brace-in-string
+  was masking a real call.
 
 ## Notes
 - **Verified against the tree at `0.33.1` (f8e90d7).** Source review:
