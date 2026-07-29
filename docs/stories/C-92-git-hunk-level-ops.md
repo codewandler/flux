@@ -87,6 +87,30 @@ user's worktree; make changes auditable) by giving the guarded git surface the g
   Acceptance list, which names only the `flux-flow` reference — worth folding into the last
   Acceptance bullet's wording for future catalog stories.
 
+- 2026-07-29 **rework after review** — two blocking silent-misapply defects, both reproduced against
+  git 2.55.0 in throwaway repos before any code changed, and both invisible to the first gate because
+  no test passed a non-default `context`:
+  - `context: 0` staged a pure insertion **at the wrong offset while exiting 0** (a hunk requested at
+    line 6 of a 30-line file landed at EOF). Fixed by a radius floor of 1 in both ops, via
+    `checked_context`. `--unidiff-zero` was rejected as the fix: it makes the case land correctly but
+    only by switching git's verification off, trading the story's central guarantee for granularity.
+  - `--recount` disabled git's corrupt-patch check on a patch flux assembles. Dropping the last line
+    of a two-hunk selection gave `APPLIED exit=0` with it and `error: corrupt patch at <stdin>:20`
+    without it. Removed; it was never needed, since the index is the preimage so the remaining hunks'
+    old-side counts stay true.
+  - Paired with it, `run_with_stdin` discarded its stdin write result; a short write closes the fd on
+    drop and delivers a *clean* EOF, so exit 0 over a truncated payload was indistinguishable from
+    success. Now a hard error under a zero exit, passed through under a non-zero exit (that is git
+    rejecting the patch, where the exit code is the real diagnosis).
+  - Also enforced the whole-file non-goal (`deleted file mode` / rename / copy / mode change in the
+    preamble are refused — the preamble rides along with whichever hunks are selected), and fixed the
+    refusal that blamed "the file changed underneath" when only the ordinals had shifted.
+- 2026-07-29 the ordinal-in-id limitation was **consciously kept, not fixed**: surviving renumbering
+  and distinguishing two byte-identical hunks are not jointly achievable, and hash-only matching
+  would let a stale id silently resolve to a different region after a revert. Full-string matching
+  fails safe; the cost is a re-read per stage. The design note previously claimed the opposite and is
+  now corrected.
+
 ## Notes
 - Motivating incident: an agent implementing `/effort` had to commit into a tree a coworker was
   editing; `engine.rs` and a design doc were shared files, and whole-file `git_stage` would have
