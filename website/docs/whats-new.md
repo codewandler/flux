@@ -12,6 +12,22 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Improved
+
+- **A running command shows what it is doing.** A shell command that takes a while used to display
+  nothing but a spinner, so a command working steadily looked identical to one that had hung. Its
+  output now appears beneath the command as it arrives, and is replaced by the usual summary once
+  the command finishes. Commands that print nothing look exactly as they did before, and the same
+  scrubbing that keeps secrets out of the final output also covers the live view. Work handed to a
+  sub-agent still shows no live output.
+
+### Fixed
+
+- **Asking for the latest download always gives you the newest version.** A released version could
+  end up with no downloadable release attached to it, which left the "latest" download quietly
+  serving an older build. The missing release has been restored, and a check now runs continuously
+  so that neither a missing download nor a "latest" pointer drifting behind can go unnoticed again.
+
 ## [0.33.0] - 2026-07-29
 
 ### New
