@@ -34,6 +34,13 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
   keybinding now fails the gate. It filed two code bugs on the way out: **C-206** (fragment
   discovery walks subdirectories while the contract promises a flat directory) and **C-207**
   (`KUBECONFIG` gates surfacing but is never forwarded to `kubectl`).
+- **Newly designed:** **the agent-authored surface** (C-219; C-220…C-225 filed, none started) — the
+  agent gets typed panes on the TUI and an allowlisted config surface. Most of the plumbing already
+  exists (`ToolProgressSink`/`SpawnActivitySink` are the template; `op.register` is the precedent),
+  and A-79's sub-agent activity stream currently has **no consumer in the TUI at all**. The epic's
+  real weight is trust: a model that can draw a styled region can imitate the approval sheet, so
+  panes carry no field that reaches a `Style`, and the writable config keys are asserted disjoint
+  from `PinnableKey::ALL`. C-220 → C-221 → C-222 land before the model can reach any of it.
 - **Improvement pillar:** ON HOLD / de-prioritized since 2026-07-06 (I-01, I-05 in Backlog) — the loop
   machinery is proven but the headline gain (trials ≥ 3, grader-confirmed) is unproven.
 - **Gate:** green — `cargo test` · `clippy -D warnings` · `fmt` · the `flux-codegate` layering lint.
@@ -48,6 +55,15 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Next (ready — take the top one unless the user named a story)
 - [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
 - [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
+
+### The agent-authored surface — panes the model opens, config it can safely change
+- [C-219 — The agent-authored surface — panes the model opens, config it can safely change (epic)](C-219-agent-authored-surface-epic.md) · Core · the tool→surface seam already exists twice (ToolProgressSink/SpawnActivitySink) and op.register already lets the model extend the harness one layer down — what's missing is the surface layer, and the whole risk is that a model-drawn region can imitate the approval sheet
+- [C-220 — The SurfaceSink contract at L2 — typed pane commands, redacted at the reporter](C-220-surface-sink-contract.md) · Core · third instance of a twice-proven pattern — ToolProgressSink/SpawnActivitySink (flux-runtime lib.rs:188-262) are the template: trait at L2, installed by the L6 surface, reached only via ToolContext, redaction applied at the reporter so no tool can put raw bytes on a screen
+- [C-221 — Pane slots in the TUI — layout split, bounds, and narrow-width suppression](C-221-tui-pane-slots.md) · Core · render() is a fixed six-row Layout::vertical (rendering.rs:122-171) with no horizontal split at all; panes need left/right/bottom slots that are bounded and suppressed at narrow widths rather than squeezing the transcript — host-pushed only, no model path until C-223
+- [C-222 — The trusted-chrome invariant — an agent pane can never be mistaken for the approval sheet](C-222-pane-trusted-chrome.md) · Core · C-163 already wrote the rule for plugins — 'a plugin that can pop a dialog is a plugin that can phish the user inside a trusted surface … constrain the rendering rather than relying on good behavior'; it holds harder for the model, which is the thing the approval sheet exists to gate
+- [C-223 — The pane.* ops — open, update, close, list, surfaced by sink presence at assembly time](C-223-pane-ops.md) · Core · NOT a ToolGroup — groups are signal-gated (groups.rs:9-28) and there is no project.signal for 'a human is watching a terminal'; the precedent is [consult] model, whose mere presence surfaces the op once at assembly time and never churns (the A-95 cache-stability lesson)
+- [C-224 — The sub-agent fleet pane — render the SpawnActivity stream the TUI currently discards](C-224-subagent-fleet-pane.md) · Core · A-79 shipped a correlated, redacted, per-role sub-agent activity stream and flux-tui installs NO sink for it — the only impl in the tree is flux-cli's IgnoredSpawnActivity (main.rs:114), which drops every event; the data is already designed, tested and thrown away
+- [C-225 — config.get / config.set over an agent-writable allowlist, disjoint from PinnableKey by test](C-225-agent-writable-config.md) · Core · the first model-facing op that writes a file the safety envelope reads back — PinnableKey::ALL (config lib.rs:451-505) already enumerates every security-relevant key, so asserting the agent-writable set is DISJOINT from it makes [permissions]/[sandbox]/workspace.allow_all unrepresentable rather than denied
 
 ### Evidence-pinned memory — cross-session memory with provenance
 - [A-107 — The memory stream — MemoryEntry projection over an append-only memory:<scope> stream](A-107-memory-stream-and-projection.md) · Agent · cross-session memory needs its own stream in the SAME events.db, not a side table — inherits multi-process safety (C-25/C-125), WAL hygiene (C-126), the PG backend and flush-seam redaction for free

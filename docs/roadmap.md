@@ -85,6 +85,40 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### The agent-authored surface — panes the model opens, config it can safely change (epic) — 🔄 **DESIGNED (C-219; C-220…C-225 filed, none started)**
+
+The ask was "tools to directly modify the harness, the UI … so it would be completely free". Reading
+the tree said most of the plumbing is already built, and that the interesting question is not
+capability but trust. **The tool→surface seam exists twice already** — `ToolProgressSink` and
+`SpawnActivitySink` (`flux-runtime/src/lib.rs:188-262`) are the same shape: a send-only trait at L2,
+installed by the L6 surface, reachable only through `ToolContext`, with redaction applied at the
+reporter so a tool structurally cannot put raw bytes on a screen. **And "the agent extends the
+harness" already ships one layer down**: `op.register` (`flux-tools/src/reflect.rs:459`) lets the
+model author a Flux-Lang composite at runtime with `scope: turn|session|project|global`, where the
+engine owns all state mutation and every inner call still traverses the envelope. What is missing is
+only the surface layer. A third finding decided where to start: **A-79's correlated sub-agent
+activity stream has no consumer in the TUI at all** — the tree's only `SpawnActivitySink`
+implementation is `flux-cli`'s `IgnoredSpawnActivity` (`main.rs:114`), so a designed, redacted,
+tested stream is discarded on the daily driver. The epic's weight, though, sits somewhere else
+entirely: **a model that can draw a styled region inside a trusted terminal is a model that can
+imitate the approval sheet.** C-163 already wrote that rule for plugins — *constrain the rendering
+rather than relying on good behaviour* — and it holds harder for the model, which is the thing the
+approval sheet exists to gate. So both halves are closed structurally rather than by policy: panes
+carry `kind` and `data` and **no field that reaches a `Style`**, making trust chrome unforgeable
+because there is nothing to forge it with; and the agent-writable config key set is asserted
+**disjoint from `PinnableKey::ALL`** by unit test, so `[permissions]`, `[sandbox]`,
+`workspace.allow_all` and `private_net.web` are unknown keys rather than denied ones. Two scope
+decisions were taken deliberately against the more powerful option: a **typed pane vocabulary**
+(`rows|kv|log|progress|tree|markdown`) rather than raw layout control, and **no process re-exec** —
+`/resume`'s existing `project_session` gives in-process reload without opening a new
+turn-termination path, the bug class that has recurred three times. C-220 → C-221 → C-222 land the
+contract, the rendering and the trust invariant *before* C-223 makes any of it reachable by the
+model; C-224 (the fleet pane) and C-225 (config) are separable. Done looks like a live pane the agent
+opened on `flux tui`, and two tests: one where an approval-sheet impersonation payload still renders
+inside the marked agent region with the real sheet drawn over it, and one where the writable key set
+provably cannot name a security-relevant key. Design:
+[designs/agent-authored-surface.md](designs/agent-authored-surface.md).
+
 ### Cross-harness session history — search what was already said, in any local harness (epic) — 🔄 **DESIGNED (C-212; C-213…C-216 filed, none started)**
 
 The ask was a datasource: `search(query: "why did we drop the retry wrapper", harness: "opencode")`
