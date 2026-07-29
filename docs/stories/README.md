@@ -129,6 +129,10 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 ### Fleet coordinator — flux orchestrating flux across repos
 - [A-115 — JiraBoard over the existing jira plugin, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · the status↔State mapping is config, not code — Jira workflows differ per project, and a hardcoded transition name makes the backend work at exactly one company
 - [A-118 — GitlabBoard — a second real tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · deferrable past the epic's first release — its value is the proof that WorkBoard is not 'Jira with a trait on top'
+- [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
+- [A-133 — Startup does not strictly precede bus events under `App::run` — the run lease activates before `Start` completes](A-133-startup-strictly-precedes-bus-events.md) · Agent · filed from A-112's implementor report and still unaddressed — it has been living as a Note on A-129, which explicitly declined it as out of Acceptance
+- [A-134 — No SDK seam for a `WorkBoard` — decide whether boards are embeddable, then ship `ClientBuilder::try_with_work_board` if they are](A-134-sdk-seam-for-a-workboard.md) · Agent · filed from A-131's implementor report — live datasources have a documented SDK registration seam, boards have none, so an embedder cannot bind a board at all
+- [A-135 — `A2aClient` hardwires its transport, so there is no socket-free way to test a fleet journey](A-135-socket-free-fleet-journey-test.md) · Agent · A-117's blocker B3, the only one of its five with no owner — every fleet test today binds a real loopback listener because A2aClient offers no injectable-transport seam
 
 ### Flow Package Registry
 - [D-194 — Flow package registry — flux flow install (epic)](D-194-flow-package-registry-epic.md) · Language · EPIC — flows/journeys are shareable artifacts with no distribution story; reuse the signed plugin-pack channel (D-46/D-47: signed index, sha256, versioned store) for .flux flow packages: flux flow install <name> fetches into ~/.flux/flows/, flow_list surfaces them, the analyzer runs at install time so a broken pack fails at install
@@ -150,6 +154,10 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 
 ### Remote Approvals
 - [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
+
+### Security assurance — close the gap between the envelope and its proof
+- [C-233 — The published risk-column drift guard silently skips every non-built-in op, so `fleet.*`, `browser.*`, `web.*` and `consult` are unverified](C-233-risk-column-guard-skips-every-non-builtin-op.md) · Core · filed from A-131's implementor report — the_published_risk_column_matches_the_registry only checks rows whose op is in try_register_builtins, so a wrong published risk tier on any pack op passes green
+- [C-234 — The catalog-coherence registration-seam scan only reads `execution.rs`, so a pack registered from `app_cmd.rs` escapes the census](C-234-registration-seam-scan-only-reads-execution-rs.md) · Core · filed from A-131's implementor report — the board seam was caught only because build_datasources' doc comment happens to name try_register_work_board; that is a textual accident, not a property
 
 ### Taint Flow Policy
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
