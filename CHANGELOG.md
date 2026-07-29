@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **The examples sweep was stricter than the runtime it stands in for (C-232).**
+  `validate_program_structure` asserted `flow_named(&t.run).is_some()` for every trigger, but an
+  **agent-bound** trigger legitimately parses with an empty `run` — the agent drives the turn, so
+  `run` is never consulted — and `flux-app`'s own `Engine::validate` exempts exactly that shape. The
+  sweep did not, so a valid agent-triggered Program could not ship as an example.
+  Fixed at the cause rather than the symptom: the real defect was **two hand-maintained copies of one
+  rule**, which is a divergence waiting to happen rather than a divergence that happened once. The
+  rule now lives once at L0 as `Program::validate_trigger_targets()`, carrying both arms and a doc
+  comment that names its two callers and forbids re-implementing it; the runtime gate and the sweep
+  both delegate, so they agree **by construction instead of by maintenance**. Guarded in both
+  directions — the sweep now accepts an agent-bound trigger, and `should_panic` tests pin that it
+  still rejects a trigger naming no declared flow and one naming an undeclared agent, because the
+  cheap way to stop being too strict is to become too loose. Closes blocker B5 of A-117.
+
 ## [0.36.0] - 2026-07-29
 
 ### Added

@@ -2,7 +2,7 @@
 id: C-232
 title: "The examples validation sweep is stricter than the runtime, so a valid Program cannot ship as an example"
 pillar: Core
-status: in-progress
+status: done
 priority: 27
 design:
 note: "SURFACED BY A-117: examples_validate asserts flow_named(&t.run).is_some() for every trigger, but an agent-bound trigger legitimately parses with run == \"\" and flux-app's Engine::validate explicitly exempts it — the sweep does not, so an agent-triggered Program is unshippable as an example"
