@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-07-29
+
 ### Added
 
 - **Running `bash` cards show what the command is doing (C-158).** A long op used to show an

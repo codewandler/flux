@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.33.0 (2026-07-29)**: public + installable at
+Status as of **0.33.1 (2026-07-29)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
@@ -80,11 +80,55 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 ## Next
 
 > The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.32.0** is released — that MINOR grew the deliberately-exhaustive `EventKind` for agent-set
-> wake-ups, and also carried the NDJSON stdio protocol, `flux doctor`, the managed-config tier and
-> OpenTelemetry export. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
+> **v0.33.0** is released — that MINOR closed the TUI polish round-2 and event-store epics and added
+> `flux export`. Work sitting in `[Unreleased]` is the C-158 live-output channel, the C-47 release-tag
+> audit and A-99's shape types. See [CHANGELOG.md](../CHANGELOG.md) for the itemized history.
 
-### TUI polish round 2 — legibility, discoverability, one overlay language (epic) — ✅ **SHIPPED v0.33.0 (2026-07-29; C-149…C-158; nine implemented, C-158 retired with cause)**
+### Typed session log — session-shape validity by construction (epic) — 🔄 **IN PROGRESS (A-93; A-99 done, A-100…A-102 filed)**
+
+The "session shape is always a valid provider history" invariant has broken three times — cancel,
+compaction, the iteration cap — each time on a newly added turn-termination path, and each time it
+was caught by a provider 400 rather than by the code. It held by *discipline*: every writer funnels
+through one `finish_turn`, and compaction snaps its own boundary with a local helper. **A-99** (in
+`[Unreleased]`) makes the three rules types instead — `AssistantMessage`, `ValidHistory` and
+`ShapeError` in `flux-events`, neither constructible except through a checking constructor nor
+mutable afterwards, with rejections naming the failed invariant and the offending index. The design
+also turned up the predicted fourth path already in the tree: `resurrect.rs` closes a turn outside
+`finish_turn` and is correct only because its ordering was copied by hand. **A-100** (next, and the
+board's top `ready` story) puts a turn-lifecycle state machine at the write seam; **A-101** migrates
+`flux-flow` onto it and deletes the unguarded write API; **A-102** migrates the SDK/CLI history
+rewriters. Design: [designs/typed-session-log.md](designs/typed-session-log.md).
+
+### Transactional turns — a compensating undo for the world, not just the session (epic) — 🔄 **DESIGNED (A-91; A-103…A-106 filed, none started)**
+
+The Time Machine and the Lab replay and fork the *session*; nothing undoes effects in the *world*.
+Since every effect is a frozen `ActionBatch` of literal calls, each mutating op can declare its
+compensator and the runtime can synthesize a reverse batch, making `flux undo --turn 14` one command
+and "no compensator declared" a policy-visible risk signal. The design corrects the epic's original
+premise rather than inheriting it: reverse-batch synthesis **at approval time is not implementable**
+for the dominant case, because the prior bytes a `write` must restore are not knowable until
+immediately before the write — capturing early would confidently restore the wrong content. So
+declaration (static, on `ToolSpec`, which is what powers the risk signal) splits from materialization
+(execution time, inside the guarded boundary). Undo runs LIFO through the ordinary approval envelope,
+so it is itself undoable, and stops at the first failure rather than half-applying. `EventKind` is a
+closed set, so the new `Compensated` variant is breaking ⇒ MINOR. Design:
+[designs/transactional-turns.md](designs/transactional-turns.md).
+
+### Evidence-pinned memory — cross-session memory with provenance (epic) — 🔄 **DESIGNED (A-92; A-107…A-110 filed, none started)**
+
+flux has no memory of any kind today (confirmed by code read — the `Memory*` hits in
+`flux-capabilities` are the unrelated in-memory vector store). The flux-native version is not a
+scratchpad: every entry cites the event-store receipt and git SHA it was learned from, and goes
+stale-visible when that evidence changes. The load-bearing invariant is that **the model supplies the
+claim, the host supplies the citation** — `memory_note` takes only `(claim, scope)`, so there is no
+parameter through which provenance can be forged, the same property that makes `ActionBatch`
+trustworthy. Storage is a `memory:<scope>` stream in the existing `events.db`, inheriting C-25/C-125
+multi-process safety, C-126 WAL hygiene and flush-seam redaction instead of re-earning them;
+injection reuses the `<knowledge-base>` `ContextBlock` seam already hardened against breakout (A-21)
+and budget-bounded (A-24). Stale entries are still injected, marked — stale means *unverified*, not
+false. Design: [designs/evidence-pinned-memory.md](designs/evidence-pinned-memory.md).
+
+### TUI polish round 2 — legibility, discoverability, one overlay language (epic) — ✅ **COMPLETE (C-149…C-158, all ten stories; nine shipped v0.33.0, C-158 in `[Unreleased]`)**
 
 The first wave (C-101…C-116) delivered the TUI's *capabilities* — dense transcript, themes, approval
 sheet with diffs, focus/yank, search, live tool cards. A read of `crates/flux-tui/src` said the
@@ -104,13 +148,18 @@ defect: the per-op approval path received its `IntentSet` and discarded it, so a
 destructive call had never disclosed as destructive — only whole-plan approvals did. **C-155** makes
 per-card expansion discoverable, **C-156** requires a second Ctrl-C to quit, **C-157** greets an
 empty session with a card naming model, workspace and the three affordances worth knowing.
-**C-158** (streaming partial tool output onto running cards) is **retired with cause, not deferred
-vaguely**: the investigation established that no seam inside the TUI/CLI/runtime boundary can observe
-in-flight *content* — `bash` and `task` live in other crates and are awaited as one opaque unit, and
-the one live relay that already reaches a running op deliberately carries no content field, a
-security boundary rather than an oversight. Widening it is a different and larger decision; the exact
-installation seam is recorded on the story for whoever files it. The breaking change is
-`ApprovalRequest` gaining `mutating` ⇒ MINOR per the pre-1.0 rule.
+**C-158** (streaming partial tool output onto running cards) was first *retired with cause*: an
+investigation scoped to the TUI/CLI/runtime crates found no seam there that can observe in-flight
+content, since `bash` and `task` live elsewhere and are awaited as one opaque unit. It was then
+reopened with the wider crate set and **implemented in `[Unreleased]`**, and the blocking decision
+went against the option that investigation had framed: `SpawnActivityEvent` is **not** widened to
+carry content — that boundary keeps a spawned child's raw output from reaching the parent's surface
+unredacted-by-construction, and loosening it for every sub-agent consumer to serve a local `bash`
+card was the wrong trade. A narrower turn-scoped `ToolProgressSink` was added instead, whose only
+route to a sink binds the context's `Redactor`, so redaction is structural. The honest consequence,
+recorded rather than papered over: **only `bash` streams; `task` cards still show no live content.**
+The breaking change in the shipped part is `ApprovalRequest` gaining `mutating` ⇒ MINOR per the
+pre-1.0 rule.
 
 ### Event-store concurrent use — visibility, proof, hygiene (epic) — ✅ **SHIPPED v0.33.0 (2026-07-29; C-124…C-126, all three stories)**
 

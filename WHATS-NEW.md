@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-07-29
+
 ### Improved
 
 - **A running command shows what it is doing.** A shell command that takes a while used to display
