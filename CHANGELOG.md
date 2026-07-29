@@ -46,6 +46,33 @@ All notable changes to this project are documented in this file. The format is b
   held by a new `DispatchLedger` seam at L2, so the L3 fleet op never names the L5 board port; the
   two halves join only at L6.
 
+- **The fleet is reachable from a running `flux` (A-131).** A-113 landed the `WorkBoard` port and
+  A-116 the `fleet.*` ops; both were merged, tested, and constructed **nowhere** outside their own
+  modules, so no Program could call a fleet op or name the board it would operate on. This closes
+  both halves. `fleet.dispatch` / `fleet.status` / `fleet.cancel` are registered into the production
+  catalog with a `fleet` group and both op references, and a `datasource` declaration binds a board
+  through a `board:<backend>` kind — `board:markdown` for the durable file-backed board,
+  `board:memory` for a single run. The `board:` namespace is deliberate: `markdown` already means "a
+  directory of docs to index", so a board backed by markdown files needs a name that cannot be
+  confused with it, and a wrong kind now fails loudly instead of silently ingesting a board as
+  read-only knowledge.
+  Two things the first cut had wired but not working, both found by audit rather than by test:
+  `fleet.dispatch` was constructed without a `DispatchLedger`, so it **refused every call naming a
+  board item** and design §5's "the board is the run registry" stayed false in a running flux; and
+  the only bindable backend was `board:memory`, whose storage *is* the process it is supposed to
+  survive, which made crash recovery untestable. Both are closed: a board handle is retained past
+  registration to build the ledger from, and `board:markdown` binds the durable backend
+  program-relative via `rooted_in`, so a board inherits the session's guarded root rather than
+  opening one of its own — a board is a write surface, so it must not widen the sandbox it was given.
+  The ledger is wired only when a Program declares **exactly one** board, because `fleet.dispatch`
+  takes an item id but no board name: with several boards an id is genuinely ambiguous, and refusing
+  beats silently recording a run onto the wrong board.
+  Verified by hand end to end against a real loopback A2A worker, on a `board:markdown` board: a
+  dispatch wrote `runner` and `task_id` onto the item **as confirmed by reading the file off disk**,
+  the worker's own request log showed the non-blocking `message/send` arriving, a **second, fresh
+  process** over the same board re-derived both fields holding nothing but the board, and
+  `fleet.status` and `fleet.cancel` drove the same run to completion and cancellation.
+
 - **`MarkdownBoard` — the first file-backed `WorkBoard` (A-114).** One markdown file per item with a
   derived index, every read and write routed through `flux-system`'s guarded surface rather than
   `std::fs`, and a compare-and-set claim so concurrent claims on one item resolve to exactly one
