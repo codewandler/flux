@@ -955,12 +955,6 @@ impl Engine {
         let available = self.available_op_names();
         let known: HashSet<String> = available.iter().cloned().collect();
         let registered_tools: HashSet<String> = self.registry.names().into_iter().collect();
-        let agent_names: HashSet<&str> = self
-            .program
-            .agents
-            .iter()
-            .map(|agent| agent.name.as_str())
-            .collect();
         let datasource_names: HashSet<&str> = self
             .program
             .datasources
@@ -1032,21 +1026,11 @@ impl Engine {
                 }
             }
         }
-        for trigger in &self.program.triggers {
-            if let Some(agent) = trigger.agent.as_deref() {
-                if !agent_names.contains(agent) {
-                    return Err(Error::Other(format!(
-                        "trigger `{}` names unknown agent `{agent}`",
-                        trigger.name
-                    )));
-                }
-            } else if self.program.flow_named(&trigger.run).is_none() {
-                return Err(Error::Other(format!(
-                    "trigger `{}` names unknown journey/flow `{}`",
-                    trigger.name, trigger.run
-                )));
-            }
-        }
+        // Trigger targets: the rule lives at L0 on `Program` so this gate and flux-eval's
+        // `examples/` sweep cannot drift apart (C-232). Do not inline it back here.
+        self.program
+            .validate_trigger_targets()
+            .map_err(Error::Other)?;
 
         for journey in &self.program.journeys {
             let agent_permissions = match journey.agent.as_deref() {

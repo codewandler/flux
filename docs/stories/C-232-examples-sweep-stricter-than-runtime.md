@@ -2,7 +2,7 @@
 id: C-232
 title: "The examples validation sweep is stricter than the runtime, so a valid Program cannot ship as an example"
 pillar: Core
-status: ready
+status: in-progress
 priority: 27
 design:
 note: "SURFACED BY A-117: examples_validate asserts flow_named(&t.run).is_some() for every trigger, but an agent-bound trigger legitimately parses with run == \"\" and flux-app's Engine::validate explicitly exempts it — the sweep does not, so an agent-triggered Program is unshippable as an example"
@@ -23,16 +23,16 @@ coordinator needs — **cannot ship as an example at all**, because the test tha
 `examples/` fails on valid input.
 
 ## Acceptance
-- [ ] `validate_program_structure` accepts an agent-bound trigger (`run == ""`) exactly as
+- [x] `validate_program_structure` accepts an agent-bound trigger (`run == ""`) exactly as
       `Engine::validate` does. **Failing-first test**: an example Program with an agent-bound trigger
       passes the sweep — it fails today.
-- [ ] The sweep and the runtime agree **by construction, not by coincidence**. Two hand-maintained
+- [x] The sweep and the runtime agree **by construction, not by coincidence**. Two hand-maintained
       copies of "what is a valid trigger" is how this drifted in the first place, so either the test
       calls the runtime's own validation, or a comment at both sites names the other and says they
       must move together. Prefer the former.
-- [ ] The sweep does not get *looser* than the runtime in the process: a trigger naming a flow that
+- [x] The sweep does not get *looser* than the runtime in the process: a trigger naming a flow that
       genuinely does not exist must still fail. Pin both directions.
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
 - 2026-07-29 — surfaced by A-117 while it was blocked on other gaps. It is independent of the fleet
