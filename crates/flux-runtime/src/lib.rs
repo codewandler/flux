@@ -269,6 +269,273 @@ impl std::fmt::Debug for ToolProgressReporter {
     }
 }
 
+/// Where a pane asks to sit (C-220). The model **proposes** a role; the surface resolves, demotes
+/// or suppresses it. Deliberately not geometry: a slot names *what the region is for*, never how
+/// wide it is or where it starts, so the surface stays free to ignore it entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneSlot {
+    Left,
+    Right,
+    Bottom,
+    Overlay,
+}
+
+/// The renderer a pane asks for, from a **closed** set. The model picks a shape for its content;
+/// it cannot supply a renderer, a widget or a style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneKind {
+    Rows,
+    Kv,
+    Log,
+    Progress,
+    Tree,
+    Markdown,
+}
+
+/// How long a pane survives. Mirrors `op.register`'s scope ladder so the model learns one lifetime
+/// vocabulary rather than two.
+///
+/// [`PaneLifetime::Project`] parses but is **rejected by [`SurfaceReporter::send`]**: cross-session
+/// panes imply an on-disk pane store that no story has built yet. The value exists so the wire
+/// vocabulary is stable and a future story adds behaviour rather than a variant; until then a
+/// caller gets a clear error instead of a pane that silently fails to come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLifetime {
+    Turn,
+    Session,
+    Project,
+}
+
+/// One node of a [`PaneData::Tree`] payload. Content only — indentation, guides and collapse state
+/// belong to the renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneNode {
+    pub label: String,
+    #[serde(default)]
+    pub children: Vec<PaneNode>,
+}
+
+/// The typed payload behind a [`PaneKind`], carrying **content and nothing else**.
+///
+/// Every variant is text and structure: there is no colour, width, rect or z-order field anywhere
+/// in this type, and adding one would hand the model the ability to paint a region that imitates
+/// the approval sheet. That is the trust property C-222 rests on, and it is pinned by test rather
+/// than by convention. Column widths, wrapping, glyphs, tint and placement are surface-owned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneData {
+    Rows {
+        #[serde(default)]
+        header: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Kv {
+        pairs: Vec<(String, String)>,
+    },
+    Log {
+        lines: Vec<String>,
+    },
+    Progress {
+        label: String,
+        done: u64,
+        total: u64,
+    },
+    Tree {
+        roots: Vec<PaneNode>,
+    },
+    Markdown {
+        text: String,
+    },
+}
+
+impl PaneData {
+    /// The [`PaneKind`] this payload can be rendered as. Keeps [`PaneSpec::new`] from ever
+    /// producing a spec whose declared kind disagrees with its data.
+    pub fn kind(&self) -> PaneKind {
+        match self {
+            PaneData::Rows { .. } => PaneKind::Rows,
+            PaneData::Kv { .. } => PaneKind::Kv,
+            PaneData::Log { .. } => PaneKind::Log,
+            PaneData::Progress { .. } => PaneKind::Progress,
+            PaneData::Tree { .. } => PaneKind::Tree,
+            PaneData::Markdown { .. } => PaneKind::Markdown,
+        }
+    }
+
+    /// Every string in this payload, run through `redactor`. Applied by [`SurfaceReporter`], which
+    /// is the only thing that can reach a [`SurfaceSink`].
+    fn redacted(self, redactor: &Redactor) -> Self {
+        fn scrub(redactor: &Redactor, nodes: Vec<PaneNode>) -> Vec<PaneNode> {
+            nodes
+                .into_iter()
+                .map(|node| PaneNode {
+                    label: redactor.redact(&node.label),
+                    children: scrub(redactor, node.children),
+                })
+                .collect()
+        }
+        let line = |s: String| redactor.redact(&s);
+        match self {
+            PaneData::Rows { header, rows } => PaneData::Rows {
+                header: header.into_iter().map(line).collect(),
+                rows: rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(line).collect())
+                    .collect(),
+            },
+            PaneData::Kv { pairs } => PaneData::Kv {
+                pairs: pairs.into_iter().map(|(k, v)| (line(k), line(v))).collect(),
+            },
+            PaneData::Log { lines } => PaneData::Log {
+                lines: lines.into_iter().map(line).collect(),
+            },
+            PaneData::Progress { label, done, total } => PaneData::Progress {
+                label: line(label),
+                done,
+                total,
+            },
+            PaneData::Tree { roots } => PaneData::Tree {
+                roots: scrub(redactor, roots),
+            },
+            PaneData::Markdown { text } => PaneData::Markdown { text: line(text) },
+        }
+    }
+}
+
+/// A pane the model asks the surface to open.
+///
+/// The field list is the whole vocabulary: `id`, `title`, `slot`, `kind`, `lifetime`, `data`.
+/// **Nothing here reaches a `Style`** — no colour, no width, no rect, no z-order — because a model
+/// that can style a region inside a trusted terminal is a model that can imitate the approval
+/// sheet. Trust chrome (border, mark, placement) is surface-owned and therefore unforgeable: the
+/// model has no field to write it into. See `docs/designs/agent-authored-surface.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneSpec {
+    /// Model-chosen handle, used to address later `update`/`close` commands at this pane.
+    pub id: String,
+    pub title: String,
+    pub slot: PaneSlot,
+    pub kind: PaneKind,
+    pub lifetime: PaneLifetime,
+    pub data: PaneData,
+}
+
+impl PaneSpec {
+    /// A spec whose `kind` is taken from `data`, so the two cannot disagree. Deserialized specs
+    /// carry both independently — [`SurfaceReporter::send`] rejects a mismatch there.
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        slot: PaneSlot,
+        lifetime: PaneLifetime,
+        data: PaneData,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            slot,
+            kind: data.kind(),
+            lifetime,
+            data,
+        }
+    }
+}
+
+/// One instruction from a tool to the human surface. `list` is deliberately absent: this channel is
+/// send-only, so reading back what is open is a surface-side query, not a sink command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum PaneCommand {
+    Open(PaneSpec),
+    Update { id: String, data: PaneData },
+    Close { id: String },
+}
+
+impl PaneCommand {
+    /// This command with every model-supplied string redacted. `id` is scrubbed too — redaction is
+    /// deterministic, so an `open`/`update`/`close` triple still addresses the same pane.
+    fn redacted(self, redactor: &Redactor) -> Self {
+        match self {
+            PaneCommand::Open(spec) => PaneCommand::Open(PaneSpec {
+                id: redactor.redact(&spec.id),
+                title: redactor.redact(&spec.title),
+                slot: spec.slot,
+                kind: spec.kind,
+                lifetime: spec.lifetime,
+                data: spec.data.redacted(redactor),
+            }),
+            PaneCommand::Update { id, data } => PaneCommand::Update {
+                id: redactor.redact(&id),
+                data: data.redacted(redactor),
+            },
+            PaneCommand::Close { id } => PaneCommand::Close {
+                id: redactor.redact(&id),
+            },
+        }
+    }
+}
+
+/// Synchronous, send-only channel from a tool to the human surface, mirroring [`ToolProgressSink`]
+/// and [`SpawnActivitySink`]. Defined at L2 so a tool can address the surface without any crate
+/// below L6 knowing a surface exists.
+///
+/// Implementations must not hold a lock across an await, and must not block: this is called from
+/// inside a running tool, so a slow sink stalls the work it is describing. Enqueue and return.
+pub trait SurfaceSink: Send + Sync {
+    fn emit(&self, command: PaneCommand);
+}
+
+/// An owned, `'static` handle a tool uses to address the human surface.
+///
+/// Tools never touch a [`SurfaceSink`] directly, and this is the only way to reach one: every
+/// command goes through the same [`Redactor`] the final result does, so there is no path by which
+/// a tool can put unredacted content on a surface. Obtained from [`ToolContext::surface`], which
+/// returns `None` when no host installed a sink — a headless run then gets a clear failure rather
+/// than a silent no-op the model would read as success.
+#[derive(Clone)]
+pub struct SurfaceReporter {
+    redactor: Redactor,
+    sink: Arc<dyn SurfaceSink>,
+}
+
+impl SurfaceReporter {
+    /// Validate `command`, redact it, and hand it to the installed sink.
+    ///
+    /// Two rejections, both cheap and both about keeping the contract honest rather than about
+    /// policy: [`PaneLifetime::Project`] has no implementation yet, and a deserialized spec whose
+    /// `kind` disagrees with its `data` would leave the surface choosing which one to believe.
+    pub fn send(&self, command: PaneCommand) -> Result<()> {
+        if let PaneCommand::Open(spec) = &command {
+            if spec.lifetime == PaneLifetime::Project {
+                return Err(Error::Other(format!(
+                    "pane '{}': lifetime 'project' is not supported yet — panes persist for 'turn' \
+                     or 'session' only",
+                    spec.id
+                )));
+            }
+            if spec.kind != spec.data.kind() {
+                return Err(Error::Other(format!(
+                    "pane '{}': declared kind {:?} does not match its data ({:?})",
+                    spec.id,
+                    spec.kind,
+                    spec.data.kind()
+                )));
+            }
+        }
+        self.sink.emit(command.redacted(&self.redactor));
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SurfaceReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SurfaceReporter").finish_non_exhaustive()
+    }
+}
+
 /// Grace allowed for turn-owned sub-agent tasks to observe parent cancellation and durably
 /// finalize before the runtime aborts them. The child engine's cancellation path normally closes
 /// immediately; this bound exists for buggy or cancellation-insensitive [`Spawner`] implementations.
@@ -410,6 +677,7 @@ pub struct RuntimeTurnContext {
     spawn_supervisor: Option<Arc<SpawnTaskSupervisor>>,
     identity: Option<TurnIdentity>,
     tool_progress: Option<Arc<dyn ToolProgressSink>>,
+    surface: Option<Arc<dyn SurfaceSink>>,
 }
 
 /// The caller and trust assertion frozen for one runtime turn.
@@ -473,6 +741,12 @@ impl RuntimeTurnContext {
         self
     }
 
+    /// Carry the pane channel a tool addresses the human surface on (C-220).
+    pub fn with_surface_sink(mut self, sink: Arc<dyn SurfaceSink>) -> Self {
+        self.surface = Some(sink);
+        self
+    }
+
     /// Carry the owner for sub-agent tasks started during this turn.
     pub fn with_spawn_supervisor(mut self, supervisor: Arc<SpawnTaskSupervisor>) -> Self {
         self.spawn_supervisor = Some(supervisor);
@@ -510,6 +784,11 @@ impl RuntimeTurnContext {
         self.tool_progress.clone()
     }
 
+    /// The turn-owned pane channel, when a surface installed one.
+    pub fn surface_sink(&self) -> Option<Arc<dyn SurfaceSink>> {
+        self.surface.clone()
+    }
+
     /// The immutable authorization identity carried by this turn, when explicitly installed.
     pub fn identity(&self) -> Option<TurnIdentity> {
         self.identity.clone()
@@ -523,6 +802,7 @@ impl RuntimeTurnContext {
             && self.spawn_supervisor.is_none()
             && self.identity.is_none()
             && self.tool_progress.is_none()
+            && self.surface.is_none()
     }
 }
 
@@ -926,6 +1206,9 @@ pub struct ToolContext {
     /// Stored live tool-output fallback; see `cancel`. Ordinary engine turns carry the surface's
     /// sink lexically with the rest of [`RuntimeTurnContext`].
     tool_progress: Arc<Mutex<Option<Arc<dyn ToolProgressSink>>>>,
+    /// Stored pane-channel fallback; see `cancel`. Ordinary engine turns carry the surface's sink
+    /// lexically with the rest of [`RuntimeTurnContext`].
+    surface: Arc<Mutex<Option<Arc<dyn SurfaceSink>>>>,
     /// Stored sub-agent supervisor fallback for deliberately pinned spawned runtimes. Ordinary
     /// conversational turns carry it lexically with the rest of [`RuntimeTurnContext`].
     spawn_supervisor: Arc<Mutex<Option<Arc<SpawnTaskSupervisor>>>>,
@@ -967,6 +1250,7 @@ impl ToolContext {
             spawn_activity: Arc::new(Mutex::new(None)),
             spawn_supervisor: Arc::new(Mutex::new(None)),
             tool_progress: Arc::new(Mutex::new(None)),
+            surface: Arc::new(Mutex::new(None)),
             identity: None,
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1049,6 +1333,29 @@ impl ToolContext {
             })
     }
 
+    /// Install a stored pane channel. Prefer a lexical [`RuntimeTurnContext`] for live turn drives;
+    /// this setter is intended for fresh-context pinning and compatibility.
+    pub fn set_surface_sink(&self, sink: Arc<dyn SurfaceSink>) {
+        *self.surface.lock().unwrap() = Some(sink);
+    }
+
+    /// A redacting handle a tool uses to address the human surface (C-220), or `None` when no host
+    /// installed a sink — the posture of [`ToolContext::progress_reporter`]. A headless `flux run`,
+    /// `flux-server` or SDK embedding therefore has no pane channel at all, and a caller learns
+    /// that instead of writing into a void.
+    ///
+    /// This is the ONLY way to reach a [`SurfaceSink`], and it binds the context's own
+    /// [`Redactor`] — the same one [`Executor::dispatch`] scrubs the final result with — so pane
+    /// content cannot skip redaction even if the tool wanted it to.
+    pub fn surface(&self) -> Option<SurfaceReporter> {
+        self.runtime_turn_context()
+            .surface_sink()
+            .map(|sink| SurfaceReporter {
+                redactor: self.redactor.clone(),
+                sink,
+            })
+    }
+
     /// Snapshot the identity frozen for the active lexical turn. Direct one-shot runtimes may see
     /// an inherited construction-time snapshot; an ordinary context outside a turn returns `None`.
     pub fn turn_identity(&self) -> Option<TurnIdentity> {
@@ -1067,6 +1374,7 @@ impl ToolContext {
             spawn_supervisor: self.spawn_supervisor.lock().unwrap().clone(),
             identity: self.identity.clone(),
             tool_progress: self.tool_progress.lock().unwrap().clone(),
+            surface: self.surface.lock().unwrap().clone(),
         })
     }
 
@@ -1079,6 +1387,7 @@ impl ToolContext {
         *self.spawn_activity.lock().unwrap() = turn.spawn_activity;
         *self.spawn_supervisor.lock().unwrap() = turn.spawn_supervisor;
         *self.tool_progress.lock().unwrap() = turn.tool_progress;
+        *self.surface.lock().unwrap() = turn.surface;
         self.identity = turn.identity;
     }
 
@@ -3754,6 +4063,376 @@ mod tests {
         let (dir, system) = temp_workspace("progress-absent");
         let ctx = ToolContext::new(system);
         assert!(ctx.progress_reporter("bash").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[derive(Default)]
+    struct RecordingSurfaceSink(Mutex<Vec<PaneCommand>>);
+
+    impl SurfaceSink for RecordingSurfaceSink {
+        fn emit(&self, command: PaneCommand) {
+            self.0.lock().unwrap().push(command);
+        }
+    }
+
+    /// C-220 acceptance: a pane crosses to the surface through the SAME redaction a result gets.
+    /// The reporter binds the context's redactor, so a tool cannot title a pane with a secret or
+    /// fill one with secret-bearing rows — there is no unredacted path to the sink at all.
+    #[tokio::test]
+    async fn pane_content_is_redacted_before_it_reaches_a_surface() {
+        let (dir, system) = temp_workspace("surface-redact");
+        let ctx = ToolContext::new(system);
+        ctx.redactor.add_secret("hunter2-super-secret");
+        let sink = Arc::new(RecordingSurfaceSink::default());
+        let installed: Arc<dyn SurfaceSink> = sink.clone();
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_surface_sink(installed),
+            async {
+                let surface = ctx.surface().expect("a sink is installed for this turn");
+                surface
+                    .send(PaneCommand::Open(PaneSpec::new(
+                        "creds",
+                        "deploy hunter2-super-secret",
+                        PaneSlot::Right,
+                        PaneLifetime::Session,
+                        PaneData::Log {
+                            lines: vec![
+                                "connecting with hunter2-super-secret".to_string(),
+                                // A credential-SHAPED token the redactor has never been told
+                                // about is caught too, by the same pattern matcher.
+                                "token sk-ant-abcdefghijklmnop".to_string(),
+                            ],
+                        },
+                    )))
+                    .expect("a session-lifetime pane is accepted");
+            },
+        )
+        .await;
+
+        let seen = sink.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let PaneCommand::Open(spec) = &seen[0] else {
+            panic!("expected an open command, got {:?}", seen[0]);
+        };
+        assert!(
+            !spec.title.contains("hunter2-super-secret"),
+            "registered secret survived onto a pane title: {:?}",
+            spec.title
+        );
+        let PaneData::Log { lines } = &spec.data else {
+            panic!("expected log data, got {:?}", spec.data);
+        };
+        assert!(
+            !lines[0].contains("hunter2-super-secret"),
+            "registered secret survived onto pane data: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains("sk-ant-abcdefghijklmnop"),
+            "credential-shaped token survived onto pane data: {:?}",
+            lines[1]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no surface installed there is no reporter, so the pane channel is opt-in and absent by
+    /// default — a headless run cannot accidentally acquire one.
+    #[tokio::test]
+    async fn no_installed_surface_sink_means_no_reporter() {
+        let (dir, system) = temp_workspace("surface-absent");
+        let ctx = ToolContext::new(system);
+        assert!(ctx.surface().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-220 acceptance: `lifetime: project` PARSES — the wire vocabulary is stable — but the
+    /// reporter refuses it, because cross-session panes have no implementation yet. The caller
+    /// learns that; it does not get a pane that silently fails to come back.
+    #[tokio::test]
+    async fn project_lifetime_parses_but_the_reporter_rejects_it() {
+        let (dir, system) = temp_workspace("surface-project");
+        let ctx = ToolContext::new(system);
+        let sink = Arc::new(RecordingSurfaceSink::default());
+        let installed: Arc<dyn SurfaceSink> = sink.clone();
+
+        let parsed: PaneLifetime = serde_json::from_value(json!("project")).unwrap();
+        assert_eq!(parsed, PaneLifetime::Project);
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_surface_sink(installed),
+            async {
+                let surface = ctx.surface().expect("a sink is installed for this turn");
+                let err = surface
+                    .send(PaneCommand::Open(PaneSpec::new(
+                        "notes",
+                        "Notes",
+                        PaneSlot::Left,
+                        PaneLifetime::Project,
+                        PaneData::Markdown {
+                            text: "hello".to_string(),
+                        },
+                    )))
+                    .expect_err("project lifetime has no implementation yet");
+                let message = err.to_string();
+                assert!(
+                    message.contains("project") && message.contains("not supported yet"),
+                    "rejection should say plainly what is unsupported: {message}"
+                );
+            },
+        )
+        .await;
+
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "a rejected pane must never reach the surface"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Field names anywhere in a serialized pane that would let a model reach a `Style`. A model
+    /// that can paint a region inside a trusted terminal can imitate the approval sheet, so the
+    /// absence of these is the trust property C-222 rests on.
+    const STYLE_BEARING: &[&str] = &[
+        "color",
+        "colour",
+        "style",
+        "fg",
+        "bg",
+        "background",
+        "foreground",
+        "width",
+        "height",
+        "rect",
+        "area",
+        "x",
+        "y",
+        "z",
+        "z_order",
+        "zorder",
+        "layer",
+        "theme",
+        "bold",
+        "italic",
+        "underline",
+        "modifier",
+        "border",
+        "margin",
+        "padding",
+        "align",
+        "font",
+    ];
+
+    /// Every key in `value`, recursively.
+    fn collect_keys(value: &Value, into: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    into.push(key.clone());
+                    collect_keys(child, into);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect_keys(item, into)),
+            _ => {}
+        }
+    }
+
+    /// C-220 acceptance: the pane vocabulary is content and structure only. This test is the pin —
+    /// widening `PaneSpec` or `PaneData` with anything style-bearing fails here, so C-222's trust
+    /// property cannot be relaxed by accident in a later story.
+    #[test]
+    fn pane_spec_carries_no_style_bearing_field() {
+        let every_kind = vec![
+            PaneData::Rows {
+                header: vec!["file".into()],
+                rows: vec![vec!["a.rs".into()]],
+            },
+            PaneData::Kv {
+                pairs: vec![("branch".into(), "main".into())],
+            },
+            PaneData::Log {
+                lines: vec!["building".into()],
+            },
+            PaneData::Progress {
+                label: "tests".into(),
+                done: 3,
+                total: 9,
+            },
+            PaneData::Tree {
+                roots: vec![PaneNode {
+                    label: "root".into(),
+                    children: vec![PaneNode {
+                        label: "child".into(),
+                        children: vec![],
+                    }],
+                }],
+            },
+            PaneData::Markdown {
+                text: "# hi".into(),
+            },
+        ];
+
+        for data in every_kind {
+            let spec = PaneSpec::new("p", "Title", PaneSlot::Right, PaneLifetime::Turn, data);
+            let wire = serde_json::to_value(&spec).unwrap();
+
+            // The vocabulary is exactly the six documented fields — no more.
+            let mut top: Vec<&str> = wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            top.sort_unstable();
+            assert_eq!(
+                top,
+                ["data", "id", "kind", "lifetime", "slot", "title"],
+                "PaneSpec grew or lost a field: {wire}"
+            );
+
+            let mut keys = Vec::new();
+            collect_keys(&wire, &mut keys);
+            for key in keys {
+                let normalized = key.to_ascii_lowercase();
+                assert!(
+                    !STYLE_BEARING.contains(&normalized.as_str()),
+                    "pane payload gained a style-bearing field '{key}': a model could then paint a \
+                     region that imitates the approval sheet (see C-222): {wire}"
+                );
+            }
+        }
+    }
+
+    /// The three closed vocabularies are exactly what the design names, and an unknown value is a
+    /// parse failure rather than a silently-accepted default.
+    #[test]
+    fn pane_vocabularies_are_closed_sets() {
+        for (wire, slot) in [
+            ("left", PaneSlot::Left),
+            ("right", PaneSlot::Right),
+            ("bottom", PaneSlot::Bottom),
+            ("overlay", PaneSlot::Overlay),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<PaneSlot>(json!(wire)).unwrap(),
+                slot
+            );
+        }
+        for (wire, kind) in [
+            ("rows", PaneKind::Rows),
+            ("kv", PaneKind::Kv),
+            ("log", PaneKind::Log),
+            ("progress", PaneKind::Progress),
+            ("tree", PaneKind::Tree),
+            ("markdown", PaneKind::Markdown),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<PaneKind>(json!(wire)).unwrap(),
+                kind
+            );
+        }
+        for (wire, lifetime) in [
+            ("turn", PaneLifetime::Turn),
+            ("session", PaneLifetime::Session),
+            ("project", PaneLifetime::Project),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<PaneLifetime>(json!(wire)).unwrap(),
+                lifetime
+            );
+        }
+        assert!(serde_json::from_value::<PaneSlot>(json!("floating")).is_err());
+        assert!(serde_json::from_value::<PaneKind>(json!("canvas")).is_err());
+        assert!(serde_json::from_value::<PaneLifetime>(json!("forever")).is_err());
+    }
+
+    /// A deserialized spec carries `kind` and `data` independently, so the two can disagree. The
+    /// reporter refuses rather than leaving the surface to pick which one to believe.
+    #[tokio::test]
+    async fn a_spec_whose_kind_contradicts_its_data_is_rejected() {
+        let (dir, system) = temp_workspace("surface-mismatch");
+        let ctx = ToolContext::new(system);
+        let sink = Arc::new(RecordingSurfaceSink::default());
+        let installed: Arc<dyn SurfaceSink> = sink.clone();
+
+        let spec: PaneSpec = serde_json::from_value(json!({
+            "id": "p",
+            "title": "Title",
+            "slot": "right",
+            "kind": "rows",
+            "lifetime": "turn",
+            "data": { "markdown": { "text": "# hi" } },
+        }))
+        .expect("both fields are on the wire, so this parses");
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_surface_sink(installed),
+            async {
+                let err = ctx
+                    .surface()
+                    .expect("a sink is installed for this turn")
+                    .send(PaneCommand::Open(spec))
+                    .expect_err("a contradictory spec is refused");
+                assert!(err.to_string().contains("does not match its data"));
+            },
+        )
+        .await;
+
+        assert!(sink.0.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `update` and `close` reach the surface through the same redaction `open` does — there is one
+    /// gate, not one per command shape.
+    #[tokio::test]
+    async fn update_and_close_are_redacted_on_the_same_path() {
+        let (dir, system) = temp_workspace("surface-update");
+        let ctx = ToolContext::new(system);
+        ctx.redactor.add_secret("hunter2-super-secret");
+        let sink = Arc::new(RecordingSurfaceSink::default());
+        let installed: Arc<dyn SurfaceSink> = sink.clone();
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_surface_sink(installed),
+            async {
+                let surface = ctx.surface().expect("a sink is installed for this turn");
+                surface
+                    .send(PaneCommand::Update {
+                        id: "creds".to_string(),
+                        data: PaneData::Kv {
+                            pairs: vec![("token".into(), "hunter2-super-secret".into())],
+                        },
+                    })
+                    .unwrap();
+                surface
+                    .send(PaneCommand::Close {
+                        id: "creds".to_string(),
+                    })
+                    .unwrap();
+            },
+        )
+        .await;
+
+        let seen = sink.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        let PaneCommand::Update { data, .. } = &seen[0] else {
+            panic!("expected an update, got {:?}", seen[0]);
+        };
+        let PaneData::Kv { pairs } = data else {
+            panic!("expected kv data, got {data:?}");
+        };
+        assert!(
+            !pairs[0].1.contains("hunter2-super-secret"),
+            "registered secret survived a pane update: {:?}",
+            pairs[0].1
+        );
+        // An id with no secret in it is unchanged, so open/update/close still address one pane.
+        assert_eq!(
+            seen[1],
+            PaneCommand::Close {
+                id: "creds".to_string()
+            }
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
