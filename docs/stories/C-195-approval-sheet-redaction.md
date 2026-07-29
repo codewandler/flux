@@ -2,8 +2,8 @@
 id: C-195
 title: "Decide and enforce redaction on the approval sheet's diff preview"
 pillar: Core
-status: backlog
-priority:
+status: ready
+priority: 2
 epic: security-assurance
 design: docs/designs/security-assurance.md
 note: "SPLIT FROM C-185 item 4 — flux-tui performs NO redaction at all (no flux-secret dep, no Redactor in the crate); covering the approval sheet's hunk preview is a new dependency edge plus a design decision, not a boundary-set change"

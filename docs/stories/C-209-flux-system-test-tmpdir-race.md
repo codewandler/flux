@@ -3,7 +3,7 @@ id: C-209
 title: "flux-system tests build fixtures under a transient TMPDIR, reddening the gate at random"
 pillar: Core
 status: ready
-priority: 19
+priority: 3
 epic:
 design:
 note: "temp_workspace() reads temp_dir() under sandbox::EnvGuard for a documented reason; ~15 other tests call it bare, so a concurrent sandbox test's transient TMPDIR becomes their fixture root and it vanishes underneath them"

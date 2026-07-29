@@ -2,8 +2,8 @@
 id: C-92
 title: Add hunk-level git_* ops so an agent can stage part of a shared file
 pillar: Core
-status: backlog
-priority:
+status: ready
+priority: 6
 note: "whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool"
 ---
 

@@ -2,7 +2,8 @@
 id: A-102
 title: "Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()"
 pillar: Agent
-status: backlog
+status: ready
+priority: 4
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
 note: "fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N"

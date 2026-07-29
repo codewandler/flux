@@ -2,8 +2,8 @@
 id: C-131
 title: flux policy simulate — replay a proposed policy against recorded history
 pillar: Core
-status: backlog
-priority:
+status: ready
+priority: 5
 epic:
 design:
 note: "before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)"

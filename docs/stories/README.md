@@ -46,17 +46,21 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-209 — flux-system tests build fixtures under a transient TMPDIR, reddening the gate at random](C-209-flux-system-test-tmpdir-race.md) · Core · temp_workspace() reads temp_dir() under sandbox::EnvGuard for a documented reason; ~15 other tests call it bare, so a concurrent sandbox test's transient TMPDIR becomes their fixture root and it vanishes underneath them
+- [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
+- [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
 
 ### Security assurance — close the gap between the envelope and its proof
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
+- [C-195 — Decide and enforce redaction on the approval sheet's diff preview](C-195-approval-sheet-redaction.md) · Core · SPLIT FROM C-185 item 4 — flux-tui performs NO redaction at all (no flux-secret dep, no Redactor in the crate); covering the approval sheet's hunk preview is a new dependency edge plus a design decision, not a boundary-set change
 - [C-208 — Extend ToolSpec coherence to the full production catalog, and settle the Network-without-Read posture](C-208-full-catalog-toolspec-coherence.md) · Core · C-191 gated try_register_builtins only; 11 known violations sit outside it, including improve_log — [Write, Filesystem] at Risk::Low, C-191's own title case
+
+### Typed session log — session-shape validity by construction
+- [A-102 — Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()](A-102-migrate-sdk-cli-history-rewriters.md) · Agent · fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N
 
 ## Blocked
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
 
 ## Backlog
-- [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
-- [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
 - [C-161 — User-defined review checks — project criteria layered over the built-in reviewer roles](C-161-user-defined-review-checks.md) · Core · flux review runs three embedded reviewer roles (review.rs:100-108) overridable only wholesale via .flux/agents/review-*.md — there is no per-CRITERION project check with its own severity and path scope, though --fail-on <severity> already exists (args.rs:381-384) so the severity plumbing is done
 - [C-163 — Plugin-registered commands and host UI prompts](C-163-plugin-commands-and-host-ui.md) · Core · plugins expose OPS only — PluginCapabilities (flux-plugin-protocol lib.rs:515-578) has no ui/command verb, and the host-callback surface is just host.read/host.write — so a plugin cannot add a slash command or ask the user a question; the frame protocol is command-keyed (lib.rs:44-59) on an independent additive 1.x line, which is exactly the seam this needs
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
@@ -92,9 +96,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ### Remote Approvals
 - [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
 
-### Security assurance — close the gap between the envelope and its proof
-- [C-195 — Decide and enforce redaction on the approval sheet's diff preview](C-195-approval-sheet-redaction.md) · Core · SPLIT FROM C-185 item 4 — flux-tui performs NO redaction at all (no flux-secret dep, no Redactor in the crate); covering the approval sheet's hunk preview is a new dependency edge plus a design decision, not a boundary-set change
-
 ### Taint Flow Policy
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
 
@@ -107,9 +108,6 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-104 — Materialize reverse actions — pre-image capture at the dispatch seam + EventKind::Compensated](A-104-preimage-capture-and-compensated-event.md) · Agent · capture runs inside the guarded boundary immediately before execution (NOT at approval time — prior bytes aren't knowable then); BREAKING: EventKind is a closed set, a new variant ⇒ MINOR
 - [A-105 — flux undo --turn <n> — reverse-batch reconstruction, LIFO execution, itemized report](A-105-flux-undo-turn.md) · Agent · the epic's headline verb; undo is NOT privileged — it runs through the ordinary approval + guarded envelope, so the undo itself records compensations and is undoable
 - [A-106 — Irreversibility disclosure — surface 'cannot be undone' at approval and to policy](A-106-irreversibility-disclosure-at-approval.md) · Agent · the risk signal that IS available at approval time because declaration is static; rides the C-182 op list + C-154 risk tint rather than adding a new sheet
-
-### Typed session log — session-shape validity by construction
-- [A-102 — Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()](A-102-migrate-sdk-cli-history-rewriters.md) · Agent · fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N
 
 ## Done
 - [A-01 — Unify SDK onto FlowEngine, retire the classic Agent loop](A-01-unify-flowengine.md) · Agent · one loop everywhere; `flux-agent` repurposed as the `AgentSpec` home (see [CHANGELOG](../../CHANGELOG.md))
