@@ -1303,6 +1303,93 @@ impl System {
         write_result
     }
 
+    /// Read–modify–write a workspace file under an **exclusive reservation**, committed by an
+    /// atomic rename — the compare-and-set that [`write_file_atomic`](Self::write_file_atomic)
+    /// cannot offer, because its staging sibling carries a unique name and its rename therefore
+    /// always wins.
+    ///
+    /// The reservation is a *deterministically* named sibling created with `O_EXCL`, so exactly one
+    /// writer per destination holds it at a time; committing renames it **onto** the destination,
+    /// releasing it in the same atomic step. Writers targeting different paths never meet, so a
+    /// file-per-record store gets mutual exclusion without a shared lock file.
+    ///
+    /// * `Ok(true)` — `update` ran and its output is now the file's contents.
+    /// * `Ok(false)` — another writer holds the reservation. Nothing was read and nothing written;
+    ///   the caller decides whether that is a conflict or a retry.
+    /// * `Err(_)` — the IO failed, or `update` refused. Either way the destination is untouched:
+    ///   a refusal is "never start", not "roll back", so a rejected update cannot leave a partial
+    ///   or truncated file behind.
+    ///
+    /// `update` receives the current contents, or `None` when the destination does not exist yet —
+    /// which is what lets a caller mint a new record and edit an existing one through one path.
+    pub fn update_file_reserved(
+        &self,
+        path: &str,
+        update: impl FnOnce(Option<&str>) -> Result<String>,
+    ) -> Result<bool> {
+        use std::io::Write as _;
+
+        let destination = self.workspace.resolve(path)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Config(format!("path {path:?} has no parent")))?;
+        std::fs::create_dir_all(parent)?;
+
+        // Resolve again after creating the parent, exactly as `write_file_atomic` does: it closes
+        // the parent-symlink swap window and gives the reservation its physical, guarded directory.
+        let destination = self.workspace.resolve(path)?;
+        let file_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Config(format!("path {path:?} is not valid UTF-8")))?;
+        let reservation = destination.with_file_name(format!(".{file_name}.reserved"));
+
+        // The `O_EXCL` create *is* the compare half of the compare-and-set. A loser must return
+        // before touching anything — and in particular must not remove the reservation, which
+        // belongs to the writer that won it.
+        let file = match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&reservation)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+
+        // Borrowed so the cleanup below still owns the path after the closure consumes `file`.
+        let staged = &reservation;
+        let commit = (move || -> Result<()> {
+            let mut file = file;
+            let current = match std::fs::read(&destination) {
+                Ok(bytes) => Some(
+                    String::from_utf8(bytes)
+                        .map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))?,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let next = update(current.as_deref())?;
+            file.write_all(next.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+
+            // A final identity check catches a destination or parent retarget before replacement.
+            let final_destination = self.workspace.resolve(path)?;
+            if final_destination != destination {
+                return Err(Error::Config(format!(
+                    "path {path:?} changed identity during a reserved write"
+                )));
+            }
+            std::fs::rename(staged, &final_destination)?;
+            Ok(())
+        })();
+        if commit.is_err() {
+            let _ = std::fs::remove_file(&reservation);
+        }
+        commit.map(|()| true)
+    }
+
     /// Read the raw bytes of a file within the workspace (no UTF-8 decode). Used to sniff binary
     /// files (NUL bytes) and report byte sizes *before* a lossy text decode.
     pub async fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>> {
@@ -2939,6 +3026,103 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
             std::fs::remove_dir_all(&outside).ok();
         }
+    }
+
+    /// The compare half of the compare-and-set: while one writer holds the reservation, a second
+    /// writer for the same path is told so rather than being allowed to race it. The nesting is
+    /// what makes the contention deterministic — the inner call runs *inside* the outer one's
+    /// window, with no reliance on thread timing.
+    #[test]
+    fn a_reserved_update_excludes_a_second_writer_for_the_same_path() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file_atomic("item.md", "first").unwrap();
+
+        let committed = sys
+            .update_file_reserved("item.md", |current| {
+                assert_eq!(current, Some("first"));
+                // A second writer arriving mid-window is refused, and refused *without* stealing
+                // or clearing the reservation this call still holds.
+                let contended = sys
+                    .update_file_reserved("item.md", |_| {
+                        panic!("the contended writer must not run its update")
+                    })
+                    .expect("contention is a verdict, not an error");
+                assert!(!contended, "a second writer must not hold the reservation");
+                Ok("second".to_string())
+            })
+            .unwrap();
+        assert!(committed);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("item.md")).unwrap(),
+            "second"
+        );
+
+        // The reservation was consumed by the commit, so the next writer sails through.
+        assert!(sys
+            .update_file_reserved("item.md", |current| {
+                assert_eq!(current, Some("second"));
+                Ok("third".into())
+            })
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("item.md")).unwrap(),
+            "third"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A refused update is "never start", not "roll back": the destination keeps its exact bytes
+    /// and no reservation is left behind to wedge the next writer.
+    #[test]
+    fn a_refused_reserved_update_leaves_the_destination_and_the_directory_clean() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file_atomic("nested/item.md", "original").unwrap();
+
+        let error = sys
+            .update_file_reserved("nested/item.md", |_| {
+                Err(Error::Other("the caller refused".into()))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("the caller refused"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("nested/item.md")).unwrap(),
+            "original"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(dir.join("nested"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "item.md")
+            .collect();
+        assert!(leftovers.is_empty(), "stray staging files: {leftovers:?}");
+
+        // And the path is still writable afterwards — the refusal did not wedge it.
+        assert!(sys
+            .update_file_reserved("nested/item.md", |_| Ok("replaced".into()))
+            .unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `None` arm: the same call mints a file that does not exist yet, which is what lets a
+    /// file-per-record store create and edit through one guarded path.
+    #[test]
+    fn a_reserved_update_mints_a_missing_file_and_stays_inside_the_workspace() {
+        let (dir, sys) = temp_workspace();
+        assert!(sys
+            .update_file_reserved("fresh.md", |current| {
+                assert_eq!(current, None);
+                Ok("minted".into())
+            })
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh.md")).unwrap(),
+            "minted"
+        );
+        assert!(
+            sys.update_file_reserved("../escape.md", |_| Ok("nope".into()))
+                .is_err(),
+            "a reserved write is confined exactly like every other guarded write"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]

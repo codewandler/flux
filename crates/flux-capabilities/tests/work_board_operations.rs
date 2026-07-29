@@ -1,8 +1,8 @@
-//! The six generated `<domain>.*` board operations (A-113).
+//! The seven generated `<domain>.*` board operations (A-113, A-130).
 //!
 //! Mirrors `live_datasource_operations.rs` — the board port follows `try_register_live_datasource`
 //! exactly for op generation, atomic registration on a clone, and the evidence surface. What is new
-//! here, and what carries the review weight, is the **mutating** half: four ops declaring
+//! here, and what carries the review weight, is the **mutating** half: five ops declaring
 //! `Effect::Write` whose `permission_subjects` must stay concrete.
 
 use std::collections::HashSet;
@@ -16,13 +16,14 @@ use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::{System, Workspace};
 use serde_json::{json, Value};
 
-/// The four ops that write. Every assertion about gating below is driven off this list, so adding a
+/// The five ops that write. Every assertion about gating below is driven off this list, so adding a
 /// mutating op without deciding its subject shape makes the tests fail rather than pass silently.
-const MUTATING: [&str; 4] = [
+const MUTATING: [&str; 5] = [
     "board.create",
     "board.transition",
     "board.claim",
     "board.comment",
+    "board.record_dispatch",
 ];
 
 fn ctx() -> ToolContext {
@@ -54,12 +55,15 @@ fn mutating_params(op: &str, id: &str) -> Value {
         "board.transition" => json!({"id": id, "to": "claimed"}),
         "board.claim" => json!({"id": id, "assignee": "worker-a"}),
         "board.comment" => json!({"id": id, "text": "a note"}),
+        "board.record_dispatch" => {
+            json!({"id": id, "runner": "https://worker-1.internal:8787", "task_id": "t_1"})
+        }
         other => panic!("unclassified mutating op {other}"),
     }
 }
 
 #[test]
-fn registration_installs_six_source_labelled_generated_contracts() {
+fn registration_installs_seven_source_labelled_generated_contracts() {
     let registry = registry();
     assert_eq!(
         registry.names(),
@@ -69,6 +73,7 @@ fn registration_installs_six_source_labelled_generated_contracts() {
             "board.create",
             "board.get",
             "board.list",
+            "board.record_dispatch",
             "board.transition",
         ]
     );
@@ -101,7 +106,7 @@ fn registration_installs_six_source_labelled_generated_contracts() {
 }
 
 #[test]
-fn the_surface_groups_all_six_operations_behind_the_domain_signal() {
+fn the_surface_groups_all_seven_operations_behind_the_domain_signal() {
     let mut registry = ToolRegistry::new();
     let surface =
         try_register_work_board(&mut registry, "board", Arc::new(MemoryBoard::new())).unwrap();
@@ -119,6 +124,7 @@ fn the_surface_groups_all_six_operations_behind_the_domain_signal() {
                 "board.transition".into(),
                 "board.claim".into(),
                 "board.comment".into(),
+                "board.record_dispatch".into(),
             ],
             surface_when: vec![SignalMatch {
                 kind: KIND_SIGNAL.into(),
@@ -136,7 +142,7 @@ fn the_surface_groups_all_six_operations_behind_the_domain_signal() {
                 &HashSet::from([surface.ambient_signal.clone()])
             )
             .len(),
-        6
+        7
     );
 }
 

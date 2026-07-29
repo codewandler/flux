@@ -450,6 +450,7 @@ Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values su
 | `FLUX_A2A_MAX_INFLIGHT_PER_REALM` | Concurrent in-flight A2A turns permitted per realm. |
 | `FLUX_A2A_PUSH_ALLOW_LOCAL` | Permits A2A push notifications to loopback targets. |
 | `FLUX_A2A_PUSH_PRIVATE_HOSTS` | Private hosts permitted as A2A push targets. |
+| `FLUX_MAX_INFLIGHT_DELIVERIES` | How many program deliveries a running app processes at once (default `64`). Past the bound a delivery **waits** — it is never dropped — so a channel adapter under a storm feels backpressure instead of the app spawning without limit. A `0` or unparseable value falls back to the default. Raise it above your program's fan-out width if journeys deliberately wait on one another. |
 
 See the [HTTP API](../agent/http-api.md) and
 [Server authentication & tenancy](../security/server-auth.md).

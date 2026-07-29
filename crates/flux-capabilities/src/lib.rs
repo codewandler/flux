@@ -22,10 +22,10 @@ pub use datasource::{
     chunk_text, datasource_tools, freshness, ingest_markdown, ingest_openapi, ingest_text,
     live_datasource_tools, records_to_context_blocks, register_datasource_ops, reindex,
     try_register_datasource_ops, try_register_live_datasource, try_register_work_board,
-    validate_board_contract, validate_live_contract, work_board_tools, ChunkOptions,
+    validate_board_contract, validate_live_contract, work_board_tools, BoardLedger, ChunkOptions,
     DatasourceBackend, DatasourceHostCaps, Embedder, EmbeddingUsage, LiveAccess, LiveDatasource,
-    LiveDatasourceSurface, MemoryBackend, MemoryBoard, MemoryVectorStore, SemanticIndex,
-    SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface,
+    LiveDatasourceSurface, MarkdownBoard, MemoryBackend, MemoryBoard, MemoryVectorStore,
+    SemanticIndex, SqliteBackend, VectorStore, WorkBoard, WorkBoardSurface,
 };
 pub use endpoint::{
     endpoint_tools, register_endpoint_ops, try_register_endpoint_ops, CredentialReader,

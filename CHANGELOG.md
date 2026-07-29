@@ -6,6 +6,90 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The TUI has somewhere to put a pane (C-221).** Second story of the **agent-authored surface**
+  epic, and still not reachable by the model — rendering lands before reachability on purpose, so
+  C-223 wires the `pane.*` ops onto a surface that already draws. Today a host (or a test) can push
+  a pane into one of four slots: `left`/`right` carve columns off the transcript row, `bottom` takes
+  one extra vertical constraint, and `overlay` reuses the shared overlay chrome C-152 consolidated
+  rather than growing a second one. Header, footer and composer keep their full width in every slot.
+  **Every bound is a surface constant, never the payload's choice** — pane count, body rows, column
+  width, the bottom strip's height and tree depth are all decided by `flux-tui` from the terminal's
+  geometry, and content that exceeds one is truncated by the surface behind an explicit elision
+  marker. A pane can never push the transcript below its width floor, and below a minimum width no
+  pane is drawn at all: the narrow-terminal posture `EMPTY_CARD_MIN_WIDTH` established, where the
+  aside is dropped rather than the conversation squeezed.
+  Panes are deliberately outside the transcript machinery — no layout-cache entry, no `focused`
+  index, no scroll bookkeeping, and invisible to transcript search — the same rule the orientation
+  card follows, for the same reason: anything drawn into the transcript area that is not a transcript
+  row must stay out of it entirely. Each `kind` renders through machinery the TUI already owns
+  (`markdown` via `flux-markdown`, `tree` via the plan DAG's renderer, kept beside it so the glyphs
+  and theme roles cannot drift apart), so **no dependency was added** and `ratatui` stays pinned at
+  0.29. Panes always draw before the approval sheet, which is the ordering C-222's trust invariant
+  will rest on. A session with no panes renders cell for cell as it did before, pinned by every
+  pre-existing TUI layout test passing unchanged.
+
+- **The board is the run registry (A-130).** ⚠ **Breaking for out-of-tree `WorkBoard` implementors.**
+  The fleet design claims run state needs no second store, because `fleet.dispatch` writes the
+  worker's address and `task_id` back onto the board `Item` — so crash recovery is "restart, sweep,
+  re-derive". That write path did not exist, which made the recovery story a claim rather than a
+  property. `WorkBoard` now carries a **required** `record_dispatch` method — a seventh generated
+  operation rather than an extension of `claim`, deliberately: the `task_id` does not exist until the
+  worker answers the send, so folding it into `claim` would buy no atomicity for the only window that
+  matters, and would make `claim`'s conditional idempotency incoherent ("same assignee, different
+  task id" has no answer). It is required and has no default body on purpose — a backend that
+  silently declined to record would look healthy right up until a restart recovered nothing. The
+  write is durable, replacing rather than appending (a stale `task_id` would send the sweep after a
+  run that no longer exists), and explicitly *not* a state change: `transition` stays the single
+  entry point into the state machine, because a second one could not be edge-checked. Layering is
+  held by a new `DispatchLedger` seam at L2, so the L3 fleet op never names the L5 board port; the
+  two halves join only at L6.
+
+- **`MarkdownBoard` — the first file-backed `WorkBoard` (A-114).** One markdown file per item with a
+  derived index, every read and write routed through `flux-system`'s guarded surface rather than
+  `std::fs`, and a compare-and-set claim so concurrent claims on one item resolve to exactly one
+  winner while different items never contend. It is the first backend that can actually demonstrate
+  what the design's recovery story needs, and it carries the test that proves it: a dispatch recorded
+  through one board instance is recovered by a **second, independent instance opened over the same
+  directory**. That property is one the shared contract suite structurally cannot check — the suite
+  receives an already-constructed board, so a backend caching in memory passes it in full while
+  recovering nothing across a restart. `record_dispatch` is implemented by reusing the existing
+  reserved-update primitive, so durability, atomicity and no-tearing come from the audited write path
+  instead of a reimplementation.
+
+### Fixed
+
+- **`fleet.dispatch` could never be registered at all (A-116, found via A-130/A-131).** It declared
+  `Effect::Process` without `AccessKind::Process`, a combination the runtime rejects — so the op was
+  unregistrable in any `ToolRegistry`, and being unregistrable *was* the unreachability the fleet
+  wiring set out to close. It survived because A-116's tests only ever called `.spec()` and
+  `.execute()` on freshly constructed tools, so the registration path that validates authority
+  contracts never ran against them; that gap is now closed by a test which registers the fleet ops
+  for real and asserts the exact requirement vector, not merely that registration succeeds. Authority
+  is derived from a **discriminated** subject split: the worker's origin earns the network and
+  provider requirements, and the board item earns `datasource_write` — so the operator is never asked
+  to approve network access to a board item, and the single grant covers both routes to the same
+  write. An endpoint that cannot be named now yields a conservative wildcard requirement rather than
+  an empty one, since an empty list would have meant the op demanded nothing. `fleet.status` and
+  `fleet.cancel` were checked against the same validator and were already sound.
+
+- **Delivery concurrency is bounded again (A-129).** A-112 made `App::deliver` concurrent by
+  spawning each dequeued delivery into a `JoinSet` — which was the point of that story, but it also
+  removed the supervisor's `mpsc` capacity bound, and that bound was the **only** backpressure in
+  the system. A loop that dequeues instantly applies none, so a webhook storm could spawn a journey
+  per event without limit. This matters most for exactly the workload A-112 exists to enable: a
+  coordinator taking inbound webhooks while a sweep runs. Deliveries now acquire an admission slot
+  before the spawn — default **64**, configurable via `App::with_max_inflight_deliveries` or
+  `FLUX_MAX_INFLIGHT_DELIVERIES`. The bound holds work back rather than dropping it: everything
+  submitted still runs as slots free, and it does not reintroduce head-of-line blocking between
+  unrelated channels, so a slow sweep still cannot starve webhook intake. Backpressure is also
+  **observable** — `App::delivery_load` reports `DeliveryLoad { in_flight, waiting, limit }`, so a
+  delivery queued behind the bound is distinguishable from one merely running slowly, rather than
+  both looking like "slow". The slot is held by a `#[must_use]` guard that releases on drop, so a
+  delivery future cancelled mid-enqueue cannot leak a waiting count and strand the app in a
+  permanently "backpressured" state.
+
 ## [0.35.0] - 2026-07-29
 
 ### Fixed

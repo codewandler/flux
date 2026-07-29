@@ -33,7 +33,7 @@ fn overlay_window(selected: usize, total: usize, cap: usize) -> (usize, usize) {
 /// overflow counter — one `Clear` + `Paragraph` pane sized exactly to its content instead of three
 /// hand-rolled copies. Selection styling and row content stay with the caller; only the shape
 /// (header style, no border, exact-fit sizing) is shared.
-fn render_overlay_panel(
+pub(super) fn render_overlay_panel(
     frame: &mut Frame,
     theme: &Theme,
     header: impl Into<String>,
@@ -157,18 +157,37 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     } else {
         queued.len().min(3) as u16
     };
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
+    // C-221: the `bottom` pane slot is ONE extra vertical constraint, and it is added only when it
+    // actually claims rows — a session with no panes (or a frame too narrow/short to carry them)
+    // solves the exact six-constraint layout it solved before C-221, so its frame is unchanged
+    // cell for cell. Header, footer and composer keep the full width in every case; only the
+    // transcript row is ever split.
+    let bottom_h = panes::bottom_rows(state, frame.area());
+    let mut constraints = vec![Constraint::Length(1), Constraint::Min(1)];
+    if bottom_h > 0 {
+        constraints.push(Constraint::Length(bottom_h));
+    }
+    constraints.extend([
         Constraint::Length(queue_h),
         Constraint::Length(menu_h),
         Constraint::Length(input_h),
         Constraint::Length(1),
-    ])
-    .split(frame.area());
-    let (header_area, transcript_area, queue_area, menu_area, input_area, footer_area) = (
-        chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5],
+    ]);
+    let chunks = Layout::vertical(constraints).split(frame.area());
+    let rest = 2 + usize::from(bottom_h > 0);
+    let bottom_area = (bottom_h > 0).then(|| chunks[2]);
+    let (header_area, transcript_row, queue_area, menu_area, input_area, footer_area) = (
+        chunks[0],
+        chunks[1],
+        chunks[rest],
+        chunks[rest + 1],
+        chunks[rest + 2],
+        chunks[rest + 3],
     );
+    // The `left`/`right` slots carve columns off the transcript ROW only. With no side pane
+    // resolved this returns the row unchanged, so `transcript_area` is the same `Rect` as before.
+    let pane_areas = panes::split_transcript(state, frame.area(), transcript_row);
+    let transcript_area = pane_areas.transcript;
 
     frame.render_widget(
         Paragraph::new(state.header_line(header_area.width)),
@@ -201,6 +220,14 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
             );
         }
     }
+
+    // C-221: panes draw here — after the transcript, and always BEFORE the approval sheet at the
+    // bottom of this function, so a pane can never paint over it. They take no part in
+    // `transcript_viewport`: no layout-cache entry, no `focused` index (C-111), no scroll
+    // bookkeeping (C-106), not found by transcript search (C-108) — the same rule
+    // `render_empty_state_card` states above, for the same reason. Every colour here comes from
+    // the `Theme`; `PaneSpec` carries no style-bearing field.
+    panes::render_panes(frame, state, &pane_areas, bottom_area);
 
     if !queued.is_empty() {
         let mut rows: Vec<Line> = queued
@@ -309,6 +336,12 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         Paragraph::new(state.footer_line(footer_area.width)),
         footer_area,
     );
+
+    // C-221: an `overlay`-slot pane reuses `render_overlay_panel` — the chrome C-152 consolidated
+    // the queue, session-picker and help overlays onto — rather than growing a second overlay
+    // shape. It draws BEFORE the surface's own overlays below (and, like them, before the approval
+    // sheet), so surface-owned chrome always paints over an agent pane and never under it.
+    panes::render_overlay_pane(frame, state);
 
     if state.queue_open && !queued.is_empty() {
         let (start, visible) = overlay_window(state.queue_sel, queued.len(), 10);

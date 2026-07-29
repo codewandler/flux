@@ -38,6 +38,7 @@ use flux_runtime::{
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
 
+use crate::admission::DeliveryLoad;
 use crate::bus::{delivery_origin, Bus};
 use crate::ops::{self, JourneyHost};
 use crate::park::{self, ParkedAsk};
@@ -505,6 +506,11 @@ impl App {
     /// agent sessions, ask-parks, the recorded-send log — so two deliveries that touch the same
     /// conversation interleave rather than queue. A journey may not re-enter `deliver` on the App
     /// it is itself running under; that still fails fast.
+    ///
+    /// **Bounded (A-129).** At most [`DeliveryLoad::limit`] deliveries run at once; a submission
+    /// beyond that **waits** for a slot rather than being dropped or rejected, and the wait
+    /// propagates backwards — a caller submitting into a saturated App blocks in `deliver`. See
+    /// [`App::with_max_inflight_deliveries`] and [`App::delivery_load`].
     pub async fn deliver(
         &self,
         label: impl Into<String>,
@@ -521,6 +527,32 @@ impl App {
     /// surface may resume supervision without creating another event receiver or repeating startup.
     pub async fn run(&self) -> Result<()> {
         self.engine.delivery.run(&self.engine).await
+    }
+
+    /// Bound how many deliveries may run at once (A-129), overriding
+    /// [`crate::DEFAULT_MAX_INFLIGHT_DELIVERIES`] and the `FLUX_MAX_INFLIGHT_DELIVERIES`
+    /// environment override. `0` is clamped to `1`; there is no "unbounded" setting.
+    ///
+    /// Consumes and returns the App because the limit is read once, when the delivery supervisor
+    /// starts on the first [`deliver`](Self::deliver)/[`run`](Self::run) — configure it while you
+    /// still hold the App by value, which is exactly the window in which it can have no actor.
+    ///
+    /// Raise it above your program's fan-out width if journeys deliberately wait on one another:
+    /// deliveries at the bound *block*, so `limit` mutually-dependent deliveries can deadlock.
+    #[must_use]
+    pub fn with_max_inflight_deliveries(self, limit: usize) -> Self {
+        self.engine.delivery.set_limit(limit);
+        self
+    }
+
+    /// A snapshot of delivery admission (A-129): how many deliveries are running, how many are
+    /// held by the bound, and what the bound is.
+    ///
+    /// `waiting > 0` is backpressure — work the App is refusing to start. A delivery counted in
+    /// `in_flight` was admitted and is simply taking a long time. Distinguishing the two is the
+    /// whole reason this is exposed: they look identical from a caller's latency.
+    pub fn delivery_load(&self) -> DeliveryLoad {
+        self.engine.delivery.load()
     }
 
     /// Test-only: how many messages the agent's bound session for `conversation` holds (`0` if none).

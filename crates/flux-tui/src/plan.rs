@@ -7,6 +7,9 @@ use ansi_to_tui::IntoText;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
+
+use flux_runtime::PaneNode;
 
 use crate::theme::{self, Theme};
 
@@ -83,6 +86,49 @@ pub fn render(data: &Value, theme: &Theme) -> Vec<Line<'static>> {
         Ok(text) => out.extend(text.lines),
         Err(_) => out.extend(tree_ansi.lines().map(|l| Line::raw(l.to_string()))),
     }
+    out
+}
+
+/// How deep a [`PaneNode`] forest is walked before the surface stops (C-221). The payload chooses
+/// the tree's shape but never how much of the screen it costs, so depth is a surface constant like
+/// every other pane bound.
+pub(crate) const MAX_TREE_DEPTH: usize = 6;
+
+/// Render a [`PaneNode`] forest as an indented tree, with the same `├─`/`└─` connectors the plan
+/// DAG above draws and the same muted-connector / plain-label split (C-221).
+///
+/// Kept here beside [`render`] rather than in `panes.rs` so the TUI has one tree renderer: the plan
+/// DAG arrives as a `DraftAst` behind ANSI and a pane arrives as [`PaneNode`]s, but the glyphs,
+/// the indent guides and the theme roles must not drift apart between them. Connectors come from
+/// the theme and labels are truncated to `cols` here — a pane payload carries content only, so it
+/// can decide neither style nor width.
+pub(crate) fn render_nodes(roots: &[PaneNode], theme: &Theme, cols: usize) -> Vec<Line<'static>> {
+    fn walk(
+        nodes: &[PaneNode],
+        prefix: &str,
+        depth: usize,
+        theme: &Theme,
+        cols: usize,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        if depth >= MAX_TREE_DEPTH {
+            return;
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            let last = index + 1 == nodes.len();
+            let guide = format!("{prefix}{}", if last { "└─ " } else { "├─ " });
+            let room = cols.saturating_sub(UnicodeWidthStr::width(guide.as_str()));
+            out.push(Line::from(vec![
+                Span::styled(guide, theme.muted_style()),
+                Span::styled(crate::truncate(&node.label, room), theme.panel_style()),
+            ]));
+            let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+            walk(&node.children, &child_prefix, depth + 1, theme, cols, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(roots, "", 0, theme, cols, &mut out);
     out
 }
 

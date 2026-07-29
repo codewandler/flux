@@ -2,7 +2,7 @@
 id: C-221
 title: Pane slots in the TUI — layout split, bounds, and narrow-width suppression
 pillar: Core
-status: ready
+status: done
 priority: 12
 epic: agent-authored-surface
 design: docs/designs/agent-authored-surface.md
@@ -18,25 +18,25 @@ Give `flux-tui` somewhere to put a pane. `ChatState` grows a pane collection, `r
 push a pane, the model cannot yet. Rendering lands before reachability.
 
 ## Acceptance
-- [ ] `ChatState.panes` holds host-pushed panes keyed by id, with `turn` and `session` lifetimes
+- [x] `ChatState.panes` holds host-pushed panes keyed by id, with `turn` and `session` lifetimes
       honoured (`turn` panes cleared at turn end). `project` is not implemented — the reporter
       already rejects it (C-220).
-- [ ] `render` (`crates/flux-tui/src/rendering.rs:122`) splits the transcript row horizontally for
+- [x] `render` (`crates/flux-tui/src/rendering.rs:122`) splits the transcript row horizontally for
       `left`/`right` and takes one extra vertical constraint for `bottom`. `overlay` reuses
       `render_overlay_panel` (`:36`) rather than growing a second overlay chrome — C-152 consolidated
       that on purpose.
-- [ ] **Bounded by surface constants, not by model input:** max pane count, max rows per pane, max
+- [x] **Bounded by surface constants, not by model input:** max pane count, max rows per pane, max
       total width fraction. A pane exceeding its bound is truncated by the surface, never allowed to
       push the transcript below its minimum.
-- [ ] **Failing-first test (`TestBackend`):** below a minimum transcript width, panes are not drawn
+- [x] **Failing-first test (`TestBackend`):** below a minimum transcript width, panes are not drawn
       at all — the same posture `EMPTY_CARD_MIN_WIDTH` (`:66`) established and C-102 took for the
       header/footer bars. A narrow terminal renders exactly as it does today.
-- [ ] Panes never participate in `transcript_viewport`: no layout cache entry, no `focused` index, no
+- [x] Panes never participate in `transcript_viewport`: no layout cache entry, no `focused` index, no
       scroll bookkeeping. `render_empty_state_card`'s doc comment (`:70-74`) states why; the same
       rule applies and is asserted.
-- [ ] Each `kind` renders through machinery the TUI already owns — `markdown` via `flux-markdown`,
+- [x] Each `kind` renders through machinery the TUI already owns — `markdown` via `flux-markdown`,
       `tree` via `plan.rs` — so no widget dependency is added under the `ratatui` 0.29 hold.
-- [ ] Full gate green; existing TUI layout tests unchanged (a session with no panes must render
+- [x] Full gate green; existing TUI layout tests unchanged (a session with no panes must render
       byte-identically to today).
 
 ## Progress
