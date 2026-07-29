@@ -1109,6 +1109,7 @@ impl EnvGuard {
         for &k in keys {
             std::env::remove_var(k);
         }
+        HOLDS_ENV_LOCK.with(|h| h.set(true));
         Self { _lock: lock, saved }
     }
 }
@@ -1122,23 +1123,85 @@ impl Drop for EnvGuard {
                 None => std::env::remove_var(k),
             }
         }
+        HOLDS_ENV_LOCK.with(|h| h.set(false));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// True while this thread holds [`SANDBOX_ENV_LOCK`] through a live [`EnvGuard`]. The lock is a
+    /// plain non-reentrant `Mutex`, so [`fixture_path`] asks this instead of blindly acquiring it a
+    /// second time and deadlocking a test that is already inside a guard.
+    static HOLDS_ENV_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Takes [`SANDBOX_ENV_LOCK`] for the caller's scope, unless this thread is already inside an
+/// [`EnvGuard`] — the lock is not reentrant, so a second acquire on the same thread would deadlock.
+/// This is what lets every env-reading test helper be called from anywhere without case analysis.
+#[cfg(test)]
+pub(crate) fn env_lock_if_free() -> Option<EnvGuard> {
+    if HOLDS_ENV_LOCK.with(std::cell::Cell::get) {
+        None
+    } else {
+        Some(EnvGuard::new(&[]))
+    }
+}
+
+/// A per-process-unique fixture name, `flux-<prefix>-<pid>-<seq>`.
+#[cfg(test)]
+fn fixture_name(prefix: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "flux-{prefix}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// **The one way this crate's tests may build a fixture root** (C-209). Reads the system temp dir
+/// under [`SANDBOX_ENV_LOCK`] and hangs a unique name off it; the path is not created.
+///
+/// Sandbox tests deliberately mutate `TMPDIR` under an [`EnvGuard`] —
+/// `wrap_argv_rejects_root_from_automatic_tmpdir_too` sets it to `/`. A bare `temp_dir()` read in
+/// another test thread can therefore observe that transient value and root its fixture under it;
+/// the owning test then restores `TMPDIR` and the victim fails on a path it never chose, as a bare
+/// `Permission denied`/`No such file or directory` in a *different* test each run. Reading the base
+/// under the same lock makes the capture impossible, which is why no bare read may return to the
+/// test modules — `no_bare_temp_dir_in_the_test_modules` in `lib.rs` enforces that.
+#[cfg(test)]
+pub(crate) fn fixture_path(prefix: &str) -> PathBuf {
+    let _env = env_lock_if_free();
+    std::env::temp_dir().join(fixture_name(prefix))
+}
+
+/// [`fixture_path`], created on disk.
+#[cfg(test)]
+pub(crate) fn fixture_dir(prefix: &str) -> PathBuf {
+    let dir = fixture_path(prefix);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_workspace() -> (PathBuf, Workspace) {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("flux-sandbox-test-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fixture_dir("sandbox-test");
         let ws = Workspace::new(&dir).unwrap();
         (dir, ws)
+    }
+
+    /// **The one way these tests may build a policy** (C-209, second leg).
+    /// [`SpawnPolicy::for_workspace`] reads `TMPDIR`/`CARGO_HOME`/`RUSTUP_HOME`/`HOME` from the
+    /// process env, so a bare call while `wrap_argv_rejects_root_from_automatic_tmpdir_too` has
+    /// `TMPDIR` swapped to `/` yields a posture nobody configured — and the caller then fails on a
+    /// writable root it never asked for, in a different test each run. Read them under the same
+    /// lock the mutators hold; `env_lock_if_free` keeps this safe inside a test that holds its own
+    /// [`EnvGuard`]. `no_bare_temp_dir_in_the_test_modules` in `lib.rs` keeps this the only call.
+    fn workspace_policy(ws: &Workspace, settings: &SandboxSettings) -> SpawnPolicy {
+        let _env = env_lock_if_free();
+        SpawnPolicy::for_workspace(ws, settings)
     }
 
     // `EnvGuard`/`SANDBOX_ENV_LOCK` now live at module scope (`pub(crate)`, above) so `lib.rs`'s
@@ -1311,7 +1374,7 @@ mod tests {
     fn wrap_argv_is_identity_when_inactive() {
         let (_dir, ws) = temp_workspace();
         let sandbox = Sandbox::disabled();
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         let argv = vec!["echo".to_string(), "hi".to_string()];
         let wrapped = sandbox.wrap_argv(&argv, &policy).unwrap();
         assert_eq!(wrapped, argv);
@@ -1375,7 +1438,7 @@ mod tests {
             network: false,
             extra_writable: vec![PathBuf::from("/opt/extra")],
         };
-        let policy = SpawnPolicy::for_workspace(&ws, &settings);
+        let policy = workspace_policy(&ws, &settings);
 
         assert_eq!(policy.cwd, ws.root());
         assert!(!policy.network);
@@ -1397,7 +1460,7 @@ mod tests {
             .unwrap_or_default();
 
         let (_dir, ws) = temp_workspace();
-        let policy = SpawnPolicy::for_workspace(&ws, &SandboxSettings::off());
+        let policy = workspace_policy(&ws, &SandboxSettings::off());
         assert!(policy.writable.contains(&home.join(".cargo")));
         assert!(policy.writable.contains(&home.join(".rustup")));
     }
@@ -1420,7 +1483,7 @@ mod tests {
             // A relative extra-writable is also a misconfiguration and must be dropped.
             extra_writable: vec![PathBuf::from(""), PathBuf::from("relative/dir")],
         };
-        let policy = SpawnPolicy::for_workspace(&ws, &settings);
+        let policy = workspace_policy(&ws, &settings);
 
         assert!(
             !policy.writable.iter().any(|p| p.as_os_str().is_empty()),
@@ -1465,7 +1528,7 @@ mod tests {
         std::fs::write(admin.join("commondir"), "../..\n").unwrap();
 
         let ws = Workspace::new(&worktree).unwrap();
-        let policy = SpawnPolicy::for_workspace(&ws, &SandboxSettings::off());
+        let policy = workspace_policy(&ws, &SandboxSettings::off());
         assert!(
             policy.writable.contains(&admin.canonicalize().unwrap()),
             "linked-worktree admin dir must be writable: {:?}",
@@ -1498,7 +1561,7 @@ mod tests {
         std::fs::write(arbitrary.join("commondir"), "../..\n").unwrap();
 
         let ws = Workspace::new(&worktree).unwrap();
-        let policy = SpawnPolicy::for_workspace(&ws, &SandboxSettings::off());
+        let policy = workspace_policy(&ws, &SandboxSettings::off());
         assert!(
             !policy.writable.contains(&arbitrary.canonicalize().unwrap()),
             "a workspace-writable .git file must not grant arbitrary host writes"
@@ -1508,11 +1571,7 @@ mod tests {
     // -- test helpers (D-131/D-132) -------------------------------------------------------------
 
     fn temp_dir(prefix: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("flux-sandbox-{prefix}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        fixture_dir(&format!("sandbox-{prefix}"))
     }
 
     #[cfg(unix)]
@@ -1674,7 +1733,7 @@ mod tests {
             },
         };
         let (_dir, ws) = temp_workspace();
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         let err = sandbox
             .wrap_argv(&["true".to_string()], &policy)
             .expect_err("a late `--bind / /` would erase the special mounts");
@@ -1696,7 +1755,7 @@ mod tests {
                 bwrap: PathBuf::from("/usr/bin/bwrap"),
             },
         };
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         assert!(policy.writable.contains(&PathBuf::from("/")));
         assert!(sandbox.wrap_argv(&["true".to_string()], &policy).is_err());
     }
@@ -1717,7 +1776,7 @@ mod tests {
                 bwrap: PathBuf::from("/usr/bin/bwrap"),
             },
         };
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         assert!(sandbox.wrap_argv(&["true".to_string()], &policy).is_err());
     }
 
@@ -1739,7 +1798,7 @@ mod tests {
             },
         };
         let ws = Workspace::new(&worktree).unwrap();
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         let out = sandbox.wrap_argv(&["true".to_string()], &policy).unwrap();
         assert!(
             output.is_dir(),
@@ -2125,7 +2184,7 @@ mod tests {
             },
         };
         let (_dir, ws) = temp_workspace();
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         let out = sandbox.wrap_argv(&["true".to_string()], &policy).unwrap();
         assert_eq!(out[0], "/usr/bin/bwrap");
         assert_eq!(out.last().unwrap(), "true");
@@ -2144,7 +2203,7 @@ mod tests {
             },
         };
         let (_dir, ws) = temp_workspace();
-        let policy = SpawnPolicy::for_workspace(&ws, sandbox.settings());
+        let policy = workspace_policy(&ws, sandbox.settings());
         let out = sandbox.wrap_argv(&["true".to_string()], &policy).unwrap();
         assert_eq!(out[0], "/usr/bin/sandbox-exec");
         assert_eq!(out.last().unwrap(), "true");
