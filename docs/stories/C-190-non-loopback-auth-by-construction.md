@@ -2,7 +2,7 @@
 id: C-190
 title: "Make the non-loopback auth invariant hold by construction, not only inside serve_on"
 pillar: Core
-status: in-progress
+status: done
 priority: 7
 epic: security-assurance
 design: docs/designs/security-assurance.md

@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Security
 
+- **The unauthenticated-non-loopback refusal now holds by construction, not only in `serve_on`
+  (C-190, breaking).** `serve_on` refused to bind an `Open` (unauthenticated) listener to a
+  non-loopback address, but the check lived in the serving function — a lower-level caller that
+  mounted the router directly (as the A2A channel does) inherited no guard and silently re-owned the
+  invariant. `AGENTS.md` is explicit that there are no bypass paths; this was one. `flux_server::router`
+  / `router_multi` now take the `bind: SocketAddr` and return `Result`, refusing `Open` + a
+  non-loopback address at **router construction** via one shared `guard_open_bind` (total
+  `ip().is_loopback()` classification, covering all of `127.0.0.0/8` and `::1` — not a spelling list).
+  Every in-tree caller passes its true bind address; the A2A channel's own config-time check is now a
+  redundant fail-fast backstop rather than the sole guard. **Breaking:** the public `router`/`router_multi`
+  signatures changed (added bind arg, now fallible) — direct mounters must pass the address they serve
+  on and handle the `Result`. Independently reviewed: auth/realm layering and the C-189 limits are
+  intact, and the failing-first test drives the real construction path.
 - **CI now carries a standing dependency-advisory and supply-chain signal (C-188).** The build ran
   locked fetches, fmt, clippy, tests and layering checks — but nothing that answered "does any crate
   in the ~38-crate transitive tree carry a known advisory right now?". A new `security-audit.yml`
