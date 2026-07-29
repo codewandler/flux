@@ -415,6 +415,23 @@ The correct sequence:
 Step 1 is a prerequisite and belongs in its own story when this epic's four land. Recording the
 reasoning here so the deferral is a decision with a trail, not an omission.
 
+**2026-07-29 — step 1 is now filed as [C-217](../stories/C-217-sandbox-on-reports-resolved-posture.md).**
+Verifying the premise against the tree first made the defect sharper than the review stated it: it is
+not that `on` warns quietly, it is that **`on` does not warn at all**. `Sandbox::resolve` stores
+`Backend::Unsupported { reason }` and `ensure_available` returns `Ok(())` emitting nothing — pinned
+today by `ensure_available_is_ok_under_on_mode_when_unsupported`. The reason string is already
+computed by `discover_backend`; nobody is shown it. So step 1 is a disclosure story, not a detection
+story.
+
+One hazard C-217 carries that is worth naming here, because it is the reason this is not a one-line
+change: `ProbeOutcome::NamespacesDenied` is the **expected** state under default-seccomp Docker and
+hardened kernels — the terminal-bench eval containers all land there. A disclosure that fires on
+every containerised run is noise, and noise is what gets filtered and then missed when it matters.
+The posture must be stated without being an error, and it must stay out of `--json` and eval output.
+
+Step 2 — the default flip — remains deferred behind C-217, unchanged, and still needs its own design
+doc covering the Windows gap and the migration story.
+
 ## Acceptance for the epic
 
 The epic is done when a re-run of the adversarial review against a later version can mark findings

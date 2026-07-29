@@ -33,8 +33,9 @@ closure instead of re-deriving it.
 - [ ] A re-run of the [`adversarial-review`](../../.agents/skills/adversarial-review/SKILL.md) skill
       against the then-current version can mark findings 1–4 and classification trust **closed with
       evidence**, diffed against the 2026-07-29 baseline.
-- [ ] The deferred sandbox-default question (see Notes) has either become its own story or been
-      consciously dropped with the reason recorded.
+- [x] The deferred sandbox-default question (see Notes) has either become its own story or been
+      consciously dropped with the reason recorded. → **C-217** files step 1 (make `on` report its
+      resolved posture); step 2, the default flip itself, stays deferred behind it by design.
 
 ## Progress
 - 2026-07-29 — epic opened from the review. Design:
