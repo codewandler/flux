@@ -105,6 +105,34 @@ nothing in-tree does yet (`FleetDispatchTool` is exported but never registered; 
 **Breaking, and deliberately so:** `WorkBoard` is public API of `codewandler-flux-capabilities`, so
 the new required method breaks any out-of-tree implementor. `MemoryBoard` is the only in-tree one.
 
+**Rework: a latent A-116 defect fixed here (not an A-130 regression).** `fleet.dispatch` could not be
+registered into *any* `ToolRegistry`: it declares `Effect::Process` with access
+`[Network, Provider]`, and `authority_requirements_from_declaration` refuses a process effect without
+process access. The merge base declares exactly the same thing, so the defect predates this branch;
+it surfaced because A-131 tried to wire the ops up. Root cause was a coverage hole — A-116's tests
+only ever call `.spec()` and `.execute()`, neither of which runs `authority_requirements`, and
+`fleet.*` is not in `try_register_builtins`, so nothing else covered it.
+
+Verdicts, one per op: **`fleet.dispatch` broken** (both the plain and the ledger-wired shape);
+**`fleet.status` already registrable** (`[Read, Network]` / `[Network]` — the network effect is
+satisfied by network access); **`fleet.cancel` already registrable** (`[Write, Network]` /
+`[Network]` — the write effect resolves to an `operation.mutate` requirement because network access
+is present). Neither status nor cancel was modified.
+
+Fixed by overriding `Tool::authority_requirements` on `FleetDispatchTool`, following the `TaskTool`
+precedent. `Effect::Process` is kept (it is the op-cache generation bump, not OS-process access) and
+`AccessKind::Process` is deliberately *not* added (it would derive `process.exec` on a Process
+resource named by the worker's URL). The override discriminates the two subject families rather than
+iterating the flat subject list — a `DispatchSubjects { worker, item }` split shared with
+`permission_subjects`, so the two can never disagree:
+
+- worker origin → `network.fetch` + `model.invoke`;
+- board item → `datasource.write`, matching `<domain>.record_dispatch` exactly. This is required, not
+  double-gating: `BoardLedger` calls the `WorkBoard` backend directly, so the generated op's own gate
+  never runs on the ledger path;
+- unnameable endpoint → the conservative wildcard (`network:*`, `provider:*`), never an empty
+  requirement list, which would mean the op demands nothing at all.
+
 ## Notes
 - Filed 2026-07-29 from A-116's handoff, corroborated by A-113's. Both implementors independently
   reported the same gap from opposite sides, which is the strongest signal the design had a hole.

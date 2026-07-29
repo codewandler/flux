@@ -40,8 +40,10 @@ use tokio_util::sync::CancellationToken;
 
 use flux_a2a::{A2aClient, A2aError, Message, Part, SendOutcome, Task};
 use flux_core::{Error, Result};
+use flux_policy::{ResourceKind, ResourceRef};
 use flux_runtime::{
-    DispatchLedger, SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext, ToolResult,
+    AuthorityRequirement, DispatchLedger, SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext,
+    ToolResult,
 };
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::net::{guard_url_scoped, PrivateNetAllow};
@@ -338,6 +340,30 @@ impl FleetDispatchTool {
         }
     }
 
+    /// The subjects one `fleet.dispatch` call touches, kept apart **by resource family**.
+    ///
+    /// Two callers need this and they must never disagree: `permission_subjects` flattens it into
+    /// the grantable-subject list, and `authority_requirements` maps each half onto the authority
+    /// family that actually fits it. Computing both from one place is what stops the fleet op and
+    /// `<domain>.record_dispatch` from naming the same item two different ways.
+    fn subjects(&self, params: &Value) -> DispatchSubjects {
+        let args = serde_json::from_value::<DispatchInput>(params.clone()).ok();
+        DispatchSubjects {
+            worker: args
+                .as_ref()
+                .map(|args| args.worker.as_str())
+                .and_then(worker_origin),
+            // Only the ledger can name the item's subject, because only it knows the board domain.
+            // No ledger means no board write is possible, so there is no board subject to report.
+            item: self.ledger.as_ref().and_then(|ledger| {
+                args.and_then(|args| args.item)
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .map(|item| ledger.subject(&item))
+            }),
+        }
+    }
+
     /// Bind the op to the ledger that records what it dispatches — in the fleet coordinator, a
     /// [`BoardLedger`](https://docs.rs/codewandler-flux-capabilities) over the registered work
     /// board. Doing so adds `Effect::Write` to the op's declared effects and the item's subject to
@@ -346,6 +372,20 @@ impl FleetDispatchTool {
         self.ledger = Some(ledger);
         self
     }
+}
+
+/// What one `fleet.dispatch` call may touch, split by resource family.
+///
+/// The split is the point: a flat `Vec<String>` of subjects loses which is which, and the two are
+/// authorized as different resource kinds — a network origin and a datasource row. `None` on either
+/// half means "not nameable / not applicable", never "unrestricted".
+struct DispatchSubjects {
+    /// The worker's guarded origin (scheme + host + port), or `None` when the endpoint cannot be
+    /// named at all — never `*`.
+    worker: Option<String>,
+    /// The board item's subject as the ledger spells it, or `None` when no ledger is wired or no
+    /// `item` was named — in which case this call performs no board write.
+    item: Option<String>,
 }
 
 /// The board write failed **after** the worker had already accepted the run.
@@ -406,21 +446,69 @@ impl Tool for FleetDispatchTool {
     }
 
     fn permission_subjects(&self, params: &Value) -> Vec<String> {
-        let args = serde_json::from_value::<DispatchInput>(params.clone()).ok();
-        let mut subjects = endpoint_subjects(args.as_ref().map(|args| args.worker.as_str()));
         // The board item is a second, independently grantable subject: an operator may allow
         // dispatch to a worker without allowing this coordinator to rewrite arbitrary items. Only
         // the ledger can name it, since only it knows the board's domain — which is also why the
         // subject cannot drift from the one `<domain>.record_dispatch` reports for the same item.
-        if let (Some(ledger), Some(item)) = (
-            self.ledger.as_ref(),
-            args.and_then(|args| args.item)
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty()),
-        ) {
-            subjects.push(ledger.subject(&item));
+        let subjects = self.subjects(params);
+        subjects.worker.into_iter().chain(subjects.item).collect()
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        // Why this op derives its own requirements instead of letting the declaration do it
+        // (A-116 defect, fixed under A-130):
+        //
+        // `authority_requirements_from_declaration` refuses any spec carrying `Effect::Process`
+        // without `AccessKind::Process`, so `fleet.dispatch` could not be registered into ANY
+        // registry. Neither half of the declaration is wrong, which is why the fix is an override
+        // rather than an edit to `spec()`:
+        //
+        // * `Effect::Process` stays. It is what bumps the parent's op-cache invalidation
+        //   generation, so reads after a dispatch never replay pre-dispatch state — the same reason
+        //   `TaskTool` declares it (see `crate::TaskTool`). It does NOT mean OS-process access.
+        // * `AccessKind::Process` is NOT added. That would derive `process.exec` on a Process
+        //   resource named by the worker's URL origin, demanding local process authority this op
+        //   never uses and cannot honour.
+        //
+        // The subjects must be discriminated, not iterated. `permission_subjects` deliberately
+        // reports two DIFFERENT resource families — a network origin and a board item — and the
+        // declaration path applies every declared access kind to every subject. Deriving from the
+        // flat list would therefore demand `network.fetch` and `model.invoke` on `board/item/PROJ-42`,
+        // i.e. ask an operator to approve network egress to a board row. So each subject earns only
+        // the family that fits it. Params are re-read rather than trusting the flat `subjects`
+        // argument, exactly as the board's own ops do (`flux_capabilities`' `BoardOp`); safe here
+        // because this op declares no filesystem access, so `Executor::gate` passes subjects
+        // through unrewritten.
+        let DispatchSubjects { worker, item } = self.subjects(params);
+        let mut requirements = match worker {
+            Some(origin) => vec![
+                AuthorityRequirement::network_fetch(&origin),
+                AuthorityRequirement::provider_invoke(&origin),
+            ],
+            // An endpoint this op cannot name yields no subject — but NOT an empty requirement
+            // list. `Executor::gate` walks the requirements to find its policy floor, so returning
+            // none would mean this op demands nothing at all, which is strictly weaker than the
+            // declaration path's conservative wildcard. `validate_authority_contracts` says the
+            // same thing in its own doc comment: produce a wildcard or refuse registration, never
+            // lean on runtime parameters to invent the resource family.
+            None => vec![
+                AuthorityRequirement::new("network.fetch", ResourceRef::any(ResourceKind::Network)),
+                AuthorityRequirement::new("model.invoke", ResourceRef::any(ResourceKind::Provider)),
+            ],
+        };
+        // The board write is gated HERE or nowhere — it is not double-gated. `BoardLedger` calls
+        // `WorkBoard::record_dispatch` on the backend directly, so the generated
+        // `<domain>.record_dispatch` op never traverses `Executor::dispatch` on this path and its
+        // own `datasource.write` requirement never runs. Demanding the identical action on the
+        // identical subject means one operator grant covers both routes to the same write.
+        if let Some(item) = item {
+            requirements.push(AuthorityRequirement::datasource_write(item));
         }
-        subjects
+        Ok(requirements)
     }
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
@@ -613,6 +701,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    use flux_runtime::ToolRegistry;
     use flux_spec::metadata_violations;
     use flux_system::{System, Workspace};
     use serde_json::json;
@@ -913,6 +1002,179 @@ mod tests {
                 "expected no subjects for {params}, got {subjects:?}"
             );
             assert!(!subjects.iter().any(|s| s == "*"));
+        }
+    }
+
+    // ── registrability (the gate A-116 never had) ───────────────────────────
+
+    /// `(action, resource family, subject)` per requirement — the three things that must be right.
+    /// `ResourceRef` has no `Display`, and comparing the family explicitly is the point: the whole
+    /// class of bug here is a correct-looking subject filed under the wrong resource kind.
+    fn shapes(requirements: &[AuthorityRequirement]) -> Vec<(String, ResourceKind, String)> {
+        requirements
+            .iter()
+            .map(|req| {
+                (
+                    req.action.0.clone(),
+                    req.resource.kind,
+                    req.resource.id.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The coverage hole that let an unregistrable op ship: A-116's tests only ever call `.spec()`
+    /// and `.execute()` on freshly-constructed tools, and neither touches
+    /// `authority_requirements`. Registration does — `try_register_from` validates the contract on
+    /// the least-specific call, and `validate_authority_contracts` is the same check every
+    /// registration owner runs. `fleet.*` is not in `try_register_builtins`, so nothing else covers
+    /// it. Every fleet op must therefore be registrable *here*, in its own crate.
+    #[test]
+    fn every_fleet_op_is_registrable_with_a_valid_authority_contract() {
+        let ledger = RecordingLedger::new(false);
+        let ops: Vec<(&str, Arc<dyn Tool>)> = vec![
+            (
+                "fleet.dispatch",
+                Arc::new(FleetDispatchTool::new(PrivateNetAllow::None, None)),
+            ),
+            // The board-backed shape is a DIFFERENT declaration — `with_ledger` adds `Effect::Write`
+            // — so registrability has to be proven for it too, not inferred from the plain one.
+            (
+                "fleet.dispatch + ledger",
+                Arc::new(FleetDispatchTool::new(PrivateNetAllow::None, None).with_ledger(ledger)),
+            ),
+            (
+                "fleet.status",
+                Arc::new(FleetStatusTool::new(PrivateNetAllow::None, None)),
+            ),
+            (
+                "fleet.cancel",
+                Arc::new(FleetCancelTool::new(PrivateNetAllow::None, None)),
+            ),
+        ];
+        // Accumulate rather than panic on the first: which ops are broken is the diagnostic, and
+        // stopping at the first hides whether the others share the defect.
+        let mut broken = Vec::new();
+        for (label, tool) in ops {
+            let mut registry = ToolRegistry::new();
+            let outcome = registry
+                .try_register_from("fleet", tool)
+                .and_then(|()| registry.validate_authority_contracts());
+            if let Err(err) = outcome {
+                broken.push(format!("{label}: {err}"));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "fleet ops that cannot be registered:\n  {}",
+            broken.join("\n  ")
+        );
+    }
+
+    /// What the dispatch op actually demands, by resource family. The declaration path cannot derive
+    /// this — `Effect::Process` is the op-cache generation bump, not OS-process access — so the
+    /// override owns it, and these assertions are what stop the override from drifting into either
+    /// of the two wrong answers: a `process.exec` on the worker's URL, or network/provider authority
+    /// demanded on a board item id.
+    #[test]
+    fn dispatch_demands_network_and_provider_on_the_worker_and_datasource_write_on_the_item() {
+        let plain = FleetDispatchTool::new(PrivateNetAllow::None, None);
+        let params = json!({ "worker": "https://worker-1.internal:8787/a2a", "task": "build" });
+        let requirements = plain
+            .authority_requirements(&params, &plain.permission_subjects(&params))
+            .expect("a nameable worker is a valid contract");
+        assert_eq!(
+            shapes(&requirements),
+            vec![
+                (
+                    "network.fetch".to_string(),
+                    ResourceKind::Network,
+                    "https://worker-1.internal:8787".to_string()
+                ),
+                (
+                    "model.invoke".to_string(),
+                    ResourceKind::Provider,
+                    "https://worker-1.internal:8787".to_string()
+                ),
+            ],
+            "the worker origin is the only network/provider resource"
+        );
+        assert!(
+            !requirements
+                .iter()
+                .any(|req| req.action.0 == "process.exec"),
+            "dispatch runs no local process; `process.exec` on a URL would be a false demand"
+        );
+
+        // With a ledger and a named item, the board write is gated HERE or nowhere: `BoardLedger`
+        // calls the backend directly, so `<domain>.record_dispatch`'s own gate never runs on this
+        // path. The demand must match what that op would have made for the same item.
+        let recording = FleetDispatchTool::new(PrivateNetAllow::None, None)
+            .with_ledger(RecordingLedger::new(false));
+        let params = json!({
+            "worker": "https://worker-1.internal:8787/a2a",
+            "task": "build",
+            "item": "PROJ-42",
+        });
+        let recording_reqs = recording
+            .authority_requirements(&params, &recording.permission_subjects(&params))
+            .expect("a board-backed dispatch is a valid contract");
+        let board: Vec<_> = shapes(&recording_reqs)
+            .into_iter()
+            .filter(|(action, ..)| action.starts_with("datasource."))
+            .collect();
+        assert_eq!(
+            board,
+            vec![(
+                "datasource.write".to_string(),
+                ResourceKind::Datasource,
+                "board/item/PROJ-42".to_string()
+            )],
+            "the recorded item is a datasource write, not a network or provider resource"
+        );
+        assert!(
+            !recording_reqs.iter().any(|req| {
+                matches!(req.action.0.as_str(), "network.fetch" | "model.invoke")
+                    && req.resource.id.contains("PROJ-42")
+            }),
+            "a board item is not a network or provider resource: {recording_reqs:?}"
+        );
+    }
+
+    /// The egress posture A-116 established, restated as an authority contract. An endpoint the op
+    /// cannot name reports no subjects — but the requirements list must NOT then be empty, because
+    /// `Executor::gate` walks the requirements to find its policy floor and an empty list demands
+    /// nothing at all. The declaration path answers this with a conservative wildcard resource; so
+    /// must the override.
+    #[test]
+    fn an_unnameable_worker_still_demands_a_conservative_wildcard_never_nothing() {
+        let dispatch = FleetDispatchTool::new(PrivateNetAllow::None, None);
+        for params in [
+            json!({ "worker": "not a url", "task": "x" }),
+            json!({ "worker": "file:///etc/passwd", "task": "x" }),
+            json!({}),
+        ] {
+            let subjects = dispatch.permission_subjects(&params);
+            assert!(subjects.is_empty(), "{params}");
+            let requirements = dispatch
+                .authority_requirements(&params, &subjects)
+                .unwrap_or_else(|err| panic!("{params} must still yield a contract: {err}"));
+            assert_eq!(
+                shapes(&requirements),
+                vec![
+                    (
+                        "network.fetch".to_string(),
+                        ResourceKind::Network,
+                        "*".to_string()
+                    ),
+                    (
+                        "model.invoke".to_string(),
+                        ResourceKind::Provider,
+                        "*".to_string()
+                    ),
+                ],
+                "an unnameable endpoint demands the wildcard, not nothing: {params}"
+            );
         }
     }
 
