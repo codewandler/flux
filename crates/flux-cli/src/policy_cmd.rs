@@ -25,10 +25,11 @@
 //! binary is `async`.
 //!
 //! # What the log records, and what it therefore cannot decide
-//! A dispatch is recorded as one `tool_call` observation carrying `{tool, subjects, caller}`
-//! (`flux_runtime`'s `Executor::dispatch_outcome`) — the op name, its invocation subjects, and the
-//! caller's **principal id**. The invocation params are not recorded, and neither are the caller's
-//! kind, groups, trust level, or scopes.
+//! A dispatch is recorded as one `tool_call` observation carrying
+//! `{tool, subjects, caller, caller_kind}` (`flux_runtime`'s `Executor::dispatch_outcome`) — the op
+//! name, its invocation subjects, and the caller's **principal id and kind**. The invocation params
+//! are not recorded, and neither are the caller's groups, trust level, or scopes. Records written
+//! before `caller_kind` existed do not carry it, and are treated as consistent with *any* kind.
 //!
 //! So a recorded op is decidable only when the verdict follows from that recorded context alone.
 //! Everything else is reported as **indeterminate** with a reason, never bucketed as allowed or
@@ -41,22 +42,33 @@
 //! - an op whose declaration does not yield a valid authority contract;
 //! - an op whose verdict is **not invariant** over the caller facts the log omits — see
 //!   [`CallerFact`]. Rather than assume a trust level or a group membership, the simulator brackets
-//!   each omitted fact between its minimum (the recorded caller holds none of it) and its maximum
-//!   (everything either policy could possibly ask for) and reports the op indeterminate whenever the
-//!   two ends disagree. Deciding it would mean inventing the missing fact, which is precisely the
-//!   silent classification this command must not make. An op the policies settle the same way at
-//!   both ends stays decided — a trust-gated grant elsewhere in the file does not smear the whole
-//!   report into "unknown".
+//!   the omitted facts between their **joint** minimum (the recorded caller holds none of them) and
+//!   their **joint** maximum (everything either policy could possibly ask for) and reports the op
+//!   indeterminate whenever the two ends disagree. Deciding it would mean inventing the missing
+//!   facts, which is precisely the silent classification this command must not make. An op the
+//!   policies settle the same way at both ends stays decided — a trust-gated grant elsewhere in the
+//!   file does not smear the whole report into "unknown".
 //!
-//! # The one declared assumption: the caller's kind
-//! The log records a principal **id**, not a principal **kind**, and unlike trust/scopes/groups the
-//! kind is not an ordered axis to bracket — `user`, `agent`, and `system` are disjoint, and under an
-//! `agent` hypothesis a policy written for `user` subjects denies everything, which would make every
-//! report empty rather than useful. So the replay reconstructs each recorded caller as a **`user`**
-//! principal: what [`flux_policy::local_identity`] mints for every session the CLI itself records.
-//! That assumption is **declared in the output**, not buried here ([`REPLAY_ASSUMPTION`]) — and when
-//! either policy contains an `agent` or `system` subject the assumption becomes load-bearing, so
-//! every op is reported indeterminate instead.
+//!   Widening **jointly** rather than one axis at a time is load-bearing, not a detail. A grant
+//!   gated on two omitted facts at once (`subjects = [group "ops"]` with
+//!   `required_trust = "privileged"`) is satisfied by neither single-axis probe, so a per-axis
+//!   bracket finds no movement and reports the op as confidently decided. That is a silent
+//!   under-report of exactly the kind this command exists to prevent.
+//!
+//! # The caller's kind is enumerated, not assumed
+//! Trust, scopes and groups are ordered axes, so two points bracket them. The principal **kind** is
+//! not: `user`, `agent` and `system` are disjoint. It is therefore *enumerated* — every kind the
+//! record is consistent with is evaluated, and the op is indeterminate if they disagree.
+//!
+//! This matters far more widely than it first appears. [`flux_policy::subject_matches`] requires
+//! `CallerKind::User` for a `SubjectKind::User` grant, so a `user` subject is *itself*
+//! kind-discriminating — the kind is load-bearing for every grant in the built-in floor, not merely
+//! for policies that mention `agent` or `system` subjects. Assuming `user` would therefore silently
+//! mis-report every op recorded by a non-`user` principal, and those are reachable: `flux app run
+//! --serve` shares this same store, and a client-credentials token mints `CallerKind::Agent`.
+//!
+//! Because the recorder now writes `caller_kind`, current records pin the kind exactly and stay
+//! decidable; only records predating that key fan out across all three kinds.
 
 use super::*;
 
@@ -202,7 +214,9 @@ struct SimulationReport {
     ops: usize,
     active_grants: usize,
     proposed_grants: usize,
-    /// What the replay assumed rather than read — see [`REPLAY_ASSUMPTION`].
+    /// The limits of the claim this report makes — what it does *not* replay, what `newly allowed`
+    /// structurally cannot show, and whether the session window was bounded. Surfaced in both
+    /// renderings so an operator never has to read this module to know the shape of the answer.
     replay_assumptions: Vec<String>,
     counts: Counts,
     newly_blocked: Vec<DecidedOp>,
@@ -675,20 +689,14 @@ fn simulate(
                 }
             };
 
-            let (active_verdict, proposed_verdict) = match decide(
-                active,
-                proposed,
-                &caller_id,
-                kind,
-                &ceiling,
-                &requirements,
-            ) {
-                Ok(verdicts) => verdicts,
-                Err(why) => {
-                    indeterminate(op, why.reason());
-                    continue;
-                }
-            };
+            let (active_verdict, proposed_verdict) =
+                match decide(active, proposed, &caller_id, kind, &ceiling, &requirements) {
+                    Ok(verdicts) => verdicts,
+                    Err(why) => {
+                        indeterminate(op, why.reason());
+                        continue;
+                    }
+                };
             let decided = DecidedOp {
                 session,
                 op,
@@ -1073,9 +1081,7 @@ mod tests {
             id: "ops".into(),
         }];
         both.required_trust = TrustLevel::Privileged;
-        let proposed = with_local_floor(Some(AuthorizationPolicy {
-            grants: vec![both],
-        }));
+        let proposed = with_local_floor(Some(AuthorizationPolicy { grants: vec![both] }));
 
         let report = run(&events, &active, &proposed);
 
