@@ -35,12 +35,10 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
 - [A-93 — Typed session log — session-shape validity by construction (epic)](A-93-typed-session-log-epic.md) · Agent · EPIC — make the invalid provider-history shapes (split tool_use/tool_result, empty assistant, user-after-user) unrepresentable in the session log's type; the thrice-recurred bug class becomes unwritable instead of test-guarded
+- [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-185 — A leading diff/list marker must not hide a credential from the redactor](C-185-redactor-line-marker-boundary.md) · Core · `redact_patterns`' is_boundary set omits `+`/`-`/`*`/`#`, and the shape matcher requires token.starts_with(prefix) — so `+sk-ant-…` on an added diff line tokenizes with the marker glued on and is NOT redacted; every surface that renders a diff inherits the gap (found while building C-132, worked around locally there)
-
-### Typed session log — session-shape validity by construction
-- [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
 
 ## Blocked
 _None._

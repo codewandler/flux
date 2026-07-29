@@ -56,8 +56,7 @@
 
 use std::sync::Arc;
 
-use flux_core::Message;
-use flux_events::EventStore;
+use flux_events::{AssistantMessage, EventStore, SessionLog};
 use flux_lang::ast::{DraftAst, RunEvent};
 use flux_lang::program::CompositeOpDecl;
 use flux_lang::runtime::{flow_key, PlanHalt, ResumeLedger};
@@ -422,9 +421,10 @@ pub async fn resurrect(
         ("resurrected", outcome.result.trim().to_string(), None)
     };
 
-    // Mirrors `FlowEngine::finish_turn_lifecycle`'s ordering: close the turn on the durable log first
-    // (`TurnEnded`), then the single assistant message, then tell the sink. No model call was made, so
-    // there is no usage to attribute.
+    // Close the turn on the durable log first (`TurnEnded`), then the single assistant message,
+    // then tell the sink. No model call was made, so there is no usage to attribute. A-101: the
+    // ordering used to be a hand-copy of `FlowEngine::finish_turn_lifecycle` — the assistant write
+    // now goes through the same typed seam that path does, so it is enforced rather than mirrored.
     store.event_store().end_turn(
         session,
         it.turn_id,
@@ -433,9 +433,13 @@ pub async fn resurrect(
         &answer,
         None,
     )?;
-    store
-        .event_store()
-        .record_message(session, &Message::assistant_text(answer.clone()))?;
+    let answer_message = AssistantMessage::text(&answer)
+        .or_else(|_| AssistantMessage::text(crate::engine::BLANK_ANSWER_PLACEHOLDER))
+        .map_err(flux_core::Error::from)?;
+    let events = store.event_store();
+    SessionLog::open(&events, session)
+        .and_then(|mut log| log.close_turn(answer_message))
+        .map_err(flux_core::Error::from)?;
     sink.turn_end(None);
 
     Ok(Some(ResurrectReport {
@@ -455,6 +459,7 @@ pub async fn resurrect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_core::Message;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -622,12 +627,30 @@ mod tests {
     /// then `completed` top-level statements' `StatementCompleted` rows (with REAL bound values, so
     /// the interpreter's own fast-forward rehydration succeeds) — no `TurnEnded`, simulating a crash
     /// right there. Returns `(turn_id, flow_key)`.
+    /// Close a seeded turn's *conversation* the way a real completed turn does. `end_turn` is only
+    /// telemetry; a turn that "closes cleanly" also writes its assistant message, and without that
+    /// the next seeded turn opens onto a log that still owes an answer (A-101).
+    fn close_seeded_turn(events: &EventStore, answer: &str) {
+        SessionLog::open(events, "sess")
+            .unwrap()
+            .close_turn(AssistantMessage::text(answer).unwrap())
+            .unwrap();
+    }
+
     fn seed_interrupted_turn(
         events: &EventStore,
         store: &FlowStore,
         ast: &DraftAst,
         completed: usize,
     ) -> (i64, String) {
+        // A real interrupted turn always has its opening user message on the log — the crash comes
+        // *between* a turn's two writes, which is the whole reason resurrect exists. Seeding only
+        // the `TurnStarted` telemetry made this fixture describe a turn that cannot occur, and the
+        // typed close (A-101) is what noticed.
+        SessionLog::open(events, "sess")
+            .unwrap()
+            .open_turn(Message::user_text("do the thing"))
+            .unwrap();
         let turn_id = events
             .begin_turn("sess", "do the thing", "test-model")
             .unwrap();
@@ -704,6 +727,7 @@ mod tests {
         events
             .end_turn("sess", turn2, "completed", 1, "done", None)
             .unwrap();
+        close_seeded_turn(&events, "done");
 
         let err = interrupted(&events, "sess").unwrap_err();
         let msg = err.to_string();
@@ -723,6 +747,7 @@ mod tests {
         events
             .end_turn("sess", turn_id, "completed", 3, "done", None)
             .unwrap();
+        close_seeded_turn(&events, "done");
 
         assert!(interrupted(&events, "sess").unwrap().is_none());
     }
@@ -987,6 +1012,7 @@ mod tests {
         events
             .end_turn("sess", turn1, "completed", 3, "done", None)
             .unwrap();
+        close_seeded_turn(&events, "done");
 
         // Turn 2: re-accepts the SAME plan, crashes before any progress of its own (no
         // `StatementCompleted` at all) — left open.
@@ -1046,9 +1072,14 @@ mod tests {
         events
             .end_turn("sess", turn_a, "completed", 3, "done", None)
             .unwrap();
+        close_seeded_turn(&events, "done");
 
         // Turn B: purely native — no plan attempt, no statement boundary, just a recorded cell for
         // the exact same zero-arg `counted()` shape turn C is about to dispatch — then closes clean.
+        SessionLog::open(&events, "sess")
+            .unwrap()
+            .open_turn(Message::user_text("native tool call"))
+            .unwrap();
         let turn_b = events
             .begin_turn("sess", "native tool call", "test-model")
             .unwrap();
@@ -1058,6 +1089,7 @@ mod tests {
         events
             .end_turn("sess", turn_b, "completed", 1, "done", None)
             .unwrap();
+        close_seeded_turn(&events, "done");
 
         // Turn C: authored again (same plan shape), crashes before any progress of its own.
         seed_interrupted_turn(&events, &store, &ast, 0);

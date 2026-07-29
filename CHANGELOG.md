@@ -6,6 +6,36 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Compaction wrote a broken conversation on ordinary sessions (A-101).** The persisted log is a
+  strict `user, assistant, …` alternation, so compaction's split point always landed on a **user**
+  message; the walk-back that was supposed to protect the boundary only stepped back off a
+  `tool_result`, never off a `user`. The synthetic `[summary of earlier conversation]` message was
+  therefore prepended directly in front of another user message and stored — a history every
+  provider that enforces the Messages contract rejects. Reachable on any session that grew past
+  `compact_threshold_chars` with at least four messages. The boundary rule now lives in
+  `ValidHistory::snap`, and compaction validates what it is about to write.
+- **A flow-driven session's conversation no longer starts on an assistant message (A-101).** A turn
+  started by `start_flow` / the app runner / the voice driver has no user input, but still persists
+  its answer — so those logs opened on an `assistant` message, which is not a valid provider
+  history. Such a turn now opens with a short synthetic message naming its trigger, and the flow's
+  answer stays visible to the next conversational turn.
+- **An interrupted turn no longer wedges its session (A-101).** A turn that died between its two
+  writes and was not resurrected left the log owing an assistant answer forever; the next turn is
+  now able to close it as `(turn interrupted)` and proceed. Append-only — the crashed turn's
+  telemetry and run trace are untouched.
+
+### Changed
+
+- **flux-flow writes the conversation only through the typed session log (A-101).** The engine's
+  turn start and `finish_turn`, compaction, and the resurrect path all go through `SessionLog`
+  (A-100) instead of the unguarded `record_message`/`record_compaction`. `resurrect`'s hand-copied
+  mirror of `finish_turn_lifecycle`'s ordering is gone — the ordering is enforced, not replicated —
+  and a blank answer closes the turn as `(no answer)` rather than writing an empty assistant
+  message. The unguarded pair still exists for the remaining SDK/CLI callers; its removal (breaking)
+  lands with A-102.
+
 ### Added
 
 - **The persisted conversation has a typed write seam (A-100).** A turn's two writes — the user

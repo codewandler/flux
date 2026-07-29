@@ -99,6 +99,15 @@ impl fmt::Display for ShapeError {
 
 impl std::error::Error for ShapeError {}
 
+/// A shape rejection is a real failure at every call site that cannot handle it structurally, so it
+/// converts into the crate-wide error type — the variant is preserved in the message, which already
+/// names the invariant and the offending index.
+impl From<ShapeError> for flux_core::Error {
+    fn from(e: ShapeError) -> Self {
+        flux_core::Error::Other(format!("session shape: {e}"))
+    }
+}
+
 /// An assistant message that is guaranteed non-empty.
 ///
 /// There is no way to build one that violates the rule, which is what lets `close_turn` (A-100)

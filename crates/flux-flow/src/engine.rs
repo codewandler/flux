@@ -10,8 +10,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use flux_core::{Chunk, ContentBlock, Error, Message, Result, Usage};
-use flux_events::EventStore;
+use flux_core::{Chunk, Error, Message, Result, Usage};
+use flux_events::{AssistantMessage, EventStore, SessionLog, Tail, ValidHistory};
 use flux_provider::{Effort, Provider, Request};
 use flux_runtime::{
     scope_runtime_turn, Executor, RuntimeTurnContext, SpawnTaskSupervisor, TurnIdentity,
@@ -82,6 +82,28 @@ impl AgentLoopSpec {
 /// long-lived shared engine. Generous — realistic interleaving stays well under it, so the
 /// cross-session cache-stability invariant holds — while still turning unbounded growth into a bound.
 const MAX_STICKY_SESSIONS: usize = 1024;
+
+/// What a turn persists when its answer is blank (A-101). An `AssistantMessage` cannot be empty —
+/// that is invariant #1 — but a turn still has to close, because a log left ending on the `user`
+/// message is invariant #3 waiting to happen on the next turn. So a blank answer becomes something
+/// visible and honest rather than an error or an empty bubble.
+pub(crate) const BLANK_ANSWER_PLACEHOLDER: &str = "(no answer)";
+
+/// What closes a turn that was abandoned mid-flight (A-101) — a crash between its two writes that
+/// nobody resurrected. The next turn writes it so the log stays a valid alternation; without it the
+/// session would be permanently unable to open another turn.
+pub(crate) const ABANDONED_TURN_PLACEHOLDER: &str = "(turn interrupted)";
+
+/// The trigger name a flow-driven turn's synthetic opening message carries (A-101). The turn label
+/// is the authored flow's name, or `(flow start)` for an anonymous one; either way the reader learns
+/// the turn began without a person asking for it.
+fn flow_trigger_label(label: &str) -> &str {
+    if label.trim().is_empty() {
+        "flow start"
+    } else {
+        label
+    }
+}
 
 /// flux-flow's turn engine: a provider, the tool executor (safety envelope), the unified event store
 /// (conversation + run trace + turn telemetry), and flux-flow's own value/symbol/suspension store.
@@ -417,10 +439,29 @@ impl FlowEngine {
         let skill_input = user_message.unwrap_or_default();
         // The cache boundary precedes every execution flavor, including a persisted continuation.
         self.executor.begin_cache_turn();
-        if let Some(message) = user_message {
-            self.events
-                .record_message(session_id, &Message::user_text(message))?;
+        // A-101: the turn's opening write, through the typed handle. `open_turn` refuses from
+        // `AwaitingAssistant`, so a previous turn that died between its two writes surfaces here as
+        // an error instead of silently appending `user` after `user`.
+        //
+        // A turn with no user input (an authored flow started by the SDK, the app runner, or the
+        // voice driver) still opens one: `finish_turn` persists its answer, and an assistant message
+        // with no user message before it is a history no Messages-contract provider accepts — the
+        // log used to *start on `assistant`* for every flow-driven session. The synthetic opener
+        // names the trigger, so the transcript says why the assistant spoke first.
+        let opening = match user_message {
+            Some(message) => Message::user_text(message),
+            None => Message::user_text(format!("[{}]", flow_trigger_label(label))),
+        };
+        let mut log = SessionLog::open(&self.events, session_id)?;
+        // A previous turn that died between its two writes (a crash the embedder chose not to
+        // resurrect, `auto_resurrect` off) leaves the log owing an answer. Closing it here is what
+        // keeps that from becoming this turn's `user`-after-`user`: the abandoned turn gets a
+        // visible, honest ending instead of blocking the session or being silently overwritten.
+        // Append-only, so nothing is lost — the crashed turn's telemetry and trace stay intact.
+        if log.tail() == Tail::AwaitingAssistant {
+            log.close_turn(AssistantMessage::text(ABANDONED_TURN_PLACEHOLDER)?)?;
         }
+        log.open_turn(opening)?;
         let turn_id = self
             .events
             .begin_turn(
@@ -1179,12 +1220,13 @@ impl FlowEngine {
         self.flush_observations(session_id, turn_id);
         self.composites.clear_turn(session_id);
         self.flow.set_cassette(None);
-        self.events.record_message(
-            session_id,
-            &Message::assistant(vec![ContentBlock::Text {
-                text: answer.to_string(),
-            }]),
-        )?;
+        // A-101: the turn's closing write. `AssistantMessage` cannot hold an empty answer, and a
+        // blank one is a real possibility (a flow that returns `""`), so it becomes a visible
+        // placeholder rather than an `Err` — failing here would leave the log ending on the `user`
+        // message, which is the very shape this seam exists to prevent.
+        let answer_message = AssistantMessage::text(answer)
+            .or_else(|_| AssistantMessage::text(BLANK_ANSWER_PLACEHOLDER))?;
+        SessionLog::open(&self.events, session_id)?.close_turn(answer_message)?;
         sink.turn_end(usage);
         Ok(())
     }
@@ -1456,14 +1498,14 @@ impl FlowEngine {
             return (Ok(()), None);
         }
 
+        // A-101: the boundary rule lives in `ValidHistory::snap`, not here. The inline walk-back it
+        // replaces guarded only the `tool_result` case and missed the one that actually fires: with
+        // a strict `user, assistant, …` log, `len - keep` always lands on a **user** message, and
+        // prepending the synthetic `user` summary in front of it wrote `user`-after-`user`.
         let keep = 2.min(messages.len());
-        let mut split = messages.len() - keep;
-        while split > 0 && has_tool_result(&messages[split]) {
-            split -= 1;
-        }
-        if split == 0 {
-            return (Ok(()), None); // can't summarize without splitting a tool_use/tool_result pair
-        }
+        let Some(split) = ValidHistory::snap(&messages, keep) else {
+            return (Ok(()), None); // nothing can be summarized without breaking the shape
+        };
         let (old, recent) = messages.split_at(split);
 
         let mut transcript = String::new();
@@ -1517,8 +1559,17 @@ impl FlowEngine {
         ))];
         new_msgs.extend(recent.iter().cloned());
         let to = new_msgs.len();
-        if let Err(error) = self.events.record_compaction(session_id, &new_msgs) {
-            return (Err(error), Some(usage));
+        let rewritten = match ValidHistory::new(new_msgs) {
+            Ok(history) => history,
+            // Unreachable via `snap`, which chooses the split precisely so this holds — but the
+            // check is the guarantee, so a future change to how `new_msgs` is built fails loudly
+            // here instead of writing a history the next turn's provider call rejects.
+            Err(error) => return (Err(flux_core::Error::Other(error.to_string())), Some(usage)),
+        };
+        if let Err(error) =
+            SessionLog::open(&self.events, session_id).and_then(|mut log| log.rewrite(rewritten))
+        {
+            return (Err(error.into()), Some(usage));
         }
 
         let obs = flux_evidence::Observation::new(
@@ -1626,13 +1677,6 @@ fn render_skill_catalog(catalog: &[flux_skill::Skill]) -> String {
     }
     listing.push_str("</available-skills>");
     listing
-}
-
-/// True if a message carries a tool_result block (a `user` message answering tool calls).
-fn has_tool_result(msg: &Message) -> bool {
-    msg.content
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
 /// Where the active agent loop came from — what [`agent_loop_source`] resolved.
@@ -2053,6 +2097,7 @@ pub(crate) fn suspension_prompt(outcome: &FlowOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_core::ContentBlock;
 
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -2442,6 +2487,15 @@ mod tests {
         provider: Arc<dyn Provider>,
         loop_spec: AgentLoopSpec,
     ) -> (Result<FlowEngine>, Arc<EventStore>) {
+        assemble_test_engine_with_compaction(provider, loop_spec, 0)
+    }
+
+    /// [`assemble_test_engine`] with compaction armed (`0` disables it, which is the default).
+    fn assemble_test_engine_with_compaction(
+        provider: Arc<dyn Provider>,
+        loop_spec: AgentLoopSpec,
+        compact_threshold_chars: usize,
+    ) -> (Result<FlowEngine>, Arc<EventStore>) {
         let sequence = TEST_ROOT.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!(
             "flux-adaptive-engine-{}-{sequence}",
@@ -2470,7 +2524,7 @@ mod tests {
             2_048,
             5,
             Vec::new(),
-            0,
+            compact_threshold_chars,
             Vec::new(),
             root.clone(),
             loop_spec,
@@ -3843,9 +3897,14 @@ mod tests {
         assert_eq!(resumed.text, "(turn cancelled)");
         assert_eq!(resumed.ended, 1);
         let conversation = events.conversation(&session).unwrap();
-        assert_eq!(conversation.len(), 3);
-        assert_eq!(conversation[1].text(), "answer");
-        assert_eq!(conversation[2].text(), "(turn cancelled)");
+        // A-101: the flow-started turn opens with a synthetic user message naming its trigger, so
+        // the log is a valid alternation — before that it began on an `assistant` message, which no
+        // Messages-contract provider accepts.
+        assert_eq!(conversation.len(), 4);
+        assert!(conversation[0].text().starts_with('['), "synthetic opener");
+        assert_eq!(conversation[2].text(), "answer");
+        assert_eq!(conversation[3].text(), "(turn cancelled)");
+        ValidHistory::new(conversation.clone()).expect("a valid provider history");
         assert_eq!(
             events.turns(&session).unwrap().last().unwrap().outcome,
             "cancelled"
@@ -3886,9 +3945,14 @@ mod tests {
         assert_eq!(resumed.text, "(turn cancelled)");
         assert_eq!(resumed.ended, 1);
         let conversation = events.conversation(&session).unwrap();
-        assert_eq!(conversation.len(), 3);
-        assert_eq!(conversation[1].text(), "answer");
-        assert_eq!(conversation[2].text(), "(turn cancelled)");
+        // A-101: the flow-started turn opens with a synthetic user message naming its trigger, so
+        // the log is a valid alternation — before that it began on an `assistant` message, which no
+        // Messages-contract provider accepts.
+        assert_eq!(conversation.len(), 4);
+        assert!(conversation[0].text().starts_with('['), "synthetic opener");
+        assert_eq!(conversation[2].text(), "answer");
+        assert_eq!(conversation[3].text(), "(turn cancelled)");
+        ValidHistory::new(conversation.clone()).expect("a valid provider history");
         assert_eq!(
             events.turns(&session).unwrap().last().unwrap().outcome,
             "cancelled"
@@ -4238,6 +4302,57 @@ mod tests {
         let (engine, _) = assemble_test_engine(provider, loop_spec);
         let error = engine.err().expect("unknown op must fail assembly");
         assert!(error.to_string().contains("missing_operation"));
+    }
+
+    /// A-101 (failing-first): compaction wrote `user`-after-`user` on any ordinary conversation.
+    ///
+    /// The persisted log is a strict `user, assistant, …` alternation, so `len - keep` (keep = 2)
+    /// always lands on a **user** message. The inline walk-back it replaced only stepped back off a
+    /// `tool_result`, never off a `user` — so the synthetic `[summary …]` user message was prepended
+    /// directly in front of another user message and stored. Reachable on every session that grows
+    /// past `compact_threshold_chars` with at least 4 messages, which is to say: the common case.
+    /// `ValidHistory::snap` picks the split that survives the prepend.
+    #[tokio::test]
+    async fn compaction_never_writes_a_user_after_user_history() {
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from(vec![prose("earlier: we discussed pandas")])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        });
+        // Threshold 1 char: any real conversation is over it.
+        let (engine, events) =
+            assemble_test_engine_with_compaction(provider, AgentLoopSpec::default(), 1);
+        let engine = engine.unwrap();
+        let session = events.create_session("scripted/test-model").unwrap();
+
+        // Four messages in strict alternation — the shape every ordinary session has.
+        let mut log = SessionLog::open(&events, &session).unwrap();
+        for i in 0..2 {
+            log.open_turn(Message::user_text(format!("u{i}"))).unwrap();
+            log.close_turn(AssistantMessage::text(format!("a{i}")).unwrap())
+                .unwrap();
+        }
+
+        let mut sink = CollectSink::default();
+        engine
+            .maybe_compact(&session, &mut sink, &CancellationToken::new())
+            .await
+            .expect("compaction succeeds");
+
+        let after = events.conversation(&session).unwrap();
+        assert!(
+            after[0]
+                .text()
+                .starts_with("[summary of earlier conversation]"),
+            "compaction actually ran: {:?}",
+            after.iter().map(|m| m.text()).collect::<Vec<_>>()
+        );
+        assert!(
+            !after.iter().any(|m| m.text() == "u0"),
+            "the summarized prefix is gone"
+        );
+        // The load-bearing assertion. On the old inline walk-back this is
+        // `[summary(user), u1(user), a1(assistant)]` — `user`-after-`user`.
+        ValidHistory::new(after).expect("compaction must leave a valid provider history");
     }
 
     #[tokio::test]

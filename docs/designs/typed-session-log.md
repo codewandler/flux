@@ -180,6 +180,27 @@ wire codec keeps consuming that. This design deliberately does **not** push the 
 codecs: the codecs' job is per-provider shape translation, and they already work. The invariant
 being fixed is about what gets *written*, not how it is rendered.
 
+## What the migration forced (A-101)
+
+Two things the sketch above did not anticipate, both found by migrating `flux-flow` onto the handle
+and both pre-existing bugs rather than migration artifacts:
+
+- **A turn can have no user message.** `start_flow_turn` (SDK `start_flow`, the app runner, the
+  voice driver) begins a turn with `user_input: None`, yet `finish_turn` still persists its answer —
+  so a flow-driven session's log *opened on an `assistant` message*, which is not a valid provider
+  history. Such a turn now opens with a synthetic `[<flow name>]` user message naming its trigger.
+  The alternative considered and rejected was pairing both writes or neither (drop the answer): it
+  keeps the log valid too, but a later conversational turn would lose the flow's answer entirely,
+  which matters most exactly where flow turns are used (voice, app runners).
+- **An abandoned turn must be closeable by someone else.** A turn that died between its two writes
+  and was not resurrected leaves the log owing an answer; every later `open_turn` would be
+  `TurnAlreadyOpen` forever. `begin_turn_lifecycle` closes it with `(turn interrupted)` before
+  opening its own. This is append-only — the crashed turn's telemetry and run trace are untouched —
+  and it is what turns the invariant from a trap into a self-healing property.
+
+Both are the same lesson: the state machine is only as good as its handling of the states that
+already exist in the wild. The type made them visible; it did not create them.
+
 ## What this does not do
 
 - It does not validate *content* (a `tool_result` whose `tool_use_id` matches no in-flight call

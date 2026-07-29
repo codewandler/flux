@@ -138,6 +138,13 @@ fn two_step_plan() -> DraftAst {
 fn seed_crash(cl: &Client, session: &str, ast: &DraftAst, completed: usize) -> i64 {
     let events = cl.event_store();
     let flow = &cl.engine().flow;
+    // A real interrupted turn already carries its opening user message — the crash happens *between*
+    // a turn's two writes. Seeding only the `TurnStarted` telemetry described a turn that cannot
+    // occur, which the typed close (A-101) rejects.
+    flux_events::SessionLog::open(&events, session)
+        .unwrap()
+        .open_turn(flux_core::Message::user_text("do the thing"))
+        .unwrap();
     let turn_id = events.begin_turn(session, "do the thing", "mock").unwrap();
     events
         .record_plan_attempt(
