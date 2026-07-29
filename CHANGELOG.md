@@ -19,6 +19,15 @@ All notable changes to this project are documented in this file. The format is b
   and binds that redactor, so a tool cannot report an unredacted line. The sub-agent
   `SpawnActivityEvent` contract is deliberately **not** widened to carry content, so `task` cards
   still show no live output; only `bash` streams.
+- **The session-shape rules are types now, not discipline (A-99).** Three shapes break every provider
+  that enforces the Messages contract — an empty assistant message, a split `tool_use`/`tool_result`
+  pair, and a broken role alternation — and each has broken flux at least once, always on a newly
+  added turn-termination path. `flux-events` gains `AssistantMessage`, `ValidHistory` and
+  `ShapeError`: neither shape-checked type can be constructed except through a checking constructor,
+  and the rejection names both the invariant that failed and the offending index instead of
+  surfacing as a provider 400 seconds later. `ValidHistory::snap` absorbs compaction's ad-hoc
+  boundary walk-back into the type. Additive only — no call site moves yet, and
+  `record_message`/`record_compaction` are untouched; the migration is A-100…A-102.
 
 ## [0.33.0] - 2026-07-29
 
