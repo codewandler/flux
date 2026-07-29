@@ -70,7 +70,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [A-131 — Wire the fleet into a running flux — register the fleet.* ops and bind a WorkBoard from config](A-131-wire-the-fleet-into-a-running-flux.md) · Agent · SURFACED BY A-117, verified: FleetDispatchTool/A2aSpawner are constructed nowhere outside their own module (only re-exported at flux-orchestrate/src/lib.rs:18), and build_datasources knows only markdown|openapi — so the fleet exists in code and is unreachable from a running flux
 - [A-111 — Fleet coordinator — flux orchestrating flux across repos (epic)](A-111-fleet-coordinator-epic.md) · Agent · EPIC — the coordinator is a .flux Program on flux-app, not a new binary: a write-capable WorkBoard port (Jira/markdown/GitLab swappable), outbound A2A dispatch to remote workers, and per-delivery bus isolation as the blocker
 - [A-114 — MarkdownBoard — file-per-item with a derived index, IO via flux-system](A-114-markdown-board.md) · Agent · the track-style backend flux already dogfoods; write contention resolved structurally (file-per-item + atomic rename), never a lock
-- [A-117 — The coordinator.flux reference Program + offline end-to-end journey test](A-117-coordinator-program.md) · Agent · the epic's headline proof — intake → dispatch → sweep → done against MemoryBoard and a stub A2A worker, no credentials, no network
 - [A-129 — Bound delivery concurrency — the mpsc capacity was the only backpressure](A-129-bound-delivery-concurrency.md) · Agent · filed from A-112's implementor report — concurrency was the point of A-112, but it removed the one thing that bounded it
 - [A-130 — Board write-back of runner and task_id — make "the board is the run registry" true](A-130-board-run-state-writeback.md) · Agent · filed from A-116's implementor report — design §5 says the board IS the run registry, but no op can write the two fields that make it one
 
@@ -100,6 +99,7 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 - [C-227 — A dropped provider stream ends the whole turn — no automatic resume for a transport-class failure](C-227-no-automatic-resume-on-transport-class-provider-failure.md) · Core · `stream closed before completion` mid-exploration kills a 34-step run outright; flux has `--continue` but nothing retries, so long headless runs are a coin flip on provider transport
 
 ## Blocked
+- [A-117 — The coordinator.flux reference Program + offline end-to-end journey test](A-117-coordinator-program.md) · Agent · the epic's headline proof — intake → dispatch → sweep → done against MemoryBoard and a stub A2A worker, no credentials, no network
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
 
 ## Backlog
