@@ -40,6 +40,13 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Next (ready — take the top one unless the user named a story)
 - [C-185 — A leading diff/list marker must not hide a credential from the redactor](C-185-redactor-line-marker-boundary.md) · Core · `redact_patterns`' is_boundary set omits `+`/`-`/`*`/`#`, and the shape matcher requires token.starts_with(prefix) — so `+sk-ant-…` on an added diff line tokenizes with the marker glued on and is NOT redacted; every surface that renders a diff inherits the gap (found while building C-132, worked around locally there)
 
+### Security assurance — close the gap between the envelope and its proof
+- [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in the 2026-07-29 adversarial desk review; architecture rated 8/10 while assurance rated 5/10, and the spread is the work
+- [C-187 — SHA-pin every third-party GitHub Action — the signing key sits behind movable tags](C-187-sha-pin-github-actions.md) · Core · REVIEW — the ONLY confirmed finding exploitable by a third party with no flux bug and no operator mistake: MINISIGN_SECRET_KEY and crates.io publish rights run alongside actions pinned to movable tags
+- [C-188 — Dependency advisory scanning in CI — cargo-audit + cargo-deny over the 38-crate tree](C-188-dependency-advisory-scanning.md) · Core · REVIEW — the one confirmed finding whose truth value is UNKNOWN today: a RUSTSEC advisory in the transitive tree either exists right now or does not, and nothing in CI can tell you which
+- [C-189 — Server body limits and request timeouts — SECURITY.md declares daemon DoS in scope, the routers have no limit](C-189-server-body-limit-and-timeouts.md) · Core · REVIEW — a gap against flux's OWN published scope: SECURITY.md names --serve DoS as in-scope while flux-server/src/lib.rs mounts every router with no DefaultBodyLimit, TimeoutLayer or concurrency cap
+- [C-190 — Make the non-loopback auth invariant hold by construction, not only inside serve_on](C-190-non-loopback-auth-by-construction.md) · Core · REVIEW — AGENTS.md says 'there are no bypass paths, don't add one'; the unauthenticated-non-loopback refusal lives in serve_on (lib.rs:457) so a caller mounting the router directly gets no guard at all
+
 ## Blocked
 _None._
 
@@ -80,6 +87,9 @@ _None._
 
 ### Remote Approvals
 - [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
+
+### Security assurance — close the gap between the envelope and its proof
+- [C-191 — Registry-wide ToolSpec invariant test — a mutating op must not keep a read-only risk class](C-191-toolspec-invariant-test.md) · Core · REVIEW — the policy engine is only as good as each op's self-declared metadata; ToolSpec::read_only() is a coherent preset but NOTHING asserts the combination stays coherent as an op gains effects
 
 ### Taint Flow Policy
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
