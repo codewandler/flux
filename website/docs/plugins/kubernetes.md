@@ -59,8 +59,11 @@ kubectl config get-contexts        # what you already have
 flux spawns the plugin through the guarded process path, which clears the environment and re-adds
 only a minimal non-secret allow-list. `KUBECONFIG` is on that list, alongside `PATH` and `HOME`, so
 a kubeconfig at a non-default path resolves for the plugin exactly as it does in your own shell.
-What is forwarded is the *path*; the plugin reads the file through `kubectl`, and nothing else from
-your environment crosses over.
+What is forwarded is the *path* — the plugin opens the file itself, through `kubectl`. The rest of
+the allow-list is the same fixed non-secret set every plugin subprocess gets — locale, `TMPDIR`,
+your username, toolchain locations, logging knobs and the like. Nothing outside that list survives
+the clear, so a cloud token, an API key or any other export sitting in your shell never reaches the
+plugin.
 
 Every operation takes an optional `context` naming a kubeconfig context; omitting it uses the
 current one. The cluster inventory is available without any further grant — the plugin reaches the
