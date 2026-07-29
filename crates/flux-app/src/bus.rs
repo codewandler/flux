@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::admission::Admission;
 use crate::supervisor::DeliveryMessage;
 
 /// The observation-channel depth. Generous so observers can absorb a burst of journey `emit`s.
@@ -50,6 +51,9 @@ impl DeliveryOrigin {
 struct DeliveryRouter {
     supervisor: u64,
     sender: mpsc::WeakSender<DeliveryMessage>,
+    /// The delivery bound (A-129). The router only *counts* against it here — a `run`-routed event
+    /// is a submission like any other, and must show up as `waiting` until the actor admits it.
+    admission: Arc<Admission>,
     external_run: Arc<Mutex<Option<RunContext>>>,
 }
 
@@ -176,9 +180,14 @@ impl Bus {
                         .filter(RunContext::accepts)
                         .is_some_and(|run| {
                             router.sender.upgrade().is_some_and(|sender| {
-                                sender
+                                let submission = router.admission.submit();
+                                let sent = sender
                                     .try_send(DeliveryMessage::Event { event, run })
-                                    .is_ok()
+                                    .is_ok();
+                                if sent {
+                                    submission.enqueued();
+                                }
+                                sent
                             })
                         }),
                 }
@@ -200,6 +209,7 @@ impl Bus {
         &self,
         supervisor: u64,
         sender: mpsc::WeakSender<DeliveryMessage>,
+        admission: Arc<Admission>,
         external_run: Arc<Mutex<Option<RunContext>>>,
     ) -> bool {
         let mut delivery = self.delivery.lock().expect("delivery router poisoned");
@@ -209,6 +219,7 @@ impl Bus {
         *delivery = Some(DeliveryRouter {
             supervisor,
             sender,
+            admission,
             external_run,
         });
         true
@@ -291,7 +302,12 @@ mod tests {
         let bus = Bus::new();
         let (sender, _receiver) = mpsc::channel(CAPACITY);
         let external_run = Arc::new(Mutex::new(None));
-        assert!(bus.install_delivery_router(1, sender.downgrade(), external_run.clone(),));
+        assert!(bus.install_delivery_router(
+            1,
+            sender.downgrade(),
+            Admission::new(CAPACITY),
+            external_run.clone(),
+        ));
         let (run, _errors) = RunContext::new();
         run.activate();
         *external_run.lock().unwrap() = Some(run);
@@ -305,7 +321,13 @@ mod tests {
         let bus = Bus::new();
         let (sender, _receiver) = mpsc::channel(CAPACITY);
         let external_run = Arc::new(Mutex::new(None));
-        assert!(bus.install_delivery_router(1, sender.downgrade(), external_run.clone(),));
+        let admission = Admission::new(CAPACITY);
+        assert!(bus.install_delivery_router(
+            1,
+            sender.downgrade(),
+            admission.clone(),
+            external_run.clone(),
+        ));
         let (run, _errors) = RunContext::new();
         run.activate();
         *external_run.lock().unwrap() = Some(run);
@@ -314,5 +336,10 @@ mod tests {
             assert_eq!(bus.emit("tick", json!({"index": index})), 1);
         }
         assert_eq!(bus.emit("overflow", json!({})), 0);
+        assert_eq!(
+            admission.load().waiting,
+            CAPACITY,
+            "the rejected overflow event was not left counted as waiting (A-129)"
+        );
     }
 }

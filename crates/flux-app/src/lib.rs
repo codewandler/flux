@@ -32,6 +32,7 @@
 //! # const SRC: &str = "trigger boot\n  on \"startup\"\n  run hello\njourney hello\n  flow\n    return \"hi\"";
 //! ```
 
+mod admission;
 mod app;
 mod bus;
 mod ops;
@@ -40,6 +41,7 @@ pub mod review;
 mod secrets;
 mod supervisor;
 
+pub use admission::{DeliveryLoad, DEFAULT_MAX_INFLIGHT_DELIVERIES, MAX_INFLIGHT_DELIVERIES_ENV};
 pub use app::{App, HostPermissionRules, JourneyRun, RecordingSink};
 pub use bus::{Bus, Event, SentMessage};
 pub use review::{review_code_journey, strict_review_op, strict_review_program};
