@@ -17,16 +17,28 @@ replays the proposed policy against the recorded op history and reports, diff-st
 historical ops it would have newly blocked and newly allowed relative to the active policy.
 
 ## Acceptance
-- [ ] `flux policy simulate <file> [--sessions N]` evaluates both the active and proposed policy
+- [x] `flux policy simulate <file> [--sessions N]` evaluates both the active and proposed policy
   against recorded op requests and prints newly-blocked / newly-allowed / unchanged counts with
   per-op detail — failing-first test over a seeded event store.
-- [ ] Pure read: simulation writes nothing to the event store and constructs no providers.
-- [ ] Ops whose recorded context is insufficient to re-evaluate are reported as
+- [x] Pure read: simulation writes nothing to the event store and constructs no providers.
+- [x] Ops whose recorded context is insufficient to re-evaluate are reported as
   "indeterminate", never silently classified.
-- [ ] `--json` output for tooling.
+- [x] `--json` output for tooling.
 
 ## Progress
-- (not started — filed from the 2026-07-28 feature-suggestion pass)
+- Implemented as a CLI-only subcommand — it registers no op, so the public op catalog and
+  `website/docs/language/ops.md` are untouched.
+- `crates/flux-cli/src/policy_cmd.rs` holds the replay; `crates/flux-cli/tests/policy_simulate.rs`
+  is the acceptance suite (4 tests, drives the real binary over a seeded store), plus 8 unit tests
+  in `policy_cmd.rs`.
+- Indeterminacy is three-sourced and each carries a reason: no authority contract for the op in
+  this build, a record missing its caller, and a verdict that turns on caller trust/scopes/groups
+  the log never recorded. The third is scoped — a missing fact only makes indeterminate the ops it
+  could actually have decided, so an inert gate still leaves every op decided.
+- Known limit, surfaced in the report's `assumes:` line rather than hidden: the log records a
+  caller's principal id but not its kind, so every recorded caller is replayed as a `user`
+  principal. A proposed policy whose subjects discriminate on principal *kind* is refused whole
+  rather than answered wrongly (`a_kind_dependent_subject_refuses_the_whole_replay`).
 
 ## Notes
 - Pairs with approval distillation (C-94): distillation proposes a policy; simulation lets you
