@@ -24,10 +24,12 @@ const sidebars = {
       label: 'Agent',
       items: [
         'agent/cli',
+        'agent/tui',
         'agent/agent-loop',
         'agent/providers',
         'agent/claude-code',
         'agent/safety',
+        'agent/http-api',
         'agent/a2a',
         'agent/a2a-conformance',
         'agent/programs',
@@ -99,7 +101,14 @@ const sidebars = {
     {
       type: 'category',
       label: 'Plugins',
-      items: ['plugins/using-plugins', 'plugins/gitlab', 'plugins/slack', 'plugins/authoring'],
+      items: [
+        'plugins/using-plugins',
+        'plugins/gitlab',
+        'plugins/slack',
+        'plugins/kubernetes',
+        'plugins/sql',
+        'plugins/authoring',
+      ],
     },
     {
       type: 'category',

@@ -37,7 +37,7 @@ capability is denied.
 
 | Capability | Grants | Scope |
 |---|---|---|
-| `process` | Run a subprocess | exact `argv[0]` allow-list (empty = denied) |
+| `process` | Run a subprocess | argv-**prefix** allow-list (empty = denied) |
 | `secrets` | Read a secret by env key | exact env-key allow-list (empty = denied) |
 | `http` + `http_hosts` | Make HTTP requests | boolean on/off, plus an allowed-host list (SSRF guard still applies) |
 | `private_hosts` | Reach private/loopback addresses | declared hosts, admitted only when the operator *also* grants them |
@@ -45,6 +45,11 @@ capability is denied.
 | `blob` | Content-addressed scratch store | boolean |
 | `discover` | Ask "what endpoints exist for product X?" | boolean (cross-plugin discovery) |
 | `credential` | Materialize a credential reference into its raw value | boolean (see the exceptions below) |
+
+An argv-prefix grant matches whole leading tokens, not a substring: `kubectl` admits any `kubectl …`,
+while `kubectl get` admits `kubectl get pods` and refuses `kubectl delete pod x`. That is what lets a
+plugin be granted read verbs without the destructive ones. The manifest-level gate and the
+per-operation narrowing use the same matcher, so the two levels cannot disagree.
 | `fs` | Read specific host files outside the workspace | path-scoped globs, `..` rejected |
 
 Because these are declared once in the manifest and authorized up front, there is no per-call

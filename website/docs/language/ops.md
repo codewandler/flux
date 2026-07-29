@@ -271,6 +271,92 @@ family internally; strict-review flows use the review family directly.
 | `review.normalize` | `findings` | Normalize raw reviewer output and quarantine malformed entries as gaps |
 | `review.aggregate` | `findings[, files, reviewers]` | Deduplicate, rank, and summarize findings into a stable review report |
 
+## Scheduled wake-ups
+
+| op | arguments | description |
+|---|---|---|
+| `schedule_wakeup` | `in_secs, prompt` | Register a future wake-up on **this** session: after `in_secs`, the session resumes with `prompt` |
+
+`Medium` risk, `LocalSystem` effect. Off by default and absent from the catalog entirely until
+`[wakeup] enabled = true` — see the [configuration reference](../reference/config.md#scheduled-wake-ups-wakeup)
+for the horizon and pending-count bounds, and `flux wakeups list | cancel` in the
+[CLI reference](../agent/cli.md) to inspect and revoke them. Enabling the table does not grant the
+op: registration still needs approval-gated `host.write` authority.
+
+## Agent-loop stages
+
+These belong to the `reflect` group, which is **never surfaced into a model-facing catalog** — the
+model cannot call them. They exist so the agent turn loop can be *authored* in Flux-Lang rather than
+hard-coded, and you only write them when supplying your own loop via `[agent] loop`.
+
+| op | arguments | description |
+|---|---|---|
+| `detect_intent` | turn context | Detect the turn's intent and resolve capability signals into a durable `IntentSet` |
+| `explore` | exploration state | Continue evidence gathering and native-schema action proposal; may return more work |
+| `approve_batch` | `batch` | Request aggregate approval for one immutable `ActionBatch`; returns a session-bound one-shot receipt |
+| `execute_batch` | `batch, receipt` | Consume a matching receipt and dispatch every operation through authorization and guarded IO |
+| `ai_segment` | scope, exit condition | Hand a bounded run of model turns to the loop under a capability scope and an explicit exit condition |
+| `present_results` | stage artifact | Render a terminal adaptive-stage artifact into channel-neutral answer text |
+
+The approve/execute split is the safety envelope made explicit: `approve_batch` produces a receipt
+bound to one immutable batch, and `execute_batch` refuses anything the receipt does not match. See
+[The agent loop](../agent/agent-loop.md) and [Durability](./durability.md) for `ai_segment`'s role
+in bounded adaptive work.
+
+## Improvement loop
+
+The ops the self-improvement flows orchestrate. They are registered in every session, so a flow can
+call them directly.
+
+:::note Status
+The Improvement pillar is **de-prioritized and on hold** (since 2026-07-06). The machinery below is
+real and runnable; the headline claim — a repeatable, grader-confirmed gain — is not yet proven. Use
+these ops to measure and audit, not on the assumption that the loop reliably improves the harness.
+See [Improvement](../agent/improvement.md).
+:::
+
+**Running and scoring evals**
+
+| op | arguments | description |
+|---|---|---|
+| `eval_run` | `adapter, …` | Run a benchmark suite against the flux binary; returns `{adapter, pass_rate, scalar, total, …}` |
+| `eval_scalar` | `report` | The report's score scalar as a plain string |
+| `eval_report_md` | `report` | Render a report as categorized Markdown (headline score, per-task table) |
+| `eval_sessions` | `report` | Extract session references `[{id, db, task_id}]` from a report |
+| `eval_adopt` | `report` | Return a report unchanged — used to re-bind the baseline after adopting a candidate |
+| `score_compare` | `candidate, baseline` | `"true"` iff the candidate report is strictly better |
+| `score_compare_multi` | `candidate, baseline` | `"true"` iff better overall **and** no member benchmark regressed |
+| `grade` | `criterion` | Evaluate a pass/fail criterion against the current workspace |
+
+`score_compare_multi` exists because a single combined score can hide a regression: it requires
+every member benchmark's pass rate and check rate to be at least the baseline's.
+
+**Mining and ranking improvements**
+
+| op | arguments | description |
+|---|---|---|
+| `sessions_digest` | `sessions` | Render each session's run trace into a compact transcript for review |
+| `painpoints_collect` | `sessions` | Mine pain-points — tool errors, retry loops, missing tools, churn — from session references |
+| `improvements_aggregate` | `painpoints, findings` | Cluster mined pain-points and review findings into ranked candidates |
+| `candidates_advance` | `candidates` | Drop the consumed candidate and return the rest |
+| `candidates_empty` | `candidates` | `"true"` iff the candidate list is empty |
+| `improve_log` | round record | Append a timestamped round record to `.flux/eval/improve-log.jsonl` |
+
+**Applying a round, under guard**
+
+| op | arguments | description |
+|---|---|---|
+| `change_implement` | tasks | Implement each derived task by spawning a `worker` sub-agent; returns a per-task summary |
+| `gate_check` | | Run the dev gate (build/test/clippy/fmt) and return `"true"` or `"false"` |
+| `guard_protected` | snapshot | Restore grader/suite/loop/CI paths to the round snapshot after the worker runs |
+| `git_snapshot` | | Capture `HEAD` for later revert; errors if the working tree is dirty |
+| `git_revert` | snapshot | **Destructive** — hard-reset the working tree to a snapshot, discarding the round's changes |
+| `git_tag` | `[message]` | Tag the current commit (annotated when a message is given) |
+
+`guard_protected` is the anti-cheat step: it restores the grader, the suite, the loop, and the CI
+config after each worker run, so a round cannot raise its own score by editing what measures it.
+`git_revert` carries the `Destructive` risk tier and is approval-gated accordingly.
+
 ## The loop itself
 
 flux's own agent turn loop is a Flux-Lang flow, driven by reflexive planning and evidence ops

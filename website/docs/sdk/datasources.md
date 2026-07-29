@@ -47,9 +47,25 @@ assert!(client
 ```
 
 `flux_sdk::datasource` re-exports the complete consumer contract: `LiveDatasource`, `LiveAccess`,
-`LiveSchema`, `LiveEntity`, typed filter declarations, `Page`/`PageRequest`, and weak `Row`/
-`Reference` values. A live backend therefore needs the SDK, but not a direct dependency on flux's
-internal capability crate.
+`LiveDatasourceSurface`, `LiveSchema`, `LiveEntity`, typed filter declarations (`FilterKey`,
+`FilterType`, `FilterValue`, `Filters`), `Page`/`PageRequest`, and weak `Row`/`Reference` values. A
+live backend therefore needs the SDK, but not a direct dependency on flux's internal capability
+crate.
+
+The trait itself is four methods — `schema()` and `access()` describe the backend once, at
+registration, and `list(ctx, entity, page, filters)` / `get(ctx, entity, id)` do the async work with
+already-validated arguments:
+
+```rust
+#[async_trait]
+pub trait LiveDatasource: Send + Sync {
+    fn schema(&self) -> LiveSchema;
+    fn access(&self) -> Vec<LiveAccess> { Vec::new() }
+    async fn list(&self, ctx: &ToolContext, entity: &str, page: PageRequest, filters: &Filters)
+        -> Result<Page<Row>>;
+    async fn get(&self, ctx: &ToolContext, entity: &str, id: &str) -> Result<Option<Row>>;
+}
+```
 
 Registration generates exactly two operations:
 
@@ -89,8 +105,10 @@ URL—never a credential, session, database handle, presigned secret URL, or liv
 configured-domain ambient signal as one unit. Consequently, `support.list` and `support.get` are
 advertised only when the `support` backend is actually configured. Lower-level hosts using
 `try_register_live_datasource` receive the same group/signal description and must carry it into
-their engine assembly. `FLUX_SURFACE_ALL` remains the explicit catalog-debug override; it does not
-widen authorization.
+their engine assembly — that description is a `LiveDatasourceSurface { group, ambient_signal }`,
+returned from registration precisely so a host cannot advertise the tools without also installing
+the evidence that makes them available. `FLUX_SURFACE_ALL` remains the explicit catalog-debug
+override; it does not widen authorization.
 
 The no-key reference implementation exercises two entities, typed filters, cursor paging, get,
 not-found, and real executor dispatch:
@@ -108,12 +126,10 @@ Use the indexed backend when records should be ingested into flux and searched b
 semantic similarity. This remains the right contract for workspace docs, program-declared
 knowledge, and plugin-contributed records.
 
-Add the capabilities crate alongside the SDK:
+Add the capabilities crate alongside the SDK — keep both on the same version, they release together:
 
-```toml
-[dependencies]
-codewandler-flux-sdk = "0.25"
-codewandler-flux-capabilities = "0.25"
+```bash
+cargo add codewandler-flux-sdk codewandler-flux-capabilities
 ```
 
 Build a backend, index documents, and attach the six retrieval operations through the fallible pack
@@ -155,5 +171,36 @@ The same installer works with `ClientBuilder::try_register_pack` for a conversat
 cargo run -p codewandler-flux-sdk --example datasource_recipe
 ```
 
-See [the agent datasource concept](../agent/datasources.md) for how indexed and live datasources fit
-into the operation catalog.
+### Choosing a backend and getting records in
+
+`DatasourceBackend` is a trait, so the index is pluggable:
+
+| Backend | Build with | Use for |
+|---|---|---|
+| `MemoryBackend` | `MemoryBackend::new()` | Tests, ephemeral indexes, program-declared knowledge rebuilt at startup. |
+| `SqliteBackend` | `SqliteBackend::open(path)` (WAL, created if absent) or `SqliteBackend::in_memory()` | A persistent index that survives restarts. |
+| `SemanticIndex` | `SemanticIndex::new(inner, embedder)` | Wrap any backend to add embedding rerank on top of keyword search. |
+
+`SemanticIndex` blends the two scores — `with_keyword_weight(w)` sets the keyword share (the cosine
+share is `1 - w`; the default is `0.5`). `with_semantic_sources([..])` opts individual sources in
+rather than embedding everything, `with_source_embedder(source, embedder)` routes different
+knowledge bases to different embedding models, and `with_vector_store(..)` replaces the default
+in-memory vectors. An `Embedder` is a trait too; the SDK's optional `embeddings` /
+`local-embeddings` / `sqlite-vec` features supply concrete ones.
+
+Ingest helpers all take `&dyn DatasourceBackend` and return the number of records written:
+
+- `ingest_markdown(backend, source, &[(path, text)])` — chunked Markdown documents.
+- `ingest_text(backend, source, id, text, &ChunkOptions)` — one blob, with explicit chunking.
+- `ingest_openapi(backend, source, &spec)` — an OpenAPI document, one record per operation.
+- `reindex(backend)` clears the index for a full rebuild; `freshness(backend)` returns the record
+  count, so a zero means "nothing is indexed yet".
+
+## Related docs
+
+- [Datasources (concept)](../agent/datasources.md) — how indexed and live datasources fit into the operation catalog.
+- [Operations](../language/ops.md) — the `search`/`get`/`list`/`relation`/`batch_get`/`sources` operations as the model sees them.
+- [SDK overview](./overview.md) — the front doors and every other `flux_sdk` re-export module.
+- [Sessions & persistence](./sessions.md) — the conversational `Client` a datasource attaches to.
+- [`FlowClient`](./flow-client.md) — `try_register_pack` and the rest of the registration surface.
+- [Safety and approvals](../agent/safety.md) — the envelope every generated datasource call still crosses.

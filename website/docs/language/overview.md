@@ -52,17 +52,21 @@ runtime safety envelope before it touches the world.
 - **Not a general-purpose language.** Loops are bounded, recursion is rejected, and the analyzer
   refuses plans it cannot reason about. The language is deliberately small.
 
-## The two forms
+## The three front-ends
 
-Every flow has two interchangeable representations:
+One flow, three ways to say it. All of them describe the same AST:
 
 - **Text** — `.flux` files. Human-writable, comment-friendly, version-controllable. This is what
   you write in an editor and what the docs mostly show.
 - **JSON AST** — the canonical programmatic and storage format used by SDKs, tooling, replay, and
   host-derived execution records. Not meant to be hand-written.
+- **Rust DSL** — the `flux_lang::dsl` builders, re-exported as `flux_sdk::dsl`. Typed, composable
+  Rust that constructs a `DraftAst` directly, for embedders who want the compiler to check the
+  program they are assembling. See the [SDK overview](../sdk/overview.md).
 
-The two forms are semantically identical: a `.flux` file parses to exactly the AST the JSON expresses,
-and the formatter turns any AST back into canonical text. The same flow, both ways:
+The forms are semantically identical: a `.flux` file parses to exactly the AST the JSON expresses,
+the DSL builds that same tree in Rust, and the formatter turns any AST back into canonical text. The
+same flow, two of the three ways:
 
 ```flux
 flow check-readme
@@ -81,8 +85,9 @@ flow check-readme
 }
 ```
 
-Humans usually write the text form; SDK builders and host tooling may construct the AST directly.
-Both are normalized into the same AST before analysis and execution. Every node kind has a native text spelling; a one-line
+Humans usually write the text form; SDK builders and host tooling may construct the AST directly,
+either as JSON or through the Rust DSL. All three are normalized into the same AST before analysis
+and execution. Every node kind has a native text spelling; a one-line
 `@json` escape remains for the rare shapes the text grammar cannot express. The
 [node reference](./node-reference.md) covers every kind in both shapes.
 

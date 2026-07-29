@@ -88,12 +88,36 @@ The complete discovery, precedence, CLI-input, and `op.register` scope rules liv
 ## Program declarations
 
 Beyond flows and ops, a module may declare a whole multi-agent application: `permissions`, `agent`,
-`channel`, `datasource`, `trigger`, and `journey` declarations describe the capability ceiling,
-agents, channels, indexed data, and event-triggered journeys that tie them together — one typed
-`.flux` file for the entire app. A journey's optional `agent` attribute makes ownership executable:
-the fixed flow inherits that agent's model, persona, datasource scope, and capability narrowing.
-Secrets are declared as references
+`agent_loop`, `channel`, `datasource`, `trigger`, and `journey` declarations describe the capability
+ceiling, agents, their outer loops, channels, indexed data, and event-triggered journeys that tie
+them together — one typed `.flux` file for the entire app. A journey's optional `agent` attribute
+makes ownership executable: the fixed flow inherits that agent's model, persona, datasource scope,
+and capability narrowing. Secrets are declared as references
 (`secret "ENV_VAR"`) and resolved at load time; values never live in the file.
+
+### `agent_loop` — authoring the outer loop
+
+An `agent_loop` declaration is a named flow body that replaces the built-in adaptive turn loop. An
+agent selects one with a `loop "<name>"` attribute; an agent that declares none gets the host's
+adaptive preset.
+
+```flux
+agent_loop triage
+  $intent = detect_intent()
+  $found  = explore({intent: $intent})
+  $ok     = approve_batch({batch: $found.batch})
+  $done   = execute_batch({batch: $found.batch, receipt: $ok})
+  return present_results({stage: $done})
+
+agent responder
+  model "sonnet"
+  loop "triage"
+```
+
+The stage ops it calls belong to the `reflect` group and are never offered to the model — see
+[Agent-loop stages](./ops.md#agent-loop-stages). Because the loop is an ordinary flow body, it is
+analyzed and budgeted like any other, and every operation it dispatches still crosses the same
+safety envelope.
 
 Top-level and agent `allow`/`deny` lists contain exact operation names. The app list is the ceiling;
 an agent list may narrow but never widen it. `tools` remains the separate model-visible catalog.

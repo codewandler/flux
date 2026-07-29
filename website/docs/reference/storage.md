@@ -27,6 +27,27 @@ Zero configuration. The `flux` binary opens (creating on first use):
 SQLite runs in WAL mode with a ~5 s busy timeout, so concurrent readers and multiple flux
 processes sharing the same log coordinate safely.
 
+### Relocating the store
+
+| Override | Effect |
+|---|---|
+| `--store <dir>` | Store location for this invocation. flux exports it as `FLUX_STORE_DIR`, so subprocesses inherit the same store. |
+| `FLUX_STORE_DIR` | The same thing set directly — useful for a shell session or a service unit. |
+
+With neither set, the store is `$HOME/.flux`. Because `--store` works *by* setting
+`FLUX_STORE_DIR`, the two are one mechanism rather than two layers.
+
+Pointing `--store` at a scenario fixture written by `flux record` makes the session tools
+(`replay`, `fork`, `diff`, `sessions`) work against a committed fixture with no fixture-specific
+code path.
+
+:::note `flux usage` does not follow `--store`
+`flux usage` reads the **global** events store, resolved from `FLUX_HOME` (falling back to
+`~/.flux`), and deliberately ignores `--store`. Cost roll-ups therefore stay account-wide even while
+you are working against a relocated or fixture store — so a `--store` session's spend will not
+appear where you might expect it.
+:::
+
 ## Postgres backend (opt-in)
 
 For deployments that embed the flux crates and run **several processes or replicas against one

@@ -103,17 +103,18 @@ same convention as declaring `fn f(x)` and writing `x + 1` in mainstream languag
 
 | Kind | Syntax | Example |
 |---|---|---|
-| String | double-quoted, single line | `"hello"` |
+| String | double-quoted, or `"""…"""` to span lines | `"hello"` |
 | Number | bare numeric | `42`, `3.14` |
 | Bool | keyword | `true`, `false` |
 | Null | keyword | `null` |
 | Array | `[val, val, ...]` | `["a", "b", "c"]` |
 | Object | `{key: val, ...}` | `{adapter: "local", trials: 3}` |
 
-Strings are single-line; embed newlines with `\n` escapes. Object and array literals are valid
-inside call arguments **on one line** — the parser is line-based, so a statement is a single
-line. Inside a call argument list, `{` always starts an object, never a block; blocks are only
-introduced by flow-control keywords on their own line.
+A `"…"` string is single-line — embed newlines with `\n` escapes, or use the
+[`"""…"""` form](#multi-line-strings) below, which is the better choice for anything long. Object
+and array literals are valid inside call arguments **on one line** — the parser is line-based, so a
+statement is a single line. Inside a call argument list, `{` always starts an object, never a block;
+blocks are only introduced by flow-control keywords on their own line.
 
 An object or array whose leaves include symbols or expressions is a **value template** rather
 than a literal — see [Pure data](./pure-data.md).
@@ -127,6 +128,47 @@ evaluation time. Unbound names are left verbatim. Double the braces to emit a li
 $msg     = "built {sha} in {elapsed}ms"
 $example = "use {{key: value}} syntax"   # outputs: use {key: value} syntax
 ```
+
+### Multi-line strings
+
+A `"""` token opens a multi-line string. Everything up to the **next literal `"""`** is the value,
+taken completely **verbatim**: no escape processing (`\n`, `\"` and `\\` are literal characters, not
+escapes), no comment stripping (a `#` inside the block is content), and no indentation stripping
+(the block's own indentation is part of the value — there is no dedent).
+
+```flux
+flow review-diff -> String
+  $diff = git_diff()
+
+  $prompt = """Analyse this diff and suggest improvements.
+Focus on correctness, not style.
+
+Diff:
+{diff}"""
+
+  $notes = ai.reason({ask: $prompt})
+  return $notes
+```
+
+This is the one construct allowed to span physical lines — the terminator is found by scanning for
+the next `"""`, not by tracking indentation, so it sidesteps the line-based statement grammar used
+everywhere else. It works in **every** position a `"…"` string does: a bind value, a call argument,
+a `lit` nested in an object or array, a value-template leaf, and the natively spelled string fields
+(`fmt`'s template, `assert`'s message, `ctx`'s purpose, `route`'s case label).
+
+`{symbol}` interpolation applies exactly as it does to a normal string — interpolation is a property
+of the value, not of the spelling used to write it.
+
+Prefer this form for anything long: prompts, embedded JSON, diffs, file contents. Removing escaping
+as a failure mode is the point of the feature.
+
+:::note Two things a `"""` block cannot contain
+Because the terminator is "the next literal `\"\"\"`", the content cannot itself contain `"""`, and
+cannot **end** with a `"` (that quote would merge with the closing delimiter into an ambiguous run).
+Both are rare in real payloads. `fluxlang format` detects them and falls back to the escaped
+single-line spelling automatically, so round-tripping is never unsafe — a small set of inputs simply
+don't get the nicer spelling.
+:::
 
 ## Calls
 
@@ -168,6 +210,16 @@ $scaled = $base * 1.2
 Operator formulas in bind RHS positions lower to pure `expr` nodes. `$name` references become the
 `expr.vars` map automatically, and dotted `$issue.state` reads object fields leniently inside the
 formula. Annotations are preserved in the AST and used by analysis; they are optional everywhere.
+
+One bind variant is spelled differently: prefixing a bind with `memo` caches its value for the whole
+session, so the op does not re-execute on later turns. It takes the same optional type annotation
+and `@effect(tag)` line as an ordinary bind:
+
+```flux
+memo $schema = read("schema.sql")
+```
+
+See [Durability](./durability.md#memo--compute-once-per-session) for when the cache is invalidated.
 
 ## Native Conditions
 

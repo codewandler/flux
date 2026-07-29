@@ -122,6 +122,10 @@ flux auth login claude   # optional opt-in OAuth path
 | `claude` | Anthropic Messages | Claude subscription OAuth (`~/.claude/.credentials.json`) |
 | `codex` | OpenAI Responses | ChatGPT/Codex OAuth (`~/.codex/auth.json`) |
 | `aws` | Bedrock Anthropic | AWS env / SSO / IRSA / EKS Pod Identity |
+| `mock` | — | none — offline test provider, exercises the full pipeline |
+
+Bare aliases need no prefix: `fable`, `opus`, `sonnet`, `haiku` resolve on `anthropic`; bare
+`claude`, `codex`, and `aws` resolve their provider's default model; `mock` runs offline.
 
 ## Configuration (`.flux/config.toml`)
 
@@ -207,11 +211,16 @@ All non-health routes require bearer auth by default. A non-loopback bind withou
 ## Presets and programs
 
 flux includes a preset library (`flux preset`) for common flow structures (retries, fan-out, loops,
-fallbacks). Programs (`flux run --program`) let you compose multi-agent journeys in Flux-Lang.
+fallbacks). Programs let you compose multi-agent journeys in Flux-Lang: a `.flux` file declaring
+agents, channels, datasources, triggers, and journeys. Run one with `flux app run <program.flux>`,
+or hand it to bare `flux run <app.flux>` — a `.flux` path is detected instead of treated as a prompt.
 
 ```bash
 flux preset list
 flux preset retry_with_backoff max=3 delay_ms=200 op=read input='"README.md"' bind=r --run --yes
+
+flux app run support-bot.flux          # serve its declared channels until Ctrl-C
+flux run support-bot.flux              # same program, auto-detected
 ```
 
 ## SDK

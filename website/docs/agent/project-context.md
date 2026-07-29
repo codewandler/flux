@@ -94,3 +94,10 @@ therefore ignored — including one pointing somewhere harmless inside the repo.
 - Applies to one subsystem → a fragment with `globs:`.
 - Reference material the agent should consult on demand rather than always carry → a
   [skill](./skills-and-roles.md) instead.
+
+## Related docs
+
+- [Skills and roles](./skills-and-roles.md) — the on-demand alternative to always-loaded context.
+- [The agent loop](./agent-loop.md) — where the assembled block sits in a turn, and what runs after it.
+- [Safety & approvals](./safety.md) — the authorization and guarded-IO envelope that reads these files.
+- [Configuration](../reference/config.md) — the `[workspace]` table behind `--add-dir` and `--allow-all-paths`.

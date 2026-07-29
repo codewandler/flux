@@ -88,6 +88,7 @@ actions   = ["workspace.write"]
 | Key | Meaning |
 |---|---|
 | `model` | Default provider/model spec; `-m` overrides it. Default: `sonnet`. |
+| `theme` | TUI color theme — `dark`, `light`, `dracula`, `nord`, `high-contrast`, `mono`. The in-TUI `/theme` command persists it here. See [the TUI](../agent/tui.md). |
 | `browser_bin` | Chromium executable for `browser.*`; otherwise `FLUX_BROWSER_BIN`, then `PATH`. |
 | `enable_shell` | Surface the high-risk `bash` and `proc.run` shell group. Off by default. |
 | `allow_private_net` | Deprecated compatibility switch that grants all private hosts to native web ops. Prefer `[private_net] web`. It never grants plugins. |
@@ -369,6 +370,32 @@ credential-free `url` are required; `product`, `protocol`, `credential_ref`, and
 value. Project declarations override user declarations with the same id. Use `flux endpoint add`
 when you want the equivalent imperative surface. See [Endpoints](../agent/endpoints.md).
 
+## Scheduled wake-ups (`[wakeup]`)
+
+The `schedule_wakeup` op lets an agent schedule its own later turn. It is **off by default** and
+absent from the operation catalog entirely until enabled — the same off-by-default posture as
+`enable_shell`.
+
+```toml
+[wakeup]
+enabled = true
+max_horizon_secs = 86400
+max_pending_per_session = 8
+```
+
+| `[wakeup]` key | Meaning |
+|---|---|
+| `enabled` | Surfaces the `schedule_wakeup` op. Default `false`. |
+| `max_horizon_secs` | Furthest ahead a single wake-up may be scheduled. Absent means the built-in default. |
+| `max_pending_per_session` | Cap on simultaneously pending wake-ups per session. Absent means the built-in default. |
+
+Enabling the table is necessary but not sufficient: registering a wake-up also needs `host.write`
+authority, which is approval-gated by the default policy. This table **bounds** an approved
+registration; it does not grant one.
+
+Inspect and cancel pending wake-ups with `flux wakeups list` and `flux wakeups cancel` — see the
+[CLI reference](../agent/cli.md).
+
 ## Server settings
 
 | `[server]` key | Meaning |
@@ -388,15 +415,85 @@ listener.
 
 ## Environment overrides
 
-Common runtime overrides include `FLUX_VERBOSE=1`, `FLUX_SHOW_LOOP=1`,
-`FLUX_TURN_TOKEN_BUDGET`, `FLUX_COMPACT_CHARS`, `FLUX_ENABLE_BASH=1`,
-`FLUX_BROWSER_BIN`, `FLUX_ALLOW_PRIVATE_NET=1`, `FLUX_MANAGED_CONFIG` (path to the managed config
-file, overriding the `/etc/flux/config.toml` convention), `OLLAMA_HOST`,
-`FLUX_SANDBOX` (`off`/`on`/`require`),
-`FLUX_SANDBOX_NET`, `FLUX_SANDBOX_WRITABLE`, `FLUX_BWRAP_BIN`, `FLUX_SANDBOX_EXEC_BIN`, and the
-provider API-key variables listed under [Providers and models](../agent/providers.md).
 Security-relevant booleans only enable on `1`, `true`, `yes`, or `on`; values such as `0` and
-`false` stay off.
+`false` stay off. Provider API-key variables are listed under
+[Providers and models](../agent/providers.md).
+
+### Paths and workspace
+
+| Variable | Effect |
+|---|---|
+| `FLUX_STORE_DIR` | Overrides the event-store location; `--store` works by setting it. See [Storage](./storage.md). |
+| `FLUX_HOME` | The flux home directory (default `~/.flux`) that `flux usage` resolves its global events store from. It does **not** redirect `--store`/`FLUX_STORE_DIR`. |
+| `FLUX_ADD_DIRS` | Extra workspace roots, path-separator delimited; the environment form of `--add-dir`. |
+| `FLUX_WORKTREE_DIR` | Where context-local Git worktrees are created. |
+
+### Safety and permissions
+
+| Variable | Effect |
+|---|---|
+| `FLUX_ALLOW_ALL` | Auto-approves every action — the environment form of `--allow-all-paths`/`--yes`. Do not set it on a shared or non-interactive host without an explicit policy. |
+| `FLUX_ENABLE_BASH` | Surfaces the high-risk shell group, like `enable_shell`. |
+| `FLUX_ALLOW_PRIVATE_NET` | Grants private-network egress to native web ops. Prefer `[private_net] web`. |
+| `FLUX_ALLOW_SOURCE_BUILD` | Permits installing a plugin by building it from source, bypassing the signed-pack channel. See [Plugin trust](../security/plugin-trust.md). |
+| `FLUX_SANDBOX` | `off` / `on` / `require`. With `FLUX_SANDBOX_NET`, `FLUX_SANDBOX_WRITABLE`, `FLUX_BWRAP_BIN`, `FLUX_SANDBOX_EXEC_BIN` — see [OS process sandboxing](../security/os-sandbox.md). |
+| `FLUX_MANAGED_CONFIG` | Path to the managed config file, overriding the `/etc/flux/config.toml` convention. |
+
+### Server and A2A
+
+| Variable | Effect |
+|---|---|
+| `FLUX_SERVER_TOKEN` | Shared secret for shared-secret auth mode. |
+| `FLUX_SERVER_MAX_BODY_BYTES` | Request-body cap; over it the server answers `413`. A `0` or unparseable value falls back to the default rather than disabling the bound. |
+| `FLUX_SERVER_REQUEST_TIMEOUT_SECS` | Response-production timeout; over it the server answers `408`. Same fallback rule. |
+| `FLUX_A2A_TOKEN` | Bearer token used when flux calls *out* to another agent. |
+| `FLUX_A2A_MAX_INFLIGHT_PER_REALM` | Concurrent in-flight A2A turns permitted per realm. |
+| `FLUX_A2A_PUSH_ALLOW_LOCAL` | Permits A2A push notifications to loopback targets. |
+| `FLUX_A2A_PUSH_PRIVATE_HOSTS` | Private hosts permitted as A2A push targets. |
+
+See the [HTTP API](../agent/http-api.md) and
+[Server authentication & tenancy](../security/server-auth.md).
+
+### Model, context and cost
+
+| Variable | Effect |
+|---|---|
+| `FLUX_TURN_TOKEN_BUDGET` | Per-turn token budget. |
+| `FLUX_COMPACT_CHARS` | Character threshold that triggers history compaction. |
+| `FLUX_TOOL_OUTPUT_CAP` | Maximum characters of a single tool result kept in context. |
+| `FLUX_CACHE_TAIL` | Tunes the prompt-cache tail boundary. |
+| `FLUX_BEDROCK_HAIKU_PROFILE` | Bedrock inference profile used for the small/fast model. |
+| `FLUX_CODEX_WS` | Toggles the Codex provider's WebSocket transport. |
+
+### Datasource embeddings
+
+Semantic retrieval over an indexed datasource needs an embeddings endpoint. Without these three,
+retrieval falls back to lexical matching.
+
+| Variable | Effect |
+|---|---|
+| `FLUX_EMBEDDINGS_URL` | Embeddings endpoint URL. |
+| `FLUX_EMBEDDINGS_API_KEY` | Its API key. |
+| `FLUX_EMBEDDINGS_MODEL` | Embedding model name. |
+
+See [Datasources](../agent/datasources.md).
+
+### Interface and diagnostics
+
+| Variable | Effect |
+|---|---|
+| `FLUX_VERBOSE` | Verbose output. |
+| `FLUX_SHOW_LOOP` | Shows agent-loop steps as they run. |
+| `FLUX_NO_SPLASH` | Suppresses the TUI splash screen. |
+| `FLUX_BROWSER_BIN` | Chromium executable for `browser.*` ops. |
+| `FLUX_TRACE_LOOP` | Traces loop execution. |
+| `FLUX_MODEL_TRACE` | Traces model requests and responses. |
+| `FLUX_TRANSPORT_DEBUG` | Logs provider transport detail. |
+| `FLUX_AUTO_RESURRECT` | Automatically resurrects an interrupted session on restart. |
+| `FLUX_VAULT_MOUNT` / `FLUX_VAULT_PREFIX` | HashiCorp Vault mount and path prefix for credential lookup. See [Credentials](../security/credentials.md). |
+
+The diagnostic variables are for troubleshooting, not for normal operation — see
+[Troubleshooting](../troubleshooting.md).
 
 ## Related docs
 

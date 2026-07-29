@@ -85,3 +85,10 @@ You have used an adaptive turn with reliable operation schemas and a guarded eff
 you will author a reusable flow whose structure never has to be inferred.
 
 Continue to [Write a reusable flow](./first-flow.md).
+
+## Related docs
+
+- [2. Write a reusable flow](./first-flow.md) — the next lesson: the same task, authored instead of inferred.
+- [The agent loop](../agent/agent-loop.md) — the stages you just watched, in full: intent, exploration, batch, approval.
+- [Safety & approvals](../agent/safety.md) — why the write waited and what approving it actually granted.
+- [CLI](../agent/cli.md) — `flux run`, `flux loop`, and the rest of the local command surface.

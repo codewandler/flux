@@ -22,7 +22,9 @@ The default turn has explicit phases:
 
 The built-in file operations are: `read` (one file, a list of files, or a glob pattern — single-file
 reads get a line-numbered view, multi-file reads return `==> path <==` sections; refuses binary and
-guides you to a range for very large files; `read_many` remains only as a legacy alias), `write`
+guides you to a range for very large files), `read_many` (a first-class bulk read — once several
+relevant paths are known, the registry tells the model to prefer it over sequential `read` calls;
+each section is headed `==> path <==`), `write`
 (create/overwrite, returns a diff), `append` (lower-risk add to a file), `edit` (string replace with
 progressively looser whitespace/indentation matching and a unified diff), `patch` (line-anchored
 `insert_before/after`/`replace_range`/`delete_range`), `glob`, and `grep` (regex by default; pass
@@ -188,6 +190,10 @@ flux render <file.flux>          # render a .flux file as a syntax-highlighted i
                                  #   out.png rasterizes PNG (embedded font); both workspace-
                                  #   confined, stdout (SVG) otherwise; the doc-image generator
 flux sessions                    # list recent sessions
+flux wakeups list [<session>]    # inspect agent-scheduled wake-ups (A-98) — a turn that called
+                                 #   `schedule_wakeup` to resume itself later. `list` is the
+                                 #   default action and the session defaults to `last`;
+                                 #   `cancel <session> <wakeup-id>` cancels one before it fires
 flux usage                       # aligned token/cost dashboard for flux + detected Codex,
                                  #   Claude Code, and opencode stores. Shows period/session/time
                                  #   metrics, a per-harness + absolute total summary, cache share,
@@ -214,6 +220,23 @@ flux fork <session> --at N       # TIME MACHINE (A-46): branch a recorded run at
 flux diff <A> <B>                # TIME MACHINE (C-44): align two recorded runs; shows where the FLOW
                                  #   changed vs where the same flow hit a DIFFERENT WORLD (op output
                                  #   differs); --json; exit 1 when the runs diverge (diff-style)
+flux export <run> -o run.html    # TIME MACHINE (C-132): render a recorded run as ONE self-contained
+                                 #   static HTML file — plan tree (the `flow_render` substrate),
+                                 #   per-op results and diffs, cost, timeline, sub-agent children
+                                 #   nested, every rendered string redacted (C-22). The read-only
+                                 #   sibling of replay/fork/diff: a pure read, no event-store write,
+                                 #   no provider. Inline CSS, no JS, no network refs. <run> defaults
+                                 #   to `last`; without -o the HTML goes to stdout
+flux record <name> "<prompt>"    # record ONE live turn as a committed-safe scenario fixture (D-174):
+                                 #   the run's events, flow state, redacted model cassette, and
+                                 #   canonical plan snapshot land in tests/scenarios/<name>/ (--dir
+                                 #   relocates the fixture root)
+flux test [<name>]               # replay those fixtures offline as a test gate (D-174): the REAL
+                                 #   agent re-runs against the recorded world under a deny-all
+                                 #   approver and a never-called provider — $0, no key, no network.
+                                 #   Omit <name> to run every fixture under --dir. Exit 1 if any
+                                 #   fixture diverges (prints the plan source and the world diff),
+                                 #   so it works as a CI gate; --json for a machine-readable report
 flux plugin install <name>       # the plugin CLI — verified install from the signed plugin pack (@<version>, --all;
                                  #   --dir registers local builds); also ls / status / call / pin / rollback / uninstall / skill
 flux eval synthetic --watch      # run a benchmark suite (synthetic riddles / mock / terminal-bench / multi);
@@ -238,6 +261,13 @@ flux changelog                   # show what changed in flux, in plain language 
                                  #   not-yet-released (development) section
 flux completion [shell]          # print a shell completion script to stdout (defaults to fish); an
                                  #   unknown shell is a usage error (exit 2)
+flux doctor                      # diagnose a flux install end-to-end (C-128): provider credentials
+                                 #   (incl. OAuth expiry), plugin-pack signature/hash drift, the OS
+                                 #   sandbox backend, events.db health, private-network egress
+                                 #   config sanity, `[tools] disable` resolution, and version skew
+                                 #   vs the latest release — each non-pass carries a one-line
+                                 #   fix-it hint. Exit is non-zero iff a check FAILS (a warning
+                                 #   never fails the run); --json for scripting
 flux preset list                 # the recipe cookbook — scaffold or run a parameterized flow. `help
                                  #   <name>` shows a preset's keys; `<name> key=value …` scaffolds it
                                  #   (-o pretty|json), add --run [--yes] [-m <spec>] to execute instead

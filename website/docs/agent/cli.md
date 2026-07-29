@@ -27,7 +27,7 @@ and [Safety & approvals](./safety.md).
 |---|---|
 | `flux run "…"` | run an adaptive turn (`--yes` auto-approves; `-c` continues the last session) |
 | `flux` | interactive REPL |
-| `flux tui` | ratatui chat UI with an in-UI approval modal |
+| `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
@@ -51,10 +51,42 @@ and [Safety & approvals](./safety.md).
 | `flux completion [shell]` | generate a completion script (fish by default) |
 | `flux doctor` | diagnose the install: credentials, plugin-pack integrity, sandbox backend, `events.db` health, egress config, `[tools] disable`, and version skew (`--json` for scripting) |
 
-### `--store <DIR>` — point the session tools at another store
+## Global flags
 
-Sessions normally live in `~/.flux` (`events.db` + `flow.db`). `--store` is a global flag that
-redirects that for one invocation:
+These seven flags are accepted by **every** subcommand — they sit on `flux` itself, so
+`flux --sandbox run "…"` and `flux run --sandbox "…"` are equivalent. Everything else is
+per-subcommand (see [Turn controls](#turn-controls) for the flags the agent-path commands carry).
+
+| Flag | What it does |
+|---|---|
+| `--color auto\|always\|never` | When to colorize output. `auto` (the default) colors only when **both** stdout and stderr are terminals and `NO_COLOR` is unset, so `flux usage > report.txt` never embeds escapes. |
+| `--store <DIR>` | Read and write sessions in `DIR` instead of `~/.flux` (see [below](#store-flag)). |
+| `--add-dir <DIR>` | Grant **read** access to one more directory outside the workspace. Repeatable; writes stay confined to the current directory. |
+| `--allow-all-paths` | Lift filesystem confinement entirely — read *and* write anywhere. Dangerous; prints a warning. |
+| `--allow-private-net` | Allow egress to private/internal addresses for this invocation only — nothing is persisted. |
+| `--sandbox` | Turn on OS-level process sandboxing (bubblewrap on Linux, Seatbelt on macOS) for spawned shell/plugin processes. |
+| `--no-sandbox` | Force OS-level sandboxing off — the kill switch, overriding `--sandbox`, `FLUX_SANDBOX`, and config. Conflicts with `--sandbox`. |
+
+The four safety flags are per-invocation overrides layered over persistent configuration, and the
+reasoning behind each lives with the model it belongs to:
+
+- `--add-dir` and `--allow-all-paths` widen the **workspace** boundary — see
+  [`[workspace]` in the configuration reference](../reference/config.md#skills-and-workspace-access).
+  They do not widen what [project context](./project-context.md) reads.
+- `--allow-private-net` opens **egress** — see
+  [private-network egress](../reference/config.md#private-network-egress) for the scoped
+  `[private_net]` grants you should prefer for anything recurring.
+- `--sandbox` / `--no-sandbox` control **process** confinement — see the
+  [OS sandbox](../security/os-sandbox.md) page for backends, the strictest-wins precedence, and
+  what happens when no backend is available.
+
+None of these replace the approval envelope; they change what an *approved* action is allowed to
+touch. See [Safety and approvals](./safety.md).
+
+### `--store <DIR>` — point the session tools at another store {#store-flag}
+
+Sessions normally live in `~/.flux` (`events.db` + `flow.db`). `--store` redirects that for one
+invocation:
 
 ```bash
 flux replay --store tests/scenarios/refund-flow last
@@ -126,6 +158,9 @@ flux run --loop loops/support.flux "triage this request"
 - `--show-loop` reveals typed stages and batch machinery; normal operation calls remain visible.
 - `--trace-loop` shows the authored loop's structural Flux nodes.
 - `--loop adaptive|FILE` explicitly selects the outer loop. `.flux/agent-loop.flux` is never magic.
+- `--max-tokens` caps the output tokens of a single model-stage call (default: 16384; must be ≥ 1).
+  A truncated intent, exploration, repair, or presentation stage fails loudly rather than silently
+  stopping.
 - `--turn-budget` bounds cumulative model usage for the turn.
 - `--max-model-calls` bounds provider consultations across intent, exploration, repairs, and
   decision resumes for one logical adaptive turn (default: 50).
@@ -202,14 +237,24 @@ only parameters not already supplied deterministically.
 
 ## REPL slash commands
 
+Bare `flux` opens a line-oriented REPL. Its built-in commands:
+
 | Command | Effect |
 |---|---|
+| `/help` | show the complete current command list |
 | `/model <spec>` | switch model mid-session (for example `/model opus`) |
+| `/effort [level]` | show or set reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`, `off`) |
 | `/tools` · `/evidence` | list available operations · show the session's evidence trail |
 | `/shell` | explicitly toggle the optional shell group |
-| `/sessions` · `/resume <id>` · `/clear` | session management |
+| `/session` · `/sessions` · `/resume <id>` · `/clear` | session management (`/sessions --prune` deletes empty sessions) |
 | `/compact` | compact older conversation history now |
-| `/help` | show the complete current command list |
+| `/pd <goal>` | plan-and-dispatch: run subtasks as parallel dependency waves |
+| `/goal <condition>` | drive turns toward a goal, stopping once it is satisfied |
+| `/loop <n> <task>` | repeat a task up to `n` times |
+| `/exit` · `/quit` | leave the REPL (`Ctrl-D` also exits; `Ctrl-C` interrupts a running turn) |
+
+The [TUI](./tui.md#slash-commands) has its own, partly different set — it adds `/usage`, `/queue`,
+and `/theme`, and does not carry `/pd`, `/goal`, or `/loop`.
 
 ## Command files
 
@@ -252,6 +297,8 @@ custom loop before the turn begins.
 ## Related docs
 
 - [Getting started](../getting-started.md) — the first-run path.
+- [TUI](./tui.md) — keybindings, mid-turn steering, and in-UI approvals for `flux tui`.
 - [The agent loop](./agent-loop.md) — intent, exploration, batches, decisions, and repair.
 - [Safety and approvals](./safety.md) — what prompts during CLI execution.
 - [Providers and models](./providers.md) — how `-m` resolves.
+- [OS sandbox](../security/os-sandbox.md) — the reasoning behind `--sandbox` / `--no-sandbox`.

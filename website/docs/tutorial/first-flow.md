@@ -80,3 +80,11 @@ You now have a reusable typed workflow. The final lesson will keep the same hand
 one-shot command with a long-running application that receives questions as events.
 
 Continue to [Make the docs assistant reliable](./first-app.md).
+
+## Related docs
+
+- [3. Make the docs assistant reliable](./first-app.md) — the next lesson: the same handbook as a long-running app.
+- [Flows & syntax](../language/flows-and-syntax.md) — flow headers, indentation, symbols, interpolation, and `return`.
+- [Context packs](../language/context-packs.md) — what `ctx` selects, how `budget` bounds it, and `ctx_append`.
+- [Operations](../language/ops.md) — the full catalog a call such as `read` or `ai.reason` can target.
+- [Types & effects](../language/types-and-effects.md) — the declared input and result types flux checks before the flow runs.

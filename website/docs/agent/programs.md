@@ -18,6 +18,9 @@ its settings inline as ordinary Flux-Lang values:
 
 - **`permissions`** — the app-wide operation ceiling, declared as exact `allow`/`deny` names.
 - **`agent`** — a model, its model-visible tools, datasources, description, and optional capability narrowing.
+- **`agent_loop`** — a named outer loop, authored as an ordinary flow body, that an agent selects
+  with `loop "<name>"`. An agent that declares none gets the built-in adaptive loop. See
+  [`agent_loop`](../language/modules-and-programs.md#agent_loop--authoring-the-outer-loop).
 - **`channel`** — a surface the app is reached on (CLI, Slack, HTTP/A2A, …).
 - **`datasource`** — grounded knowledge an agent answers from (e.g. a Markdown corpus) — see [Datasources](./datasources.md).
 - **`trigger`** — an event to listen for, and what runs when it fires: an **agent** (the model drives

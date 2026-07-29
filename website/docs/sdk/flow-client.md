@@ -160,7 +160,7 @@ parse -> analyze -> execute_with
 ```
 
 Declare reusable inputs in the flow header so plain analysis recognizes them. The command-line
-equivalent is [`flux flow run --inputs/--arg`](../language/tooling.md#flux-flow-list--run--discover-and-execute-saved-flows).
+equivalent is [`flux flow run --inputs/--arg`](../language/tooling.md#flux-flow-list--run).
 
 ## Read the result
 

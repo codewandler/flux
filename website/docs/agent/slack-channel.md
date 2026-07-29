@@ -47,6 +47,8 @@ non-mention messages in channels it is in.
 Under **Event Subscriptions**, toggle **Enable Events** on, then under **Subscribe to bot events** add:
 
 - `app_mention` — fires when someone `@`-mentions the bot.
+- `message.channels` — optional; add it (together with the `channels:history` scope from step 3) only
+  if you want the bot to act on plain channel messages, not just mentions.
 
 With Socket Mode enabled there is **no Request URL to configure** — events arrive over the socket.
 
@@ -90,3 +92,10 @@ Empty lists (the default) allow everyone.
 - **No messages arrive** — confirm Socket Mode is on, the app-level token has `connections:write`, the
   bot has `app_mentions:read` + `chat:write`, the app is subscribed to `app_mention`, and the bot has
   been invited into the channel.
+
+## Related docs
+
+- [Multi-agent programs](./programs.md) — the `channel`, `agent`, `trigger`, and `journey` declarations this channel plugs into.
+- [Datasources](./datasources.md) — giving the bot indexed docs to answer from.
+- [Credentials & secrets](../security/credentials.md) — how `secret` references resolve and stay out of logs and model context.
+- [Slack plugin](../plugins/slack.md) — the other direction: an agent *calling* the Slack Web API rather than being hosted on it.

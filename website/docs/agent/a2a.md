@@ -75,6 +75,9 @@ explicit `agent`. On startup flux prints the agent-card and endpoint URLs.
 The discovery card is always public so external agents can find flux without a token. Every other
 route requires authentication per the configured mode (see [Security](#security)).
 
+These are the A2A routes only. The same server also exposes a session REST API, an SSE stream, a
+webhook trigger and two usage endpoints — see the [HTTP API reference](./http-api.md).
+
 ### Serving many agents from one server
 
 One server can serve **N agents keyed by path** — `GET /:agent_id/.well-known/agent-card.json` and

@@ -29,6 +29,30 @@ placeholders are left verbatim (no silent data loss). The result is always a str
 native form is the keyword spelling `peek $x`, and native formulas are written directly where they
 are invertible, for example `$ok = $score >= 0.8`.
 
+For a template longer than a line, give `fmt` a
+[multi-line string](./flows-and-syntax.md#multi-line-strings) — the content is verbatim, so an
+embedded JSON body needs no escaping:
+
+```flux
+flow render-payload -> String
+  $env = "staging"
+
+  $body = fmt("""{
+  "environment": "{env}",
+  "checks": ["build", "test"]
+}""")
+
+  return $body
+```
+
+The JSON braces do not need doubling. A `{…}` run whose contents are not a bound symbol is emitted
+verbatim, and the scanner resumes just after the brace it rejected — so the real `{env}` placeholder
+later in the template still resolves.
+
+For structured payloads, prefer building the value with an [`obj` template](#value-templates--obj-and-list)
+and letting the op serialize it. Formatting JSON as a string works, but it gives up the type checking
+that a template keeps.
+
 ## Field access — `$var.path`
 
 When the input is a bound symbol and the path is a simple dotted field path, extract fields

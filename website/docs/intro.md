@@ -25,7 +25,10 @@ runtime decides what is allowed and performs the work.
 - **Agent**: the local coding agent — CLI/TUI, an embeddable Rust SDK, an HTTP/[A2A](./agent/a2a.md)
   server, and [multi-agent programs](./agent/programs.md).
 - **Flux-Lang**: the plan language and reference interpreter.
-- **Improvement loop**: the eval and self-improvement harness used to improve flux itself.
+- **[Improvement loop](./agent/improvement.md)**: the eval and self-improvement harness used to
+  measure flux against benchmarks. Unlike the other two, this pillar is **de-prioritized and on
+  hold** — the harness runs and its evidence is trustworthy, but a repeatable grader-confirmed gain
+  is unproven. Treat it as a measurement tool, not a shipped capability.
 
 ## Public docs vs project docs
 

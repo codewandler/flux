@@ -196,12 +196,12 @@ Starting from basic terminal commands, you have now:
 - bounded exactly what the reasoning step could see; and
 - declared the app and agent capabilities in the application source.
 
-## Where to go next
+## Related docs
 
 - [A ten-minute Flux-Lang tour](../language/tour.md) — branching, iteration, concurrency, and guard
   rails.
-- [Editor setup](../language/editors.md) — syntax highlighting, diagnostics, completion, hover, and
-  formatting for `.flux` files.
 - [Multi-agent programs](../agent/programs.md) — more agents, channels, events, and journeys.
+- [Datasources](../agent/datasources.md) — beyond the markdown index: what `datasource` can point at
+  and how it is governed.
 - [Slack channel setup](../agent/slack-channel.md) — move the same docs-assistant pattern into Slack.
 - [Safety and approvals](../agent/safety.md) — the envelope that still guards every declared operation.

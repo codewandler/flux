@@ -46,7 +46,7 @@ Bare `flux plugin install` (no names, no `--all`, no `--dir`) is an error — it
 | Dev & project tracking | `gitlab`, `jira`, `confluence` |
 | Infra & observability | `kubernetes`, `docker`, `aws`, `prometheus`, `loki`, `grafana`, `alertmanager`, `opsgenie` |
 | Messaging | `slack` |
-| Data | `sql` (PostgreSQL read-only query + introspection) |
+| Data | `sql` (PostgreSQL and MySQL/MariaDB read-only query + introspection) |
 | Telephony | `asterisk` (AMI), `homer` (SIP search / QoS / PCAP) |
 | Secret management | `vault` (KV-v2 administration), `onepassword` (Connect server) |
 

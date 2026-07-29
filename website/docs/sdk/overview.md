@@ -129,6 +129,87 @@ Direct `flux-lang` interpretation does not silently inherit flux's concrete safe
 embedder supplies the host traits. `FlowClient`, `Client`, and `FlowEngine` already wire operation
 calls through the envelope and are therefore the safer starting points for effectful applications.
 
+## Sub-agents
+
+`flux_sdk::subagents` re-exports the whole delegation bundle, so a host wires named child agents
+without depending on flux's orchestration crate directly. Attach it with
+`ClientBuilder::with_sub_agents` (conversational) or `FlowClient::with_sub_agents` (flow); either
+way the `task` tool joins the client's catalog and a plan that calls `task(role, …)` delegates to
+that role's child agent through the **same** authorization → approval → guarded-IO envelope. The
+child's usage is folded into the parent turn's recorded spend.
+
+```rust
+use std::sync::Arc;
+
+use flux_sdk::subagents::{ProviderFactory, Role, RoleRegistry, SpawnLimits, SubAgents};
+use flux_sdk::tools::ToolRegistry;
+use flux_sdk::{Client, Provider};
+
+// Roles can be registered in memory (the multi-tenant path) or loaded from `.flux/agents/*.md`
+// with `RoleRegistry::try_load` / `try_load_project`.
+let roles = RoleRegistry::from_roles([Role {
+    name: "scout".into(),
+    description: "read-only reconnaissance".into(),
+    model: None,             // inherit the spawner's default model
+    thinking: None,
+    effort: None,
+    agent_loop: None,        // `adaptive`, or inline Flux-Lang for this role's outer loop
+    tools: Some(Vec::new()), // a leaf: `None` inherits every parent tool, `Some([])` grants none
+    prompt: "You are a scout. Investigate and report findings tersely.".into(),
+}]);
+
+// A fresh provider per child — children cannot share one `Box<dyn Provider>`.
+let factory: ProviderFactory = Arc::new(|| Ok(Box::new(build_provider()) as Box<dyn Provider>));
+
+let sub_agents = SubAgents::new(roles, ToolRegistry::new(), factory, "anthropic/opus", 4096)
+    .with_limits(SpawnLimits {
+        max_iterations: 30,
+        max_tokens: 4096,
+        wall_clock: Some(std::time::Duration::from_secs(120)),
+    });
+
+let client = Client::builder()
+    .model("anthropic/opus")
+    .with_sub_agents(sub_agents)
+    .build(provider, ".")?;
+```
+
+`SubAgents::new(roles, child_base, provider_factory, default_model, max_tokens)` takes the child
+tool surface **explicitly** rather than reusing the parent's assembled registry, so a child's
+reachable ops are auditable and independent of parent registration order; each role's `tools`
+allowlist subsets it. `with_authorization`, `with_approver`, `with_audit`, and `with_reasoning`
+cover the remaining knobs, and `with_max_depth` (default `1`, children are leaves) bounds nesting.
+`with_sub_agents` applies a 10-minute `wall_clock` when the bundle sets none, so a hung child cannot
+run forever; `with_sub_agents_policy` is the sibling that also pins an explicit `AdaptiveLoopPolicy`
+for every child. Roles authored as markdown parse through `try_parse_role`, which rejects malformed
+frontmatter rather than defaulting it — a missing `tools` key means "inherit the parent's tools" and
+is therefore security-relevant.
+
+```sh
+cargo run -p codewandler-flux-sdk --example sub_agent
+```
+
+## What else `flux_sdk` re-exports
+
+The SDK is the single dependency an embedder needs: each module below re-exports a contract from an
+internal crate so consumer code names only `flux_sdk::…`.
+
+| Module | Contract | Guide |
+|---|---|---|
+| `tools` | `Tool`, `tool_fn`, `ToolSpec`/`Risk`, `ToolContext`, `ToolResult`, `ToolRegistry` — custom operations. | [`FlowClient`](./flow-client.md) |
+| `approval` | `Approver`, `ApprovalChoice`, `RiskApprover`, `IntentSet` — your approval policy. | [Safety and approvals](../agent/safety.md) |
+| `authorization` | `AuthorizationPolicy`, `Caller`, `Trust`, `ExecutionAuthorization`, `IdentityCell` — the policy floor and resolved identity. | [Safety and approvals](../agent/safety.md) |
+| `observe` | `Message`, `TurnSummary`, `RunEvent`, `ModelCost`, `EfficiencySummary`, `RunDiff`/`DiffRow`, the `EventStore`/`FlowStore` handles, and the evidence-gating types (`ToolGroup`, `SignalMatch`, `Observation`, `KIND_SIGNAL`). | [Sessions](./sessions.md#reading-a-session-back) |
+| `subagents` | `SubAgents`, `SpawnLimits`, `ProviderFactory`, `Role`, `RoleRegistry`, `try_parse_role`. | above, and [Skills and roles](../agent/skills-and-roles.md) |
+| `whatif` | `Counterfactual`, `WhatIf`, `WhatIfSpec`, `SweepReport`, `OffTape`, `Divergence` — world-pinned counterfactuals. | [Agent Lab](./agent-lab.md) |
+| `datasource` | `LiveDatasource`, `LiveAccess`, `LiveSchema`/`LiveEntity`, typed filters, `Page`/`PageRequest`, `Row`/`Reference`. | [Datasources](./datasources.md) |
+| `voice` | `VoiceSink`, `VoiceReply`, `RealtimeProvider`, `RealtimeConfig`. | [Realtime voice](../agent/realtime.md) |
+| `recipes` | Parameterized DSL flow builders. | below |
+
+Four modules are feature-gated and off by default, so their dependency closures stay out of a
+default build: `test` (`test-kit`), `providers` (`providers`), `plugins` (`plugins`), and `pricing`
+(`pricing`).
+
 ## Zero-key testing
 
 `Provider` is a small trait, so tests and examples can drive the real engine and envelope with a
