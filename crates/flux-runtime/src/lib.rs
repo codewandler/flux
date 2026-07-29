@@ -192,6 +192,83 @@ pub trait SpawnActivitySink: Send + Sync {
     fn emit(&self, activity: SpawnActivity);
 }
 
+/// One line of output from a tool that is **still running** (C-158).
+///
+/// Deliberately a separate channel from [`SpawnActivity`] rather than a content field added to
+/// [`SpawnActivityEvent`]. That type carries a spawned *child agent's* activity across a trust
+/// boundary and documents that result content is intentionally absent; widening it would loosen a
+/// boundary for every sub-agent consumer in order to serve a local `bash` card. This channel makes
+/// the narrower claim: content from a tool **this** agent invoked directly, already redacted by
+/// [`ToolContext::progress_reporter`], for display only. Nothing here is fed back to the model —
+/// the model still sees exactly one thing, the final [`ToolResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolProgress {
+    /// The op name, matching the `tool_call` that opened the card.
+    pub tool: String,
+    /// One complete, already-redacted output line.
+    pub line: String,
+}
+
+/// Observation kind carrying [`ToolProgress`] through the existing `AgentSink::observation`
+/// extension point, so no surface has to grow a new callback to ignore.
+pub const KIND_TOOL_PROGRESS: &str = "tool.progress";
+
+impl ToolProgress {
+    pub fn to_observation(&self) -> Observation {
+        Observation::new(
+            KIND_TOOL_PROGRESS,
+            Phase::ToolFollowup,
+            serde_json::to_value(self).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Decode a live tool-progress observation; unrelated/malformed observations return `None`.
+    pub fn from_observation(observation: &Observation) -> Option<Self> {
+        (observation.kind == KIND_TOOL_PROGRESS)
+            .then(|| serde_json::from_value(observation.data.clone()).ok())
+            .flatten()
+    }
+}
+
+/// Synchronous, send-only reporter for [`ToolProgress`], mirroring [`SpawnActivitySink`].
+/// Implementations must not hold a lock across an await, and must not block: this is called from
+/// the pipe-drain task of a running child, so a slow sink stalls the child it is reporting on.
+pub trait ToolProgressSink: Send + Sync {
+    fn emit(&self, progress: ToolProgress);
+}
+
+/// An owned, `'static` handle a tool uses to report its own in-flight output.
+///
+/// Tools never touch a [`ToolProgressSink`] directly, and this is the only way to reach one: every
+/// line goes through the same [`Redactor`] the final result does, so there is no path by which a
+/// tool can put unredacted content on a surface. Obtained from
+/// [`ToolContext::progress_reporter`], which returns `None` when no host installed a sink — a tool
+/// then simply runs without reporting.
+#[derive(Clone)]
+pub struct ToolProgressReporter {
+    tool: String,
+    redactor: Redactor,
+    sink: Arc<dyn ToolProgressSink>,
+}
+
+impl ToolProgressReporter {
+    /// Redact `line` and hand it to the installed sink.
+    pub fn report(&self, line: &str) {
+        self.sink.emit(ToolProgress {
+            tool: self.tool.clone(),
+            line: self.redactor.redact(line),
+        });
+    }
+}
+
+impl std::fmt::Debug for ToolProgressReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolProgressReporter")
+            .field("tool", &self.tool)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Grace allowed for turn-owned sub-agent tasks to observe parent cancellation and durably
 /// finalize before the runtime aborts them. The child engine's cancellation path normally closes
 /// immediately; this bound exists for buggy or cancellation-insensitive [`Spawner`] implementations.
@@ -332,6 +409,7 @@ pub struct RuntimeTurnContext {
     spawn_activity: Option<Arc<dyn SpawnActivitySink>>,
     spawn_supervisor: Option<Arc<SpawnTaskSupervisor>>,
     identity: Option<TurnIdentity>,
+    tool_progress: Option<Arc<dyn ToolProgressSink>>,
 }
 
 /// The caller and trust assertion frozen for one runtime turn.
@@ -389,6 +467,12 @@ impl RuntimeTurnContext {
         self
     }
 
+    /// Carry the surface channel a running tool reports its own in-flight output on (C-158).
+    pub fn with_tool_progress_sink(mut self, sink: Arc<dyn ToolProgressSink>) -> Self {
+        self.tool_progress = Some(sink);
+        self
+    }
+
     /// Carry the owner for sub-agent tasks started during this turn.
     pub fn with_spawn_supervisor(mut self, supervisor: Arc<SpawnTaskSupervisor>) -> Self {
         self.spawn_supervisor = Some(supervisor);
@@ -421,6 +505,11 @@ impl RuntimeTurnContext {
         self.spawn_supervisor.clone()
     }
 
+    /// The turn-owned live tool-output channel, when a surface installed one.
+    pub fn tool_progress_sink(&self) -> Option<Arc<dyn ToolProgressSink>> {
+        self.tool_progress.clone()
+    }
+
     /// The immutable authorization identity carried by this turn, when explicitly installed.
     pub fn identity(&self) -> Option<TurnIdentity> {
         self.identity.clone()
@@ -433,6 +522,7 @@ impl RuntimeTurnContext {
             && self.spawn_activity.is_none()
             && self.spawn_supervisor.is_none()
             && self.identity.is_none()
+            && self.tool_progress.is_none()
     }
 }
 
@@ -833,6 +923,9 @@ pub struct ToolContext {
     /// Stored child-activity fallback; see `cancel`. Ordinary engine turns manufacture a fresh
     /// reporter and carry it only in their lexical [`RuntimeTurnContext`].
     spawn_activity: Arc<Mutex<Option<Arc<dyn SpawnActivitySink>>>>,
+    /// Stored live tool-output fallback; see `cancel`. Ordinary engine turns carry the surface's
+    /// sink lexically with the rest of [`RuntimeTurnContext`].
+    tool_progress: Arc<Mutex<Option<Arc<dyn ToolProgressSink>>>>,
     /// Stored sub-agent supervisor fallback for deliberately pinned spawned runtimes. Ordinary
     /// conversational turns carry it lexically with the rest of [`RuntimeTurnContext`].
     spawn_supervisor: Arc<Mutex<Option<Arc<SpawnTaskSupervisor>>>>,
@@ -873,6 +966,7 @@ impl ToolContext {
             session: Arc::new(Mutex::new(None)),
             spawn_activity: Arc::new(Mutex::new(None)),
             spawn_supervisor: Arc::new(Mutex::new(None)),
+            tool_progress: Arc::new(Mutex::new(None)),
             identity: None,
             cap_scopes: Arc::new(Mutex::new(Vec::new())),
         }
@@ -939,6 +1033,22 @@ impl ToolContext {
         self.runtime_turn_context().spawn_supervisor()
     }
 
+    /// A redacting handle `tool` uses to report its own in-flight output (C-158), or `None` when no
+    /// surface installed a live channel — a tool then runs exactly as before, reporting nothing.
+    ///
+    /// This is the ONLY way to reach a [`ToolProgressSink`], and it binds the context's own
+    /// [`Redactor`] — the same one [`Executor::dispatch`] scrubs the final result with — so a
+    /// reported line cannot skip redaction even if the tool wanted it to.
+    pub fn progress_reporter(&self, tool: &str) -> Option<ToolProgressReporter> {
+        self.runtime_turn_context()
+            .tool_progress_sink()
+            .map(|sink| ToolProgressReporter {
+                tool: tool.to_string(),
+                redactor: self.redactor.clone(),
+                sink,
+            })
+    }
+
     /// Snapshot the identity frozen for the active lexical turn. Direct one-shot runtimes may see
     /// an inherited construction-time snapshot; an ordinary context outside a turn returns `None`.
     pub fn turn_identity(&self) -> Option<TurnIdentity> {
@@ -956,6 +1066,7 @@ impl ToolContext {
             spawn_activity: self.spawn_activity.lock().unwrap().clone(),
             spawn_supervisor: self.spawn_supervisor.lock().unwrap().clone(),
             identity: self.identity.clone(),
+            tool_progress: self.tool_progress.lock().unwrap().clone(),
         })
     }
 
@@ -967,6 +1078,7 @@ impl ToolContext {
         *self.session.lock().unwrap() = turn.session;
         *self.spawn_activity.lock().unwrap() = turn.spawn_activity;
         *self.spawn_supervisor.lock().unwrap() = turn.spawn_supervisor;
+        *self.tool_progress.lock().unwrap() = turn.tool_progress;
         self.identity = turn.identity;
     }
 
@@ -3580,6 +3692,66 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct RecordingProgressSink(Mutex<Vec<ToolProgress>>);
+
+    impl ToolProgressSink for RecordingProgressSink {
+        fn emit(&self, progress: ToolProgress) {
+            self.0.lock().unwrap().push(progress);
+        }
+    }
+
+    /// C-158 acceptance: partial output flows through the SAME redaction the final result gets.
+    /// The reporter binds the context's redactor, so a tool cannot report a raw secret even by
+    /// mistake — there is no un-redacted path to the sink at all.
+    #[tokio::test]
+    async fn reported_tool_progress_is_redacted_like_a_result() {
+        let (dir, system) = temp_workspace("progress-redact");
+        let ctx = ToolContext::new(system);
+        ctx.redactor.add_secret("hunter2-super-secret");
+        let sink = Arc::new(RecordingProgressSink::default());
+        let installed: Arc<dyn ToolProgressSink> = sink.clone();
+
+        scope_runtime_turn(
+            RuntimeTurnContext::new().with_tool_progress_sink(installed),
+            async {
+                let reporter = ctx
+                    .progress_reporter("bash")
+                    .expect("a sink is installed for this turn");
+                reporter.report("connecting with hunter2-super-secret now");
+                // A credential-SHAPED token the redactor has never been told about is caught too,
+                // by the same pattern matcher that scrubs results.
+                reporter.report("token sk-ant-abcdefghijklmnop");
+            },
+        )
+        .await;
+
+        let seen = sink.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            !seen[0].line.contains("hunter2-super-secret"),
+            "registered secret survived onto the progress channel: {:?}",
+            seen[0].line
+        );
+        assert!(
+            !seen[1].line.contains("sk-ant-abcdefghijklmnop"),
+            "credential-shaped token survived onto the progress channel: {:?}",
+            seen[1].line
+        );
+        assert_eq!(seen[0].tool, "bash");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no surface installed there is no reporter, so a tool runs exactly as it did before —
+    /// the capability is opt-in and absent by default.
+    #[tokio::test]
+    async fn no_installed_sink_means_no_reporter() {
+        let (dir, system) = temp_workspace("progress-absent");
+        let ctx = ToolContext::new(system);
+        assert!(ctx.progress_reporter("bash").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn temp_workspace(tag: &str) -> (std::path::PathBuf, Arc<System>) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);

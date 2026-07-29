@@ -33,6 +33,13 @@ pub(super) enum UiEvent {
         content: String,
         is_error: bool,
     },
+    /// C-158: one already-redacted output line from a tool that is **still running**, for the live
+    /// tail under its card header. Superseded by the real summary once [`UiEvent::ToolResult`]
+    /// lands.
+    ToolProgress {
+        name: String,
+        line: String,
+    },
     Usage(Usage),
     /// One completed model call, delivered live from the engine's `model.call` observation
     /// (C-139 for the usage, C-180 for the latency). The turn-end [`UiEvent::Usage`] carries
@@ -258,6 +265,12 @@ impl AgentSink for ChannelSink {
                     },
                 });
             }
+        } else if let Some(progress) = flux_runtime::ToolProgress::from_observation(observation) {
+            // C-158: already redacted at the reporter — the surface never sees a raw line.
+            self.send(UiEvent::ToolProgress {
+                name: progress.tool,
+                line: progress.line,
+            });
         } else if observation.kind == "model.retry" {
             // C-181: reported before the backoff sleep, so the footer can name the wait while the
             // user is still in it rather than explaining it afterwards.

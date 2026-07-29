@@ -476,10 +476,15 @@ impl FlowEngine {
             Some((self.events.clone(), turn_id)),
         );
         let spawn_supervisor = Arc::new(SpawnTaskSupervisor::with_cancel(cancel.child_token()));
+        // C-158: the live tool-output channel is turn-owned exactly like the child-activity
+        // reporter above — built from this turn's own sink so a later turn can never observe it.
+        let tool_progress: Arc<dyn flux_runtime::ToolProgressSink> =
+            Arc::new(crate::loop_host::AgentSinkToolProgressSink(channel.clone()));
         let runtime = RuntimeTurnContext::new()
             .with_cancel(cancel.clone())
             .with_session(session_id)
             .with_spawn_activity_sink(activity)
+            .with_tool_progress_sink(tool_progress)
             .with_spawn_supervisor(spawn_supervisor.clone())
             .with_identity(identity.clone());
         // D-175: `run_turn_pinned` supplies the WHOLE cassette scope for this turn — explicitly

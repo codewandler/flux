@@ -151,6 +151,13 @@ const CURSOR: &str = "▍";
 /// `FLUX_VERBOSE`), whose promise is tool output in full, no truncation.
 const MAX_DETAIL: usize = 30;
 
+/// How many in-flight output lines a running tool card keeps (C-158). Deliberately small and NOT
+/// lifted by verbose: this is a "still moving, here's roughly where" signal on a card that has no
+/// result yet, not a log viewer — the full output arrives seconds later as the card's real detail,
+/// which verbose does lift. A tight bound also keeps a chatty command from dominating the
+/// transcript while it runs.
+const MAX_PARTIAL_LINES: usize = 3;
+
 /// How many per-call rows the `/usage` overlay keeps for the turn in progress (C-140). A turn is
 /// bounded by the adaptive model-call budget well below this; the cap exists so a runaway loop can't
 /// grow the row list without bound. The session-level cache totals are unaffected — they keep
@@ -362,6 +369,9 @@ struct ToolEntry {
     /// Per-card expansion override (C-111): `None` follows the global `expand_tools`; Enter on
     /// the focused card sets `Some(!effective)` so one card can open/close independently.
     expanded: Option<bool>,
+    /// C-158: the last few already-redacted output lines while this op is still running. Always
+    /// empty once `result` is set — the real summary/detail supersedes it.
+    partial: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -385,6 +395,7 @@ impl ToolEntry {
             timing: None,
             result: None,
             expanded: None,
+            partial: Vec::new(),
         }
     }
 
@@ -413,6 +424,7 @@ impl ToolEntry {
                 approval_wait: None,
             }),
             expanded: None,
+            partial: Vec::new(),
         }
     }
 
@@ -442,6 +454,7 @@ impl ToolEntry {
                 approval_wait: None,
             }),
             expanded: None,
+            partial: Vec::new(),
         }
     }
 }
@@ -1584,6 +1597,27 @@ impl ChatState {
 
     /// Attach a result to the most recent still-running tool card. Ops dispatch sequentially, so the
     /// newest result-less [`Entry::Tool`] is the one that just returned.
+    /// C-158: record one in-flight output line on the newest still-running card named `name`,
+    /// keeping only the last [`MAX_PARTIAL_LINES`]. Matching mirrors `finish_tool` (newest running
+    /// card with this op name), so concurrent same-named ops resolve the same way the result does.
+    ///
+    /// A line arriving after the result landed is dropped: the card has moved on to its real
+    /// summary and must not flip back to a partial view.
+    fn progress_tool(&mut self, name: &str, line: String) {
+        for entry in self.entries.iter_mut().rev() {
+            if let Entry::Tool(tool) = entry {
+                if tool.result.is_none() && tool.name == name {
+                    if tool.partial.len() == MAX_PARTIAL_LINES {
+                        tool.partial.remove(0);
+                    }
+                    tool.partial.push(line);
+                    self.mark_transcript_dirty();
+                    return;
+                }
+            }
+        }
+    }
+
     fn finish_tool(&mut self, name: &str, content: String, is_error: bool) {
         let summary = toolview::format_result(name, &content, is_error);
         for entry in self.entries.iter_mut().rev() {
@@ -1605,6 +1639,9 @@ impl ChatState {
                         summary,
                         content,
                     });
+                    // C-158: the live tail was a stand-in for the result; the real summary and
+                    // detail supersede it, so drop it rather than render both.
+                    tool.partial.clear();
                     self.mark_transcript_dirty();
                     return;
                 }
@@ -2086,6 +2123,22 @@ impl ChatState {
             width,
             marker,
         ));
+
+        // C-158: while the op is still running, show the tail of what it has produced so far. An op
+        // that has produced nothing renders exactly as it did before — no empty placeholder row.
+        // These rows sit BELOW the header, so the C-109 badge pairing (which matches each header
+        // row by its last span) is unaffected: none of these lines ends with the running badge.
+        if tool.result.is_none() {
+            for line in &tool.partial {
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate(line, width.saturating_sub(2) as usize),
+                        t.muted_style(),
+                    ),
+                ]));
+            }
+        }
 
         // One-line summary (always, once the result is in).
         if let Some(o) = &tool.result {
@@ -3034,6 +3087,7 @@ async fn event_loop(
                     state.steps += 1;
                     state.push(Entry::Tool(ToolEntry::new(name, input)));
                 }
+                UiEvent::ToolProgress { name, line } => state.progress_tool(&name, line),
                 UiEvent::ToolTiming { name, timing } => state.time_tool(&name, timing),
                 UiEvent::ToolResult {
                     name,
@@ -5096,6 +5150,128 @@ mod tests {
                 .is_some_and(|l| l.running_rows.len() == 1),
             "running-badge pairing must still find the row"
         );
+    }
+
+    /// C-158: a running card renders a bounded tail of in-flight output that updates as the op
+    /// runs, and is replaced by the normal summary once the result lands.
+    #[test]
+    fn running_card_shows_a_live_output_tail_then_the_summary() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "cargo build"}),
+        )));
+
+        let text = |state: &mut ChatState| -> String {
+            state
+                .transcript_lines(72)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Nothing reported yet: the card is exactly the header, as before this story.
+        assert_eq!(text(&mut state).lines().count(), 1);
+
+        state.progress_tool("bash", "Compiling serde v1.0".into());
+        let shown = text(&mut state);
+        assert!(shown.contains("Compiling serde v1.0"), "{shown}");
+
+        // It updates as more arrives.
+        state.progress_tool("bash", "Compiling tokio v1.4".into());
+        let shown = text(&mut state);
+        assert!(shown.contains("Compiling tokio v1.4"), "{shown}");
+
+        // The result supersedes the tail entirely: the card switches to its real summary row and
+        // the in-flight lines are gone.
+        state.finish_tool("bash", "Finished in 3.1s".into(), false);
+        let shown = text(&mut state);
+        assert!(
+            shown.contains('✓'),
+            "the card must show its result: {shown}"
+        );
+        assert!(
+            !shown.contains("Compiling serde v1.0") && !shown.contains("Compiling tokio v1.4"),
+            "the live tail must not survive alongside the real result: {shown}"
+        );
+    }
+
+    /// C-158: the tail is bounded — a chatty command keeps only the newest lines and must not
+    /// grow the card without limit.
+    #[test]
+    fn live_output_tail_is_bounded_to_the_newest_lines() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "yes"}),
+        )));
+        for i in 0..50 {
+            state.progress_tool("bash", format!("line-{i}"));
+        }
+        let Entry::Tool(tool) = &state.entries[0] else {
+            panic!("expected a tool entry");
+        };
+        assert_eq!(tool.partial.len(), MAX_PARTIAL_LINES);
+        assert_eq!(tool.partial.last().unwrap(), "line-49");
+        assert!(
+            !tool.partial.iter().any(|l| l == "line-0"),
+            "the oldest lines must be dropped, not kept"
+        );
+    }
+
+    /// C-158: a line that arrives after the result landed is dropped — the card has moved on to
+    /// its real summary and must not flip back to a partial view.
+    #[test]
+    fn progress_after_the_result_is_ignored() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "echo hi"}),
+        )));
+        state.finish_tool("bash", "hi".into(), false);
+        state.progress_tool("bash", "late straggler".into());
+
+        let Entry::Tool(tool) = &state.entries[0] else {
+            panic!("expected a tool entry");
+        };
+        assert!(tool.partial.is_empty());
+        let shown: String = state
+            .transcript_lines(72)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!shown.contains("late straggler"), "{shown}");
+    }
+
+    /// C-158 acceptance: the extra rows sit below the header, so the C-109 running-badge pairing
+    /// (which matches each header row's LAST span) still finds exactly one running row — and it is
+    /// still the header row, not a tail row.
+    #[test]
+    fn live_output_tail_keeps_the_running_badge_pairing() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "sleep 5"}),
+        )));
+        state.progress_tool("bash", "still working".into());
+        state.progress_tool("bash", "nearly there".into());
+
+        let lines = state.transcript_lines(72);
+        assert_eq!(
+            lines[0].spans.last().unwrap().content.as_ref(),
+            RUNNING_BADGE,
+            "running badge must stay the header row's last span"
+        );
+        let layout = state.transcript_layout.borrow();
+        let running = &layout.as_ref().unwrap().running_rows;
+        assert_eq!(running.len(), 1, "exactly one running row");
+        assert_eq!(running[0], (0, 0), "the paired row must be the header row");
     }
 
     /// C-149: a running tool card's per-tick spinner/elapsed patch (`transcript_viewport`) rebuilds

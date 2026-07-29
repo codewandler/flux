@@ -2,10 +2,10 @@
 id: C-158
 title: Stream partial tool output onto running tool cards
 pillar: Core
-status: blocked
+status: done
 epic: tui-polish-round-2
 design:
-note: "BLOCKED on a boundary decision, not on effort — the 2026-07-29 investigation (see Progress) proved no in-flight *content* is observable from flux-tui/flux-cli/flux-runtime/flux-core: bash/task are awaited as one opaque unit from other crates, and the one live relay that does reach a running op deliberately carries no content field. Unblocking means deciding to source progress at the tool (flux-tools/flux-orchestrate/flux-system) and, for sub-agents, deliberately loosening SpawnActivityEvent's content boundary; the install seam is already confirmed"
+note: "DONE 2026-07-29 — the boundary decision was taken: source progress at the tool via a NEW `ToolProgressSink` capability (bash only), leaving `SpawnActivityEvent`'s no-content contract untouched. Sub-agent `task` progress is deliberately still out of scope"
 ---
 
 # Stream partial tool output onto running tool cards
@@ -17,16 +17,59 @@ A long `bash` or `task` call shows an animated `◌ running` badge with live ela
 stuck. Show the last line (or a bounded tail) of in-flight output under the header.
 
 ## Acceptance
-- [ ] A running tool card renders a bounded, redacted tail of partial output that updates as the op
+- [x] A running tool card renders a bounded, redacted tail of partial output that updates as the op
       runs, and is replaced by the normal summary/detail when the result lands — failing-first test
       driving partial output through the entry pipeline.
-- [ ] Partial output flows through the same redaction the final result gets; nothing bypasses the
+- [x] Partial output flows through the same redaction the final result gets; nothing bypasses the
       guarded/redacted result path.
-- [ ] The C-109 badge patch and the running-row pairing (`lib.rs:1554-1567`) still hold with the
+- [x] The C-109 badge patch and the running-row pairing (`lib.rs:1554-1567`) still hold with the
       extra row present.
-- [ ] Ops that produce no incremental output render exactly as today (no empty placeholder row).
+- [x] Ops that produce no incremental output render exactly as today (no empty placeholder row).
 
 ## Progress
+- 2026-07-29 **DONE.** The blocking decision was taken deliberately, and it went the *other* way
+  from the option the 2026-07-29 investigation had framed: `SpawnActivityEvent` is **not** widened.
+  That type carries a spawned child's activity across a trust boundary and documents that result
+  content is intentionally absent; loosening it for every sub-agent consumer in order to serve a
+  local `bash` card would have been the wrong trade. Instead a **new, narrower channel** was added
+  for the case actually asked for — content from a tool *this* agent invoked directly, for display
+  only. Consequence, stated plainly: **`task` (sub-agent) cards still show no live content.** Only
+  `bash` streams. That is the honest subset the story's own fallback ladder asks for, not an
+  oversight.
+- 2026-07-29 One correction to the investigation's evidence: it recorded that nothing in
+  `flux-system` is pollable on the synchronous `run` path. `run_with_env_streamed` does already
+  exist — but it `inherit`s stdio to the terminal, so it is unusable from a TUI (it would draw over
+  the interface) and hands the caller no content. The finding's *conclusion* was right; a
+  callback-based primitive genuinely did not exist.
+- 2026-07-29 Shape of the change, five crates, each layer's guarantee tested:
+  - `flux-system` — `capture_bounded`'s drain loop gained an optional `OutputObserver`, plus
+    `run_observed`/`run_with_env_observed`. Emission is **line-oriented**, not per-read-chunk:
+    an 8 KiB read can split a multi-byte codepoint, and per-chunk `from_utf8_lossy` would render
+    replacement characters. The observer is a view onto the same capture, so `PROCESS_OUTPUT_CAP`
+    bounds it too — it is not a second, unbounded channel. `ProcessOutput` is byte-for-byte
+    unchanged.
+  - `flux-runtime` — `ToolProgress`/`ToolProgressSink`/`KIND_TOOL_PROGRESS`, a turn-scoped slot on
+    `RuntimeTurnContext` mirroring `SpawnActivitySink`, and `ToolContext::progress_reporter`. The
+    reporter is the **only** route to a sink and binds the context's own `Redactor`, so there is no
+    path by which a tool reports an unredacted line — redaction is structural, not a convention.
+  - `flux-tools` — `BashTool` uses the observed run path when a surface installed a channel, and is
+    byte-identical to before when none is installed.
+  - `flux-flow` — `AgentSinkToolProgressSink` forwards to `AgentSink::observation()`, installed
+    per-turn in `engine.rs` from the same turn sink as the child-activity reporter, so a later turn
+    can never observe an earlier turn's channel.
+  - `flux-tui` — `UiEvent::ToolProgress` → `ChatState::progress_tool` → a `MAX_PARTIAL_LINES`-bounded
+    tail rendered under the header while running, cleared when the result lands.
+- 2026-07-29 The dead-plumbing risk the investigation correctly flagged is closed by testing at the
+  real producer, not with a synthetic event: `bash_reports_its_output_lines_while_running` executes
+  the actual `BashTool` and asserts the lines arrive and the `ToolResult` is unchanged. Liveness is
+  asserted rather than assumed — `observed_run_reports_lines_while_the_child_is_still_running`
+  fails if output batches at exit, which is the failure mode a naive "did we see the lines"
+  assertion would pass. Redaction is proven end-to-end at both layers
+  (`bash_progress_lines_are_redacted`, `reported_tool_progress_is_redacted_like_a_result`), and
+  `live_output_tail_keeps_the_running_badge_pairing` pins the C-109 invariant.
+- 2026-07-29 Full gate green in both workspaces: `cargo test --workspace` (143 suites, exit 0),
+  `clippy --all-targets -D warnings`, `fmt --check`, `cargo test -p flux-codegate` (13), plugins
+  workspace tests (24) + clippy + fmt.
 - 2026-07-29: **STOPPED — not implemented.** Traced the full pipeline from a running op to a TUI
   entry and found a hard architectural wall inside the crates this run was scoped to (`flux-tui`,
   `flux-cli`, `flux-runtime`, `flux-core`): there is no point in that set where genuine in-flight

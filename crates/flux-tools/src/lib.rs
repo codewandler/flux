@@ -1240,10 +1240,25 @@ impl Tool for BashTool {
         let command = str_param(&params, "command", "bash")?;
         let timeout = u64_arg(&params, "timeout_secs").unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
         let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
-        let out = ctx
-            .system()
-            .run(&argv, Duration::from_secs(timeout))
-            .await?;
+        // C-158: when a surface installed a live channel, report each output line as it lands so a
+        // long command shows progress instead of a silent spinner. The reporter redacts (it binds
+        // the same `Redactor` the final result is scrubbed with), and the captured `out` below is
+        // byte-for-byte what the unobserved `run` would have returned — the model's view of this op
+        // is unchanged, only the surface's.
+        let out = match ctx.progress_reporter("bash") {
+            Some(reporter) => {
+                let observer: flux_system::OutputObserver =
+                    std::sync::Arc::new(move |line: &str| reporter.report(line));
+                ctx.system()
+                    .run_observed(&argv, Duration::from_secs(timeout), observer)
+                    .await?
+            }
+            None => {
+                ctx.system()
+                    .run(&argv, Duration::from_secs(timeout))
+                    .await?
+            }
+        };
         let mut body = String::new();
         if !out.stdout.is_empty() {
             body.push_str(&out.stdout);
@@ -3079,6 +3094,91 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
         (dir, c)
+    }
+
+    #[derive(Default)]
+    struct RecordingProgressSink(std::sync::Mutex<Vec<flux_runtime::ToolProgress>>);
+
+    impl flux_runtime::ToolProgressSink for RecordingProgressSink {
+        fn emit(&self, progress: flux_runtime::ToolProgress) {
+            self.0.lock().unwrap().push(progress);
+        }
+    }
+
+    /// C-158 end-to-end through the REAL producer: a `bash` op with a surface-installed channel
+    /// reports its own output lines while running, and the final `ToolResult` is unchanged. This is
+    /// the assertion that keeps the seam from being dead plumbing — it runs the actual `BashTool`,
+    /// not a synthetic event.
+    #[tokio::test]
+    async fn bash_reports_its_output_lines_while_running() {
+        let (dir, ctx) = ctx();
+        let sink = Arc::new(RecordingProgressSink::default());
+        let installed: Arc<dyn flux_runtime::ToolProgressSink> = sink.clone();
+
+        let result = flux_runtime::scope_runtime_turn(
+            flux_runtime::RuntimeTurnContext::new().with_tool_progress_sink(installed),
+            BashTool.execute(&ctx, json!({"command": "echo alpha; echo beta"})),
+        )
+        .await
+        .unwrap();
+
+        let lines: Vec<String> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.line.clone())
+            .collect();
+        assert_eq!(lines, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(sink.0.lock().unwrap().iter().all(|p| p.tool == "bash"));
+        // The model's view of the op is untouched by observing it.
+        assert_eq!(result.content, "alpha\nbeta\n");
+        assert!(!result.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-158: with no sink installed, `bash` behaves exactly as before — same result, and nothing
+    /// reported anywhere.
+    #[tokio::test]
+    async fn bash_without_a_progress_sink_is_unchanged() {
+        let (dir, ctx) = ctx();
+        let result = BashTool
+            .execute(&ctx, json!({"command": "echo alpha; echo beta"}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "alpha\nbeta\n");
+        assert!(!result.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-158: a secret in a running op's output is redacted on the LIVE channel too, not only in
+    /// the final result — the reporter binds the context's redactor.
+    #[tokio::test]
+    async fn bash_progress_lines_are_redacted() {
+        let (dir, ctx) = ctx();
+        ctx.redactor.add_secret("swordfish-tenant-key");
+        let sink = Arc::new(RecordingProgressSink::default());
+        let installed: Arc<dyn flux_runtime::ToolProgressSink> = sink.clone();
+
+        let result = flux_runtime::scope_runtime_turn(
+            flux_runtime::RuntimeTurnContext::new().with_tool_progress_sink(installed),
+            BashTool.execute(&ctx, json!({"command": "echo using swordfish-tenant-key"})),
+        )
+        .await
+        .unwrap();
+
+        let lines = sink.0.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !lines[0].line.contains("swordfish-tenant-key"),
+            "secret reached the live channel: {:?}",
+            lines[0].line
+        );
+        // The raw result is still raw HERE by design: `Executor::dispatch` is what redacts a tool's
+        // returned content, one layer up. The point of this test is that the live channel does NOT
+        // get to skip that layer — it redacts at the reporter instead, so both faces are covered.
+        assert!(result.content.contains("swordfish-tenant-key"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// C-57: `flux_reload` is rebuild-only — it no longer replaces the running process image. The

@@ -15,7 +15,7 @@ use flux_core::{Error, Message, Result, Usage};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
     CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SkillLoadOutcome,
-    SkillLoader, SpawnActivity, SpawnActivitySink, ToolResult,
+    SkillLoader, SpawnActivity, SpawnActivitySink, ToolProgress, ToolProgressSink, ToolResult,
 };
 
 use crate::composites::{prepare_registration, CompositeScope, DynamicComposites};
@@ -1198,5 +1198,19 @@ impl SpawnActivitySink for AgentSinkSpawnActivitySink {
             .lock()
             .unwrap()
             .observation(&activity.to_observation());
+    }
+}
+
+/// C-158 counterpart of [`AgentSinkSpawnActivitySink`] for a directly-invoked tool's own in-flight
+/// output. Same shape and same constraint — emission only enqueues on the wrapped `ChannelSink`, so
+/// nothing blocks the pipe-drain task that calls it.
+pub(crate) struct AgentSinkToolProgressSink(pub(crate) Arc<Mutex<dyn AgentSink>>);
+
+impl ToolProgressSink for AgentSinkToolProgressSink {
+    fn emit(&self, progress: ToolProgress) {
+        self.0
+            .lock()
+            .unwrap()
+            .observation(&progress.to_observation());
     }
 }

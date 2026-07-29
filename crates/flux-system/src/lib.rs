@@ -570,7 +570,33 @@ where
     Ok(BoundedCapture { bytes, truncated })
 }
 
-async fn capture_bounded<R>(mut reader: R) -> std::io::Result<BoundedCapture>
+/// Callback invoked with each **complete line** a guarded child writes while it is still running
+/// (C-158). Emission is line-oriented rather than per-read-chunk for two reasons: a surface wants
+/// lines, and a fixed-size read can split a multi-byte codepoint, which per-chunk `from_utf8_lossy`
+/// would turn into replacement characters. Buffering to the newline reassembles those bytes first.
+///
+/// The observer sees only what the capture actually keeps, so the `PROCESS_OUTPUT_CAP` bound governs
+/// the observed stream too — a runaway child cannot push unbounded text through this callback.
+/// Implementations must be cheap and non-blocking: they run inline on the drain task, so blocking
+/// here stops draining the pipe and eventually stalls the child.
+pub type OutputObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Emit every complete line accumulated in `pending`, leaving any trailing partial line buffered.
+fn emit_lines(pending: &mut Vec<u8>, observer: &OutputObserver) {
+    while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=nl).collect();
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches('\n').trim_end_matches('\r');
+        if !text.is_empty() {
+            observer(text);
+        }
+    }
+}
+
+async fn capture_bounded<R>(
+    mut reader: R,
+    observer: Option<OutputObserver>,
+) -> std::io::Result<BoundedCapture>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -579,6 +605,7 @@ where
     let mut bytes = Vec::with_capacity(8192.min(PROCESS_OUTPUT_CAP));
     let mut truncated = false;
     let mut chunk = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
@@ -588,6 +615,17 @@ where
         let keep = read.min(room);
         bytes.extend_from_slice(&chunk[..keep]);
         truncated |= keep < read;
+        if let Some(observer) = &observer {
+            pending.extend_from_slice(&chunk[..keep]);
+            emit_lines(&mut pending, observer);
+        }
+    }
+    // A child that exits without a trailing newline still has a last line worth showing.
+    if let Some(observer) = &observer {
+        if !pending.is_empty() {
+            pending.push(b'\n');
+            emit_lines(&mut pending, observer);
+        }
     }
     Ok(BoundedCapture { bytes, truncated })
 }
@@ -781,9 +819,12 @@ async fn drive_process(
     program: String,
     timeout: Duration,
     mut result_tx: tokio::sync::oneshot::Sender<Result<ProcessOutput>>,
+    observer: Option<OutputObserver>,
 ) {
-    let stdout_task = stdout.map(|stream| tokio::spawn(capture_bounded(stream)));
-    let stderr_task = stderr.map(|stream| tokio::spawn(capture_bounded(stream)));
+    // Both streams feed the one observer: a build tool's progress commonly lands on stderr, so
+    // watching stdout alone would leave the most interesting ops looking silent.
+    let stdout_task = stdout.map(|stream| tokio::spawn(capture_bounded(stream, observer.clone())));
+    let stderr_task = stderr.map(|stream| tokio::spawn(capture_bounded(stream, observer)));
     let mut child = GuardedChild::new(child);
 
     let stop = tokio::select! {
@@ -845,10 +886,11 @@ async fn await_process(
     stderr: Option<tokio::process::ChildStderr>,
     program: String,
     timeout: Duration,
+    observer: Option<OutputObserver>,
 ) -> Result<ProcessOutput> {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(drive_process(
-        child, stdout, stderr, program, timeout, result_tx,
+        child, stdout, stderr, program, timeout, result_tx, observer,
     ));
     result_rx
         .await
@@ -1719,7 +1761,38 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed)
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, None)
+            .await
+    }
+
+    /// [`run`](Self::run) with a live line observer (C-158) — see
+    /// [`run_with_env_observed`](Self::run_with_env_observed) for the guarantees.
+    pub async fn run_observed(
+        &self,
+        argv: &[String],
+        timeout: Duration,
+        observer: OutputObserver,
+    ) -> Result<ProcessOutput> {
+        self.run_with_env_observed(argv, &[], timeout, observer)
+            .await
+    }
+
+    /// Like [`run_with_env`](Self::run_with_env), but additionally reports each **complete line** the
+    /// child writes while it is still running (C-158), so a surface can show a long op progressing
+    /// instead of a silent spinner.
+    ///
+    /// This changes nothing about the result: stdout/stderr are still captured in full and the
+    /// returned [`ProcessOutput`] is byte-for-byte what `run_with_env` would have produced. The
+    /// observer is a **view onto** the same capture, not a second, unbounded channel — see
+    /// [`OutputObserver`] for the cap and the non-blocking requirement.
+    pub async fn run_with_env_observed(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        timeout: Duration,
+        observer: OutputObserver,
+    ) -> Result<ProcessOutput> {
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, Some(observer))
             .await
     }
 
@@ -1734,7 +1807,7 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt)
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt, None)
             .await
     }
 
@@ -1744,6 +1817,7 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
         confinement: Confinement,
+        observer: Option<OutputObserver>,
     ) -> Result<ProcessOutput> {
         let mut cmd = self.build_tokio_command(argv, env, true, confinement)?;
         cmd.stdin(std::process::Stdio::null())
@@ -1772,7 +1846,15 @@ impl System {
                 return Err(Error::Other("child stderr unavailable".to_string()));
             }
         };
-        await_process(child, Some(stdout), Some(stderr), program, timeout).await
+        await_process(
+            child,
+            Some(stdout),
+            Some(stderr),
+            program,
+            timeout,
+            observer,
+        )
+        .await
     }
 
     /// Scrub a command's environment to the minimal non-secret allow-list, then apply caller
@@ -1935,7 +2017,7 @@ impl System {
         let child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
-        await_process(child, None, None, program, timeout).await
+        await_process(child, None, None, program, timeout, None).await
     }
 
     /// Spawn a **long-lived background** child without awaiting it — for host-managed processes such
@@ -3106,6 +3188,103 @@ mod tests {
         assert!(out.stdout.contains('\u{fffd}'));
         assert!(out.stdout.ends_with("\n…[output truncated]"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-158: the observer must see lines WHILE the child runs, not one batch at the end — that is
+    /// the whole point, and a capture that only flushed at exit would pass a naive "did we see the
+    /// lines" assertion. The child sleeps between writes, so the run future is still pending when
+    /// the first line is asserted.
+    #[tokio::test]
+    async fn observed_run_reports_lines_while_the_child_is_still_running() {
+        let (dir, sys) = temp_workspace();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let first_line_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let stamp = first_line_at.clone();
+        let observer: OutputObserver = Arc::new(move |line: &str| {
+            if stamp.lock().unwrap().is_none() {
+                *stamp.lock().unwrap() = Some(std::time::Instant::now());
+            }
+            sink.lock().unwrap().push(line.to_string());
+        });
+
+        let started = std::time::Instant::now();
+        let out = sys
+            .run_with_env_observed(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo one; sleep 0.4; echo two".to_string(),
+                ],
+                &[],
+                Duration::from_secs(20),
+                observer,
+            )
+            .await
+            .unwrap();
+        let finished_at = std::time::Instant::now();
+
+        let lines = seen.lock().unwrap().clone();
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+        // The result is unchanged by observing it.
+        assert_eq!(out.stdout, "one\ntwo\n");
+        assert_eq!(out.exit_code, 0);
+
+        // The liveness claim: the first line arrived well before the process exited.
+        let first = first_line_at.lock().unwrap().expect("a line was observed");
+        assert!(
+            finished_at.duration_since(first) >= Duration::from_millis(200),
+            "first line landed {:?} before exit — that is batched-at-exit, not live \
+             (run took {:?})",
+            finished_at.duration_since(first),
+            finished_at.duration_since(started),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A line split across two reads must reassemble, including a multi-byte codepoint straddling
+    /// the boundary — the reason emission is line-oriented rather than per-chunk.
+    #[test]
+    fn emit_lines_reassembles_across_chunk_boundaries() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let observer: OutputObserver = Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        });
+
+        let mut pending = Vec::new();
+        // "héllo\n" with the 2-byte 'é' split down the middle.
+        let full = "héllo\nworld".as_bytes().to_vec();
+        let split = 2; // mid-'é'
+        pending.extend_from_slice(&full[..split]);
+        emit_lines(&mut pending, &observer);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a partial line must not be emitted"
+        );
+        pending.extend_from_slice(&full[split..]);
+        emit_lines(&mut pending, &observer);
+        assert_eq!(seen.lock().unwrap().clone(), vec!["héllo".to_string()]);
+        assert_eq!(
+            pending, b"world",
+            "the trailing partial line stays buffered"
+        );
+    }
+
+    /// Windows line endings must not leak a stray `\r` into a rendered row.
+    #[test]
+    fn emit_lines_strips_carriage_returns_and_blank_lines() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let observer: OutputObserver = Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        });
+        let mut pending = b"a\r\n\r\nb\n".to_vec();
+        emit_lines(&mut pending, &observer);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[tokio::test]

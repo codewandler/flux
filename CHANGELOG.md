@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Running `bash` cards show what the command is doing (C-158).** A long op used to show an
+  animated `◌ running` badge and nothing else, so a multi-second command was indistinguishable from
+  a stuck one. A running card now carries a bounded tail of the command's own output, updating as it
+  arrives and replaced by the real summary when the result lands; an op that produces no output
+  renders exactly as before. New `System::run_observed` reports each complete output line while a
+  guarded child runs (the captured `ProcessOutput` is unchanged), and a new turn-scoped
+  `ToolProgressSink` capability carries it to the surface. Every reported line goes through the same
+  `Redactor` the final result does — `ToolContext::progress_reporter` is the only route to the sink
+  and binds that redactor, so a tool cannot report an unredacted line. The sub-agent
+  `SpawnActivityEvent` contract is deliberately **not** widened to carry content, so `task` cards
+  still show no live output; only `bash` streams.
+
 ## [0.33.0] - 2026-07-29
 
 ### Added
