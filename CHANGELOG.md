@@ -108,6 +108,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **The `WorkBoard` port — a write-capable state source with a closed state machine (A-113).**
+  `LiveDatasource` is strictly read-only (`list` + `get`), so the fleet coordinator had no swappable
+  way to *write* a board. This adds the sibling port following the same convention: a backend
+  declares a schema plus its external authority, is validated once at registration, and the host
+  generates uniform ops with stable permission subjects, a tool group and an ambient signal.
+  L0 `flux_datasource::board` contributes the typed vocabulary (`Item`, `ItemDraft`, `State`,
+  `BoardSchema`), reusing `live::{Page, PageRequest, Filters, FilterValue, Reference}` verbatim
+  rather than growing a parallel one. L5 `flux_capabilities::datasource::board` contributes the
+  `WorkBoard` trait and `try_register_work_board`, generating `board.list` / `.get` / `.create` /
+  `.transition` / `.claim` / `.comment` and registering atomically on a clone.
+  The point of the typed machine is that the coordinator can **reason** about the board — dependency
+  waves from `depends_on`, stuck detection from `state` + `attempts` — instead of shuffling opaque
+  rows. Every legal edge lives in one `const EDGES` table in L0; an illegal transition is an error
+  and **not a write**, pinned by a test asserting the item is byte-identical afterwards. Each
+  mutating op reports a **concrete** `permission_subject` (`<domain>/item/<id>`; `create` reports
+  `<domain>/item/new`) — never `*`, never empty, so per AGENTS.md an empty-subject `Write` forced to
+  approval is not something this port can dodge. `MemoryBoard` ships as the offline double, and the
+  shared contract suite that runs against it is reusable verbatim by the sibling backends, with no
+  credentials and no network. `codewandler-flux-datasource` moves to **1.1.0** (additive module).
+
 - **Metadata coherence is gated over the full production catalog, not just the built-ins (C-208).**
   C-191's build-time gate covered `try_register_builtins`. The registry a running agent actually
   dispatches against also carries the cognition pack, eval ops, `reflect`/`flows`/`render`, web ops,

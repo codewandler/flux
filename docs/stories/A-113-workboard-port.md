@@ -2,7 +2,7 @@
 id: A-113
 title: The WorkBoard port — L0 contracts, L5 registration generating six ops, MemoryBoard
 pillar: Agent
-status: ready
+status: done
 priority: 3
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
@@ -68,6 +68,22 @@ work-item state machine, so the coordinator can *reason* about the board — dep
   live's existing error strings are preserved via a `scope` parameter.
 - The contract suite is `crates/flux-capabilities/tests/board_contract/mod.rs`. A-114/A-115/A-118
   reuse it with one `mod board_contract;` — no manifest change, no public-API cost.
+
+## Integration (main)
+- Merged as `impl/A-113`. Two things the implementor correctly left to integration were done here:
+  **`plugins/Cargo.lock` regenerated** (that nested workspace pinned `flux-datasource 1.0.0` and
+  resolves with `--locked`, so `plugin_builds_exclude_host_only_crates` stayed red until it moved),
+  and the **version decision revised from `1.0.1` to `1.1.0`** — a whole new public module on a
+  `1.x` crate is additive API, which is MINOR; the repo's own precedent is `flux-spec` 1.1.0 → 1.2.0
+  for the coherence module (`c92ab31c`).
+- **The design doc was updated, not the code.** §2's ASCII diagram drew a narrower machine
+  (`Blocked` rejoining at `Claimed`, `Failed` only from `Review`) than the implementation. The
+  implementation is right and the diagram was the sketch: §5's sweep reconciles `Claimed`/`InProgress`
+  items, and a crashed worker sits in `InProgress` — under the narrow diagram it would have had no
+  legal edge home. §2 now states the edge set as three rules and says why.
+- Gate on the integration branch: `cargo test --workspace` green, `flux-codegate` 13 passed (layer
+  map untouched), clippy `-D warnings` clean, `cargo fmt` clean in both workspaces,
+  `check-crate-versions.sh` PASS.
 
 ## Notes
 - Design: [fleet-coordinator.md §2, §3](../designs/fleet-coordinator.md) — including why extending

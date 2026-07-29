@@ -109,12 +109,21 @@ Two alternatives were weighed and rejected:
 The typed state machine is the reason the port is purpose-built:
 
 ```
-Ready → Claimed → InProgress → Review → Done
-   ↘ Blocked ↗                    ↘ Failed → Ready (retry, attempts += 1)
+spine:    Ready → Claimed → InProgress → Review → Done   (Done is terminal)
+blocked:  {Ready, Claimed, InProgress, Review} → Blocked → Ready
+failed:   {InProgress, Review} → Failed → Ready          (retry, attempts += 1)
 ```
+
+`Failed` is reachable from `InProgress`, not only from `Review`: a crashed worker is *in* `InProgress`,
+and that is precisely the state §5's sweep inspects — a machine that could only fail out of `Review`
+would leave crashed items with no legal edge home. `Blocked` rejoins at `Ready` rather than `Claimed`,
+so an unblocked item is re-claimed through the normal path instead of inheriting a stale assignee.
 
 `transition` **validates the edge**; an illegal edge is an error, *not a write*. That is a property
 a generic record store cannot express, and it is what makes a crashed coordinator recoverable (§5).
+The edge set lives in one `const EDGES` table in L0 (`flux_datasource::board`); `State::allowed_next`
+and `validate_transition` are its only readers, so this diagram and the code cannot drift apart
+silently — the contract suite pins every edge above.
 
 ### The safety surface: concrete permission subjects
 
