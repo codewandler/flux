@@ -18,20 +18,42 @@ crates.io publish rights. Pin them to immutable commit SHAs so the plugin trust 
 trust is not reachable through someone else's tag.
 
 ## Acceptance
-- [ ] Every `uses:` referencing a third-party action in `.github/workflows/*.yml` names a full
+- [x] Every `uses:` referencing a third-party action in `.github/workflows/*.yml` names a full
       40-character commit SHA, with the human-readable version retained as a trailing comment
       (`uses: actions/checkout@<sha> # v4.2.2`).
-- [ ] The intra-action version skew is resolved: `actions/checkout` currently appears as both `@v4`
+- [x] The intra-action version skew is resolved: `actions/checkout` currently appears as both `@v4`
       and `@v6`, and `actions/upload-artifact` as both `@v4` and `@v7`, across workflows. Each action
       resolves to one deliberate version repo-wide, or the difference is justified in a comment.
-- [ ] A check fails CI when an unpinned `uses:` is introduced — a grep-based guard in the existing
+- [x] A check fails CI when an unpinned `uses:` is introduced — a grep-based guard in the existing
       workflow lint is sufficient; it must fail on a deliberately unpinned line and pass on the
       pinned tree.
 - [ ] `release.yml`, `release-plugins.yml` and `crates-io.yml` still complete a full dry-run cut
       after pinning — pinning must not silently change action behavior.
+      (Static reasoning done — see Progress; a live `workflow_dispatch` dry-run cannot run from this
+      worktree, so the box stays open for the integration/release runner to confirm.)
 
 ## Progress
-- (not started)
+- Pinned all 54 third-party `uses:` across the six workflows to full commit SHAs with a `# <version>`
+  trailing comment. SHAs re-verified against `gh api .../git/ref/tags/<tag>` (annotated tags like
+  `Swatinem/rust-cache@v2.9.1` dereferenced through `git/tags/<obj>` to the commit).
+- Version skew unified repo-wide: `actions/checkout` v4+v6 → v6.1.0; `actions/upload-artifact`
+  v4+v7 → v7.0.1; `actions/download-artifact` v4+v8 → v8.0.1. `website.yml`'s pages actions and
+  `lycheeverse`/`Swatinem` had no skew and were pinned at their current major's latest tag.
+- `dtolnay/rust-toolchain` was NOT unified: `1.97.0` (ci.yml, a deliberate clippy-stability pin) and
+  `stable` (release-plugins.yml) are *branches designed to move*, so both are pinned to the same
+  immutable master SHA `2c7215f…` with the toolchain moved into an explicit `with: toolchain:` input.
+  At that SHA `toolchain` is a **required** input (`action.yml` exits 1 when empty), so the input is
+  load-bearing, not cosmetic — verified against the pinned `action.yml`.
+- Guard: `scripts/check-action-pins.sh` (follows the repo `check-*.sh --self-test` idiom). `--self-test`
+  proves a movable `@tag` and a comment-less SHA are rejected while a `@<sha> # version` pin and a
+  local `./` action pass. Wired into `ci.yml` as a dedicated `action-pins` job (mirrors `crate-versions`).
+- Acceptance 4 (dry-run): a real `workflow_dispatch` dry-run needs a GitHub runner and cannot execute
+  from this worktree. Static compatibility check done instead — every input each bumped action call
+  uses (checkout `fetch-depth`/`persist-credentials`; upload-artifact `name`/`path`/`if-no-files-found`;
+  download-artifact `pattern`/`path`/`merge-multiple`) is still a declared input on the target major
+  (download-artifact confirmed against v8's `action.yml`). Pure SHA-pins of already-current majors
+  (checkout@v6, upload@v7, download@v8) are behavior-preserving by construction. The coordinator/release
+  runner should complete the actual dry-run to close the box.
 
 ## Notes
 - Confirmed unpinned at review time: `actions/checkout@v4`, `actions/checkout@v6`,
