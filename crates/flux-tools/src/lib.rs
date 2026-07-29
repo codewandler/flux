@@ -4653,11 +4653,13 @@ mod tests {
                 "first",
                 "flatten",
                 "gaps",
+                "git_branch",
                 "git_checkout",
                 "git_commit",
                 "git_diff",
                 "git_hunks",
                 "git_log",
+                "git_merge",
                 "git_push",
                 "git_stage",
                 "git_stage_hunks",
@@ -6009,6 +6011,209 @@ mod tests {
         assert_eq!(c.system().workspace().root(), checkout);
 
         std::fs::remove_dir_all(&parent).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // git_branch / git_merge (C-238)
+    //
+    // Driven through the registry by op NAME — the same surface a Program's `call` uses — so the
+    // journey compiles against the merge base and fails there on the ops' absence (the
+    // failing-first), rather than naming the tool structs directly.
+    // -----------------------------------------------------------------------
+
+    /// Dispatch one op call through the registry by name, as the engine would.
+    async fn call_op(
+        registry: &ToolRegistry,
+        c: &ToolContext,
+        name: &str,
+        params: Value,
+    ) -> ToolResult {
+        let tool = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("op `{name}` is not registered"));
+        tool.execute(c, params).await.unwrap()
+    }
+
+    /// C-238: the serial-integration journey — create a branch without leaving `main`, land work
+    /// on it, merge it back with `--no-ff`, and assert the merge commit and the tree.
+    #[tokio::test]
+    async fn git_ops_branch_create_merge_no_ff_journey() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // git_branch creates the branch; HEAD stays on `main`.
+        let r = call_op(&registry, &c, "git_branch", json!({"name": "impl/item-1"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            raw_git(&dir, &["branch", "--list", "impl/item-1"]),
+            "impl/item-1"
+        );
+        assert_eq!(raw_git(&dir, &["branch", "--show-current"]), "main");
+
+        // Concrete subjects name the branch (never `*`, never empty).
+        let tool = registry.get("git_branch").unwrap();
+        assert_eq!(
+            tool.permission_subjects(&json!({"name": "impl/item-1"})),
+            vec!["git_branch:impl/item-1".to_string()]
+        );
+
+        // Land work on the branch through the existing family.
+        let r = call_op(&registry, &c, "git_checkout", json!({"branch": "impl/item-1"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        WriteTool
+            .execute(
+                &c,
+                json!({"path": "feature.txt", "content": "from the branch\n"}),
+            )
+            .await
+            .unwrap();
+        let r = call_op(&registry, &c, "git_stage", json!({"paths": ["feature.txt"]})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(&registry, &c, "git_commit", json!({"message": "add feature.txt"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let r = call_op(&registry, &c, "git_checkout", json!({"branch": "main"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            !dir.join("feature.txt").exists(),
+            "main does not have the work yet"
+        );
+
+        // git_merge --no-ff: a real merge commit lands the work on `main`.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/item-1", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        let merges = raw_git(&dir, &["log", "--oneline", "--merges"]);
+        assert!(!merges.is_empty(), "a --no-ff merge commit exists: {merges}");
+        assert!(dir.join("feature.txt").exists(), "the merge landed the work");
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+
+        // Concrete subjects name the merged ref.
+        let tool = registry.get("git_merge").unwrap();
+        assert_eq!(
+            tool.permission_subjects(&json!({"branch": "impl/item-1"})),
+            vec!["git_merge:impl/item-1".to_string()]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: a conflicting merge is a clean recoverable error that NAMES the conflicting files,
+    /// and the tree is left consistent — never silently half-merged.
+    #[tokio::test]
+    async fn git_merge_conflict_is_recoverable_and_names_the_files() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // A branch that edits the same line `main` will edit.
+        raw_git(&dir, &["checkout", "-q", "-b", "impl/conflict"]);
+        std::fs::write(dir.join("base.txt"), "branch version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "branch edit"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("base.txt"), "main version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "main edit"]);
+        let pre_merge = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/conflict", "no_ff": true}),
+        )
+        .await;
+        assert!(
+            r.is_error,
+            "a conflict is a recoverable error, got: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("base.txt"),
+            "the error names the conflicting file: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("aborted"),
+            "the error states the merge was aborted: {}",
+            r.content
+        );
+
+        // The tree is consistent: HEAD unchanged, no merge in progress, nothing half-applied.
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), pre_merge);
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+        assert!(
+            !dir.join(".git/MERGE_HEAD").exists(),
+            "no merge in progress"
+        );
+
+        // Recoverable: align the branch's content with `main` and the same op call succeeds.
+        raw_git(&dir, &["checkout", "-q", "impl/conflict"]);
+        std::fs::write(dir.join("base.txt"), "main version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "align with main"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "impl/conflict", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "the retried merge succeeds: {}", r.content);
+        assert_eq!(raw_git(&dir, &["status", "--porcelain"]), "");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-238: `git_branch` deletes with the SAFE delete (`-d` — git itself refuses unmerged work
+    /// and the checked-out branch), and rejects option/path-shaped names like `git_checkout`
+    /// does (C-85).
+    #[tokio::test]
+    async fn git_branch_delete_and_name_guards() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // Create + delete round trip.
+        let r = call_op(&registry, &c, "git_branch", json!({"name": "scratch"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(raw_git(&dir, &["branch", "--list", "scratch"]), "scratch");
+        let r = call_op(
+            &registry,
+            &c,
+            "git_branch",
+            json!({"name": "scratch", "delete": true}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(raw_git(&dir, &["branch", "--list", "scratch"]), "");
+
+        // Deleting the checked-out branch is refused (by git, surfaced cleanly).
+        let r = call_op(
+            &registry,
+            &c,
+            "git_branch",
+            json!({"name": "main", "delete": true}),
+        )
+        .await;
+        assert!(r.is_error, "{}", r.content);
+        assert_eq!(raw_git(&dir, &["branch", "--show-current"]), "main");
+
+        // Option/path-shaped names are rejected before git ever runs.
+        for bad in ["-D", "--force", ".", "..", "a..b", ""] {
+            let r = call_op(&registry, &c, "git_branch", json!({"name": bad})).await;
+            assert!(r.is_error, "name {bad:?} must be refused");
+        }
+        assert_eq!(raw_git(&dir, &["branch", "--format=%(refname:short)"]), "main");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
