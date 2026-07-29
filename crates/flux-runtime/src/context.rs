@@ -272,7 +272,7 @@ impl ContextProvider for RepoSignal {
     }
 }
 
-/// How many entries under `.flux/context.d` are scanned before the walk stops. Guidance is
+/// How many fragments in `.flux/context.d` are collected before discovery stops. Guidance is
 /// hand-authored, so this is a runaway guard, not a working limit.
 const FRAGMENT_SCAN_CAP: usize = 256;
 
@@ -341,18 +341,41 @@ impl ContextProvider for ContextFragments {
         // read them through a workspace pinned to the project root rather than the agent's possibly
         // widened (`--add-dir`/`--allow-all-paths`) tool workspace.
         let system = flux_system::System::new(flux_system::Workspace::new(&self.root)?);
+        // Read only the top level, never a tree: `System::walk_files` recurses (rightly, for
+        // `glob`/`grep`), which would let `context.d/sub/x.md` reach the prompt from a path the
+        // flat-directory contract above says is never scanned — C-206. The workspace still resolves
+        // the directory, so the confinement stance is unchanged.
         // An absent fragment directory is the overwhelmingly common case, not a misconfiguration —
         // unlike `ProjectFiles`' explicitly-named files, whose absence it also tolerates.
-        let Ok(found) = system.walk_files(FRAGMENT_DIR, FRAGMENT_SCAN_CAP).await else {
+        let Ok(dir) = system.workspace().resolve_read(FRAGMENT_DIR) else {
             return Ok(None);
         };
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            return Ok(None);
+        };
+        let mut files: Vec<String> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if files.len() >= FRAGMENT_SCAN_CAP {
+                break;
+            }
+            // `DirEntry::file_type` doesn't follow symlinks, so this one test drops both
+            // subdirectories and symlinks (the escape guard `walk_files` applies too) in one go.
+            if !entry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".md") {
+                files.push(format!("{FRAGMENT_DIR}/{name}"));
+            }
+        }
 
-        // Sort: the walk order is filesystem-dependent, and an unstable fragment order would
+        // Sort: directory order is filesystem-dependent, and an unstable fragment order would
         // reshuffle the system prompt between runs and cold-write the cache for nothing.
-        let mut files: Vec<String> = found
-            .into_iter()
-            .filter(|f| f.ends_with(".md"))
-            .collect::<Vec<_>>();
         files.sort();
 
         // No working set (clean tree, or not a repo at all) leaves `changed` empty, so scoped
@@ -558,6 +581,50 @@ mod tests {
         assert!(
             block.contains("ALWAYS RULES"),
             "unscoped fragment missing: {block}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-206 (failing-first): the directory is flat by contract (see [`FRAGMENT_DIR`]) — one `ls`
+    /// must enumerate everything that can reach the system prompt. A fragment parked in a
+    /// subdirectory is therefore not a fragment at all, and must not load.
+    #[tokio::test]
+    async fn fragments_ignore_subdirectories() {
+        let dir = temp_dir();
+        let frags = dir.join(".flux/context.d");
+        std::fs::create_dir_all(frags.join("sub/deep")).unwrap();
+        std::fs::write(frags.join("top.md"), "TOP RULES").unwrap();
+        std::fs::write(frags.join("sub/x.md"), "NESTED RULES").unwrap();
+        std::fs::write(frags.join("sub/deep/y.md"), "DEEPLY NESTED RULES").unwrap();
+
+        let block = ContextFragments::new(&dir).render().await.unwrap().unwrap();
+        assert!(
+            block.contains("TOP RULES"),
+            "top-level fragment missing: {block}"
+        );
+        assert!(
+            !block.contains("NESTED RULES"),
+            "fragment from a subdirectory leaked into the prompt: {block}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The runaway guard survives the flat scan: past `FRAGMENT_SCAN_CAP` fragments, discovery
+    /// stops rather than pouring an unbounded directory into the system prompt.
+    #[tokio::test]
+    async fn fragment_scan_stops_at_the_cap() {
+        let dir = temp_dir();
+        let frags = dir.join(".flux/context.d");
+        std::fs::create_dir_all(&frags).unwrap();
+        for i in 0..FRAGMENT_SCAN_CAP + 20 {
+            std::fs::write(frags.join(format!("f{i:04}.md")), format!("RULE {i}")).unwrap();
+        }
+
+        let block = ContextFragments::new(&dir).render().await.unwrap().unwrap();
+        assert_eq!(
+            block.matches("\n\n## ").count() + 1,
+            FRAGMENT_SCAN_CAP,
+            "scan did not stop at the cap"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
