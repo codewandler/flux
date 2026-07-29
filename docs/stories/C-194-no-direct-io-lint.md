@@ -2,7 +2,7 @@
 id: C-194
 title: "Enforce the no-direct-IO invariant mechanically — tools must not reach the filesystem behind flux-system"
 pillar: Core
-status: ready
+status: done
 priority: 4
 epic: security-assurance
 design: docs/designs/security-assurance.md

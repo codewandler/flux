@@ -52,6 +52,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Security
 
+- **The "tools never touch `std::fs`/`std::process` directly" invariant is now enforced mechanically
+  (C-194).** `docs/architecture.md` stated that all real IO in model-facing tool crates goes through
+  `flux-system`, but nothing checked it — which is exactly how the C-192 `sqlite_query` bypass shipped.
+  A new `scripts/check-no-direct-io.sh`, wired as the named `no-direct-io` CI job, scans `flux-tools`,
+  `flux-web` and `flux-capabilities` for `std::fs`/`std::process`/`tokio::fs`/`tokio::process`/direct
+  DB opens outside `#[cfg(test)]`; any legitimate exception must carry an explicit, greppable
+  `// flux-allow-direct-io:` annotation with a reason (14 such sites annotated, each verified to be a
+  host-configured or otherwise-contained path, not a model-reachable one). The scanner is a
+  string/char/comment-aware tokenizer, so a brace or `//` inside a string literal cannot disarm it and
+  the allow-marker is honoured only in a real comment — it errs toward over-flagging, never toward
+  silently passing a real call. `docs/architecture.md` now points at the enforcing check.
 - **The unauthenticated-non-loopback refusal now holds by construction, not only in `serve_on`
   (C-190, breaking).** `serve_on` refused to bind an `Open` (unauthenticated) listener to a
   non-loopback address, but the check lived in the serving function — a lower-level caller that
