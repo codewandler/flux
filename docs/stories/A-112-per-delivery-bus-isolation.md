@@ -2,8 +2,7 @@
 id: A-112
 title: Per-delivery bus isolation — concurrent deliveries without cascade double-processing
 pillar: Agent
-status: ready
-priority: 2
+status: done
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
 areas: [flux-app, flux-channels]

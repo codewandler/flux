@@ -42,6 +42,13 @@
 
 ### Action needed
 
+- **A slow job no longer blocks everything else in an app.** Until now, an app handled one incoming
+  event at a time: if a scheduled job ran for a minute, every webhook, chat message and API call
+  that arrived during that minute waited for it. They now run alongside each other, so a long job
+  and a busy inbox no longer compete. Two things to know if you rely on the old behaviour: work that
+  touches the same conversation can now interleave rather than queue, and there is currently no
+  cap on how many events run at once, so a large burst starts a large amount of work.
+
 - **If you embed flux in your own Rust program, two conversation-writing methods are gone.** The
   event store used to let you append a conversation message directly, with nothing checking that the
   result was a conversation a model would accept. Those two shortcuts have been removed rather than

@@ -32,6 +32,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **BREAKING: `App::deliver` is concurrent — deliveries are isolated per root instead of serialized
+  (A-112).** `flux-channels` documented the constraint in its own module docs: deliveries were
+  "serialized by the shared `flux_app::App`" because `App::deliver` subscribed to the broadcast bus
+  and drained the cascade its journeys emitted, so concurrent deliveries would double-process via
+  fan-out — and "cross-channel parallelism needs per-delivery bus isolation". The consequence was
+  that a program whose nightly sweep ran for a minute could not accept a webhook for that minute;
+  a fleet coordinator built on it would have been single-threaded by construction.
+  `supervise()` no longer processes inline: it only dequeues, spawning each `DeliveryMessage` into
+  a `JoinSet`. `process_root` already gave every root a private cascade queue, so isolation followed
+  once the roots stopped queueing. The second half was not in the story and is the better find —
+  `Engine::depth`, the `spawn` recursion budget, was an engine-wide `AtomicU32` that was equivalent
+  to per-delivery *only because* deliveries were serialized; concurrency would have let 17
+  simultaneous deliveries trip `MAX_SPAWN_DEPTH = 16` on work that never recursed. The budget moved
+  into `DeliveryOrigin`, with the engine counter kept as the fallback for runs outside any delivery
+  scope. Three failing-first tests pin the behaviour (each verified to fail on the merge base with
+  `Elapsed(())`), plus a 24-delivery barrier test for the nesting budget and a retained regression
+  guard for cascade bounds. **Breaking for embedders**: journeys still share the App's mutable state
+  — agent sessions, ask-parks, the recorded-send log — all `Mutex`-guarded and sound, but two
+  deliveries addressing the same conversation now interleave rather than queue. Two follow-ups filed
+  rather than widened into this diff: delivery concurrency is now unbounded, since the supervisor's
+  `mpsc` capacity was the only backpressure (A-129); and under `App::run` the run lease activates
+  before the `Start` response is awaited, so a `startup` journey's initialization can interleave with
+  triggered journeys that read it.
+
 - **Gather-safety reads `semantic_effects`, so a self-declared durable write can no longer run before
   approval (C-210).** `gather_safe` (`flux-flow`) and `is_consequence_bearing` (`flux-spec`) both
   decided from `spec.effects`; **neither read `semantic_effects`**. C-208 made that live — `web.fetch`
