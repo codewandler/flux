@@ -1761,7 +1761,7 @@ mod loading;
 pub(crate) use loading::invalid_plugin_name;
 pub use loading::*;
 #[cfg(test)]
-use loading::{plugin_tool_spec, semantic_effect_tags, validate_op_coherence};
+use loading::{op_coherence_warnings, plugin_tool_spec, semantic_effect_tags};
 
 #[cfg(test)]
 mod tests {
@@ -2208,9 +2208,9 @@ mod tests {
 
     /// C-191: a plugin's `effects` / `risk` / `idempotency` are authored outside this repo and are
     /// then trusted verbatim by every approval gate. A manifest that declares a mutating operation
-    /// while keeping the read-only risk class must not load at all.
+    /// while keeping the read-only risk class is named at load.
     #[test]
-    fn a_mis_declared_plugin_operation_is_refused_at_load() {
+    fn a_mis_declared_plugin_operation_is_reported_at_load() {
         let drifted = OperationSpec {
             name: "acme.deploy".into(),
             description: "ship the current build".into(),
@@ -2225,11 +2225,12 @@ mod tests {
             ..Default::default()
         };
 
-        let error = validate_op_coherence(&manifest).unwrap_err();
-        assert!(error.contains("acme.deploy"), "{error}");
-        assert!(error.contains("I1 "), "{error}");
+        let warnings = op_coherence_warnings(&manifest);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("acme.deploy"), "{warnings:?}");
+        assert!(warnings[0].starts_with("I1 "), "{warnings:?}");
 
-        // Raising the tier — the correction the manifest actually needs — loads. The rule is a
+        // Raising the tier — the correction the manifest actually needs — clears it. The rule is a
         // floor on the declaration, not a ban on plugins that mutate.
         let corrected = PluginManifest {
             name: "acme".into(),
@@ -2239,7 +2240,72 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(validate_op_coherence(&corrected).is_ok());
+        assert!(op_coherence_warnings(&corrected).is_empty());
+    }
+
+    /// The projection is what gets checked, not the raw manifest — `access` comes from the
+    /// *plugin's* capabilities and an op that declares no effects is defaulted to
+    /// `[Process, Network]`. Both are properties of `plugin_tool_spec`, so this pins that the
+    /// coherence pass sees them (C-191).
+    #[test]
+    fn plugin_coherence_reads_the_projected_spec_not_the_raw_declaration() {
+        // Declares nothing: `plugin_tool_spec` defaults it to `[Process, Network]`, which is
+        // consequence-bearing, so `risk = "low"` understates it.
+        let undeclared = OperationSpec {
+            name: "acme.run".into(),
+            description: "run something".into(),
+            risk: Some(Risk::Low),
+            idempotency: Some(Idempotency::NonIdempotent),
+            ..Default::default()
+        };
+        let warnings = op_coherence_warnings(&PluginManifest {
+            name: "acme".into(),
+            operations: vec![undeclared],
+            ..Default::default()
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("I1 "), "{warnings:?}");
+
+        // A declared read under a `process`-capable plugin projects `AccessKind::Process` from the
+        // plugin's capabilities, not the op's. That must NOT be read as a consequence, or every
+        // read op of a process-capable plugin would be flagged.
+        let read_under_process_caps = PluginManifest {
+            name: "kubernetes".into(),
+            capabilities: PluginCapabilities {
+                process: vec!["kubectl".into()],
+                ..Default::default()
+            },
+            operations: vec![OperationSpec {
+                name: "kubernetes.pod.list".into(),
+                description: "list pods".into(),
+                effects: vec![Effect::Read],
+                risk: Some(Risk::Low),
+                idempotency: Some(Idempotency::Idempotent),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(op_coherence_warnings(&read_under_process_caps).is_empty());
+    }
+
+    /// An `internal: true` op never becomes an agent tool, so it never reaches the gates these
+    /// invariants protect and is deliberately out of scope for the check.
+    #[test]
+    fn plugin_coherence_skips_host_only_operations() {
+        let manifest = PluginManifest {
+            name: "acme".into(),
+            operations: vec![OperationSpec {
+                name: "acme.auth".into(),
+                description: "resolve credentials (host-only)".into(),
+                internal: true,
+                effects: vec![Effect::Write, Effect::Network],
+                risk: Some(Risk::Low),
+                idempotency: Some(Idempotency::Idempotent),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(op_coherence_warnings(&manifest).is_empty());
     }
 
     #[test]

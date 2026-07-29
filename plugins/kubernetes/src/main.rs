@@ -410,7 +410,10 @@ fn manifest_builder() -> PluginBuilder {
                  kubernetes.portforward.start).",
                 vec![Effect::Write, Effect::Process],
                 Risk::Medium,
-                Idempotency::Idempotent,
+                // C-191: stopping an already-stopped forward converges, so repeating is safe — but
+                // it kills a real process and the outcome depends on what is running at call time.
+                // `Idempotent` is the claim that licenses replaying a stored result instead.
+                Idempotency::Conditional,
             ),
                 &["kubectl port-forward"],
             ),
@@ -463,7 +466,9 @@ fn manifest_builder() -> PluginBuilder {
                 "Scale a Kubernetes deployment to a desired replica count.",
                 vec![Effect::Write, Effect::Network],
                 Risk::High,
-                Idempotency::Idempotent,
+                // C-191: scaling to the same replica count converges, so repeating is safe — but it
+                // mutates a live cluster every time and must never be served from a replay cache.
+                Idempotency::Conditional,
             ),
                 &["kubectl scale", "kubectl get"],
             ),

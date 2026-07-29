@@ -61,10 +61,26 @@
 //! * **Built-in ops — this test.** They are first-party code with a build of ours to run, so a
 //!   build-time gate is the right instrument, exactly as the story asks ("a gate that runs on every
 //!   build").
-//! * **Plugin-supplied ops — `flux_plugin`'s `validate_op_coherence`, at load.** A plugin's
+//! * **Plugin-supplied ops — `flux_plugin`'s `op_coherence_warnings`, at load.** A plugin's
 //!   metadata is authored outside this repo and there is no compile-time list of plugin ops to
-//!   walk, so the check has to sit on the seam every plugin op crosses. `plugin_declarations`
-//!   below is this suite's copy of that boundary case.
+//!   walk, so the check has to sit on the seam every plugin op crosses. It *reports* rather than
+//!   refuses: failing a manifest closed drops the plugin's whole surface off the agent over one
+//!   under-declared field, which costs the capability without buying any gating. The refusal
+//!   cutover needs a deprecation window and its own story.
+//!   `plugin_declarations_are_held_to_the_same_invariants` below is this suite's copy of that
+//!   boundary case; the seam itself is asserted in `flux-plugin`.
+//!
+//! ## What this gate does NOT cover
+//!
+//! `try_register_builtins` is not the whole production catalog. `flux-cli` also assembles the
+//! cognition pack, the eval/reflect/flows/render packs, `flux_web`, datasource and endpoint ops,
+//! `TaskTool`, and config-authored model stages — all reaching the same dispatcher and the same
+//! `RiskApprover`, and several of them violate these invariants today. A gate over that catalog
+//! cannot live here (`flux-web`/`flux-eval`/`flux-cognition` sit above `flux-tools`); it belongs in
+//! `flux-cli`, and closing it requires a safety-posture decision — most of the violations are
+//! `Network` without `Read` at `Risk::Low`, where the honest fix either makes the ops gather-safe
+//! or puts an approval prompt in front of every model call. The debt is itemised in
+//! `docs/stories/C-191-toolspec-invariant-test.md`.
 //!
 //! Deliberately **not** enforced inside `ToolRegistry::try_register_from`. Registration is not a
 //! trust boundary in this runtime: it is the seam first-party test fixtures use to construct
@@ -79,7 +95,8 @@ use flux_runtime::ToolRegistry;
 use flux_spec::{metadata_violations, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_tools::try_register_builtins;
 
-/// Every built-in operation, walked through the same registry the agent surface is assembled from.
+/// Every operation in the built-in pack — the core of the agent surface, and the part assembled
+/// from crates at or below `flux-tools`. See "What this gate does NOT cover" above.
 #[test]
 fn every_registered_builtin_spec_is_metadata_coherent() {
     let mut registry = ToolRegistry::new();
@@ -100,6 +117,80 @@ fn every_registered_builtin_spec_is_metadata_coherent() {
         "{} operation(s) declare an incoherent metadata combination:\n  {}",
         violations.len(),
         violations.join("\n  ")
+    );
+}
+
+/// `crates/flux-flow/docs/ops-reference.md` publishes a Risk column per op, and AGENTS.md requires
+/// it to mirror the catalog — but nothing enforced that, so correcting `append` and `git_unstage`
+/// in code would have left the reference telling operators they are still `Low`. The risk tier is
+/// the exact field this story is about, so the doc is held to the registry (C-191).
+///
+/// Only rows naming a *built-in* op are checked; the reference also documents ops from packs this
+/// registry does not assemble (`browser.*`, `web.*`, `consult`), and those are skipped rather than
+/// guessed at. Likewise only the one table that *has* a risk column is read — the others
+/// (pure/model/channel ops) are keyed differently.
+#[test]
+fn the_published_risk_column_matches_the_registry() {
+    let mut registry = ToolRegistry::new();
+    try_register_builtins(&mut registry).expect("built-ins register");
+
+    let reference = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../flux-flow/docs/ops-reference.md"),
+    )
+    .expect("the ops reference is readable");
+
+    let mut checked = 0usize;
+    let mut drifted = Vec::new();
+    // Which column holds the risk tier, for the table currently being read. Only one of the
+    // reference's tables has one; the rest reset this to `None`.
+    let mut risk_column: Option<usize> = None;
+    for line in reference.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if !line.trim_start().starts_with('|') {
+            risk_column = None;
+            continue;
+        }
+        if let Some(index) = cells.iter().position(|c| *c == "risk") {
+            risk_column = Some(index);
+            continue;
+        }
+        let Some(index) = risk_column else { continue };
+        let Some(op) = cells
+            .get(1)
+            .and_then(|c| c.strip_prefix('`'))
+            .and_then(|c| c.strip_suffix('`'))
+        else {
+            continue;
+        };
+        let Some(tool) = registry.get(op) else {
+            continue;
+        };
+        let Some(documented) = cells.get(index).copied() else {
+            continue;
+        };
+        let declared = match tool.spec().risk {
+            Risk::Low => "Low",
+            Risk::Medium => "Medium",
+            Risk::High => "High",
+            Risk::Destructive => "Destructive",
+        };
+        checked += 1;
+        if documented != declared {
+            drifted.push(format!(
+                "`{op}` is declared `{declared}` but the reference documents it as `{documented}`"
+            ));
+        }
+    }
+
+    assert!(
+        checked > 20,
+        "only {checked} rows matched a built-in — the table format probably changed, and this \
+         test would pass vacuously"
+    );
+    assert!(
+        drifted.is_empty(),
+        "crates/flux-flow/docs/ops-reference.md has drifted from the catalog:\n  {}",
+        drifted.join("\n  ")
     );
 }
 

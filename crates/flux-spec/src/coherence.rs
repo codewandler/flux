@@ -124,7 +124,11 @@ struct Exemption {
     /// Invariant ids this op is excused from (`"I1"`, `"I2"`, `"I3"`).
     invariants: &'static [&'static str],
     /// Why the declaration is honest as it stands. Not "it was already like that".
-    #[allow(dead_code)]
+    ///
+    /// Read by [`the_allowlist_is_well_formed`](tests::the_allowlist_is_well_formed) rather than by
+    /// the check itself: an exemption with no stated reason is the failure mode this whole story
+    /// exists to prevent, so it is a build failure, not a silently unused field.
+    #[cfg_attr(not(test), allow(dead_code))]
     reason: &'static str,
 }
 
@@ -223,8 +227,38 @@ mod tests {
     fn a_read_shaped_filesystem_or_fetch_op_stays_low_risk() {
         let file_read = spec("read").with_effects(vec![Effect::Read, Effect::Filesystem]);
         assert!(metadata_violations(&file_read, &[]).is_empty());
-        let fetch = spec("web.fetch").with_effects(vec![Effect::Read, Effect::Network]);
+        // A fetch — `Network` paired with `Read`. (The shipped `web.fetch` declares `Network`
+        // alone, which this rule does flag; it sits outside the catalog this story gates. See the
+        // follow-up noted in `docs/stories/C-191-*.md`.)
+        let fetch = spec("some.fetch").with_effects(vec![Effect::Read, Effect::Network]);
         assert!(metadata_violations(&fetch, &[]).is_empty());
+    }
+
+    /// An allowlist entry is a claim that a declaration is honest as it stands. A claim with no
+    /// stated reason, or excusing an invariant that does not exist, is exactly the kind of
+    /// unexamined trust this module was written to remove — so it fails the build.
+    #[test]
+    fn the_allowlist_is_well_formed() {
+        for entry in EXEMPT {
+            assert!(
+                entry.reason.trim().len() >= 20,
+                "allowlist entry for `{}` needs a real justification, got {:?}",
+                entry.op,
+                entry.reason
+            );
+            assert!(
+                !entry.invariants.is_empty(),
+                "allowlist entry for `{}` excuses no invariant",
+                entry.op
+            );
+            for id in entry.invariants {
+                assert!(
+                    matches!(*id, "I1" | "I2" | "I3"),
+                    "allowlist entry for `{}` names unknown invariant {id:?}",
+                    entry.op
+                );
+            }
+        }
     }
 
     #[test]
