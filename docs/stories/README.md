@@ -48,6 +48,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ### Security assurance — close the gap between the envelope and its proof
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
+- [C-208 — Extend ToolSpec coherence to the full production catalog, and settle the Network-without-Read posture](C-208-full-catalog-toolspec-coherence.md) · Core · C-191 gated try_register_builtins only; 11 known violations sit outside it, including improve_log — [Write, Filesystem] at Risk::Low, C-191's own title case
 
 ## Blocked
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
