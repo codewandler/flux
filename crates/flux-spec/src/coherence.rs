@@ -36,6 +36,17 @@
 //! 2. it declares effects and that set leaves `{Read, Filesystem, Network}`, or names `Network`
 //!    without `Read`.
 //!
+//! **…or when it declares a consequential semantic effect (C-210).** The effect set is only one of
+//! two channels an operation declares consequence through; the other is the
+//! [`FlowEffect`](crate::FlowEffect) tag vocabulary, and a tag is consequential exactly when it
+//! lowers to a write or to a policy action (see
+//! [`FlowEffect::is_consequential`](crate::FlowEffect::is_consequential)). That channel is not
+//! decorative: `flow.write_db` and `model.invoke` are the two authorities the default policy floor
+//! grants *without* approval, so an op declaring `write_db` or `model` and nothing else clears both
+//! the gate and — until C-210 — the classifier. [`is_consequence_bearing_with_effects`] is the
+//! complete predicate and the one every seam should call; [`is_consequence_bearing`] is the
+//! effect-set half, kept separate only because `flux-spec` is on the frozen protocol line.
+//!
 //! That is not a new classification: it is exactly the shape `flux-flow`'s `gather_safe`
 //! (`crates/flux-flow/src/staged.rs`) refuses to run during evidence gathering — including the
 //! detail that the access branch applies *only* to an empty effect set. That detail is load-bearing
@@ -132,9 +143,49 @@ struct Exemption {
     reason: &'static str,
 }
 
-/// Whether `spec` reaches something whose consequence outlives the call — see the module docs for
-/// the derivation. Public because the invariants are only legible alongside the classification they
-/// are built on.
+/// Whether a *call* reaches something whose consequence outlives it — the complete classification,
+/// and **the one to reach for** (C-210).
+///
+/// An operation declares consequence through two independent channels, and reading only one is the
+/// exact defect this function exists to close:
+///
+/// * **The effect set** — [`is_consequence_bearing`], the `spec.effects` / `spec.access` shape.
+/// * **The semantic-effect tags** — [`declares_consequential_effect`], what the op says it *means*.
+///
+/// `semantic_effects` is the tag list from `flux_runtime::Tool::semantic_effects`; pass an empty
+/// slice for a spec that carries none. Note it is an *instance* fact, not a catalog one — `web.fetch`
+/// declares `write_db` only when a record sink is actually wired — so classify the tool you hold,
+/// never a spec pulled from a catalog listing.
+///
+/// This is the exact negation of the spec-shape branch of `flux-flow`'s `gather_safe`, which is the
+/// correspondence C-191's invariants rest on; the two must keep moving together.
+pub fn is_consequence_bearing_with_effects(spec: &ToolSpec, semantic_effects: &[String]) -> bool {
+    is_consequence_bearing(spec) || declares_consequential_effect(semantic_effects)
+}
+
+/// Whether any tag in `semantic_effects` names a consequence that outlives the call — the tag half
+/// of [`is_consequence_bearing_with_effects`].
+///
+/// Delegates the classification to [`FlowEffect::is_consequential`](crate::FlowEffect::is_consequential)
+/// so the vocabulary carries its consequence class exactly once. Tags are taken as plain strings for
+/// the same reason the trait hook returns them that way — the tool seam must not need the language
+/// crate — and an **unrecognized tag is not consequential**: it cannot be lowered, so it reaches no
+/// host effect and demands no authority. A typo'd tag is caught where tags are validated, not by
+/// silently escalating every op that carries one.
+pub fn declares_consequential_effect(semantic_effects: &[String]) -> bool {
+    semantic_effects
+        .iter()
+        .filter_map(|tag| crate::FlowEffect::from_tag(tag))
+        .any(crate::FlowEffect::is_consequential)
+}
+
+/// Whether `spec`'s **effect set** reaches something whose consequence outlives the call — see the
+/// module docs for the derivation. Public because the invariants are only legible alongside the
+/// classification they are built on.
+///
+/// This is one of two channels. It cannot see a consequence declared only as a semantic effect — a
+/// durable `write_db`, a billable `model` call — so prefer [`is_consequence_bearing_with_effects`]
+/// wherever the tags are in reach, which at every gather-safety and coherence seam they are.
 pub fn is_consequence_bearing(spec: &ToolSpec) -> bool {
     if spec.effects.is_empty() {
         return spec.access.iter().any(|a| {
@@ -168,14 +219,35 @@ fn exempt_from(op: &str, invariant: &str) -> bool {
 /// reason the trait hook returns them that way — the tool seam must not need the language crate.
 pub fn metadata_violations(spec: &ToolSpec, semantic_effects: &[String]) -> Vec<String> {
     let mut violations = Vec::new();
-    let consequential = is_consequence_bearing(spec);
+    // Both channels (C-210): the effect-set shape *and* the semantic tags. Reading only the first
+    // let an op declare a durable `write_db` while keeping a read-only tier.
+    let consequential = is_consequence_bearing_with_effects(spec, semantic_effects);
+    // Name the channel the verdict actually came from. An op whose effect set is an innocuous
+    // `[Read, Network]` and whose consequence is a `write_db` tag would otherwise be told its
+    // "shape" is the problem, sending the reader to edit the one field that is already correct.
+    let because = if is_consequence_bearing(spec) {
+        format!(
+            "declares effects {:?} / access {:?} — a consequence-bearing shape",
+            spec.effects, spec.access
+        )
+    } else {
+        format!(
+            "declares the semantic effect(s) {:?} — a consequence that outlives the call, even \
+             though its effect set {:?} is inert",
+            semantic_effects
+                .iter()
+                .filter(|t| crate::FlowEffect::from_tag(t)
+                    .is_some_and(crate::FlowEffect::is_consequential))
+                .collect::<Vec<_>>(),
+            spec.effects
+        )
+    };
 
     if consequential && spec.risk == Risk::Low && !exempt_from(&spec.name, "I1") {
         violations.push(format!(
-            "I1 (risk floor): `{}` declares effects {:?} / access {:?} — a consequence-bearing shape — \
-             but carries `Risk::Low`, the tier the gather path, the op cache, and the approval prompt \
-             all read as harmless",
-            spec.name, spec.effects, spec.access
+            "I1 (risk floor): `{}` {because} — but carries `Risk::Low`, the tier the gather path, \
+             the op cache, and the approval prompt all read as harmless",
+            spec.name
         ));
     }
 
@@ -198,10 +270,9 @@ pub fn metadata_violations(spec: &ToolSpec, semantic_effects: &[String]) -> Vec<
         && !exempt_from(&spec.name, "I3")
     {
         violations.push(format!(
-            "I3 (repeatability floor): `{}` declares effects {:?} / access {:?} — a \
-             consequence-bearing shape — but claims `Idempotency::Idempotent`; use \
+            "I3 (repeatability floor): `{}` {because} — but claims `Idempotency::Idempotent`; use \
              `NonIdempotent`, or `Conditional` when repeating really is safe",
-            spec.name, spec.effects, spec.access
+            spec.name
         ));
     }
 
@@ -221,6 +292,84 @@ mod tests {
     #[test]
     fn the_read_only_preset_is_coherent() {
         assert!(metadata_violations(&spec("read"), &[]).is_empty());
+    }
+
+    /// C-210: the tag half, derived from `lower()` rather than a hand-kept list. Written as a total
+    /// match over the vocabulary so a new variant cannot be added without classifying it.
+    #[test]
+    fn every_semantic_effect_tag_states_its_own_consequence_class() {
+        use crate::FlowEffect::*;
+        #[allow(deprecated)]
+        for effect in [
+            Pure,
+            Read,
+            Model,
+            Network,
+            WriteFile,
+            WriteDb,
+            SendExternal,
+            Delete,
+            Money,
+            Calendar,
+            HumanVisible,
+        ] {
+            let expected = match effect {
+                // Reaches nothing that outlives the call. `Network` is the deliberate one: an
+                // unread egress is already caught by the effect-set branch, and classifying it on
+                // both channels would let them disagree about a single fact.
+                Pure | Read | Network | HumanVisible => false,
+                // Lowers to `Effect::Write`, or to a `flow.*` / `model.invoke` policy action —
+                // needing a policy decision is what "consequence" means here.
+                _ => true,
+            };
+            assert_eq!(
+                effect.is_consequential(),
+                expected,
+                "`{}` is misclassified",
+                effect.tag()
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_consequential_tag_makes_a_read_shaped_spec_consequence_bearing() {
+        // `[Read, Network]` — gather-safe on its effect set alone, which is exactly the shipped
+        // `web.fetch` shape. The tag is the only thing that can catch it.
+        let fetch = spec("site.fetch").with_effects(vec![Effect::Read, Effect::Network]);
+        assert!(
+            !is_consequence_bearing(&fetch),
+            "the effect-set half is blind here"
+        );
+
+        let wired = vec!["write_db".to_string()];
+        assert!(declares_consequential_effect(&wired));
+        assert!(is_consequence_bearing_with_effects(&fetch, &wired));
+
+        // Both floors fire on the composed predicate — `read_only()` supplies `Risk::Low` *and*
+        // `Idempotent`, and a durable write honestly satisfies neither.
+        let violations = metadata_violations(&fetch, &wired);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0].starts_with("I1 (risk floor)"));
+        assert!(violations[1].starts_with("I3 (repeatability floor)"));
+        // The diagnostic names the channel the verdict came from. Blaming the `[Read, Network]`
+        // effect set here would send the reader to edit the one field that is already correct.
+        for v in &violations {
+            assert!(
+                v.contains("semantic effect(s) [\"write_db\"]"),
+                "must point at the tag, not the shape: {v}"
+            );
+        }
+
+        // Inert and unrecognized tags change nothing: an unknown tag lowers to no effect and no
+        // authority, so it must not silently escalate the op.
+        for tag in ["read", "pure", "human_visible", "network", "not_a_real_tag"] {
+            let tags = vec![tag.to_string()];
+            assert!(!declares_consequential_effect(&tags), "`{tag}`");
+            assert!(
+                !is_consequence_bearing_with_effects(&fetch, &tags),
+                "`{tag}`"
+            );
+        }
     }
 
     #[test]

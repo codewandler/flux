@@ -27,7 +27,7 @@ use flux_datasource::{Record, Source};
 use flux_runtime::{Tool, ToolContext, ToolResult};
 use flux_spec::{
     AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty, IntentRole,
-    IntentSet, IntentTarget, ToolSpec,
+    IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
 
@@ -191,6 +191,12 @@ impl Tool for WebCrawlTool {
         // fires here — the declaration has to stand on its own now that the invariant stopped
         // watching it.
         spec.idempotency = Idempotency::Conditional;
+        if self.records.is_some() {
+            // C-210, same reasoning as `web.fetch`: a wired sink makes this op self-declare
+            // `write_db`, which is consequence-bearing, so `Risk::Low` would violate I1. `Medium`
+            // is honest and removes the op from pre-approval gathering without adding a prompt.
+            spec.risk = Risk::Medium;
+        }
         spec
     }
 
@@ -745,6 +751,35 @@ mod tests {
         // A crawl replayed from the op cache would skip up to 50 live fetches and every
         // `web.page` record they contribute.
         assert_eq!(t.spec().idempotency, Idempotency::Conditional);
+    }
+
+    /// C-210, the `web.fetch` posture applied to the crawl — stated rather than left to emerge.
+    /// A wired sink means up to 50 durable `web.page` upserts, which is not something to perform
+    /// before a human has seen the plan; unwired, the op is a pure bounded read and stays
+    /// gather-safe.
+    #[tokio::test]
+    async fn a_sink_wired_crawl_is_consequence_bearing_and_leaves_the_gather_path() {
+        let wired = tool(
+            PrivateNetAllow::Any,
+            Some(Arc::new(RecordingSink::default())),
+        );
+        assert!(flux_spec::is_consequence_bearing_with_effects(
+            &wired.spec(),
+            &wired.semantic_effects()
+        ));
+        assert_eq!(wired.spec().risk, Risk::Medium);
+        assert!(
+            flux_spec::metadata_violations(&wired.spec(), &wired.semantic_effects()).is_empty(),
+            "the raised tier is what keeps I1 satisfied: {:?}",
+            flux_spec::metadata_violations(&wired.spec(), &wired.semantic_effects())
+        );
+
+        let catalog_only = tool(PrivateNetAllow::Any, None);
+        assert!(!flux_spec::is_consequence_bearing_with_effects(
+            &catalog_only.spec(),
+            &catalog_only.semantic_effects()
+        ));
+        assert_eq!(catalog_only.spec().risk, Risk::Low);
     }
 
     #[tokio::test]

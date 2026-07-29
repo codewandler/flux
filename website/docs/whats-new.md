@@ -21,6 +21,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   medium, and genuine page fetches are correctly marked as reads. This adds no new approval prompts;
   it makes the description you are shown before approving match what will actually happen.
 
+- **Page fetches that also save the page now wait to be shown to you first.** When flux is set up to
+  keep what it reads — fetched and crawled pages are saved as searchable knowledge you can ground
+  later answers on — those operations do more than read, so they no longer run during the quick
+  look-around flux does before showing you a plan. They appear in the plan instead. There is no new
+  prompt and nothing you can no longer do; an affected turn may simply take one extra step. Page
+  fetching without that saving behaviour is unchanged.
+
 - **flux now tells you when an integration understates what its operations do.** Every operation
   declares how risky it is and whether it only reads — and that declaration is what decides whether
   you get asked before it runs. Nothing checked those declarations against each other, so an

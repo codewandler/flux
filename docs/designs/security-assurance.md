@@ -200,6 +200,112 @@ Two registration seams stay open, deliberately:
   over. The C-208 gate asserts that directly rather than assuming it, because "the child registry is
   a subset" is a property that a future edit could quietly falsify.
 
+## `semantic_effects` participates in gather-safety (C-210)
+
+C-208 named a structural gap and declined to patch it there: `gather_safe` and
+`is_consequence_bearing` both decide from `spec.effects` (plus `intents` / `spec.access`), and
+**neither reads `semantic_effects`**. The C-191 correspondence between them is exact, but both are
+blind in the same place, so being exact does not make it complete. C-210 answers whether that
+blindness is a defect or the design.
+
+**Decision: it is a defect. Both classifiers read `semantic_effects`, and the tag vocabulary carries
+its own consequence class via `FlowEffect::is_consequential()`, derived from `FlowEffect::lower`.**
+
+### Why the blindness could not stand
+
+The tempting counter-argument is that authorization already covers it: C-208's review traced the
+gather path and confirmed `Executor::gate` evaluates the `flow.write_db` requirement against the
+mandatory policy floor on every gather-phase call. True, and it is why this was never an
+authorization hole. It is also not sufficient, for three reasons.
+
+**1. The default floor lets exactly the two silent tags through, and `write_db` is one of them.**
+Lay the consequential tags against `default_policy` (`flux-policy/src/lib.rs:407-446`):
+`flow.send_external` is granted but `requires_approval: true`; `flow.delete`, `flow.money` and
+`flow.calendar` are absent and therefore default-deny. Those four are stopped at the gate whatever
+the classifier thinks. But `flow.write_db` is granted with `requires_approval: false`, and so is
+`model.invoke`. **`write_db` and `model` are the only consequential tags that clear the floor
+unapproved** — which is precisely why `web.fetch` is the op that surfaced this, and why the gap is
+narrow rather than theoretical.
+
+**2. Making gather-safety depend on the policy file is the wrong dependency.** The four tags above
+are safe *today* because of a default an operator is expected to edit. Granting
+`flow.send_external` without approval is a legitimate configuration for an unattended automation
+deployment — and it would silently re-open pre-approval sending, because the classifier that decides
+what runs before a human looks would still not know the op sends anything. A gather-safety rule that
+holds only under the shipped policy is not a rule.
+
+**3. The `model` case is currently protected by nothing but a hand-maintained tier.** C-208 moved
+every model-calling op to `Risk::Medium` on the cost test ("does calling this cost money?"), which
+keeps them out of the gather path *through the risk branch*, not the effect branch. C-208 recorded
+the fragility itself: "Whenever a fix narrows what an invariant classifies, re-check every invariant
+that was firing before the narrowing. Nothing enforces that; it is a review obligation." Reading the
+tag converts that obligation into a gate — which is the whole reason C-191 exists.
+
+### The rule
+
+A `FlowEffect` is **consequential** iff its `lower()` yields `Effect::Write` or *any* policy
+`Action`. No second table: the vocabulary already states its class once, and this reads it.
+
+| tag | lowers to | consequential |
+| --- | --- | --- |
+| `pure`, `read`, `network`, `human_visible` | no write, no action | no |
+| `model` | `model.invoke` | yes |
+| `write_file` | `Effect::Write` | yes |
+| `write_db` | `Effect::Network` + `flow.write_db` | yes |
+| `send_external` | `Effect::Network` + `flow.send_external` | yes |
+| `delete` | `Effect::Write` + `flow.delete` | yes |
+| `money` | `flow.money` | yes |
+| `calendar` (deprecated) | `flow.calendar` | yes |
+
+`network` is deliberately *not* consequential on the tag channel: an unread egress is already caught
+by the effect-set branch's `Network`-without-`Read` test, and duplicating it here would make the two
+branches disagree about the same fact. `write_file` is likewise already closed on the effect channel
+— `authority_requirements_from_declaration` rejects a `write_file` tag with no `workspace.write`
+requirement (`flux-runtime/src/lib.rs:2559-2568`) — so it is listed for completeness of the
+derivation, not because it was reachable.
+
+**The C-191 correspondence is preserved, not weakened.** `gather_safe`'s spec-shape branch remains
+the exact negation of the consequence classifier; both simply now take the same second argument.
+Because `flux-spec` is on the independent protocol line, the classifier is extended *additively*:
+`is_consequence_bearing(spec)` keeps its signature as the effect-set half, a companion predicate
+covers the tag half, and the composed predicate is the blessed entry point. A caller reaching for the
+spec-only half gets the incomplete answer, so the composed one is what `metadata_violations` and
+`gather_safe` both call.
+
+### The behavioural trade-off: `web.fetch` and `web.crawl` leave the gather path
+
+This is the part that is a decision rather than a consequence, so it is stated outright.
+`semantic_effects()` on both ops is **instance-conditional** — the `write_db` tag appears only when a
+record sink is wired (`flux-web/src/fetch.rs:135-143`), so a catalog-only registry stays a pure
+network read. `flux-cli` always wires one, which means in the shipped CLI both ops are now
+consequence-bearing, move to `Risk::Medium`, and are no longer runnable during pre-approval evidence
+gathering.
+
+**The cost is one loop round, not an approval prompt and not a lost capability.** `Risk::Medium`
+adds no prompt — `RiskApprover` gates writes at `Risk::High` and above, and `Executor::dispatch`
+forces approval only for `Risk::Destructive`. What changes is pacing: a fetch moves out of the gather
+round and into the execute batch, so the agent fetches and the loop revises rather than fetching
+mid-exploration. That is exactly the cost C-208 accepted for its six Group B ops, and it is accepted
+here for the same reason.
+
+Two alternatives were considered and rejected:
+
+- **Exempt the two ops.** Defensible on the merits — a `web.page` record is the agent's own index of
+  a page it just read, not a mutation of the user's world. Rejected because it needs a *new*
+  mechanism: `flux_spec::coherence::EXEMPT` excuses ops from I1/I2/I3, not from gather-safety, and
+  C-208's stated goal state for that allowlist is empty. Buying back one loop round with a novel
+  exemption surface is a bad trade.
+- **Suppress the record during the gather phase**, so the op performs no durable write pre-approval
+  and stays gather-safe. Honest, and the most capability-preserving option, but it introduces
+  phase-dependent op behaviour as a new concept and silently drops a record the caller explicitly
+  wired — the same "skips a durable contribution the caller asked for" that made `Idempotent` false
+  for these ops in the first place.
+
+Note what is *not* changed: the record is still declared as the semantic effect `write_db` with a
+`datasource:web.page` subject, never as a host `Effect::Write`. C-208's reasoning stands — promoting
+it would falsely demand a filesystem `workspace.write`, which a test in `flux-web/src/fetch.rs`
+deliberately guards against.
+
 ## The approval sheet does not redact (C-195)
 
 C-185 fixed the shared redactor and left one acceptance item behind — "the approval sheet's diff

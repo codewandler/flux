@@ -2,7 +2,7 @@
 id: C-210
 title: "gather_safe never reads semantic_effects, so an op can be pre-approval reachable and still declare a durable write"
 pillar: Core
-status: ready
+status: done
 priority: 7
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -32,23 +32,50 @@ the classifier that decides *what may run before a human looks* is blind to a fi
 declare that they persist state.
 
 ## Acceptance
-- [ ] The question is answered in writing first, in `docs/designs/security-assurance.md`: should
+- [x] The question is answered in writing first, in `docs/designs/security-assurance.md`: should
       `gather_safe` (and therefore `is_consequence_bearing`) take `semantic_effects` into account,
       or is the `Effect`/`intents` pair deliberately the whole contract with `semantic_effects`
       reserved for authorization only? Both are defensible; what is not defensible is the current
       state, where the answer is implicit and nobody has stated it.
-- [ ] If the decision is that it should: `gather_safe` and `is_consequence_bearing` move together —
+- [x] If the decision is that it should: `gather_safe` and `is_consequence_bearing` move together —
       they must stay exact negations, since C-191's whole design rests on that. A failing-first test
       pins that an op declaring a persisting semantic effect is not gather-safe.
-- [ ] If the decision is that it should not: the reasoning is recorded at both seams in code, so the
+- [~] If the decision is that it should not: the reasoning is recorded at both seams in code, so the
       next reviewer does not re-file this, and the story closes as "won't do" with that pointer.
-- [ ] Either way, the `web.fetch`/`web.crawl` case is covered by a test that states the intended
+- [x] Either way, the `web.fetch`/`web.crawl` case is covered by a test that states the intended
       behaviour explicitly rather than leaving it as an emergent property.
 
 ## Progress
 - 2026-07-29 — surfaced by the independent review of C-208, which traced the gather path end to end
   and confirmed authorization is intact. Filed rather than fixed inside C-208, which was already
   scoped to the catalog census.
+- 2026-07-29 — **decided and implemented.** The written answer landed first, in
+  [security-assurance.md](../designs/security-assurance.md) § "`semantic_effects` participates in
+  gather-safety (C-210)": the blindness is a **defect**, so both classifiers now read the tags. The
+  third acceptance branch ("if the decision is that it should not") is therefore not applicable.
+  Three facts carried it, none of which the story had: of the consequential tags only `flow.write_db`
+  and `model.invoke` clear the default policy floor *without* approval
+  (`crates/flux-policy/src/lib.rs:407-446`) — `flow.send_external` is approval-gated,
+  `flow.delete`/`flow.money`/`flow.calendar` default-deny; leaning on that would make gather-safety
+  depend on a policy file operators are expected to edit; and the `model` case was held only by the
+  hand-maintained tier C-208 assigned, which C-208 recorded as an *unenforced* review obligation.
+  The story's proposed shape was taken: `FlowEffect::is_consequential()` **derived from `lower()`**
+  (consequential iff it lowers to `Effect::Write` or any policy `Action`), so the vocabulary states
+  its class once. `Network` is deliberately excluded on the tag channel — the effect-set branch
+  already catches unread egress, and classifying it twice would let the two branches disagree.
+  Extension is **additive**, so `flux-spec` needed no further bump: it already sits at an unreleased
+  1.2.0 (v0.34.0 carries 1.1.0), and a second bump would strand 1.2.0 as a version that never ships.
+  `is_consequence_bearing_with_effects` is the complete predicate; `is_consequence_bearing` stays the
+  effect-set half. The C-191 correspondence is now **pinned by a test** rather than asserted in prose.
+  The product question is answered **yes**: sink-wired `web.fetch`/`web.crawl` become `Risk::Medium`
+  and leave the gather path. Cost is one loop round, *not* an approval prompt (`RiskApprover` gates
+  writes at `High`+, `dispatch` forces only `Destructive`) — the cost C-208 already accepted for its
+  six Group B ops. Exempting the ops, and suppressing the record during gather, were considered and
+  rejected with reasons recorded.
+  Failing-first verified by neutralizing the three production edits and confirming all four new
+  behavioural tests fail, then restoring. Full gate green: `cargo test --workspace` (144 binaries),
+  `clippy --workspace --all-targets -D warnings`, `cargo fmt` in both workspaces,
+  `scripts/check-crate-versions.sh`, and the regenerated website changelog mirror.
 
 ## Notes
 - Seams: `gather_safe` at `crates/flux-flow/src/staged.rs:2447-2475`; `is_consequence_bearing` at

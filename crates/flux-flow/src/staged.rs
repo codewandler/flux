@@ -163,6 +163,7 @@ pub fn statically_gather_safe(tool: &dyn flux_runtime::Tool) -> bool {
         &spec,
         tool.staging_disposition(),
         flux_spec::IntentSet::new(),
+        &tool.semantic_effects(),
     )
 }
 
@@ -792,7 +793,12 @@ async fn run_model_stage_inner(
                 results.push(ContentBlock::tool_result_text(id, last_error.clone(), true));
                 continue;
             }
-            if !gather_safe(spec, tool.staging_disposition(), tool.intents(&call_input)) {
+            if !gather_safe(
+                spec,
+                tool.staging_disposition(),
+                tool.intents(&call_input),
+                &tool.semantic_effects(),
+            ) {
                 last_error = format!(
                     "model stage `{name}` call to `{operation}` is not gather-safe for these arguments"
                 );
@@ -1341,7 +1347,12 @@ async fn adaptive_explore(
                     "selected operation `{operation}` disappeared from the registry"
                 ))
             })?;
-            if gather_safe(spec, tool.staging_disposition(), tool.intents(&input)) {
+            if gather_safe(
+                spec,
+                tool.staging_disposition(),
+                tool.intents(&input),
+                &tool.semantic_effects(),
+            ) {
                 let ast = one_call_ast(
                     &operation,
                     input.clone(),
@@ -2444,15 +2455,33 @@ fn finalize_tool() -> ToolDef {
     }
 }
 
+/// Whether this invocation may run during pre-approval evidence gathering.
+///
+/// `semantic_effects` is `flux_runtime::Tool::semantic_effects` for the tool being classified. It is
+/// not optional context (C-210): an operation declares consequence through two channels, and the
+/// effect set is only one of them. `web.fetch` wired with a record sink persists a durable
+/// `web.page` datasource record and says so as the semantic effect `write_db` — which lowers to
+/// `flow.write_db`, one of exactly two authorities the default policy floor grants *without*
+/// approval. Deciding what may run before a human looks while blind to that channel is the gap this
+/// argument closes.
+///
+/// The spec-shape half stays the exact negation of `flux_spec::is_consequence_bearing_with_effects`,
+/// which is the correspondence C-191's metadata invariants rest on. Change one, change both.
 fn gather_safe(
     spec: &ToolSpec,
     disposition: flux_spec::StagingDisposition,
     intents: flux_spec::IntentSet,
+    semantic_effects: &[String],
 ) -> bool {
     if disposition == flux_spec::StagingDisposition::Capture {
         return false;
     }
     if spec.risk != Risk::Low || intents.is_mutating() || intents.is_destructive() {
+        return false;
+    }
+    // A self-declared consequential effect (`write_db`, `model`, `send_external`, `delete`, `money`)
+    // disqualifies the call whatever the effect set says.
+    if flux_spec::declares_consequential_effect(semantic_effects) {
         return false;
     }
     if spec.effects.is_empty() {
@@ -4315,17 +4344,20 @@ mod tests {
         assert!(gather_safe(
             &read,
             flux_spec::StagingDisposition::Infer,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
         assert!(!gather_safe(
             &read,
             flux_spec::StagingDisposition::Capture,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
         assert!(gather_safe(
             &read,
             flux_spec::StagingDisposition::Gather,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
 
         let network_read = spec(
@@ -4337,7 +4369,8 @@ mod tests {
         assert!(gather_safe(
             &network_read,
             flux_spec::StagingDisposition::Infer,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
 
         let mut fresh_read = spec("clock", vec![Effect::Read], vec![], None);
@@ -4346,7 +4379,8 @@ mod tests {
             gather_safe(
                 &fresh_read,
                 flux_spec::StagingDisposition::Infer,
-                flux_spec::IntentSet::new()
+                flux_spec::IntentSet::new(),
+                &[]
             ),
             "freshness/cacheability must not turn a side-effect-free read into an action"
         );
@@ -4360,12 +4394,14 @@ mod tests {
         assert!(!gather_safe(
             &write,
             flux_spec::StagingDisposition::Infer,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
         assert!(!gather_safe(
             &write,
             flux_spec::StagingDisposition::Gather,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
 
         // A pure op (no effects, no access) stays gather-safe.
@@ -4373,7 +4409,8 @@ mod tests {
         assert!(gather_safe(
             &pure,
             flux_spec::StagingDisposition::Infer,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
 
         // An operation that declares no effects but reaches a code-running / local-system host
@@ -4382,14 +4419,144 @@ mod tests {
         assert!(!gather_safe(
             &process,
             flux_spec::StagingDisposition::Infer,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
         let local_system = spec("host_probe", vec![], vec![AccessKind::LocalSystem], None);
         assert!(!gather_safe(
             &local_system,
             flux_spec::StagingDisposition::Infer,
-            flux_spec::IntentSet::new()
+            flux_spec::IntentSet::new(),
+            &[]
         ));
+    }
+
+    /// C-210: an op may declare consequence through the semantic-effect tags instead of the effect
+    /// set, and gather-safety has to read that channel too. Every spec below is `[Read, Network]` at
+    /// `Risk::Low` — gather-safe on its effect set alone — so the tag is the only thing deciding.
+    #[test]
+    fn a_declared_consequential_semantic_effect_is_not_gather_safe() {
+        let fetch = spec(
+            "site.fetch",
+            vec![Effect::Read, Effect::Network],
+            vec![AccessKind::Network],
+            None,
+        );
+        let gather = |tags: &[&str]| {
+            let owned: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+            gather_safe(
+                &fetch,
+                flux_spec::StagingDisposition::Infer,
+                flux_spec::IntentSet::new(),
+                &owned,
+            )
+        };
+
+        assert!(gather(&[]), "the effect set alone is gather-safe");
+
+        // The two tags the default policy floor grants *without* approval, which is why the
+        // classifier — not the gate — has to be the thing that stops them.
+        assert!(
+            !gather(&["write_db"]),
+            "a durable datasource write must not run before a human sees the plan"
+        );
+        assert!(
+            !gather(&["model"]),
+            "a billable model call must not be spent during pre-approval exploration"
+        );
+
+        // The rest are stopped at the gate today by the shipped policy, but gather-safety must not
+        // depend on a default the operator is expected to edit.
+        for tag in ["send_external", "delete", "money", "write_file"] {
+            assert!(!gather(&[tag]), "`{tag}` declares a consequence");
+        }
+
+        // Inert tags leave the classification alone, and an unknown tag lowers to nothing at all.
+        for tag in ["read", "pure", "human_visible", "network", "not_a_real_tag"] {
+            assert!(
+                gather(&[tag]),
+                "`{tag}` reaches nothing that outlives the call"
+            );
+        }
+
+        // One consequential tag in a list is enough.
+        assert!(!gather(&["read", "write_db"]));
+
+        // `Capture` and a mutating intent still dominate, tags or no tags.
+        assert!(!gather_safe(
+            &fetch,
+            flux_spec::StagingDisposition::Capture,
+            flux_spec::IntentSet::new(),
+            &[]
+        ));
+    }
+
+    /// The C-191 correspondence, restated for the tag channel: `gather_safe`'s spec-shape branch is
+    /// the exact negation of `is_consequence_bearing_with_effects`. C-208 rested a whole catalog
+    /// census on that, so it is pinned rather than assumed.
+    #[test]
+    fn gather_safety_stays_the_exact_negation_of_the_consequence_classifier() {
+        let cases: Vec<(ToolSpec, Vec<String>)> = vec![
+            (
+                spec(
+                    "read",
+                    vec![Effect::Read, Effect::Filesystem],
+                    vec![AccessKind::Filesystem],
+                    None,
+                ),
+                vec![],
+            ),
+            (
+                spec(
+                    "fetch",
+                    vec![Effect::Read, Effect::Network],
+                    vec![AccessKind::Network],
+                    None,
+                ),
+                vec!["write_db".to_string()],
+            ),
+            (
+                spec(
+                    "egress",
+                    vec![Effect::Network],
+                    vec![AccessKind::Network],
+                    None,
+                ),
+                vec![],
+            ),
+            (
+                spec(
+                    "write",
+                    vec![Effect::Write, Effect::Filesystem],
+                    vec![AccessKind::Filesystem],
+                    None,
+                ),
+                vec![],
+            ),
+            (spec("compute", vec![], vec![], None), vec![]),
+            (
+                spec("shell_probe", vec![], vec![AccessKind::Process], None),
+                vec![],
+            ),
+            (
+                spec("consult", vec![Effect::Read], vec![], None),
+                vec!["model".to_string()],
+            ),
+        ];
+
+        for (spec, tags) in cases {
+            assert_eq!(
+                gather_safe(
+                    &spec,
+                    flux_spec::StagingDisposition::Infer,
+                    flux_spec::IntentSet::new(),
+                    &tags,
+                ),
+                !flux_spec::is_consequence_bearing_with_effects(&spec, &tags),
+                "`{}` disagrees between gather-safety and the consequence classifier",
+                spec.name
+            );
+        }
     }
 
     #[tokio::test]

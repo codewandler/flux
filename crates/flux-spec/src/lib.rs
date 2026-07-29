@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod coherence;
 mod schema;
-pub use coherence::{is_consequence_bearing, metadata_violations};
+pub use coherence::{
+    declares_consequential_effect, is_consequence_bearing, is_consequence_bearing_with_effects,
+    metadata_violations,
+};
 pub use schema::{empty_schema, object_schema, opt, req, Field, FieldType};
 
 /// Generate the provider-facing JSON Schema for a typed tool input.
@@ -201,6 +204,29 @@ impl FlowEffect {
             Calendar => (None, Some(Action::from("flow.calendar"))),
             HumanVisible => (None, None),
         }
+    }
+
+    /// Whether this tag names a consequence that outlives the call — the tag-channel half of
+    /// [`coherence::is_consequence_bearing_with_effects`] (C-210).
+    ///
+    /// **Derived from [`lower`](Self::lower), never from a second table**: a tag is consequential
+    /// exactly when it lowers to [`Effect::Write`] or to *any* policy
+    /// [`Action`](flux_policy::Action). The vocabulary already states each variant's consequence
+    /// class once — the host effect it implies and the `flow.*` authority it demands — so this reads
+    /// that statement rather than restating it, and a new variant classifies itself the moment it is
+    /// lowered.
+    ///
+    /// Why an [`Action`] is enough on its own: a semantic-only effect carries a dedicated `flow.*`
+    /// action *because* it does something no host effect describes — sends mail, spends money,
+    /// deletes irreversibly, persists a record. Needing a policy decision is the definition of
+    /// consequence here.
+    ///
+    /// [`Network`](Self::Network) is deliberately **not** consequential on this channel. An unread
+    /// egress is already caught by the effect-set branch's `Network`-without-`Read` test, and
+    /// classifying it twice would let the two branches disagree about one fact.
+    pub fn is_consequential(self) -> bool {
+        let (effect, action) = self.lower();
+        matches!(effect, Some(Effect::Write)) || action.is_some()
     }
 }
 

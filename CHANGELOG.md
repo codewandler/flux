@@ -32,6 +32,41 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **Gather-safety reads `semantic_effects`, so a self-declared durable write can no longer run before
+  approval (C-210).** `gather_safe` (`flux-flow`) and `is_consequence_bearing` (`flux-spec`) both
+  decided from `spec.effects`; **neither read `semantic_effects`**. C-208 made that live — `web.fetch`
+  gained `Effect::Read` and became gather-safe while, with a record sink wired, each HTML response
+  upserts a durable `web.page` datasource record declared as the semantic effect `write_db`. Never an
+  authorization hole (`Executor::gate` evaluates `flow.write_db` on every gather-phase call), but the
+  classifier deciding *what may run before a human looks* was blind to a channel ops use to declare
+  persistence.
+  **The decision is recorded in `docs/designs/security-assurance.md` before any code moved**, because
+  both answers were defensible and the indefensible state was the implicit one. Three facts settled
+  it: of the consequential tags, only `flow.write_db` and `model.invoke` clear the default policy floor
+  *without* approval (`flux-policy/src/lib.rs:407-446`) — `flow.send_external` is approval-gated and
+  `flow.delete`/`flow.money`/`flow.calendar` are default-deny; relying on that makes gather-safety
+  depend on a policy file operators are expected to edit; and the `model` case was protected by
+  nothing but the hand-maintained tier C-208 assigned, which C-208 itself recorded as an unenforced
+  review obligation.
+  The vocabulary now carries its consequence class once: `FlowEffect::is_consequential()` is **derived
+  from `lower()`** — consequential iff it lowers to `Effect::Write` or any policy `Action` — rather
+  than a second table that could drift from the first. `Network` is deliberately excluded on the tag
+  channel, since an unread egress is already caught by the effect-set branch and classifying it twice
+  would let the two disagree. The C-191 correspondence is preserved and now **pinned by a test**
+  asserting `gather_safe` is the exact negation of the classifier across a spec matrix. Because
+  `flux-spec` is on the frozen protocol line the extension is additive:
+  `is_consequence_bearing_with_effects` is the complete predicate every seam should call,
+  `is_consequence_bearing` remains the effect-set half. Violation messages now name the channel the
+  verdict came from, so an op whose effect set is a blameless `[Read, Network]` is not told its shape
+  is wrong.
+  **The behavioural trade-off, decided explicitly:** `semantic_effects()` is instance-conditional, so
+  a catalog-only `web.fetch`/`web.crawl` stays a pure network read at `Risk::Low`, while the sink-wired
+  instances `flux-cli` builds become `Risk::Medium` and leave the pre-approval gather path. That costs
+  one loop round, **not** an approval prompt (`RiskApprover` gates writes at `Risk::High`+,
+  `dispatch` forces only `Destructive`) — the same cost C-208 accepted for its six Group B ops.
+  Exempting the two ops and suppressing the record during gather were both considered and rejected in
+  the design doc. Closes the last open code story under the **security assurance** epic.
+
 - **The history rewriters run through the typed seam, and the unguarded write API is gone (A-102).**
   Session fork, `whatif` re-plan and the CLI's fork replayed a parent conversation *message by
   message* through `EventStore::record_message`, so they inherited no shape guarantee at all: a fork

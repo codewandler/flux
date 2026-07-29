@@ -114,6 +114,15 @@ impl Tool for WebFetchTool {
         // fires on it. That makes fixing it here load-bearing rather than optional: the invariant
         // stopped watching, so the declaration has to be right on its own.
         spec.idempotency = Idempotency::Conditional;
+        if self.records.is_some() {
+            // C-210: with a sink wired this op self-declares `write_db`, which now counts as
+            // consequence-bearing — so `Risk::Low` would violate I1. `Medium` is the honest tier
+            // and is what takes the op out of the pre-approval gather path; it adds no approval
+            // prompt (`RiskApprover` gates writes at `High`+, `dispatch` forces only
+            // `Destructive`). Conditional on the sink for the same reason the tag is: without one,
+            // this really is a pure network read. See `docs/designs/security-assurance.md`.
+            spec.risk = Risk::Medium;
+        }
         spec
     }
 
@@ -896,6 +905,41 @@ mod tests {
         // `read_only()`'s inherited `Idempotent` and an op-cache replay that would skip both the
         // live fetch and the `web.page` record it contributes.
         assert_eq!(t.spec().idempotency, Idempotency::Conditional);
+    }
+
+    /// C-210 states the gather posture outright instead of leaving it to emerge from the effect set.
+    ///
+    /// The `write_db` tag is instance-conditional, so this op sits on both sides of the line: a
+    /// catalog-only registration really is a pure network read and stays pre-approval reachable,
+    /// while the sink-wired instance `flux-cli` builds self-declares a durable datasource write and
+    /// must not run before a human sees the plan. `Risk::Medium` is what carries that — it costs an
+    /// extra loop round, not an approval prompt (`RiskApprover` gates writes at `High`+).
+    #[tokio::test]
+    async fn a_sink_wired_fetch_is_consequence_bearing_and_leaves_the_gather_path() {
+        let wired = tool(
+            PrivateNetAllow::Any,
+            Some(Arc::new(RecordingSink::default())),
+        );
+        assert!(
+            flux_spec::is_consequence_bearing_with_effects(&wired.spec(), &wired.semantic_effects()),
+            "a self-declared `write_db` is a consequence even though the effect set is [Read, Network]"
+        );
+        assert_eq!(wired.spec().risk, Risk::Medium);
+        assert!(
+            flux_spec::metadata_violations(&wired.spec(), &wired.semantic_effects()).is_empty(),
+            "the raised tier is what keeps I1 satisfied: {:?}",
+            flux_spec::metadata_violations(&wired.spec(), &wired.semantic_effects())
+        );
+
+        let catalog_only = tool(PrivateNetAllow::Any, None);
+        assert!(
+            !flux_spec::is_consequence_bearing_with_effects(
+                &catalog_only.spec(),
+                &catalog_only.semantic_effects()
+            ),
+            "with no sink there is no durable write, so gather-safety is retained"
+        );
+        assert_eq!(catalog_only.spec().risk, Risk::Low);
     }
 
     #[tokio::test]
