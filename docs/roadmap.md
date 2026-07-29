@@ -85,6 +85,28 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### Website truth and identity — the public site tells the truth and looks like the product (epic) — 🔄 **DESIGNED (C-196; C-197…C-204 filed, none started)**
+
+A 2026-07-29 audit of all 64 pages under `website/docs/` against the tree at `0.33.1` found the
+site structurally strong — all 26 CLI subcommands, all 43 node kinds and all 21 expr builtins are
+covered, and three regions are generated from the Rust source behind drift-guarded markers. D-117
+and L-42 held. What drifted is narrower and, because the rest is trustworthy, harder for a reader
+to detect. `language/flows-and-syntax.md:118` states that strings are single-line, on the page that
+owns text syntax, while triple-quoted verbatim strings have shipped since L-39 — `"""` has zero
+occurrences anywhere under `website/docs/language/`. The **entire HTTP session API is absent**:
+`flux-server` registers twelve routes and the site documents the three A2A ones, so `POST
+/sessions`, the SSE stream and the webhook — the reason `flux app run --serve` exists — are
+publicly undocumented. Behind those sit uncatalogued ops, the `[wakeup]` and `theme` config keys,
+~14 undocumented `FLUX_*` variables, a TUI surface reduced to one table row, and four places where
+the **website is right and the in-repo docs are wrong** (README documents a `flux run --program`
+flag that does not exist). Separately, the site is the only surface that ignores
+[`assets/README.md`](../assets/README.md), the project's own brand spec: no favicon key at all, no
+navbar logo, no social card, and a petrol-teal accent that appears in no brand asset. Done looks
+like eight landed stories and, more durably, three coverage assertions in `website_contract.rs`
+that make an undocumented route, op or config key fail `cargo test` — a truth pass without a guard
+is a story we file again in three months. Design:
+[designs/website-truth-and-identity.md](designs/website-truth-and-identity.md).
+
 ### Typed session log — session-shape validity by construction (epic) — 🔄 **IN PROGRESS (A-93; A-99 + A-100 done, A-101…A-102 filed)**
 
 The "session shape is always a valid provider history" invariant has broken three times — cancel,

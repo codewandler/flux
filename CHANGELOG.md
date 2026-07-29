@@ -6,6 +6,50 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Documentation
+
+- **The public website tells the truth about the shipped surface, and is guarded against drifting
+  again (C-196 epic; C-197…C-204).** A page-by-page audit of `website/docs` against the tree found
+  four claims a reader would act on and be wrong: the syntax page stated *"strings are single-line"*
+  while triple-quoted verbatim strings have shipped since L-39; the entire HTTP session API (`POST
+  /sessions`, the SSE stream, `/webhook`, both usage endpoints) was undocumented — the site covered
+  3 of **14** served routes; `README.md` documented a `flux run --program` flag that does not exist;
+  and `docs/usage.md` was missing five shipped subcommands and called `read_many` a legacy alias
+  while the registry says to prefer it. Beyond those: **26** undocumented `FLUX_*` variables
+  (including the `FLUX_EMBEDDINGS_*` trio that gates datasource embeddings, and `FLUX_ALLOW_ALL`
+  which widens the safety envelope), the `[wakeup]` and `theme` config keys, **27** registered
+  operations absent from the operation reference, the `agent_loop` program declaration, and a TUI
+  surface reduced to one table row. New pages: `agent/http-api.md`, `agent/tui.md`,
+  `plugins/kubernetes.md`, `plugins/sql.md`; `plugins/authoring.md` went from a 40-line stub to a
+  real authoring guide, and `agent/improvement.md` now states the pillar's on-hold status instead of
+  implying it ships.
+  The durable half is six new or tightened assertions in `crates/flux-cli/tests/website_contract.rs`
+  (13 → 18 tests): an undocumented **server route**, **registered op**, **public config section or
+  `FLUX_*` variable**, **subcommand** (now checked against `docs/usage.md` too, the file that
+  drifted), **TUI keybinding or theme**, or a removed multi-line-string section now fails `cargo
+  test`. Each enumerates from the real source — the axum router, the tool registry, the config
+  schema, `flux --help`, and the TUI's own F1 help table — so the next gap fails the gate rather
+  than waiting for an audit. Also fixed en route: `security/plugin-sandbox.md` described the
+  `process` capability as an exact `argv[0]` allow-list (it is an argv-**prefix** matcher since
+  C-90 — the property that lets `kubectl get` be granted without `kubectl delete`),
+  `plugins/using-plugins.md` called the `sql` plugin PostgreSQL-only (MySQL/MariaDB shipped in
+  D-196…D-198), and `sdk/datasources.md` pinned a 0.25 SDK against a 0.33.1 workspace.
+- **The site now looks like the same product as the README (C-197).** `assets/README.md` fixes a
+  brand — the execution-gate mark, signal green `#0bbf83`/`#2be6a5`, ink `#141a18` — that the README
+  hero and its badges follow and the website ignored entirely: no favicon key at all, no navbar
+  logo, no social card (so every shared link rendered blank), and a petrol-teal accent that appears
+  in no brand asset. The site now carries the favicon, navbar logo, a 1200×630 Open Graph card and
+  the brand accent, all derived from `assets/`. Raw `#0bbf83` is ~2.4:1 on white and fails WCAG AA
+  for text, so light mode uses a hue-preserving darkened ramp measured at **4.65:1** while dark mode
+  uses `#2be6a5` verbatim at **10.62:1**; the raw signal survives for non-text accents. The logos
+  ship as explicit light/dark files rather than one `prefers-color-scheme` SVG, because the source
+  asset follows the OS scheme and would disagree with the site's own theme toggle. `Inter` was named
+  in the font stack with no `@font-face` and no stylesheet link — it had never loaded — and is
+  dropped rather than added, matching the brand's own "no webfont dependency" stance. Explicit
+  light/dark Prism themes replace the `palenight` default that rendered code blocks dark on the
+  light theme, and `onBrokenAnchors` is now `'throw'` (it immediately caught a real broken anchor in
+  `sdk/flow-client.md`).
+
 ### Security
 
 - **The unauthenticated-non-loopback refusal now holds by construction, not only in `serve_on`
