@@ -547,12 +547,32 @@ pub(super) async fn run_app(
     // The declared work boards (A-113's port). `try_register_work_board` *derives* the generated op
     // set from the port itself, so an operation added to `WorkBoard` reaches a Program through this
     // line unchanged — nothing here enumerates or counts them.
+    //
+    // A handle is retained per board so the fleet dispatch op can be given a `BoardLedger` below.
+    // Registering consumes the `Arc`, so without the clone there would be no way back to the board
+    // and `fleet.dispatch` could never record a run — which is exactly the gap that left design §5's
+    // "the board IS the run registry" false in a running flux.
+    let mut board_handles: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for (domain, board) in boards {
+        board_handles.push((domain.clone(), Arc::clone(&board)));
         flux_capabilities::try_register_work_board(&mut integration_registry, &domain, board)?;
     }
     // Outbound A2A dispatch (A-116). Registered through the same helper the agent assembly uses, so
     // `flux app run` and `flux run` offer the identical fleet catalog under the identical grant.
-    try_register_fleet(&mut integration_registry)?;
+    //
+    // The ledger is wired only when the Program declares EXACTLY ONE board. `fleet.dispatch` takes
+    // an `item` id but no board name, so with several boards an item id is genuinely ambiguous and
+    // guessing could record a run onto the wrong board — a silent, wrong write is worse than a
+    // refusal. With none, there is nothing to record onto. In both of those cases the op still
+    // dispatches normally and only refuses calls that name an `item`.
+    let ledger: Option<Arc<dyn flux_runtime::DispatchLedger>> = match board_handles.as_slice() {
+        [(domain, board)] => Some(Arc::new(flux_capabilities::BoardLedger::new(
+            domain.clone(),
+            Arc::clone(board),
+        ))),
+        _ => None,
+    };
+    try_register_fleet(&mut integration_registry, ledger)?;
     let approver: Arc<dyn Approver> = if auto_approve {
         Arc::new(AllowApprover)
     } else {

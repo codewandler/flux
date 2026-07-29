@@ -186,9 +186,9 @@ pub(super) async fn build_doc_index(
 const BOARD_KIND_PREFIX: &str = "board:";
 
 /// The board backends bindable from a `datasource` declaration today, for the error message that
-/// names them. `MemoryBoard` is the offline backend A-113 shipped with the port; the file- and
-/// issue-tracker-backed ones arrive with their own stories.
-const BOARD_BACKENDS: &str = "memory";
+/// names them. `MemoryBoard` is the offline backend A-113 shipped with the port; `MarkdownBoard`
+/// (A-114) is the file-backed one; the issue-tracker-backed ones arrive with their own stories.
+const BOARD_BACKENDS: &str = "markdown | memory";
 
 /// What a Program's `datasource` declarations resolve to: one shared knowledge backend, plus the
 /// work boards declared alongside it.
@@ -207,12 +207,29 @@ pub(super) struct ProgramDatasources {
 /// An unrecognized backend names itself and the ones that exist. It is deliberately NOT tolerant:
 /// falling back to the knowledge ingester here would reintroduce exactly the silent, wrong behaviour
 /// [`BOARD_KIND_PREFIX`] exists to prevent.
-fn build_work_board(name: &str, backend: &str) -> Result<Arc<dyn flux_capabilities::WorkBoard>> {
+///
+/// `root` is the already-resolved, program-relative directory the file-backed backends live under;
+/// `memory` ignores it. `MarkdownBoard` is built with
+/// [`rooted_in`](flux_capabilities::MarkdownBoard::rooted_in) rather than `new`, so the board
+/// **inherits the session's guarded `System`** instead of minting a fresh `Workspace` at an
+/// arbitrary root — a board is a write surface, so it must not be able to widen the sandbox it was
+/// handed.
+fn build_work_board(
+    name: &str,
+    backend: &str,
+    root: &str,
+    system: &System,
+) -> Result<Arc<dyn flux_capabilities::WorkBoard>> {
     match backend {
         "memory" => Ok(Arc::new(flux_capabilities::MemoryBoard::new())),
+        "markdown" => Ok(Arc::new(
+            flux_capabilities::MarkdownBoard::rooted_in(system, root).map_err(|e| {
+                anyhow::anyhow!("datasource `{name}` (board:markdown) at `{root}`: {e}")
+            })?,
+        )),
         "" => Err(anyhow::anyhow!(
             "datasource `{name}` declares a board but names no backend — write \
-             `kind = \"{BOARD_KIND_PREFIX}memory\"` (available: {BOARD_BACKENDS})"
+             `kind = \"{BOARD_KIND_PREFIX}markdown\"` (available: {BOARD_BACKENDS})"
         )),
         other => Err(anyhow::anyhow!(
             "datasource `{name}`: unknown board backend `{other}` (available: {BOARD_BACKENDS})"
@@ -254,7 +271,13 @@ pub(super) async fn build_datasources(
             // unknown-kind one.
             kind if kind == "board" || kind.starts_with(BOARD_KIND_PREFIX) => {
                 let backend = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("").trim();
-                boards.push((d.name.clone(), build_work_board(&d.name, backend)?));
+                // A board's `path` is program-relative exactly like a knowledge datasource's, so
+                // `path "./board"` means "beside the .flux file" whatever the launch cwd is.
+                let root = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
+                boards.push((
+                    d.name.clone(),
+                    build_work_board(&d.name, backend, &root, system)?,
+                ));
             }
             "markdown" => {
                 let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
@@ -1077,13 +1100,24 @@ fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
 /// that does not exist yet, and inventing an env var for it here would add public surface this
 /// story does not own. A worker behind `flux serve`'s required auth is therefore not yet reachable;
 /// an unauthenticated one is.
-pub(super) fn try_register_fleet(registry: &mut ToolRegistry) -> Result<()> {
+pub(super) fn try_register_fleet(
+    registry: &mut ToolRegistry,
+    ledger: Option<Arc<dyn flux_runtime::DispatchLedger>>,
+) -> Result<()> {
     let private_net = fleet_private_net();
+    let dispatch = flux_orchestrate::FleetDispatchTool::new(private_net.clone(), None);
+    // With a ledger, `fleet.dispatch` records `runner` + `task_id` onto the board item it was given,
+    // which is what makes design §5's "the board IS the run registry" true rather than aspirational
+    // — and it is why crash recovery can be "restart, sweep, re-derive" with no second store.
+    // Without one, the op refuses any call that names an `item` rather than dispatching work that
+    // nothing could later sweep. Dispatch with no `item` stays legal either way, so a Program that
+    // declares no board is unaffected.
+    let dispatch = match ledger {
+        Some(ledger) => dispatch.with_ledger(ledger),
+        None => dispatch,
+    };
     let tools: Vec<Arc<dyn flux_runtime::Tool>> = vec![
-        Arc::new(flux_orchestrate::FleetDispatchTool::new(
-            private_net.clone(),
-            None,
-        )),
+        Arc::new(dispatch),
         Arc::new(flux_orchestrate::FleetStatusTool::new(
             private_net.clone(),
             None,
@@ -1154,7 +1188,12 @@ pub(super) fn register_tool_packs(
     // Outbound A2A dispatch to remote flux workers (A-116, wired by A-131). Unconditional: the
     // worker endpoint is a per-call argument, not configuration, so there is nothing to switch on —
     // and the ops carry no authority of their own beyond the egress guard they each run first.
-    try_register_fleet(registry)?;
+    //
+    // No ledger on this path: `register_tool_packs` builds the agent catalog, which has no Program
+    // and therefore no declared board to record a dispatch onto. Naming an `item` here refuses
+    // rather than dispatching untrackable work; the `flux app run` path wires the ledger from the
+    // Program's own board.
+    try_register_fleet(registry, None)?;
     // Eval / self-improvement ops (the ones the improve flows orchestrate).
     flux_eval::try_register_eval_ops(registry)?;
     // Authored-loop stages are registered for `agent-loop.flux` but tagged to the never-surfaced
@@ -2336,7 +2375,7 @@ mod fleet_and_board_wiring {
     #[test]
     fn registration_preserves_the_fleet_egress_posture() {
         let mut registry = ToolRegistry::new();
-        try_register_fleet(&mut registry).expect("the fleet ops register");
+        try_register_fleet(&mut registry, None).expect("the fleet ops register");
 
         let dispatch = registry.get("fleet.dispatch").expect("fleet.dispatch");
         assert_eq!(
@@ -2388,5 +2427,118 @@ mod fleet_and_board_wiring {
             );
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `board:markdown` must bind the **durable** backend (A-114), not fall back to the in-process
+    /// one. Failing-first before `build_work_board` gained its `markdown` arm: the declaration was an
+    /// "unknown board backend" error, so no durable board could be named from a Program at all — and
+    /// without one, the design's "restart, sweep, re-derive" claim is untestable, because
+    /// `MemoryBoard`'s storage *is* the process it is supposed to survive.
+    ///
+    /// Durability is asserted the only way that actually proves it: write through the bound board,
+    /// then read the bytes back off the filesystem.
+    #[tokio::test]
+    async fn a_markdown_board_binds_a_durable_backend_rooted_under_the_program() {
+        let root = temp_root("markdown-board");
+        let board_dir = root.join("board");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        let system = System::new(Workspace::new(&root).unwrap());
+
+        let mut decls = decl("board", "board:markdown");
+        decls[0].path = Some("./board".into());
+        let bound = build_datasources(&decls, &root, &system)
+            .await
+            .expect("`board:markdown` must bind a durable board");
+        assert_eq!(bound.boards.len(), 1, "one declared board binds one board");
+
+        let (domain, board) = &bound.boards[0];
+        assert_eq!(domain, "board");
+
+        // The board is program-relative and rooted under the declared `path`, so a write lands
+        // beside the .flux file rather than wherever the process happened to be launched.
+        let ctx =
+            flux_runtime::ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap())));
+        let item = board
+            .create(
+                &ctx,
+                flux_datasource::board::ItemDraft {
+                    title: "durable across a restart".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the board accepts a create");
+
+        let on_disk = std::fs::read_dir(board_dir.join("items"))
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert!(
+            on_disk > 0,
+            "a durable board must leave the item on disk under the program-relative root; \
+             `board:memory` would leave nothing and the recovery story would be unprovable"
+        );
+        assert!(!item.id.is_empty(), "the created item has an id");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The ledger must actually reach `fleet.dispatch`, because that is what makes design §5's "the
+    /// board IS the run registry" true. Failing-first before this story wired one:
+    /// `try_register_fleet` took no ledger, so the op was always built with `None` and *refused* any
+    /// call naming an `item` — "refusing to dispatch work nothing could sweep". The write path
+    /// existed and production could not take it.
+    ///
+    /// Asserted on the declared surface rather than on registration succeeding, because a
+    /// registration-only check passes with no ledger attached at all.
+    #[test]
+    fn a_wired_ledger_makes_fleet_dispatch_declare_the_write_it_performs() {
+        fn dispatch_spec(registry: &ToolRegistry) -> flux_spec::ToolSpec {
+            registry
+                .get("fleet.dispatch")
+                .expect("fleet.dispatch is registered")
+                .spec()
+        }
+
+        let mut without = ToolRegistry::new();
+        try_register_fleet(&mut without, None).expect("registers with no ledger");
+        assert!(
+            !dispatch_spec(&without)
+                .effects
+                .contains(&flux_spec::Effect::Write),
+            "with no ledger the op records nothing, so it must not claim a write"
+        );
+
+        let board: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let ledger: Arc<dyn flux_runtime::DispatchLedger> =
+            Arc::new(flux_capabilities::BoardLedger::new("board", board));
+        let mut with = ToolRegistry::new();
+        try_register_fleet(&mut with, Some(ledger)).expect("registers with a ledger");
+        assert!(
+            dispatch_spec(&with)
+                .effects
+                .contains(&flux_spec::Effect::Write),
+            "a wired ledger means the op genuinely writes the board, so it must declare it — \
+             otherwise the write escapes the gate that reads the declaration"
+        );
+
+        // And the item it would write is named concretely, so a grant scoped to one item cannot be
+        // widened into another. Never `*`, never empty.
+        let subjects = with
+            .get("fleet.dispatch")
+            .expect("registered")
+            .permission_subjects(&serde_json::json!({
+                "worker": "https://worker-1.internal:8787",
+                "task": "do the thing",
+                "item": "item-0001",
+            }));
+        assert!(
+            subjects.iter().any(|s| s == "board/item/item-0001"),
+            "the board item must be a concrete subject, got: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s == "*" || s.is_empty()),
+            "no subject may be a wildcard or empty, got: {subjects:?}"
+        );
     }
 }

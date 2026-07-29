@@ -201,20 +201,33 @@ A program declares one the same way it declares knowledge, with a `board:` kind:
 
 ```flux
 datasource board
-  kind "board:memory"
+  kind "board:markdown"
+  path "./board"
 ```
 
 The declaration's **name** becomes the operation prefix, so this one generates `board.list`,
-`board.get`, `board.create`, `board.transition`, `board.claim`, and `board.comment`. Board kinds live
-in their own `board:` namespace on purpose: `markdown` already means *a directory of docs to index*,
-so a board that happens to be backed by markdown files needs a name that cannot be confused with it.
-A knowledge kind is never promoted to a board, a board kind is never ingested as knowledge, and a
-`board:` kind naming a backend that does not exist is an error rather than a fall-through.
+`board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`, and
+`board.record_dispatch`. Board kinds live in their own `board:` namespace on purpose: `markdown`
+already means *a directory of docs to index*, so a board that happens to be backed by markdown files
+needs a name that cannot be confused with it. A knowledge kind is never promoted to a board, a board
+kind is never ingested as knowledge, and a `board:` kind naming a backend that does not exist is an
+error rather than a fall-through.
 
-`board:memory` is the in-process backend, useful for a single run and for tests. Durable backends
-land with their own stories.
+Two backends exist today:
 
-The four mutating operations are gated like any other write: each reports a concrete
+| Kind | Storage | Use |
+|---|---|---|
+| `board:markdown` | one markdown file per item under `path`, with a derived index | durable — survives a restart, so a coordinator can re-derive its runs |
+| `board:memory` | in-process | a single run, and tests |
+
+`path` is resolved relative to the **program file's** directory, exactly like a knowledge
+datasource's, and the board inherits the session's guarded filesystem root rather than opening one of
+its own.
+
+`board:memory` cannot outlive the process that created it, so a Program relying on crash recovery
+wants `board:markdown`.
+
+The five mutating operations are gated like any other write: each reports a concrete
 `<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant
 scoped to one item can never move another. `transition` validates the edge against the state machine
 *before* writing, so an illegal move is a clean error and leaves the item byte-identical.

@@ -2,7 +2,7 @@
 id: A-131
 title: "Wire the fleet into a running flux — register the fleet.* ops and bind a WorkBoard from config"
 pillar: Agent
-status: ready
+status: done
 priority: 28
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
@@ -26,13 +26,13 @@ So a `.flux` Program cannot call a fleet op, and cannot declare the board it wou
 both gaps — this is the wiring that turns two merged stories into a usable feature.
 
 ## Acceptance
-- [ ] The `fleet.*` ops are registered into the production catalog so a Program can call them.
+- [x] The `fleet.*` ops are registered into the production catalog so a Program can call them.
       **Failing-first test**: assert the registry resolves `fleet.dispatch` — it does not today.
 - [x] Registration follows the existing pack conventions: the op group in `groups.rs`, the
       `builtins_register` expected-name list, **and both op references** (`crates/flux-flow/docs/
       ops-reference.md` *and* `website/docs/language/ops.md` — a registered public op missing from
       either reds `operations_reference_covers_the_registered_public_catalog`).
-- [ ] Each registered op's `ToolSpec` is coherent under `flux_spec::metadata_violations`, including
+- [x] Each registered op's `ToolSpec` is coherent under `flux_spec::metadata_violations`, including
       `semantic_effects` (C-210). Do **not** regress A-116's egress posture: the `worker` endpoint is
       caller-supplied and therefore model-reachable, so it resolves through `guard_url_scoped` before
       any request and `permission_subjects` reports the worker's origin — never `*`, and empty when
@@ -43,9 +43,44 @@ both gaps — this is the wiring that turns two merged stories into a usable fea
 - [x] The failure mode that exists today is closed: `kind = "markdown"` currently builds a *knowledge*
       datasource, so a user pointing it at a board would get silent, wrong behaviour rather than an
       error. Whatever naming is chosen, the wrong kind must fail loudly.
-- [ ] Standard gate green in both workspaces.
+- [x] Standard gate green in both workspaces.
 
 ## Progress
+- 2026-07-29 — completed. Four decisions worth recording, all made at rework after an independent
+  hollowness audit found the first cut wired the ops but not the feature:
+  - **The dispatch ledger is wired, and only when exactly one board is declared.** Without a ledger
+    `fleet.dispatch` *refuses* any call naming an `item` ("refusing to dispatch work nothing could
+    sweep"), so the first cut left design §5's "the board IS the run registry" false in a running
+    flux. `try_register_work_board` consumes the `Arc`, so a handle is now retained per board to
+    build a `BoardLedger` from. It is scoped to the single-board case deliberately:
+    `fleet.dispatch` takes an item id but no board name, so with several boards an id is genuinely
+    ambiguous and a silent write onto the wrong board is worse than a refusal. Zero boards and
+    several boards both still dispatch normally; only item-naming calls refuse.
+  - **`board:markdown` binds A-114's durable backend**, resolved program-relative like a knowledge
+    datasource and built with `rooted_in` so the board inherits the session's guarded `System`
+    instead of minting a `Workspace` at an arbitrary root — a board is a write surface, so it must
+    not widen the sandbox it was handed. Until this, the only bindable backend was `board:memory`,
+    whose storage *is* the process it is supposed to survive, which made the design's
+    "restart, sweep, re-derive" claim untestable.
+  - **The `fleet` group stays force-on, now with the argument A-116 asked for.** A board's ambient
+    signal is its declaration name, so it is per-Program and no stable predicate could name it;
+    `when("fleet")` would be a predicate nothing emits, recreating the unreachability this story
+    closes. Force-on is acceptable because advertising is not authority: private addresses are
+    refused by default, every call re-resolves its endpoint through `guard_url_scoped`, and the
+    permission subject is the worker's *origin*, so a new worker cannot match an existing grant and
+    routes to approval. The cost is catalog size, not reachable authority.
+  - **The 6 -> 7 board op drift is fixed.** A-130 added `record_dispatch`; the op references still
+    enumerated six. `operations_reference_covers_the_registered_public_catalog` cannot catch this
+    because board ops are not in the registry that test builds, so it was fixed by reading.
+- Gate on the branch: 3074 passed / 0 failed, clippy clean, fmt clean in both workspaces,
+  codegate 13/13, check-crate-versions PASS.
+- Failing-first proven mechanically, not asserted: the ledger test was re-run with the ledger
+  ignored (`let _ = ledger`) and failed on "a wired ledger means the op genuinely writes the board,
+  so it must declare it"; the source was then restored byte-identical.
+- Known residue, filed rather than silently carried: boards are registered only on the
+  `flux app run` path, so `flux run` offers `fleet.*` but no boards; and the `WorkBoardSurface`'s
+  group and ambient signal are still discarded (harmless only because flux-app sets no groups, so
+  everything is advertised). See A-134 and C-234.
 - 2026-07-29 — filed from A-117's blocked report; both halves independently re-verified against the
   tree before filing (the missing construction sites and the two known kinds).
 - 2026-07-29 — **board half done, fleet half blocked on an A-116 defect in another story's crate.**

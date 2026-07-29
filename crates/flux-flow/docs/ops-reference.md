@@ -191,14 +191,18 @@ is no workspace signal that could gate them honestly. `.flux/groups.toml` can st
 the group. A worker behind `flux serve`'s required bearer token is not yet reachable — the token is
 operator configuration that does not exist yet.
 
-## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment`)
+## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch`)
 
 A `WorkBoard` (A-113) is the write-capable sibling of a live datasource: a typed item state machine
 behind a swappable backend. A program binds one with a `board:<backend>` datasource declaration
-(A-131) and the host generates six operations under the declaration's name — so `datasource board`
-yields `board.list` … `board.comment`. Four of them write, and each reports a concrete
+(A-131) and the host generates seven operations under the declaration's name — so `datasource board`
+yields `board.list` … `board.record_dispatch`. Five of them write, and each reports a concrete
 `<domain>/item/<id>` permission subject (`<domain>/item/new` for `create`); `transition` validates
-the edge before writing, so an illegal edge errors and performs no write. See
+the edge before writing, so an illegal edge errors and performs no write. `record_dispatch` (A-130)
+binds an item to the worker running it — the `runner` address and the worker-minted `task_id` — which
+is what makes the board a run registry rather than only a task list; it writes those two fields and
+nothing else, so `transition` stays the single entry point into the state machine.
+Backends: `board:markdown` (durable, file-per-item) and `board:memory` (in-process). See
 [`fleet-coordinator.md`](../../../docs/designs/fleet-coordinator.md).
 
 ## Orchestration ops (the `flux-app` host only)
