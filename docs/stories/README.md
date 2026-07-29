@@ -87,6 +87,12 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 ### Typed session log — session-shape validity by construction
 - [C-211 — Validate the parent history before minting the fork's child session, and test the CLI refusal](C-211-fork-validates-before-minting-child.md) · Core · SURFACED BY the A-102 review — the refusal path is new, and both fork sites create the child before they know the parent is forkable; the CLI's copy of the logic has no test at all
 
+### Unattended run integrity — surviving provider transport failure, and being honest when you don't
+- [C-229 — Unattended run integrity — survive provider transport failure, and be honest when you don't (epic)](C-229-unattended-run-integrity-epic.md) · Core · three separately-filed stories are one failure at three depths — a provider bug, no resume, and no way to tell a dead turn from a live one; C-228 must be DIAGNOSED before C-227 is designed, or the retry masks a deterministic codec bug as a flaky network
+- [C-226 — A failed turn is indistinguishable from a successful one to every machine consumer](C-226-failed-turn-is-indistinguishable-from-a-successful-one.md) · Core · detect_intent/explore convert a provider Err into an Ok value tagged kind=error (loop_host.rs:563-586) — so a turn that never ran exits 0, emits no NDJSON `error` line, and reports the failure as prose inside `turn_end.answer`
+- [C-228 — Gemini 3.x over OpenRouter drops the stream mid-exploration, reproducibly](C-228-gemini-3x-over-openrouter-drops-the-stream-mid-exploration.md) · Core · gemini-3.6-flash and gemini-3.5-flash both die with `stream closed before completion` during exploration at 12-21k ctx; gemini-2.5-flash (no reasoning stream) survives the same workload — points at reasoning-delta handling on the Messages path, not at OpenRouter generally
+- [C-227 — A dropped provider stream ends the whole turn — no automatic resume for a transport-class failure](C-227-no-automatic-resume-on-transport-class-provider-failure.md) · Core · `stream closed before completion` mid-exploration kills a 34-step run outright; flux has `--continue` but nothing retries, so long headless runs are a coin flip on provider transport
+
 ## Blocked
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
 

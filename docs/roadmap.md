@@ -85,6 +85,37 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
+
+Three stories filed separately turned out to be one failure at three depths, and grouping them said
+something none of them said alone. **C-228** is the symptom: `openrouter/google/gemini-3.x` dies with
+`stream closed before completion`, reproducibly, part-way through exploration at 12–21k ctx — short
+turns survive, which is why no smoke test catches it. **C-227** is the missing capability: a closed
+socket is not a decision the agent made, yet it ends the turn outright, so a run that has executed
+dozens of ops and written real files loses the rest of its work to one dropped TCP stream. **C-226**
+is why nobody has quantified any of it: that dead turn exits **0**, emits no NDJSON `error` line, and
+reports the failure as prose inside `turn_end.answer` — `loop_host.rs` literally converts
+`Err(error)` into `Ok(json!({"kind": "error", …}))`, at two sites. So flux is not currently safe to
+run unattended against a real provider for a long task, and the failures are invisible to exactly the
+automated consumers — CI, editor extensions, a coordinator fanning work to sub-agents — that would
+have counted them. The load-bearing decision is an **ordering** one: **C-228 must be diagnosed before
+C-227's retry is designed.** If the stream close is a genuine transport event, bounded retry is the
+right fix; if flux's own Messages-path codec ends the stream on an unhandled reasoning envelope, then
+retrying re-runs a *deterministic* bug — every attempt failing identically at the same context depth,
+burning budget and real money, and converting a reproducible defect into what looks like a flaky
+network, which is strictly worse than today's honest hard failure. The evidence leans that way
+already: `gemini-2.5-flash`, which has **no reasoning stream**, survives the workload that kills
+3.5 and 3.6, and a vendor-wide transport problem would not discriminate on whether a model emits
+reasoning deltas. There is even an invariant to judge it against — A-33…A-37 established that codecs
+*skip and count* an unparseable envelope via `Chunk::StreamDiagnostic` rather than `?`-propagating, so
+a hard `api_error` that kills a turn is the exact shape that rule exists to prevent, and C-228 would
+be an **invariant regression rather than a feature request**. Sequenced C-226 ∥ C-228 (file-disjoint:
+`flux-flow`/`flux-cli` vs `flux-providers`), then C-227, which needs C-226's typed outcome before its
+own "visible, never silent" retry telemetry has anywhere to go. Done looks like a long run that either
+completes with a bounded, visible, *accounted* retry, or exits non-zero with an outcome a subprocess
+driver can branch on without parsing prose. Design:
+[designs/unattended-run-integrity.md](designs/unattended-run-integrity.md).
+
 ### The agent-authored surface — panes the model opens, config it can safely change (epic) — 🔄 **DESIGNED (C-219; C-220…C-225 filed, none started)**
 
 The ask was "tools to directly modify the harness, the UI … so it would be completely free". Reading
