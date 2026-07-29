@@ -45,6 +45,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
 
 ## Next (ready — take the top one unless the user named a story)
+- [C-209 — flux-system tests build fixtures under a transient TMPDIR, reddening the gate at random](C-209-flux-system-test-tmpdir-race.md) · Core · temp_workspace() reads temp_dir() under sandbox::EnvGuard for a documented reason; ~15 other tests call it bare, so a concurrent sandbox test's transient TMPDIR becomes their fixture root and it vanishes underneath them
 
 ### Security assurance — close the gap between the envelope and its proof
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
