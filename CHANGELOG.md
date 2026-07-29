@@ -30,7 +30,37 @@ All notable changes to this project are documented in this file. The format is b
   will rest on. A session with no panes renders cell for cell as it did before, pinned by every
   pre-existing TUI layout test passing unchanged.
 
+- **The board is the run registry (A-130).** ⚠ **Breaking for out-of-tree `WorkBoard` implementors.**
+  The fleet design claims run state needs no second store, because `fleet.dispatch` writes the
+  worker's address and `task_id` back onto the board `Item` — so crash recovery is "restart, sweep,
+  re-derive". That write path did not exist, which made the recovery story a claim rather than a
+  property. `WorkBoard` now carries a **required** `record_dispatch` method — a seventh generated
+  operation rather than an extension of `claim`, deliberately: the `task_id` does not exist until the
+  worker answers the send, so folding it into `claim` would buy no atomicity for the only window that
+  matters, and would make `claim`'s conditional idempotency incoherent ("same assignee, different
+  task id" has no answer). It is required and has no default body on purpose — a backend that
+  silently declined to record would look healthy right up until a restart recovered nothing. The
+  write is durable, replacing rather than appending (a stale `task_id` would send the sweep after a
+  run that no longer exists), and explicitly *not* a state change: `transition` stays the single
+  entry point into the state machine, because a second one could not be edge-checked. Layering is
+  held by a new `DispatchLedger` seam at L2, so the L3 fleet op never names the L5 board port; the
+  two halves join only at L6.
+
 ### Fixed
+
+- **`fleet.dispatch` could never be registered at all (A-116, found via A-130/A-131).** It declared
+  `Effect::Process` without `AccessKind::Process`, a combination the runtime rejects — so the op was
+  unregistrable in any `ToolRegistry`, and being unregistrable *was* the unreachability the fleet
+  wiring set out to close. It survived because A-116's tests only ever called `.spec()` and
+  `.execute()` on freshly constructed tools, so the registration path that validates authority
+  contracts never ran against them; that gap is now closed by a test which registers the fleet ops
+  for real and asserts the exact requirement vector, not merely that registration succeeds. Authority
+  is derived from a **discriminated** subject split: the worker's origin earns the network and
+  provider requirements, and the board item earns `datasource_write` — so the operator is never asked
+  to approve network access to a board item, and the single grant covers both routes to the same
+  write. An endpoint that cannot be named now yields a conservative wildcard requirement rather than
+  an empty one, since an empty list would have meant the op demanded nothing. `fleet.status` and
+  `fleet.cancel` were checked against the same validator and were already sound.
 
 - **Delivery concurrency is bounded again (A-129).** A-112 made `App::deliver` concurrent by
   spawning each dequeued delivery into a `JoinSet` — which was the point of that story, but it also

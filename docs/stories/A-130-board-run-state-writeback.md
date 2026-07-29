@@ -2,7 +2,7 @@
 id: A-130
 title: Board write-back of runner and task_id — make "the board is the run registry" true
 pillar: Agent
-status: in-progress
+status: done
 priority: 33
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
