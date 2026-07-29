@@ -2,7 +2,7 @@
 //!
 //! - `file_stat`    — file metadata (size, line count, mtime, mode). Risk: Low.
 //! - `path_exists`  — pure filesystem probe. Risk: Low.
-//! - `sqlite_query` — read-only SQLite query (no INSERT/UPDATE/DELETE/DROP/ALTER). Risk: Low.
+//! - `sqlite_query` — read-only SQLite query; statement-type allowlist (SELECT/WITH/PRAGMA/EXPLAIN). Risk: Low.
 //! - `home_dir`     — the user's home directory. Risk: Low.
 //! - `now`          — current wall-clock time (unix seconds + UTC). Replaces `date`. Risk: Low.
 //! - `cwd`          — the workspace root path. Replaces `pwd`. Risk: Low.
@@ -196,25 +196,83 @@ pub struct SqliteQueryTool;
 struct SqliteQueryInput {
     /// Path to the SQLite database file.
     db: String,
-    /// SELECT or PRAGMA statement to execute.
+    /// SQL to execute. Must begin with SELECT, WITH, PRAGMA, or EXPLAIN (read-only allowlist).
     sql: String,
     /// Max rows to return (default 200).
     #[serde(default)]
     limit: Option<u64>,
 }
 
-/// Reject any SQL that looks like a write operation.
-fn is_write_sql(sql: &str) -> bool {
-    let upper = sql.trim_start().to_ascii_uppercase();
-    for kw in &[
-        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE", "ATTACH",
-        "DETACH",
-    ] {
-        if upper.starts_with(kw) {
-            return true;
+/// The statement types `sqlite_query` admits — an **allowlist**, not a denylist (C-193). The first
+/// meaningful token of the SQL (after leading whitespace and SQL comments are stripped exactly as
+/// SQLite's tokenizer skips them, see [`leading_statement_keyword`]) must be one of these, or the
+/// statement is refused. Everything else — `VACUUM`, `ATTACH`, `INSERT`, … — is refused *as a
+/// consequence of not being on the list*, not as a special-cased keyword. In particular this is how
+/// `VACUUM INTO` (C-192) is closed: it can no longer reach the connection to create a file outside
+/// guarded IO.
+///
+/// Why exactly these four:
+/// - `SELECT`  — the primary read path.
+/// - `WITH`    — common-table-expression reads (`WITH … SELECT`). `WITH` can also front DML
+///   (`WITH … DELETE`), but such a write is still blocked by `SQLITE_OPEN_READ_ONLY`, and `WITH`
+///   cannot express `VACUUM INTO`, so admitting it does not reopen the escape C-192 closes.
+/// - `PRAGMA`  — schema/introspection pragmas (`PRAGMA table_info(…)`). A side-effecting pragma is
+///   contained by the read-only connection and cannot write to an arbitrary path.
+/// - `EXPLAIN` — `EXPLAIN [QUERY PLAN] <stmt>` returns the compiled program and never *executes* the
+///   inner statement, so even `EXPLAIN VACUUM INTO …` is inert.
+const ALLOWED_STATEMENT_KEYWORDS: [&str; 4] = ["SELECT", "WITH", "PRAGMA", "EXPLAIN"];
+
+/// Return the leading statement keyword of `sql` — its first meaningful token, uppercased — after
+/// stripping leading whitespace and SQL comments (`-- …` line comments and `/* … */` block comments,
+/// including an unterminated block comment that runs to end of input) exactly as SQLite's tokenizer
+/// skips them. Returns `None` when the input is only whitespace/comments or does not begin with an
+/// identifier token.
+///
+/// This is what makes the allowlist see the statement *as SQLite will parse it*: a leading `/* … */`
+/// or `-- …`, arbitrary whitespace, and letter case can no longer separate the admission check from
+/// what the connection actually executes.
+fn leading_statement_keyword(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
+        // `-- …` line comment: to end of line, or end of input.
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // `/* … */` block comment. SQLite accepts an unterminated one, running to end of input.
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        break;
     }
-    false
+    // The leading identifier token: a run of ASCII alphanumerics / underscores.
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(sql[start..i].to_ascii_uppercase())
+}
+
+/// True when `sql`'s leading statement type is on the read-only allowlist
+/// ([`ALLOWED_STATEMENT_KEYWORDS`]).
+fn is_allowed_sql(sql: &str) -> bool {
+    leading_statement_keyword(sql)
+        .is_some_and(|kw| ALLOWED_STATEMENT_KEYWORDS.contains(&kw.as_str()))
 }
 
 /// Expand a leading `~` / `~/` to `$HOME`. Any other form is returned unchanged.
@@ -267,11 +325,13 @@ impl Tool for SqliteQueryTool {
         ToolSpec {
             name: "sqlite_query".into(),
             description: "Execute a read-only SQL query against a SQLite database file. \
-                          Only SELECT and PRAGMA statements are allowed — write operations \
-                          (INSERT, UPDATE, DELETE, DROP, ALTER, …) are refused. \
-                          Returns rows as a JSON array. `db` must be a database inside the \
-                          workspace or under ~/.flux (e.g. ~/.flux/sessions.db); other on-disk \
-                          databases are refused."
+                          Admission is an allowlist over the statement type: the statement must \
+                          begin with SELECT, WITH, PRAGMA, or EXPLAIN (a leading comment or \
+                          whitespace is stripped first, so it cannot cloak the statement); \
+                          anything else — VACUUM, ATTACH, INSERT, UPDATE, DELETE, DROP, … — is \
+                          refused. Returns rows as a JSON array. `db` must be a database inside \
+                          the workspace or under ~/.flux (e.g. ~/.flux/sessions.db); other \
+                          on-disk databases are refused."
                 .into(),
             input_schema: tool_input_schema::<SqliteQueryInput>(),
             output_schema: None,
@@ -317,9 +377,14 @@ impl Tool for SqliteQueryTool {
             .ok_or_else(|| Error::Other("sqlite_query: required param `sql` missing".into()))?;
         let max_rows = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
 
-        if is_write_sql(sql) {
+        // Admission is an allowlist over the statement type (C-193), evaluated against the SQL as
+        // SQLite will parse it. This is also what closes VACUUM INTO (C-192): VACUUM is simply not on
+        // the list, so it never reaches the connection.
+        if !is_allowed_sql(sql) {
             return Ok(ToolResult::error(
-                "sqlite_query: only SELECT and PRAGMA are allowed; write operations are refused"
+                "sqlite_query: only SELECT / WITH / PRAGMA / EXPLAIN statements are admitted; the \
+                 leading statement type is not on the read-only allowlist (VACUUM, ATTACH, INSERT, \
+                 UPDATE, DELETE, DROP, … are refused, and a leading comment cannot cloak them)"
                     .to_string(),
             ));
         }
@@ -336,6 +401,15 @@ impl Tool for SqliteQueryTool {
         let sql = sql.to_string();
 
         // Open read-only and run the query on a blocking thread.
+        //
+        // DEVIATION from `docs/architecture.md`'s "all IO goes through flux-system" invariant: rusqlite
+        // opens this file descriptor directly, not through flux-system, so flux-system's confinement,
+        // symlink rejection and canonicalization do not cover it. The primitive is instead contained by
+        // three guards in this op: `jail_sqlite_path` above (the `db` path stays inside the workspace or
+        // under ~/.flux), `SQLITE_OPEN_READ_ONLY` (no write to the source), and the statement-type
+        // allowlist (only SELECT/WITH/PRAGMA/EXPLAIN reach `prepare`, which is what stops `VACUUM INTO`
+        // from creating a file at an arbitrary path — C-192). C-194 will add the mechanical no-direct-IO
+        // lint that flags this call site so the deviation cannot spread silently.
         let result =
             tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Map<String, Value>>> {
                 let conn = rusqlite::Connection::open_with_flags(
@@ -633,6 +707,155 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let c = ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap())));
         (dir, c)
+    }
+
+    /// Create a valid source SQLite database with a seeded table `t`, so that a `VACUUM INTO`
+    /// against it has real content to copy and an `INSERT INTO t …` is stopped only by the
+    /// read-only connection flag (not by a missing table).
+    fn make_source_db(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).expect("create source db");
+        conn.execute_batch("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (42);")
+            .expect("seed source db");
+    }
+
+    /// C-192: `sqlite_query` is declared `Effect::Read` / `Risk::Low` and authorized as a workspace
+    /// *read*. `VACUUM INTO '<absolute path>'` is read-only with respect to the *source* database, so
+    /// `SQLITE_OPEN_READ_ONLY` does not stop it — it creates a brand-new file at an arbitrary absolute
+    /// path entirely outside flux-system's guarded IO. Admission must refuse it; the proof is that the
+    /// target file is never created. Red before the allowlist lands (the file appears), green after.
+    #[tokio::test]
+    async fn sqlite_query_vacuum_into_cannot_escape_the_workspace() {
+        let (dir, c) = tool_ctx();
+        let src = dir.join("source.db");
+        make_source_db(&src);
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let escape =
+            std::env::temp_dir().join(format!("flux-vacuum-escape-{}-{n}.db", std::process::id()));
+        let _ = std::fs::remove_file(&escape);
+
+        let r = SqliteQueryTool
+            .execute(
+                &c,
+                json!({
+                    "db": "source.db",
+                    "sql": format!("VACUUM INTO '{}'", escape.display()),
+                }),
+            )
+            .await
+            .expect("an admission refusal is a clean tool result, not an Err");
+
+        let created = escape.exists();
+        let _ = std::fs::remove_file(&escape);
+        assert!(
+            !created,
+            "VACUUM INTO created a file outside guarded IO at {}",
+            escape.display()
+        );
+        assert!(r.is_error, "the VACUUM INTO must be refused: {}", r.content);
+    }
+
+    /// C-192 regression: even when the `VACUUM INTO` target is *inside* the workspace, it is still a
+    /// write performed outside flux-system by an op declaring only `Effect::Read`. The allowlist
+    /// refuses it for the same reason (VACUUM is not an admitted statement type), and the internal
+    /// target is never created.
+    #[tokio::test]
+    async fn sqlite_query_vacuum_into_inside_the_workspace_is_refused() {
+        let (dir, c) = tool_ctx();
+        let src = dir.join("source.db");
+        make_source_db(&src);
+        let target = dir.join("copy.db");
+        let _ = std::fs::remove_file(&target);
+
+        let r = SqliteQueryTool
+            .execute(
+                &c,
+                json!({"db": "source.db", "sql": format!("VACUUM INTO '{}'", target.display())}),
+            )
+            .await
+            .expect("a clean tool result");
+        assert!(
+            r.is_error,
+            "a workspace-internal VACUUM INTO is still a misdeclared write: {}",
+            r.content
+        );
+        assert!(
+            !target.exists(),
+            "the workspace-internal VACUUM target must not be created"
+        );
+    }
+
+    /// C-193: a leading `/* … */` comment defeats the old `trim_start()` prefix denylist — the check
+    /// saw `/*x*/`, not `INSERT`. The statement must be refused by flux's *own* admission (the
+    /// allowlist), not merely bounce off `SQLITE_OPEN_READ_ONLY`, so the refusal must carry flux's
+    /// admission message rather than SQLite's "readonly database" error. Red before, green after.
+    #[tokio::test]
+    async fn sqlite_query_refuses_a_comment_cloaked_write() {
+        let (dir, c) = tool_ctx();
+        let src = dir.join("t.db");
+        make_source_db(&src);
+        let r = SqliteQueryTool
+            .execute(
+                &c,
+                json!({"db": "t.db", "sql": "/*x*/ INSERT INTO t VALUES (1)"}),
+            )
+            .await
+            .expect("a clean tool result");
+        assert!(
+            r.is_error,
+            "the comment-cloaked write must be refused: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("allowlist") || r.content.contains("admitted"),
+            "the refusal is flux's admission check, not SQLite's read-only flag: {}",
+            r.content
+        );
+    }
+
+    /// C-193: the allowlist is applied to the statement *as SQLite parses it* — a leading block
+    /// comment, leading whitespace and lower-case cannot separate the check from execution. A
+    /// comment-cloaked, lower-case `select` is admitted and returns its row; a comment-cloaked,
+    /// lower-case `vacuum into` is refused and its target never appears.
+    #[tokio::test]
+    async fn sqlite_query_allowlist_reads_past_comments_and_case() {
+        let (dir, c) = tool_ctx();
+        let src = dir.join("t.db");
+        make_source_db(&src);
+
+        let ok = SqliteQueryTool
+            .execute(&c, json!({"db": "t.db", "sql": "  /*hi*/ select 1 as n"}))
+            .await
+            .expect("a clean tool result");
+        assert!(
+            !ok.is_error,
+            "a comment/lower-case SELECT is a read and must be admitted: {}",
+            ok.content
+        );
+        assert!(
+            ok.content.contains("\"n\":1"),
+            "the SELECT returned its row: {}",
+            ok.content
+        );
+
+        let escape = dir.join("cloaked.db");
+        let _ = std::fs::remove_file(&escape);
+        let bad = SqliteQueryTool
+            .execute(
+                &c,
+                json!({"db": "t.db", "sql": format!("/*c*/ vacuum into '{}'", escape.display())}),
+            )
+            .await
+            .expect("a clean tool result");
+        assert!(
+            bad.is_error,
+            "a comment/lower-case VACUUM must be refused: {}",
+            bad.content
+        );
+        assert!(
+            !escape.exists(),
+            "the comment-cloaked VACUUM target must not be created"
+        );
     }
 
     /// C-78: a database outside the workspace and outside `~/.flux` must be refused before it is
