@@ -30,6 +30,24 @@ All notable changes to this project are documented in this file. The format is b
   will rest on. A session with no panes renders cell for cell as it did before, pinned by every
   pre-existing TUI layout test passing unchanged.
 
+### Fixed
+
+- **Delivery concurrency is bounded again (A-129).** A-112 made `App::deliver` concurrent by
+  spawning each dequeued delivery into a `JoinSet` — which was the point of that story, but it also
+  removed the supervisor's `mpsc` capacity bound, and that bound was the **only** backpressure in
+  the system. A loop that dequeues instantly applies none, so a webhook storm could spawn a journey
+  per event without limit. This matters most for exactly the workload A-112 exists to enable: a
+  coordinator taking inbound webhooks while a sweep runs. Deliveries now acquire an admission slot
+  before the spawn — default **64**, configurable via `App::with_max_inflight_deliveries` or
+  `FLUX_MAX_INFLIGHT_DELIVERIES`. The bound holds work back rather than dropping it: everything
+  submitted still runs as slots free, and it does not reintroduce head-of-line blocking between
+  unrelated channels, so a slow sweep still cannot starve webhook intake. Backpressure is also
+  **observable** — `App::delivery_load` reports `DeliveryLoad { in_flight, waiting, limit }`, so a
+  delivery queued behind the bound is distinguishable from one merely running slowly, rather than
+  both looking like "slow". The slot is held by a `#[must_use]` guard that releases on drop, so a
+  delivery future cancelled mid-enqueue cannot leak a waiting count and strand the app in a
+  permanently "backpressured" state.
+
 ## [0.35.0] - 2026-07-29
 
 ### Fixed
