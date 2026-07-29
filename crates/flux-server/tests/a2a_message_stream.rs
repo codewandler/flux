@@ -25,7 +25,9 @@ async fn message_stream_emits_a_working_frame_then_a_final_completed_frame() {
         engine,
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
-    );
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
 
     let body = json!({
         "jsonrpc": "2.0",

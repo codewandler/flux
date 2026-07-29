@@ -145,7 +145,16 @@ impl Channel for A2aChannel {
              a2a: /a2a)",
             self.name
         );
-        let router = flux_server::router(self.engine.clone(), self.auth.clone(), self.card.clone());
+        // `router` enforces the unauthenticated-non-loopback refusal by construction (C-190), so the
+        // fail-fast check in `from_decl_and_app` is now a backstopped early error, not the only
+        // guard — both use the identical `addr.ip().is_loopback()` predicate.
+        let router = flux_server::router(
+            self.engine.clone(),
+            self.auth.clone(),
+            self.card.clone(),
+            self.addr,
+        )
+        .map_err(|e| anyhow::anyhow!("channel `{}`: {e}", self.name))?;
         axum::serve(listener, router)
             .with_graceful_shutdown(async move { cancel.cancelled().await })
             .await

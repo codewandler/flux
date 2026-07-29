@@ -88,7 +88,9 @@ async fn same_context_id_continues_the_session_with_memory() {
         engine,
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
-    );
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
 
     let (s1, r1) =
         support::post_json(app.clone(), "/a2a", send_body(Some("ctx-mem"), "one", 1)).await;
@@ -121,7 +123,9 @@ async fn different_or_absent_context_ids_stay_isolated() {
         engine,
         flux_server::ServerAuth::Open,
         flux_server::CardInfo::flux_coding(),
-    );
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
 
     let (_, a1) = support::post_json(app.clone(), "/a2a", send_body(Some("ctx-a"), "hi", 1)).await;
     let (_, b1) = support::post_json(app.clone(), "/a2a", send_body(Some("ctx-b"), "hi", 2)).await;

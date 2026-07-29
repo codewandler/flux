@@ -65,7 +65,13 @@ const EXTERNAL: &str = "https://agents.example.test";
 fn principal_app() -> (Router, Arc<FlowEngine>) {
     let engine = test_engine(Arc::new(ProseProvider));
     let auth = ServerAuth::Principal(PrincipalAuth::new(Arc::new(TestAuthenticator), EXTERNAL));
-    let app = flux_server::router(engine.clone(), auth, CardInfo::flux_coding());
+    let app = flux_server::router(
+        engine.clone(),
+        auth,
+        CardInfo::flux_coding(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
     (app, engine)
 }
 
@@ -426,7 +432,13 @@ async fn shared_secret_card_uses_configured_external_url() {
         Some("s3cr3t".into()),
         Some("https://trusted.example".into()),
     );
-    let app = flux_server::router(engine, auth, CardInfo::flux_coding());
+    let app = flux_server::router(
+        engine,
+        auth,
+        CardInfo::flux_coding(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
     let (status, _, body) = get_full(
         app,
         "/.well-known/agent-card.json",
