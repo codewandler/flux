@@ -9,7 +9,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod coherence;
 mod schema;
+pub use coherence::{is_consequence_bearing, metadata_violations};
 pub use schema::{empty_schema, object_schema, opt, req, Field, FieldType};
 
 /// Generate the provider-facing JSON Schema for a typed tool input.

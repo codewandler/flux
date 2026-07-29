@@ -315,6 +315,50 @@ impl PluginTool {
     }
 }
 
+/// Report every projected [`ToolSpec`] in `manifest` whose metadata contradicts itself (C-191).
+///
+/// A plugin's `effects` / `risk` / `idempotency` / `access` are authored outside this repo and are
+/// then trusted verbatim by every downstream gate — the gather path, the op cache, the risk
+/// approver, and the sentence a human reads at the approval prompt. Built-in ops are held to the
+/// same invariants by a build-time test over the registry (`flux-tools`'
+/// `toolspec_invariants.rs`); a plugin has no build of ours to run, so for plugin-supplied specs
+/// the only place the invariants can be applied is where the declaration enters — here, at load.
+///
+/// # Why this warns instead of refusing the plugin
+///
+/// The first cut of this check failed the whole manifest closed. Run against the plugins this repo
+/// actually ships, that dropped all 24 `kubernetes` ops off the agent surface over two mis-declared
+/// idempotency fields, and dropped an installed third-party plugin entirely over 51 operations that
+/// tag `delete`/`money` below `Risk::Destructive` — and it did so on a process that still exits 0,
+/// so the agent just quietly lost the capability.
+///
+/// Refusal is the wrong remedy for an under-declaration. It removes the operation rather than
+/// gating it, it lands as a breaking change on plugin authors who have had no window to correct
+/// their manifests, and it is *less* safe than loading loudly: an operator who loses `kubernetes`
+/// silently learns nothing, while one who is told which 51 operations under-declare destructiveness
+/// can act on it. The in-repo half of that population is fixed in this same change
+/// (`plugins/kubernetes`); the out-of-repo half needs a deprecation window before a hard cutover,
+/// and that cutover belongs to its own story.
+///
+/// Scope is [`visible_ops`] — the ops that actually become agent tools. An `internal: true` op
+/// never reaches a [`ToolRegistry`] and so never reaches the gates these invariants protect; the
+/// host dispatches it directly through the shared [`PluginHost`] handle.
+///
+/// Free function over the manifest so it is unit-testable without spawning a subprocess, like
+/// [`plugin_tool_spec`] and [`visible_ops`] beside it. The invariants and their allowlist live in
+/// [`flux_spec::coherence`].
+pub(super) fn op_coherence_warnings(manifest: &PluginManifest) -> Vec<String> {
+    let mut violations = Vec::new();
+    for op in visible_ops(manifest) {
+        let (_, spec) = plugin_tool_spec(&manifest.name, op, &manifest.capabilities);
+        violations.extend(flux_spec::metadata_violations(
+            &spec,
+            &semantic_effect_tags(&op.semantic_effects),
+        ));
+    }
+    violations
+}
+
 pub(super) fn plugin_tool_spec(
     plugin: &str,
     op: &OperationSpec,
@@ -590,6 +634,10 @@ pub struct LoadedPlugin {
     pub manifest: PluginManifest,
     /// The guarded host capabilities the plugin's ops run under (the output of `make_caps`).
     pub caps: Arc<dyn HostCapabilities>,
+    /// Metadata-coherence violations in this plugin's declarations (C-191), one sentence each, for
+    /// the caller to surface. Non-empty does **not** block the load — see
+    /// [`op_coherence_warnings`] for why an under-declaration is warned about rather than refused.
+    pub coherence_warnings: Vec<String>,
 }
 
 /// Spawn a plugin from its descriptor, fetch its manifest, and project every operation as a
@@ -613,6 +661,7 @@ pub async fn load_plugin_tools(
     let mut host = PluginHost::spawn_verified(system, name, descriptor).await?;
     let manifest = host.manifest().await?;
     validate_manifest_operations(&manifest).map_err(Error::Other)?;
+    let coherence_warnings = op_coherence_warnings(&manifest);
     let caps = make_caps(&manifest);
     let host = Arc::new(tokio::sync::Mutex::new(host));
     // Project only the non-`internal` ops as agent tools (C-09a). A host-only op (`internal: true`,
@@ -630,6 +679,7 @@ pub async fn load_plugin_tools(
         host,
         manifest,
         caps,
+        coherence_warnings,
     })
 }
 

@@ -213,6 +213,29 @@ pub(super) async fn assemble_integrations(
     for (plugin_name, loaded) in loaded_plugins {
         match loaded {
             Ok(loaded) => {
+                // C-191: the plugin still loads — an under-declared operation is gated by the rest
+                // of the envelope, and removing it would cost the capability without buying safety.
+                // But it is named, every run, so the mis-declaration is actionable rather than
+                // silent. Capped: one real plugin here declares 51 of these, and a wall of dim
+                // text on every startup is how a warning stops being read.
+                const SHOWN: usize = 3;
+                let warnings = &loaded.coherence_warnings;
+                if !warnings.is_empty() {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "(plugin `{plugin_name}`: {} operation(s) declare incoherent metadata \
+                             — they still load, but their approval tier understates them)",
+                            warnings.len()
+                        ))
+                    );
+                    for warning in warnings.iter().take(SHOWN) {
+                        eprintln!("{}", style::dim(&format!("  {warning}")));
+                    }
+                    if let Some(rest) = warnings.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+                        eprintln!("{}", style::dim(&format!("  … and {rest} more")));
+                    }
+                }
                 plugin_registry.register(
                     loaded.manifest.name.clone(),
                     flux_capabilities::ProviderEntry {

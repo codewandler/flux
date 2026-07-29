@@ -36,7 +36,7 @@ optional arguments are in `[brackets]`.
 | `write` | `path, content` | Medium | Write (create/overwrite) a file |
 | `edit` | `path, old_string, new_string[, replace_all]` | Medium | Replace a string in a file (must match exactly once unless `replace_all`); if the exact text isn't found, progressively looser matching is tried (trailing whitespace → indentation drift → first/last-line anchor) and the result reports which strategy matched |
 | `patch` | `path, edits` | Medium | Apply several line-anchored edits in one call; each edit is `{op, line, end_line?, text?}` where op is `insert_before`, `insert_after`, `replace_range`, or `delete_range`; ALL line numbers refer to the original file |
-| `append` | `path, content` | Low | Append to a file (creates it and parent dirs if absent); lower-risk than `write` |
+| `append` | `path, content` | Medium | Append to a file (creates it and parent dirs if absent); smaller blast radius than `write`, same approval tier |
 | `read_many` | `paths` | Low | Read several files at once (each section headed `==> path <==`); prefer single `read` when you need to embed a file's text into a later string |
 | `task` | `role, task` | Medium | Delegate to a sub-agent role |
 | `consult` | `question[, context, model]` | Low | Ask a DIFFERENT model for a second opinion — pure advice, no tools (only advertised once `[consult] model` is configured) |
@@ -69,7 +69,7 @@ optional arguments are in `[brackets]`.
 | `git_log` | `[limit]` | Low | Recent commits |
 | `git_push` | `[branch, remote]` | Medium | Push to remote |
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
-| `git_unstage` | `paths` | Low | Unstage files |
+| `git_unstage` | `paths` | Medium | Unstage files |
 | `git_worktree_enter` | | High | Move this context into an isolated temp git worktree (clean `main` only; generated `flux/worktree/*` branch) |
 | `git_worktree_leave` | | High | Merge the worktree back into `main` (`--no-ff`, trial-merge guarded), clean up, restore the original root |
 | `flow_list` | | Low | List reusable flows and composite ops under `.flux/flows` / `~/.flux/flows` (and the legacy `.flux/ops` / `@global_ops`) — each with its description and params |

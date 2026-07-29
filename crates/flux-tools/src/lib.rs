@@ -673,7 +673,11 @@ impl Tool for WriteTool {
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // C-191: overwriting a path with the same content converges, so repeating is safe —
+            // but the call really acts every time and its outcome depends on the file that is
+            // there, not on the input alone. `Conditional` says that; `Idempotent` would license
+            // a replay from cache in place of the write.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Filesystem],
             group: None,
         }
@@ -1563,7 +1567,11 @@ impl Tool for AppendTool {
             input_schema: tool_input_schema::<AppendInput>(),
             output_schema: None,
             effects: vec![Effect::Write, Effect::Filesystem],
-            risk: Risk::Low,
+            // C-191: `append` mutates a workspace file exactly as `write` does, and `Risk` is the
+            // approval tier, not a blast-radius rating — `Risk::Low` is what the risk approver
+            // auto-approves and what the plan prompt shows a human. "Lower-risk than `write`"
+            // (above) is true of the blast radius and was never true of the tier.
+            risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
             access: vec![AccessKind::Filesystem],
             group: None,
@@ -2025,7 +2033,10 @@ impl Tool for GitStageTool {
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
             risk: Risk::Medium,
-            idempotency: Idempotency::Idempotent,
+            // C-191: staging the same paths twice converges, so repeating is safe — but what lands
+            // in the index is whatever the working tree holds at call time, not a function of the
+            // input, so the result must never be replayed from a cache.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: None,
         }
@@ -2159,8 +2170,12 @@ impl Tool for GitStatusTool {
             input_schema: tool_input_schema::<GitStatusInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
+            // Stays `Low` on the strength of an explicit I1 allowlist entry in
+            // `flux_spec::coherence` — fixed argv, observation only (C-191).
             risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
+            // C-191: the answer is the working tree's, not the input's — it changes under the
+            // agent's own edits, so a cached replay would hand back a stale tree.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: None,
         }
@@ -2223,8 +2238,11 @@ impl Tool for GitDiffTool {
             input_schema: tool_input_schema::<GitDiffInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
+            // Stays `Low` on the strength of an explicit I1 allowlist entry in
+            // `flux_spec::coherence` — fixed argv, observation only (C-191).
             risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
+            // C-191: the diff tracks the working tree, not the input — see `git_status`.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: None,
         }
@@ -2296,8 +2314,11 @@ impl Tool for GitLogTool {
             input_schema: tool_input_schema::<GitLogInput>(),
             output_schema: None,
             effects: vec![Effect::Process],
+            // Stays `Low` on the strength of an explicit I1 allowlist entry in
+            // `flux_spec::coherence` — fixed argv, observation only (C-191).
             risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
+            // C-191: the log tracks the repository's commits, not the input — see `git_status`.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: None,
         }
@@ -2514,8 +2535,12 @@ impl Tool for GitUnstageTool {
             input_schema: tool_input_schema::<GitUnstageInput>(),
             output_schema: None,
             effects: vec![Effect::Process, Effect::LocalSystem],
-            risk: Risk::Low,
-            idempotency: Idempotency::Idempotent,
+            // C-191: `git restore --staged` mutates the index and runs a program — the same shape
+            // as its twin `git_stage`, which has always been `Medium`. `Low` here was drift, not a
+            // judgement that unstaging is cheaper than staging.
+            risk: Risk::Medium,
+            // C-191: converges on repeat, but what it removes depends on the index at call time.
+            idempotency: Idempotency::Conditional,
             access: vec![AccessKind::Process],
             group: None,
         }
