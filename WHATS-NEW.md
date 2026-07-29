@@ -15,6 +15,17 @@
 
 ## [Unreleased]
 
+### Improved
+
+- **flux now tells you when an integration understates what its operations do.** Every operation
+  declares how risky it is and whether it only reads — and that declaration is what decides whether
+  you get asked before it runs. Nothing checked those declarations against each other, so an
+  operation that quietly gained the ability to change something could keep a "harmless" label and
+  skip the approval it deserved. A dozen built-in operations had drifted that way and are corrected,
+  and the check now runs on every build so it cannot drift again. Integrations you install are
+  checked when they load: they still work, but flux names how many of their operations understate
+  themselves so you can weigh that when approving.
+
 ### Fixed
 
 - **Project guidance files in subfolders no longer load.** `.flux/context.d/` is documented as a flat

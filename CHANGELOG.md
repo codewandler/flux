@@ -6,6 +6,47 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Operation metadata is checked for coherence on every build, and plugin drift is reported at load
+  (C-191).** Approval gating is driven by each operation's self-declared `effects`, `risk`,
+  `idempotency` and `access`. Those declarations were trusted and never cross-checked, so an op that
+  started from `ToolSpec::read_only()` and later gained a mutating effect compiled, shipped, and
+  cleared a lower approval bar than it deserved. `flux_spec::coherence` now states three invariants
+  as prose before code — a risk floor (a consequence-bearing spec must not be `Risk::Low`), a
+  destructive floor (`delete`/`money` must be `Risk::Destructive`), and a repeatability floor (a
+  consequence-bearing spec must not claim `Idempotency::Idempotent`; `Conditional` is the sanctioned
+  "safely repeatable" annotation) — over a *consequence-bearing* classification that is the exact
+  negation of `flux-flow`'s `gather_safe`. The story's literal wording ("any non-`Read` effect must
+  not be `Risk::Low`") was deliberately not implemented: `Effect` mixes direction with carrier, so
+  `read` itself declares `[Read, Filesystem]` and the literal rule would condemn every file read in
+  the catalog.
+  Twelve built-in ops were mis-declared and are corrected: `append` and `git_unstage` sat at
+  `Risk::Low` while mutating, and `write`, `git_stage`, `git_status`, `git_diff`, `git_log`,
+  `cargo_{build,check,clippy,fmt}` and `go_{build,vet}` claimed `Idempotent` — the word that licenses
+  the op cache to replay a stored result *instead of executing*. Three exemptions
+  (`git_status`/`git_diff`/`git_log`, fixed argv, observation only) are explicit allowlist entries
+  scoped to one invariant, and an entry with no justification or an unknown invariant id now fails
+  the build. `crates/flux-flow/docs/ops-reference.md`'s risk column is pinned by a test that reads
+  the registry, since a doc contradicting the field this story is about is the same defect one layer
+  out.
+  Plugin-supplied specs are checked where they enter, at load. This **warns rather than refuses**:
+  the first cut failed the manifest closed, which dropped all 24 `kubernetes` ops over two fields and
+  an installed third-party plugin entirely over 51 — on a process that still exits 0, so the agent
+  silently lost the capability. Refusal removes an operation instead of gating it and lands as a
+  breaking change on authors with no correction window; an operator told which operations
+  under-declare can act on it. The in-repo half is fixed here
+  (`kubernetes.portforward.stop`/`deployment.scale`); a hard cutover needs a deprecation window and
+  its own story.
+  **Scope is honest and bounded:** the build-time gate covers `try_register_builtins`. Ops registered
+  by `flux-web`, `flux-cognition`, `flux-eval` and `flux-cli` are outside it — 11 known violations,
+  itemised with `file:line` in the story, including `improve_log` (`[Write, Filesystem]` at
+  `Risk::Low`), which is this story's own title case. A gate over the full production catalog has to
+  live in `flux-cli`, and closing it requires a product decision (8 of the 11 are `Network` without
+  `Read` at `Risk::Low`; adding `Read` makes them gather-safe, raising them to `Medium` puts a prompt
+  in front of every model call) — so it is tracked separately rather than resolved by loosening the
+  invariants to fit the catalog.
+
 ### Fixed
 
 - **Guidance-fragment discovery is flat, as its contract always claimed (C-206).**

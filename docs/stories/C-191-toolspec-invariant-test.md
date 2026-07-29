@@ -2,7 +2,7 @@
 id: C-191
 title: "Registry-wide ToolSpec invariant test — a mutating op must not keep a read-only risk class"
 pillar: Core
-status: in-progress
+status: done
 epic: security-assurance
 design: docs/designs/security-assurance.md
 note: "REVIEW — the policy engine is only as good as each op's self-declared metadata; ToolSpec::read_only() is a coherent preset but NOTHING asserts the combination stays coherent as an op gains effects"
