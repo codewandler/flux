@@ -5,7 +5,7 @@ pillar: Core
 priority: 6
 epic: security-assurance
 design: docs/designs/security-assurance.md
-status: in-progress
+status: done
 note: "REVIEW — a gap against flux's OWN published scope: SECURITY.md names --serve DoS as in-scope while flux-server/src/lib.rs mounts every router with no DefaultBodyLimit, TimeoutLayer or concurrency cap"
 ---
 

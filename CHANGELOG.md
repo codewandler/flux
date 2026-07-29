@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Security
 
+- **The `--serve` daemon now bounds request bodies and request time (C-189).** `SECURITY.md` lists
+  denial of service in the `--serve` daemon as in scope, yet every mounted router accepted an
+  unbounded request body and held a connection for as long as a handler ran. Every router now carries
+  a `DefaultBodyLimit` (default 1 MiB, override `FLUX_SERVER_MAX_BODY_BYTES`) — an over-limit body is
+  rejected with `413` during extraction, before the handler runs — and a request `TimeoutLayer`
+  (default 300s, override `FLUX_SERVER_REQUEST_TIMEOUT_SECS`) returns `408` for a wedged or overrunning
+  request. SSE/streaming routes are deliberately exempt from the timeout (a long-lived stream is not a
+  stuck request) but still carry the body cap; the A2A routes are covered too. The body limit is
+  applied outermost so no future route can forget it, and `0`/missing/unparseable env values fall back
+  to the documented default — the daemon is never accidentally left unbounded. Rate limiting is out of
+  scope (it needs a keying decision). Reviewed independently: auth and realm guards are preserved on
+  every route across the router split, and a timeout that drops a mid-turn handler leaves a valid,
+  self-repairing session log rather than a broken history.
 - **`sqlite_query` can no longer create a file outside guarded IO, and its SQL admission is now a
   real allowlist (C-192, C-193).** `sqlite_query` is a default-registered `Risk::Low` / `Effect::Read`
   op authorized as a workspace *read*, but its admission was a prefix *denylist* (`is_write_sql`) that
