@@ -247,8 +247,10 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GitStatusTool),
             Arc::new(GitDiffTool),
             Arc::new(GitLogTool),
+            Arc::new(GitMergeTool),
             Arc::new(GitPushTool),
             Arc::new(GitCheckoutTool),
+            Arc::new(GitBranchTool),
             Arc::new(GitUnstageTool),
             Arc::new(GitHunksTool),
             Arc::new(GitStageHunksTool),
@@ -474,6 +476,28 @@ struct GitCheckoutInput {
     /// Create the branch if it doesn't exist
     #[serde(default)]
     create: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitBranchInput {
+    /// Branch name to create (or to delete with `delete: true`)
+    name: String,
+    /// Delete the branch instead of creating it (safe delete: git refuses unmerged work and the
+    /// checked-out branch)
+    #[serde(default)]
+    delete: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitMergeInput {
+    /// Branch or ref to merge into the current branch
+    branch: String,
+    /// Always create a merge commit (`--no-ff`), even when a fast-forward is possible — the
+    /// integration loop's audit trail
+    #[serde(default)]
+    no_ff: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2404,6 +2428,131 @@ impl Tool for GitLogTool {
 }
 
 // ---------------------------------------------------------------------------
+// git_merge
+// ---------------------------------------------------------------------------
+
+pub struct GitMergeTool;
+
+#[async_trait]
+impl Tool for GitMergeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_merge".into(),
+            description: "Merge a branch or ref into the current branch (`git merge`). \
+                          `no_ff: true` always creates a merge commit even when a fast-forward \
+                          is possible — the integration loop's audit trail. A conflict is a \
+                          recoverable error naming the conflicting files: the merge is aborted \
+                          and the tree restored to its pre-merge state (never left half-merged, \
+                          never auto-resolved)."
+                .into(),
+            input_schema: tool_input_schema::<GitMergeInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // High like `git_worktree_leave`: a merge moves the integration branch's tip and can
+            // conflict — the caller must be able to trust the reported outcome.
+            risk: Risk::High,
+            // A repeated merge of the same ref converges ("Already up to date."), but what lands
+            // depends on both refs at call time — never replay a merge result from a cache.
+            idempotency: Idempotency::Conditional,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // C-238: name the merged ref — `git_merge:impl/x` matches a `git_merge:*` grant the way
+        // `rm:…` matches `Bash(rm:*)`; fall back to the bare op name on malformed params so
+        // subjects are never empty (a write with no subjects is forced to approval).
+        params
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .map(|b| vec![format!("git_merge:{b}")])
+            .unwrap_or_else(|| vec!["git_merge".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let branch = params.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+        let no_ff = params
+            .get("no_ff")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: if no_ff {
+                    format!("git merge --no-ff {branch}")
+                } else {
+                    format!("git merge {branch}")
+                },
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitMergeInput = parse_params(params, "git_merge")?;
+        let branch = args.branch;
+        // Same guard as `git_checkout` (C-85): a model-chosen ref must never read as an option.
+        let trimmed = branch.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            return Ok(ToolResult::error(format!(
+                "git_merge: refusing ref {branch:?} — it is empty or looks like an option, \
+                 not a ref"
+            )));
+        }
+        let system = ctx.system();
+        let mut argv = vec!["merge".to_string()];
+        if args.no_ff.unwrap_or(false) {
+            argv.push("--no-ff".to_string());
+        }
+        // Never open an editor for the merge message: the guarded system clears the environment,
+        // and git's default message already names the merged branch — the audit trail the
+        // integration loop needs.
+        argv.push("--no-edit".to_string());
+        argv.push(branch.clone());
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (ok, out) = run_git(&system, &argv).await?;
+        if ok {
+            return Ok(ToolResult::ok(if out.is_empty() {
+                format!("merged {branch}")
+            } else {
+                out
+            }));
+        }
+        // A failed merge with MERGE_HEAD present stopped on a conflict: name the unmerged paths,
+        // abort, and hand back a recoverable error — the tree is never left half-merged silently.
+        let (in_progress, _) =
+            run_git(&system, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await?;
+        if in_progress {
+            let (_, unmerged) =
+                run_git(&system, &["diff", "--name-only", "--diff-filter=U"]).await?;
+            let (aborted, abort_out) = run_git(&system, &["merge", "--abort"]).await?;
+            if !aborted {
+                return Ok(ToolResult::error(format!(
+                    "git_merge: the merge of `{branch}` failed AND `git merge --abort` failed — \
+                     the tree may be mid-merge; resolve by hand before any further git op.\n\
+                     merge: {out}\nabort: {abort_out}"
+                )));
+            }
+            let files = if unmerged.is_empty() {
+                "(git reported no unmerged paths)".to_string()
+            } else {
+                unmerged
+            };
+            return Ok(ToolResult::error(format!(
+                "git_merge: the merge of `{branch}` conflicted; the merge was aborted and the \
+                 tree restored to its pre-merge state. Resolve the conflict on the source branch \
+                 and retry. Conflicting files:\n{files}"
+            )));
+        }
+        Ok(ToolResult::error(format!("git merge failed: {out}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // git_push
 // ---------------------------------------------------------------------------
 
@@ -2550,6 +2699,111 @@ impl Tool for GitCheckoutTool {
         }
         Ok(ToolResult::ok(if body.is_empty() {
             format!("switched to {branch}")
+        } else {
+            body
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_branch
+// ---------------------------------------------------------------------------
+
+pub struct GitBranchTool;
+
+#[async_trait]
+impl Tool for GitBranchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_branch".into(),
+            description: "Create a branch without switching to it (`git branch`), or delete one \
+                          with `delete: true`. Deletion is the SAFE form (`git branch -d`): git \
+                          itself refuses unmerged work and the checked-out branch — there is no \
+                          force-delete."
+                .into(),
+            input_schema: tool_input_schema::<GitBranchInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // Medium like `git_checkout` (which also creates branches): creation is benign, and
+            // the only deletion offered is `-d`, which git refuses for unmerged or checked-out
+            // branches — the destructive `-D` is not reachable.
+            risk: Risk::Medium,
+            idempotency: Idempotency::NonIdempotent,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        // C-238: name the branch — `git_branch:impl/x` matches a `git_branch:*` grant the way
+        // `rm:…` matches `Bash(rm:*)`; fall back to the bare op name on malformed params so
+        // subjects are never empty (a write with no subjects is forced to approval).
+        params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| vec![format!("git_branch:{n}")])
+            .unwrap_or_else(|| vec!["git_branch".to_string()])
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let delete = params
+            .get("delete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: if delete {
+                    format!("git branch -d {name}")
+                } else {
+                    format!("git branch {name}")
+                },
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitBranchInput = parse_params(params, "git_branch")?;
+        let name = args.name;
+        let delete = args.delete.unwrap_or(false);
+        // Same guard as `git_checkout` (C-85): a model-chosen name must never read as an option
+        // (`git branch -D …` would force-delete) or a path.
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.starts_with('-')
+            || trimmed.contains("..")
+        {
+            return Ok(ToolResult::error(format!(
+                "git_branch: refusing branch name {name:?} — it looks like a path or an option, \
+                 not a branch"
+            )));
+        }
+        let mut argv = vec!["git".to_string(), "branch".to_string()];
+        if delete {
+            argv.push("-d".to_string());
+        }
+        argv.push(name.clone());
+        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        if out.exit_code != 0 {
+            return Ok(ToolResult::error(format!(
+                "git branch failed [exit {}]: {body}",
+                out.exit_code
+            )));
+        }
+        Ok(ToolResult::ok(if body.is_empty() {
+            if delete {
+                format!("deleted {name}")
+            } else {
+                format!("created {name}")
+            }
         } else {
             body
         }))

@@ -86,6 +86,8 @@ bounded by that plugin's manifest and its Tavily credential is injected host-sid
 | `git_commit` | `message[, body]` | medium | Create a commit |
 | `git_push` | `[branch, remote]` | medium | Push to a remote |
 | `git_checkout` | `branch[, create]` | medium | Switch or create a branch |
+| `git_branch` | `name[, delete]` | medium | Create a branch without switching to it, or safe-delete one (`-d` refuses unmerged work and the checked-out branch) |
+| `git_merge` | `branch[, no_ff]` | high | Merge a ref into the current branch (`no_ff` forces a merge commit); a conflict is a recoverable error naming the conflicting files — the merge is aborted and the tree restored, never left half-merged |
 | `git_worktree_enter` | | high | Move this agent context into an isolated temporary git worktree (requires a clean `main`; creates a generated `flux/worktree/*` branch) |
 | `git_worktree_leave` | | high | Merge the worktree's committed work back into `main` (`--no-ff`, guarded by an aborted trial merge), remove the worktree and branch, restore the original root |
 

@@ -67,8 +67,10 @@ optional arguments are in `[brackets]`.
 | `git_status` | | Low | Working tree status |
 | `git_diff` | `[path, staged]` | Low | Show unstaged (or staged) diff |
 | `git_log` | `[limit]` | Low | Recent commits |
+| `git_merge` | `branch[, no_ff]` | High | Merge a ref into the current branch (`no_ff` forces a merge commit); a conflict is a recoverable error naming the conflicting files — the merge is aborted and the tree restored, never left half-merged |
 | `git_push` | `[branch, remote]` | Medium | Push to remote |
 | `git_checkout` | `branch[, create]` | Medium | Switch/create branch |
+| `git_branch` | `name[, delete]` | Medium | Create a branch without switching to it, or safe-delete one (`-d` — git refuses unmerged work and the checked-out branch) |
 | `git_unstage` | `paths` | Medium | Unstage files |
 | `git_hunks` | `path[, context]` | Low | List one file's individually stageable unstaged hunks, each with a stable id |
 | `git_stage_hunks` | `path, hunks[, context]` | Medium | Stage only the named hunks of one file (the `git add -p` equivalent) |
