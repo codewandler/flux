@@ -2195,16 +2195,94 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_workspace() -> (PathBuf, System) {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Sandbox tests deliberately exercise TMPDIR parsing. Read it under their shared env lock
-        // so an unrelated process test never builds its fixture under a transient test value.
-        let dir = {
-            let _env = sandbox::EnvGuard::new(&[]);
-            std::env::temp_dir().join(format!("flux-sys-test-{}-{n}", std::process::id()))
-        };
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = sandbox::fixture_dir("sys-test");
         let ws = Workspace::new(&dir).unwrap();
         (dir, System::new(ws))
+    }
+
+    /// C-209: a transient `TMPDIR` must never capture another test's fixture root.
+    ///
+    /// Deterministic reproduction of the gate flake. The hijacker thread mutates `TMPDIR` exactly
+    /// the way `sandbox`'s `wrap_argv_rejects_root_from_automatic_tmpdir_too` does — under
+    /// `EnvGuard`, to a directory it then deletes — and holds it until the victim reports back or a
+    /// deadline passes. A victim that reads the temp dir *bare* answers at once, from inside that
+    /// window, and roots its fixture in the doomed directory; a victim that reads it under the same
+    /// env lock cannot run until the hijacker is gone, so the deadline is what releases it and the
+    /// root lands under the restored temp dir. Only the second outcome passes.
+    #[test]
+    fn a_transient_tmpdir_never_captures_a_fixture_root() {
+        let transient = sandbox::fixture_dir("c209-transient");
+        let (hijacked_tx, hijacked_rx) = std::sync::mpsc::channel();
+        let (built_tx, built_rx) = std::sync::mpsc::channel();
+
+        let doomed = transient.clone();
+        let hijacker = std::thread::spawn(move || {
+            let _env = sandbox::EnvGuard::new(&["TMPDIR"]);
+            std::env::set_var("TMPDIR", &doomed);
+            hijacked_tx.send(()).unwrap();
+            // A guarded victim cannot answer while this thread holds the lock; an unguarded one
+            // answers immediately. Either way the transient root is gone before TMPDIR is restored.
+            let _ = built_rx.recv_timeout(Duration::from_millis(250));
+            std::fs::remove_dir_all(&doomed).ok();
+        });
+
+        hijacked_rx.recv().unwrap();
+        let dir = sandbox::fixture_dir("c209-victim");
+        let _ = built_tx.send(());
+        hijacker.join().unwrap();
+
+        assert!(
+            !dir.starts_with(&transient),
+            "fixture root captured by a transient TMPDIR: {}",
+            dir.display()
+        );
+        assert!(
+            dir.is_dir(),
+            "fixture root vanished with the transient TMPDIR: {}",
+            dir.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-209 regression guard: the "read the process env under the env lock" invariant is only
+    /// worth something if a new bare read cannot quietly reappear, so enforce it on the source
+    /// rather than in a comment. No test module in this crate may call `std::env::temp_dir` itself
+    /// — fixture roots come from `sandbox::fixture_path`/`fixture_dir` — and `sandbox`'s tests may
+    /// reach `SpawnPolicy::for_workspace` (which reads `TMPDIR`/`CARGO_HOME`/`RUSTUP_HOME`/`HOME`)
+    /// only through their own `workspace_policy` wrapper. Production code above each file's
+    /// `mod tests` line — `worktree_base_dir`, the spawn path — is deliberately out of scope.
+    #[test]
+    fn no_bare_temp_dir_in_the_test_modules() {
+        // Assembled at runtime so this test never matches its own source.
+        let needle = format!("std::env::{}()", "temp_dir");
+        for (file, src) in [
+            ("lib.rs", include_str!("lib.rs")),
+            ("sandbox.rs", include_str!("sandbox.rs")),
+            ("net.rs", include_str!("net.rs")),
+        ] {
+            let (_, test_module) = src
+                .split_once("\nmod tests {")
+                .unwrap_or_else(|| panic!("{file} has no `mod tests` block to guard"));
+            assert!(
+                !test_module.contains(&needle),
+                "{file}'s test module calls {needle} directly — build fixture roots through \
+                 sandbox::fixture_path/fixture_dir, which read it under the sandbox env lock so a \
+                 concurrent TMPDIR test cannot capture them (C-209)"
+            );
+        }
+
+        // The same invariant for the policy builder: exactly one call, inside `workspace_policy`.
+        let (_, sandbox_tests) = include_str!("sandbox.rs")
+            .split_once("\nmod tests {")
+            .expect("sandbox.rs has no `mod tests` block to guard");
+        let policy_calls = sandbox_tests
+            .matches(&format!("SpawnPolicy::{}(", "for_workspace"))
+            .count();
+        assert_eq!(
+            policy_calls, 1,
+            "sandbox.rs's test module must reach SpawnPolicy::for_workspace only through its \
+             workspace_policy() wrapper, which reads the env under the sandbox env lock (C-209)"
+        );
     }
 
     /// C-97: the re-root derive must preserve the *entire* access posture — dropping `@named`
@@ -2250,14 +2328,12 @@ mod tests {
     /// directly-under-tmp `flux-worktree-*` allocation.
     #[test]
     fn worktree_dir_alloc_and_guarded_removal() {
-        // The refusal fixture is built FIRST: temp_workspace() takes the sandbox env lock
-        // internally, and EnvGuard below holds that same non-reentrant lock for the whole test.
         let (other, _) = temp_workspace();
         // Pin the base via FLUX_WORKTREE_DIR (under the env lock) so the test never touches the
-        // real ~/.flux/worktrees and stays hermetic under parallel test threads.
+        // real ~/.flux/worktrees and stays hermetic under parallel test threads. The fixture
+        // helpers stay usable inside the guard — they detect that this thread already holds it.
         let _env = sandbox::EnvGuard::new(&["FLUX_WORKTREE_DIR"]);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("flux-wt-base-{}-{n}", std::process::id()));
+        let base = sandbox::fixture_path("wt-base");
         std::env::set_var("FLUX_WORKTREE_DIR", &base);
 
         let dir = allocate_worktree_dir().unwrap();
@@ -2278,8 +2354,7 @@ mod tests {
         // DIFFERENT base than the resolved one (e.g. a stale /tmp allocation after the base moved).
         assert!(remove_worktree_dir(&other).is_err());
         assert!(remove_worktree_dir(&base.join("flux-worktree-x/nested")).is_err());
-        let foreign = std::env::temp_dir().join("flux-worktree-foreign");
-        std::fs::create_dir_all(&foreign).unwrap();
+        let foreign = sandbox::fixture_dir("worktree-foreign");
         assert!(remove_worktree_dir(&foreign).is_err());
         assert!(foreign.exists());
         std::fs::remove_dir(&foreign).unwrap();
@@ -2402,12 +2477,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_bytes_rejects_read_only_root() {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let ws_dir = std::env::temp_dir().join(format!("flux-sys-wsb-{}-{n}", std::process::id()));
-        let ext_dir =
-            std::env::temp_dir().join(format!("flux-sys-extb-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::create_dir_all(&ext_dir).unwrap();
+        let ws_dir = sandbox::fixture_dir("sys-wsb");
+        let ext_dir = sandbox::fixture_dir("sys-extb");
 
         let mut ws = Workspace::new(&ws_dir).unwrap();
         ws.add_read_root(&ext_dir).unwrap();
@@ -2502,11 +2573,8 @@ mod tests {
     /// A read-only extra root: reads reach under it, writes do not, and outside-all is still rejected.
     #[tokio::test]
     async fn read_root_allows_reads_but_not_writes() {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let ws_dir = std::env::temp_dir().join(format!("flux-sys-ws-{}-{n}", std::process::id()));
-        let ext_dir = std::env::temp_dir().join(format!("flux-sys-ext-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::create_dir_all(&ext_dir).unwrap();
+        let ws_dir = sandbox::fixture_dir("sys-ws");
+        let ext_dir = sandbox::fixture_dir("sys-ext");
         std::fs::write(ext_dir.join("ref.txt"), "outside data").unwrap();
 
         let mut ws = Workspace::new(&ws_dir).unwrap();
@@ -2530,12 +2598,8 @@ mod tests {
     /// subsequent `read` resolves.
     #[tokio::test]
     async fn walk_includes_read_roots_as_absolute() {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let ws_dir = std::env::temp_dir().join(format!("flux-sys-ws2-{}-{n}", std::process::id()));
-        let ext_dir =
-            std::env::temp_dir().join(format!("flux-sys-ext2-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::create_dir_all(&ext_dir).unwrap();
+        let ws_dir = sandbox::fixture_dir("sys-ws2");
+        let ext_dir = sandbox::fixture_dir("sys-ext2");
         std::fs::write(ext_dir.join("outside.txt"), "out").unwrap();
 
         let mut ws = Workspace::new(&ws_dir).unwrap();
@@ -2566,9 +2630,7 @@ mod tests {
     /// The `--allow-all-paths` hatch: `unconfined` lifts confinement for both read and write.
     #[tokio::test]
     async fn unconfined_lifts_the_sandbox() {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let ws_dir = std::env::temp_dir().join(format!("flux-sys-unc-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws_dir = sandbox::fixture_dir("sys-unc");
         let mut ws = Workspace::new(&ws_dir).unwrap();
         // Confined: an absolute outside path is rejected on both paths.
         assert!(ws.resolve_read("/etc/passwd").is_err());
@@ -2641,12 +2703,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let (dir, sys) = temp_workspace();
-        let outside = std::env::temp_dir().join(format!(
-            "flux-sys-metadata-outside-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = sandbox::fixture_dir("sys-metadata-outside");
         std::fs::write(outside.join("secret.md"), "OUTSIDE").unwrap();
         std::fs::create_dir_all(dir.join(".flux/skills")).unwrap();
 
@@ -2748,12 +2805,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let (dir, sys) = temp_workspace();
-        let outside = std::env::temp_dir().join(format!(
-            "flux-sys-nested-outside-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = sandbox::fixture_dir("sys-nested-outside");
         std::fs::write(outside.join("SKILL.md"), "OUTSIDE").unwrap();
         std::fs::create_dir_all(dir.join(".claude/skills/ns")).unwrap();
         symlink(&outside, dir.join(".claude/skills/ns/escaped")).unwrap();
@@ -2774,12 +2826,7 @@ mod tests {
 
         for parent_escape in [false, true] {
             let (dir, sys) = temp_workspace();
-            let outside = std::env::temp_dir().join(format!(
-                "flux-sys-atomic-outside-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&outside).unwrap();
+            let outside = sandbox::fixture_dir("sys-atomic-outside");
             if parent_escape {
                 symlink(&outside, dir.join(".flux")).unwrap();
             } else {
@@ -2822,11 +2869,7 @@ mod tests {
         let (dir, sys) = temp_workspace();
         // A symlink inside the workspace pointing at a NON-EXISTENT outside target. `Path::exists()`
         // follows the link → false, so the old parent-only canonicalize let the write through.
-        let outside = std::env::temp_dir().join(format!(
-            "flux-escape-target-{}-{}.txt",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let outside = sandbox::fixture_path("escape-target");
         std::fs::remove_file(&outside).ok();
         std::os::unix::fs::symlink(&outside, dir.join("evil")).unwrap();
         let err = sys.write_file("evil", "pwned").await;
@@ -2855,8 +2898,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn path_identity_follows_symlink_and_preserves_missing_create_tail() {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("flux-sys-path-id-{}-{n}", std::process::id()));
+        let dir = sandbox::fixture_path("sys-path-id");
         std::fs::create_dir_all(dir.join("allowed/real")).unwrap();
         std::os::unix::fs::symlink("real", dir.join("allowed/alias")).unwrap();
         let workspace = Workspace::new(&dir).unwrap();
