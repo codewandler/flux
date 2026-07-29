@@ -19,13 +19,9 @@
 
 - **Hand work to other flux agents, and pick it back up after a restart.** A program can now declare
   a **work board** — a list of tasks with real states (ready, claimed, in progress, blocked, review,
-  done, failed) — and hand items out to remote flux workers without waiting for them:
-
-  ```flux
-  datasource board
-    kind "board:markdown"
-    path "./board"
-  ```
+  done, failed) — and hand items out to remote flux workers without waiting for them. Declaring one
+  takes three lines: a `datasource` named `board`, a `kind` of `"board:markdown"`, and the `path` the
+  items live under.
 
   That gives your program operations to list, read, create, claim, move, comment on and dispatch
   board items. `board:markdown` keeps one file per item on disk, so **the board survives the process
