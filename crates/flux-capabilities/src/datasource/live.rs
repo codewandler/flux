@@ -238,10 +238,15 @@ impl Tool for LiveListOp {
         let operation = &self.spec.name;
         let input: LiveListInput = parse(operation, params)?;
         let entity = self.projection.entity(operation, &input.entity)?;
-        let filters = normalize_filters(operation, entity, input.filters)?;
+        let filters = normalize_filters(
+            operation,
+            &format!("entity `{}`", entity.entity),
+            &entity.filters,
+            input.filters,
+        )?;
         let page = PageRequest {
             cursor: input.page,
-            limit: normalize_limit(operation, entity, input.limit)?,
+            limit: normalize_limit(operation, entity.default_page, entity.max_page, input.limit)?,
         };
         let result = self
             .projection
@@ -295,41 +300,50 @@ impl Tool for LiveGetOp {
     }
 }
 
-fn parse<T: serde::de::DeserializeOwned>(operation: &str, params: Value) -> Result<T> {
+pub(super) fn parse<T: serde::de::DeserializeOwned>(operation: &str, params: Value) -> Result<T> {
     serde_json::from_value(params)
         .map_err(|error| Error::Other(format!("{operation}: bad input: {error}")))
 }
 
-fn normalize_limit(
+/// Clamp a caller-supplied page limit against a declared `(default, max)` pair.
+///
+/// Shared with the board port so both surfaces treat "omitted" and "over the ceiling" identically.
+pub(super) fn normalize_limit(
     operation: &str,
-    entity: &LiveEntity,
+    default_page: usize,
+    max_page: usize,
     requested: Option<usize>,
 ) -> Result<usize> {
     match requested {
         Some(0) => Err(Error::Other(format!(
             "{operation}.limit: must be greater than zero"
         ))),
-        Some(limit) => Ok(limit.min(entity.max_page)),
-        None => Ok(entity.default_page),
+        Some(limit) => Ok(limit.min(max_page)),
+        None => Ok(default_page),
     }
 }
 
-fn normalize_filters(
+/// Validate and normalize caller filters against a declared filter set.
+///
+/// `scope` names the thing the filters belong to for error messages (`entity \`ticket\``, `board
+/// \`board\``). Shared with the board port: a board filters items the same way a live datasource
+/// filters rows, so the vocabulary and the diagnostics stay single-sourced.
+pub(super) fn normalize_filters(
     operation: &str,
-    entity: &LiveEntity,
+    scope: &str,
+    declared: &[FilterKey],
     supplied: Map<String, Value>,
 ) -> Result<Filters> {
     for name in supplied.keys() {
-        if !entity.filters.iter().any(|filter| filter.name == *name) {
+        if !declared.iter().any(|filter| filter.name == *name) {
             return Err(Error::Other(format!(
-                "{operation}.filters.{name}: unknown filter for entity `{}`",
-                entity.entity
+                "{operation}.filters.{name}: unknown filter for {scope}"
             )));
         }
     }
 
     let mut normalized = Filters::new();
-    for filter in &entity.filters {
+    for filter in declared {
         let Some(value) = supplied.get(&filter.name) else {
             if filter.required {
                 return Err(Error::Other(format!(
@@ -347,7 +361,7 @@ fn normalize_filters(
     Ok(normalized)
 }
 
-fn normalize_filter_value(
+pub(super) fn normalize_filter_value(
     operation: &str,
     filter: &FilterKey,
     value: &Value,
@@ -556,7 +570,7 @@ fn list_entity_schema(entity: &LiveEntity) -> Value {
     schema
 }
 
-fn filter_schema(filter: &FilterKey) -> Value {
+pub(super) fn filter_schema(filter: &FilterKey) -> Value {
     let mut schema = match &filter.ty {
         FilterType::String => json!({"type": "string"}),
         FilterType::Int => json!({"type": "integer"}),
@@ -675,7 +689,7 @@ pub fn validate_live_contract(
     Ok(())
 }
 
-fn valid_domain(domain: &str) -> bool {
+pub(super) fn valid_domain(domain: &str) -> bool {
     let mut chars = domain.chars();
     matches!(chars.next(), Some('a'..='z'))
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')

@@ -17,6 +17,11 @@ use serde_json::Value;
 /// [`Record`] vocabulary because live backends do not ingest or own a snapshot in flux.
 pub mod live;
 
+/// Pure contracts for a **write-capable** work board: a typed item, its closed state machine, and
+/// the schema a backend declares. Reuses [`live`]'s paging, filter, and reference vocabulary rather
+/// than minting a parallel one.
+pub mod board;
+
 /// Where a record came from: a plugin (or `"local"` for the host's own ingesters) and an optional
 /// configured instance (e.g. two GitLab endpoints).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
