@@ -156,6 +156,55 @@ containment tag the knowledge-injection path uses (A-21), and the call is attrib
 calling turn's usage exactly like every other model-stage call, subject to a per-turn call cap
 (`[consult] max_calls`, default 2) so it stays a cheap escape valve rather than an unbounded spend.
 
+## Fleet ops (outbound A2A dispatch)
+
+`task` delegates to a **local** sub-agent and awaits it. The `fleet.*` ops (A-116, wired into the
+CLI catalog by A-131) are the half `task` cannot express: hand work to a **remote** `flux serve`
+worker over A2A *without* waiting, then poll or stop it. That is what lets a coordinator hold ten
+workers in flight and reconcile them later.
+
+| op | signature | risk | description |
+|---|---|---|---|
+| `fleet.dispatch` | `worker, task[, role, context_id]` | Medium | Send a task to a remote worker and return its `task_id` without waiting. A worker that answers synchronously returns `task_id: null` plus its answer, rather than an id that would be polled forever |
+| `fleet.status` | `worker, task_id` | Low | Read a dispatched task's current state → `{task_id, state, terminal, text}` |
+| `fleet.cancel` | `worker, task_id` | Medium | Stop a dispatched task. An already-finished task reports that it was not cancelable |
+
+**Egress posture.** `worker` is a caller-supplied argument, not configuration, so it is
+model-reachable and treated as such:
+
+- Every call resolves the endpoint through `flux_system::net::guard_url_scoped` **before** any
+  request, in both directions.
+- `permission_subjects` reports the worker's **origin** (`https://worker-1.internal:8787`) — never
+  `*`. An endpoint the op cannot parse reports **no** subject, which forces approval instead of
+  matching a broad grant.
+- The ops carry no standing private-network grant. They are *not* folded into the `[private_net]
+  web` scope, which names the native web family; only the blanket `--allow-private-net` /
+  `FLUX_ALLOW_PRIVATE_NET` override admits a private or loopback worker.
+
+`fleet.status` is deliberately **not** `Idempotent` — that word would license the op cache to serve
+a stored result instead of executing, and observing the change since the last poll is the whole
+point. `fleet.cancel` is `Conditional`: a repeat answers `TaskNotCancelable` rather than acting
+again.
+
+The ops are force-on (group `fleet`, empty `surface_when`): the worker address is per-call, so there
+is no workspace signal that could gate them honestly. `.flux/groups.toml` can still reassign or gate
+the group. A worker behind `flux serve`'s required bearer token is not yet reachable — the token is
+operator configuration that does not exist yet.
+
+## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch`)
+
+A `WorkBoard` (A-113) is the write-capable sibling of a live datasource: a typed item state machine
+behind a swappable backend. A program binds one with a `board:<backend>` datasource declaration
+(A-131) and the host generates seven operations under the declaration's name — so `datasource board`
+yields `board.list` … `board.record_dispatch`. Five of them write, and each reports a concrete
+`<domain>/item/<id>` permission subject (`<domain>/item/new` for `create`); `transition` validates
+the edge before writing, so an illegal edge errors and performs no write. `record_dispatch` (A-130)
+binds an item to the worker running it — the `runner` address and the worker-minted `task_id` — which
+is what makes the board a run registry rather than only a task list; it writes those two fields and
+nothing else, so `transition` stays the single entry point into the state machine.
+Backends: `board:markdown` (durable, file-per-item) and `board:memory` (in-process). See
+[`fleet-coordinator.md`](../../../docs/designs/fleet-coordinator.md).
+
 ## Orchestration ops (the `flux-app` host only)
 
 These are registered **only by the `flux-app` runtime host** (`flux run app.flux`), not the base engine
