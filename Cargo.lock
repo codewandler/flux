@@ -1006,6 +1006,7 @@ name = "codewandler-flux-orchestrate"
 version = "0.34.0"
 dependencies = [
  "async-trait",
+ "codewandler-flux-a2a",
  "codewandler-flux-agent",
  "codewandler-flux-core",
  "codewandler-flux-events",
