@@ -11,6 +11,7 @@ use flux_core::{is_subscription, CostSource, Message, Money, PricingTable, Usage
 use flux_lang::ast::RunEvent;
 
 use crate::kind::{EventKind, StoredEvent};
+use crate::memory::{self, MemoryEntry};
 
 /// Rebuild the conversation by replaying message-kind events in stream order. A
 /// [`EventKind::Compacted`] snapshot resets the fold (the superseded messages stay on
@@ -92,6 +93,52 @@ pub fn pending_wakeups(events: &[StoredEvent]) -> Vec<PendingWakeup> {
         }
     }
     pending
+}
+
+/// Fold a memory stream's `memory.noted` / `memory.edited` / `memory.forgotten` events into the
+/// currently-believed set: **latest state per [`MemoryEntry::id`]**, minus whatever has since been
+/// tombstoned (A-107).
+///
+/// An edit carries a whole replacement [`MemoryEntry`] and replaces its predecessor **in place**,
+/// so the returned order stays first-noted-first rather than jumping to the end on every
+/// re-statement — the same ordered-`Vec` choice, for the same reason, as [`pending_wakeups`]. A
+/// forget `retain`s the id away; nothing is deleted from the log, so the entry's whole believed
+/// history stays readable through `load_stream`. An edit naming an id that is not currently in the
+/// set (never noted, or noted and since forgotten) is appended as a fresh state — "latest state
+/// wins" with no special case, which is also what makes a forget honestly reversible by a later
+/// re-statement instead of quietly permanent.
+///
+/// A `memory.*` event whose payload does not decode is **skipped**, not propagated as an error:
+/// `EventKind::Custom` is an open extension point, so an unrelated embedder can put anything under
+/// a colliding name, and a newer build can widen the payload. One such event must not make the
+/// whole memory read model unavailable — the same reasoning as `decode_all`'s skip-and-continue.
+pub fn memory_entries(events: &[StoredEvent]) -> Vec<MemoryEntry> {
+    let mut live: Vec<MemoryEntry> = Vec::new();
+    for e in events {
+        let EventKind::Custom { name, payload } = &e.kind else {
+            continue;
+        };
+        match name.as_str() {
+            memory::MEMORY_NOTED | memory::MEMORY_EDITED => {
+                let Ok(entry) = serde_json::from_value::<MemoryEntry>(payload.clone()) else {
+                    continue;
+                };
+                match live.iter_mut().find(|m| m.id == entry.id) {
+                    Some(slot) => *slot = entry,
+                    None => live.push(entry),
+                }
+            }
+            memory::MEMORY_FORGOTTEN => {
+                let Ok(stone) = serde_json::from_value::<memory::MemoryTombstone>(payload.clone())
+                else {
+                    continue;
+                };
+                live.retain(|m| m.id != stone.id);
+            }
+            _ => {}
+        }
+    }
+    live
 }
 
 /// One planning attempt within a turn (the old `plan_attempts` row). Also the WRITE shape
