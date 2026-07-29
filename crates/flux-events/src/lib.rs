@@ -28,6 +28,7 @@
 
 mod context;
 mod kind;
+pub mod memory;
 #[cfg(feature = "otel")]
 pub mod otel;
 mod projection;
@@ -37,10 +38,11 @@ mod store;
 
 pub use context::EventContext;
 pub use kind::{EventKind, NewEvent, StoredEvent};
+pub use memory::{GitPin, MemoryEntry, MemoryNote, MemoryScope, MemoryTombstone, Receipt};
 pub use projection::{
-    conversation, cost_summary, efficiency_summary, observations, pending_wakeups, render_run_diff,
-    run_diff, run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow, EfficiencySummary,
-    ModelCost, PendingWakeup, PlanAttempt, RunDiff, StmtRow, TurnSummary,
+    conversation, cost_summary, efficiency_summary, memory_entries, observations, pending_wakeups,
+    render_run_diff, run_diff, run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow,
+    EfficiencySummary, ModelCost, PendingWakeup, PlanAttempt, RunDiff, StmtRow, TurnSummary,
 };
 pub use session_log::{LogError, SessionLog, Tail};
 pub use shape::{AssistantMessage, ShapeError, ValidHistory};

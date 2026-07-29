@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use flux_core::Message;
-use flux_events::{EventStore, NewEvent};
+use flux_events::{EventStore, MemoryNote, MemoryScope, NewEvent, Receipt};
 
 /// Shared events.db path for a worker to open (unset ⇒ this invocation is the orchestrator).
 const DB_ENV: &str = "FLUX_EVENTS_C125_DB";
@@ -30,6 +30,9 @@ const COUNT_ENV: &str = "FLUX_EVENTS_C125_COUNT";
 /// When set, every appended event carries this SAME stable id (the idempotent-path variant)
 /// instead of a store-minted one.
 const STABLE_ID_ENV: &str = "FLUX_EVENTS_C125_STABLE_ID";
+/// When set to `memory`, a worker writes A-107 memory entries through `EventStore::remember`
+/// instead of raw message appends (`STREAMS_ENV` is then the memory scope key, not a session id).
+const MODE_ENV: &str = "FLUX_EVENTS_C125_MODE";
 
 struct TempPath(PathBuf);
 
@@ -72,6 +75,29 @@ fn run_worker_if_invoked() -> bool {
     let stable_id = std::env::var(STABLE_ID_ENV).ok();
 
     let store = EventStore::open(&db).expect("worker opens the shared store");
+
+    // A-107: memory rides the SAME store and the SAME append path, so its multi-process safety is
+    // inherited rather than re-implemented — this worker mode only swaps *what* is written.
+    if std::env::var(MODE_ENV).as_deref() == Ok("memory") {
+        let redactor = flux_secret::Redactor::new();
+        for i in 0..count {
+            let note = MemoryNote::new(
+                &format!("pid {} learned fact {i}", std::process::id()),
+                Receipt {
+                    stream: "s_1".to_string(),
+                    event_id: ulid::Ulid::generate().to_string(),
+                    turn_id: None,
+                },
+                None,
+                |s| redactor.redact(s),
+            );
+            store
+                .remember(&MemoryScope::Global, note)
+                .expect("worker remember");
+        }
+        return true;
+    }
+
     for i in 0..count {
         let stream = &streams[i % streams.len()];
         let mut ev = NewEvent::message(Message::user_text(format!(
@@ -95,6 +121,18 @@ fn spawn_worker(
     count: usize,
     stable_id: Option<&str>,
 ) -> std::process::Child {
+    spawn_worker_in_mode(test_name, db, streams, count, stable_id, None)
+}
+
+/// [`spawn_worker`] with an explicit worker `mode` (`Some("memory")` drives the A-107 path).
+fn spawn_worker_in_mode(
+    test_name: &str,
+    db: &Path,
+    streams: &[String],
+    count: usize,
+    stable_id: Option<&str>,
+    mode: Option<&str>,
+) -> std::process::Child {
     let exe = std::env::current_exe().expect("current_exe for re-exec");
     let mut cmd = Command::new(exe);
     cmd.args([test_name, "--exact", "--nocapture"])
@@ -105,6 +143,11 @@ fn spawn_worker(
         cmd.env(STABLE_ID_ENV, id);
     } else {
         cmd.env_remove(STABLE_ID_ENV);
+    }
+    if let Some(mode) = mode {
+        cmd.env(MODE_ENV, mode);
+    } else {
+        cmd.env_remove(MODE_ENV);
     }
     cmd.spawn().expect("spawn worker process")
 }
@@ -227,4 +270,78 @@ fn multi_process_idempotent_append_stores_exactly_once() {
     // Only ONE stream_seq was ever consumed for the N racing appends of the same id (1, not N) —
     // proves the losers re-read the winner rather than each minting their own seq.
     assert_eq!(verifier.head_seq(&stream).unwrap(), 1);
+}
+
+/// A-107 item 6: cross-session **memory** inherits multi-process safety rather than
+/// re-implementing it. Memory lives on its own `memory:<scope-key>` stream in the SAME
+/// `events.db`, written through the SAME `EventStore::append`, so the C-25/C-125 machinery
+/// (`BEGIN IMMEDIATE` + busy_timeout, file locking, WAL shared memory) already covers it. This is
+/// the proof, deliberately shaped exactly like
+/// [`multi_process_writers_produce_contiguous_gapless_streams`] above: `WORKERS` real OS processes
+/// race `remember` against ONE memory stream, and afterwards the stream's `stream_seq`s must be
+/// exactly contiguous — no gaps, no duplicates — with every entry present in the projection.
+///
+/// A gap or duplicate here would mean the memory path had found a way *around* the store's write
+/// transaction; a lost entry would mean it had invented its own sequencing.
+#[test]
+fn multi_process_memory_writers_produce_a_gapless_memory_stream() {
+    if run_worker_if_invoked() {
+        return; // this invocation IS a spawned worker.
+    }
+
+    const WORKERS: usize = 4;
+    const PER_WORKER: usize = 25;
+
+    let db = TempPath::new("memory");
+    let scope = MemoryScope::Global;
+    let stream = scope.stream();
+    {
+        // Bootstrap the schema and drop the connection before any child opens the file — the same
+        // orchestrator shape as the two tests above. (It must be a separate step: several processes
+        // cold-booting the SAME brand-new file race the SQLite schema migration, which is a store
+        // bootstrap concern, not a memory one.) Nothing is seeded onto the memory stream itself: it
+        // is ad-hoc (no `streams` registry row), so it comes into existence on a *child*'s first
+        // append, on the shared file.
+        let _orchestrator = EventStore::open(db.path()).unwrap();
+    }
+    let children: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            spawn_worker_in_mode(
+                "multi_process_memory_writers_produce_a_gapless_memory_stream",
+                db.path(),
+                std::slice::from_ref(&stream),
+                PER_WORKER,
+                None,
+                Some("memory"),
+            )
+        })
+        .collect();
+    for (i, mut child) in children.into_iter().enumerate() {
+        let status = child.wait().expect("join worker process");
+        assert!(
+            status.success(),
+            "worker process {i} exited non-zero: {status:?}"
+        );
+    }
+
+    let verifier = EventStore::open(db.path()).unwrap();
+    let events = verifier.load_stream(&stream, None).unwrap();
+    let mut seqs: Vec<i64> = events.iter().map(|e| e.stream_seq).collect();
+    seqs.sort_unstable();
+    let head = verifier.head_seq(&stream).unwrap();
+    assert_eq!(
+        seqs,
+        (0..=head).collect::<Vec<i64>>(),
+        "the memory stream has gaps or duplicates in stream_seq: {seqs:?}"
+    );
+    assert_eq!(
+        events.len(),
+        WORKERS * PER_WORKER,
+        "some memory writes were lost or duplicated across the {WORKERS} worker processes"
+    );
+    // And the read model agrees: every entry the workers wrote is believed, each exactly once.
+    let entries = verifier.memories(&scope).unwrap();
+    assert_eq!(entries.len(), WORKERS * PER_WORKER);
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids.len(), entries.len(), "entry ids must be unique");
 }
