@@ -1761,7 +1761,7 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, None)
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, None, None)
             .await
     }
 
@@ -1792,8 +1792,15 @@ impl System {
         timeout: Duration,
         observer: OutputObserver,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, Some(observer))
-            .await
+        self.run_with_env_confinement(
+            argv,
+            env,
+            timeout,
+            Confinement::Sandboxed,
+            Some(observer),
+            None,
+        )
+        .await
     }
 
     /// Launch a trusted host process outside this `System`'s child sandbox while retaining every
@@ -1807,8 +1814,34 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt, None)
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt, None, None)
             .await
+    }
+
+    /// Like [`run`](Self::run), but feeds `stdin` to the child on its standard input, then closes
+    /// it (C-92). This exists for the handful of git plumbing commands whose *input* is a document
+    /// rather than an argument — `git apply --cached -` takes the patch on stdin, and the only
+    /// alternative would be writing a scratch file into the very workspace the op is guarding.
+    ///
+    /// Every other guarantee of [`run`](Self::run) is unchanged: the same [`Self::build_command`]
+    /// choke point, argv-only, workspace-pinned cwd, cleared environment, capped output. The bytes
+    /// are written from a concurrent task so a payload larger than the pipe buffer cannot deadlock
+    /// against the output capture.
+    pub async fn run_with_stdin(
+        &self,
+        argv: &[String],
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_with_env_confinement(
+            argv,
+            &[],
+            timeout,
+            Confinement::Sandboxed,
+            None,
+            Some(stdin),
+        )
+        .await
     }
 
     async fn run_with_env_confinement(
@@ -1818,16 +1851,41 @@ impl System {
         timeout: Duration,
         confinement: Confinement,
         observer: Option<OutputObserver>,
+        stdin: Option<&[u8]>,
     ) -> Result<ProcessOutput> {
         let mut cmd = self.build_tokio_command(argv, env, true, confinement)?;
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
         let program = argv[0].clone();
 
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
+        // Write the payload from its own task: a patch can exceed the pipe buffer, and writing it
+        // inline before draining stdout would deadlock the pair.
+        if let Some(bytes) = stdin {
+            match child.stdin.take() {
+                Some(mut sink) => {
+                    let bytes = bytes.to_vec();
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt as _;
+                        let _ = sink.write_all(&bytes).await;
+                        let _ = sink.shutdown().await; // EOF, so the child stops reading.
+                    });
+                }
+                None => {
+                    let mut child = GuardedChild::new(child);
+                    child.terminate_tree();
+                    let _ = child.wait().await;
+                    return Err(Error::Other("child stdin unavailable".to_string()));
+                }
+            }
+        }
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -3035,6 +3093,40 @@ mod tests {
             .unwrap();
         assert_eq!(out.stdout, "hi");
         assert_eq!(out.exit_code, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92: `run_with_stdin` feeds the child its payload and closes the pipe. The payload is
+    /// deliberately larger than a pipe buffer (64 KiB on Linux) — writing it inline before draining
+    /// stdout would deadlock, which is why the write lives in its own task.
+    #[tokio::test]
+    async fn run_with_stdin_feeds_a_payload_larger_than_the_pipe_buffer() {
+        let (dir, sys) = temp_workspace();
+        let payload = "x".repeat(256 * 1024);
+        let out = sys
+            .run_with_stdin(
+                &["cat".to_string()],
+                payload.as_bytes(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout.len(), payload.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92: stdin is closed after the payload, so a child that reads to EOF terminates on its own
+    /// rather than hanging until the deadline.
+    #[tokio::test]
+    async fn run_with_stdin_closes_the_pipe_so_the_child_sees_eof() {
+        let (dir, sys) = temp_workspace();
+        let out = sys
+            .run_with_stdin(&["cat".to_string()], b"one\ntwo\n", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "one\ntwo\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

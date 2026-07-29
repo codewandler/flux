@@ -126,6 +126,14 @@ const EXEMPT: &[Exemption] = &[
         invariants: &["I1"],
         reason: "fixed argv `git log`, caller may only cap the entry count; read-only",
     },
+    Exemption {
+        op: "git_hunks",
+        invariants: &["I1"],
+        reason: "`git diff` with a parser attached (C-92) — fixed argv, caller may only restrict \
+                 it to a path and a context radius; splits the result into addressable hunks and \
+                 changes nothing. Same grounds and same scope as `git_diff` above: I1 only, and \
+                 its result tracks the working tree, so I3 still forbids `Idempotent`.",
+    },
 ];
 
 /// One allowlist entry: an op name, the invariants it is excused from, and why.

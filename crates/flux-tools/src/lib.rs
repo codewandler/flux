@@ -250,6 +250,8 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GitPushTool),
             Arc::new(GitCheckoutTool),
             Arc::new(GitUnstageTool),
+            Arc::new(GitHunksTool),
+            Arc::new(GitStageHunksTool),
             Arc::new(GitWorktreeEnterTool),
             Arc::new(GitWorktreeLeaveTool),
         ],
@@ -479,6 +481,28 @@ struct GitCheckoutInput {
 struct GitUnstageInput {
     /// Files to unstage
     paths: Vec<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitHunksInput {
+    /// Workspace-relative path of the file whose unstaged hunks to list
+    path: String,
+    /// Lines of context around each change (default 3). A smaller radius splits adjacent
+    /// changes into separate, individually stageable hunks.
+    context: Option<u32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitStageHunksInput {
+    /// Workspace-relative path of the file to stage hunks from
+    path: String,
+    /// Hunk ids to stage, exactly as `git_hunks` reported them (e.g. `h1-1a2b3c4d5e6f7a8b`)
+    hunks: Vec<String>,
+    /// Context radius used when the ids were listed — must match the `git_hunks` call they came
+    /// from (default 3)
+    context: Option<u32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1780,6 +1804,19 @@ fn read_path_list(params: &Value) -> Vec<String> {
 }
 
 /// Extract the `paths` string array from params (empty when absent/malformed).
+/// The single `path` argument as a one-element subject list, falling back to the op's own name
+/// when the parameter is absent or blank.
+///
+/// The fallback matters: a `Write`-effect op reporting **no** subjects is unscoped, and an unscoped
+/// write matches a `*` path grant — so a malformed call must still name something the approval gate
+/// can reason about, never an empty list (AGENTS.md, "`permission_subjects` must be accurate").
+fn single_path(params: &Value, fallback: &str) -> Vec<String> {
+    match params.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => vec![p.to_string()],
+        _ => vec![fallback.to_string()],
+    }
+}
+
 fn path_list(params: &Value) -> Vec<String> {
     params
         .get("paths")
@@ -2591,6 +2628,362 @@ impl Tool for GitUnstageTool {
         } else {
             body
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_hunks / git_stage_hunks (C-92)
+//
+// Hunk-level staging: the `git add -p` capability, minus the interactivity the guarded envelope
+// cannot offer. `git_hunks` splits a file's index-vs-worktree diff into addressable units;
+// `git_stage_hunks` stages a named subset of them.
+//
+// The selector is a CONTENT hash, not a position (design: docs/designs/hunk-level-staging.md).
+// A positional index is the one shape that fails silently — if a coworker saves between the read
+// and the stage, index 2 is now a different hunk and their work lands in our commit, which is the
+// exact bug this pair exists to prevent. A content id simply stops matching, and the op refuses.
+// ---------------------------------------------------------------------------
+
+/// One addressable unit of an index-vs-worktree diff.
+struct Hunk {
+    /// Content-derived selector, `h{ordinal}-{16 hex}` — see [`hunk_id`].
+    id: String,
+    /// The `@@ -a,b +c,d @@` line, verbatim.
+    header: String,
+    /// The hunk verbatim (header line + body lines), ready to splice into a patch.
+    patch: String,
+    added: usize,
+    removed: usize,
+}
+
+/// The stable identity of a hunk: a hash of the file it belongs to and the lines it changes,
+/// **excluding** the `@@` line numbers.
+///
+/// Position is deliberately not part of the identity. Staging or editing an earlier hunk shifts
+/// every later hunk's line numbers without changing what those hunks do, and re-keying them on
+/// every edit would force a re-listing between each staged hunk. The `ordinal` prefix keeps the id
+/// readable and disambiguates two byte-identical hunks in one file; because it is only ever
+/// compared after the hash matches, a stale ordinal can misdirect nothing.
+///
+/// Uses `DefaultHasher` for the same reason `cognition::compute_fingerprint` does — constructed
+/// directly it is SipHash-1-3 with a fixed zero key, deterministic across runs and processes, and
+/// it keeps this crate free of a hashing dependency. The id is an integrity check against
+/// concurrent edits, not a security boundary.
+fn hunk_id(path: &str, ordinal: usize, body: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    format!("{path}\u{1}{body}").hash(&mut hasher);
+    format!("h{ordinal}-{:016x}", hasher.finish())
+}
+
+/// Split one file's unified diff into its preamble (everything before the first `@@`, i.e. the
+/// `diff --git`/`index`/`---`/`+++` lines) and its hunks.
+///
+/// Returns `Err` with a human-readable reason if the diff covers more than one file — one path per
+/// call is what keeps `permission_subjects` exact.
+fn split_hunks(path: &str, diff: &str) -> std::result::Result<(String, Vec<Hunk>), String> {
+    if diff.matches("\ndiff --git ").count() + usize::from(diff.starts_with("diff --git ")) > 1 {
+        return Err(format!(
+            "`{path}` expanded to more than one file — pass a single file path, not a directory \
+             or glob"
+        ));
+    }
+    let mut preamble = String::new();
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut current: Option<(String, String)> = None; // (header, body)
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("@@") {
+            if let Some((header, body)) = current.take() {
+                hunks.push(build_hunk(path, hunks.len() + 1, header, body));
+            }
+            current = Some((line.trim_end_matches('\n').to_string(), String::new()));
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+        } else {
+            preamble.push_str(line);
+        }
+    }
+    if let Some((header, body)) = current.take() {
+        hunks.push(build_hunk(path, hunks.len() + 1, header, body));
+    }
+    Ok((preamble, hunks))
+}
+
+/// Assemble one [`Hunk`] from its `@@` header and raw body.
+fn build_hunk(path: &str, ordinal: usize, header: String, body: String) -> Hunk {
+    let added = body.lines().filter(|l| l.starts_with('+')).count();
+    let removed = body.lines().filter(|l| l.starts_with('-')).count();
+    Hunk {
+        id: hunk_id(path, ordinal, &body),
+        patch: format!("{header}\n{body}"),
+        header,
+        added,
+        removed,
+    }
+}
+
+/// `git diff` argv for one path, pinned so the output cannot drift with the user's git config
+/// (an external differ or `diff.noprefix` would otherwise produce something `git apply` can't read).
+fn hunk_diff_argv(path: &str, context: u32) -> Vec<String> {
+    [
+        "git",
+        "--no-pager",
+        "diff",
+        "--no-ext-diff",
+        "--no-color",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .chain([format!("--unified={context}"), "--".to_string()])
+    .chain([path.to_string()])
+    .collect()
+}
+
+/// Guidance for selectors that name nothing in the current diff (C-32's repairable-failure
+/// pattern). Names the stale ids, what is actually there now, and the op to re-run — a bare
+/// "hunk not found" would leave the model with no move.
+fn stale_hunk_guidance(path: &str, missing: &[String], live: &[Hunk]) -> String {
+    let available = if live.is_empty() {
+        format!("`{path}` now has no unstaged hunks at all")
+    } else {
+        format!(
+            "the hunks in `{path}` are now: {}",
+            live.iter()
+                .map(|h| format!("{} {}", h.id, h.header))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "no such hunk in `{path}`: {} — the file changed underneath this selection, so {available}. \
+         Nothing was staged. Re-run git_hunks(\"{path}\") and select from the ids it returns.",
+        missing.join(", ")
+    )
+}
+
+pub struct GitHunksTool;
+
+#[async_trait]
+impl Tool for GitHunksTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_hunks".into(),
+            description: "List the individually stageable hunks of one file's unstaged changes \
+                          (index vs working tree). Each hunk gets a stable id to pass to \
+                          `git_stage_hunks`. Optional `context` sets the context radius \
+                          (default 3); a smaller radius splits adjacent changes apart."
+                .into(),
+            input_schema: tool_input_schema::<GitHunksInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process],
+            // Stays `Low` on the strength of an explicit I1 allowlist entry in
+            // `flux_spec::coherence` — it is `git diff` with a parser attached: fixed argv, the
+            // caller may only narrow it to a path, and it mutates nothing (C-92).
+            risk: Risk::Low,
+            // The hunks track the working tree, not the input — see `git_diff`.
+            idempotency: Idempotency::Conditional,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        single_path(params, "git_hunks")
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        for p in single_path(params, "git_hunks") {
+            set.push(Intent {
+                behavior: IntentBehavior::CommandExecution,
+                target: IntentTarget::Process {
+                    command: format!("git diff -- {p}"),
+                },
+                role: IntentRole::ProcessCommand,
+                certainty: IntentCertainty::Certain,
+            });
+        }
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitHunksInput = parse_params(params, "git_hunks")?;
+        let context = args.context.unwrap_or(3);
+        let argv = hunk_diff_argv(&args.path, context);
+        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        if out.exit_code != 0 {
+            let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+            return Ok(ToolResult::error(format!(
+                "git diff failed [exit {}]: {body}",
+                out.exit_code
+            )));
+        }
+        let (_, hunks) = match split_hunks(&args.path, &out.stdout) {
+            Ok(split) => split,
+            Err(why) => return Ok(ToolResult::error(why)),
+        };
+        if hunks.is_empty() {
+            return Ok(ToolResult::ok(format!(
+                "no unstaged hunks in `{}`",
+                args.path
+            )));
+        }
+        let mut body = format!(
+            "{} hunk{} in `{}` (unstaged, context {context}) — pass ids to git_stage_hunks\n",
+            hunks.len(),
+            if hunks.len() == 1 { "" } else { "s" },
+            args.path
+        );
+        for h in &hunks {
+            body.push_str(&format!(
+                "\n[{}] {}  +{} -{}\n{}",
+                h.id, h.header, h.added, h.removed, h.patch
+            ));
+        }
+        Ok(ToolResult::ok(body))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// git_stage_hunks
+// ---------------------------------------------------------------------------
+
+pub struct GitStageHunksTool;
+
+#[async_trait]
+impl Tool for GitStageHunksTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_stage_hunks".into(),
+            description: "Stage only the named hunks of one file (the `git add -p` equivalent) — \
+                          use when another author has in-flight changes in the same file and only \
+                          your own hunks belong in the commit. `hunks` are ids from `git_hunks`; \
+                          pass the same `context` you listed them with. All-or-nothing: if any id \
+                          no longer matches, nothing is staged."
+                .into(),
+            input_schema: tool_input_schema::<GitStageHunksInput>(),
+            output_schema: None,
+            effects: vec![Effect::Process, Effect::LocalSystem],
+            // Mutates the index and runs a program — the same shape as its whole-file twin
+            // `git_stage`.
+            risk: Risk::Medium,
+            // Restaging the same hunks converges (they are simply gone from the unstaged diff on
+            // the second call), but what lands in the index is a function of the working tree at
+            // call time, so the result must never be replayed from a cache.
+            idempotency: Idempotency::Conditional,
+            access: vec![AccessKind::Process],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        single_path(params, "git_stage_hunks")
+    }
+
+    fn intents(&self, params: &Value) -> IntentSet {
+        let mut set = IntentSet::new();
+        for p in single_path(params, "git_stage_hunks") {
+            set.push(Intent {
+                behavior: IntentBehavior::CommandExecution,
+                target: IntentTarget::Process {
+                    command: format!("git apply --cached -- {p}"),
+                },
+                role: IntentRole::ProcessCommand,
+                certainty: IntentCertainty::Certain,
+            });
+        }
+        set
+    }
+
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let args: GitStageHunksInput = parse_params(params, "git_stage_hunks")?;
+        if args.hunks.is_empty() {
+            return Err(Error::Other(
+                "git_stage_hunks: `hunks` must be a non-empty array of ids from git_hunks"
+                    .to_string(),
+            ));
+        }
+        let context = args.context.unwrap_or(3);
+
+        // Recompute the diff HERE rather than trusting whatever the caller last saw. The ids are
+        // matched against the working tree as of this call, which is what makes a concurrent edit
+        // a refusal instead of a wrong commit.
+        let argv = hunk_diff_argv(&args.path, context);
+        let out = ctx.system().run(&argv, Duration::from_secs(30)).await?;
+        if out.exit_code != 0 {
+            let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+            return Ok(ToolResult::error(format!(
+                "git diff failed [exit {}]: {body}",
+                out.exit_code
+            )));
+        }
+        let (preamble, hunks) = match split_hunks(&args.path, &out.stdout) {
+            Ok(split) => split,
+            Err(why) => return Ok(ToolResult::error(why)),
+        };
+
+        let missing: Vec<String> = args
+            .hunks
+            .iter()
+            .filter(|want| !hunks.iter().any(|h| &h.id == *want))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Ok(ToolResult::error(stale_hunk_guidance(
+                &args.path, &missing, &hunks,
+            )));
+        }
+
+        // Reassemble a patch from the selected hunks — verbatim bytes flux just read out of `git
+        // diff`, never bytes supplied by the caller. Order follows the diff so the hunks stay
+        // ascending, as `git apply` expects.
+        let selected: Vec<&Hunk> = hunks
+            .iter()
+            .filter(|h| args.hunks.contains(&h.id))
+            .collect();
+        let mut patch = preamble;
+        for h in &selected {
+            patch.push_str(&h.patch);
+        }
+
+        let apply = vec![
+            "git".to_string(),
+            "apply".to_string(),
+            "--cached".to_string(),
+            "--recount".to_string(),
+            "--whitespace=nowarn".to_string(),
+            "-".to_string(),
+        ];
+        let out = ctx
+            .system()
+            .run_with_stdin(&apply, patch.as_bytes(), Duration::from_secs(30))
+            .await?;
+        if out.exit_code != 0 {
+            let body = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+            // The ids all matched, so this is the *staged* side having moved under us. Recoverable
+            // for the same reason a stale id is: `git apply` is all-or-nothing, so the index is
+            // untouched and the agent can re-list and retry.
+            return Ok(ToolResult::error(format!(
+                "the selected hunks no longer apply to `{}` [git apply exit {}]: {body} — nothing \
+                 was staged. Re-run git_hunks(\"{}\") and select from the ids it returns.",
+                args.path, out.exit_code, args.path
+            )));
+        }
+        Ok(ToolResult::ok(format!(
+            "staged {} of {} hunk{} in `{}`: {}",
+            selected.len(),
+            hunks.len(),
+            if hunks.len() == 1 { "" } else { "s" },
+            args.path,
+            selected
+                .iter()
+                .map(|h| h.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 }
 
@@ -4176,9 +4569,11 @@ mod tests {
                 "git_checkout",
                 "git_commit",
                 "git_diff",
+                "git_hunks",
                 "git_log",
                 "git_push",
                 "git_stage",
+                "git_stage_hunks",
                 "git_status",
                 "git_unstage",
                 "git_worktree_enter",
@@ -4690,6 +5085,226 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feature");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pull the `[h1-…]` selectors out of a `git_hunks` listing, in order.
+    fn hunk_ids(listing: &str) -> Vec<String> {
+        listing
+            .lines()
+            .filter_map(|l| l.strip_prefix('['))
+            .filter_map(|l| l.split_once(']').map(|(id, _)| id.to_string()))
+            .collect()
+    }
+
+    /// A committed 20-line baseline plus two independent edits — ours near the top, a coworker's
+    /// near the bottom, far enough apart that `git diff -U3` reports them as two hunks.
+    async fn split_author_file(c: &ToolContext) {
+        let base: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        WriteTool
+            .execute(c, json!({"path": "shared.txt", "content": base}))
+            .await
+            .unwrap();
+        GitStageTool
+            .execute(c, json!({"paths": ["shared.txt"]}))
+            .await
+            .unwrap();
+        GitCommitTool
+            .execute(c, json!({"message": "baseline"}))
+            .await
+            .unwrap();
+        let edited = base
+            .replace("line 2\n", "line 2 OURS\n")
+            .replace("line 18\n", "line 18 THEIRS\n");
+        WriteTool
+            .execute(c, json!({"path": "shared.txt", "content": edited}))
+            .await
+            .unwrap();
+    }
+
+    /// C-92, the motivating case: two authors edit one file and the agent stages **only its own**
+    /// hunk. Whole-file `git_stage` cannot express this — it sweeps the coworker's in-flight hunk
+    /// into the agent's commit, which is the incident that filed the story.
+    #[tokio::test]
+    async fn staging_one_hunk_leaves_the_other_authors_hunk_in_the_working_tree() {
+        let (dir, c) = git_ctx();
+        split_author_file(&c).await;
+
+        // The read op surfaces two addressable hunks.
+        let listed = GitHunksTool
+            .execute(&c, json!({"path": "shared.txt"}))
+            .await
+            .unwrap();
+        assert!(!listed.is_error, "{}", listed.content);
+        let ids = hunk_ids(&listed.content);
+        assert_eq!(ids.len(), 2, "expected two hunks, got:\n{}", listed.content);
+
+        // Stage ONLY ours.
+        let staged = GitStageHunksTool
+            .execute(&c, json!({"path": "shared.txt", "hunks": [&ids[0]]}))
+            .await
+            .unwrap();
+        assert!(!staged.is_error, "{}", staged.content);
+
+        // The index holds exactly our hunk …
+        let idx = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert!(
+            idx.content.contains("+line 2 OURS"),
+            "index is missing our hunk:\n{}",
+            idx.content
+        );
+        assert!(
+            !idx.content.contains("THEIRS"),
+            "index swept the coworker's hunk:\n{}",
+            idx.content
+        );
+
+        // … and the coworker's stays in the working tree, untouched.
+        let wt = GitDiffTool.execute(&c, json!({})).await.unwrap();
+        assert!(
+            wt.content.contains("+line 18 THEIRS"),
+            "the coworker's hunk was lost:\n{}",
+            wt.content
+        );
+        assert!(
+            !wt.content.contains("OURS"),
+            "our hunk is still unstaged:\n{}",
+            wt.content
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92, the mirror case: staging only the **later** hunk. This is the one that exercises
+    /// line-number drift — dropping the earlier hunk from the patch leaves every following hunk's
+    /// `@@` new-side start stale, so it proves the reassembled patch is located by preimage
+    /// context rather than by the counts we copied.
+    #[tokio::test]
+    async fn staging_only_the_later_hunk_still_applies_despite_the_shifted_line_numbers() {
+        let (dir, c) = git_ctx();
+        split_author_file(&c).await;
+
+        let listed = GitHunksTool
+            .execute(&c, json!({"path": "shared.txt"}))
+            .await
+            .unwrap();
+        let ids = hunk_ids(&listed.content);
+        assert_eq!(ids.len(), 2, "expected two hunks, got:\n{}", listed.content);
+
+        let staged = GitStageHunksTool
+            .execute(&c, json!({"path": "shared.txt", "hunks": [&ids[1]]}))
+            .await
+            .unwrap();
+        assert!(!staged.is_error, "{}", staged.content);
+
+        let idx = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert!(
+            idx.content.contains("+line 18 THEIRS") && !idx.content.contains("OURS"),
+            "the index should hold only the later hunk:\n{}",
+            idx.content
+        );
+        let wt = GitDiffTool.execute(&c, json!({})).await.unwrap();
+        assert!(
+            wt.content.contains("+line 2 OURS") && !wt.content.contains("THEIRS"),
+            "the earlier hunk should still be unstaged:\n{}",
+            wt.content
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92: a selector that no longer names a live hunk comes back as a **repairable**
+    /// `ToolResult` error naming the stale id and the op to re-run — the C-32 guidance pattern —
+    /// never a plan-halting `Err`, and never a partial stage.
+    #[tokio::test]
+    async fn stage_hunks_refuses_cleanly_when_the_file_changed_underneath() {
+        let (dir, c) = git_ctx();
+        split_author_file(&c).await;
+
+        let listed = GitHunksTool
+            .execute(&c, json!({"path": "shared.txt"}))
+            .await
+            .unwrap();
+        let ids = hunk_ids(&listed.content);
+        assert_eq!(ids.len(), 2, "expected two hunks, got:\n{}", listed.content);
+
+        // The coworker saves again: our hunk's own content changes, so its content-derived id is
+        // no longer the id of anything in the tree.
+        let moved: String = (1..=20)
+            .map(|n| match n {
+                2 => "line 2 REWRITTEN BY SOMEONE ELSE\n".to_string(),
+                18 => "line 18 THEIRS\n".to_string(),
+                _ => format!("line {n}\n"),
+            })
+            .collect();
+        WriteTool
+            .execute(&c, json!({"path": "shared.txt", "content": moved}))
+            .await
+            .unwrap();
+
+        let r = GitStageHunksTool
+            .execute(&c, json!({"path": "shared.txt", "hunks": [&ids[0]]}))
+            .await
+            .unwrap();
+        assert!(
+            r.is_error,
+            "a stale selector must fail, not stage something else:\n{}",
+            r.content
+        );
+        assert!(
+            r.content.contains(&ids[0]) && r.content.contains("git_hunks"),
+            "the refusal must name the stale id and the repair op:\n{}",
+            r.content
+        );
+
+        // Nothing was staged — the refusal is all-or-nothing.
+        let idx = GitDiffTool
+            .execute(&c, json!({"staged": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            idx.content, "no changes",
+            "the index moved:\n{}",
+            idx.content
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92: both new ops declare a coherent spec (`flux_spec::metadata_violations`, which since
+    /// C-210 reads `semantic_effects` too) and a **non-empty, path-scoped** subject — an unscoped
+    /// write would otherwise match a `*` path grant.
+    #[test]
+    fn the_hunk_ops_declare_coherent_path_scoped_metadata() {
+        let params = json!({"path": "src/engine.rs", "hunks": ["h1-0123456789abcdef"]});
+        for tool in [
+            Box::new(GitHunksTool) as Box<dyn Tool>,
+            Box::new(GitStageHunksTool) as Box<dyn Tool>,
+        ] {
+            let spec = tool.spec();
+            let violations = flux_spec::metadata_violations(&spec, &tool.semantic_effects());
+            assert!(
+                violations.is_empty(),
+                "{} is incoherent: {violations:?}",
+                spec.name
+            );
+            assert_eq!(
+                tool.permission_subjects(&params),
+                vec!["src/engine.rs".to_string()],
+                "{} must scope approval to the named path",
+                spec.name
+            );
+            assert!(
+                !tool.intents(&params).intents.is_empty(),
+                "{} must declare its intent",
+                spec.name
+            );
+        }
     }
 
     /// D-66: `git_push` end-to-end against a local bare "remote" (no network needed).
