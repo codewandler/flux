@@ -3,7 +3,7 @@ id: C-190
 title: "Make the non-loopback auth invariant hold by construction, not only inside serve_on"
 pillar: Core
 status: ready
-priority: 4
+priority: 7
 epic: security-assurance
 design: docs/designs/security-assurance.md
 note: "REVIEW — AGENTS.md says 'there are no bypass paths, don't add one'; the unauthenticated-non-loopback refusal lives in serve_on (lib.rs:457) so a caller mounting the router directly gets no guard at all"

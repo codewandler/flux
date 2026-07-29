@@ -3,7 +3,7 @@ id: C-189
 title: "Server body limits and request timeouts — SECURITY.md declares daemon DoS in scope, the routers have no limit"
 pillar: Core
 status: ready
-priority: 3
+priority: 6
 epic: security-assurance
 design: docs/designs/security-assurance.md
 note: "REVIEW — a gap against flux's OWN published scope: SECURITY.md names --serve DoS as in-scope while flux-server/src/lib.rs mounts every router with no DefaultBodyLimit, TimeoutLayer or concurrency cap"

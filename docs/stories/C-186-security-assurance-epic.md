@@ -6,7 +6,7 @@ status: ready
 priority: 1
 epic: security-assurance
 design: docs/designs/security-assurance.md
-note: "REVIEW EPIC — every child traces to a CONFIRMED finding in the 2026-07-29 adversarial desk review; architecture rated 8/10 while assurance rated 5/10, and the spread is the work"
+note: "REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work"
 ---
 
 # Security assurance — close the gap between the envelope and its proof (epic)
@@ -25,6 +25,11 @@ closure instead of re-deriving it.
       demonstration its story names.
 - [ ] C-191 lands a registry-wide `ToolSpec` invariant test, converting the review's
       "classification trust" concern from an assumption into a gate.
+- [ ] C-192 (the `sqlite_query` guarded-IO bypass), C-193 (statement allowlist) and C-194 (the
+      mechanical no-direct-IO lint) are done. These trace to the **envelope-integrity** review, not
+      the desk review, and they matter disproportionately: C-192 is the epic's only *confirmed
+      bypass* of the envelope rather than a missing assurance step, and C-194 is the check that
+      would have caught it at authoring time.
 - [ ] A re-run of the [`adversarial-review`](../../.agents/skills/adversarial-review/SKILL.md) skill
       against the then-current version can mark findings 1–4 and classification trust **closed with
       evidence**, diffed against the 2026-07-29 baseline.
@@ -39,6 +44,15 @@ closure instead of re-deriving it.
   the reviewer's prose.
 - Ordering is **not** the review's ordering. Ranked by risk × reachability ÷ cost, which puts the
   supply-chain item first and the review's own headline finding out of scope (see Notes).
+- 2026-07-29 — second review, `envelope-integrity` lens:
+  [`reviews/2026-07-29-envelope-integrity.md`](../../reviews/2026-07-29-envelope-integrity.md).
+  Added C-192, C-193, C-194. C-192 inserted at priority 2 — ahead of advisory scanning and the
+  server limits — because it is model-reachable in any default session with no operator mistake and
+  no third party required; C-188/C-189/C-190 shifted to 5/6/7. That pass **confirmed** the dispatch
+  chain itself is sound on every path examined (shared `gate` between `dispatch` and a synchronous
+  `authorize`, cap-scope checked before hooks, filesystem subjects normalized to physical identity,
+  no production `Tool::execute` call, workspace root not model-reachable) — the failure came from
+  outside the envelope, which is the argument for C-194 over more envelope hardening.
 
 ## Notes
 - **Why C-187 leads.** It is the only finding exploitable by a third party with no flux bug and no

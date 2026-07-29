@@ -3,7 +3,7 @@ id: C-188
 title: "Dependency advisory scanning in CI — cargo-audit + cargo-deny over the 38-crate tree"
 pillar: Core
 status: ready
-priority: 2
+priority: 5
 epic: security-assurance
 design: docs/designs/security-assurance.md
 note: "REVIEW — the one confirmed finding whose truth value is UNKNOWN today: a RUSTSEC advisory in the transitive tree either exists right now or does not, and nothing in CI can tell you which"
