@@ -1693,8 +1693,9 @@ mod tests {
 
         // Both sessions age past the cutoff below… but `active` sees a message afterwards.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        events
-            .record_message(&active, &flux_core::Message::user_text("still here"))
+        flux_events::SessionLog::open(&events, &active)
+            .unwrap()
+            .open_turn(flux_core::Message::user_text("still here"))
             .unwrap();
 
         // Cutoff strictly after both creations, strictly before the touch: prune as of

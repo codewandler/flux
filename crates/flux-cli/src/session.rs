@@ -295,7 +295,9 @@ pub(super) async fn run_fork(
 
     // Mint the fork session, correlated to its source (the A-08 linkage `flux replay
     // --sub-agents` and cost rollups already understand), and seed its conversation with the
-    // parent's messages so an adaptive tail has the recorded context.
+    // parent's messages so an adaptive tail has the recorded context. The seeding is one checked
+    // rewrite (A-102): the tail runs live, so a parent history that no provider would accept — one
+    // ending mid-tool-pair, say — is refused here rather than 400ing on the fork's first turn.
     let fork_sid = events
         .create_session_with_context(
             &src_info.model,
@@ -306,14 +308,15 @@ pub(super) async fn run_fork(
             },
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for m in events
-        .conversation(&sid)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-    {
+    let history = flux_events::ValidHistory::new(
         events
-            .record_message(&fork_sid, &m)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+            .conversation(&sid)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    )
+    .with_context(|| format!("session `{sid}` cannot be forked"))?;
+    flux_events::SessionLog::open(&events, &fork_sid)
+        .and_then(|mut log| log.rewrite(history))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     drop(events);
 
     let (engine, _session, model_spec, _spawner) =

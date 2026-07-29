@@ -10,14 +10,19 @@
 //! This replaces the old `flux-session` message log *and* `flux-flow`'s `run_events` /
 //! `turn_log` / `plan_attempts` tables — three separate append-only logs collapsed into one.
 //!
+//! Conversation messages are written only through [`SessionLog`] (A-100/A-102), the typed handle
+//! that makes the session-shape invariant hold by construction — there is no unguarded
+//! "append a message" helper on the store to reach for instead.
+//!
 //! ```
-//! use flux_events::EventStore;
+//! use flux_events::{AssistantMessage, EventStore, SessionLog};
 //! use flux_core::Message;
 //!
 //! let store = EventStore::in_memory().unwrap();
 //! let s = store.create_session("claude-sonnet-4-6").unwrap();
-//! store.record_message(&s, &Message::user_text("hi")).unwrap();
-//! store.record_message(&s, &Message::assistant_text("hello")).unwrap();
+//! let mut log = SessionLog::open(&store, &s).unwrap();
+//! log.open_turn(Message::user_text("hi")).unwrap();
+//! log.close_turn(AssistantMessage::text("hello").unwrap()).unwrap();
 //! assert_eq!(store.conversation(&s).unwrap().len(), 2);
 //! ```
 

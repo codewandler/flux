@@ -3071,4 +3071,117 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Append a message to `stream` without the session log's shape check — the only way to put a
+    /// log into a state the typed seam refuses, which is what a crashed turn leaves behind in the
+    /// wild and what these two tests need as a starting point.
+    fn seed_raw_message(events: &EventStore, stream: &str, m: flux_core::Message) {
+        events
+            .append(stream, flux_events::NewEvent::message(m))
+            .unwrap();
+    }
+
+    /// A-102 **failing-first**: forking a session whose history ends mid-tool-pair — a `tool_use`
+    /// whose `tool_result` never landed, exactly what a crashed turn leaves — must be refused at
+    /// the fork's write seam, naming the invariant. Before this story the fork replayed the parent's
+    /// messages one at a time through the unguarded `record_message`, so the broken shape was copied
+    /// through unexamined and the child session 400'd on its first live turn.
+    #[tokio::test]
+    async fn fork_refuses_a_parent_history_that_ends_mid_tool_pair() {
+        let (dir, store, sid) = record_bind_session("mid-tool-pair").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let events = client.event_store();
+
+        // A valid alternation that is not a valid provider history: the last assistant message
+        // issues a tool call nothing ever answers.
+        seed_raw_message(&events, &sid, flux_core::Message::user_text("and again"));
+        seed_raw_message(
+            &events,
+            &sid,
+            flux_core::Message::assistant(vec![ContentBlock::ToolUse {
+                id: "orphan-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }]),
+        );
+        let source_len = events.load_stream(&sid, None).unwrap().len();
+
+        let session = client.open_session(&sid).unwrap();
+        let rendered = match session.fork(0).await {
+            Err(e) => e.to_string(),
+            Ok(f) => panic!(
+                "a fork of a mid-tool-pair history must be refused, not copied through — got {}",
+                f.id()
+            ),
+        };
+        assert!(
+            rendered.contains("tool_use") && rendered.contains("orphan-1"),
+            "the refusal must name the invariant it protects: {rendered}"
+        );
+
+        // And the refusal is not paid for out of the source stream: fork is a pure read of it.
+        assert_eq!(
+            events.load_stream(&sid, None).unwrap().len(),
+            source_len,
+            "forking must not append to the source stream"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The parent's history reaches the child as **one** checked rewrite, not one append per
+    /// message — the other half of moving this path onto `rewrite(ValidHistory)`.
+    #[tokio::test]
+    async fn fork_seeds_the_child_conversation_with_one_append() {
+        let (dir, store, sid) = record_bind_session("one-append").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let events = client.event_store();
+
+        // Four messages in the parent, so "one append per message" and "one append" differ.
+        seed_raw_message(&events, &sid, flux_core::Message::user_text("and again"));
+        seed_raw_message(&events, &sid, flux_core::Message::assistant_text("sure"));
+        let parent_history = events.conversation(&sid).unwrap();
+        assert_eq!(parent_history.len(), 4, "the parent has four messages");
+        let source_len = events.load_stream(&sid, None).unwrap().len();
+
+        let session = client.open_session(&sid).unwrap();
+        let fork = session.fork(0).await.unwrap();
+
+        assert_eq!(
+            events.conversation(fork.id()).unwrap(),
+            parent_history,
+            "the child starts from the parent's history"
+        );
+        assert_eq!(
+            events.load_by_kind(fork.id(), "compacted").unwrap().len(),
+            1,
+            "one Compacted event installs the whole history"
+        );
+        assert!(
+            events
+                .load_by_kind(fork.id(), "message")
+                .unwrap()
+                .is_empty(),
+            "no per-message append survives the migration"
+        );
+        assert_eq!(
+            events.load_stream(&sid, None).unwrap().len(),
+            source_len,
+            "forking must not append to the source stream"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

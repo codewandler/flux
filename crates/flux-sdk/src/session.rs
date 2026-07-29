@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use flux_core::Message;
 use flux_core::{PricingTable, Result, Usage};
-use flux_events::{EfficiencySummary, EventContext, ModelCost, RunDiff, TurnSummary};
+use flux_events::{
+    EfficiencySummary, EventContext, ModelCost, RunDiff, SessionLog, TurnSummary, ValidHistory,
+};
 use flux_flow::ast::DraftAst;
 use flux_flow::ast::RunEvent;
 use flux_flow::engine::FlowEngine;
@@ -397,10 +399,12 @@ impl Session {
                 ..Default::default()
             },
         )?;
-        // Copy the conversation so the fork's adaptive tail sees the same history.
-        for m in self.engine.events.conversation(&self.id)? {
-            self.engine.events.record_message(&fork_id, &m)?;
-        }
+        // Copy the conversation so the fork's adaptive tail sees the same history — as one checked
+        // rewrite (A-102). Checking it here is the point: a parent whose log ends mid-tool-pair
+        // would otherwise be copied through unexamined, and the child would 400 on its first live
+        // turn. The source stream is only read.
+        let history = ValidHistory::new(self.engine.events.conversation(&self.id)?)?;
+        SessionLog::open(&self.engine.events, &fork_id)?.rewrite(history)?;
         // Replay the prefix into the fork session. The replay is hermetic (cassette-served), so its
         // events don't need surfacing — discard them.
         let mut sink = DiscardSink;
