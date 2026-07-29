@@ -16,6 +16,21 @@ export default function prismIncludeLanguages(PrismObject) {
   // Flux-Lang (.flux) — hand-written grammar for the text syntax.
   PrismObject.languages.flux = {
     comment: /#.*/,
+    // Triple-quoted verbatim strings (L-39) must come first: they span lines, so the
+    // single-line `string` pattern below cannot match them, and `greedy` lets the block
+    // reclaim any `#` inside it that `comment` matched first (a `#` in a `"""` block is
+    // content, not a comment). Same arrangement Prism's own Python grammar uses.
+    'triple-quoted-string': {
+      pattern: /"""[\s\S]*?"""/,
+      greedy: true,
+      alias: 'string',
+      inside: {
+        interpolation: {
+          pattern: /\{[a-z_][a-z0-9_]*\}/,
+          alias: 'variable',
+        },
+      },
+    },
     string: {
       pattern: /"(?:\\.|[^"\\\r\n])*"/,
       greedy: true,

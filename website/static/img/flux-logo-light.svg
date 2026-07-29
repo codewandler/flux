@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 180" role="img" aria-labelledby="title desc">
+  <title id="title">flux</title>
+  <desc id="desc">Three plan rails cross a signal-green execution gate and resolve into one output.</desc>
+  <g transform="translate(18 16)">
+    <path fill="#141a18" d="M0 16h45c21 0 35 6 50 21l25 25v25L80 51c-9-8-18-11-33-11H0z"/>
+    <path fill="#141a18" d="M0 62h88v24H0z"/>
+    <path fill="#141a18" d="M0 108h47c15 0 24-3 33-11l40-36v25l-25 25c-15 15-29 21-50 21H0z"/>
+    <path fill="#0bbf83" d="M132 50h22v79h-22z"/>
+    <path fill="#141a18" d="M166 62h30l20 24-20 24h-30z"/>
+  </g>
+  <g fill="#141a18" transform="translate(270 10)">
+    <path d="M0 150V72c0-30 17-47 49-47h24v24H52c-16 0-23 7-23 23v9h40v23H29v46z"/>
+    <path d="M91 25h29v125H91z"/>
+    <path d="M143 81h29v43c0 10 5 15 15 15 11 0 17-7 17-18V81h29v69h-28v-11c-6 9-16 14-28 14-22 0-34-13-34-37z"/>
+    <path d="M251 81h33l16 21 16-21h33l-32 34 34 35h-34l-17-22-17 22h-34l34-35z"/>
+  </g>
+</svg>

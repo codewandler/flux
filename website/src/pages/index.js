@@ -2,6 +2,8 @@ import React from 'react';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
 import CodeBlock from '@theme/CodeBlock';
+import ThemedImage from '@theme/ThemedImage';
+import useBaseUrl from '@docusaurus/useBaseUrl';
 
 const HERO_FLOW = `flow triage-failures -> String
   $status = git_status()
@@ -34,7 +36,21 @@ export default function Home() {
           <div className="container home-hero-inner">
             <div>
               <p className="eyebrow">deterministic agent platform</p>
-              <h1>flux</h1>
+              {/*
+                The wordmark is the brand lockup from assets/flux-logo.svg, shipped as two
+                explicit files rather than one prefers-color-scheme SVG: the source asset keys
+                off the OS scheme, which would disagree with the site's own theme toggle.
+                The alt text carries the accessible name for the h1.
+              */}
+              <h1 className="home-wordmark">
+                <ThemedImage
+                  alt="flux"
+                  sources={{
+                    light: useBaseUrl('/img/flux-logo-light.svg'),
+                    dark: useBaseUrl('/img/flux-logo-dark.svg'),
+                  }}
+                />
+              </h1>
               <p className="hero-copy">
                 The model compiles a request into a typed Flux-Lang plan. A Rust runtime executes
                 that plan through authorization, approval, and guarded IO.
@@ -66,9 +82,9 @@ export default function Home() {
           <Card title="SDK" to="/docs/sdk/flow-client">
             Parse, analyze, optimize, and execute flows from Rust through the same safety envelope.
           </Card>
-          <Card title="Improvement" to="/docs/agent/improvement">
-            Measure repeatable tasks, inspect evidence, and keep harness changes only when evals show
-            a real gain.
+          <Card title="Security" to="/docs/security/overview">
+            Authorization, approvals, guarded IO, plugin confinement, and an opt-in OS sandbox — what
+            each one guarantees, and where the boundaries sit.
           </Card>
         </section>
       </main>
