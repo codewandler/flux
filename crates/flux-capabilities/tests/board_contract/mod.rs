@@ -16,6 +16,8 @@
 //! 4. `claim` is idempotent for the same assignee and conflicts for a different one.
 //! 5. `list` honours the declared page bounds and the `state` filter.
 //! 6. `comment` and `get` behave for present and absent ids.
+//! 7. **A dispatch is recorded durably** — `runner` + `task_id` survive a fresh read, replace on a
+//!    redispatch, and never move the state machine (A-130).
 
 #![allow(dead_code)]
 
@@ -42,6 +44,7 @@ pub async fn assert_work_board_contract(board: Arc<dyn WorkBoard>, ctx: &ToolCon
     claim_is_idempotent_for_one_assignee_and_conflicts_for_another(&board, ctx).await;
     list_honours_declared_page_bounds_and_the_state_filter(&board, ctx).await;
     comment_and_get_agree_about_which_items_exist(&board, ctx).await;
+    a_dispatch_is_recorded_and_survives_a_fresh_read(&board, ctx).await;
 }
 
 fn draft(title: &str) -> ItemDraft {
@@ -352,5 +355,66 @@ async fn comment_and_get_agree_about_which_items_exist(
             .await
             .is_err(),
         "claiming an absent id is an error"
+    );
+}
+
+/// A-130: the property that makes `docs/designs/fleet-coordinator.md` §5 true rather than
+/// aspirational. A backend that cannot answer "who is running this, under what handle" is not a run
+/// registry, and a coordinator restarted over it recovers nothing.
+async fn a_dispatch_is_recorded_and_survives_a_fresh_read(
+    board: &Arc<dyn WorkBoard>,
+    ctx: &ToolContext,
+) {
+    let item = create(board, ctx, "dispatched to a worker").await;
+    board
+        .claim(ctx, &item.id, "worker-1")
+        .await
+        .expect("claiming before dispatch");
+
+    let recorded = board
+        .record_dispatch(ctx, &item.id, "https://worker-1.internal:8787", "t_1")
+        .await
+        .unwrap_or_else(|error| panic!("record_dispatch failed: {error}"));
+    assert_eq!(
+        recorded.runner.as_deref(),
+        Some("https://worker-1.internal:8787")
+    );
+    assert_eq!(recorded.task_id.as_deref(), Some("t_1"));
+
+    // The only assertion that matters: a reader holding nothing but the board sees it.
+    let fresh = fetch(board, ctx, &item.id).await;
+    assert_eq!(
+        fresh.runner.as_deref(),
+        Some("https://worker-1.internal:8787"),
+        "the runner address must be durable, not returned-only"
+    );
+    assert_eq!(fresh.task_id.as_deref(), Some("t_1"));
+    assert_eq!(
+        fresh.state,
+        State::Claimed,
+        "recording a dispatch is a field write; the state machine is `transition`'s job alone"
+    );
+    assert_eq!(fresh.assignee.as_deref(), Some("worker-1"));
+    assert_eq!(fresh.attempts, 0, "recording a dispatch is not a retry");
+
+    // A retry dispatches the same item again, so the record must be replaceable rather than
+    // append-only — a stale task id would send the sweep after a run that no longer exists.
+    board
+        .record_dispatch(ctx, &item.id, "https://worker-2.internal:8787", "t_2")
+        .await
+        .expect("re-recording a redispatched item");
+    let replaced = fetch(board, ctx, &item.id).await;
+    assert_eq!(
+        replaced.runner.as_deref(),
+        Some("https://worker-2.internal:8787")
+    );
+    assert_eq!(replaced.task_id.as_deref(), Some("t_2"));
+
+    assert!(
+        board
+            .record_dispatch(ctx, "definitely-not-an-item", "https://w.example", "t_3")
+            .await
+            .is_err(),
+        "recording a dispatch against an absent id is an error"
     );
 }
