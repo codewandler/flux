@@ -16,19 +16,23 @@ jobs:
     name: build · test · clippy · fmt · layering
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain
         # Pinned, not `stable`: every Rust release ships new clippy lints that `-D warnings`
         # promotes to errors, so a floating CI toolchain breaks on code that is clean locally
         # (hit on the 1.96→1.97 bump, 2026-07-09). To bump: update the version here, run
         # both-workspace clippy/fmt locally on that same version, fix, commit.
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          # `master` above pins the action's *code* to a commit (C-187); the toolchain the tag used
+          # to encode is now an explicit — and, at this SHA, required — input. To bump: change the
+          # version here, run both-workspace clippy/fmt on it, fix, commit.
+          toolchain: "1.97.0"
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # The layering lint runs `cargo metadata --locked --offline`, which needs every lockfile
       # dep's manifest locally — including other-target deps (e.g. android_system_properties) that
@@ -65,21 +69,25 @@ jobs:
     name: plugins workspace · build · test · clippy · fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain
         # Pinned, not `stable`: every Rust release ships new clippy lints that `-D warnings`
         # promotes to errors, so a floating CI toolchain breaks on code that is clean locally
         # (hit on the 1.96→1.97 bump, 2026-07-09). To bump: update the version here, run
         # both-workspace clippy/fmt locally on that same version, fix, commit.
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          # `master` above pins the action's *code* to a commit (C-187); the toolchain the tag used
+          # to encode is now an explicit — and, at this SHA, required — input. To bump: change the
+          # version here, run both-workspace clippy/fmt on it, fix, commit.
+          toolchain: "1.97.0"
           components: rustfmt, clippy
 
       # The integration plugin pack (D-08) is a nested cargo workspace, EXCLUDED from the root workspace
       # (heavy vendor deps), so the `check` job above never builds it — gate it here in its own job.
       - name: Cache cargo (plugins)
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: plugins
 
@@ -106,7 +114,7 @@ jobs:
     # by `scripts/cut-release.sh`, so nothing else stops an edit shipping under a version already on
     # crates.io — where `cargo publish` would skip it and every consumer would keep the old code.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0 # the check diffs against the previous v* tag
 
@@ -114,6 +122,21 @@ jobs:
         run: |
           ./scripts/check-crate-versions.sh --self-test
           ./scripts/check-crate-versions.sh
+
+  action-pins:
+    name: third-party actions are pinned to a commit SHA
+    runs-on: ubuntu-latest
+    # C-187: a `uses:` on a movable tag hands whoever controls that upstream tag the code running in
+    # our workflows — including release.yml (crates.io publish) and release-plugins.yml (the Minisign
+    # signing key). Fail CI the moment an unpinned action reappears. Runs on the checkout only, so no
+    # Rust build is needed.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Every third-party action names a full commit SHA
+        run: |
+          ./scripts/check-action-pins.sh --self-test
+          ./scripts/check-action-pins.sh
 
   host-kit-protocol-drift:
     name: published host-kit is not behind the live protocol version
@@ -125,7 +148,7 @@ jobs:
     # This runs on every push to main (i.e. every flux release commit), not only inside the pack
     # workflow that may never be dispatched — so a flux cut tells you a pack release is now owed.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Published host-kit's protocol requirement is not behind the live protocol version
         run: |
@@ -152,7 +175,7 @@ jobs:
     # tag's Release repoints it at that old version. Backfilling v0.9.3 on 2026-07-29 did exactly
     # that to v0.33.0 until it was repaired.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Every version tag has a Release, and /releases/latest is the newest one
         env:
@@ -194,11 +217,14 @@ jobs:
     env:
       COMPAT_BASELINE_TAG: plugins-v0.1.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          # `master` pins the action's code (C-187); `toolchain` is now a required explicit input.
+          toolchain: "1.97.0"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: "Baseline (cross-time): a pack older than the protocol crate still speaks this host's protocol"
         env:
@@ -257,19 +283,22 @@ jobs:
       # Env-gated tests connect here; each test isolates itself in a throwaway `?schema=t_<ulid>`.
       TEST_POSTGRES_URL: postgres://flux:flux@localhost:5432/flux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain
         # Pinned, not `stable`: every Rust release ships new clippy lints that `-D warnings`
         # promotes to errors, so a floating CI toolchain breaks on code that is clean locally
         # (hit on the 1.96→1.97 bump, 2026-07-09). To bump: update the version here, run
         # both-workspace clippy/fmt locally on that same version, fix, commit.
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          # `master` above pins the action's code (C-187); `toolchain` is now an explicit (required)
+          # input rather than carried by the ref.
+          toolchain: "1.97.0"
           components: clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # `flux-pg` is always Postgres (no `postgres` feature to toggle); the two backend crates gate it.
       # NB: flux-pg, flux-events, and flux-capabilities are in the crates.io publish closure, so their
