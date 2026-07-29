@@ -78,7 +78,9 @@ Without it, a retry duplicates the event.
 
 Under extreme contention SQLite can still return busy after the 5s window. Callers must not
 silently drop the write — `flow_cmd.rs:685` states the invariant: a recording failure must be
-visible at record time. `record_message` `?`-propagates and aborts the turn; keep it that way.
+visible at record time. The conversation write `?`-propagates and aborts the turn; keep it that way.
+(A-102 removed `EventStore::record_message`, which this rule used to name; the rule is unchanged and
+now binds the typed `SessionLog` writes that replaced it.)
 
 ### R5 — keep the WAL sidecar files together
 

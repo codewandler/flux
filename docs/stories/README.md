@@ -54,6 +54,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-195 — Decide and enforce redaction on the approval sheet's diff preview](C-195-approval-sheet-redaction.md) · Core · SPLIT FROM C-185 item 4 — flux-tui performs NO redaction at all (no flux-secret dep, no Redactor in the crate); covering the approval sheet's hunk preview is a new dependency edge plus a design decision, not a boundary-set change
 - [C-210 — gather_safe never reads semantic_effects, so an op can be pre-approval reachable and still declare a durable write](C-210-gather-safe-ignores-semantic-effects.md) · Core · SURFACED BY the C-208 review — web.fetch is the first op that is gather-safe AND self-declares write_db; is_consequence_bearing mirrors gather_safe exactly, and neither classifier looks at semantic_effects
 
+### Typed session log — session-shape validity by construction
+- [C-211 — Validate the parent history before minting the fork's child session, and test the CLI refusal](C-211-fork-validates-before-minting-child.md) · Core · SURFACED BY the A-102 review — the refusal path is new, and both fork sites create the child before they know the parent is forkable; the CLI's copy of the logic has no test at all
+
 ## Blocked
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
 
