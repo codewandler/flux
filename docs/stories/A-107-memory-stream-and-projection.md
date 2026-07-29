@@ -2,7 +2,8 @@
 id: A-107
 title: "The memory stream — MemoryEntry projection over an append-only memory:<scope> stream"
 pillar: Agent
-status: backlog
+status: ready
+priority: 15
 epic: evidence-pinned-memory
 design: docs/designs/evidence-pinned-memory.md
 note: "cross-session memory needs its own stream in the SAME events.db, not a side table — inherits multi-process safety (C-25/C-125), WAL hygiene (C-126), the PG backend and flush-seam redaction for free"

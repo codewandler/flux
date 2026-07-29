@@ -49,6 +49,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
 - [C-92 — Add hunk-level git_* ops so an agent can stage part of a shared file](C-92-git-hunk-level-ops.md) · Core · whole-file git_stage forces sweeping a coworker's in-flight hunks into an agent commit; the split-file case has no tool
 
+### Evidence-pinned memory — cross-session memory with provenance
+- [A-107 — The memory stream — MemoryEntry projection over an append-only memory:<scope> stream](A-107-memory-stream-and-projection.md) · Agent · cross-session memory needs its own stream in the SAME events.db, not a side table — inherits multi-process safety (C-25/C-125), WAL hygiene (C-126), the PG backend and flush-seam redaction for free
+
 ### Fleet coordinator — flux orchestrating flux across repos
 - [A-116 — Outbound A2A dispatch — client cancel, A2aSpawner, and fleet.dispatch/status/cancel](A-116-a2a-outbound-dispatch.md) · Agent · the A2A server task surface is already done (A-53…A-57 in flux-server); this is the missing client half — A2aClient has no cancel, and only the flux a2a REPL can reach it
 
@@ -64,6 +67,9 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
 - [C-217 — `sandbox on` reports its resolved posture instead of degrading silently](C-217-sandbox-on-reports-resolved-posture.md) · Core · the prerequisite the epic deferred the default-flip behind — `on` + no backend returns Ok and says nothing, so an operator who asked to be sandboxed is told nothing when they are not
 - [C-218 — `git_diff` honours external diff drivers, so its I1 exemption claims more than it can hold](C-218-git-diff-external-driver.md) · Core · the exemption's stated grounds are 'argv is fixed by the op, never a caller-supplied program name' — but `git diff` without --no-ext-diff runs whatever diff.external names, so fixed argv does not mean fixed behaviour
+
+### Transactional turns — a compensating undo for the world, not just the session
+- [A-103 — The Compensation contract on ToolSpec — every mutating op declares how it is reversed](A-103-compensation-contract-on-toolspec.md) · Agent · Inverse | Snapshot | NotNeeded | None{why}; a registry-walk test fails on any mutating built-in with no declaration, which is what stops the contract rotting as ops are added
 
 ### Typed session log — session-shape validity by construction
 - [C-211 — Validate the parent history before minting the fork's child session, and test the CLI refusal](C-211-fork-validates-before-minting-child.md) · Core · SURFACED BY the A-102 review — the refusal path is new, and both fork sites create the child before they know the parent is forkable; the CLI's copy of the logic has no test at all
@@ -93,7 +99,6 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
 
 ### Evidence-pinned memory — cross-session memory with provenance
-- [A-107 — The memory stream — MemoryEntry projection over an append-only memory:<scope> stream](A-107-memory-stream-and-projection.md) · Agent · cross-session memory needs its own stream in the SAME events.db, not a side table — inherits multi-process safety (C-25/C-125), WAL hygiene (C-126), the PG backend and flush-seam redaction for free
 - [A-108 — memory_note — the op whose citation the model cannot supply, forge, or omit](A-108-memory-note-op-host-stamped-citation.md) · Agent · the epic's load-bearing invariant: the model supplies the claim, the HOST supplies the receipt + git SHA + paths — same property that makes ActionBatch trustworthy (staged.rs:203)
 - [A-109 — Inject memory as ContextBlocks with git-pin staleness computed at turn assembly](A-109-memory-injection-and-staleness.md) · Agent · stale entries are STILL injected, marked stale='true' with the reason — dropping them silently loses real knowledge; reuses the A-21-hardened, A-24-budgeted <knowledge-base> seam rather than a second injection path
 - [A-110 — flux memory list/show/forget — the inspect surface and the --stale review queue](A-110-flux-memory-cli.md) · Agent · `--stale` is the maintenance loop — the review queue for knowledge whose evidence moved; flux never silently forgets on the agent's behalf, pruning is a user verb
@@ -136,7 +141,6 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
 
 ### Transactional turns — a compensating undo for the world, not just the session
-- [A-103 — The Compensation contract on ToolSpec — every mutating op declares how it is reversed](A-103-compensation-contract-on-toolspec.md) · Agent · Inverse | Snapshot | NotNeeded | None{why}; a registry-walk test fails on any mutating built-in with no declaration, which is what stops the contract rotting as ops are added
 - [A-104 — Materialize reverse actions — pre-image capture at the dispatch seam + EventKind::Compensated](A-104-preimage-capture-and-compensated-event.md) · Agent · capture runs inside the guarded boundary immediately before execution (NOT at approval time — prior bytes aren't knowable then); BREAKING: EventKind is a closed set, a new variant ⇒ MINOR
 - [A-105 — flux undo --turn <n> — reverse-batch reconstruction, LIFO execution, itemized report](A-105-flux-undo-turn.md) · Agent · the epic's headline verb; undo is NOT privileged — it runs through the ordinary approval + guarded envelope, so the undo itself records compensations and is undoable
 - [A-106 — Irreversibility disclosure — surface 'cannot be undone' at approval and to policy](A-106-irreversibility-disclosure-at-approval.md) · Agent · the risk signal that IS available at approval time because declaration is static; rides the C-182 op list + C-154 risk tint rather than adding a new sheet
