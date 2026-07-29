@@ -2,7 +2,7 @@
 id: A-93
 title: "Typed session log — session-shape validity by construction (epic)"
 pillar: Agent
-status: in-progress
+status: done
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
 note: "EPIC — make the invalid provider-history shapes (split tool_use/tool_result, empty assistant, user-after-user) unrepresentable in the session log's type; the thrice-recurred bug class becomes unwritable instead of test-guarded"
@@ -21,14 +21,14 @@ tool_use/tool_result pair, or a user-after-user sequence — the bug class becom
 the pre-release live-provider gate stops being the only net that catches it.
 
 ## Acceptance
-- [ ] A design doc (`docs/designs/typed-session-log.md`) covering: the typed log states and legal
+- [x] A design doc (`docs/designs/typed-session-log.md`) covering: the typed log states and legal
       transitions, how every turn-termination path (stop, cancel, compaction, iteration cap, and
       any future path) appends through the one typed API, the migration of existing history
       handling in `flux-flow`, and the provider-wire seam where the typed log projects to each
       codec's message shape.
-- [ ] The epic is broken into implementation stories on the board; each behavioral change ships
+- [x] The epic is broken into implementation stories on the board; each behavioral change ships
       with a failing-first test.
-- [ ] Headline proof: the three historical invalid shapes are unrepresentable (rejected at compile
+- [x] Headline proof: the three historical invalid shapes are unrepresentable (rejected at compile
       time or by the log's only constructors), pinned by a hermetic shape gate that would have
       caught all three past regressions without a live provider 400.
 
@@ -71,3 +71,12 @@ the pre-release live-provider gate stops being the only net that catches it.
   pre-release gate in docs/roadmap.md); validity-by-construction closes that structural gap.
 - Smallest of the three re-assessment suggestions; purely internal, no user-visible behavior
   change when done right.
+- 2026-07-29 — **A-102 DONE, and the epic closes with it.** The SDK/CLI rewriters (session fork,
+  `whatif` re-plan, CLI fork) build a `ValidHistory` and install it with one `SessionLog::rewrite`,
+  and `EventStore::record_message`/`record_compaction` are **deleted** — the breaking cutover A-101
+  deferred. The headline proof holds: the three historical invalid shapes have no constructor. The
+  bug class is unwritable rather than test-guarded, and the migration turned up **three live bugs**
+  of exactly that family on the way (compaction's `user`-after-`user`, a flow-driven session opening
+  on an `assistant` message, and a fork copying a mid-tool-pair history into its child) — each one
+  reachable in ordinary use, none caught by the mock provider. That is the epic's own argument for
+  itself, made in evidence rather than in prose.

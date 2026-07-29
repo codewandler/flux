@@ -2,7 +2,7 @@
 id: A-102
 title: "Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()"
 pillar: Agent
-status: in-progress
+status: done
 priority: 4
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
@@ -48,6 +48,12 @@ inherit no shape guarantee at all and pay N appends for one logical operation. M
 - Where a fixture genuinely needs a shape the typed seam refuses (the `append` transactionality and
   C-124/C-126 contention tests; the TUI projection over a log that opens on an assistant message),
   it now calls `store.append(.., NewEvent::message(..))` explicitly, with a comment saying why.
+
+- 2026-07-29 — **integrated.** Merged to `main` as `a88edf56` (implementor commit `1c5515a2`); full
+  gate re-run green on the integration branch — workspace build, 144 test suites, clippy
+  `-D warnings`, `cargo fmt --check` in both the root and `plugins/` workspaces, and `flux-codegate`.
+  Closes the **typed session log** epic (A-93). **The next release cut is a MINOR** — the removal is
+  a breaking change to the published `codewandler-flux-events`.
 
 ## Notes
 - Design: [typed-session-log.md](../designs/typed-session-log.md).

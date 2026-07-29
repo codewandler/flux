@@ -30,7 +30,21 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   checked when they load: they still work, but flux names how many of their operations understate
   themselves so you can weigh that when approving.
 
+### Action needed
+
+- **If you embed flux in your own Rust program, two conversation-writing methods are gone.** The
+  event store used to let you append a conversation message directly, with nothing checking that the
+  result was a conversation a model would accept. Those two shortcuts have been removed rather than
+  deprecated — leaving them next to the checked path is how the broken sessions kept happening. Use
+  the session-log handle instead; the underlying append is still available if you genuinely need to
+  write an unusual shape.
+
 ### Fixed
+
+- **Forking a session no longer hands you a copy that fails immediately.** If you forked a session
+  whose last action was still waiting on a result, the fork copied that half-finished state into the
+  new session, and the new session then failed on its very first message. Forking now refuses up
+  front and tells you why, instead of giving you a session that was already broken.
 
 - **Project guidance files in subfolders no longer load.** `.flux/context.d/` is documented as a flat
   folder — the whole point being that one look tells you everything that can reach the agent. It was

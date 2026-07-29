@@ -10,21 +10,24 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 > and the `## Status` summary) lives outside the generated region.
 
 ## Status
-- **Released:** v0.33.0 (2026-07-29) — a MINOR closing the **TUI polish round 2** epic
-  (C-149…C-157: gutter rail, three new palettes, one overlay language, effect-tiered approval
-  sheet, empty-state card, double-Ctrl-C quit) and the **event-store concurrent use** epic
-  (C-124…C-126: contention warnings, a real multi-process proof, WAL truncation), plus
-  **`flux export <run>`** (C-132) — a recorded run as one self-contained, redacted HTML file.
-  Breaking (embedders only): `ApprovalRequest` gains `mutating`. See
+- **Released:** v0.34.0 (2026-07-29) — a MINOR carrying most of the **security assurance** epic
+  (C-187…C-190, C-192, C-193, C-194: SHA-pinned Actions, advisory scanning, server body/time limits,
+  an authenticated-by-construction router, the SQLite statement allowlist) and the first three
+  stories of the **typed session log** epic (A-99…A-101), which fixed three live invalid-history
+  bugs on the way. Breaking (embedders only): the `flux-server` router constructors. See
   [CHANGELOG](../../CHANGELOG.md) and the [roadmap](../roadmap.md).
-- **Unreleased on `main`:** C-158 (live output on running `bash` cards), C-47 (the release-tag
-  fleet audit that closes N-001), A-99 (session-shape rules as types), and A-100 (the `SessionLog`
-  typed write seam). Next cut is a MINOR.
-- **Focus:** the **typed session log** epic — A-99 and A-100 are in; next is **A-101** (migrate
-  flux-flow's engine/compaction/resurrect onto the handle and delete the unguarded
-  `record_message`/`record_compaction`, **breaking**), then A-102 for the SDK/CLI rewriters.
-- **Epics in flight:** **security assurance** (C-186) is most of the way through — C-187, C-188,
-  C-189, C-190, C-192, C-193 done; C-194 (the mechanical no-direct-IO lint) and C-191 remain.
+- **Unreleased on `main`:** C-191 (ToolSpec coherence gated on every build), C-206 (flat fragment
+  discovery), C-207 (`KUBECONFIG` forwarded to `kubectl`), C-208 (coherence over the full production
+  catalog), C-209 (the fixture `TMPDIR` race), and A-102 (the history rewriters on `rewrite()`).
+  **Next cut is a MINOR** — A-102 removes `EventStore::record_message`/`record_compaction` from the
+  published `codewandler-flux-events`.
+- **Focus:** the **typed session log** epic (A-93) is **complete** — A-99 (shape types) → A-100
+  (the typed handle) → A-101 (flux-flow migration) → A-102 (SDK/CLI rewriters + the breaking
+  deletion). The three historical invalid provider-history shapes now have no constructor, so the
+  bug class that recurred three times is unwritable rather than test-guarded.
+- **Epics in flight:** **security assurance** (C-186) is nearly closed — C-187…C-194 are done;
+  **C-195** (approval-sheet redaction) and **C-210** (`gather_safe` ignores `semantic_effects`)
+  remain, C-205 is blocked on the ratatui 0.29 hold.
   **Website truth and identity** (C-196; C-197…C-204) is **complete** — the public site's four
   actively wrong claims are corrected, and its durable output is six coverage assertions in
   `website_contract.rs` (13 → 18 tests) so an undocumented route, op, config key, subcommand or
@@ -41,8 +44,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Now (in progress)
 - [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
-- [A-93 — Typed session log — session-shape validity by construction (epic)](A-93-typed-session-log-epic.md) · Agent · EPIC — make the invalid provider-history shapes (split tool_use/tool_result, empty assistant, user-after-user) unrepresentable in the session log's type; the thrice-recurred bug class becomes unwritable instead of test-guarded
-- [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-131 — flux policy simulate — replay a proposed policy against recorded history](C-131-policy-simulate.md) · Core · before adopting a policy edit, replay it over the last N sessions' recorded ops: 'this change would have blocked these 12 ops and newly-allowed these 3', as a diff-style report; pure read over the event log + existing policy evaluator; the trust-builder for approval distillation (C-94)
@@ -52,9 +53,6 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-186 — Security assurance — close the gap between the envelope and its proof (epic)](C-186-security-assurance-epic.md) · Core · REVIEW EPIC — every child traces to a CONFIRMED finding in one of the two 2026-07-29 adversarial reviews (desk review + envelope-integrity); architecture rated 8/10 while assurance rated 5/10, and the spread is the work
 - [C-195 — Decide and enforce redaction on the approval sheet's diff preview](C-195-approval-sheet-redaction.md) · Core · SPLIT FROM C-185 item 4 — flux-tui performs NO redaction at all (no flux-secret dep, no Redactor in the crate); covering the approval sheet's hunk preview is a new dependency edge plus a design decision, not a boundary-set change
 - [C-210 — gather_safe never reads semantic_effects, so an op can be pre-approval reachable and still declare a durable write](C-210-gather-safe-ignores-semantic-effects.md) · Core · SURFACED BY the C-208 review — web.fetch is the first op that is gather-safe AND self-declares write_db; is_consequence_bearing mirrors gather_safe exactly, and neither classifier looks at semantic_effects
-
-### Typed session log — session-shape validity by construction
-- [A-102 — Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()](A-102-migrate-sdk-cli-history-rewriters.md) · Agent · fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N
 
 ## Blocked
 - [C-205 — Bump lru to >= 0.16.3 and drop the RUSTSEC-2026-0002 advisory ignore](C-205-bump-lru-drop-unsound-ignore.md) · Core · SURFACED BY C-188 — lru 0.12.5 carries an *unsound* (not vulnerable) advisory reachable only via LruCache::iter_mut; the clean fix is a Cargo.lock bump, which was out of C-188's fence
@@ -198,6 +196,7 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-88 — Supervise sub-agent cancellation through durable cleanup](A-88-supervise-child-cancellation.md) · Agent · parent cancellation drops the child future without the bounded cleanup used by deadline expiry
 - [A-89 — Make App own delivery serialization](A-89-app-delivery-serialization.md) · Agent · verification-first residual — direct or independently wrapped App delivery may bypass adapter-local serialization
 - [A-90 — Keep host channel operations available after adaptive routing](A-90-ambient-adaptive-operations.md) · Agent
+- [A-93 — Typed session log — session-shape validity by construction (epic)](A-93-typed-session-log-epic.md) · Agent · EPIC — make the invalid provider-history shapes (split tool_use/tool_result, empty assistant, user-after-user) unrepresentable in the session log's type; the thrice-recurred bug class becomes unwritable instead of test-guarded
 - [A-94 — Mid-turn steering — queue user guidance into a running turn](A-94-mid-turn-steering.md) · Agent · a running turn is take-it-or-Ctrl-C today; let the user type while the agent executes — the message queues and injects at the next planner consultation as a steering block, without cancelling in-flight ops or losing the turn; the multipass loop already re-consults, so the seam exists
 - [A-95 — Freeze the advertised tool set within a turn — stop cold-writing the prefix mid-loop](A-95-freeze-advertised-tool-set-per-turn.md) · Agent · `req.tools` is rebuilt every explore round from selected_specs_for_state (staged.rs:1098) and capability_signal expands it mid-loop; tools render BEFORE system, so one expansion invalidates every system breakpoint too and the next round pays a full cold write
 - [A-96 — Second-opinion op — consult a different model for advice, never effects](A-96-second-opinion-op.md) · Agent · every escalation path today carries authority (sub-agents are policy-bounded but still act); a PURE consult op adds no new authority to the envelope at all — provider/model routing already exists (args.rs:82-97), so this is a read-only op over machinery that ships
@@ -205,6 +204,8 @@ _Every mainstream agent framework lets the LLM *be* the control flow, so its run
 - [A-98 — Agent-set wake-up — let a turn schedule its own resumption](A-98-agent-set-wakeup.md) · Agent · the schedule adapter (flux-channels/src/adapters/schedule.rs) is cron-driven and AUTHOR-declared — nothing lets the agent say 'check this again in 20 minutes'; the substrate exists (await/suspension + durable journeys + the event log), so this is a new op over shipped machinery, not new machinery
 - [A-99 — ValidHistory + AssistantMessage smart constructors — the session-shape rules as types](A-99-valid-history-smart-constructors.md) · Agent · the shape rules become constructors that reject invalid input, unit-tested standalone before any call site moves; absorbs compaction's ad-hoc has_tool_result snapping (engine.rs:1629) into the type
 - [A-100 — SessionLog typed handle — a turn-lifecycle state machine at the write seam](A-100-session-log-typed-handle.md) · Agent · open/open_turn/close_turn/rewrite over a Tail state derived from the store; makes user-after-user an illegal transition rather than a silent append
+- [A-101 — Migrate flux-flow onto the typed log and delete the unguarded write API](A-101-migrate-flux-flow-onto-typed-log.md) · Agent · BREAKING (published crate) — record_message/record_compaction are removed, not deprecated, per the clean-cutover rule; resurrect.rs:438's hand-mirrored finish_turn ordering becomes the enforced one
+- [A-102 — Migrate the SDK/CLI history rewriters (fork, whatif, export) onto rewrite()](A-102-migrate-sdk-cli-history-rewriters.md) · Agent · fork and whatif replay history message-by-message through the raw API today — rewrite() gives them the shape guarantee AND one append instead of N
 - [C-01 — Crate consolidation, phases 2–4](C-01-crate-consolidation.md) · Core · hooks→plugin, browser+datasource→capabilities, context→runtime; removed dead integrations (35 → 31 crates)
 - [C-02 — Integration-stack hardening — embeddings backend, plugin install/call + CI, live smoke](C-02-integration-stack-hardening.md) · Core · `flux plugin call`/`install` + a `plugins/` CI job (`a8092dc`); feature-gated embeddings/semantic backend — `OpenAiEmbedder` + a `SemanticIndex` hybrid-rerank decorator, default build unchanged (`f912c24`); a live env-gated `scripts/smoke-plugins.sh` (`5fda8be`)
 - [C-03 — Codex provider hardening — account-id, usage tiers, reasoning continuity](C-03-codex-provider-hardening.md) · Core · `account_id` from the `id_token` JWT, cache+reasoning token capture, reasoning continuity under `store:false`

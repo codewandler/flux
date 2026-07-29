@@ -30,6 +30,23 @@ All notable changes to this project are documented in this file. The format is b
   green runs on the integration branch, on top of 80 in the implementor's tree. All changes are
   `#[cfg(test)]`; no production code moved.
 
+### Changed
+
+- **The history rewriters run through the typed seam, and the unguarded write API is gone (A-102).**
+  Session fork, `whatif` re-plan and the CLI's fork replayed a parent conversation *message by
+  message* through `EventStore::record_message`, so they inherited no shape guarantee at all: a fork
+  of a session whose log ended on an unanswered `tool_use` copied that broken shape into the child
+  unexamined, and the child 400'd on its first turn against any provider enforcing the Messages
+  contract. All three now build a `ValidHistory` and install it with one `SessionLog::rewrite` — the
+  shape is checked once, and N appends collapse to one. **Breaking:** `EventStore::record_message`
+  and `EventStore::record_compaction` are **removed** from the published
+  `codewandler-flux-events`, completing the deletion A-101 deferred. This is a clean cutover, not a
+  deprecation — leaving the shorter unguarded name beside the typed handle would recreate the bypass
+  the epic exists to close. `EventStore::append` + `NewEvent::message` remain public and equivalent:
+  the conversation-shaped convenience name is gone, not the capability, and the store's own
+  event-log and contention fixtures still write deliberately off-shape logs through it. Closes the
+  **typed session log** epic (A-99 → A-102).
+
 ### Added
 
 - **Metadata coherence is gated over the full production catalog, not just the built-ins (C-208).**

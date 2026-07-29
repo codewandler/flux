@@ -2,7 +2,7 @@
 id: A-101
 title: "Migrate flux-flow onto the typed log and delete the unguarded write API"
 pillar: Agent
-status: in-progress
+status: done
 priority: 1
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
@@ -35,7 +35,7 @@ a clean cutover, not a deprecation.
       ordering is no longer something a reader must replicate by hand.
 - [x] The resurrect path can no longer write an empty assistant message (it currently calls
       `Message::assistant_text(answer)` with no non-empty check) — pinned by a test.
-- [ ] **DEFERRED TO A-102** — `EventStore::record_message` and `record_compaction` no longer exist. **breaking** — a
+- [x] **DELIVERED BY A-102** — `EventStore::record_message` and `record_compaction` no longer exist. **breaking** — a
       published crate surface ⇒ next release is a MINOR per the pre-1.0 rule; note it in the
       CHANGELOG's breaking list.
 - [x] `cancellation_keeps_a_valid_user_assistant_session_shape` (`engine.rs:4239`) stays green
@@ -50,6 +50,9 @@ a clean cutover, not a deprecation.
   fails on the old inline walk-back with *"two User messages in a row at index 1 — broken
   alternation"*. The bug was live for every session past the threshold with ≥ 4 messages.
 - **The deletion is the one open box** and moved to A-102 — see the note below.
+- 2026-07-29 — **closed.** The migration shipped in **v0.34.0**; the deferred deletion landed with
+  A-102 on `main` (`1c5515a2`, merged `a88edf56`), so every box is now satisfied. Nothing in the
+  workspace reaches the unguarded pair — it does not exist.
 
 ## Notes
 - **Why the deletion moved to A-102.** Removing `record_message`/`record_compaction` breaks every
