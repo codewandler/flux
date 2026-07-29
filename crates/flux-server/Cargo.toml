@@ -21,6 +21,10 @@ flux-flow.workspace = true
 flux-runtime.workspace = true
 flux-system.workspace = true
 axum.workspace = true
+# C-189: request TimeoutLayer that returns a real `408` (tower's own timeout surfaces an error we
+# would have to hand-map to a response; tower-http's is Infallible-clean for axum). The body cap
+# uses axum's built-in `DefaultBodyLimit` — no dependency needed there.
+tower-http = { version = "0.6", features = ["timeout"] }
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
