@@ -85,6 +85,35 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### Fleet coordinator — flux orchestrating flux across repos (epic) — 🔄 **DESIGNED (A-111; A-112…A-118 filed, none started)**
+
+The ask was a first-level orchestration harness: cross-repo work, Jira, a global board, remote
+agents dispatched and monitored, status reported back — and the assumption was that it needed a
+second app beside the coding agent. Reading the tree said otherwise. **`flux-app` is already that
+harness**: it runs a `.flux` Program of agents/channels/datasources/triggers/journeys over a bus and
+a delivery supervisor, `flux-channels` already supplies cron/webhook/slack/a2a adapters, and
+`plugins/jira` already has issue CRUD, transitions and search. The coordinator is a *Program*, not a
+binary. What is actually missing is narrower and more interesting. The state source flux would want
+already exists in shape — `LiveDatasource` (`datasource/live.rs:60`) has a backend declare its
+entities, filters and external authority, validates it once, and then *generates* uniform ops with
+stable permission subjects, a tool group and an ambient signal — but it is **read-only**, and a board
+needs create/transition/claim/comment. So the centre of this epic is **A-113**, a write-capable
+`WorkBoard` sibling carrying a typed state machine (`Ready → Claimed → InProgress → Review → Done`,
+plus `Blocked`/`Failed`) whose `transition` rejects an illegal edge *without writing* — purpose-built
+rather than generic precisely so the coordinator can reason over dependency waves and stuck items
+instead of shuffling opaque rows, with markdown, Jira, in-memory and GitLab backends behind one
+contract suite. Two findings sharpened the rest. The A2A **server** task surface is already complete
+(A-53…A-57, `flux-server/src/a2a.rs`); the gap is the **client** — `A2aClient` has no `cancel` and
+its only caller is the `flux a2a` REPL, so no journey can dispatch anywhere (**A-116**). And run
+state dissolves entirely: `fleet.dispatch` writes the `task_id` back onto the board item, so the
+board *is* the run registry and crash recovery is "restart, sweep, re-derive". The load-bearing
+blocker is none of that: `flux-channels` documents that deliveries are serialized by the shared
+`App` and that "cross-channel parallelism needs per-delivery bus isolation" (`lib.rs:20`), so a
+coordinator whose nightly sweep blocks webhook intake is single-threaded by construction — **A-112**
+lands first, and it is likely a MINOR. Done looks like `flux run coordinator.flux --serve` driving an
+intake → dispatch → sweep → done cycle offline in CI against `MemoryBoard` and a stub worker. Design:
+[designs/fleet-coordinator.md](designs/fleet-coordinator.md).
+
 ### Website truth and identity — the public site tells the truth and looks like the product (epic) — 🔄 **DESIGNED (C-196; C-197…C-204 filed, none started)**
 
 A 2026-07-29 audit of all 64 pages under `website/docs/` against the tree at `0.33.1` found the
