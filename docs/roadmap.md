@@ -85,6 +85,37 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### Cross-harness session history — search what was already said, in any local harness (epic) — 🔄 **DESIGNED (C-212; C-213…C-216 filed, none started)**
+
+The ask was a datasource: `search(query: "why did we drop the retry wrapper", harness: "opencode")`
+over `flux | codex | claude-code | opencode`. Reading the tree said the acquisition half is already
+built and shipping. **`flux usage` locates, opens and parses all four harnesses today** —
+`$CODEX_HOME`/`~/.codex/sessions` and `$CLAUDE_CONFIG_DIR`/`~/.claude/projects` as JSONL,
+`~/.local/share/opencode/opencode.db` as SQLite, flux's own event store — and its parsers walk
+**exactly the objects that hold the message text** before taking only `usage` and `model` out of them
+(`usage.rs:963-969`, `:1058-1125`, `:1214-1220`). The content is in hand at every site and dropped one
+field short. So the extraction is one field wide, and the epic's weight sits somewhere else entirely.
+Harness history is a **category of input flux has never ingested**. Every existing datasource reads
+something the operator deliberately pointed at — a markdown tree, an OpenAPI file, a page just
+fetched. This one reads *every project the user has ever worked in*, from outside the workspace jail;
+it is secret-bearing by construction, because a conversation log is precisely where credentials get
+pasted; and it is verbatim adversarial text that an attacker can pre-load once and have retrieved
+forever after. All three land on the same `<knowledge-base>` block A-21 had to escape. The design
+consequence is that **C-215 carries the whole containment envelope rather than deferring it** — off
+unless explicitly enabled, escaped at ingest, redacted at ingest rather than at render (the C-195
+lesson mirrored: that surface has nothing downstream, this one has everything downstream), and a
+per-harness permission subject so a policy can allow `flux` and deny the rest. Splitting "ship it"
+from "make it safe" would make the unsafe version the shipped version, and the epic's entire risk
+lives in that window. The other genuinely hard part is a budget: a usage record is per-turn and eight
+integers, a message record is per-message and carries full text, so the same scan produces one to
+three orders of magnitude more output against directories holding years of history — the inherited
+`MAX_JSONL_FILES`/`MAX_JSONL_FILE_BYTES` caps are necessary and not sufficient. Strictly sequential
+(C-213 → C-216), no fan-out; no new crate (`flux-capabilities`, L5, already owns the datasource and
+`rusqlite`); read-only against every foreign harness, always. Done looks like a redacted, escaped,
+addressable message returned from a real opencode database — and a test proving a disabled datasource
+performs **zero** reads outside the workspace. Design:
+[designs/harness-history.md](designs/harness-history.md).
+
 ### Fleet coordinator — flux orchestrating flux across repos (epic) — 🔄 **DESIGNED (A-111; A-112…A-118 filed, none started)**
 
 The ask was a first-level orchestration harness: cross-repo work, Jira, a global board, remote
