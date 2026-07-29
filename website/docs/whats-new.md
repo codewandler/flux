@@ -14,6 +14,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **See what a permission change would have done, before you adopt it.** `flux policy simulate
+  proposed.toml` replays your recorded history against a proposed set of permissions and shows what
+  it would newly block, newly allow, and leave alone — so changing what flux is allowed to do stops
+  being a guess. Add `--json` to feed it to other tooling. It only reads: nothing is recorded and no
+  model is called. Where your history does not contain enough detail to re-decide an action, it says
+  so explicitly instead of guessing, because a confident wrong answer would be worse than an honest
+  gap.
+
 - **flux can now stage just its own changes in a file you are also editing.** Previously, if the
   agent and you had both edited the same file, staging was all-or-nothing: it either swept your
   unfinished edits into its commit or gave the job back to you. It can now list a file's individual

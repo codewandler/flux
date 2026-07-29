@@ -108,6 +108,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flux policy simulate` — replay a proposed policy against recorded history (C-131).** Adopting a
+  policy edit meant guessing what it would do. `flux policy simulate <proposed.toml> [--sessions N]
+  [--json]` evaluates the active and proposed policies over the same recorded op history and reports,
+  diff-style, what it would newly block, newly allow, and leave unchanged. Pure read: no event is
+  appended and no provider is constructed.
+  **The interesting property is what it refuses to answer.** An op whose recorded context cannot
+  re-decide it is reported `indeterminate` with a reason, never folded into blocked/allowed — because
+  a simulation that is confidently wrong is worse than one that admits a gap, when the operator's
+  whole reason to run it is to stop guessing. An independent review proved two ways it could have
+  been confidently wrong, and both are closed. The caller-fact bracket was three *independent
+  single-axis* probes, so a grant gated on two omitted facts at once escaped it entirely — a proposal
+  converting an approval-gated `process.exec` into a silent allow reported `unchanged, 0
+  indeterminate`. `evaluate` is monotone in trust/scopes/groups, so a two-point check is sound, but
+  only between the **joint** minimum and maximum; the per-axis probe now survives only to *attribute*
+  which fact moved a verdict, never to decide whether one is knowable.
+  The principal-kind refusal never fired, because `SubjectKind::User` is itself kind-discriminating —
+  making the "assume user" substitution load-bearing for the entire built-in floor, and inverting
+  verdicts for the token-authenticated service principals that `flux app run --serve` records into the
+  same store. Kind is categorical rather than ordered, so it is now **enumerated** rather than
+  bracketed, and the recorder writes an additive `caller_kind` on each dispatch. Records written
+  before that key remain honestly indeterminate.
+  Four further limits are disclosed in the report rather than left for a reader to discover:
+  `newly_allowed` cannot observe a deny→allow transition (the gate refuses before the observation is
+  written), only the mandatory policy floor is replayed, a bounded `--sessions` window is echoed as a
+  window, and a malformed `subjects` list now refuses the record instead of dropping entries — fewer
+  requirements would have meant a more permissive verdict.
+
 - **The `SurfaceSink` pane contract at L2 (C-220).** First story of the **agent-authored surface**
   epic, and deliberately contract-only — no rendering, no op, nothing model-facing (C-221 and C-223
   add those). A tool can now address the human surface without any crate below L6 knowing a surface
