@@ -2,7 +2,7 @@
 id: C-276
 title: "`SAFE_ENV` forwards the confinement *marker* but not the posture, so a child flux runs unconfined"
 pillar: Core
-status: in-progress
+status: done
 priority: 2
 epic: security-assurance
 design: docs/designs/security-assurance.md

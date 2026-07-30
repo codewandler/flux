@@ -8,6 +8,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A confined process now hands its sandbox posture to the children it spawns (C-276).** The scrubbed
+  child environment carried `FLUX_SANDBOXED` — the marker whose whole job is to assert *"you are already
+  confined"* — and none of the variables that decide whether confinement happens. A spawned `flux`
+  resolved its posture from an environment containing no posture, got `off`, and declined to confine its
+  own descendants while the operator had demanded `require`. Forwarding a claim of confinement without
+  the means to enforce it is strictly worse than forwarding nothing.
+  The posture travels as a **floor, never a ceiling**: an `Off` sandbox forwards nothing at all — not
+  even `FLUX_SANDBOX=off`, which is a kill switch on the reading side — and an open network forwards
+  nothing, because an unrestricted network is the absence of a restriction and absence is not a parent's
+  to impose. A sandbox with no backend of its own forwards no wrapper path; it cannot hand on a binary it
+  never established.
+  ⚠ Scope, stated rather than implied: the floor is a property of the forwarding function, not of the
+  whole spawn path. Two call sites push their own `FLUX_SANDBOX` into the caller-override slot, which
+  lands afterwards and wins. They are unchanged by this release and tracked as C-282.
+
+- **The wasm32 parity proof and the with-a-backend sandbox lane now actually run in CI (C-279, C-280).**
+  Both were guards that existed, looked green, and were not executing — the defect class this cycle has
+  produced four times over. The parity test *skips* when the wasm module is absent, and it is absent on
+  every runner, so `cargo test --workspace` was green while the proof was decorative: measured with a
+  deliberate off-by-one in the wasm ABI, the workspace suite still exited 0. The new lane builds the
+  module and asserts parity, and cannot pass vacuously.
+  The sandbox lane added in the previous release failed on its very first real run — `ubuntu-latest` is
+  now Ubuntu 24.04, which refuses unprivileged user namespaces, so bubblewrap installed and still could
+  not confine. That lane was built to fail loudly rather than go quietly green in exactly this case, and
+  it did. The runner now clears the restriction, best-effort and deliberately *not* as the gate: whether
+  confinement is real is still decided by the assertion that fails the job on a degraded backend.
+
 - **`file_stat` no longer reads the whole file twice, and no longer claims a mode it never returns
   (C-275).** The op awaited a second guarded read of the target and threw the bytes away, paying a full
   read of an arbitrarily large file for no output — a surprising cost for something a caller reasonably
