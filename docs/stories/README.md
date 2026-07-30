@@ -51,6 +51,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 ## Now (in progress)
 - [A-91 — Transactional turns — a compensating undo for the world, not just the session (epic)](A-91-transactional-turns-epic.md) · Agent · EPIC — every mutating op declares its compensator; the runtime synthesizes a reverse ActionBatch so `flux undo --turn N` rolls back real effects
 - [A-92 — Evidence-pinned memory — cross-session memory with provenance (epic)](A-92-evidence-pinned-memory-epic.md) · Agent · EPIC — every memory entry cites the event-store receipt + git SHA it was learned from and goes stale-visible when the cited evidence changes
+- [C-239 — The fleet runs the track / impl-coord loop — complete and usable (epic)](C-239-fleet-loop-epic.md) · Core · EPIC — the model reasons, the host enforces: a WaveCoordinator does isolation/gate/merge/revert/ledger so the loop's invariants hold even when the model is wrong
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-230 — Two flux processes cold-booting one fresh events.db race the schema migration](C-230-sqlite-cold-boot-migration-race.md) · Core · found by accident during A-107: four processes cold-booting the SAME brand-new events.db died with `duplicate column name: account` — D-76 fixed exactly this for Postgres with a `flux:ddl` advisory lock; SQLite has no equivalent, and every existing multi-process test creates the DB first, so nothing covers it
@@ -67,6 +68,12 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ### Fleet coordinator — flux orchestrating flux across repos
 - [A-111 — Fleet coordinator — flux orchestrating flux across repos (epic)](A-111-fleet-coordinator-epic.md) · Agent · EPIC — the coordinator is a .flux Program on flux-app, not a new binary: a write-capable WorkBoard port (Jira/markdown/GitLab swappable), outbound A2A dispatch to remote workers, and per-delivery bus isolation as the blocker
+
+### Fleet loop — the fleet runs the track / impl-coord loop
+- [C-240 — Board correctness — a retry leaves a stale runner, nothing can write evidence, and Blocked→Ready bypasses the attempt budget](C-240-board-correctness-retry-clears-runner-reassign-record-evidence.md) · Core · F2 — the sweep after a retry chases a dead run: transition() never clears runner/task_id, so worker-b's re-claim still points at worker-a's corpse
+- [C-241 — `fleet.isolate` — a per-item isolated checkout, because `git_worktree_enter` cannot give N workers their own](C-241-fleet-isolate-per-item-worktree.md) · Core · F4 — the model-owns-nothing move: the host creates impl/<id> in its own worktree and hands back {worktree, branch}; the caller's root is never rebased
+- [C-243 — `fleet.start` + `ProcessRuntime` — flux never spawns flux, so no wave can be larger than one](C-243-fleet-start-process-runtime.md) · Core · F6 — absorbs A-120/A-121/A-122. Not an optimization: FlowEngine's turn_gate means one worker serves one turn, so this is the prerequisite for parallelism at all
+- [C-246 — Fleet observability — `SpawnActivitySink` shipped in A-79 and nothing installs it, so a running fleet is invisible](C-246-fleet-observability-spawn-activity-sink.md) · Core · F10 — the sink exists and is installed for local children only (engine.rs:527); a fleet of workers produces no visible activity at all
 
 ### Cross-harness session history as a datasource
 _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 2919 lines) locates,_
@@ -130,6 +137,11 @@ _flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 
 - [A-133 — Startup does not strictly precede bus events under `App::run` — the run lease activates before `Start` completes](A-133-startup-strictly-precedes-bus-events.md) · Agent · filed from A-112's implementor report and still unaddressed — it has been living as a Note on A-129, which explicitly declined it as out of Acceptance
 - [A-134 — No SDK seam for a `WorkBoard` — decide whether boards are embeddable, then ship `ClientBuilder::try_with_work_board` if they are](A-134-sdk-seam-for-a-workboard.md) · Agent · filed from A-131's implementor report — live datasources have a documented SDK registration seam, boards have none, so an embedder cannot bind a board at all
 - [A-135 — `A2aClient` hardwires its transport, so there is no socket-free way to test a fleet journey](A-135-socket-free-fleet-journey-test.md) · Agent · A-117's blocker B3, the only one of its five with no owner — every fleet test today binds a real loopback listener because A2aClient offers no injectable-transport seam
+
+### Fleet loop — the fleet runs the track / impl-coord loop
+- [C-242 — `fleet.integrate` — gate-after-every-merge becomes impossible to skip, and red reverts itself](C-242-fleet-integrate-gated-merge-revert-on-red.md) · Core · F5 — the sharpest instance of host-enforces: the op gates and merges or does neither, so the rule stops being an instruction a model can skip
+- [C-244 — The implement-worker template + `fleet.handoff` — a worker can only return text today, so reviewing the diff as evidence has no channel](C-244-worker-template-and-fleet-handoff.md) · Core · F7 — where Task.artifacts stops being decorative: SpawnOutcome has no artifact field and flux-server never populates artifacts, so the review half of the loop is unimplementable without this
+- [C-245 — `fleet.rework` — the 2-round budget as a host rule, so a third round parks instead of dispatching](C-245-fleet-rework-two-round-budget.md) · Core · F8 — rework must reach the SAME worker (contextId continuity already exists); the budget is enforced by the op, not asked for in a prompt
 
 ### Flow Package Registry
 - [D-194 — Flow package registry — flux flow install (epic)](D-194-flow-package-registry-epic.md) · Language · EPIC — flows/journeys are shareable artifacts with no distribution story; reuse the signed plugin-pack channel (D-46/D-47: signed index, sha256, versioned store) for .flux flow packages: flux flow install <name> fetches into ~/.flux/flows/, flow_list surfaces them, the analyzer runs at install time so a broken pack fails at install
