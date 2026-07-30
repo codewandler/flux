@@ -2,7 +2,7 @@
 id: C-217
 title: "`sandbox on` reports its resolved posture instead of degrading silently"
 pillar: Core
-status: ready
+status: in-progress
 priority: 7
 epic: security-assurance
 design: docs/designs/security-assurance.md

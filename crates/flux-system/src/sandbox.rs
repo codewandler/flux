@@ -136,6 +136,20 @@ pub enum Backend {
 // Sandbox
 // ---------------------------------------------------------------------------
 
+/// One-shot latch behind [`Sandbox::take_posture_disclosure`]: the resolved-posture disclosure is a
+/// per-**process** fact, so it is stated once no matter how many [`Sandbox`]es a process resolves or
+/// clones. Process-global for the same reason [`PROBE_CACHE`] is — per-instance state would be
+/// defeated by `Sandbox: Clone`.
+static POSTURE_DISCLOSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only reset of [`POSTURE_DISCLOSED`], so the once-per-process tests can each observe a fresh
+/// latch. Callers hold [`SANDBOX_ENV_LOCK`] (via [`EnvGuard`]) to keep that observation exclusive.
+#[cfg(test)]
+fn reset_posture_disclosure_latch() {
+    POSTURE_DISCLOSED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The resolved sandbox for this process: settings plus the backend `resolve()` picked. The one
 /// seam [`crate::System::build_command`] wraps through.
 #[derive(Debug, Clone)]
@@ -248,9 +262,70 @@ impl Sandbox {
         }
     }
 
+    /// The **resolved-posture disclosure** (C-217): the one line an operator must be shown when they
+    /// asked to be confined and are not. `Some` only for `On` + [`Backend::Unsupported`] — the single
+    /// posture in which flux runs *unconfined despite having been asked to confine*.
+    ///
+    /// It states what is **true** (this process is running unconfined), not what was requested,
+    /// because the failure mode this guards against is an operator who configured `on` believing it
+    /// took effect. The `reason` is [`discover_backend`]'s, surfaced verbatim — this composes a
+    /// disclosure, it does not compute a diagnosis.
+    ///
+    /// `None` everywhere else, because nothing is being withheld: `Off` never asked; a live
+    /// [`Backend::Bubblewrap`]/[`Backend::Seatbelt`] confines this process; [`Backend::AlreadyConfined`]
+    /// means an outer flux sandbox confines the whole tree; and `Require` + `Unsupported` never
+    /// reaches an unconfined run at all — [`Sandbox::ensure_available`] fails closed first and that
+    /// error *is* the disclosure. A line that fires when nothing is wrong trains operators to ignore
+    /// the line that matters.
+    ///
+    /// Worded as a **posture statement, not an error.** The most common `reason` here is a refused
+    /// user namespace ([`ProbeOutcome::NamespacesDenied`] — default-seccomp Docker, Debian ≤11's
+    /// sysctl, Ubuntu 23.10+'s AppArmor userns restriction, and every terminal-bench eval
+    /// container), which is an expected, healthy state on those hosts rather than a fault.
+    ///
+    /// Carries only posture + `reason`: no argv, no workspace layout, no secret. The `reason` may
+    /// name an operator-supplied `FLUX_BWRAP_BIN`/`FLUX_SANDBOX_EXEC_BIN` path, exactly as
+    /// [`Sandbox::describe`] and the `require` error already do — this adds no new disclosure class.
+    ///
+    /// This is the pure accessor: it answers every time it is asked, so an on-demand surface
+    /// (`flux doctor`'s `sandbox backend` check) keeps working. For the unasked-for startup
+    /// disclosure, which must appear at most once per process, use
+    /// [`Sandbox::take_posture_disclosure`].
+    pub fn posture_disclosure(&self) -> Option<String> {
+        match (self.settings.mode, &self.backend) {
+            (SandboxMode::On, Backend::Unsupported { reason }) => Some(format!(
+                "sandbox: requested `on`, running UNCONFINED — no usable backend: {reason}. \
+                 Shell/plugin processes get no OS-level confinement this run; set \
+                 `[sandbox] require = true` (or `FLUX_SANDBOX=require`) to fail closed instead."
+            )),
+            _ => None,
+        }
+    }
+
+    /// [`Sandbox::posture_disclosure`], but at most **once per process**: returns the line on the
+    /// first call that has something to disclose and `None` on every call after it.
+    ///
+    /// This is what an unasked-for surface emits. Deliberately *not* per spawn — a warning on every
+    /// [`Sandbox::wrap_argv`] would bury the signal in exactly the sessions that spawn most, which
+    /// is the same "noise gets filtered, then missed" failure the wording above avoids.
+    ///
+    /// The latch is process-global (like [`PROBE_CACHE`]) rather than per-instance because
+    /// [`Sandbox`] is `Clone` and a process may resolve several of them; one operator-visible fact
+    /// deserves one operator-visible line. A sandbox with nothing to disclose does **not** consume
+    /// the latch — otherwise the first [`Sandbox::disabled`] built in a process (every hermetic
+    /// [`crate::System::new`]) would burn it and silence the real disclosure that follows.
+    pub fn take_posture_disclosure(&self) -> Option<String> {
+        // `?` first: only a sandbox that actually has something to say may consume the latch.
+        let line = self.posture_disclosure()?;
+        (!POSTURE_DISCLOSED.swap(true, std::sync::atomic::Ordering::Relaxed)).then_some(line)
+    }
+
     /// The fail-closed backstop: `require` + no usable backend refuses to spawn, naming the
-    /// reason. A no-op for `Off`/`On` (an `On` sandbox that can't confine warns once at CLI
-    /// startup and otherwise runs unconfined — see `flux-cli`'s `apply_sandbox_env`).
+    /// reason. A no-op for `Off`/`On` — an `On` sandbox that can't confine **continues**, and the
+    /// disclosure it owes is a separate, non-fallible concern ([`Sandbox::posture_disclosure`],
+    /// emitted once per process at CLI startup by `flux-cli`'s `apply_sandbox_env`). Keeping the two
+    /// apart is deliberate: `require`'s fail-closed contract must not depend on anything about
+    /// reporting.
     pub fn ensure_available(&self) -> Result<()> {
         if self.settings.mode == SandboxMode::Require {
             if let Backend::Unsupported { reason } = &self.backend {
@@ -1355,6 +1430,12 @@ mod tests {
         assert!(err.to_string().contains("no bwrap on PATH"), "{err}");
     }
 
+    /// `on` + no usable backend **continues** (that half was never in doubt) — but it must not
+    /// continue *silently*. C-217 split the two halves apart: `ensure_available` stays the
+    /// fail-closed backstop and keeps returning `Ok(())` here (the `continue` half, unchanged), and
+    /// the disclosure the operator is owed is a separate, non-fallible concern
+    /// ([`Sandbox::posture_disclosure`], asserted below). Both halves are pinned in one test so a
+    /// future change cannot quietly restore the silence by deleting only the disclosure assertion.
     #[test]
     fn ensure_available_is_ok_under_on_mode_when_unsupported() {
         let sandbox = Sandbox {
@@ -1368,6 +1449,179 @@ mod tests {
             },
         };
         assert!(sandbox.ensure_available().is_ok());
+        assert!(
+            sandbox.posture_disclosure().is_some(),
+            "`on` + Unsupported continues, but it must disclose that it is running unconfined"
+        );
+    }
+
+    // -- C-217: the resolved-posture disclosure ------------------------------------------------
+
+    /// C-217: `on` + [`Backend::Unsupported`] is the one posture where flux runs unconfined
+    /// *despite having been asked to confine*, so it owes the operator a line naming what is
+    /// **true** (running unconfined) plus the reason `discover_backend` already computed — not a
+    /// restatement of what was requested.
+    #[test]
+    fn posture_disclosure_names_the_resolved_posture_and_the_reason_under_on_mode() {
+        let sandbox = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::On,
+                network: true,
+                extra_writable: Vec::new(),
+            },
+            backend: Backend::Unsupported {
+                reason: "no bwrap on PATH".to_string(),
+            },
+        };
+        let line = sandbox
+            .posture_disclosure()
+            .expect("`on` + Unsupported must disclose its resolved posture");
+        assert!(
+            line.contains("UNCONFINED"),
+            "the line must state the RESOLVED posture, not the requested one: {line}"
+        );
+        assert!(
+            line.contains("no bwrap on PATH"),
+            "the line must carry the reason discovery already computed: {line}"
+        );
+        assert!(
+            line.contains("`on`"),
+            "the line must name the posture that was requested, for contrast: {line}"
+        );
+        // A posture statement, not an error: `NamespacesDenied` (default-seccomp Docker, Debian ≤11,
+        // Ubuntu 23.10+ AppArmor, every terminal-bench eval container) is an expected, healthy
+        // state, so the wording must not read as a fault.
+        let lower = line.to_ascii_lowercase();
+        assert!(
+            !lower.contains("error") && !lower.contains("failed"),
+            "must read as a posture statement, not a fault: {line}"
+        );
+        // One line — a multi-line banner would not survive being interleaved with agent output.
+        assert!(!line.contains('\n'), "must be exactly one line: {line}");
+    }
+
+    /// C-217: silent wherever confinement actually holds or was never requested. A warning that
+    /// fires when nothing is wrong trains operators to ignore it, so every one of these must be
+    /// `None`: `Off` (never asked), a live backend (confined by us), [`Backend::AlreadyConfined`]
+    /// (confined by an outer flux sandbox — the
+    /// `resolve_under_flux_sandboxed_marker_is_confined_by_parent_and_satisfies_require` path), and
+    /// `Require` + `Unsupported` (never reaches an unconfined run at all — `ensure_available`
+    /// fails closed first, and that error is itself the disclosure).
+    #[test]
+    fn posture_disclosure_is_silent_when_confinement_holds_or_was_never_requested() {
+        let unsupported = || Backend::Unsupported {
+            reason: "no bwrap on PATH".to_string(),
+        };
+        let with = |mode: SandboxMode, backend: Backend| Sandbox {
+            settings: SandboxSettings {
+                mode,
+                network: true,
+                extra_writable: Vec::new(),
+            },
+            backend,
+        };
+        let bwrap = Backend::Bubblewrap {
+            bwrap: PathBuf::from("/usr/bin/bwrap"),
+        };
+        let seatbelt = Backend::Seatbelt {
+            sandbox_exec: PathBuf::from("/usr/bin/sandbox-exec"),
+        };
+
+        for (label, sandbox) in [
+            ("off never asked to be confined", with(SandboxMode::Off, unsupported())),
+            ("a live bubblewrap backend confines us", with(SandboxMode::On, bwrap.clone())),
+            ("a live seatbelt backend confines us", with(SandboxMode::On, seatbelt.clone())),
+            ("an outer flux sandbox already confines us", with(SandboxMode::On, Backend::AlreadyConfined)),
+            ("require + unsupported fails closed instead", with(SandboxMode::Require, unsupported())),
+            ("require + a live backend is confined", with(SandboxMode::Require, bwrap)),
+            ("require under an outer sandbox is confined", with(SandboxMode::Require, Backend::AlreadyConfined)),
+        ] {
+            assert_eq!(
+                sandbox.posture_disclosure(),
+                None,
+                "must stay silent: {label}"
+            );
+        }
+
+        // The default `System::new` sandbox is `Off`, so no hermetic test site gains a line.
+        assert_eq!(Sandbox::disabled().posture_disclosure(), None);
+    }
+
+    /// C-217: the disclosure is emitted **once per process, not per spawn** — a per-`wrap_argv`
+    /// warning would bury the signal in exactly the sessions that spawn most. The latch is
+    /// process-global (like [`PROBE_CACHE`]) rather than per-`Sandbox`, because `Sandbox` is
+    /// `Clone` and a process may resolve several of them.
+    #[test]
+    fn take_posture_disclosure_yields_the_line_at_most_once_per_process() {
+        // Takes the shared sandbox env lock so this test cannot interleave with another test that
+        // consumes the same process-global latch.
+        let _g = EnvGuard::new(&["FLUX_SANDBOXED"]);
+        reset_posture_disclosure_latch();
+
+        let unconfined = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::On,
+                network: true,
+                extra_writable: Vec::new(),
+            },
+            backend: Backend::Unsupported {
+                reason: "no bwrap on PATH".to_string(),
+            },
+        };
+
+        assert!(
+            unconfined.take_posture_disclosure().is_some(),
+            "the first take discloses"
+        );
+        assert_eq!(
+            unconfined.take_posture_disclosure(),
+            None,
+            "a second take in the same process must stay silent"
+        );
+        // A *different* `Sandbox` (a clone, or a re-resolve) shares the one latch.
+        assert_eq!(
+            unconfined.clone().take_posture_disclosure(),
+            None,
+            "the latch is process-global, not per-instance"
+        );
+        // The pure accessor is unaffected by the latch — it stays available for `flux doctor`-style
+        // on-demand surfaces that must report the posture every time they are asked.
+        assert!(unconfined.posture_disclosure().is_some());
+    }
+
+    /// C-217: a sandbox with nothing to disclose must NOT consume the latch — otherwise the first
+    /// `Sandbox::disabled()` built in a process (every hermetic `System::new`) would burn it and
+    /// silence the real disclosure that follows.
+    #[test]
+    fn take_posture_disclosure_does_not_burn_the_latch_when_there_is_nothing_to_say() {
+        let _g = EnvGuard::new(&["FLUX_SANDBOXED"]);
+        reset_posture_disclosure_latch();
+
+        assert_eq!(Sandbox::disabled().take_posture_disclosure(), None);
+        let confined = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::On,
+                network: true,
+                extra_writable: Vec::new(),
+            },
+            backend: Backend::AlreadyConfined,
+        };
+        assert_eq!(confined.take_posture_disclosure(), None);
+
+        let unconfined = Sandbox {
+            settings: SandboxSettings {
+                mode: SandboxMode::On,
+                network: true,
+                extra_writable: Vec::new(),
+            },
+            backend: Backend::Unsupported {
+                reason: "no bwrap on PATH".to_string(),
+            },
+        };
+        assert!(
+            unconfined.take_posture_disclosure().is_some(),
+            "a silent sandbox must not have consumed the one-shot latch"
+        );
     }
 
     #[test]
