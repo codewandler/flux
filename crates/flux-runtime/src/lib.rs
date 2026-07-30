@@ -3297,6 +3297,16 @@ impl Executor {
     /// [`ExecutionEnvironment::with_resource_limits`] is the normal door — it installs the same
     /// ceilings on every executor it derives, which is what makes the concurrency budget shared.
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        // C-298: the evidence ceiling lives on the log, not on the executor — the log is shared
+        // (`Arc<Mutex<…>>`) with the context and with every other executor derived from the same
+        // environment, and it is the thing that grows. Installing it here means the one door a host
+        // already uses for ceilings covers it, and every derived executor's dispatches count against
+        // the same budget because they write into the same log.
+        self.ctx
+            .evidence
+            .lock()
+            .unwrap()
+            .set_max_payload_bytes(limits.max_evidence_payload_bytes());
         self.limits = limits;
         self
     }
@@ -3310,6 +3320,18 @@ impl Executor {
     /// [`ResourceLimits::max_retained_result_bytes`] bounds.
     pub fn retained_result_bytes(&self) -> usize {
         self.op_cache.lock().unwrap().bytes()
+    }
+
+    /// Bytes of observation payload currently retained in the shared evidence log — what
+    /// [`ResourceLimits::max_evidence_payload_bytes`] bounds (C-298).
+    pub fn retained_evidence_payload_bytes(&self) -> usize {
+        self.ctx.evidence.lock().unwrap().retained_payload_bytes()
+    }
+
+    /// An actionable report of what the evidence ceiling elided, or `None` if it never bound — the
+    /// "never silent" half of C-298. Names the knob and says where the full payloads still are.
+    pub fn evidence_compaction_notice(&self) -> Option<String> {
+        self.ctx.evidence.lock().unwrap().compaction_notice()
     }
 
     /// Enable/disable the deterministic read-only op cache (overrides `FLUX_OP_CACHE`).
@@ -7284,5 +7306,121 @@ mod tests {
             None => std::env::remove_var("KUBECONFIG"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // C-298 — the evidence log's retained-payload ceiling
+    // -----------------------------------------------------------------------
+
+    /// Dispatch `n` `echo` calls through one long-lived executor whose evidence payload ceiling is
+    /// `ceiling`, and report what the log still retains. Each call's `text` is the same 512-byte
+    /// blob, and `EchoTool` reports it as its permission subject — so every dispatch writes a
+    /// ~512-byte `tool_call` payload into the shared evidence log.
+    async fn evidence_after_dispatches(
+        n: usize,
+        ceiling: Option<usize>,
+    ) -> (usize, usize, EvidenceLog) {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let mut limits = ResourceLimits::new();
+        if let Some(bytes) = ceiling {
+            limits = limits.with_max_evidence_payload_bytes(bytes);
+        }
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["echo".into()], &[]),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        )
+        .with_resource_limits(limits);
+
+        let blob = "s".repeat(512);
+        for _ in 0..n {
+            let outcome = executor
+                .dispatch_outcome("echo", json!({ "text": blob }))
+                .await;
+            assert!(!outcome.result.is_error, "{}", outcome.result.content);
+        }
+        (
+            executor.retained_evidence_payload_bytes(),
+            executor.evidence().all().len(),
+            executor.evidence(),
+        )
+    }
+
+    /// The baseline this story exists to fix, **measured rather than asserted**: an unconfigured
+    /// long-lived executor retains one full `tool_call` payload per dispatch, for the process
+    /// lifetime. Quadrupling the dispatches quadruples the retained payload, and no default ceiling
+    /// interrupts that. This stays green after the fix — the ceiling is opt-in (C-290's rule: an
+    /// unconfigured runtime behaves exactly as it did before).
+    #[tokio::test]
+    async fn an_unconfigured_evidence_log_retains_one_payload_per_dispatch() {
+        let (small_bytes, small_count, _) = evidence_after_dispatches(32, None).await;
+        let (large_bytes, large_count, _) = evidence_after_dispatches(128, None).await;
+        println!(
+            "C-298 measured growth: 32 dispatches -> {small_count} observations / {small_bytes} \
+             payload bytes; 128 dispatches -> {large_count} observations / {large_bytes} payload bytes"
+        );
+        assert!(
+            large_bytes >= small_bytes * 3,
+            "retention must be measured as O(N): 32 dispatches kept {small_bytes} bytes, \
+             128 kept {large_bytes} — that is not linear, so this test no longer measures what it claims"
+        );
+        assert!(
+            large_count >= small_count * 3,
+            "observation count must also be O(N): {small_count} -> {large_count}"
+        );
+    }
+
+    /// The fix: a host-set ceiling bounds the retained payload of the SAME workload, and every
+    /// observation is still there — the count, order, kinds and phases are untouched, so nothing
+    /// that reads the log by index or by kind is silently truncated.
+    #[tokio::test]
+    async fn a_host_set_evidence_ceiling_bounds_retention_without_dropping_observations() {
+        const CEILING: usize = 8 * 1024;
+        let (unbounded_bytes, unbounded_count, _) = evidence_after_dispatches(128, None).await;
+        let (bounded_bytes, bounded_count, log) =
+            evidence_after_dispatches(128, Some(CEILING)).await;
+
+        assert!(
+            bounded_bytes <= CEILING,
+            "the ceiling must bind: retained {bounded_bytes} bytes over a {CEILING}-byte ceiling"
+        );
+        assert!(
+            unbounded_bytes > CEILING,
+            "the workload must actually exceed the ceiling or this proves nothing \
+             (unbounded retained {unbounded_bytes})"
+        );
+        assert_eq!(
+            bounded_count, unbounded_count,
+            "no observation may be dropped — the ceiling elides payloads, it does not truncate the record"
+        );
+
+        // The elision is legible, and it names the knob that caused it.
+        let elided: Vec<&Observation> =
+            log.all().iter().filter(|o| o.is_payload_elided()).collect();
+        assert!(
+            !elided.is_empty(),
+            "the ceiling bound but nothing is marked elided"
+        );
+        assert_eq!(
+            log.elided_payloads(),
+            elided.len(),
+            "the log's own count of elided payloads must match what a reader can see"
+        );
+        let notice = log
+            .compaction_notice()
+            .expect("a bound ceiling must be reportable");
+        assert!(
+            notice.contains("max_evidence_payload_bytes"),
+            "the notice must name the knob: {notice}"
+        );
+
+        // And the cumulative per-kind counts every reader depends on are exact.
+        assert_eq!(
+            log.by_kind("tool_call").count(),
+            128,
+            "`metrics()` counts tool_call markers by kind — eliding a payload must not lose one"
+        );
     }
 }
