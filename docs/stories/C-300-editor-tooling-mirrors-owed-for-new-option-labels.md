@@ -2,7 +2,7 @@
 id: C-300
 title: "Two new Flux-Lang option labels ship without their editor-tooling mirrors"
 pillar: Language
-status: in-progress
+status: done
 priority: 7
 areas: [website, flux-lang]
 note: "L-96 added `max` and `wait` as canonical header option labels; AGENTS.md mandates mirroring new language vocabulary into four grammars and nothing checks it, so editors highlight the language as it was before L-96"
