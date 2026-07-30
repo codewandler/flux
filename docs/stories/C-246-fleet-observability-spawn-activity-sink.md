@@ -2,7 +2,7 @@
 id: C-246
 title: "Fleet observability — `SpawnActivitySink` shipped in A-79 and nothing installs it, so a running fleet is invisible"
 pillar: Core
-status: ready
+status: in-progress
 priority: 5
 epic: fleet-loop
 design: docs/designs/fleet-loop.md
