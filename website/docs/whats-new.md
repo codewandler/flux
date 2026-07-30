@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-31
+
 ### New
 
 - **You can see what your sub-agents are doing, in the terminal, while they work.** Delegated workers now

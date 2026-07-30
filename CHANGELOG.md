@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-31
+
 ### Added
 
 - **A host can bound what a runtime *uses*, not only what it spends (C-290).** `ResourceLimits` adds a
