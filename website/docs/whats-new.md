@@ -12,6 +12,25 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Work boards can now hand an item to a different worker, and record what a run produced.** If the
+  worker holding a task dies, you can reassign the task to someone else — previously nothing could move
+  it, because only the current holder was allowed to claim it. And a finished piece of work can now
+  attach evidence to its item, such as a commit or a pull request link, so you can see what a run
+  actually produced instead of just that it finished.
+
+### Fixed
+
+- **A retried task no longer looks like it is still running on the machine that dropped it.** When a
+  task failed and went back to the queue, it kept pointing at the run that had died, so status could
+  report progress on a process that no longer existed. A retried task now forgets the dead run while
+  staying assigned to whoever owned it.
+- **Repeatedly blocking a task no longer resets its retry budget.** A task that cycled between blocked
+  and ready could do so indefinitely, because only outright failures counted against its retry
+  allowance. Unblocking now counts too, so a task that keeps stalling is eventually surfaced instead of
+  looping forever.
+
 ## [0.37.0] - 2026-07-30
 
 ### New

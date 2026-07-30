@@ -6,7 +6,41 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The work board can move an item off a dead worker and record what a run produced (C-240).** Two new
+  ops on the generated board surface, taking it from nine to eleven and its writes from five to seven:
+  `reassign` moves an item to a new assignee, where a `claim` by a non-holder conflicts and had left no
+  way to recover an item from a worker that died; and `record_evidence` appends a `Reference` to
+  `Item::evidence`, which existed and round-tripped through the markdown format but which **no op could
+  write** — the same defect A-130 fixed for `runner`/`task_id`, and the diff-handoff channel the fleet
+  loop's later stages need.
+  `codewandler-flux-datasource` goes 1.2.0 → 1.3.0. `is_retry`'s semantics and the public `EDGE_DIAGRAM`
+  const's text changed, but no signature was removed and the legal edge set is unchanged, so this is not
+  wire-breaking. Note for external implementors: the public `WorkBoard` trait gains two required methods
+  with **no default bodies**, which is a breaking change carried by the workspace MINOR.
+
 ### Fixed
+
+- **A retry no longer leaves the coordinator reporting progress on a process that no longer exists
+  (C-240).** `transition` never cleared `runner`/`task_id`, so after `Failed→Ready` the next sweep read
+  the dead worker's `task_id` and chased it. The worse half is why it matters: **no** code path clears
+  `assignee` — deliberately, since the holder outlives one run — so a re-claim by a second worker over a
+  stale record left the run identity pointing at the first worker's dead run. Both edges into `Ready` now
+  clear the run identity and keep the holder.
+  `Blocked→Ready` also bumps `attempts` now, closing a budget-laundering hole: `attempts` *is* the rework
+  budget a coordinator parks an item on, and while blocking was not counted an item could cycle
+  `ready → blocked → ready` forever without ever exhausting it. Implemented by folding the edge into
+  `is_retry`, so an unblock clears the run identity too — wider than the story asked, and pinned either
+  way.
+  **The load-bearing property is that all of this is pinned for both backends**, not just for
+  `MemoryBoard`: the two trait methods have no default bodies, so no backend can pass by not implementing
+  them, and the shared contract suite is driven from both the in-memory and markdown backends. The
+  markdown case is additionally proved at the bytes level — the stored file contains neither the runner
+  host nor the task id, but still contains the assignee.
+  Proved failing-first at the merge base, where the tree pinned the *opposite* behaviour
+  (`assert_eq!(requeued.attempts, 0, "blocking is not a retry")`). Five customer-facing pages were
+  corrected with it; one had begun stating the opposite of shipped behaviour.
 
 - **A refused `whatif` re-plan no longer leaves a child session behind (C-247).** C-211 established
   the invariant *a failed operation leaves no trace* by hoisting `ValidHistory::new` above
