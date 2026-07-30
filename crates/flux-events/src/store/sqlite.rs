@@ -108,9 +108,9 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 fn set_wal_mode(conn: &Connection) -> Result<()> {
     let start = Instant::now();
     loop {
-        let blocked = match conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| {
-            r.get::<_, String>(0)
-        }) {
+        let blocked = match conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))
+        {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
             // Not converted yet. SQLite reports the contended conversion as `SQLITE_BUSY`; a
             // non-`wal` answer with no error would mean the same thing, so both wait.

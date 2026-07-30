@@ -2,7 +2,8 @@
 id: C-250
 title: "Public docs describe a product that has moved — sweep for staleness and keep the enumerations honest"
 pillar: Core
-status: in-progress
+status: ready
+priority: 9
 areas: [website]
 note: "the published board pages listed seven generated ops when the code shipped nine, within hours of the change — closed enumerations in public docs rot silently because nothing tests them"
 ---
@@ -40,10 +41,22 @@ appear in it at all.
       N generated board ops" cannot be checked by `website_contract` today because generated
       datasource ops never enter the builtin catalog it walks. Either pin them or state why prose that
       cannot be tested is acceptable there — the point is that the choice becomes deliberate.
-- [ ] Standard gate green (the two suites that pin `ops.md` against the registry:
-      `flux-cli --test website_contract`, `flux-tools --test toolspec_invariants`).
+- [x] Standard gate green (the two suites that pin `ops.md` against the registry:
+      `flux-cli --test website_contract` 18/18, `flux-tools --test toolspec_invariants` 5/5, plus
+      `flux-lang --test website_in_sync` 3/3).
 
 ## Progress
+- 2026-07-30 — **first pass merged.** Left `ready` rather than `done`: the four ticked items shipped,
+  the remaining public surface (`README.md`, `docs/usage.md`, the rest of `website/docs/**`) and the
+  decision about pinning enumerations are still open.
+  Verified at integration: `flux-cli --test website_contract` 18/18,
+  `codewandler-flux-tools --test toolspec_invariants` 5/5,
+  `codewandler-flux-lang --test website_in_sync` 3/3. A full workspace gate was **not** re-run for this
+  merge and did not need to be — the diff is markdown under `website/docs/` only, so build, clippy, fmt
+  and codegate results carry over unchanged from C-230's green gate on identical code; what a docs
+  change can break is the suites that read those files at runtime, and those are the three above.
+  No `WHATS-NEW.md` entry: the capabilities themselves were already announced there under C-236 and
+  C-238, and this is the reference documentation catching up, not a product change.
 - 2026-07-30 — first pass landed on `docs/staleness-sweep-0.36` (three commits). The sweep agent was
   stopped part-way; its work was preserved and completed by the coordinator, which is how the
   `attempts` omission was caught — **the sweep's own output had the same defect class it was opened to
