@@ -2,7 +2,7 @@
 id: C-213
 title: "Extract the harness discovery + scan layer out of the CLI binary into flux-capabilities"
 pillar: Core
-status: in-progress
+status: done
 priority: 10
 epic: harness-history
 design: docs/designs/harness-history.md
