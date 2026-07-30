@@ -22,13 +22,13 @@ A channel **fires a bus event under its own name**, and a [`trigger`](../agent/p
 that name to something that does work:
 
 ```flux
-channel slack                    ← the event source, named `slack`
+channel slack                    # the event source, named `slack`
   bot_token secret "SLACK_BOT_TOKEN"
   app_token secret "SLACK_APP_TOKEN"
 
-trigger on_message               ← the route
-  on "slack"                     ← matches the channel's name, exactly
-  agent assistant                ← what runs: an agent (model-driven) or `run <journey>` (fixed flow)
+trigger on_message               # the route
+  on "slack"                     # matches the channel's name, exactly
+  agent assistant                # what runs: an agent (model-driven) or `run <journey>` (fixed flow)
 ```
 
 That separation is the whole design. The channel is transport; the trigger is policy; the agent or
