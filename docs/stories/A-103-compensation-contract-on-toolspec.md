@@ -2,7 +2,8 @@
 id: A-103
 title: "The Compensation contract on ToolSpec — every mutating op declares how it is reversed"
 pillar: Agent
-status: backlog
+status: ready
+priority: 14
 epic: transactional-turns
 design: docs/designs/transactional-turns.md
 note: "Inverse | Snapshot | NotNeeded | None{why}; a registry-walk test fails on any mutating built-in with no declaration, which is what stops the contract rotting as ops are added"
@@ -36,6 +37,17 @@ possible even though the concrete reverse action can only be materialized at exe
 
 ## Notes
 - Design: [transactional-turns.md](../designs/transactional-turns.md).
+- ⚠ **Adding `Compensation` + `with_compensation` changes `flux-spec`'s public API, and `flux-spec`
+  is itself on the independent protocol line (`1.x`)** — separate from the wire-protocol caveat
+  below, which is about not touching `flux-plugin-protocol`. The addition is additive, so it needs a
+  MINOR bump *only if* the current version is already released; check first, because as of C-210 the
+  crate sits at an unreleased `1.2.0` and a second bump would strand that version. Run
+  `./scripts/check-crate-versions.sh` before pushing — CI is otherwise the only thing that catches
+  this, and it has bitten twice.
+- The registry-walk test in the Acceptance is a sibling of `flux_spec::metadata_violations`
+  (C-191/C-208/C-210). Consider whether it belongs alongside the existing coherence invariants
+  rather than as a separate walk — one place that answers "is this op's declaration honest?" is
+  easier to keep true than two.
 - Lives in `flux-spec` because plugin manifests will eventually want to declare it too (it belongs
   to the same vocabulary as `semantic_effects`); do **not** add it to the plugin wire protocol in
   this story — the protocol crates are on an independent 1.x line and a wire change is its own

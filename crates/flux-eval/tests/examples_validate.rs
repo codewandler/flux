@@ -85,17 +85,19 @@ fn lower_or_panic(path: &str, ast: &flux_flow::ast::DraftAst, reg: &ToolRegistry
     });
 }
 
-/// Every `trigger.run` in a program must name a declared journey or top-level flow. Registry-free
-/// (no op resolution involved) — catches a dangling trigger target regardless of layering.
+/// Every trigger in a program must name a target that exists. Registry-free (no op resolution
+/// involved) — catches a dangling trigger target regardless of layering.
+///
+/// The rule itself is **not** restated here: it is `Program::validate_trigger_targets`, the same L0
+/// function `flux_app::Engine::validate` calls, so this sweep cannot be stricter or looser than the
+/// runtime it stands in for. It used to be a hand-written copy that asserted
+/// `flow_named(&t.run).is_some()` for every trigger, which rejected the legitimate **agent-bound**
+/// shape (`agent = "..."`, empty `run`) that the runtime accepts — so an agent-triggered Program
+/// could not ship as an example at all (C-232).
 fn validate_program_structure(path: &str, program: &flux_flow::program::Program) {
-    for t in &program.triggers {
-        assert!(
-            program.flow_named(&t.run).is_some(),
-            "{path}: trigger `{}` runs `{}`, which names no declared journey or top-level flow",
-            t.name,
-            t.run
-        );
-    }
+    program
+        .validate_trigger_targets()
+        .unwrap_or_else(|err| panic!("{path}: {err}"));
 }
 
 #[test]
@@ -162,4 +164,71 @@ fn every_example_validates_against_its_form_appropriate_gate() {
              remove the entry"
         );
     }
+}
+
+/// Parse `src` as a program-form module, panicking if it sniffs as a bare flow.
+fn program_or_panic(src: &str) -> flux_flow::program::Program {
+    match Module::parse_str(src).expect("fixture must parse as native flux-lang text") {
+        Module::Program(program) => program,
+        Module::Flow(_) => panic!("fixture must sniff as a program, not a bare flow"),
+    }
+}
+
+/// An **agent-bound** trigger (`agent = "..."`, no `run`) is what the fleet coordinator needs, and
+/// the runtime accepts it — so the sweep must too. Guards C-232: the sweep used to assert
+/// `flow_named(&t.run).is_some()` unconditionally, which rejects this valid shape.
+#[test]
+fn the_sweep_accepts_an_agent_bound_trigger() {
+    let program = program_or_panic(
+        "\
+agent coordinator
+  model \"mock\"
+
+trigger fanout
+  on \"a2a_request\"
+  agent \"coordinator\"
+",
+    );
+    assert!(
+        program.triggers[0].run.is_empty(),
+        "an agent-bound trigger parses with an empty `run` — that is the shape under test"
+    );
+    validate_program_structure("fixture/agent-bound-trigger.flux", &program);
+}
+
+/// The other direction of C-232: relaxing the sweep for agent-bound triggers must not make it
+/// *looser* than the runtime. A trigger whose `run` names nothing declared still fails.
+#[test]
+#[should_panic(expected = "trigger `dangling` names unknown journey/flow `nope`")]
+fn the_sweep_still_rejects_a_trigger_naming_no_declared_flow() {
+    let program = program_or_panic(
+        "\
+trigger dangling
+  on \"user_input\"
+  run nope
+
+journey handle
+  flow
+    return null
+",
+    );
+    validate_program_structure("fixture/dangling-trigger.flux", &program);
+}
+
+/// And a trigger naming an agent that was never declared must fail too — the sweep inherits that
+/// arm of the runtime's rule for free by sharing it.
+#[test]
+#[should_panic(expected = "trigger `fanout` names unknown agent `ghost`")]
+fn the_sweep_rejects_a_trigger_naming_an_undeclared_agent() {
+    let program = program_or_panic(
+        "\
+agent coordinator
+  model \"mock\"
+
+trigger fanout
+  on \"a2a_request\"
+  agent \"ghost\"
+",
+    );
+    validate_program_structure("fixture/undeclared-agent-trigger.flux", &program);
 }

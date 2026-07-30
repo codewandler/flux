@@ -80,6 +80,8 @@ bounded by that plugin's manifest and its Tavily credential is injected host-sid
 | `git_status` | | low | Working tree status |
 | `git_diff` | `[path, staged]` | low | Unstaged (or staged) diff |
 | `git_log` | `[limit]` | low | Recent commits |
+| `git_hunks` | `path[, context]` | low | List the unstaged diff as individually addressable hunks |
+| `git_stage_hunks` | `path, hunks[, context]` | medium | Stage selected hunks by id, leaving the rest of the file unstaged |
 | `git_stage` / `git_unstage` | `paths` | medium / low | Stage or unstage files |
 | `git_commit` | `message[, body]` | medium | Create a commit |
 | `git_push` | `[branch, remote]` | medium | Push to a remote |
@@ -208,6 +210,30 @@ Registered **only** by the `flux app run` host for [multi-agent programs](../age
 | `send` | `channel, message` | Send a message to a named channel |
 | `ask` | `channel, message` | Send and return a correlation id |
 | `spawn` | `run[, input]` | Run a named journey to completion and return its result |
+
+## Fleet ops
+
+`task` delegates to a **local** sub-agent and waits for it. The `fleet.*` ops are the half `task`
+cannot express — hand work to a **remote** flux worker (a `flux serve` instance reachable over A2A)
+without waiting, then poll or stop it. A coordinator can therefore keep many workers in flight and
+reconcile them later.
+
+| op | arguments | description |
+|---|---|---|
+| `fleet.dispatch` | `worker, task[, role, context_id]` | Send a task to a remote worker and return its task id without waiting. A worker that replies synchronously returns a null task id plus its answer, instead of an id that would be polled forever |
+| `fleet.status` | `worker, task_id` | Read a dispatched task's current state, whether it is terminal, and its final text |
+| `fleet.cancel` | `worker, task_id` | Stop a dispatched task. An already-finished task reports that it was not cancelable |
+
+The `worker` address is an argument, not configuration, so it is model-reachable and gated as such.
+Every call resolves the endpoint through the same egress guard as `web.fetch` before any request,
+and the approval subject is the worker's **origin** — never a wildcard. An address flux cannot parse
+reports no subject at all, which forces an approval prompt rather than matching a broad grant. These
+ops carry no standing private-network grant: they are not part of the `web` egress scope, so
+reaching a worker on a private address needs the explicit `--allow-private-net` override. A worker
+behind `flux serve`'s bearer token is not reachable yet.
+
+`fleet.status` is never served from the operation cache — observing the change since the last poll is
+the point of a status call.
 
 ## Endpoints
 

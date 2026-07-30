@@ -23,6 +23,7 @@ use flux_lang::ast::RunEvent;
 
 use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
+use crate::memory::{self, MemoryEntry, MemoryNote, MemoryScope, Receipt};
 use crate::projection;
 
 use sqlite::SqliteEvents;
@@ -986,6 +987,129 @@ impl EventStore {
         }
         self.append(stream, ev)?;
         Ok(())
+    }
+
+    // --- memory (A-107): its own stream in this same store, projected latest-state-per-id -----
+
+    /// Record a new memory entry on `scope`'s `memory:<scope-key>` stream, returning the entry as
+    /// stored.
+    ///
+    /// The entry's `id` **is** the appended `memory.noted` event's own id — one identity, minted
+    /// once, so nothing has to reconcile a separate memory-id scheme against the log (the A-98
+    /// wake-up precedent). `learned_at_ms` is stamped here; the citation comes from `note`, which
+    /// can only be built through [`MemoryNote::new`] and is therefore already scrubbed.
+    pub fn remember(&self, scope: &MemoryScope, note: MemoryNote) -> Result<MemoryEntry> {
+        let id = ulid::Ulid::generate().to_string();
+        let entry = MemoryEntry {
+            id: id.clone(),
+            claim: note.claim().to_string(),
+            scope: scope.clone(),
+            receipt: note.receipt,
+            git: note.git,
+            learned_at_ms: now_ms(),
+        };
+        self.append_memory(scope, memory::MEMORY_NOTED, &entry, Some(id))?;
+        Ok(entry)
+    }
+
+    /// Re-state an existing entry: **appends** a `memory.edited` event carrying the whole new state
+    /// for `id` — it never rewrites the original. The projection then reports the new claim while
+    /// `load_stream` still yields every state the entry ever held, which is the entire point of
+    /// putting memory in the log instead of a mutable side table.
+    ///
+    /// Returns `Ok(None)` when `id` is not currently believed in this scope (never noted, or
+    /// already forgotten), mirroring [`cancel_wakeup`](Self::cancel_wakeup)'s "nothing to do" shape
+    /// rather than erroring.
+    pub fn amend_memory(
+        &self,
+        scope: &MemoryScope,
+        id: &str,
+        note: MemoryNote,
+    ) -> Result<Option<MemoryEntry>> {
+        if !self.memories(scope)?.iter().any(|m| m.id == id) {
+            return Ok(None);
+        }
+        let entry = MemoryEntry {
+            id: id.to_string(),
+            claim: note.claim().to_string(),
+            scope: scope.clone(),
+            receipt: note.receipt,
+            git: note.git,
+            learned_at_ms: now_ms(),
+        };
+        self.append_memory(scope, memory::MEMORY_EDITED, &entry, None)?;
+        Ok(Some(entry))
+    }
+
+    /// Stop believing `id`: appends a `memory.forgotten` tombstone. The entry leaves the
+    /// projection; every state it held stays in the log. Returns `false` (no append) when `id` is
+    /// not currently believed in this scope.
+    pub fn forget_memory(&self, scope: &MemoryScope, id: &str) -> Result<bool> {
+        if !self.memories(scope)?.iter().any(|m| m.id == id) {
+            return Ok(false);
+        }
+        self.append(
+            &scope.stream(),
+            NewEvent::new(EventKind::Custom {
+                name: memory::MEMORY_FORGOTTEN.to_string(),
+                payload: serde_json::to_value(memory::MemoryTombstone { id: id.to_string() })?,
+            }),
+        )?;
+        Ok(true)
+    }
+
+    /// The currently-believed entries for `scope` — see [`projection::memory`].
+    ///
+    /// Backed by a `kind = 'custom'` load (served by `idx_events_stream_kind`) rather than the full
+    /// stream, following the C-87 precedent: memory events are the only `Custom` events a memory
+    /// stream can hold, and no other kind contributes to this fold.
+    pub fn memories(&self, scope: &MemoryScope) -> Result<Vec<MemoryEntry>> {
+        Ok(projection::memory_entries(
+            &self.load_by_kind(&scope.stream(), "custom")?,
+        ))
+    }
+
+    /// The full append-only history of `scope`'s memory stream, oldest first — every note, edit and
+    /// tombstone, including the states the projection no longer surfaces. The audit read behind
+    /// "what did the agent believe, and when did it stop?".
+    pub fn memory_history(&self, scope: &MemoryScope) -> Result<Vec<StoredEvent>> {
+        self.load_stream(&scope.stream(), None)
+    }
+
+    /// Follow a [`Receipt`] back to the event it cites, or `None` when that event is not in this
+    /// store (a pruned stream, or a citation carried in from elsewhere).
+    ///
+    /// Matches on the cited event's **stable id**, which is why [`Receipt::event_id`] is that id
+    /// and not a `global_seq`: rowids are re-minted by any re-import or backend migration, so a
+    /// `global_seq`-keyed lookup would still *succeed* afterwards — at the wrong event. A scan of
+    /// the cited stream is deliberate over a store-wide id index: `stream` is part of the citation,
+    /// so the lookup stays scoped to what the receipt actually claims, and this is a `memory show`
+    /// path, not a per-turn one.
+    pub fn resolve_receipt(&self, receipt: &Receipt) -> Result<Option<StoredEvent>> {
+        Ok(self
+            .load_stream(&receipt.stream, None)?
+            .into_iter()
+            .find(|e| e.id == receipt.event_id))
+    }
+
+    /// Append one memory event, encoding `entry` as the payload of an [`EventKind::Custom`] under
+    /// `name`. The single write point for the memory stream, so the encoding cannot drift between
+    /// note and edit.
+    fn append_memory(
+        &self,
+        scope: &MemoryScope,
+        name: &str,
+        entry: &MemoryEntry,
+        event_id: Option<String>,
+    ) -> Result<StoredEvent> {
+        let mut ev = NewEvent::new(EventKind::Custom {
+            name: name.to_string(),
+            payload: serde_json::to_value(entry)?,
+        });
+        if let Some(id) = event_id {
+            ev = ev.with_id(id);
+        }
+        self.append(&scope.stream(), ev)
     }
 
     /// Close a turn with its final outcome, iteration count, assistant answer, and token `usage`
@@ -2996,6 +3120,406 @@ mod tests {
         assert_eq!(info.created_at_ms, src_info.created_at_ms);
     }
 
+    // --- A-107: the memory stream and its projection --------------------------------------
+
+    /// Seed a session with one turn and return the event a memory can honestly cite (the user
+    /// message), plus the turn it belongs to — the shape A-108's host-stamped citation will
+    /// produce for real.
+    fn cited_event(store: &EventStore, stream: &str) -> (StoredEvent, i64) {
+        let turn_id = store
+            .begin_turn(stream, "where is the auth middleware?", "m")
+            .unwrap();
+        ask(store, stream, "where is the auth middleware?");
+        let cited = store
+            .load_stream(stream, None)
+            .unwrap()
+            .into_iter()
+            .last()
+            .expect("the seeded turn appended at least one event");
+        (cited, turn_id)
+    }
+
+    /// A note citing `cited`, scrubbed through a real `Redactor` — the same call shape production
+    /// uses, so the fixtures can only write what A-108 can write.
+    fn note_citing(claim: &str, cited: &StoredEvent, turn_id: Option<i64>) -> MemoryNote {
+        let redactor = flux_secret::Redactor::new();
+        MemoryNote::new(
+            claim,
+            Receipt {
+                stream: cited.stream.clone(),
+                event_id: cited.id.clone(),
+                turn_id,
+            },
+            Some(crate::GitPin {
+                sha: "a1b2c3d".to_string(),
+                paths: vec!["src/mw/auth.rs".to_string()],
+            }),
+            |s| redactor.redact(s),
+        )
+    }
+
+    /// A-107 item 3: entries live on their OWN `memory:<scope-key>` stream in this same store — not
+    /// on the learning session and not in a side table — and the projection is latest-state-per-id.
+    /// Two scopes are two streams, and neither can see the other's entries.
+    fn memory_entries_live_on_a_scoped_stream_in_the_same_store(store: &EventStore) {
+        let sid = store.create_session("m").unwrap();
+        let (cited, turn_id) = cited_event(store, &sid);
+
+        let global = MemoryScope::Global;
+        let project = MemoryScope::Project {
+            key: "flux".to_string(),
+        };
+        let g = store
+            .remember(
+                &global,
+                note_citing("prefers terse answers", &cited, Some(turn_id)),
+            )
+            .unwrap();
+        let p = store
+            .remember(
+                &project,
+                note_citing(
+                    "the auth middleware is in src/mw/auth.rs",
+                    &cited,
+                    Some(turn_id),
+                ),
+            )
+            .unwrap();
+
+        // The entries are on the memory streams, and the learning session is untouched by them.
+        assert_eq!(
+            store
+                .memories(&global)
+                .unwrap()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            vec![g.id.clone()],
+            "the global scope must see exactly its own entry"
+        );
+        assert_eq!(
+            store
+                .memories(&project)
+                .unwrap()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            vec![p.id.clone()],
+            "scopes are separate streams, so neither sees the other's entries"
+        );
+        assert!(
+            store
+                .load_stream(&sid, None)
+                .unwrap()
+                .iter()
+                .all(|e| !matches!(&e.kind, EventKind::Custom { name, .. } if name.starts_with("memory."))),
+            "memory must not be written onto the learning session's stream"
+        );
+        // The entry id IS its `memory.noted` event's id — one identity, no second scheme.
+        let history = store.memory_history(&global).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, g.id);
+        assert_eq!(history[0].stream, "memory:global");
+        // And the scope travels in the payload, so an exported entry stays self-describing.
+        assert_eq!(store.memories(&project).unwrap()[0].scope, project);
+    }
+
+    /// A-107 item 4 (the failing-first headline): an **edit appends** rather than mutates and a
+    /// **forget appends a tombstone**; the projection reflects both, while the log keeps every
+    /// state the entry ever held. A forgotten entry disappears from the read model *and* its
+    /// history is still there to explain what the agent used to believe.
+    fn forgetting_a_memory_hides_it_from_the_projection_but_keeps_its_history(store: &EventStore) {
+        let sid = store.create_session("m").unwrap();
+        let (cited, turn_id) = cited_event(store, &sid);
+        let scope = MemoryScope::Project {
+            key: "flux".to_string(),
+        };
+
+        let doomed = store
+            .remember(
+                &scope,
+                note_citing("auth middleware is in src/auth.rs", &cited, Some(turn_id)),
+            )
+            .unwrap();
+        let keeper = store
+            .remember(
+                &scope,
+                note_citing("tests live under crates/*/tests", &cited, Some(turn_id)),
+            )
+            .unwrap();
+
+        // An edit APPENDS: the projection shows the new claim, in the entry's original position.
+        let edited = store
+            .amend_memory(
+                &scope,
+                &doomed.id,
+                note_citing(
+                    "auth middleware moved to src/mw/auth.rs",
+                    &cited,
+                    Some(turn_id),
+                ),
+            )
+            .unwrap()
+            .expect("amending a believed entry must succeed");
+        assert_eq!(edited.id, doomed.id, "an edit keeps the entry id stable");
+        let live = store.memories(&scope).unwrap();
+        assert_eq!(
+            live.iter().map(|m| m.claim.as_str()).collect::<Vec<_>>(),
+            vec![
+                "auth middleware moved to src/mw/auth.rs",
+                "tests live under crates/*/tests"
+            ],
+            "the edit must replace the entry in place, not re-order the projection"
+        );
+
+        // A forget APPENDS a tombstone; the entry leaves the projection.
+        assert!(store.forget_memory(&scope, &doomed.id).unwrap());
+        let live = store.memories(&scope).unwrap();
+        assert_eq!(
+            live.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            vec![keeper.id.clone()],
+            "a forgotten entry must disappear from the projection"
+        );
+
+        // …while its whole believed history remains in the log: the original claim, the edit, and
+        // the tombstone are all still readable.
+        let history = store.memory_history(&scope).unwrap();
+        let names: Vec<&str> = history
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Custom { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                memory::MEMORY_NOTED,
+                memory::MEMORY_NOTED,
+                memory::MEMORY_EDITED,
+                memory::MEMORY_FORGOTTEN
+            ],
+            "nothing may be rewritten or deleted: edit and forget are appends"
+        );
+        let claims: Vec<String> = history
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Custom { name, payload } if name == memory::MEMORY_NOTED => {
+                    serde_json::from_value::<MemoryEntry>(payload.clone())
+                        .ok()
+                        .map(|m| m.claim)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            claims.contains(&"auth middleware is in src/auth.rs".to_string()),
+            "the superseded claim must survive in the log: {claims:?}"
+        );
+
+        // Forgetting twice is a no-op, and so is forgetting an unknown id — nothing extra appended.
+        assert!(!store.forget_memory(&scope, &doomed.id).unwrap());
+        assert!(!store.forget_memory(&scope, "not-an-entry").unwrap());
+        assert!(store
+            .amend_memory(&scope, &doomed.id, note_citing("back again", &cited, None))
+            .unwrap()
+            .is_none());
+        assert_eq!(store.memory_history(&scope).unwrap().len(), 4);
+    }
+
+    /// A-107 item 2: the receipt cites the **stable event id** (a ULID), never `global_seq`, and it
+    /// resolves back to exactly the cited event after a store round-trip.
+    fn a_receipt_cites_the_stable_event_id_not_the_backend_rowid(store: &EventStore) {
+        let sid = store.create_session("m").unwrap();
+        let (cited, turn_id) = cited_event(store, &sid);
+        let scope = MemoryScope::Global;
+
+        let entry = store
+            .remember(
+                &scope,
+                note_citing(
+                    "auth middleware is in src/mw/auth.rs",
+                    &cited,
+                    Some(turn_id),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(entry.receipt.event_id, cited.id);
+        assert_ne!(
+            entry.receipt.event_id,
+            cited.global_seq.to_string(),
+            "the citation must not be the backend rowid"
+        );
+        assert!(
+            ulid::Ulid::from_string(&entry.receipt.event_id).is_ok(),
+            "a store-minted event id is a ULID: {}",
+            entry.receipt.event_id
+        );
+        assert_eq!(entry.receipt.turn_id, Some(turn_id));
+
+        // Round-trip through the log (serialize → store → decode → project) and the citation still
+        // resolves to the same event.
+        let read_back = store
+            .memories(&scope)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == entry.id)
+            .expect("the entry must project back out of the log");
+        assert_eq!(read_back.receipt, entry.receipt);
+        let resolved = store
+            .resolve_receipt(&read_back.receipt)
+            .unwrap()
+            .expect("the citation must resolve");
+        assert_eq!(resolved.id, cited.id);
+        assert_eq!(resolved.global_seq, cited.global_seq);
+
+        // A citation into a stream that isn't here resolves to `None`, never to a wrong event.
+        let dangling = Receipt {
+            stream: "s_99999".to_string(),
+            event_id: cited.id.clone(),
+            turn_id: None,
+        };
+        assert!(store.resolve_receipt(&dangling).unwrap().is_none());
+    }
+
+    /// A-107 item 5: a claim carrying a credential shape is scrubbed by the **same `Redactor` the
+    /// evidence flush seam uses** (C-22/C-164) before the store ever sees it — both the always-on
+    /// credential-shape heuristic and the registered-value path. There is no second scrubber here:
+    /// `MemoryNote::new` takes the live redactor's `redact` and is the only way to build a note.
+    fn a_credential_shaped_claim_is_scrubbed_before_it_reaches_the_store(store: &EventStore) {
+        let sid = store.create_session("m").unwrap();
+        let (cited, _turn) = cited_event(store, &sid);
+        let scope = MemoryScope::Global;
+
+        // One credential caught by SHAPE alone (never registered anywhere), one caught because it
+        // was registered on the live turn's redactor — the two halves of the flush seam.
+        let shaped = "sk-ant-api03-AAAABBBBCCCCDDDD";
+        let registered = "orchid-galaxy-turnip-9317";
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret(registered.to_string());
+        let raw = format!("deploy with {shaped} and the passphrase {registered}");
+
+        let note = MemoryNote::new(
+            &raw,
+            Receipt {
+                stream: cited.stream.clone(),
+                event_id: cited.id.clone(),
+                turn_id: None,
+            },
+            None,
+            |s| redactor.redact(s),
+        );
+        let entry = store.remember(&scope, note).unwrap();
+
+        for (label, text) in [
+            ("the returned entry", entry.claim.clone()),
+            (
+                "the projection",
+                store.memories(&scope).unwrap()[0].claim.clone(),
+            ),
+            (
+                "the raw stored payload",
+                serde_json::to_string(&store.memory_history(&scope).unwrap()[0].kind).unwrap(),
+            ),
+        ] {
+            assert!(
+                !text.contains(shaped),
+                "{label} must not carry the credential-shaped token: {text}"
+            );
+            assert!(
+                !text.contains(registered),
+                "{label} must not carry the registered secret: {text}"
+            );
+            assert!(
+                text.contains("[redacted]"),
+                "{label} must show the redaction marker: {text}"
+            );
+        }
+    }
+
+    /// A-107 item 2, the part that actually costs something to get wrong: a citation must still
+    /// name **the same event** after a store migration that renumbers every `global_seq`.
+    ///
+    /// The migration is simulated the way a real one behaves — a fresh store, seeded with unrelated
+    /// traffic first so its rowid counter is offset, then both streams re-imported carrying each
+    /// event's **stable id** (the one thing a migration preserves) while the destination mints its
+    /// own rowids. The last assertion is the point of the whole story item: the source's
+    /// `global_seq` no longer names the cited event in the destination, so a receipt pinned to it
+    /// would have silently come to cite something else — the worst kind of provenance bug, because
+    /// it still looks resolvable.
+    #[test]
+    fn a_memory_citation_survives_a_migration_that_renumbers_global_seq() {
+        let scope = MemoryScope::Global;
+        let src = EventStore::in_memory().unwrap();
+        let sid = src.create_session("m").unwrap();
+        let (cited, _turn) = cited_event(&src, &sid);
+        let entry = src
+            .remember(
+                &scope,
+                note_citing("the auth middleware is in src/mw/auth.rs", &cited, None),
+            )
+            .unwrap();
+        let src_rowid = cited.global_seq;
+
+        // The destination: unrelated traffic on an ad-hoc stream first, so every rowid it mints for
+        // the imported events lands somewhere the source's numbering never reached.
+        let dst = EventStore::in_memory().unwrap();
+        for i in 0..7 {
+            dst.append(
+                "decoy",
+                NewEvent::message(Message::user_text(format!("unrelated {i}"))),
+            )
+            .unwrap();
+        }
+        let imported_sid = dst.create_session("m").unwrap();
+        assert_eq!(
+            imported_sid, sid,
+            "the fixture assumes the destination re-mints the same session id"
+        );
+        for stream in [sid.as_str(), scope.stream().as_str()] {
+            for ev in src.load_stream(stream, None).unwrap() {
+                if matches!(ev.kind, EventKind::SessionStarted { .. }) {
+                    continue; // the destination minted its own
+                }
+                dst.append(stream, NewEvent::new(ev.kind).with_id(ev.id))
+                    .unwrap();
+            }
+        }
+
+        // The entry projects out of the migrated store unchanged, receipt and all…
+        let migrated = dst
+            .memories(&scope)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == entry.id)
+            .expect("the migrated entry must project");
+        assert_eq!(migrated.receipt, entry.receipt);
+
+        // …and the citation still resolves to the same event, now under a different rowid.
+        let resolved = dst
+            .resolve_receipt(&migrated.receipt)
+            .unwrap()
+            .expect("the stable-id citation must still resolve after the migration");
+        assert_eq!(resolved.id, cited.id);
+        assert_eq!(resolved.kind, cited.kind);
+        assert_ne!(
+            resolved.global_seq, src_rowid,
+            "the fixture must actually renumber the rowid, or it proves nothing"
+        );
+
+        // The punchline: the source's `global_seq` does not name the cited event here any more.
+        let by_rowid = dst
+            .load_stream(&sid, None)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.global_seq == src_rowid);
+        assert!(
+            by_rowid.is_none_or(|e| e.id != cited.id),
+            "a global_seq-pinned citation would now resolve to the wrong event"
+        );
+    }
+
     /// The SQLite backend: every backend-agnostic conformance body against a fresh in-memory store
     /// (today's behavior — must stay green), plus the SQLite-specific tests (file reopen, cross-process
     /// busy-timeout) that have no Postgres analog.
@@ -3052,6 +3576,10 @@ mod tests {
         sqlite_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
         sqlite_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
         sqlite_case!(deleting_a_session_clears_its_pending_wakeups);
+        sqlite_case!(memory_entries_live_on_a_scoped_stream_in_the_same_store);
+        sqlite_case!(forgetting_a_memory_hides_it_from_the_projection_but_keeps_its_history);
+        sqlite_case!(a_receipt_cites_the_stable_event_id_not_the_backend_rowid);
+        sqlite_case!(a_credential_shaped_claim_is_scrubbed_before_it_reaches_the_store);
 
         // --- SQLite-specific: no Postgres analog (file reopen / cross-process busy-timeout) ---
 
@@ -3485,6 +4013,10 @@ mod tests {
         pg_case!(cancel_wakeup_is_a_noop_for_an_unknown_or_already_resolved_id);
         pg_case!(due_wakeups_filters_by_fire_at_and_sorts_soonest_first);
         pg_case!(deleting_a_session_clears_its_pending_wakeups);
+        pg_case!(memory_entries_live_on_a_scoped_stream_in_the_same_store);
+        pg_case!(forgetting_a_memory_hides_it_from_the_projection_but_keeps_its_history);
+        pg_case!(a_receipt_cites_the_stable_event_id_not_the_backend_rowid);
+        pg_case!(a_credential_shaped_claim_is_scrubbed_before_it_reaches_the_store);
 
         /// D-76 (PG-only): eight simultaneous cold-boots against ONE fresh schema must ALL succeed.
         /// Postgres's `IF NOT EXISTS` DDL is not atomic — without the global `flux:ddl` advisory

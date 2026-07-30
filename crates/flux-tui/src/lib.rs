@@ -7,6 +7,7 @@
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
 mod controller;
+mod panes;
 mod projection;
 mod rendering;
 pub mod spinners;
@@ -19,6 +20,7 @@ use controller::{
     approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
     ChannelSink, ModelCallTiming, PendingApproval, UiEvent,
 };
+use panes::PaneStore;
 #[cfg(test)]
 use projection::staged_intent_entry;
 use projection::{historical_observation_entry, load_history};
@@ -1036,7 +1038,18 @@ impl ChatState {
             next_action_id: 1,
             active_action_id: None,
             ctrl_c_armed_at: None,
+            panes: PaneStore::default(),
         }
+    }
+
+    /// Apply one host-pushed pane command (C-221).
+    ///
+    /// **The only way a pane reaches this surface.** There is deliberately no model path yet: the
+    /// `pane.*` ops and their `SurfaceSink` install are C-223's story, so today only the host (or a
+    /// test) can open a pane. Bounds — count, rows, width — are enforced by [`crate::panes`], never
+    /// by the command.
+    pub fn apply_pane_command(&mut self, command: flux_runtime::PaneCommand) {
+        self.panes.apply(command);
     }
 
     /// Track a `loop.phase` observation (design Part 1 / A-15, mirrors the CLI's
@@ -2670,6 +2683,9 @@ impl ChatState {
         self.turn_rounds.clear();
         self.cost_usd = None;
         self.cost_unpriced = false;
+        // C-221: panes are session-scoped, so projecting a different session (`/resume`) drops them
+        // rather than attributing one session's panes to another.
+        self.panes.clear();
         for usage in &turn_usage {
             self.tokens_out += usage.output_tokens;
             self.tokens_reasoning += usage.reasoning_tokens;
@@ -3155,6 +3171,10 @@ async fn event_loop(
                     state.retry = None;
                     state.turn_start = None;
                     state.active_action_id = None;
+                    // C-221: a `turn`-lifetime pane does not outlive the turn that opened it. This
+                    // is the surface's one turn-termination path (normal stop, cancel and error all
+                    // arrive as `Finished`), so clearing here covers every way a turn can end.
+                    state.panes.end_turn();
                     // A queued message starts only after the prior task's Finished marker.
                     if !state.queue_open && state.queue_edit.is_none() {
                         if let Some(queued) = state.queue.pop_front() {
@@ -4318,6 +4338,231 @@ mod tests {
             subjects: subjects.into_iter().map(Into::into).collect(),
             ..controller::ApprovalRequest::default()
         }
+    }
+
+    /// One host-pushed `log` pane in `slot`, session-lifetime.
+    #[cfg(test)]
+    fn log_pane(id: &str, slot: flux_runtime::PaneSlot) -> flux_runtime::PaneCommand {
+        flux_runtime::PaneCommand::Open(flux_runtime::PaneSpec::new(
+            id,
+            id,
+            slot,
+            flux_runtime::PaneLifetime::Session,
+            flux_runtime::PaneData::Log {
+                lines: vec![format!("{id}-body")],
+            },
+        ))
+    }
+
+    /// A `width`×20 frame of a one-entry session, optionally with a right-slot pane pushed.
+    #[cfg(test)]
+    fn pane_frame(width: u16, with_pane: bool) -> ratatui::buffer::Buffer {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Notice {
+            text: "a transcript row".into(),
+            sev: Sev::Info,
+        });
+        if with_pane {
+            state.apply_pane_command(log_pane("fleet", flux_runtime::PaneSlot::Right));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// C-221 (the story's failing-first test): below the surface's minimum transcript width, panes
+    /// are **not drawn at all** — a narrow terminal renders byte-identically, cells and styles
+    /// included, to the same session with no panes. That is the posture `EMPTY_CARD_MIN_WIDTH`
+    /// (C-157) and C-102's header/footer bars established: a narrow frame drops the aside rather
+    /// than squeezing the conversation. Given room, the same pane is drawn.
+    #[test]
+    fn panes_are_suppressed_below_the_minimum_transcript_width() {
+        // 60 columns is under `panes::PANE_MIN_TRANSCRIPT_WIDTH`.
+        assert_eq!(
+            pane_frame(60, true),
+            pane_frame(60, false),
+            "a narrow terminal must render exactly as it does with no panes"
+        );
+
+        let wide = pane_frame(100, true);
+        let text: String = wide.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("fleet"), "pane title drawn: {text}");
+        assert!(text.contains("fleet-body"), "pane body drawn: {text}");
+        assert_ne!(
+            wide,
+            pane_frame(100, false),
+            "given room, the pane changes the frame"
+        );
+    }
+
+    /// C-221 / acceptance 5: a pane is drawn, and is nonetheless **invisible to every piece of
+    /// transcript machinery** — it takes no layout-cache entry (C-149), no scroll bookkeeping
+    /// (C-106), no `focused` index (C-111), and transcript search (C-108) does not find it. This is
+    /// the rule `render_empty_state_card`'s doc comment states for the orientation card, asserted
+    /// for panes because they render into the same region for the same reason.
+    #[test]
+    fn panes_never_participate_in_the_transcript_viewport() {
+        let entry = || Entry::Notice {
+            text: "a transcript row".into(),
+            sev: Sev::Info,
+        };
+        let mut state = ChatState::new("mock".into());
+        state.push(entry());
+        state.apply_pane_command(log_pane("fleet", flux_runtime::PaneSlot::Right));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        assert!(
+            screen(&terminal).contains("fleet-body"),
+            "the pane IS drawn"
+        );
+
+        // The wrapped transcript rows hold the entry and nothing of the pane.
+        let visible = state.transcript_viewport(60, 10);
+        let flat: String = visible
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(flat.contains("a transcript row"), "{flat}");
+        assert!(
+            !flat.contains("fleet-body"),
+            "pane content is not a row: {flat}"
+        );
+
+        // Transcript search does not reach it (the layout it searches has no pane rows at all).
+        state.search = Some(TranscriptSearch {
+            query: "fleet-body".into(),
+            ..TranscriptSearch::default()
+        });
+        state.refresh_search_matches();
+        assert!(
+            state.search.as_ref().unwrap().matches.is_empty(),
+            "search must not find pane content"
+        );
+        state.search = None;
+
+        // Cache + scroll bookkeeping match a pane-less session laid out at the same width: the
+        // pane contributes neither an `entry_rows` span nor a wrapped row.
+        let mut bare = ChatState::new("mock".into());
+        bare.push(entry());
+        let _ = bare.transcript_viewport(60, 10);
+        let rows = |s: &ChatState| {
+            let layout = s.transcript_layout.borrow();
+            let layout = layout.as_ref().expect("layout built");
+            (layout.entry_rows.len(), layout.lines.len())
+        };
+        assert_eq!(rows(&state), rows(&bare), "no extra cache entry or row");
+        assert_eq!(rows(&state).0, state.entries.len(), "one span per entry");
+        assert_eq!(state.last_max_scroll.get(), bare.last_max_scroll.get());
+
+        // Focus walks entries only — it can never land on the pane.
+        state.focus_move(1);
+        assert_eq!(state.focused, Some(0));
+        state.focus_move(1);
+        assert_eq!(state.focused, Some(0), "focus stays inside the entries");
+    }
+
+    /// C-221 / acceptance 3: pane content is truncated **by the surface**. An oversized payload
+    /// loses its tail behind an explicit elision marker instead of growing the pane, and the
+    /// transcript keeps its own floor.
+    #[test]
+    fn an_oversized_pane_is_truncated_by_the_surface() {
+        let mut state = ChatState::new("mock".into());
+        state.push(Entry::Notice {
+            text: "a transcript row".into(),
+            sev: Sev::Info,
+        });
+        state.apply_pane_command(flux_runtime::PaneCommand::Open(
+            flux_runtime::PaneSpec::new(
+                "flood",
+                "flood",
+                flux_runtime::PaneSlot::Right,
+                flux_runtime::PaneLifetime::Session,
+                flux_runtime::PaneData::Log {
+                    lines: (0..200)
+                        .map(|i| format!("line-{i}-{}", "x".repeat(200)))
+                        .collect(),
+                },
+            ),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let content = screen(&terminal);
+        assert!(content.contains("line-0"), "the head is shown: {content}");
+        assert!(!content.contains("line-40"), "the tail is cut: {content}");
+        assert!(content.contains("more"), "the elision is marked: {content}");
+        // The transcript is still there and still readable beside it.
+        assert!(content.contains("a transcript row"), "{content}");
+    }
+
+    /// C-221 / acceptance 2: the horizontal split goes around the **transcript row only** and the
+    /// `bottom` slot is one extra vertical constraint — header, footer and composer keep the full
+    /// width and their rows in every slot. `overlay` goes through the shared
+    /// `render_overlay_panel` chrome (C-152). And panes draw before the approval sheet, which the
+    /// sheet's `Clear`ed rect then covers — the ordering C-222's trust invariant rests on.
+    #[test]
+    fn only_the_transcript_row_is_split_and_the_sheet_draws_over_panes() {
+        let frame = |slot: Option<flux_runtime::PaneSlot>, approval: bool| {
+            let mut state = ChatState::new("mock".into());
+            state.push(Entry::Notice {
+                text: "a transcript row".into(),
+                sev: Sev::Info,
+            });
+            if let Some(slot) = slot {
+                state.apply_pane_command(log_pane("fleet", slot));
+            }
+            if approval {
+                state.approval = Some(ApprovalView {
+                    request: op_request("read", ["README.md"]),
+                    scroll: 0,
+                    reason: None,
+                });
+            }
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|f| render(f, &state)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let row = |buf: &ratatui::buffer::Buffer, r: usize| -> Vec<ratatui::buffer::Cell> {
+            buf.content[r * 100..(r + 1) * 100].to_vec()
+        };
+
+        let bare = frame(None, false);
+        for slot in [
+            flux_runtime::PaneSlot::Left,
+            flux_runtime::PaneSlot::Right,
+            flux_runtime::PaneSlot::Bottom,
+            flux_runtime::PaneSlot::Overlay,
+        ] {
+            let with = frame(Some(slot), false);
+            assert_eq!(
+                row(&with, 0),
+                row(&bare, 0),
+                "{slot:?}: header row unchanged"
+            );
+            assert_eq!(
+                row(&with, 23),
+                row(&bare, 23),
+                "{slot:?}: footer row unchanged"
+            );
+            assert_eq!(
+                row(&with, 22),
+                row(&bare, 22),
+                "{slot:?}: composer row unchanged"
+            );
+            let text: String = with.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("fleet-body"), "{slot:?}: pane drawn: {text}");
+        }
+
+        // The approval sheet draws last, over its own `Clear`ed rect, so it survives a pane in the
+        // rows it occupies.
+        let sheet = frame(Some(flux_runtime::PaneSlot::Bottom), true);
+        let text: String = sheet.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("approve"), "the sheet still draws: {text}");
+        assert!(text.contains("README.md"), "the sheet's subject: {text}");
+        assert!(
+            !text.contains("fleet-body"),
+            "the sheet covers the bottom pane rather than the other way round: {text}"
+        );
     }
 
     #[test]

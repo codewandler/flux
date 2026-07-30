@@ -2,7 +2,8 @@
 id: A-111
 title: "Fleet coordinator — flux orchestrating flux across repos (epic)"
 pillar: Agent
-status: backlog
+status: ready
+priority: 29
 epic: fleet-coordinator
 design: docs/designs/fleet-coordinator.md
 note: "EPIC — the coordinator is a .flux Program on flux-app, not a new binary: a write-capable WorkBoard port (Jira/markdown/GitLab swappable), outbound A2A dispatch to remote workers, and per-delivery bus isolation as the blocker"

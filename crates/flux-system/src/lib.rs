@@ -1303,6 +1303,93 @@ impl System {
         write_result
     }
 
+    /// Read–modify–write a workspace file under an **exclusive reservation**, committed by an
+    /// atomic rename — the compare-and-set that [`write_file_atomic`](Self::write_file_atomic)
+    /// cannot offer, because its staging sibling carries a unique name and its rename therefore
+    /// always wins.
+    ///
+    /// The reservation is a *deterministically* named sibling created with `O_EXCL`, so exactly one
+    /// writer per destination holds it at a time; committing renames it **onto** the destination,
+    /// releasing it in the same atomic step. Writers targeting different paths never meet, so a
+    /// file-per-record store gets mutual exclusion without a shared lock file.
+    ///
+    /// * `Ok(true)` — `update` ran and its output is now the file's contents.
+    /// * `Ok(false)` — another writer holds the reservation. Nothing was read and nothing written;
+    ///   the caller decides whether that is a conflict or a retry.
+    /// * `Err(_)` — the IO failed, or `update` refused. Either way the destination is untouched:
+    ///   a refusal is "never start", not "roll back", so a rejected update cannot leave a partial
+    ///   or truncated file behind.
+    ///
+    /// `update` receives the current contents, or `None` when the destination does not exist yet —
+    /// which is what lets a caller mint a new record and edit an existing one through one path.
+    pub fn update_file_reserved(
+        &self,
+        path: &str,
+        update: impl FnOnce(Option<&str>) -> Result<String>,
+    ) -> Result<bool> {
+        use std::io::Write as _;
+
+        let destination = self.workspace.resolve(path)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Config(format!("path {path:?} has no parent")))?;
+        std::fs::create_dir_all(parent)?;
+
+        // Resolve again after creating the parent, exactly as `write_file_atomic` does: it closes
+        // the parent-symlink swap window and gives the reservation its physical, guarded directory.
+        let destination = self.workspace.resolve(path)?;
+        let file_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Config(format!("path {path:?} is not valid UTF-8")))?;
+        let reservation = destination.with_file_name(format!(".{file_name}.reserved"));
+
+        // The `O_EXCL` create *is* the compare half of the compare-and-set. A loser must return
+        // before touching anything — and in particular must not remove the reservation, which
+        // belongs to the writer that won it.
+        let file = match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&reservation)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+
+        // Borrowed so the cleanup below still owns the path after the closure consumes `file`.
+        let staged = &reservation;
+        let commit = (move || -> Result<()> {
+            let mut file = file;
+            let current = match std::fs::read(&destination) {
+                Ok(bytes) => Some(
+                    String::from_utf8(bytes)
+                        .map_err(|_| Error::Other(format!("{path}: not valid UTF-8")))?,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            let next = update(current.as_deref())?;
+            file.write_all(next.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+
+            // A final identity check catches a destination or parent retarget before replacement.
+            let final_destination = self.workspace.resolve(path)?;
+            if final_destination != destination {
+                return Err(Error::Config(format!(
+                    "path {path:?} changed identity during a reserved write"
+                )));
+            }
+            std::fs::rename(staged, &final_destination)?;
+            Ok(())
+        })();
+        if commit.is_err() {
+            let _ = std::fs::remove_file(&reservation);
+        }
+        commit.map(|()| true)
+    }
+
     /// Read the raw bytes of a file within the workspace (no UTF-8 decode). Used to sniff binary
     /// files (NUL bytes) and report byte sizes *before* a lossy text decode.
     pub async fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>> {
@@ -1761,7 +1848,7 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, None)
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, None, None)
             .await
     }
 
@@ -1792,8 +1879,15 @@ impl System {
         timeout: Duration,
         observer: OutputObserver,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Sandboxed, Some(observer))
-            .await
+        self.run_with_env_confinement(
+            argv,
+            env,
+            timeout,
+            Confinement::Sandboxed,
+            Some(observer),
+            None,
+        )
+        .await
     }
 
     /// Launch a trusted host process outside this `System`'s child sandbox while retaining every
@@ -1807,8 +1901,34 @@ impl System {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt, None)
+        self.run_with_env_confinement(argv, env, timeout, Confinement::Exempt, None, None)
             .await
+    }
+
+    /// Like [`run`](Self::run), but feeds `stdin` to the child on its standard input, then closes
+    /// it (C-92). This exists for the handful of git plumbing commands whose *input* is a document
+    /// rather than an argument — `git apply --cached -` takes the patch on stdin, and the only
+    /// alternative would be writing a scratch file into the very workspace the op is guarding.
+    ///
+    /// Every other guarantee of [`run`](Self::run) is unchanged: the same [`Self::build_command`]
+    /// choke point, argv-only, workspace-pinned cwd, cleared environment, capped output. The bytes
+    /// are written from a concurrent task so a payload larger than the pipe buffer cannot deadlock
+    /// against the output capture.
+    pub async fn run_with_stdin(
+        &self,
+        argv: &[String],
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.run_with_env_confinement(
+            argv,
+            &[],
+            timeout,
+            Confinement::Sandboxed,
+            None,
+            Some(stdin),
+        )
+        .await
     }
 
     async fn run_with_env_confinement(
@@ -1818,16 +1938,49 @@ impl System {
         timeout: Duration,
         confinement: Confinement,
         observer: Option<OutputObserver>,
+        stdin: Option<&[u8]>,
     ) -> Result<ProcessOutput> {
         let mut cmd = self.build_tokio_command(argv, env, true, confinement)?;
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
         let program = argv[0].clone();
 
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {program}: {e}")))?;
+        // Write the payload from its own task: a patch can exceed the pipe buffer, and writing it
+        // inline before draining stdout would deadlock the pair.
+        //
+        // The write result is *kept* rather than discarded. A short write closes the fd on drop and
+        // delivers a clean EOF, so the child sees a truncated-but-well-formed payload and can exit
+        // 0 on it — a partial `git apply` reported as a complete success. Callers cannot distinguish
+        // that from a real success by exit code, so a failed write has to become a hard error here.
+        let mut writer = None;
+        if let Some(bytes) = stdin {
+            match child.stdin.take() {
+                Some(mut sink) => {
+                    let bytes = bytes.to_vec();
+                    let expected = bytes.len();
+                    writer = Some(tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt as _;
+                        sink.write_all(&bytes).await?;
+                        sink.shutdown().await?; // EOF, so the child stops reading.
+                        std::io::Result::Ok(expected)
+                    }));
+                }
+                None => {
+                    let mut child = GuardedChild::new(child);
+                    child.terminate_tree();
+                    let _ = child.wait().await;
+                    return Err(Error::Other("child stdin unavailable".to_string()));
+                }
+            }
+        }
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -1846,15 +1999,39 @@ impl System {
                 return Err(Error::Other("child stderr unavailable".to_string()));
             }
         };
-        await_process(
+        let out = await_process(
             child,
             Some(stdout),
             Some(stderr),
-            program,
+            program.clone(),
             timeout,
             observer,
         )
-        .await
+        .await?;
+        // Only now is the write verdict meaningful. A child that rejects its input can exit before
+        // the payload is drained, which surfaces here as `EPIPE` — that is not our failure, and the
+        // non-zero exit already carries the real diagnosis, so let it through untouched. The case
+        // that must not pass is a failed write under a *successful* exit: that is precisely the
+        // "child acted on a truncated payload and was happy with it" shape.
+        if let Some(handle) = writer {
+            let wrote = match handle.await {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(Error::Other(format!(
+                        "{program}: stdin writer panicked: {e}"
+                    )))
+                }
+            };
+            if let Err(e) = wrote {
+                if out.exit_code == 0 {
+                    return Err(Error::Other(format!(
+                        "{program}: failed writing stdin ({e}); the child exited 0 on a partial \
+                         payload, so its result cannot be trusted"
+                    )));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Scrub a command's environment to the minimal non-secret allow-list, then apply caller
@@ -2851,6 +3028,103 @@ mod tests {
         }
     }
 
+    /// The compare half of the compare-and-set: while one writer holds the reservation, a second
+    /// writer for the same path is told so rather than being allowed to race it. The nesting is
+    /// what makes the contention deterministic — the inner call runs *inside* the outer one's
+    /// window, with no reliance on thread timing.
+    #[test]
+    fn a_reserved_update_excludes_a_second_writer_for_the_same_path() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file_atomic("item.md", "first").unwrap();
+
+        let committed = sys
+            .update_file_reserved("item.md", |current| {
+                assert_eq!(current, Some("first"));
+                // A second writer arriving mid-window is refused, and refused *without* stealing
+                // or clearing the reservation this call still holds.
+                let contended = sys
+                    .update_file_reserved("item.md", |_| {
+                        panic!("the contended writer must not run its update")
+                    })
+                    .expect("contention is a verdict, not an error");
+                assert!(!contended, "a second writer must not hold the reservation");
+                Ok("second".to_string())
+            })
+            .unwrap();
+        assert!(committed);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("item.md")).unwrap(),
+            "second"
+        );
+
+        // The reservation was consumed by the commit, so the next writer sails through.
+        assert!(sys
+            .update_file_reserved("item.md", |current| {
+                assert_eq!(current, Some("second"));
+                Ok("third".into())
+            })
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("item.md")).unwrap(),
+            "third"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A refused update is "never start", not "roll back": the destination keeps its exact bytes
+    /// and no reservation is left behind to wedge the next writer.
+    #[test]
+    fn a_refused_reserved_update_leaves_the_destination_and_the_directory_clean() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file_atomic("nested/item.md", "original").unwrap();
+
+        let error = sys
+            .update_file_reserved("nested/item.md", |_| {
+                Err(Error::Other("the caller refused".into()))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("the caller refused"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("nested/item.md")).unwrap(),
+            "original"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(dir.join("nested"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "item.md")
+            .collect();
+        assert!(leftovers.is_empty(), "stray staging files: {leftovers:?}");
+
+        // And the path is still writable afterwards — the refusal did not wedge it.
+        assert!(sys
+            .update_file_reserved("nested/item.md", |_| Ok("replaced".into()))
+            .unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `None` arm: the same call mints a file that does not exist yet, which is what lets a
+    /// file-per-record store create and edit through one guarded path.
+    #[test]
+    fn a_reserved_update_mints_a_missing_file_and_stays_inside_the_workspace() {
+        let (dir, sys) = temp_workspace();
+        assert!(sys
+            .update_file_reserved("fresh.md", |current| {
+                assert_eq!(current, None);
+                Ok("minted".into())
+            })
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fresh.md")).unwrap(),
+            "minted"
+        );
+        assert!(
+            sys.update_file_reserved("../escape.md", |_| Ok("nope".into()))
+                .is_err(),
+            "a reserved write is confined exactly like every other guarded write"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_escape_hidden_in_symlink_targets_intermediate_component() {
@@ -3035,6 +3309,88 @@ mod tests {
             .unwrap();
         assert_eq!(out.stdout, "hi");
         assert_eq!(out.exit_code, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92: `run_with_stdin` feeds the child its payload and closes the pipe. The payload is
+    /// deliberately larger than a pipe buffer (64 KiB on Linux) — writing it inline before draining
+    /// stdout would deadlock, which is why the write lives in its own task.
+    #[tokio::test]
+    async fn run_with_stdin_feeds_a_payload_larger_than_the_pipe_buffer() {
+        let (dir, sys) = temp_workspace();
+        let payload = "x".repeat(256 * 1024);
+        let out = sys
+            .run_with_stdin(
+                &["cat".to_string()],
+                payload.as_bytes(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout.len(), payload.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92 rework: an undelivered payload must not be reported as success. A child that exits
+    /// without draining stdin makes the write fail with `EPIPE`; the fd is then closed by drop and
+    /// delivers a *clean* EOF, so nothing downstream can tell a truncated payload from a complete
+    /// one by exit code alone. Discarding that write error is what made "partial `git apply`
+    /// reported as complete success" reachable, so it has to surface as a hard error.
+    ///
+    /// The payload exceeds the pipe buffer so the write is guaranteed to block and then fail,
+    /// rather than fitting entirely into the kernel buffer and succeeding.
+    #[tokio::test]
+    async fn run_with_stdin_fails_when_the_payload_is_not_delivered_but_the_child_exits_ok() {
+        let (dir, sys) = temp_workspace();
+        let payload = "x".repeat(1024 * 1024);
+        // `true` exits 0 immediately and never reads stdin.
+        let result = sys
+            .run_with_stdin(
+                &["true".to_string()],
+                payload.as_bytes(),
+                Duration::from_secs(30),
+            )
+            .await;
+        let err = result.expect_err("an undelivered payload under exit 0 must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stdin"),
+            "the error should name the stdin write: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92 rework: the converse — a child that *rejects* its input and exits non-zero also breaks
+    /// the pipe, but there the exit code carries the real diagnosis and the caller needs to see it.
+    /// That must stay a normal non-zero result, not be masked by the new stdin check.
+    #[tokio::test]
+    async fn run_with_stdin_reports_the_childs_exit_code_when_it_rejects_the_payload() {
+        let (dir, sys) = temp_workspace();
+        let payload = "x".repeat(1024 * 1024);
+        let out = sys
+            .run_with_stdin(
+                &["false".to_string()],
+                payload.as_bytes(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("a non-zero exit must surface as a result, not an error");
+        assert_ne!(out.exit_code, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-92: stdin is closed after the payload, so a child that reads to EOF terminates on its own
+    /// rather than hanging until the deadline.
+    #[tokio::test]
+    async fn run_with_stdin_closes_the_pipe_so_the_child_sees_eof() {
+        let (dir, sys) = temp_workspace();
+        let out = sys
+            .run_with_stdin(&["cat".to_string()], b"one\ntwo\n", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "one\ntwo\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

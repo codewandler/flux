@@ -2,7 +2,7 @@
 id: I-05
 title: Sharpen the improve round — stable scored task set, severity-ordered planner picks
 pillar: Improve
-status: backlog
+status: done
 note: "ON HOLD + DE-PRIORITIZED (user call 2026-07-06; focus shifts to hardening/docs/cleanup after v0.2.23) — resume by implementing the two queued fixes below, then fund round 4; the 2026-07-06 funded round proved the machinery and exposed the two odds-killers: chess-best-move is too flaky to score (vision + tb-registry 429s; baseline swung 28↔42%), and the planner skipped the reviewer's severity-5 candidate"
 ---
 
@@ -35,6 +35,14 @@ consume the ranking, so the next funded round measures the change instead of the
       funded round (see below), which is why this story stays `backlog`.**
 
 ## Progress
+- 2026-07-29 — **closed as already-shipped board drift, not new work.** Every Acceptance item was
+  already ticked with a "(Landed: …)" note, but `status` still read `backlog`. Verified all three
+  against the tree rather than trusting the ticks: `examples/improve-tbench.flux` scores
+  `fibonacci-server` only at `trials: 5` on **both** legs (`:20`, `:223`) with zero remaining
+  `chess-best-move` references; the planner template carries the "RANKED by measured weight"
+  instruction and the `addresses` field; and `bench/run-tbench-loop.sh:36` honours
+  `FLUX_IMPROVE_EVAL_MODEL`. The implementing commit is `c5943b5c` and CHANGELOG already carries
+  the entry, so only the frontmatter was stale.
 - 2026-07-06 filed + implementation started (same session as the proving round).
 
 - 2026-07-06 (round 3, the sharpened setup) — infra worked (stable fibonacci×5 substrate,

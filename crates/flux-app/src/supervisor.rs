@@ -3,16 +3,27 @@
 //! Public bus subscriptions are observation-only. This actor is the sole consumer that routes
 //! events into triggers, which keeps direct deliveries, long-running supervision, and public bus
 //! emission from duplicating or consuming one another's cascades.
+//!
+//! Single *owner*, not single *file*: the actor loop only dequeues, and runs each submitted root in
+//! its own task. Every root carries a [`DeliveryOrigin`] whose cascade queue and nesting budget are
+//! private to it (A-112), so concurrent deliveries neither collect one another's `emit`s nor wait
+//! behind one another — a nightly sweep no longer blocks webhook intake.
+//!
+//! Concurrent is not unbounded: the loop takes an admission slot before it spawns, so at most
+//! [`crate::DeliveryLoad::limit`] roots run at once and the rest wait in the queue (A-129). See
+//! [`mod@crate::admission`] for what happens at the bound and why waiting was chosen over dropping.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch, OnceCell};
+use tokio::task::JoinSet;
 
 use flux_core::{Error, Result};
 
+use crate::admission::{configured_max_inflight_deliveries, Admission, DeliveryLoad, DeliverySlot};
 use crate::app::{Engine, JourneyRun, RecordingSink};
 use crate::bus::{delivery_origin, scope_delivery, DeliveryOrigin, Event, RunContext, CAPACITY};
 
@@ -41,11 +52,15 @@ pub(crate) enum DeliveryMessage {
 
 pub(crate) struct DeliverySupervisor {
     id: u64,
+    /// The delivery bound to install when the actor starts (A-129). Configurable until then; the
+    /// [`Admission`] built from it in [`DeliverySupervisor::ensure_started`] is then fixed.
+    limit: AtomicUsize,
     handle: OnceCell<SupervisorHandle>,
 }
 
 struct SupervisorHandle {
     sender: mpsc::Sender<DeliveryMessage>,
+    admission: Arc<Admission>,
     external_run: Arc<Mutex<Option<RunContext>>>,
     startup_sent: Arc<AtomicBool>,
     startup_observed: Arc<AtomicBool>,
@@ -62,7 +77,27 @@ impl DeliverySupervisor {
     pub(crate) fn new() -> Self {
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
+            limit: AtomicUsize::new(configured_max_inflight_deliveries()),
             handle: OnceCell::new(),
+        }
+    }
+
+    /// Set the delivery bound. Takes effect when the actor starts, i.e. before the first
+    /// `deliver`/`run`; afterwards the installed [`Admission`] owns the limit and this is inert.
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.limit.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    /// The current admission snapshot. An App that has never delivered has no actor yet, so it
+    /// reports an idle load carrying the limit it *would* start with.
+    pub(crate) fn load(&self) -> DeliveryLoad {
+        match self.handle.get() {
+            Some(handle) => handle.admission.load(),
+            None => DeliveryLoad {
+                in_flight: 0,
+                waiting: 0,
+                limit: self.limit.load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -79,14 +114,22 @@ impl DeliverySupervisor {
         }
         let handle = self.ensure_started(engine).await;
         let (response, result) = oneshot::channel();
-        handle
+        // Counted before the send so the submission is never invisible; `send` itself blocks once
+        // the queue fills behind a saturated bound, which is where backpressure reaches the caller.
+        // The guard carries the count across that await, so a cancelled `deliver` takes it with it.
+        let submission = handle.admission.submit();
+        if handle
             .sender
             .send(DeliveryMessage::Deliver {
                 event: Event::new(label, payload),
                 response,
             })
             .await
-            .map_err(|_| stopped_error(handle, "delivery supervisor stopped"))?;
+            .is_err()
+        {
+            return Err(stopped_error(handle, "delivery supervisor stopped"));
+        }
+        submission.enqueued();
         result
             .await
             .map_err(|_| stopped_error(handle, "delivery supervisor dropped the request"))?
@@ -102,7 +145,8 @@ impl DeliverySupervisor {
         let mut lease = RunLease::acquire(handle.external_run.clone())?;
         if !handle.startup_sent.load(Ordering::Acquire) {
             let (response, result) = oneshot::channel();
-            handle
+            let submission = handle.admission.submit();
+            if handle
                 .sender
                 .send(DeliveryMessage::Start {
                     event: Event::new("startup", serde_json::json!({})),
@@ -112,7 +156,11 @@ impl DeliverySupervisor {
                     response,
                 })
                 .await
-                .map_err(|_| stopped_error(handle, "delivery supervisor stopped"))?;
+                .is_err()
+            {
+                return Err(stopped_error(handle, "delivery supervisor stopped"));
+            }
+            submission.enqueued();
             lease.run.activate();
             result
                 .await
@@ -133,17 +181,24 @@ impl DeliverySupervisor {
         self.handle
             .get_or_init(|| async {
                 let (sender, receiver) = mpsc::channel(CAPACITY);
+                let admission = Admission::new(self.limit.load(Ordering::Relaxed));
                 let external_run = Arc::new(Mutex::new(None));
                 assert!(
                     engine.bus.install_delivery_router(
                         self.id,
                         sender.downgrade(),
+                        admission.clone(),
                         external_run.clone(),
                     ),
                     "an App may install only one delivery supervisor"
                 );
                 let (stopped_tx, stopped) = watch::channel(None);
-                let actor = tokio::spawn(supervise(self.id, Arc::downgrade(engine), receiver));
+                let actor = tokio::spawn(supervise(
+                    self.id,
+                    Arc::downgrade(engine),
+                    receiver,
+                    admission.clone(),
+                ));
                 tokio::spawn(async move {
                     let reason: Arc<str> = match actor.await {
                         Ok(reason) => reason.into(),
@@ -153,6 +208,7 @@ impl DeliverySupervisor {
                 });
                 SupervisorHandle {
                     sender,
+                    admission,
                     external_run,
                     startup_sent: Arc::new(AtomicBool::new(false)),
                     startup_observed: Arc::new(AtomicBool::new(false)),
@@ -219,82 +275,105 @@ async fn supervise(
     supervisor: u64,
     engine: Weak<Engine>,
     mut receiver: mpsc::Receiver<DeliveryMessage>,
+    admission: Arc<Admission>,
 ) -> String {
+    // The loop dequeues and never processes: routing one root must not stall the next submission.
+    // Completed tasks are reaped opportunistically; the set is only a handle on the in-flight roots.
+    let mut roots = JoinSet::new();
     while let Some(message) = receiver.recv().await {
         let Some(engine) = engine.upgrade() else {
             return "App engine dropped".into();
         };
-        match message {
-            DeliveryMessage::Deliver {
-                event,
-                mut response,
-            } => {
-                if response.is_closed() {
-                    continue;
-                }
-                let work = process_root(&engine, supervisor, event, Some(MAX_CASCADE));
-                tokio::pin!(work);
-                let result = tokio::select! {
-                    biased;
-                    result = &mut work => Some(result),
-                    _ = response.closed() => None,
-                };
-                if let Some(result) = result {
-                    let _ = response.send(result);
-                }
+        while roots.try_join_next().is_some() {}
+        // The bound lives here, ahead of the spawn (A-129). Waiting for a slot before dequeuing the
+        // next message is what pushes backpressure back through the queue to the submitting
+        // adapter, rather than parking an unbounded pile of tasks on a semaphore.
+        let slot = admission.admit().await;
+        roots.spawn(process(engine, supervisor, message, slot));
+    }
+    "delivery supervisor queue closed".into()
+}
+
+/// Run one submitted root to completion in its own task. A journey that blocks — a sweep, a parked
+/// `ask`, a slow tool — holds up this delivery and nothing else.
+///
+/// `slot` is the admission slot this root occupies; dropping it when the task ends (however it
+/// ends) releases the bound to the next waiting delivery.
+async fn process(
+    engine: Arc<Engine>,
+    supervisor: u64,
+    message: DeliveryMessage,
+    _slot: DeliverySlot,
+) {
+    match message {
+        DeliveryMessage::Deliver {
+            event,
+            mut response,
+        } => {
+            if response.is_closed() {
+                return;
             }
-            DeliveryMessage::Start {
-                event,
-                completed,
-                observed,
-                run,
-                mut response,
-            } => {
-                if response.is_closed() {
-                    run.cancel();
-                    continue;
-                }
-                if !observed.swap(true, Ordering::AcqRel) {
-                    engine.bus.observe(event.clone());
-                }
-                let work = process_root(&engine, supervisor, event, None);
-                tokio::pin!(work);
-                let result = tokio::select! {
-                    biased;
-                    result = &mut work => Some(result.map(|_| ())),
-                    _ = response.closed() => None,
-                };
-                if let Some(result) = result {
-                    if result.is_ok() {
-                        completed.store(true, Ordering::Release);
-                    } else {
-                        run.cancel();
-                    }
-                    let _ = response.send(result);
+            let work = process_root(&engine, supervisor, event, Some(MAX_CASCADE));
+            tokio::pin!(work);
+            let result = tokio::select! {
+                biased;
+                result = &mut work => Some(result),
+                _ = response.closed() => None,
+            };
+            if let Some(result) = result {
+                let _ = response.send(result);
+            }
+        }
+        DeliveryMessage::Start {
+            event,
+            completed,
+            observed,
+            run,
+            mut response,
+        } => {
+            if response.is_closed() {
+                run.cancel();
+                return;
+            }
+            if !observed.swap(true, Ordering::AcqRel) {
+                engine.bus.observe(event.clone());
+            }
+            let work = process_root(&engine, supervisor, event, None);
+            tokio::pin!(work);
+            let result = tokio::select! {
+                biased;
+                result = &mut work => Some(result.map(|_| ())),
+                _ = response.closed() => None,
+            };
+            if let Some(result) = result {
+                if result.is_ok() {
+                    completed.store(true, Ordering::Release);
                 } else {
                     run.cancel();
                 }
+                let _ = response.send(result);
+            } else {
+                run.cancel();
             }
-            DeliveryMessage::Event { event, run } => {
-                if run.is_cancelled() {
-                    continue;
-                }
-                let work = process_root(&engine, supervisor, event, None);
-                tokio::pin!(work);
-                tokio::select! {
-                    biased;
-                    _ = run.cancelled() => {}
-                    result = &mut work => {
-                        if let Err(error) = result {
-                            run.cancel();
-                            run.report(format!("delivery supervisor failed: {error}"));
-                        }
+        }
+        DeliveryMessage::Event { event, run } => {
+            if run.is_cancelled() {
+                return;
+            }
+            let work = process_root(&engine, supervisor, event, None);
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                _ = run.cancelled() => {}
+                result = &mut work => {
+                    if let Err(error) = result {
+                        run.cancel();
+                        run.report(format!("delivery supervisor failed: {error}"));
                     }
                 }
             }
         }
     }
-    "delivery supervisor queue closed".into()
 }
 
 async fn process_root(
@@ -304,6 +383,7 @@ async fn process_root(
     limit: Option<u32>,
 ) -> Result<Vec<JourneyRun>> {
     let cascades = Arc::new(Mutex::new(VecDeque::new()));
+    let depth = Arc::new(AtomicU32::new(0));
     let mut results = Vec::new();
     let mut handled = 0_u32;
     let mut next = Some(initial);
@@ -318,6 +398,7 @@ async fn process_root(
             DeliveryOrigin {
                 supervisor,
                 cascades: cascades.clone(),
+                depth: depth.clone(),
             },
             engine.run_triggers(&event.label, &event.payload, &mut sink),
         )

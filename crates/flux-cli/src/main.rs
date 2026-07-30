@@ -26,6 +26,7 @@ mod export_cmd;
 mod flow_cmd;
 mod lab_cmd;
 mod plugin_cmd;
+mod policy_cmd;
 mod rendering;
 mod review;
 mod session;
@@ -44,6 +45,7 @@ use export_cmd::*;
 use flow_cmd::*;
 use lab_cmd::*;
 use plugin_cmd::*;
+use policy_cmd::*;
 use rendering::*;
 use review::*;
 use session::*;
@@ -1933,8 +1935,15 @@ mod tests {
             path: Some(".".into()),
             settings: serde_json::Value::Null,
         }];
-        let backend = build_datasources(&ok, &dir, &system).await.unwrap();
-        assert!(!backend.is_empty(), "the markdown note was ingested");
+        let bound = build_datasources(&ok, &dir, &system).await.unwrap();
+        assert!(
+            !bound.knowledge.is_empty(),
+            "the markdown note was ingested"
+        );
+        assert!(
+            bound.boards.is_empty(),
+            "a knowledge kind declares no board"
+        );
 
         let bad = vec![DatasourceDecl {
             name: "x".into(),
@@ -1990,7 +1999,10 @@ mod tests {
             path: Some("./docs".into()),
             settings: serde_json::Value::Null,
         }];
-        let backend = build_datasources(&decls, &progdir, &system).await.unwrap();
+        let backend = build_datasources(&decls, &progdir, &system)
+            .await
+            .unwrap()
+            .knowledge;
 
         // The program dir's corpus is searchable...
         let hits = backend
@@ -2058,7 +2070,10 @@ mod tests {
                 settings: serde_json::Value::Null,
             },
         ];
-        let backend = build_datasources(&decls, &dir, &system).await.unwrap();
+        let backend = build_datasources(&decls, &dir, &system)
+            .await
+            .unwrap()
+            .knowledge;
 
         // The markdown note is indexed as a `file.document`...
         let md = backend

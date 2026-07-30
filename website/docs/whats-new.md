@@ -12,6 +12,76 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.36.0] - 2026-07-29
+
+### New
+
+- **Hand work to other flux agents, and pick it back up after a restart.** A program can now declare
+  a **work board** — a list of tasks with real states (ready, claimed, in progress, blocked, review,
+  done, failed) — and hand items out to remote flux workers without waiting for them. Declaring one
+  takes three lines: a `datasource` named `board`, a `kind` of `"board:markdown"`, and the `path` the
+  items live under.
+
+  That gives your program operations to list, read, create, claim, move, comment on and dispatch
+  board items. `board:markdown` keeps one file per item on disk, so **the board survives the process
+  that wrote it** — which is the point. When work is handed to a worker, the worker's address and the
+  task handle are written back onto the item itself, so a coordinator that is restarted can read the
+  board and find every run that was in flight, then poll or cancel it. There is no second place where
+  run state lives and no state file to reconcile: restart, re-read the board, carry on.
+
+  `board:memory` is also available for a single run and for tests, but it cannot outlive its process,
+  so anything relying on recovery wants `board:markdown`.
+
+  Handing out work is gated like any other outbound request: a worker on a private or loopback
+  address is refused unless you allow it, each dispatch is approved against **that specific worker's
+  address** rather than a blanket permission, and a worker that cannot be named is always sent to
+  approval rather than matching an existing grant.
+
+### Action needed
+
+- If you have written your own work-board backend against the library, it must now also record which
+  worker is running an item. A backend that quietly skipped this would look healthy until a restart
+  recovered nothing, so it is required rather than optional.
+
+### Fixed
+
+- **Busy apps no longer start unlimited work at once.** The previous release made app event handling
+  concurrent but left it uncapped, so a burst of incoming events — a webhook storm, say — could start
+  a piece of work for every one of them. There is now a limit on how much runs at a time (64 by
+  default, or set `FLUX_MAX_INFLIGHT_DELIVERIES`). Work over the limit **waits rather than being
+  dropped**, so everything still runs; a slow background job still cannot starve incoming events; and
+  work that is queued behind the limit is now reported differently from work that is merely slow, so
+  "busy" and "stuck" no longer look the same.
+
+## [0.35.0] - 2026-07-29
+
+### New
+
+- **See what a permission change would have done, before you adopt it.** `flux policy simulate
+  proposed.toml` replays your recorded history against a proposed set of permissions and shows what
+  it would newly block, newly allow, and leave alone — so changing what flux is allowed to do stops
+  being a guess. Add `--json` to feed it to other tooling. It only reads: nothing is recorded and no
+  model is called. Where your history does not contain enough detail to re-decide an action, it says
+  so explicitly instead of guessing, because a confident wrong answer would be worse than an honest
+  gap.
+
+- **flux can now stage just its own changes in a file you are also editing.** Previously, if the
+  agent and you had both edited the same file, staging was all-or-nothing: it either swept your
+  unfinished edits into its commit or gave the job back to you. It can now list a file's individual
+  changes and stage only the ones it made, leaving yours untouched in your working copy — the
+  equivalent of picking changes by hand, without the prompting. If the file moves underneath a
+  selection, it refuses and asks for a fresh look rather than staging the wrong lines, and it will
+  not quietly stage a whole-file deletion when you asked for one change.
+
+- **Hand work to a flux agent running somewhere else.** flux can now delegate a task to a remote
+  flux worker over the network instead of running it in-process, and the everyday way you delegate
+  work is unchanged — the same delegation step now simply works against a remote worker. For work you
+  want to start and check on later rather than wait for, there are three new operations: send the
+  work and get a task id back, ask how it is going, and cancel it. Cancelling genuinely stops the
+  remote run; previously a remote run could only be walked away from. Remote worker addresses are
+  checked against your network rules before any request is made, and the worker you are dispatching
+  to is named on the approval prompt rather than a blanket wildcard.
+
 ### Improved
 
 - **Operations that call a model are now labelled as costing something.** Fetching a web page and
@@ -38,6 +108,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   themselves so you can weigh that when approving.
 
 ### Action needed
+
+- **A slow job no longer blocks everything else in an app.** Until now, an app handled one incoming
+  event at a time: if a scheduled job ran for a minute, every webhook, chat message and API call
+  that arrived during that minute waited for it. They now run alongside each other, so a long job
+  and a busy inbox no longer compete. Two things to know if you rely on the old behaviour: work that
+  touches the same conversation can now interleave rather than queue, and there is currently no
+  cap on how many events run at once, so a large burst starts a large amount of work.
 
 - **If you embed flux in your own Rust program, two conversation-writing methods are gone.** The
   event store used to let you append a conversation message directly, with nothing checking that the

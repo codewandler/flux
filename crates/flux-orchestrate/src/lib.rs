@@ -13,6 +13,10 @@
 #[allow(deprecated)]
 pub use flux_agent::{parse_role, try_parse_role, Role, RoleRegistry};
 
+pub mod fleet;
+
+pub use fleet::{A2aSpawner, FleetCancelTool, FleetDispatchTool, FleetStatusTool};
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

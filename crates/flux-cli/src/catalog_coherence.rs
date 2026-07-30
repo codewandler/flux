@@ -61,6 +61,19 @@ use flux_spec::metadata_violations;
 /// label instead of silently approving a name that no longer appears.
 const TASK_OP_SOURCE: &str = "flux-cli sub-agent task operation";
 
+/// The audit source label `try_register_fleet` registers the `fleet.*` ops under, held here for the
+/// same reason [`TASK_OP_SOURCE`] is: they arrive through the generic `try_register_all_from`, whose
+/// method name alone approves nothing.
+const FLEET_OP_SOURCE: &str = "flux-cli fleet dispatch";
+
+/// The domain the census binds a representative work board under (A-131).
+///
+/// A board's real domain is the Program's `datasource` name, so no fixed name is *the* production
+/// one — but every board generates the same six operations from the same host code, so one
+/// representative domain covers the shape all of them share, exactly as `census_stage` does for
+/// config-authored model stages.
+const CENSUS_BOARD_DOMAIN: &str = "census_board";
+
 /// Every op the CLI can register, assembled the way `build_agent_with` assembles it, with each
 /// config-gated pack switched on.
 ///
@@ -110,6 +123,19 @@ fn production_catalog() -> ToolRegistry {
         Arc::new(flux_capabilities::MemoryBackend::new());
     flux_capabilities::try_register_datasource_ops(&mut registry, backend.clone())
         .expect("datasource ops register");
+
+    // A declared work board (A-131). Since `build_datasources` resolves a `board:<backend>` kind
+    // into a `WorkBoard`, its six generated operations are catalog ops a `flux app run` session
+    // dispatches against — four of them *writes* — so they belong inside this gate. The production
+    // call site is `app_cmd.rs`'s registration loop over `ProgramDatasources::boards`, not
+    // `execution.rs`; the census reaches the same `try_register_work_board` the loop calls, which is
+    // what makes the classification below more than a name on a list.
+    flux_capabilities::try_register_work_board(
+        &mut registry,
+        CENSUS_BOARD_DOMAIN,
+        Arc::new(flux_capabilities::MemoryBoard::new()),
+    )
+    .expect("a declared work board registers");
 
     // The record sink matters to the census: `web.fetch` / `web.crawl` disclose their durable
     // `web.page` datasource contribution as the `write_db` *semantic* effect only when a sink is
@@ -214,6 +240,8 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
         ("search", "datasource"),
         ("endpoint.import", "endpoint"),
         ("task", "sub-agent delegation"),
+        ("fleet.dispatch", "outbound A2A fleet dispatch"),
+        ("census_board.claim", "declared work boards"),
         ("census_stage", "config-authored model stages"),
     ] {
         assert!(
@@ -225,6 +253,25 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
         catalog.names().len() > builtins.names().len(),
         "the census is no wider than the built-in pack C-191 already gates"
     );
+}
+
+/// A-131, the named failing-first test: A-116 landed `fleet.dispatch` / `.status` / `.cancel`, but
+/// they were constructed nowhere outside their own module — the only other mention in the workspace
+/// was a re-export. An op the production assembly never registers cannot be called by a Program, so
+/// the fleet existed in code and was unreachable from a running `flux`.
+///
+/// Asserted over the production census rather than over a hand-built registry, so it also proves the
+/// ops reach the metadata-coherence gate above.
+#[test]
+fn the_fleet_ops_are_reachable_from_the_production_catalog() {
+    let catalog = production_catalog();
+    for op in ["fleet.dispatch", "fleet.status", "fleet.cancel"] {
+        assert!(
+            catalog.get(op).is_some(),
+            "the production catalog does not register `{op}` — a Program cannot dispatch to a \
+             remote worker"
+        );
+    }
 }
 
 /// The sub-agent registry (`child_base` in `build_agent_with`) is one of the two open registration
@@ -286,6 +333,11 @@ fn every_registration_seam_in_the_cli_assembly_is_classified() {
         "try_register_flows",
         "try_register_render",
         "try_register_datasource_ops",
+        // A `board:<backend>` datasource declaration (A-131). `build_datasources` names it in
+        // `execution.rs`; the loop that calls it lives in `app_cmd.rs`, and the census drives the
+        // same registrar so the generated board ops are walked by the gate above.
+        "try_register_work_board",
+        "try_register_fleet",
         "try_register_web",
         "try_register_model_stage",
         // The generic registry methods, whose *callers* are classified by source label below.
@@ -306,10 +358,12 @@ fn every_registration_seam_in_the_cli_assembly_is_classified() {
     // text. Built at runtime rather than as a `const` so the `TaskTool` entry is *derived from*
     // the constant the census registers with: change the label in `execution.rs` alone and the
     // guard reports an unclassified label rather than approving a name that no longer appears.
-    let covered_sources: [String; 2] = [
+    let covered_sources: [String; 3] = [
         // `CognitionPack::try_register_from`, driven via `register_tool_packs`.
         "\"flux-cli cognition pack\"".to_string(),
         format!("{TASK_OP_SOURCE:?}"),
+        // `try_register_fleet`, also driven via `register_tool_packs`.
+        format!("{FLEET_OP_SOURCE:?}"),
     ];
     /// Source labels deliberately outside the census, with the reason.
     const EXCLUDED_SOURCES: &[(&str, &str)] = &[(

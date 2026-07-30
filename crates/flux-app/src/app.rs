@@ -38,7 +38,8 @@ use flux_runtime::{
 use flux_secret::Redactor;
 use flux_system::{System, Workspace};
 
-use crate::bus::Bus;
+use crate::admission::DeliveryLoad;
+use crate::bus::{delivery_origin, Bus};
 use crate::ops::{self, JourneyHost};
 use crate::park::{self, ParkedAsk};
 use crate::supervisor::DeliverySupervisor;
@@ -498,6 +499,18 @@ impl App {
     /// run's result. Events the journeys `emit` are processed too as a bounded cascade tree. This is
     /// the unit of work tests and the CLI channels drive; [`App::run`] is the long-running form. The
     /// App's sole delivery supervisor keeps each request and its cascades correlated.
+    ///
+    /// **Concurrent, not serialized (A-112).** Calls from different tasks run at the same time and
+    /// each one sees only its own cascade tree and its own nesting budget, so a long sweep does not
+    /// delay the deliveries submitted behind it. Journeys still share the App's mutable state —
+    /// agent sessions, ask-parks, the recorded-send log — so two deliveries that touch the same
+    /// conversation interleave rather than queue. A journey may not re-enter `deliver` on the App
+    /// it is itself running under; that still fails fast.
+    ///
+    /// **Bounded (A-129).** At most [`DeliveryLoad::limit`] deliveries run at once; a submission
+    /// beyond that **waits** for a slot rather than being dropped or rejected, and the wait
+    /// propagates backwards — a caller submitting into a saturated App blocks in `deliver`. See
+    /// [`App::with_max_inflight_deliveries`] and [`App::delivery_load`].
     pub async fn deliver(
         &self,
         label: impl Into<String>,
@@ -514,6 +527,32 @@ impl App {
     /// surface may resume supervision without creating another event receiver or repeating startup.
     pub async fn run(&self) -> Result<()> {
         self.engine.delivery.run(&self.engine).await
+    }
+
+    /// Bound how many deliveries may run at once (A-129), overriding
+    /// [`crate::DEFAULT_MAX_INFLIGHT_DELIVERIES`] and the `FLUX_MAX_INFLIGHT_DELIVERIES`
+    /// environment override. `0` is clamped to `1`; there is no "unbounded" setting.
+    ///
+    /// Consumes and returns the App because the limit is read once, when the delivery supervisor
+    /// starts on the first [`deliver`](Self::deliver)/[`run`](Self::run) — configure it while you
+    /// still hold the App by value, which is exactly the window in which it can have no actor.
+    ///
+    /// Raise it above your program's fan-out width if journeys deliberately wait on one another:
+    /// deliveries at the bound *block*, so `limit` mutually-dependent deliveries can deadlock.
+    #[must_use]
+    pub fn with_max_inflight_deliveries(self, limit: usize) -> Self {
+        self.engine.delivery.set_limit(limit);
+        self
+    }
+
+    /// A snapshot of delivery admission (A-129): how many deliveries are running, how many are
+    /// held by the bound, and what the bound is.
+    ///
+    /// `waiting > 0` is backpressure — work the App is refusing to start. A delivery counted in
+    /// `in_flight` was admitted and is simply taking a long time. Distinguishing the two is the
+    /// whole reason this is exposed: they look identical from a caller's latency.
+    pub fn delivery_load(&self) -> DeliveryLoad {
+        self.engine.delivery.load()
     }
 
     /// Test-only: how many messages the agent's bound session for `conversation` holds (`0` if none).
@@ -542,8 +581,10 @@ pub(crate) struct Engine {
     /// The sole trigger-routing owner. Public bus receivers are observation-only; direct deliveries
     /// and the long-running run lease submit roots to this coordinator.
     delivery: DeliverySupervisor,
-    /// Active `spawn` recursion depth (guards against unbounded self-spawn).
-    depth: AtomicU32,
+    /// Fallback `spawn` recursion depth, used only by a journey run with no delivery scope around
+    /// it. A run reached through the delivery supervisor counts against its own delivery's budget
+    /// ([`crate::bus::DeliveryOrigin::depth`]) so concurrent deliveries stay independent.
+    depth: Arc<AtomicU32>,
     /// Monotonic counter giving each journey run a distinct session id.
     runs: AtomicU64,
     /// Shared mechanical execution template. Per-journey/per-agent capability decisions replace
@@ -883,7 +924,7 @@ impl Engine {
                 registry,
                 bus,
                 delivery: DeliverySupervisor::new(),
-                depth: AtomicU32::new(0),
+                depth: Arc::new(AtomicU32::new(0)),
                 runs: AtomicU64::new(0),
                 execution,
                 provider,
@@ -914,12 +955,6 @@ impl Engine {
         let available = self.available_op_names();
         let known: HashSet<String> = available.iter().cloned().collect();
         let registered_tools: HashSet<String> = self.registry.names().into_iter().collect();
-        let agent_names: HashSet<&str> = self
-            .program
-            .agents
-            .iter()
-            .map(|agent| agent.name.as_str())
-            .collect();
         let datasource_names: HashSet<&str> = self
             .program
             .datasources
@@ -991,21 +1026,11 @@ impl Engine {
                 }
             }
         }
-        for trigger in &self.program.triggers {
-            if let Some(agent) = trigger.agent.as_deref() {
-                if !agent_names.contains(agent) {
-                    return Err(Error::Other(format!(
-                        "trigger `{}` names unknown agent `{agent}`",
-                        trigger.name
-                    )));
-                }
-            } else if self.program.flow_named(&trigger.run).is_none() {
-                return Err(Error::Other(format!(
-                    "trigger `{}` names unknown journey/flow `{}`",
-                    trigger.name, trigger.run
-                )));
-            }
-        }
+        // Trigger targets: the rule lives at L0 on `Program` so this gate and flux-eval's
+        // `examples/` sweep cannot drift apart (C-232). Do not inline it back here.
+        self.program
+            .validate_trigger_targets()
+            .map_err(Error::Other)?;
 
         for journey in &self.program.journeys {
             let agent_permissions = match journey.agent.as_deref() {
@@ -1163,9 +1188,14 @@ impl Engine {
         // Lower top-level `ask` calls onto the suspension seam (ask + await) — see `crate::park`.
         ast.body = park::rewrite_asks(std::mem::take(&mut ast.body));
 
-        // Depth guard: increment, ensure we decrement on every exit, then check.
-        let prev = self.depth.fetch_add(1, Ordering::SeqCst);
-        let _guard = DepthGuard(&self.depth);
+        // Depth guard: increment, ensure we decrement on every exit, then check. The budget belongs
+        // to the delivery that caused this run, so two deliveries in flight at once never spend
+        // each other's nesting allowance; a run outside any delivery falls back to the engine's.
+        let budget = delivery_origin()
+            .map(|origin| origin.depth)
+            .unwrap_or_else(|| self.depth.clone());
+        let prev = budget.fetch_add(1, Ordering::SeqCst);
+        let _guard = DepthGuard(budget);
         if prev >= MAX_SPAWN_DEPTH {
             return Err(Error::Other(format!(
                 "spawn recursion exceeded max depth {MAX_SPAWN_DEPTH}"
@@ -2015,9 +2045,9 @@ fn other(e: impl std::fmt::Display) -> Error {
 }
 
 /// Decrements the active spawn depth when a journey run unwinds (success, error, or early return).
-struct DepthGuard<'a>(&'a AtomicU32);
+struct DepthGuard(Arc<AtomicU32>);
 
-impl Drop for DepthGuard<'_> {
+impl Drop for DepthGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }

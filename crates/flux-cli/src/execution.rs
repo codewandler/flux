@@ -170,16 +170,85 @@ pub(super) async fn build_doc_index(
     backend
 }
 
-/// Build the knowledge backend from a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s
-/// — the `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index. Each declared
-/// source is ingested under its own name by the matching ingester (`markdown` walks a docs directory;
-/// `openapi` reads a JSON spec file). An unknown `kind` is a clean error. Returns the shared backend the
-/// retrieval ops dispatch against.
+/// The `kind` prefix that names a **board** declaration (A-131).
+///
+/// Naming this was a real decision, not a detail. `markdown` is already taken by the *knowledge*
+/// ingester, and a board backed by markdown files (A-114) is a different port entirely — so board
+/// kinds live in their own namespace: `board:memory` today, `board:markdown` / `board:jira` /
+/// `board:gitlab` as those backends land. Two properties follow, and both are the point:
+///
+/// * `kind = "markdown"` keeps meaning exactly what it has always meant. A knowledge declaration is
+///   never silently promoted to a board, and a board declaration is never silently ingested as
+///   knowledge — the prefix, not a lookup table, decides which port is bound.
+/// * A kind *under* this prefix that names no backend is a hard error, never a fall-through. The
+///   failure mode this closes is a user pointing `kind = "markdown"` at a board file store and
+///   getting a silently wrong, read-only knowledge index instead of a diagnostic.
+const BOARD_KIND_PREFIX: &str = "board:";
+
+/// The board backends bindable from a `datasource` declaration today, for the error message that
+/// names them. `MemoryBoard` is the offline backend A-113 shipped with the port; `MarkdownBoard`
+/// (A-114) is the file-backed one; the issue-tracker-backed ones arrive with their own stories.
+const BOARD_BACKENDS: &str = "markdown | memory";
+
+/// What a Program's `datasource` declarations resolve to: one shared knowledge backend, plus the
+/// work boards declared alongside it.
+pub(super) struct ProgramDatasources {
+    /// The shared index every `markdown` / `openapi` declaration ingested into, and the backend the
+    /// retrieval ops (`search`/`get`/`list`/…) dispatch against.
+    pub(super) knowledge: Arc<dyn flux_capabilities::DatasourceBackend>,
+    /// `(domain, backend)` per declared board, in declaration order. The caller installs each with
+    /// [`flux_capabilities::try_register_work_board`], which *derives* the generated op set from the
+    /// port — so an operation added to `WorkBoard` surfaces here with no change to this module.
+    pub(super) boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)>,
+}
+
+/// Resolve one `board:<backend>` declaration into a [`WorkBoard`](flux_capabilities::WorkBoard).
+///
+/// An unrecognized backend names itself and the ones that exist. It is deliberately NOT tolerant:
+/// falling back to the knowledge ingester here would reintroduce exactly the silent, wrong behaviour
+/// [`BOARD_KIND_PREFIX`] exists to prevent.
+///
+/// `root` is the already-resolved, program-relative directory the file-backed backends live under;
+/// `memory` ignores it. `MarkdownBoard` is built with
+/// [`rooted_in`](flux_capabilities::MarkdownBoard::rooted_in) rather than `new`, so the board
+/// **inherits the session's guarded `System`** instead of minting a fresh `Workspace` at an
+/// arbitrary root — a board is a write surface, so it must not be able to widen the sandbox it was
+/// handed.
+fn build_work_board(
+    name: &str,
+    backend: &str,
+    root: &str,
+    system: &System,
+) -> Result<Arc<dyn flux_capabilities::WorkBoard>> {
+    match backend {
+        "memory" => Ok(Arc::new(flux_capabilities::MemoryBoard::new())),
+        "markdown" => Ok(Arc::new(
+            flux_capabilities::MarkdownBoard::rooted_in(system, root).map_err(|e| {
+                anyhow::anyhow!("datasource `{name}` (board:markdown) at `{root}`: {e}")
+            })?,
+        )),
+        "" => Err(anyhow::anyhow!(
+            "datasource `{name}` declares a board but names no backend — write \
+             `kind = \"{BOARD_KIND_PREFIX}markdown\"` (available: {BOARD_BACKENDS})"
+        )),
+        other => Err(anyhow::anyhow!(
+            "datasource `{name}`: unknown board backend `{other}` (available: {BOARD_BACKENDS})"
+        )),
+    }
+}
+
+/// Build a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s — the
+/// `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index.
+///
+/// The `kind` dispatch is **total**, which is the whole safety property here: a knowledge kind
+/// ingests under its own name by the matching ingester (`markdown` walks a docs directory; `openapi`
+/// reads a JSON spec file), a `board:<backend>` kind binds a write-capable [`WorkBoard`] instead,
+/// and anything else is a clean error. Nothing falls through to a default.
 pub(super) async fn build_datasources(
     decls: &[flux_lang::program::DatasourceDecl],
     program_dir: &std::path::Path,
     system: &System,
-) -> Result<Arc<dyn flux_capabilities::DatasourceBackend>> {
+) -> Result<ProgramDatasources> {
     // A datasource path is relative to the PROGRAM FILE's directory (absolute paths pass through), so
     // `path "./docs"` means "beside the .flux file" regardless of the launch cwd. `program_dir` is a
     // read-only root of `system`, so the resulting absolute path is walkable/readable.
@@ -193,8 +262,23 @@ pub(super) async fn build_datasources(
     }
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
+    let mut boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for d in decls {
         match d.kind.as_str() {
+            // A board, not a knowledge source. `board` on its own is the shape a bare
+            // `datasource board { … }` lowers to (native text defaults `kind` to the decl name), so
+            // it is routed here to get the "names no backend" diagnostic rather than the generic
+            // unknown-kind one.
+            kind if kind == "board" || kind.starts_with(BOARD_KIND_PREFIX) => {
+                let backend = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("").trim();
+                // A board's `path` is program-relative exactly like a knowledge datasource's, so
+                // `path "./board"` means "beside the .flux file" whatever the launch cwd is.
+                let root = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
+                boards.push((
+                    d.name.clone(),
+                    build_work_board(&d.name, backend, &root, system)?,
+                ));
+            }
             "markdown" => {
                 let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
                 let docs = walk_docs(system, &base, 1000, 200_000).await;
@@ -218,13 +302,17 @@ pub(super) async fn build_datasources(
             }
             other => {
                 return Err(anyhow::anyhow!(
-                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi)",
+                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi | \
+                     {BOARD_KIND_PREFIX}<backend>)",
                     d.name
                 ))
             }
         }
     }
-    Ok(backend)
+    Ok(ProgramDatasources {
+        knowledge: backend,
+        boards,
+    })
 }
 
 /// Wrap a keyword backend in the semantic (embeddings) backend when built with `--features embeddings`
@@ -980,6 +1068,66 @@ pub(super) async fn resolve_agent_loop(
 /// ONLY — never on a worker sub-agent's scoped toolset, so a child can't run eval/git ops or the
 /// model-facing cognition/consult ops.
 #[allow(clippy::too_many_arguments)]
+/// The private-network egress grant the `fleet.*` ops run under.
+///
+/// Deliberately **not** the `[private_net] web` scope. That grant names the native web family
+/// (`http.request`, `web.fetch`, `browser.*`); quietly extending it to cover outbound dispatch to a
+/// remote worker would widen a grant an operator already made, for a family they did not grant it
+/// to. Only the blanket `--allow-private-net` / `FLUX_ALLOW_PRIVATE_NET` override — already
+/// documented as a private-net `*` grant for native ops — admits a private worker; otherwise the
+/// full SSRF guard applies and a `worker-1.internal` endpoint is refused until an operator says
+/// otherwise.
+///
+/// This is a bound on the *grant*, never a substitute for the guard: every `fleet.*` op resolves its
+/// caller-supplied endpoint through `guard_url_scoped` before any request either way (A-116), and
+/// each reports the worker's origin as its permission subject.
+fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
+    if private_net_cli_override() {
+        flux_system::net::PrivateNetAllow::Any
+    } else {
+        flux_system::net::PrivateNetAllow::None
+    }
+}
+
+/// Outbound A2A dispatch (A-116): `fleet.dispatch` / `fleet.status` / `fleet.cancel` — hand a task
+/// to a remote flux worker without waiting, poll it, stop it.
+///
+/// A-116 landed the ops; nothing constructed them, so a Program could not call one. This is the one
+/// construction site, shared by the agent assembly below and the `flux app run` path, so the two
+/// surfaces cannot offer different fleet catalogs — and a fourth fleet op is added here alone.
+///
+/// The worker bearer token is `None`: a token for an authenticated worker is operator configuration
+/// that does not exist yet, and inventing an env var for it here would add public surface this
+/// story does not own. A worker behind `flux serve`'s required auth is therefore not yet reachable;
+/// an unauthenticated one is.
+pub(super) fn try_register_fleet(
+    registry: &mut ToolRegistry,
+    ledger: Option<Arc<dyn flux_runtime::DispatchLedger>>,
+) -> Result<()> {
+    let private_net = fleet_private_net();
+    let dispatch = flux_orchestrate::FleetDispatchTool::new(private_net.clone(), None);
+    // With a ledger, `fleet.dispatch` records `runner` + `task_id` onto the board item it was given,
+    // which is what makes design §5's "the board IS the run registry" true rather than aspirational
+    // — and it is why crash recovery can be "restart, sweep, re-derive" with no second store.
+    // Without one, the op refuses any call that names an `item` rather than dispatching work that
+    // nothing could later sweep. Dispatch with no `item` stays legal either way, so a Program that
+    // declares no board is unaffected.
+    let dispatch = match ledger {
+        Some(ledger) => dispatch.with_ledger(ledger),
+        None => dispatch,
+    };
+    let tools: Vec<Arc<dyn flux_runtime::Tool>> = vec![
+        Arc::new(dispatch),
+        Arc::new(flux_orchestrate::FleetStatusTool::new(
+            private_net.clone(),
+            None,
+        )),
+        Arc::new(flux_orchestrate::FleetCancelTool::new(private_net, None)),
+    ];
+    registry.try_register_all_from("flux-cli fleet dispatch", tools)?;
+    Ok(())
+}
+
 pub(super) fn register_tool_packs(
     registry: &mut ToolRegistry,
     cog_provider: Option<Box<dyn Provider>>,
@@ -1037,6 +1185,15 @@ pub(super) fn register_tool_packs(
         )
         .try_register(registry)?;
     }
+    // Outbound A2A dispatch to remote flux workers (A-116, wired by A-131). Unconditional: the
+    // worker endpoint is a per-call argument, not configuration, so there is nothing to switch on —
+    // and the ops carry no authority of their own beyond the egress guard they each run first.
+    //
+    // No ledger on this path: `register_tool_packs` builds the agent catalog, which has no Program
+    // and therefore no declared board to record a dispatch onto. Naming an `item` here refuses
+    // rather than dispatching untrackable work; the `flux app run` path wires the ledger from the
+    // Program's own board.
+    try_register_fleet(registry, None)?;
     // Eval / self-improvement ops (the ones the improve flows orchestrate).
     flux_eval::try_register_eval_ops(registry)?;
     // Authored-loop stages are registered for `agent-loop.flux` but tagged to the never-surfaced
@@ -2126,5 +2283,262 @@ mod execution_environment_conformance {
         );
 
         std::fs::remove_dir_all(base).ok();
+    }
+}
+
+#[cfg(test)]
+mod fleet_and_board_wiring {
+    use super::*;
+
+    use flux_lang::program::DatasourceDecl;
+    use flux_system::Workspace;
+
+    /// A throwaway workspace root. `build_datasources` needs a guarded [`System`] even for a
+    /// declaration that touches no file, so every case here gets its own root.
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "flux-cli-a131-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    fn decl(name: &str, kind: &str) -> Vec<DatasourceDecl> {
+        vec![DatasourceDecl {
+            name: name.into(),
+            kind: kind.into(),
+            path: None,
+            settings: serde_json::Value::Null,
+        }]
+    }
+
+    /// A-131 Acceptance 4, the named failing-first test: a Program declaring a board must resolve to
+    /// a `WorkBoard`-backed set of generated ops. Before this story `build_datasources` knew only
+    /// `markdown` and `openapi`, so a board declaration errored as an unknown kind and a board could
+    /// not be named from configuration at all.
+    #[tokio::test]
+    async fn a_declared_board_binds_a_work_board_instead_of_erroring() {
+        let root = temp_root("board-binds");
+        let system = System::new(Workspace::new(&root).unwrap());
+
+        let bound = build_datasources(&decl("board", "board:memory"), &root, &system).await;
+        assert!(
+            bound.is_ok(),
+            "a `board:memory` datasource must bind a WorkBoard, got: {:?}",
+            bound.as_ref().err().map(ToString::to_string)
+        );
+        let bound = bound.unwrap();
+
+        // Not ingested as knowledge — the failure mode the board kind namespace exists to prevent.
+        assert!(
+            bound.knowledge.is_empty(),
+            "a board declaration must not be ingested into the knowledge index"
+        );
+
+        // ...and it resolves to a `WorkBoard`-backed set of GENERATED ops, under the decl's name as
+        // the domain. The expected set is read off the port's own registration rather than listed
+        // here, so a board operation added to `WorkBoard` (A-130) is covered without editing this.
+        let [(domain, board)] = <[_; 1]>::try_from(bound.boards).ok().expect("one board");
+        assert_eq!(domain, "board");
+        let mut registry = ToolRegistry::new();
+        let surface = flux_capabilities::try_register_work_board(&mut registry, &domain, board)
+            .expect("the board registers");
+        assert!(
+            !surface.group.tools.is_empty(),
+            "the port generated no operations"
+        );
+        for op in &surface.group.tools {
+            assert!(
+                registry.get(op).is_some(),
+                "the declared board did not generate `{op}`"
+            );
+        }
+        // The write half is what distinguishes a board from a read-only knowledge source.
+        assert!(
+            registry.get("board.claim").is_some(),
+            "a bound board must offer its mutating ops: {:?}",
+            registry.names()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A-131 Acceptance 3: wiring the fleet must not widen A-116's egress posture. The registered
+    /// ops still report the worker's **origin** as their permission subject — never `*` — and report
+    /// **no** subject for an endpoint they cannot name, which forces approval instead of matching a
+    /// broad grant. Asserted against the ops as the CLI actually registers them, not against
+    /// freshly-constructed ones, so a registration that handed them a different posture fails here.
+    #[test]
+    fn registration_preserves_the_fleet_egress_posture() {
+        let mut registry = ToolRegistry::new();
+        try_register_fleet(&mut registry, None).expect("the fleet ops register");
+
+        let dispatch = registry.get("fleet.dispatch").expect("fleet.dispatch");
+        assert_eq!(
+            dispatch.permission_subjects(&serde_json::json!({
+                "worker": "https://worker-1.internal:8787/a2a",
+                "task": "build",
+            })),
+            vec!["https://worker-1.internal:8787".to_string()],
+        );
+        for op in ["fleet.dispatch", "fleet.status", "fleet.cancel"] {
+            let tool = registry.get(op).expect("a registered fleet op");
+            let subjects = tool.permission_subjects(&serde_json::json!({ "worker": "not a url" }));
+            assert!(
+                subjects.is_empty(),
+                "`{op}` must report no subject for an unnameable worker, got {subjects:?}"
+            );
+            assert!(!subjects.iter().any(|s| s == "*"), "`{op}` reported `*`");
+        }
+
+        // The default grant is the full SSRF guard: a private worker is refused until an operator
+        // opts in. Registration must not hand the ops a blanket `Any`.
+        assert_eq!(
+            fleet_private_net(),
+            flux_system::net::PrivateNetAllow::None,
+            "the fleet ops must not be registered with a standing private-network grant"
+        );
+    }
+
+    /// A-131 Acceptance 5: the wrong board kind fails **loudly**. `markdown` stays the knowledge
+    /// ingester (it is not silently promoted to a board), a bare `board` names no backend, and a
+    /// board backend that does not exist yet is an error rather than a fall-through to knowledge
+    /// ingestion — which is the silent, wrong behaviour this story closes.
+    #[tokio::test]
+    async fn an_unnameable_board_backend_is_a_loud_error() {
+        let root = temp_root("board-loud");
+        let system = System::new(Workspace::new(&root).unwrap());
+
+        for kind in ["board", "board:", "board:nope"] {
+            let bound = build_datasources(&decl("board", kind), &root, &system).await;
+            assert!(
+                bound.is_err(),
+                "a board kind naming no backend (`{kind}`) must error, not fall through to \
+                 knowledge ingestion"
+            );
+            let text = bound.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(
+                text.contains("board"),
+                "the error must name the board kind, got: {text}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `board:markdown` must bind the **durable** backend (A-114), not fall back to the in-process
+    /// one. Failing-first before `build_work_board` gained its `markdown` arm: the declaration was an
+    /// "unknown board backend" error, so no durable board could be named from a Program at all — and
+    /// without one, the design's "restart, sweep, re-derive" claim is untestable, because
+    /// `MemoryBoard`'s storage *is* the process it is supposed to survive.
+    ///
+    /// Durability is asserted the only way that actually proves it: write through the bound board,
+    /// then read the bytes back off the filesystem.
+    #[tokio::test]
+    async fn a_markdown_board_binds_a_durable_backend_rooted_under_the_program() {
+        let root = temp_root("markdown-board");
+        let board_dir = root.join("board");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        let system = System::new(Workspace::new(&root).unwrap());
+
+        let mut decls = decl("board", "board:markdown");
+        decls[0].path = Some("./board".into());
+        let bound = build_datasources(&decls, &root, &system)
+            .await
+            .expect("`board:markdown` must bind a durable board");
+        assert_eq!(bound.boards.len(), 1, "one declared board binds one board");
+
+        let (domain, board) = &bound.boards[0];
+        assert_eq!(domain, "board");
+
+        // The board is program-relative and rooted under the declared `path`, so a write lands
+        // beside the .flux file rather than wherever the process happened to be launched.
+        let ctx =
+            flux_runtime::ToolContext::new(Arc::new(System::new(Workspace::new(&root).unwrap())));
+        let item = board
+            .create(
+                &ctx,
+                flux_datasource::board::ItemDraft {
+                    title: "durable across a restart".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the board accepts a create");
+
+        let on_disk = std::fs::read_dir(board_dir.join("items"))
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert!(
+            on_disk > 0,
+            "a durable board must leave the item on disk under the program-relative root; \
+             `board:memory` would leave nothing and the recovery story would be unprovable"
+        );
+        assert!(!item.id.is_empty(), "the created item has an id");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The ledger must actually reach `fleet.dispatch`, because that is what makes design §5's "the
+    /// board IS the run registry" true. Failing-first before this story wired one:
+    /// `try_register_fleet` took no ledger, so the op was always built with `None` and *refused* any
+    /// call naming an `item` — "refusing to dispatch work nothing could sweep". The write path
+    /// existed and production could not take it.
+    ///
+    /// Asserted on the declared surface rather than on registration succeeding, because a
+    /// registration-only check passes with no ledger attached at all.
+    #[test]
+    fn a_wired_ledger_makes_fleet_dispatch_declare_the_write_it_performs() {
+        fn dispatch_spec(registry: &ToolRegistry) -> flux_spec::ToolSpec {
+            registry
+                .get("fleet.dispatch")
+                .expect("fleet.dispatch is registered")
+                .spec()
+        }
+
+        let mut without = ToolRegistry::new();
+        try_register_fleet(&mut without, None).expect("registers with no ledger");
+        assert!(
+            !dispatch_spec(&without)
+                .effects
+                .contains(&flux_spec::Effect::Write),
+            "with no ledger the op records nothing, so it must not claim a write"
+        );
+
+        let board: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let ledger: Arc<dyn flux_runtime::DispatchLedger> =
+            Arc::new(flux_capabilities::BoardLedger::new("board", board));
+        let mut with = ToolRegistry::new();
+        try_register_fleet(&mut with, Some(ledger)).expect("registers with a ledger");
+        assert!(
+            dispatch_spec(&with)
+                .effects
+                .contains(&flux_spec::Effect::Write),
+            "a wired ledger means the op genuinely writes the board, so it must declare it — \
+             otherwise the write escapes the gate that reads the declaration"
+        );
+
+        // And the item it would write is named concretely, so a grant scoped to one item cannot be
+        // widened into another. Never `*`, never empty.
+        let subjects = with
+            .get("fleet.dispatch")
+            .expect("registered")
+            .permission_subjects(&serde_json::json!({
+                "worker": "https://worker-1.internal:8787",
+                "task": "do the thing",
+                "item": "item-0001",
+            }));
+        assert!(
+            subjects.iter().any(|s| s == "board/item/item-0001"),
+            "the board item must be a concrete subject, got: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s == "*" || s.is_empty()),
+            "no subject may be a wildcard or empty, got: {subjects:?}"
+        );
     }
 }

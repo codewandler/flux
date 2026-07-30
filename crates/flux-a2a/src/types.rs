@@ -645,7 +645,8 @@ pub struct SendConfiguration {
     pub history_length: Option<u32>,
 }
 
-/// `params` for `tasks/get`.
+/// `params` for the task-id RPCs — `tasks/get` and `tasks/cancel`, which the A2A spec both
+/// parameterizes by a bare task id.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]

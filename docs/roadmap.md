@@ -1,6 +1,6 @@
 # flux — roadmap & status
 
-Status as of **0.34.0 (2026-07-29)**: public + installable at
+Status as of **0.36.0 (2026-07-29)**: public + installable at
 [codewandler/flux](https://github.com/codewandler/flux) and published to crates.io
 (`codewandler-flux-*`); 37 root-workspace crates plus the `plugins/` pack, **2700+ tests** across
 both workspaces, a permanently green
@@ -85,6 +85,71 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 > audit, and A-99/A-100's typed session log. See [CHANGELOG.md](../CHANGELOG.md) for the itemized
 > history.
 
+### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
+
+Three stories filed separately turned out to be one failure at three depths, and grouping them said
+something none of them said alone. **C-228** is the symptom: `openrouter/google/gemini-3.x` dies with
+`stream closed before completion`, reproducibly, part-way through exploration at 12–21k ctx — short
+turns survive, which is why no smoke test catches it. **C-227** is the missing capability: a closed
+socket is not a decision the agent made, yet it ends the turn outright, so a run that has executed
+dozens of ops and written real files loses the rest of its work to one dropped TCP stream. **C-226**
+is why nobody has quantified any of it: that dead turn exits **0**, emits no NDJSON `error` line, and
+reports the failure as prose inside `turn_end.answer` — `loop_host.rs` literally converts
+`Err(error)` into `Ok(json!({"kind": "error", …}))`, at two sites. So flux is not currently safe to
+run unattended against a real provider for a long task, and the failures are invisible to exactly the
+automated consumers — CI, editor extensions, a coordinator fanning work to sub-agents — that would
+have counted them. The load-bearing decision is an **ordering** one: **C-228 must be diagnosed before
+C-227's retry is designed.** If the stream close is a genuine transport event, bounded retry is the
+right fix; if flux's own Messages-path codec ends the stream on an unhandled reasoning envelope, then
+retrying re-runs a *deterministic* bug — every attempt failing identically at the same context depth,
+burning budget and real money, and converting a reproducible defect into what looks like a flaky
+network, which is strictly worse than today's honest hard failure. The evidence leans that way
+already: `gemini-2.5-flash`, which has **no reasoning stream**, survives the workload that kills
+3.5 and 3.6, and a vendor-wide transport problem would not discriminate on whether a model emits
+reasoning deltas. There is even an invariant to judge it against — A-33…A-37 established that codecs
+*skip and count* an unparseable envelope via `Chunk::StreamDiagnostic` rather than `?`-propagating, so
+a hard `api_error` that kills a turn is the exact shape that rule exists to prevent, and C-228 would
+be an **invariant regression rather than a feature request**. Sequenced C-226 ∥ C-228 (file-disjoint:
+`flux-flow`/`flux-cli` vs `flux-providers`), then C-227, which needs C-226's typed outcome before its
+own "visible, never silent" retry telemetry has anywhere to go. Done looks like a long run that either
+completes with a bounded, visible, *accounted* retry, or exits non-zero with an outcome a subprocess
+driver can branch on without parsing prose. Design:
+[designs/unattended-run-integrity.md](designs/unattended-run-integrity.md).
+
+### The agent-authored surface — panes the model opens, config it can safely change (epic) — 🔄 **DESIGNED (C-219; C-220…C-225 filed, none started)**
+
+The ask was "tools to directly modify the harness, the UI … so it would be completely free". Reading
+the tree said most of the plumbing is already built, and that the interesting question is not
+capability but trust. **The tool→surface seam exists twice already** — `ToolProgressSink` and
+`SpawnActivitySink` (`flux-runtime/src/lib.rs:188-262`) are the same shape: a send-only trait at L2,
+installed by the L6 surface, reachable only through `ToolContext`, with redaction applied at the
+reporter so a tool structurally cannot put raw bytes on a screen. **And "the agent extends the
+harness" already ships one layer down**: `op.register` (`flux-tools/src/reflect.rs:459`) lets the
+model author a Flux-Lang composite at runtime with `scope: turn|session|project|global`, where the
+engine owns all state mutation and every inner call still traverses the envelope. What is missing is
+only the surface layer. A third finding decided where to start: **A-79's correlated sub-agent
+activity stream has no consumer in the TUI at all** — the tree's only `SpawnActivitySink`
+implementation is `flux-cli`'s `IgnoredSpawnActivity` (`main.rs:114`), so a designed, redacted,
+tested stream is discarded on the daily driver. The epic's weight, though, sits somewhere else
+entirely: **a model that can draw a styled region inside a trusted terminal is a model that can
+imitate the approval sheet.** C-163 already wrote that rule for plugins — *constrain the rendering
+rather than relying on good behaviour* — and it holds harder for the model, which is the thing the
+approval sheet exists to gate. So both halves are closed structurally rather than by policy: panes
+carry `kind` and `data` and **no field that reaches a `Style`**, making trust chrome unforgeable
+because there is nothing to forge it with; and the agent-writable config key set is asserted
+**disjoint from `PinnableKey::ALL`** by unit test, so `[permissions]`, `[sandbox]`,
+`workspace.allow_all` and `private_net.web` are unknown keys rather than denied ones. Two scope
+decisions were taken deliberately against the more powerful option: a **typed pane vocabulary**
+(`rows|kv|log|progress|tree|markdown`) rather than raw layout control, and **no process re-exec** —
+`/resume`'s existing `project_session` gives in-process reload without opening a new
+turn-termination path, the bug class that has recurred three times. C-220 → C-221 → C-222 land the
+contract, the rendering and the trust invariant *before* C-223 makes any of it reachable by the
+model; C-224 (the fleet pane) and C-225 (config) are separable. Done looks like a live pane the agent
+opened on `flux tui`, and two tests: one where an approval-sheet impersonation payload still renders
+inside the marked agent region with the real sheet drawn over it, and one where the writable key set
+provably cannot name a security-relevant key. Design:
+[designs/agent-authored-surface.md](designs/agent-authored-surface.md).
+
 ### Cross-harness session history — search what was already said, in any local harness (epic) — 🔄 **DESIGNED (C-212; C-213…C-216 filed, none started)**
 
 The ask was a datasource: `search(query: "why did we drop the retry wrapper", harness: "opencode")`
@@ -115,6 +180,35 @@ three orders of magnitude more output against directories holding years of histo
 addressable message returned from a real opencode database — and a test proving a disabled datasource
 performs **zero** reads outside the workspace. Design:
 [designs/harness-history.md](designs/harness-history.md).
+
+### Agent fleet runtime — starting, stopping and finding agents (epic) — 🔄 **DESIGNED (A-119; A-120…A-128 filed, none started)**
+
+The fleet coordinator assumes workers exist at known URLs. Two exhaustive sweeps of the tree
+established that both halves of that assumption are unbacked, and the answers are blunter than
+expected. **Who starts an A2A-reachable agent? A human, in a shell.** Every one is an
+`Arc<FlowEngine>` inside a single foreground `flux` process; `flux-channels/src/host.rs:63-78` is the
+entire supervision story and a fatal channel error kills the process with no restart; there is no
+Dockerfile, no unit file, no manifest, no `--daemon`, and flux never spawns `flux`. `GET /health`
+exists and nothing consumes it; D-63's multi-agent mount is implemented and has no production
+caller. **How does an agent learn a peer exists? It doesn't** — the A2A card answers "what is at
+this URL", never "which agents exist", there is no index route, and roles (`.flux/agents/*.md`) are
+a local persona catalog in a namespace disjoint from A2A entirely. The design's leverage is that the
+missing mechanism is only missing *for agents*: the endpoint broker (D-25…D-32) already fans a
+"which endpoints exist for product X" query out to provider plugins and returns weak refs with
+labels and a `credential_ref` and never a secret — so agents become a **product** on it, and the
+kubernetes plugin can enumerate live pods as fleet members with no config edit and no second
+discovery path. The rest is a new L5 crate, **`flux-fleet`**, built on two axes the design refuses to
+conflate: the **runtime** owns the process (`external` · `proc` · `docker` · `k8s`) and the
+**transport** owns the conversation (`a2a` over HTTP · `ndjson` over stdio), carried in one URI whose
+scheme picks the runtime — `k8s://prod/deploy/flux-worker`, `proc://flux?program=w.flux`,
+`proc://claude?proto=ndjson`. Readiness is `status()`, never `start()` returning, because a
+scheduled pod is not an agent that can take a turn. Two things carry the review weight: `fleet.start`
+on a `proc://` address is **`bash`-class power** and is gated as such, and unifying roles with the
+fleet (a role gains an optional `address`) means `cap_scope` — enforced today by constructing the
+child's registry in-process — becomes a *request* across a trust boundary, which the design surfaces
+as a divergence rather than papering over. Done looks like a coordinator discovering a worker,
+starting it, dispatching to it, watching it through `Ready → Busy → Exited`, and reclaiming its work
+— offline, in CI. Design: [designs/agent-fleet-runtime.md](designs/agent-fleet-runtime.md).
 
 ### Fleet coordinator — flux orchestrating flux across repos (epic) — 🔄 **DESIGNED (A-111; A-112…A-118 filed, none started)**
 

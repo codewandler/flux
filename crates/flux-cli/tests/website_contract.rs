@@ -359,9 +359,31 @@ fn operations_reference_covers_the_registered_public_catalog() {
     )
     .try_register(&mut registry)
     .unwrap();
-
     let docs = read("website/docs/language/ops.md");
     let mut names = registry.names();
+    // The `fleet.*` ops (A-116), which `execution.rs`'s `try_register_fleet` puts in the production
+    // catalog (A-131). They were constructed *nowhere* before that story, which is exactly why this
+    // contract stayed green while they went undocumented — the same failure mode the comment above
+    // records for `ai_segment` and the eval family. Their names are read off `Tool::spec` rather
+    // than listed as literals below, so renaming one here alone cannot silence this check.
+    names.extend(
+        [
+            Arc::new(flux_orchestrate::FleetDispatchTool::new(
+                flux_system::net::PrivateNetAllow::None,
+                None,
+            )) as Arc<dyn Tool>,
+            Arc::new(flux_orchestrate::FleetStatusTool::new(
+                flux_system::net::PrivateNetAllow::None,
+                None,
+            )),
+            Arc::new(flux_orchestrate::FleetCancelTool::new(
+                flux_system::net::PrivateNetAllow::None,
+                None,
+            )),
+        ]
+        .into_iter()
+        .map(|tool| tool.spec().name),
+    );
     names.extend(
         [
             "ask",

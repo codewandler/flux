@@ -8,6 +8,137 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The examples sweep was stricter than the runtime it stands in for (C-232).**
+  `validate_program_structure` asserted `flow_named(&t.run).is_some()` for every trigger, but an
+  **agent-bound** trigger legitimately parses with an empty `run` — the agent drives the turn, so
+  `run` is never consulted — and `flux-app`'s own `Engine::validate` exempts exactly that shape. The
+  sweep did not, so a valid agent-triggered Program could not ship as an example.
+  Fixed at the cause rather than the symptom: the real defect was **two hand-maintained copies of one
+  rule**, which is a divergence waiting to happen rather than a divergence that happened once. The
+  rule now lives once at L0 as `Program::validate_trigger_targets()`, carrying both arms and a doc
+  comment that names its two callers and forbids re-implementing it; the runtime gate and the sweep
+  both delegate, so they agree **by construction instead of by maintenance**. Guarded in both
+  directions — the sweep now accepts an agent-bound trigger, and `should_panic` tests pin that it
+  still rejects a trigger naming no declared flow and one naming an undeclared agent, because the
+  cheap way to stop being too strict is to become too loose. Closes blocker B5 of A-117.
+
+## [0.36.0] - 2026-07-29
+
+### Added
+
+- **The TUI has somewhere to put a pane (C-221).** Second story of the **agent-authored surface**
+  epic, and still not reachable by the model — rendering lands before reachability on purpose, so
+  C-223 wires the `pane.*` ops onto a surface that already draws. Today a host (or a test) can push
+  a pane into one of four slots: `left`/`right` carve columns off the transcript row, `bottom` takes
+  one extra vertical constraint, and `overlay` reuses the shared overlay chrome C-152 consolidated
+  rather than growing a second one. Header, footer and composer keep their full width in every slot.
+  **Every bound is a surface constant, never the payload's choice** — pane count, body rows, column
+  width, the bottom strip's height and tree depth are all decided by `flux-tui` from the terminal's
+  geometry, and content that exceeds one is truncated by the surface behind an explicit elision
+  marker. A pane can never push the transcript below its width floor, and below a minimum width no
+  pane is drawn at all: the narrow-terminal posture `EMPTY_CARD_MIN_WIDTH` established, where the
+  aside is dropped rather than the conversation squeezed.
+  Panes are deliberately outside the transcript machinery — no layout-cache entry, no `focused`
+  index, no scroll bookkeeping, and invisible to transcript search — the same rule the orientation
+  card follows, for the same reason: anything drawn into the transcript area that is not a transcript
+  row must stay out of it entirely. Each `kind` renders through machinery the TUI already owns
+  (`markdown` via `flux-markdown`, `tree` via the plan DAG's renderer, kept beside it so the glyphs
+  and theme roles cannot drift apart), so **no dependency was added** and `ratatui` stays pinned at
+  0.29. Panes always draw before the approval sheet, which is the ordering C-222's trust invariant
+  will rest on. A session with no panes renders cell for cell as it did before, pinned by every
+  pre-existing TUI layout test passing unchanged.
+
+- **The board is the run registry (A-130).** ⚠ **Breaking for out-of-tree `WorkBoard` implementors.**
+  The fleet design claims run state needs no second store, because `fleet.dispatch` writes the
+  worker's address and `task_id` back onto the board `Item` — so crash recovery is "restart, sweep,
+  re-derive". That write path did not exist, which made the recovery story a claim rather than a
+  property. `WorkBoard` now carries a **required** `record_dispatch` method — a seventh generated
+  operation rather than an extension of `claim`, deliberately: the `task_id` does not exist until the
+  worker answers the send, so folding it into `claim` would buy no atomicity for the only window that
+  matters, and would make `claim`'s conditional idempotency incoherent ("same assignee, different
+  task id" has no answer). It is required and has no default body on purpose — a backend that
+  silently declined to record would look healthy right up until a restart recovered nothing. The
+  write is durable, replacing rather than appending (a stale `task_id` would send the sweep after a
+  run that no longer exists), and explicitly *not* a state change: `transition` stays the single
+  entry point into the state machine, because a second one could not be edge-checked. Layering is
+  held by a new `DispatchLedger` seam at L2, so the L3 fleet op never names the L5 board port; the
+  two halves join only at L6.
+
+- **The fleet is reachable from a running `flux` (A-131).** A-113 landed the `WorkBoard` port and
+  A-116 the `fleet.*` ops; both were merged, tested, and constructed **nowhere** outside their own
+  modules, so no Program could call a fleet op or name the board it would operate on. This closes
+  both halves. `fleet.dispatch` / `fleet.status` / `fleet.cancel` are registered into the production
+  catalog with a `fleet` group and both op references, and a `datasource` declaration binds a board
+  through a `board:<backend>` kind — `board:markdown` for the durable file-backed board,
+  `board:memory` for a single run. The `board:` namespace is deliberate: `markdown` already means "a
+  directory of docs to index", so a board backed by markdown files needs a name that cannot be
+  confused with it, and a wrong kind now fails loudly instead of silently ingesting a board as
+  read-only knowledge.
+  Two things the first cut had wired but not working, both found by audit rather than by test:
+  `fleet.dispatch` was constructed without a `DispatchLedger`, so it **refused every call naming a
+  board item** and design §5's "the board is the run registry" stayed false in a running flux; and
+  the only bindable backend was `board:memory`, whose storage *is* the process it is supposed to
+  survive, which made crash recovery untestable. Both are closed: a board handle is retained past
+  registration to build the ledger from, and `board:markdown` binds the durable backend
+  program-relative via `rooted_in`, so a board inherits the session's guarded root rather than
+  opening one of its own — a board is a write surface, so it must not widen the sandbox it was given.
+  The ledger is wired only when a Program declares **exactly one** board, because `fleet.dispatch`
+  takes an item id but no board name: with several boards an id is genuinely ambiguous, and refusing
+  beats silently recording a run onto the wrong board.
+  Verified by hand end to end against a real loopback A2A worker, on a `board:markdown` board: a
+  dispatch wrote `runner` and `task_id` onto the item **as confirmed by reading the file off disk**,
+  the worker's own request log showed the non-blocking `message/send` arriving, a **second, fresh
+  process** over the same board re-derived both fields holding nothing but the board, and
+  `fleet.status` and `fleet.cancel` drove the same run to completion and cancellation.
+
+- **`MarkdownBoard` — the first file-backed `WorkBoard` (A-114).** One markdown file per item with a
+  derived index, every read and write routed through `flux-system`'s guarded surface rather than
+  `std::fs`, and a compare-and-set claim so concurrent claims on one item resolve to exactly one
+  winner while different items never contend. It is the first backend that can actually demonstrate
+  what the design's recovery story needs, and it carries the test that proves it: a dispatch recorded
+  through one board instance is recovered by a **second, independent instance opened over the same
+  directory**. That property is one the shared contract suite structurally cannot check — the suite
+  receives an already-constructed board, so a backend caching in memory passes it in full while
+  recovering nothing across a restart. `record_dispatch` is implemented by reusing the existing
+  reserved-update primitive, so durability, atomicity and no-tearing come from the audited write path
+  instead of a reimplementation.
+
+### Fixed
+
+- **`fleet.dispatch` could never be registered at all (A-116, found via A-130/A-131).** It declared
+  `Effect::Process` without `AccessKind::Process`, a combination the runtime rejects — so the op was
+  unregistrable in any `ToolRegistry`, and being unregistrable *was* the unreachability the fleet
+  wiring set out to close. It survived because A-116's tests only ever called `.spec()` and
+  `.execute()` on freshly constructed tools, so the registration path that validates authority
+  contracts never ran against them; that gap is now closed by a test which registers the fleet ops
+  for real and asserts the exact requirement vector, not merely that registration succeeds. Authority
+  is derived from a **discriminated** subject split: the worker's origin earns the network and
+  provider requirements, and the board item earns `datasource_write` — so the operator is never asked
+  to approve network access to a board item, and the single grant covers both routes to the same
+  write. An endpoint that cannot be named now yields a conservative wildcard requirement rather than
+  an empty one, since an empty list would have meant the op demanded nothing. `fleet.status` and
+  `fleet.cancel` were checked against the same validator and were already sound.
+
+- **Delivery concurrency is bounded again (A-129).** A-112 made `App::deliver` concurrent by
+  spawning each dequeued delivery into a `JoinSet` — which was the point of that story, but it also
+  removed the supervisor's `mpsc` capacity bound, and that bound was the **only** backpressure in
+  the system. A loop that dequeues instantly applies none, so a webhook storm could spawn a journey
+  per event without limit. This matters most for exactly the workload A-112 exists to enable: a
+  coordinator taking inbound webhooks while a sweep runs. Deliveries now acquire an admission slot
+  before the spawn — default **64**, configurable via `App::with_max_inflight_deliveries` or
+  `FLUX_MAX_INFLIGHT_DELIVERIES`. The bound holds work back rather than dropping it: everything
+  submitted still runs as slots free, and it does not reintroduce head-of-line blocking between
+  unrelated channels, so a slow sweep still cannot starve webhook intake. Backpressure is also
+  **observable** — `App::delivery_load` reports `DeliveryLoad { in_flight, waiting, limit }`, so a
+  delivery queued behind the bound is distinguishable from one merely running slowly, rather than
+  both looking like "slow". The slot is held by a `#[must_use]` guard that releases on drop, so a
+  delivery future cancelled mid-enqueue cannot leak a waiting count and strand the app in a
+  permanently "backpressured" state.
+
+## [0.35.0] - 2026-07-29
+
+### Fixed
+
 - **`flux-system`'s test fixtures no longer race the sandbox tests for `TMPDIR` (C-209).**
   `cargo test --workspace` reddened intermittently — a *different* test each run, roughly 1 in 6 to
   1 in 20 — which is the worst shape a flake can take: it never looked systemic, and it cost two
@@ -31,6 +162,30 @@ All notable changes to this project are documented in this file. The format is b
   `#[cfg(test)]`; no production code moved.
 
 ### Changed
+
+- **BREAKING: `App::deliver` is concurrent — deliveries are isolated per root instead of serialized
+  (A-112).** `flux-channels` documented the constraint in its own module docs: deliveries were
+  "serialized by the shared `flux_app::App`" because `App::deliver` subscribed to the broadcast bus
+  and drained the cascade its journeys emitted, so concurrent deliveries would double-process via
+  fan-out — and "cross-channel parallelism needs per-delivery bus isolation". The consequence was
+  that a program whose nightly sweep ran for a minute could not accept a webhook for that minute;
+  a fleet coordinator built on it would have been single-threaded by construction.
+  `supervise()` no longer processes inline: it only dequeues, spawning each `DeliveryMessage` into
+  a `JoinSet`. `process_root` already gave every root a private cascade queue, so isolation followed
+  once the roots stopped queueing. The second half was not in the story and is the better find —
+  `Engine::depth`, the `spawn` recursion budget, was an engine-wide `AtomicU32` that was equivalent
+  to per-delivery *only because* deliveries were serialized; concurrency would have let 17
+  simultaneous deliveries trip `MAX_SPAWN_DEPTH = 16` on work that never recursed. The budget moved
+  into `DeliveryOrigin`, with the engine counter kept as the fallback for runs outside any delivery
+  scope. Three failing-first tests pin the behaviour (each verified to fail on the merge base with
+  `Elapsed(())`), plus a 24-delivery barrier test for the nesting budget and a retained regression
+  guard for cascade bounds. **Breaking for embedders**: journeys still share the App's mutable state
+  — agent sessions, ask-parks, the recorded-send log — all `Mutex`-guarded and sound, but two
+  deliveries addressing the same conversation now interleave rather than queue. Two follow-ups filed
+  rather than widened into this diff: delivery concurrency is now unbounded, since the supervisor's
+  `mpsc` capacity was the only backpressure (A-129); and under `App::run` the run lease activates
+  before the `Start` response is awaited, so a `startup` journey's initialization can interleave with
+  triggered journeys that read it.
 
 - **Gather-safety reads `semantic_effects`, so a self-declared durable write can no longer run before
   approval (C-210).** `gather_safe` (`flux-flow`) and `is_consequence_bearing` (`flux-spec`) both
@@ -83,6 +238,138 @@ All notable changes to this project are documented in this file. The format is b
   **typed session log** epic (A-99 → A-102).
 
 ### Added
+
+- **`flux policy simulate` — replay a proposed policy against recorded history (C-131).** Adopting a
+  policy edit meant guessing what it would do. `flux policy simulate <proposed.toml> [--sessions N]
+  [--json]` evaluates the active and proposed policies over the same recorded op history and reports,
+  diff-style, what it would newly block, newly allow, and leave unchanged. Pure read: no event is
+  appended and no provider is constructed.
+  **The interesting property is what it refuses to answer.** An op whose recorded context cannot
+  re-decide it is reported `indeterminate` with a reason, never folded into blocked/allowed — because
+  a simulation that is confidently wrong is worse than one that admits a gap, when the operator's
+  whole reason to run it is to stop guessing. An independent review proved two ways it could have
+  been confidently wrong, and both are closed. The caller-fact bracket was three *independent
+  single-axis* probes, so a grant gated on two omitted facts at once escaped it entirely — a proposal
+  converting an approval-gated `process.exec` into a silent allow reported `unchanged, 0
+  indeterminate`. `evaluate` is monotone in trust/scopes/groups, so a two-point check is sound, but
+  only between the **joint** minimum and maximum; the per-axis probe now survives only to *attribute*
+  which fact moved a verdict, never to decide whether one is knowable.
+  The principal-kind refusal never fired, because `SubjectKind::User` is itself kind-discriminating —
+  making the "assume user" substitution load-bearing for the entire built-in floor, and inverting
+  verdicts for the token-authenticated service principals that `flux app run --serve` records into the
+  same store. Kind is categorical rather than ordered, so it is now **enumerated** rather than
+  bracketed, and the recorder writes an additive `caller_kind` on each dispatch. Records written
+  before that key remain honestly indeterminate.
+  Four further limits are disclosed in the report rather than left for a reader to discover:
+  `newly_allowed` cannot observe a deny→allow transition (the gate refuses before the observation is
+  written), only the mandatory policy floor is replayed, a bounded `--sessions` window is echoed as a
+  window, and a malformed `subjects` list now refuses the record instead of dropping entries — fewer
+  requirements would have meant a more permissive verdict.
+
+- **The `SurfaceSink` pane contract at L2 (C-220).** First story of the **agent-authored surface**
+  epic, and deliberately contract-only — no rendering, no op, nothing model-facing (C-221 and C-223
+  add those). A tool can now address the human surface without any crate below L6 knowing a surface
+  exists: `SurfaceSink` is a send-only trait in `flux-runtime`, installed by an L6 surface and
+  reachable by a tool only through `ToolContext::surface()`, which returns `None` when no host
+  installed one. It is the third instance of the `ToolProgressSink`/`SpawnActivitySink` pattern, and
+  it copies that shape deliberately rather than inventing one — including redaction **at the
+  reporter**, so every string crossing to a screen (pane id, title, and every payload field down to
+  a recursive tree node's label) is scrubbed on one path that `update` and `close` cannot route
+  around.
+  Two properties are enforced by construction rather than by convention, because the trusted-chrome
+  invariant (C-222) will rest on them. **`PaneSpec` carries no field that reaches a `Style`** — no
+  colour, width, rect or z-order — pinned by an exact-set assertion over its fields, so the model
+  supplies data and the surface keeps every trust marker. And **`surface_sink()` is `pub(crate)`**,
+  diverging from its public sibling `tool_progress_sink()`: a public getter paired with the public
+  `runtime_turn_context()` would let a tool emit unredacted bytes straight to the screen, which would
+  have made "the reporter is the only route" aspirational. Installing a sink stays public; only
+  reading one back is closed. `lifetime: "project"` parses but is rejected at the reporter until a
+  story claims it, so the field cannot quietly imply persistence it does not have.
+
+- **Memory gets its own append-only stream and projection (A-107).** First story of the
+  **evidence-pinned memory** epic, and deliberately store-layer only — no op, no CLI (A-108 and A-110
+  add those). `MemoryEntry { id, claim, scope, receipt, git, learned_at_ms }` lives on a
+  `memory:<scope-key>` stream inside the existing `events.db`, projected to latest-state-per-id. An
+  edit appends, a forget appends a tombstone, and the projection reflects both — so *what the agent
+  believed* survives, which is the point when debugging a bad decision six sessions later.
+  `receipt.event_id` cites the **stable ULID event id, never `global_seq`** — a backend rowid that
+  would not survive a store migration and does not mean the same thing across the SQLite and Postgres
+  backends. Two tests pin it, one of which runs a migration that renumbers `global_seq` and asserts
+  the citation still resolves. The convenient-handle mistake is the one the story warned about, and
+  it is now the thing that reds the build.
+  Two deliberate design calls: memory facts ride `EventKind::Custom` under a reserved `memory.`
+  prefix rather than new enum variants, because `EventKind` is public and not `#[non_exhaustive]`, so
+  new variants would break every downstream `match` for a fact none of flux's closed projections
+  read — and an undecodable `memory.*` payload is *skipped* rather than failing the read, so one bad
+  event cannot take out the whole read model. Redaction stays a caller responsibility, as it is
+  throughout `flux-events` (C-22/C-164): `MemoryNote`'s claim field is private with exactly one
+  constructor taking the live turn's redactor, so no field-assignment path reaches the store with raw
+  model text.
+
+- **Hunk-level git staging — an agent can stage part of a file another author is editing (C-92).**
+  `git_stage` operates on whole paths, so a file touched by two authors could only be staged in full:
+  the agent either swept a coworker's uncommitted hunks into its own commit or handed the task back.
+  Two new guarded ops close that — `git_hunks` lists a file's addressable hunks, `git_stage_hunks`
+  stages a chosen subset. Both route through the same `flux_system` guarded spawn as the rest of the
+  `git_*` family (no second `Command::new`, argv-only, workspace-pinned), which grew
+  `System::run_with_stdin` to feed `git apply` its patch — same `build_command` choke point, same
+  `Confinement::Sandboxed`, and `Stdio::null()` still for every existing caller.
+  Selectors are **content-addressed** (`h{ordinal}-{hash}`), re-verified against a freshly recomputed
+  diff at stage time, so a stale selector refuses rather than staging the wrong region. A positional
+  index was rejected in the design note precisely because it fails *silently*: a coworker's save
+  between the read and the stage would redirect the selection onto their hunk — the exact bug the
+  story exists to prevent.
+  **An independent review found two silent-misapply paths behind a green gate, and both are closed.**
+  `context: 0` produced a patch `git apply` placed at end-of-file while exiting 0 (reported as
+  success); it is now refused with a floor of 1, chosen over `--unidiff-zero` because that flag fixes
+  placement only by disabling the verification a zero-context patch has nothing to verify with —
+  `context: 1` keeps the check and still splits adjacent changes. And `--recount` was masking corrupt
+  patches: a truncated stdin write applied as a *partial* stage reporting full success. The two
+  proved independent under the implementor's own repro, which sharpened the diagnosis. A third defect
+  surfaced from a review question: staging "one hunk" of a deleted file committed a whole-file
+  deletion the caller never selected — preambles carrying `deleted file mode`, renames, copies or
+  mode changes are now refused.
+  One limitation is stated rather than papered over: surviving renumbering and distinguishing two
+  byte-identical hunks are not jointly achievable — the first needs hash-only matching, the second
+  needs position. Full-string matching fails *safe*, and the design note now records that trade
+  instead of two claims that were not true of the shipped code.
+
+- **Outbound A2A dispatch — flux can hand work to a remote flux agent (A-116).** The A2A server has
+  implemented `tasks/cancel` since A-55, but no client could reach it, so a remote run could only be
+  detached from, never stopped. `A2aClient::cancel_task` closes that asymmetry. On top of it,
+  `A2aSpawner` (`flux-orchestrate`) is a `Spawner` backed by a remote worker rather than an
+  in-process sub-agent — so **the existing `task` op drives it verbatim** through the same
+  `ToolContext::spawner` seam, adding zero op surface for the blocking-delegate case while keeping
+  every depth and cap-scope bound the op already applies.
+  `fleet.dispatch` / `fleet.status` / `fleet.cancel` cover the fire-and-**track** case that
+  `Spawner`'s fire-and-await signature cannot express: `dispatch` sends non-blocking and returns the
+  `task_id`, `status` wraps `tasks/get`, `cancel` wraps the new `cancel_task`.
+  Egress is guarded on all three — the `worker` endpoint is caller-supplied and therefore
+  model-reachable, so each resolves it through `guard_url_scoped` before any request, and
+  `permission_subjects` reports the worker's origin: **never `*`**, and empty when the endpoint
+  cannot be named, which forces approval rather than matching a broad grant. Takes the L3 → L1 edge
+  the story sanctions (`flux-a2a` becomes a dependency of `flux-orchestrate`); no new crate and no
+  `flux-codegate` `layer()` change.
+
+- **The `WorkBoard` port — a write-capable state source with a closed state machine (A-113).**
+  `LiveDatasource` is strictly read-only (`list` + `get`), so the fleet coordinator had no swappable
+  way to *write* a board. This adds the sibling port following the same convention: a backend
+  declares a schema plus its external authority, is validated once at registration, and the host
+  generates uniform ops with stable permission subjects, a tool group and an ambient signal.
+  L0 `flux_datasource::board` contributes the typed vocabulary (`Item`, `ItemDraft`, `State`,
+  `BoardSchema`), reusing `live::{Page, PageRequest, Filters, FilterValue, Reference}` verbatim
+  rather than growing a parallel one. L5 `flux_capabilities::datasource::board` contributes the
+  `WorkBoard` trait and `try_register_work_board`, generating `board.list` / `.get` / `.create` /
+  `.transition` / `.claim` / `.comment` and registering atomically on a clone.
+  The point of the typed machine is that the coordinator can **reason** about the board — dependency
+  waves from `depends_on`, stuck detection from `state` + `attempts` — instead of shuffling opaque
+  rows. Every legal edge lives in one `const EDGES` table in L0; an illegal transition is an error
+  and **not a write**, pinned by a test asserting the item is byte-identical afterwards. Each
+  mutating op reports a **concrete** `permission_subject` (`<domain>/item/<id>`; `create` reports
+  `<domain>/item/new`) — never `*`, never empty, so per AGENTS.md an empty-subject `Write` forced to
+  approval is not something this port can dodge. `MemoryBoard` ships as the offline double, and the
+  shared contract suite that runs against it is reusable verbatim by the sibling backends, with no
+  credentials and no network. `codewandler-flux-datasource` moves to **1.1.0** (additive module).
 
 - **Metadata coherence is gated over the full production catalog, not just the built-ins (C-208).**
   C-191's build-time gate covered `try_register_builtins`. The registry a running agent actually

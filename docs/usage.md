@@ -253,6 +253,22 @@ flux endpoint list               # inspect the persisted endpoint store (~/.flux
                                  #   add <id> --url <bare-url> [--product/--protocol/--credential-ref/
                                  #   --label] · show <id> · resolve <id> (what a ref WOULD bind to) ·
                                  #   import <id> [--from-json <ref>]
+flux policy simulate p.toml      # POLICY SIMULATION (C-131): replay a proposed authorization policy over
+                                 #   the recorded op history and print a diff — newly blocked / newly
+                                 #   allowed / unchanged, with the deciding requirement per op. A pure
+                                 #   read: no event is appended and no provider is built (it does create
+                                 #   the store dir on a fresh HOME, as `export`/`sessions` do).
+                                 #   Ops the log cannot re-evaluate are reported "indeterminate" with a
+                                 #   reason — never folded into blocked or allowed: no authority contract
+                                 #   in this build, a malformed record, a verdict that turns on caller
+                                 #   trust/scopes/groups (bracketed jointly, so grants gated on several
+                                 #   at once are caught), or one that turns on the caller's principal
+                                 #   kind on a record predating `caller_kind`.
+                                 #   Only the mandatory policy floor is replayed — not permission rules,
+                                 #   the capability-scope floor, `[tools] disable`, or the approval gate.
+                                 #   `newly allowed` shows approval_required->allow only: a denied
+                                 #   dispatch is never recorded, so deny->allow cannot appear.
+                                 #   --sessions N limits the replay window (0 = all), --json for tooling
 flux skill [cli|lang|plugin|ops] # print a generated Claude-format skill's SKILL.md to stdout (omit the
                                  #   type for the root skill); --install writes skill directories to
                                  #   .flux/skills instead, --global targets ~/.claude/skills

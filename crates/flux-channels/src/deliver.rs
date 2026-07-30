@@ -16,9 +16,9 @@ pub trait Deliverer: Send + Sync {
 
 /// The production deliverer: routes an event into a running [`App`]'s bus → triggers → journeys.
 ///
-/// [`App::deliver`] owns delivery serialization because its broadcast subscription drains cascade
-/// events. Keeping that invariant on the shared App also covers direct callers and independently
-/// constructed adapters.
+/// [`App::deliver`] isolates each delivery's cascade, so this may be called concurrently from every
+/// adapter; a channel that blocks in one journey does not stall the others. Keeping the coordinator
+/// on the shared App also covers direct callers and independently constructed adapters.
 pub struct AppDeliverer {
     app: Arc<App>,
 }

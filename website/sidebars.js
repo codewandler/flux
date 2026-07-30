@@ -35,6 +35,7 @@ const sidebars = {
         'agent/programs',
         'agent/slack-channel',
         'agent/datasources',
+        'agent/fleet',
         'agent/endpoints',
         'agent/saved-flows',
         'agent/project-context',
