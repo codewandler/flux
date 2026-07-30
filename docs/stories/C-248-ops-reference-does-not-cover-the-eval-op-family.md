@@ -1,0 +1,51 @@
+---
+id: C-248
+title: "`ops-reference.md` documents none of the eval op family, so a rename there has one unguarded reference"
+pillar: Core
+status: ready
+priority: 7
+areas: [flux-flow, flux-eval]
+note: "found while renaming git_revert→git_reset for C-238: only the website file is coverage-tested, so the in-repo op reference can silently rot for any eval op"
+---
+
+# `ops-reference.md` documents none of the eval op family, so a rename there has one unguarded reference
+
+## Goal
+flux has two op references: `crates/flux-flow/docs/ops-reference.md` (in-repo, for agents) and
+`website/docs/language/ops.md` (published). The catalog-coherence tests
+(`operations_reference_covers_the_registered_public_catalog`,
+`the_published_risk_column_matches_the_registry`) guard the **website** file against the registry.
+
+`ops-reference.md` documents **none** of the eval-pack ops — `eval_run`, `guard_protected`,
+`git_snapshot`, `git_tag`, `gate_check`, and now `git_reset`. Because they are absent rather than
+wrong, no coverage test notices. So for any eval op there is exactly one reference that can drift
+silently, and the drift is invisible until an agent reads the in-repo file and finds nothing.
+
+This surfaced during C-238's `git_revert` → `git_reset` rename: the rename had to be applied by hand
+across both references, and only one of them would have failed the gate if it had been missed.
+
+## Acceptance
+- [ ] Decide and record which of two shapes is right, then implement it:
+      (a) `ops-reference.md` covers the eval family too, and a coverage test pins it the way the
+      website file is pinned; or (b) `ops-reference.md` is explicitly and *testably* scoped to the
+      builtin catalog, with the eval pack's exclusion asserted rather than incidental.
+- [ ] **Failing-first test**: whichever shape is chosen, a test fails today. For (a) that is an
+      eval op missing from `ops-reference.md`; for (b) it is the absence of any assertion that the
+      exclusion is deliberate.
+- [ ] No reference can be silently incomplete afterwards: adding an op to either the builtin or the
+      eval pack without updating the references it belongs in must redden the gate.
+- [ ] Standard gate green in both workspaces.
+
+## Progress
+- 2026-07-30 — filed from the C-238 implementation, which had to rename an eval op across both
+  references and observed that only the website side was guarded.
+
+## Notes
+- The eval pack registers via `flux_eval::try_register_eval_ops`
+  (`crates/flux-eval/src/lib.rs:76`), wired into production at
+  `crates/flux-cli/src/execution.rs`. So these are **public** ops in a running flux, not test
+  scaffolding — which is the argument for shape (a).
+- Counter-argument for (b), worth weighing rather than dismissing: `ops-reference.md` is the agent's
+  working catalog, and the eval ops are only registered when the eval pack is present. A reference
+  that lists ops the current binary may not have is its own kind of wrong. Whichever way it goes,
+  the point of the story is that the choice becomes *testable* instead of accidental.

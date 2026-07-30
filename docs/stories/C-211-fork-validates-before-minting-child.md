@@ -2,8 +2,7 @@
 id: C-211
 title: "Validate the parent history before minting the fork's child session, and test the CLI refusal"
 pillar: Core
-status: in-progress
-priority: 8
+status: done
 epic: typed-session-log
 design: docs/designs/typed-session-log.md
 note: "SURFACED BY the A-102 review — the refusal path is new, and both fork sites create the child before they know the parent is forkable; the CLI's copy of the logic has no test at all"

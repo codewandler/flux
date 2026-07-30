@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A refused fork left an empty orphan session behind (C-211).** Both fork sites — `Session::fork`
+  in the SDK and `flux session fork` in the CLI — minted the child session *first* and only then ran
+  `ValidHistory::new` on the parent, so a parent whose log ends mid-tool-pair was refused **after**
+  the child already existed. The validation is now hoisted above `create_session_with_context` at
+  both sites, which restores the simpler invariant: **a failed operation leaves no trace.** Worth
+  stating why this was fixed even though it was self-cleaning — nothing is appended to the orphan, so
+  `last_seq == 0` and `prune_empty` collects it — the point is that "a failed operation leaves no
+  trace" is cheaper to hold as an invariant than to re-derive from a pruning rule every time someone
+  reads the fork path. Pinned in both directions and at both layers: the SDK test asserts the store's
+  session count is unchanged after a refusal, and a new CLI test
+  (`crates/flux-cli/tests/fork_refusal.rs`) drives the real binary, because the CLI is a second
+  hand-written copy of validate-then-rewrite with different error plumbing and a divergence would
+  surface as a CLI that still mints broken children. Surfaced by the A-102 review. The identical
+  defect in `WhatIf::run`'s re-plan path — which has *two* bails after the child exists — is filed
+  separately as C-247 rather than folded in here.
+
 - **The examples sweep was stricter than the runtime it stands in for (C-232).**
   `validate_program_structure` asserted `flow_named(&t.run).is_some()` for every trigger, but an
   **agent-bound** trigger legitimately parses with an empty `run` — the agent drives the turn, so

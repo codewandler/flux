@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Forking a session that can't be forked no longer leaves a stray empty session behind. Previously
+  the new session was created before flux checked whether the original could be forked at all, so a
+  refused fork still cluttered your session list. It now checks first and creates nothing on refusal.
+
 ## [0.36.0] - 2026-07-29
 
 ### New
