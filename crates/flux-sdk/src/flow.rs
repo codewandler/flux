@@ -180,9 +180,12 @@ impl FlowClientBuilder {
     }
     /// Bound what this runtime **uses** (C-290): a ceiling on simultaneously executing tool calls
     /// and on retained result bytes. Enforced inside the safety envelope, so it binds every op this
-    /// client runs — including the branches of a `parallel` block, which is where an authored flow
-    /// actually produces concurrency. Unbounded by default; see
-    /// [`ClientBuilder::resource_limits`](crate::ClientBuilder::resource_limits).
+    /// client's own executors run — including the branches of a `parallel` block, which is where an
+    /// authored flow actually produces concurrency. It does **not** descend into sub-agents
+    /// attached via [`with_sub_agents`](FlowClient::with_sub_agents): a `task`-delegated child gets
+    /// a fresh, unbounded executor. Unbounded by default; see
+    /// [`ClientBuilder::resource_limits`](crate::ClientBuilder::resource_limits) for the full
+    /// contract, including why the queue timeout is not clamped.
     pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.envelope.resource_limits = limits;
         self

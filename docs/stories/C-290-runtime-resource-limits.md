@@ -39,11 +39,19 @@ Let a host that constructs a runtime bound its resource use, not just its token 
       (plus the `parallel`-flow variant, which is where an authored flow actually produces
       concurrency, and a shared-budget variant across two executors).
 - [x] Exceeding a limit is an observable, actionable refusal — never a silent truncation or a hang.
-      → a saturated ceiling refuses after a bounded `tool_call_queue_timeout` (default 30s, no
-      "wait forever" setting) with a message naming the limit and the knob, plus a
-      `tool_concurrency_refused` observation and a `tool.concurrency_refused` dispatch event.
-      Retained-byte pressure *evicts from a cache*, which is correctness-neutral — it never
-      truncates a result the model sees.
+      → a saturated ceiling refuses after `tool_call_queue_timeout` with a message naming the limit
+      and the knob, plus a `tool_concurrency_refused` observation and a `tool.concurrency_refused`
+      dispatch event. Retained-byte pressure *evicts from a cache*, which is correctness-neutral —
+      it never truncates a result the model sees.
+      **Precisely scoped, after review:** the no-hang property holds by *default*, not by
+      *construction*. No sentinel value means "wait forever" and the 30s default binds when the
+      host sets nothing — but the timeout is not clamped at either door. `[limits]
+      tool_call_queue_timeout_ms` is a bare `u64` fed to `Duration::from_millis`, so `u64::MAX` is a
+      ~584,942,417-year wait that `tokio::time::timeout` honors rather than caps. That takes
+      deliberate operator action and is visible in the config file; no clamp was added, because any
+      maximum would be a guess that breaks a legitimate long-queue deployment (a batch host may
+      genuinely prefer queueing for an hour over being refused). All four doc sites now say this
+      rather than claiming a guarantee the config path contradicts.
 - [x] The gate is green.
 
 ## Notes
@@ -97,12 +105,34 @@ Of the three structures the acceptance named, exactly one is both **owned by the
 - The refusal is deliberately **not** `DispatchOutcome::denied` — it is transient, so `retry`/`loop`
   should try it again, unlike an authorization refusal.
 
-**Owed, deliberately not done here:** wiring `[limits]` into the `flux` binary. `flux-cli` was
-fenced for this story. Until that lands, the `[limits]` concurrency keys are consumed only by an
-embedding host via `ResourceLimits::from_config`; the field docs in `flux-config` say so.
+### Owed, deliberately not done here
+
+All three are outside this story's fence. They are recorded here so the next reader finds them from
+the story rather than rediscovering them.
+
+1. **`[limits]` is not wired into the `flux` binary.** `flux-cli` was fenced (C-213 in flight).
+   Until that lands, the `[limits]` concurrency keys are consumed only by an embedding host via
+   `ResourceLimits::from_config`; the field docs in `flux-config` say so. One call site in
+   `flux-cli`'s executor assembly.
+2. **The ceiling does not descend into sub-agents.** `LocalSpawner::spawn`
+   (`crates/flux-orchestrate/src/lib.rs:399`) builds the child with
+   `Executor::new_with_authorization(...)`, which defaults to `ResourceLimits::new()` — unbounded;
+   `grep -rn "ResourceLimits\|resource_limits" crates/flux-orchestrate/` returns nothing. So
+   `task`-delegated work runs unbounded **in the same process** while `ClientBuilder::resource_limits`
+   bounds the parent. `ClientBuilder::resource_limits`' doc now states this scope explicitly rather
+   than implying whole-process coverage. Note this is also what makes the parent ceiling
+   deadlock-safe across a spawn: the child never contends for the parent's semaphore. Descending the
+   ceiling would need that interaction designed, not just threaded.
+3. **`website/docs/reference/config.md:204-208` still lists only `turn_token_budget`** under
+   "Resource limits". Defensible while the keys stay embedder-only (item 1), but an operator gets no
+   signal either way.
 
 **Published-API note for the release cut:** this is **additive** to `flux-sdk`'s public surface
 (`ClientBuilder::resource_limits`, `FlowClientBuilder::resource_limits`, `Client::resource_limits`,
 the `ResourceLimits`/`ConcurrencyRefusal` re-exports) and to `flux-runtime`'s
 (`ExecutionEnvironment::with_resource_limits`, `Executor::with_resource_limits`,
 `Executor::retained_result_bytes`). Nothing was removed or re-signatured.
+
+One caveat for that note: `flux_config::Limits` gained three `pub` fields and is not
+`#[non_exhaustive]`, so an external caller constructing it by struct literal breaks. That is
+release-bump input and matches existing practice for this struct.

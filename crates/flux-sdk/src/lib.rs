@@ -750,8 +750,16 @@ impl ClientBuilder {
     ///
     /// Enforced inside the safety envelope, so it binds for this in-process client — not only for
     /// `flux-server`, whose `max_inflight_per_principal` was the only concurrency control before
-    /// this existed. Exceeding the concurrency ceiling is an actionable refusal after a bounded
-    /// wait, never a silent truncation and never a hang. Unbounded by default.
+    /// this existed. Exceeding the concurrency ceiling is an actionable refusal, never a silent
+    /// truncation; the wait before that refusal is bounded by
+    /// [`with_tool_call_queue_timeout`](ResourceLimits::with_tool_call_queue_timeout), which
+    /// defaults to 30s and is *not* clamped, so a host that sets an absurd value gets an absurd
+    /// wait. Unbounded by default.
+    ///
+    /// **Scope:** these ceilings cover the ops *this client's own executors* run. They do **not**
+    /// descend into sub-agents — `task`-delegated work is spawned with a fresh, unbounded executor,
+    /// so it runs in the same process without counting against this budget (C-290, recorded as
+    /// owed).
     ///
     /// A file-configured host builds the same value from `[limits]` with
     /// [`ResourceLimits::from_config`].

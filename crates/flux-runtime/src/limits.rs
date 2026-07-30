@@ -42,9 +42,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 /// [`max_concurrent_tool_calls`](ResourceLimits::max_concurrent_tool_calls) but no explicit
 /// [`tool_call_queue_timeout`](ResourceLimits::tool_call_queue_timeout): 30 seconds.
 ///
-/// There is deliberately no "wait forever" default. An unbounded queue is indistinguishable from a
-/// hang at the call site, and C-290 requires that exceeding a limit be an observable, actionable
-/// refusal.
+/// **What this does and does not guarantee.** There is no *sentinel* for "wait forever": no value
+/// of the timeout is interpreted as unbounded, and this default binds whenever the host does not
+/// set one. An unbounded queue is indistinguishable from a hang at the call site, which is why the
+/// unset case has a finite answer.
+///
+/// It is **not** a ceiling on the wait. The timeout is an arbitrary [`Duration`] (and through
+/// `[limits] tool_call_queue_timeout_ms` an arbitrary `u64` of milliseconds), and nothing clamps
+/// it: `u64::MAX` milliseconds is ~584,942,417 years, and `tokio::time::timeout` honors an absurd
+/// duration rather than capping it. An operator who writes that has chosen a hang, deliberately and
+/// visibly. Nothing here overrides that choice, because any maximum this module could pick would be
+/// a guess that breaks a legitimate long-queue deployment — a batch host may genuinely prefer
+/// queueing for an hour over being refused.
 pub const DEFAULT_TOOL_CALL_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The op cache's entry-count bound, unchanged from before the byte ceiling existed. Both bounds
@@ -94,7 +103,9 @@ impl ResourceLimits {
     /// `0` is meaningless as a ceiling (it would refuse every call), so it is read as `1`. A call
     /// that arrives at a saturated runtime waits up to
     /// [`tool_call_queue_timeout`](Self::tool_call_queue_timeout) and is then refused with an
-    /// actionable message — it never truncates and never waits forever.
+    /// actionable message. It never truncates; and it never waits *unboundedly by default*, though
+    /// a host that sets an absurd timeout gets an absurd wait — see
+    /// [`DEFAULT_TOOL_CALL_QUEUE_TIMEOUT`].
     pub fn with_max_concurrent_tool_calls(mut self, n: usize) -> Self {
         let n = n.max(1);
         self.max_concurrent_tool_calls = Some(n);
@@ -105,6 +116,10 @@ impl ResourceLimits {
     /// How long a tool call waits for a slot before being refused. Defaults to
     /// [`DEFAULT_TOOL_CALL_QUEUE_TIMEOUT`]; `Duration::ZERO` refuses immediately rather than
     /// queueing at all. Ignored when no concurrency ceiling is set.
+    ///
+    /// Not clamped. A very large value is honored as written, so it is the one way to turn the
+    /// refusal back into an effectively unbounded wait — deliberately, never by default and never
+    /// via a sentinel. See [`DEFAULT_TOOL_CALL_QUEUE_TIMEOUT`] for why no maximum is imposed.
     pub fn with_tool_call_queue_timeout(mut self, timeout: Duration) -> Self {
         self.queue_timeout = Some(timeout);
         self
@@ -326,6 +341,53 @@ mod tests {
     fn a_zero_concurrency_ceiling_is_read_as_one() {
         let limits = ResourceLimits::new().with_max_concurrent_tool_calls(0);
         assert_eq!(limits.max_concurrent_tool_calls(), Some(1));
+    }
+
+    /// The `[limits]` table maps straight onto the runtime ceilings, and an absent key leaves the
+    /// corresponding ceiling off rather than inventing one.
+    #[test]
+    fn the_config_table_maps_onto_the_runtime_ceilings() {
+        let limits = ResourceLimits::from_config(&flux_config::Limits {
+            max_concurrent_tool_calls: Some(4),
+            tool_call_queue_timeout_ms: Some(2_500),
+            max_retained_result_bytes: Some(1_048_576),
+            ..Default::default()
+        });
+        assert_eq!(limits.max_concurrent_tool_calls(), Some(4));
+        assert_eq!(
+            limits.tool_call_queue_timeout(),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(limits.max_retained_result_bytes(), Some(1_048_576));
+
+        let empty = ResourceLimits::from_config(&flux_config::Limits::default());
+        assert!(empty.is_unbounded());
+        assert_eq!(
+            empty.tool_call_queue_timeout(),
+            DEFAULT_TOOL_CALL_QUEUE_TIMEOUT
+        );
+    }
+
+    /// The queue timeout is deliberately **not** clamped, so this pins the documented behavior: a
+    /// host that asks for an absurd wait gets one, and turning that into a clamp is a deliberate
+    /// change rather than an accident. No sentinel means "wait forever" — the only way there is to
+    /// write an absurd number, and the 30s default binds when nothing is written.
+    #[test]
+    fn an_absurd_queue_timeout_is_honored_rather_than_clamped() {
+        let limits = ResourceLimits::from_config(&flux_config::Limits {
+            max_concurrent_tool_calls: Some(1),
+            tool_call_queue_timeout_ms: Some(u64::MAX),
+            ..Default::default()
+        });
+        assert_eq!(
+            limits.tool_call_queue_timeout(),
+            Duration::from_millis(u64::MAX),
+            "nothing caps the configured wait — the docs must keep saying so"
+        );
+        assert!(
+            limits.tool_call_queue_timeout() > Duration::from_secs(60 * 60 * 24 * 365),
+            "and it is long enough to be a hang in practice"
+        );
     }
 
     /// Clones share the ceiling — that is what makes it a runtime-wide budget rather than a

@@ -839,8 +839,14 @@ pub struct Limits {
     pub max_concurrent_tool_calls: Option<usize>,
     /// C-290: how long a tool call waits for a concurrency slot before it is refused with an
     /// actionable message. Absent means the runtime default (30s). Meaningful only alongside
-    /// `max_concurrent_tool_calls`; there is no "wait forever" setting, because an unbounded queue
-    /// is indistinguishable from a hang.
+    /// `max_concurrent_tool_calls`.
+    ///
+    /// **No sentinel means "wait forever", and the 30s default binds when this is absent — but this
+    /// value is not clamped.** It is milliseconds handed to `Duration::from_millis`, so `u64::MAX`
+    /// is a ~584,942,417-year wait that `tokio::time::timeout` will honor rather than cap. An
+    /// operator who writes an absurd number here has chosen a hang; that is deliberate and visible,
+    /// and nothing overrides it. See `flux_runtime::DEFAULT_TOOL_CALL_QUEUE_TIMEOUT` for why no
+    /// maximum is imposed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_queue_timeout_ms: Option<u64>,
     /// C-290: how many bytes of tool results the runtime may retain in its deterministic op cache.
