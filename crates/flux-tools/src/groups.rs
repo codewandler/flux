@@ -253,6 +253,7 @@ mod tests {
         // C-238: the serial-integration verbs are Git-group members too.
         assert!(git.tools.contains(&"git_branch".to_string()));
         assert!(git.tools.contains(&"git_merge".to_string()));
+        assert!(git.tools.contains(&"git_revert".to_string()));
         assert_eq!(git.surface_when[0].signal.as_deref(), Some("git_repo"));
     }
 

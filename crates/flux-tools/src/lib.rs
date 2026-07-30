@@ -2791,7 +2791,9 @@ impl Tool for GitRevertTool {
         }
         let system = ctx.system();
 
-        // Same clean-tree discipline as git_merge: the conflict abort restores exactly this.
+        // `git revert` refuses a dirty tree itself, but only after the fact and with a hint aimed
+        // at a human. Check first so the caller gets one recoverable error naming the offending
+        // paths — and so the conflict abort below has an unambiguous state to restore to.
         let (ok, status) = run_git(&system, &["status", "--porcelain"]).await?;
         if !ok {
             return Ok(ToolResult::error(format!(
@@ -2805,9 +2807,11 @@ impl Tool for GitRevertTool {
             )));
         }
 
+        // Never open an editor for the revert message (same reason as `git_merge`): the guarded
+        // system clears the environment, and git's default "Revert ..." subject is the audit trail
+        // the integration loop needs.
         let mut argv = vec!["revert".to_string(), "--no-edit".to_string()];
-        let mainline = args.mainline.map(|n| n.to_string());
-        if let Some(n) = mainline.as_deref() {
+        if let Some(n) = args.mainline {
             argv.push("-m".to_string());
             argv.push(n.to_string());
         }
@@ -2842,9 +2846,14 @@ impl Tool for GitRevertTool {
             )));
         }
         let count = conflicts.lines().filter(|l| !l.is_empty()).count();
+        let files = if conflicts.is_empty() {
+            "(git reported no unmerged paths)".to_string()
+        } else {
+            conflicts
+        };
         Ok(ToolResult::error(format!(
             "git_revert: reverting `{commit}` conflicts in {count} file(s); the revert was \
-             aborted and the tree is clean. Reconcile and retry. Conflicting files:\n{conflicts}"
+             aborted and the tree is clean. Reconcile and retry. Conflicting files:\n{files}"
         )))
     }
 }
