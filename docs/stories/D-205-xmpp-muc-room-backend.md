@@ -3,7 +3,7 @@ id: D-205
 title: XMPP MUC room backend — the portable room, no vendor and no browser
 pillar: Agent
 status: ready
-priority: 25
+priority: 4
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
 areas: [flux-channels]
