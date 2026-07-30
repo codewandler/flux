@@ -6605,6 +6605,116 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Run git and return (success, stdout+stderr) WITHOUT asserting — for setup steps that are
+    /// meant to fail, like the conflicting merge that puts the tree mid-merge below.
+    fn raw_git_try(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let body = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), body.trim().to_string())
+    }
+
+    /// C-238 (review round 1): a merge already in progress belongs to the USER, not to this op.
+    ///
+    /// `git merge` refuses to start at all while `MERGE_HEAD` exists, so a naive conflict path
+    /// reads that PRE-EXISTING `MERGE_HEAD` as "this call conflicted" and runs `git merge --abort`,
+    /// which discards a hand-resolved but uncommitted merge resolution. That is the invariant
+    /// AGENTS.md holds hardest ("Protect the user's worktree … never reset, discard"), so the op
+    /// must refuse up front and abort nothing.
+    #[tokio::test]
+    async fn git_merge_refuses_when_a_merge_is_already_in_progress() {
+        let (dir, c) = worktree_ctx();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry);
+
+        // `side` edits base.txt, and so does `main` — merging `side` conflicts. `other` branches
+        // off `main` before that edit and touches a different file, so it would merge cleanly.
+        raw_git(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("base.txt"), "side version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "side edit"]);
+        raw_git(&dir, &["checkout", "-q", "-b", "other", "main"]);
+        std::fs::write(dir.join("other.txt"), "other\n").unwrap();
+        raw_git(&dir, &["add", "other.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "other edit"]);
+        raw_git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("base.txt"), "main version\n").unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        raw_git(&dir, &["commit", "-q", "-m", "main edit"]);
+
+        // The USER starts a merge, hits the conflict, and hand-resolves it WITHOUT committing.
+        let (merged, _) = raw_git_try(&dir, &["merge", "side"]);
+        assert!(!merged, "the setup merge is supposed to conflict");
+        const RESOLVED: &str = "carefully hand-resolved content\n";
+        std::fs::write(dir.join("base.txt"), RESOLVED).unwrap();
+        raw_git(&dir, &["add", "base.txt"]);
+        let user_merge_head = std::fs::read_to_string(dir.join(".git/MERGE_HEAD")).unwrap();
+        let pre_head = raw_git(&dir, &["rev-parse", "HEAD"]);
+
+        // Now the op is asked to merge something else entirely.
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "other", "no_ff": true}),
+        )
+        .await;
+
+        // THE INVARIANT: the user's uncommitted resolution is still there.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            RESOLVED,
+            "the user's hand-resolved, uncommitted merge must survive; op said: {}",
+            r.content
+        );
+        // Their merge is untouched: same MERGE_HEAD, same HEAD, still in progress.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/MERGE_HEAD")).unwrap(),
+            user_merge_head,
+            "the in-flight merge must not be aborted"
+        );
+        assert_eq!(raw_git(&dir, &["rev-parse", "HEAD"]), pre_head);
+
+        // And the refusal is a recoverable error that says why — not a success, and not a claim
+        // that the merge of `other` conflicted (it never started).
+        assert!(r.is_error, "refusal is a recoverable error: {}", r.content);
+        assert!(
+            r.content.contains("already in progress"),
+            "the error explains a merge is in flight: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("conflicted"),
+            "it must not claim the merge of `other` conflicted: {}",
+            r.content
+        );
+
+        // Recoverable: once the user concludes their own merge, the same call succeeds.
+        raw_git(&dir, &["commit", "-q", "--no-edit"]);
+        let r = call_op(
+            &registry,
+            &c,
+            "git_merge",
+            json!({"branch": "other", "no_ff": true}),
+        )
+        .await;
+        assert!(!r.is_error, "the retried merge succeeds: {}", r.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            RESOLVED,
+            "and the resolution is still the committed content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// C-238: `git_branch` deletes with the SAFE delete (`-d` — git itself refuses unmerged work
     /// and the checked-out branch), and rejects option/path-shaped names like `git_checkout`
     /// does (C-85).
