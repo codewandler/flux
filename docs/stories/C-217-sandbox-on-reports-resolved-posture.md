@@ -56,7 +56,14 @@ honest `off`.
   `aed01f7e`, `apply_sandbox_env` has printed a styled one-per-process stderr line —
   `warning: OS sandbox requested but unavailable (<reason>): shell/plugin processes run WITHOUT
   OS-level confinement this run. …`. The premise was verified against `sandbox.rs` only, so the
-  `format!` one layer up was missed. Verified by running the merge-base binary directly.
+  `format!` one layer up was missed. Verified by planting this story's final test file on the merge
+  base (`cedef3f4`) and running it there: 4 of 6 tests fail, and **every one fails on wording** —
+  `discloses_unconfined` looks for the tokens `UNCONFINED` and `sandbox:`, neither of which the
+  merge-base line contains. So the honest failing-first claim is *"the line did not name the resolved
+  posture, was not exposed at L2, and was untested"* — **not** "nothing was emitted". The two tests
+  that already pass on the merge base (`require_still_fails_closed_…` and
+  `no_disclosure_when_the_sandbox_is_off_or_confinement_is_inherited`) are regression pins by design:
+  they assert behaviour that must NOT move.
 
   What was genuinely missing, and is what this story actually shipped:
   1. **No test anywhere pinned it.** `aed01f7e` moved that line between modules with zero coverage;
