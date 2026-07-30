@@ -78,6 +78,34 @@ list holding only flux-system's three native impls, and it runs from `scripts/ch
 Verified to bite (a rogue `impl GuardedProcess` in `flux-web/src` reds it), and blanket impls are
 reported as `<generic>` rather than dropped.
 
+**The gate resolves renamed trait imports** (review follow-up). Its first cut matched only the final
+path segment's literal ident, so `use flux_system::port::GuardedProcess as Exec; impl Exec for Rogue {}`
+walked through clean — while the incumbent sibling gate already defended the identical evasion
+(`use std::process::Command as Exec` is caught, because that scanner carries `ProcessAliases`). The
+newer, security-relevant gate being the weaker of the two was not defensible, so `PortAliases` now
+mirrors that pattern: identity-seeded canonical names plus renamed imports, grouped renames, module
+renames, and rename *chains* resolved to a fixed point (hence order-insensitive). Hits carry the
+**canonical** trait name so an allowance cannot be dodged by renaming, with the written spelling
+reported in the diagnostic (`GuardedProcess implemented for Rogue (written as `Exec`)`). Locked in by
+`port_impl_scanner_resolves_renamed_trait_imports` and re-verified against the tree with the
+reviewer's exact snippet.
+
+Also locked in: `#[cfg(test)]` is the *only* configuration the gate excuses —
+`#[cfg(feature = "wasm")]` and `#[cfg(all(unix, feature = "remote"))]` backends ship to users and are
+reported (`port_impl_scanner_excuses_only_cfg_test_not_other_cfgs`).
+
+**Known, pre-existing scanner limits.** Macro-expanded impls and sources pulled in from outside `src/`
+via `#[path]` escape this gate — but they equally escape the incumbent `Command` gate, because both
+share `workspace_source_files`. Tree-wide AST-scanner limitation, not specific to the port; noted here
+so the next reader does not mistake it for a C-269 regression.
+
+**The port traits are unsealed and the gate is in-repo only** — both deliberate, now disclosed in
+`port.rs`'s module docs. Any downstream crate can implement the three traits; that is the epic's whole
+point, and it is not an escalation, since such a crate could already call `Command::new` directly. The
+traits are a *contract*, not a permission. The gate's reach ends at `crates/*/src` + `plugins/*/src`:
+inside flux the one-guarded-path invariant is mechanically enforced, outside it a consumer takes
+responsibility for the guarantees itself.
+
 **Deliberately not done, and why.**
 
 - The **workspace-confined file port** (`read_file`, `write_file`, `read_file_bytes`, `is_dir`,

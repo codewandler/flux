@@ -31,6 +31,8 @@ case "${1:-}" in
     cargo test -p flux-codegate --lib -- tests::direct_io_scanner_resolves_known_io_glob_imports --exact
     cargo test -p flux-codegate --lib -- tests::direct_io_allowance_requires_a_real_reason_immediately_above_the_call --exact
     cargo test -p flux-codegate --lib -- tests::port_impl_scanner_finds_production_backends_and_ignores_test_doubles --exact
+    cargo test -p flux-codegate --lib -- tests::port_impl_scanner_resolves_renamed_trait_imports --exact
+    cargo test -p flux-codegate --lib -- tests::port_impl_scanner_excuses_only_cfg_test_not_other_cfgs --exact
     ;;
   *)
     printf 'usage: %s [--self-test]\n' "$0" >&2

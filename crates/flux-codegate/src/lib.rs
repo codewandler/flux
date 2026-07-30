@@ -1059,13 +1059,140 @@ const GUARDED_PORT_TRAITS: &[&str] = &["GuardedProcess", "GuardedHostFiles", "Gu
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GuardedPortImpl {
     pub line: usize,
-    /// The port trait's final path segment (`GuardedProcess`).
+    /// The **canonical** port trait name (`GuardedProcess`), whatever local spelling reached it.
+    /// Allowances match on this, so a rename cannot mint a fresh unreviewed identity.
     pub port: String,
     /// The implementing type's final path segment (`System`), or `<generic>` for a blanket impl.
     pub backend: String,
+    /// The local name actually written, when it differs from [`Self::port`] — i.e. the impl came
+    /// through a renamed import. Diagnostics only; it makes an aliased violation readable.
+    pub spelled_as: Option<String>,
 }
 
-struct PortImplVisitor {
+/// The canonical port trait a path names, matched on its **final segment**: reached as
+/// `GuardedProcess`, `port::GuardedProcess`, `flux_system::port::GuardedProcess`, or through a glob
+/// import, it is the same trait, and a gate that demanded the full path would miss the short spellings
+/// that are actually idiomatic. Over-reporting an unrelated same-named trait is the safe direction for
+/// a security gate — that costs a reviewed allowance, whereas under-reporting costs the invariant.
+fn direct_port_trait(segments: &[String]) -> Option<&'static str> {
+    let last = segments.last()?;
+    GUARDED_PORT_TRAITS
+        .iter()
+        .find(|port| *port == last)
+        .copied()
+}
+
+/// Local names that reach a guarded-IO port trait, so a renamed import cannot hide a backend.
+///
+/// This mirrors [`ProcessAliases`], which already resolves `use std::process::Command as Exec` for
+/// `no_raw_process_command_outside_system` — without the same treatment here the newer gate would be
+/// weaker than its sibling against the identical evasion.
+#[derive(Default)]
+struct PortAliases {
+    /// Local trait name → canonical port trait. Seeded with the identity mapping for every port
+    /// trait, so unaliased spellings resolve through the same table as renamed ones.
+    traits: HashMap<String, &'static str>,
+    /// `use <path> as <local>` pairs whose target was not itself a port trait, resolved to a fixed
+    /// point once the whole file is collected — so a rename *chain*
+    /// (`use …GuardedProcess as A; use A as B;`) still lands on the canonical name, and so a
+    /// `use` that appears textually before the one it depends on is not order-sensitive.
+    renames: Vec<(Vec<String>, String)>,
+}
+
+impl PortAliases {
+    fn new() -> Self {
+        let mut aliases = Self::default();
+        for port in GUARDED_PORT_TRAITS {
+            aliases.traits.insert((*port).to_string(), *port);
+        }
+        aliases
+    }
+
+    /// The canonical port trait an `impl … for` trait path resolves to.
+    fn resolve_path(&self, path: &syn::Path) -> Option<&'static str> {
+        let last = path.segments.last()?.ident.to_string();
+        self.traits.get(&last).copied()
+    }
+
+    fn add_use(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.add_use(&path.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                prefix.push(name.ident.to_string());
+                if let Some(port) = direct_port_trait(prefix) {
+                    self.traits.insert(name.ident.to_string(), port);
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Rename(rename) => {
+                prefix.push(rename.ident.to_string());
+                match direct_port_trait(prefix) {
+                    Some(port) => {
+                        self.traits.insert(rename.rename.to_string(), port);
+                    }
+                    // Not (yet) known to be a port trait — it may be a local re-export of one, so
+                    // defer rather than drop.
+                    None => self
+                        .renames
+                        .push((prefix.clone(), rename.rename.to_string())),
+                }
+                prefix.pop();
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.add_use(item, prefix);
+                }
+            }
+            // A glob re-exports the canonical names unchanged, which the identity seeding covers.
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    fn resolve_renames(&mut self) {
+        let renames = std::mem::take(&mut self.renames);
+        loop {
+            let mut changed = false;
+            for (segments, local) in &renames {
+                if self.traits.contains_key(local) {
+                    continue;
+                }
+                if let Some(port) = segments
+                    .last()
+                    .and_then(|last| self.traits.get(last).copied())
+                {
+                    self.traits.insert(local.clone(), port);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+struct PortAliasCollector<'a>(&'a mut PortAliases);
+
+impl<'ast> Visit<'ast> for PortAliasCollector<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if !has_cfg_test(&item.attrs) {
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if !has_cfg_test(&item.attrs) {
+            self.0.add_use(&item.tree, &mut Vec::new());
+        }
+    }
+}
+
+struct PortImplVisitor<'a> {
+    aliases: &'a PortAliases,
     hits: BTreeSet<GuardedPortImpl>,
 }
 
@@ -1084,7 +1211,7 @@ fn self_type_name(ty: &syn::Type) -> String {
     }
 }
 
-impl<'ast> Visit<'ast> for PortImplVisitor {
+impl<'ast> Visit<'ast> for PortImplVisitor<'_> {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if !has_cfg_test(&item.attrs) {
             syn::visit::visit_item_mod(self, item);
@@ -1096,15 +1223,18 @@ impl<'ast> Visit<'ast> for PortImplVisitor {
             return;
         }
         if let Some((path, _)) = &item.trait_ {
-            if let Some(segment) = path.segments.last() {
-                let port = segment.ident.to_string();
-                if GUARDED_PORT_TRAITS.contains(&port.as_str()) {
-                    self.hits.insert(GuardedPortImpl {
-                        line: start_line(item.impl_token.span),
-                        port,
-                        backend: self_type_name(&item.self_ty),
-                    });
-                }
+            if let Some(port) = self.aliases.resolve_path(path) {
+                let written = path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                self.hits.insert(GuardedPortImpl {
+                    line: start_line(item.impl_token.span),
+                    port: port.to_string(),
+                    backend: self_type_name(&item.self_ty),
+                    spelled_as: (written != port).then_some(written),
+                });
             }
         }
         syn::visit::visit_item_impl(self, item);
@@ -1112,9 +1242,17 @@ impl<'ast> Visit<'ast> for PortImplVisitor {
 }
 
 /// Every production implementation of a guarded-IO port trait in `src`, `#[cfg(test)]` ones excluded.
+///
+/// Renamed imports are resolved back to the canonical trait, so `use …GuardedProcess as Exec;
+/// impl Exec for Rogue {}` reports as `GuardedProcess`. Only `#[cfg(test)]` is skipped — a
+/// `#[cfg(feature = "…")]` impl is production code and is reported.
 pub fn guarded_port_impls(src: &str) -> syn::Result<Vec<GuardedPortImpl>> {
     let file = syn::parse_file(src)?;
+    let mut aliases = PortAliases::new();
+    PortAliasCollector(&mut aliases).visit_file(&file);
+    aliases.resolve_renames();
     let mut visitor = PortImplVisitor {
+        aliases: &aliases,
         hits: BTreeSet::new(),
     };
     visitor.visit_file(&file);
@@ -1808,6 +1946,105 @@ impl GuardedEnv for AnotherDouble {}
         let hits = guarded_port_impls(blanket).unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].backend, "<generic>");
+        assert_eq!(hits[0].spelled_as, None);
+    }
+
+    /// A renamed import must not launder a backend past the gate. This is the exact evasion
+    /// [`ProcessAliases`] already defends `no_raw_process_command_outside_system` against
+    /// (`use std::process::Command as Exec`), so the port gate has to match its sibling — otherwise
+    /// the newer, security-relevant gate is the weaker of the two.
+    #[test]
+    fn port_impl_scanner_resolves_renamed_trait_imports() {
+        // The shape the reviewer used to walk straight through the first cut of this gate.
+        let renamed = r#"
+use flux_system::port::GuardedProcess as Exec;
+
+impl Exec for Rogue {}
+"#;
+        let hits = guarded_port_impls(renamed).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a renamed port trait must still be seen: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].port, "GuardedProcess",
+            "the hit must carry the CANONICAL name so an allowance cannot be dodged by renaming"
+        );
+        assert_eq!(hits[0].backend, "Rogue");
+        assert_eq!(
+            hits[0].spelled_as.as_deref(),
+            Some("Exec"),
+            "the local spelling belongs in the diagnostic"
+        );
+
+        // A grouped rename, a module rename, and a rename *chain* — the chain also proves resolution
+        // is order-insensitive, since `Hop` is defined by a later `use` than the one consuming it.
+        let harder = r#"
+use flux_system::port::{GuardedEnv as Env, GuardedHostFiles};
+use flux_system::port as p;
+use Hop as Chained;
+use flux_system::port::GuardedProcess as Hop;
+
+impl Env for A {}
+impl GuardedHostFiles for B {}
+impl p::GuardedEnv for C {}
+impl Chained for D {}
+"#;
+        let hits = guarded_port_impls(harder).unwrap();
+        let mut resolved: Vec<(&str, &str)> = hits
+            .iter()
+            .map(|hit| (hit.port.as_str(), hit.backend.as_str()))
+            .collect();
+        resolved.sort_unstable();
+        assert_eq!(
+            resolved,
+            vec![
+                ("GuardedEnv", "A"),
+                ("GuardedEnv", "C"),
+                ("GuardedHostFiles", "B"),
+                ("GuardedProcess", "D"),
+            ],
+            "every spelling must resolve to its canonical port: {hits:?}"
+        );
+
+        // A rename that has nothing to do with the ports must not be dragged in.
+        let unrelated = r#"
+use std::fmt::Display as Show;
+
+impl Show for Harmless {}
+"#;
+        assert!(guarded_port_impls(unrelated).unwrap().is_empty());
+    }
+
+    /// `#[cfg(test)]` is the *only* configuration this gate excuses. A `#[cfg(feature = "…")]` backend
+    /// ships to users, so it is production code and must be reported — including behind an alias.
+    #[test]
+    fn port_impl_scanner_excuses_only_cfg_test_not_other_cfgs() {
+        let src = r#"
+use flux_system::port::GuardedProcess as Exec;
+
+#[cfg(feature = "wasm")]
+impl GuardedProcess for WasmSubstrate {}
+
+#[cfg(all(unix, feature = "remote"))]
+impl Exec for RemoteSubstrate {}
+
+#[cfg(test)]
+impl Exec for Double {}
+"#;
+        let hits = guarded_port_impls(src).unwrap();
+        let mut backends: Vec<&str> = hits.iter().map(|hit| hit.backend.as_str()).collect();
+        backends.sort_unstable();
+        assert_eq!(
+            backends,
+            vec!["RemoteSubstrate", "WasmSubstrate"],
+            "feature-gated backends ship and must be gated; only #[cfg(test)] is excused: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.port == "GuardedProcess"),
+            "{hits:?}"
+        );
     }
 
     /// Architecture guard (C-269): the guarded-IO port made "being a `System`" substitutable, so the
@@ -1867,8 +2104,12 @@ impl GuardedEnv for AnotherDouble {}
                         ));
                     }
                 } else {
+                    let via = match &hit.spelled_as {
+                        Some(alias) => format!(" (written as `{alias}`)"),
+                        None => String::new(),
+                    };
                     violations.push(format!(
-                        "{rel}:{}: unreviewed guarded-IO backend — {} implemented for {}",
+                        "{rel}:{}: unreviewed guarded-IO backend — {} implemented for {}{via}",
                         hit.line, hit.port, hit.backend
                     ));
                 }

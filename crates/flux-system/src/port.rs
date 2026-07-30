@@ -38,6 +38,28 @@
 //! C-269's story notes. Its consumers all still hold a concrete `System`, and a trait with no call
 //! sites would be indirection without a seam.
 //!
+//! ## These traits are unsealed, and the gate on them stops at this repo
+//!
+//! Both facts are deliberate, and stated here because neither is obvious from the signatures.
+//!
+//! **Unsealed.** Any crate depending on published `codewandler-flux-system` can implement
+//! `GuardedProcess`, `GuardedHostFiles` or `GuardedEnv`. That is the point — an out-of-repo Wasm
+//! embedder serving these ports is the whole reason they exist. It is also not an escalation: a
+//! downstream crate that wanted to run an unguarded process could always just call `Command::new`
+//! itself. What these traits are is a *contract*, not a permission — implementing one grants no
+//! ability, it only claims to uphold the guarantees documented on each method.
+//!
+//! **The gate is in-repo only.** `flux-codegate`'s `no_unreviewed_guarded_port_backend_outside_system`
+//! enumerates every production `impl` of these traits — resolving renamed imports, and excusing only
+//! `#[cfg(test)]` — so a second backend cannot appear inside flux without a reviewed allowance. Its
+//! reach ends at this repo's two workspaces: it walks `crates/*/src` and `plugins/*/src` and nothing
+//! else. It says nothing about downstream implementors, and (like every AST scanner in that file,
+//! including the older `Command` gate it mirrors) it does not see macro-generated impls or sources
+//! pulled in from outside `src/` via `#[path]`.
+//!
+//! So: inside flux, "one guarded path starts every OS process" is mechanically enforced. Outside
+//! flux, a consumer that implements these traits is taking responsibility for the guarantees itself.
+//!
 //! ## Fail-closed defaults
 //!
 //! Optional port operations default to a denial, never to a weaker equivalent. Bringing a substrate
