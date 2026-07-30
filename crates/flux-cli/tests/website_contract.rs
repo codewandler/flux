@@ -588,9 +588,12 @@ fn public_config_examples_deserialize_and_have_effect() {
     }
 }
 
+/// Covers `website/blog` as well as `website/docs`: a blog post is published Flux source on the same
+/// domain, and a tutorial whose example does not parse is worse than no tutorial. Adding the blog to
+/// the same scan is what stops it becoming a second, unchecked corpus.
 #[test]
 fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
-    let docs_root = repo_path("website/docs");
+    let roots = ["website/docs", "website/blog"];
     let declarations = [
         "permissions",
         "agent_loop ",
@@ -603,7 +606,11 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
         "trigger ",
     ];
     let mut checked = 0;
-    for path in markdown_files(&docs_root) {
+    let paths: Vec<_> = roots
+        .iter()
+        .flat_map(|root| markdown_files(&repo_path(root)))
+        .collect();
+    for path in paths {
         let markdown = fs::read_to_string(&path).expect("read website doc");
         for (index, block) in fenced_blocks(&markdown, "flux").into_iter().enumerate() {
             assert!(

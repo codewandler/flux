@@ -51,7 +51,27 @@ const config = {
           routeBasePath: 'docs',
           editUrl: 'https://github.com/codewandler/flux/tree/main/website/',
         },
-        blog: false,
+        blog: {
+          path: 'blog',
+          routeBasePath: 'blog',
+          blogTitle: 'flux blog',
+          blogDescription:
+            'Tutorials and release walkthroughs for flux — the deterministic agent platform.',
+          blogSidebarTitle: 'Recent posts',
+          blogSidebarCount: 10,
+          showReadingTime: true,
+          // A post is a dated claim about how flux behaved at a point in time. Truncating the feed
+          // to summaries keeps the index readable; `<!-- truncate -->` marks the cut in each post.
+          truncateMarker: /<!--\s*truncate\s*-->/,
+          onUntruncatedBlogPosts: 'warn',
+          feedOptions: {
+            type: ['rss', 'atom'],
+            title: 'flux blog',
+            description:
+              'Tutorials and release walkthroughs for flux — the deterministic agent platform.',
+            copyright: `Copyright © ${new Date().getFullYear()} codewandler`,
+          },
+        },
         theme: {
           customCss: require.resolve('./src/css/custom.css'),
         },
@@ -65,7 +85,7 @@ const config = {
       {
         // Offline, index-based search — no external service (Algolia) needed.
         hashed: true,
-        indexBlog: false,
+        indexBlog: true,
         docsRouteBasePath: 'docs',
         highlightSearchTermsOnTargetPage: true,
       },
@@ -115,6 +135,11 @@ const config = {
           position: 'left',
         },
         {
+          to: '/blog',
+          label: 'Blog',
+          position: 'left',
+        },
+        {
           href: 'https://github.com/codewandler/flux',
           label: 'GitHub',
           position: 'right',
@@ -132,6 +157,7 @@ const config = {
             { label: 'SDK', to: '/docs/sdk/flow-client' },
             { label: 'Improvement', to: '/docs/agent/improvement' },
             { label: "What's new", to: '/docs/whats-new' },
+            { label: 'Blog', to: '/blog' },
           ],
         },
         {
