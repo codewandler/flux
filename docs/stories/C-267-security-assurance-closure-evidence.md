@@ -2,7 +2,7 @@
 id: C-267
 title: "Record C-186's closure evidence against the 2026-07-29 baseline"
 pillar: Core
-status: in-progress
+status: done
 priority: 2
 epic: security-assurance
 design: docs/designs/security-assurance.md

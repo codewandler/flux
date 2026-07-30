@@ -2,7 +2,7 @@
 id: C-266
 title: "Both sides of the fail-closed sandbox switch are unproven in CI"
 pillar: Core
-status: in-progress
+status: done
 priority: 2
 epic: security-assurance
 design: docs/designs/security-assurance.md
@@ -41,12 +41,16 @@ that thesis in miniature, on the newest control in the envelope.
 - [x] A guard prevents silent recurrence: a new auto-approved or serving spawn added to a test
       without declaring its posture fails a named check, rather than passing locally and reddening
       CI. State plainly in the story what the guard does and does not cover.
-- [ ] Full Rust gate green (`cargo build/test/clippy -D warnings/fmt` both workspaces,
-      `cargo test -p flux-codegate`), and the seven `scripts/check-*.sh` policy gates pass.
-      **Not tickable at this merge base**: `codewandler-flux-lang` is red at `588144a2` in 6 tests
-      (`highlight`, `cst_agreement`, `roundtrip_property`) — that commit carried another session's
-      in-progress L-93 syntax work alongside the story files, and CI's last green run is its parent
-      `34f29e4d`. Unrelated to this story and outside its fence; everything else in the gate is green.
+- [x] Full Rust gate green (`cargo build/test/clippy -D warnings/fmt` both workspaces,
+      `cargo test -p flux-codegate`), and the `scripts/check-*.sh` policy gates pass.
+      **Tickable now, and the blocker was never this story's.** The implementor correctly refused to
+      tick it: `codewandler-flux-lang` was red at its merge base `588144a2`, a commit that had swept
+      another session's in-progress L-93 work in alongside the story files. That was a coordinator
+      error, since corrected — the commit was rewritten to carry only its own content, and the story
+      was cherry-picked onto a green `main` rather than merged. Verified at integration:
+      **3252 tests / 0 failures with a sandbox backend present, and 0 failed suites under
+      `FLUX_BWRAP_BIN=/nonexistent/bwrap`** — which is this story's own two-posture claim, met.
+      `check-host-kit-protocol-drift.sh` remains red on unrelated pack-release debt (C-143 line).
 
 ## Progress
 

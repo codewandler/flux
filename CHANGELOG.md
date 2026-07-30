@@ -6,6 +6,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Both sides of the fail-closed sandbox switch are now proven in CI (C-266).** C-262's fail-closed
+  default cost the 0.38.0 cut four successive fix commits, each found only by pushing and reading a red
+  run, because every developer machine has `bwrap` and no runner does. The `check` job now sets
+  `FLUX_BWRAP_BIN=/nonexistent/bwrap` job-wide, so all seven of its steps run the no-backend posture **by
+  construction** rather than by the accident of a runner image — including `smoke-live.sh --shapes`,
+  whose serving-surface step a `cargo test` run does not reach. A new `sandbox-backend` job installs
+  bubblewrap and runs the suite plus the shape guard at `FLUX_SANDBOX=require`.
+  The story's stated premise turned out to be **false**, and the implementor falsified it rather than
+  inheriting it: `sandbox_posture.rs` does *not* require the absence of a backend — every spawn there
+  already pins both discovery variables at nonexistent paths, so it is hermetic and passes on a host
+  that has `bwrap`. Nothing had to be weakened and no test relocated. The real trap was the inverse:
+  `apt-get install bubblewrap` does not mean bwrap *works* — a kernel refusing unprivileged user
+  namespaces resolves `Unsupported` and the new lane would have become a silently-green copy of `check`.
+  So the lane asserts its own premise via `flux doctor --json` and proves confinement behaviourally by
+  the child's pid inside `--unshare-pid`, not by exit status. Recurrence is guarded by
+  `every_unattended_test_spawn_declares_its_sandbox_posture`, with its non-coverage stated plainly.
+
+- **The security-assurance epic's closure is now recorded rather than re-derivable (C-267).** Every
+  2026-07-29 desk-review finding and the classification-trust concern is mapped to a commit, test name
+  and `file:line` verified against the shipped tree — landed as a dated artifact under `reviews/` with a
+  per-axis delta against that baseline, so the next reviewer verifies instead of starting over. Two
+  results worth naming: **no `done`-but-unreachable child was found** — looked for deliberately, since
+  C-233 and C-234 are prior instances of exactly that pattern — and **envelope-integrity finding 4 is
+  reported OPEN**, now filed as C-275. It had survived by never being filed rather than by decision.
+  C-186 is consequently `in-progress`, not `done`, and says why.
+
 ### Added
 
 - **`fleet.isolate` — a per-item checkout the caller's root never pays for (C-241).** A coordinator can

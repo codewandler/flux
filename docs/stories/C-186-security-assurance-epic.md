@@ -56,6 +56,16 @@ closure instead of re-deriving it.
       resolved posture); step 2, the default flip itself, stays deferred behind it by design.
 
 ## Progress
+
+- 2026-07-30 — **envelope-integrity finding 4 is now filed as
+  [C-275](C-275-file-stat-discards-a-whole-read.md)**, closing the one gap C-267 could not close itself.
+  It had survived by never being filed rather than by decision: C-192/193/194 map to envelope findings
+  1–3, and the fourth fell off the edge with no story and no "won't do". Verified in the tree before
+  filing (`crates/flux-tools/src/extra.rs:96-107` reads the whole file into `.map(|_| …)` and discards
+  it; the "note below" its comment promises is absent from both the JSON and the view).
+  This epic therefore now waits on exactly two things: **C-275** and **C-205** (`blocked` on the
+  `ratatui` 0.29 hold, for an *unsound*-class advisory flux cannot reach). Both are recorded rather
+  than implied, so the epic can be closed by evidence rather than by fatigue.
 - 2026-07-29 — epic opened from the review. Design:
   [security-assurance.md](../designs/security-assurance.md). Source review:
   [`reviews/2026-07-29-security-posture-desk-review.md`](../../reviews/2026-07-29-security-posture-desk-review.md),
