@@ -677,8 +677,10 @@ pub enum Node {
     },
 
     /// Pure type coercion. Converts the string result of a `jq` or `fmt` node into a typed
-    /// value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`.
-    /// No IO, no approval gate. Example: `parse(jq(".price", $raw), as: "f64")`.
+    /// value. `as_type` is one of `"f64"`, `"i64"`, `"bool"`, `"json"`, `"string"`, `"form"`.
+    /// `"json"` and `"form"` also run the other way, serializing a record as canonical JSON or as
+    /// `application/x-www-form-urlencoded` text. No IO, no approval gate.
+    /// Example: `parse(jq(".price", $raw), as: "f64")`.
     Parse {
         value: Box<Node>,
         #[serde(rename = "as")]

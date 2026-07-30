@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **Authored Flux can produce a form-encoded request body (L-101).** `parse($record, as: "form")`
+  serializes a record as `application/x-www-form-urlencoded`, the sibling of `as: "json"` for the other
+  body format real APIs ask for. Nothing in the language could produce one before: `http.request` reads
+  `body` with `Value::as_str` and forwards the bytes verbatim, no node or `expr` function escapes
+  anything, and the only record-to-text path was JSON — so every OAuth2 token endpoint (form-encoded
+  **by specification**, RFC 6749 §4.3.2) and every form-only vendor API (Stripe, Twilio, Mailgun, PayPal
+  classic) was unreachable. The workaround, assembling `k={v}&k2={v2}` with `fmt`, interpolates values
+  *unencoded*: a value carrying `&` or `=` corrupts the body and can inject a field.
+  Four behaviors are wire decisions rather than conveniences, and each is tested: fields are emitted in
+  **sorted key order** so one record encodes to one body; a **`null` field is omitted**, which is how an
+  unsupplied optional parameter means "do not send this field" instead of sending the literal text
+  `null`; a **nested field is refused** rather than flattened, because the format has no agreed
+  convention (Stripe writes `metadata[key]`, PHP and Rails write `a[b]` and `a[b][]`) and a key a vendor
+  does not recognize is accepted and *ignored*, answering `200`; and escaping follows the WHATWG
+  urlencoded serializer, so a space is `+` rather than RFC 3986's `%20`.
+  Additive: `as_type` gains a value, no node kind and no syntax changed, and the analyzer's rejection of
+  an unknown target still holds.
+
 ## [0.41.0] - 2026-07-31
 
 ### Added

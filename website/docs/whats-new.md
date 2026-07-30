@@ -12,6 +12,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **Your flows can now call APIs that want a form-encoded body — including OAuth2 token endpoints.**
+  Writing `parse($fields, as: "form")` turns a record into the `key=value&key=value` body those APIs
+  require, with every value escaped properly. Previously the only body a flow could build was JSON, and
+  hand-assembling a form body with text formatting silently corrupted any value containing `&` or `=`.
+  A field you leave empty is simply not sent, and a nested field is refused with an explanation rather
+  than guessed at — because every service spells nested form fields differently, and a wrong guess is
+  accepted and quietly ignored.
+
 ## [0.41.0] - 2026-07-31
 
 ### New
