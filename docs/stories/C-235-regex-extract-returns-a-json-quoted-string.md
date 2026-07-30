@@ -2,7 +2,7 @@
 id: C-235
 title: "`regex_extract` returns a JSON-quoted string, so its output cannot be fed to another op"
 pillar: Core
-status: backlog
+status: done
 areas: [flux-tools]
 note: "SURFACED BY the A-131 fleet smoke test: the sweep journey re-derived `runner` off the board correctly, then `fleet.status` failed with `invalid url: relative URL without a base` because the extracted value carried literal quote characters"
 ---

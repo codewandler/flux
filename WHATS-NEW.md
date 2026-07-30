@@ -15,6 +15,42 @@
 
 ## [Unreleased]
 
+### New
+
+- Flows can now create a branch, merge it, and undo a merge. Together with the existing stage, commit
+  and diff steps, a flow can integrate work end to end: branch, merge with a real merge commit, and —
+  if something turns out to be wrong — undo that merge. Undoing always *adds* a commit that reverses
+  the change; it never rewrites or discards history, so the record of what happened stays intact.
+
+- Work boards can now be read as structured data, not just as text. A flow can loop over board items
+  and branch on their state, filter to the items that are ready *and* not blocked by unfinished
+  dependencies in a single call, and read back the notes it left on an item. This is what lets a flow
+  coordinate work across a board instead of only reporting on it.
+
+### Fixed
+
+- Pulling a value out of text and feeding it straight into another step now works. Extracting a
+  single match (or taking the first, last, or first-non-empty value) used to hand back the text
+  wrapped in quote characters, so the next step received something like `"1.2.3"` instead of `1.2.3`
+  and typically failed on it.
+
+### Action needed
+
+- **If a flow of yours calls `git_revert`, rename that call to `git_reset`.** The step that discarded
+  your changes and returned the checkout to a snapshot was named `git_revert`, which described the
+  wrong thing — it resets. It is now called `git_reset`, and the name `git_revert` belongs to a new
+  step that undoes a commit by adding a reversing commit instead. There is no alias, so the old name
+  will not be recognised. If you miss one it fails safely rather than destructively: the new
+  `git_revert` refuses a snapshot argument instead of resetting anything.
+
+- If you have a flow that worked around the quoting above — for example by stripping quote characters
+  from an extracted value before using it — remove that workaround, or it will now strip real
+  characters. Flows that simply passed the value along need no change and start working.
+
+- Forking a session that can't be forked no longer leaves a stray empty session behind. Previously
+  the new session was created before flux checked whether the original could be forked at all, so a
+  refused fork still cluttered your session list. It now checks first and creates nothing on refusal.
+
 ## [0.36.0] - 2026-07-29
 
 ### New

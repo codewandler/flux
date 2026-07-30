@@ -1,4 +1,4 @@
-//! The write-capable [`WorkBoard`] port and its seven generated operations (A-113, A-130).
+//! The write-capable [`WorkBoard`] port and its nine generated operations (A-113, A-130, C-236).
 //!
 //! This is the sibling of [`super::live::LiveDatasource`], and deliberately the same shape: a
 //! backend declares a schema plus its external authority, the contract is snapshotted and validated
@@ -6,7 +6,7 @@
 //! subjects, a per-domain [`ToolGroup`] and an ambient signal, installed atomically on a clone.
 //! Everything a reader already knows about `try_register_live_datasource` transfers.
 //!
-//! What is new is that five of the seven operations **write**. That changes two things and nothing
+//! What is new is that five of the nine operations **write**. That changes two things and nothing
 //! else:
 //!
 //! * **Permission subjects stay concrete.** `board.transition` on `PROJ-42` reports
@@ -31,7 +31,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flux_core::{Error, Result};
-use flux_datasource::board::{BoardSchema, Item, ItemDraft, State, EDGE_DIAGRAM};
+use flux_datasource::board::{
+    BoardSchema, DependencyMatch, Item, ItemDraft, State, DEPENDS_ON_FILTER, EDGE_DIAGRAM,
+};
 use flux_datasource::live::{FilterKey, FilterType, Filters, Page, PageRequest, Reference};
 use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
 use flux_runtime::{
@@ -67,6 +69,31 @@ const UNRESOLVED_ID: &str = "<unresolved>";
 /// The `state` filter the host always declares on `list`. Reserved: a backend may not redeclare it.
 const STATE_FILTER: &str = "state";
 
+/// The reserved `depends_on` filter the host declares on `query` (C-236).
+///
+/// Query-only on purpose: `list` is the human, prose surface and keeps its original filter
+/// vocabulary; the structured surface is where a coordinator expresses "ready and unblocked". The
+/// semantics every backend applies live in [`DependencyMatch`] — like [`STATE_FILTER`], a backend
+/// may not redeclare the name.
+fn depends_on_filter() -> FilterKey {
+    FilterKey {
+        name: DEPENDS_ON_FILTER.to_string(),
+        ty: FilterType::Enum(
+            DependencyMatch::ALL
+                .iter()
+                .map(|m| m.as_str().to_string())
+                .collect(),
+        ),
+        required: false,
+        description: Some(
+            "Dependency gating: `satisfied` keeps items whose every dependency is `done` (no \
+             dependencies is trivially satisfied); `unsatisfied` keeps items still waiting on at \
+             least one. An absent dependency never resolves."
+                .to_string(),
+        ),
+    }
+}
+
 /// A write-capable work board: a typed item state machine behind a swappable implementation.
 ///
 /// Jira is one implementation, a markdown file store is another; the coordinator agent only ever
@@ -76,12 +103,15 @@ const STATE_FILTER: &str = "state";
 /// URL or connection client must still pass the guards its [`LiveAccess`] declaration names.
 ///
 /// **Every implementation must pass the shared contract suite verbatim**
-/// (`crates/flux-capabilities/tests/board_contract/mod.rs`). In particular the four properties the
+/// (`crates/flux-capabilities/tests/board_contract/mod.rs`). In particular the properties the
 /// generated operations cannot enforce for you:
 ///
 /// * an illegal edge errors and performs **no write** — the item is byte-identical afterwards;
 /// * the `Failed → Ready` retry edge increments [`Item::attempts`], and no other edge touches it;
 /// * `claim` is idempotent for the same assignee and conflicts for a different one;
+/// * the reserved `depends_on` filter treats an item as blocked until **every** dependency is
+///   `done` — an absent dependency never resolves (C-236);
+/// * `comments` reads back what `comment` wrote, oldest first (C-236);
 /// * a recorded dispatch is **durable** — `runner` and `task_id` survive a fresh read.
 #[async_trait]
 pub trait WorkBoard: Send + Sync {
@@ -141,6 +171,18 @@ pub trait WorkBoard: Send + Sync {
 
     /// Append a note to an item. An absent id is an error.
     async fn comment(&self, ctx: &ToolContext, id: &str, text: &str) -> Result<()>;
+
+    /// Read back the notes left on one item, oldest first. An absent id is an error — the same
+    /// one [`comment`](WorkBoard::comment) reports, so the read path and the write path agree
+    /// about which items exist.
+    ///
+    /// Notes sit *beside* the [`Item`], not inside it: they are not part of the item's identity
+    /// (a refused transition still leaves the item byte-identical, comments and all), and reading
+    /// them changes nothing. This is the read half of the sweep's evidence trail — what a worker
+    /// recorded with `comment`, a coordinator can see (C-236). For a document-backed board the
+    /// mapping is explicit: [`super::MarkdownBoard`] renders a comment as a markdown bullet in the
+    /// item's document, so read-back reports every top-level bullet of that document in order.
+    async fn comments(&self, ctx: &ToolContext, id: &str) -> Result<Vec<String>>;
 }
 
 /// Evidence-gated catalog metadata returned with one registered board.
@@ -150,14 +192,18 @@ pub trait WorkBoard: Send + Sync {
 /// [`ambient_signal`](Self::ambient_signal) whenever the configured backend is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkBoardSurface {
-    /// Per-domain group containing exactly the seven generated operations.
+    /// Per-domain group containing exactly the nine generated operations.
     pub group: ToolGroup,
     /// Ambient project signal emitted because this board is configured.
     pub ambient_signal: String,
 }
 
-/// The seven operation suffixes a board generates, in catalog order.
-const OPERATIONS: [&str; 7] = [
+/// The nine operation suffixes a board generates, in catalog order.
+///
+/// The first seven are A-113/A-130's. `query` (C-236) is the machine-readable sibling of `list` —
+/// typed rows under an `output_schema` instead of prose — and `comments` the read half of
+/// `comment`.
+const OPERATIONS: [&str; 9] = [
     "list",
     "get",
     "create",
@@ -165,10 +211,12 @@ const OPERATIONS: [&str; 7] = [
     "claim",
     "comment",
     "record_dispatch",
+    "query",
+    "comments",
 ];
 
 /// Build the uniform `<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment`
-/// operations for one board backend.
+/// / `.record_dispatch` / `.query` / `.comments` operations for one board backend.
 ///
 /// The backend contract is snapshotted and validated once, so the filters, page bounds and external
 /// authority advertised at registration are the same vocabulary used to route calls — a backend
@@ -178,9 +226,13 @@ pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec
     let access = backend.access();
     validate_board_contract(domain, &schema, &access)?;
 
+    let filters = declared_filters(&schema);
+    let mut query_filters = filters.clone();
+    query_filters.push(depends_on_filter());
     let projection = Arc::new(BoardProjection {
         domain: domain.to_string(),
-        filters: declared_filters(&schema),
+        filters,
+        query_filters,
         schema,
         access,
         backend,
@@ -197,9 +249,9 @@ pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec
         .collect())
 }
 
-/// Atomically install exactly the seven operations for one board domain.
+/// Atomically install exactly the nine operations for one board domain.
 ///
-/// All seven share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on a
+/// All nine share an auditable source label. [`ToolRegistry::try_register_all_from`] assembles on a
 /// clone, so a collision or an invalid declaration leaves the caller's registry unchanged — there
 /// is no state in which a board is half-registered and three of its writes are reachable.
 pub fn try_register_work_board(
@@ -255,6 +307,9 @@ struct BoardProjection {
     schema: BoardSchema,
     /// The reserved `state` filter plus the backend's own, resolved once at registration.
     filters: Vec<FilterKey>,
+    /// [`filters`](Self::filters) plus the reserved `depends_on` filter — the set `query` accepts
+    /// (C-236). `list` never sees it: the human surface keeps its original vocabulary.
+    query_filters: Vec<FilterKey>,
     access: Vec<LiveAccess>,
     backend: Arc<dyn WorkBoard>,
 }
@@ -276,7 +331,7 @@ impl BoardProjection {
     /// The subject one invocation touches. Never `*`, never empty — see [`UNRESOLVED_ID`].
     fn subject(&self, kind: OpKind, params: &Value) -> String {
         match kind {
-            OpKind::List => format!("{}/{ENTITY}", self.domain),
+            OpKind::List | OpKind::Query => format!("{}/{ENTITY}", self.domain),
             OpKind::Create => format!("{}/{ENTITY}/{NEW_ID}", self.domain),
             _ => item_subject(
                 &self.domain,
@@ -304,9 +359,9 @@ impl BoardProjection {
 // Operations
 // ---------------------------------------------------------------------------
 
-/// Which of the seven an instance is. One `impl Tool` covers all of them because they differ only in
-/// their input contract and their one backend call — the subject, authority and spec derivation are
-/// shared, which is the whole point of generating them.
+/// Which of the nine an instance is. One `impl Tool` covers all of them because they differ only
+/// in their input contract and their one backend call — the subject, authority and spec derivation
+/// are shared, which is the whole point of generating them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpKind {
     List,
@@ -316,6 +371,8 @@ enum OpKind {
     Claim,
     Comment,
     RecordDispatch,
+    Query,
+    Comments,
 }
 
 impl OpKind {
@@ -328,6 +385,8 @@ impl OpKind {
             "claim" => Self::Claim,
             "comment" => Self::Comment,
             "record_dispatch" => Self::RecordDispatch,
+            "query" => Self::Query,
+            "comments" => Self::Comments,
             other => unreachable!("undeclared board operation `{other}`"),
         }
     }
@@ -335,7 +394,7 @@ impl OpKind {
     /// Whether this operation mutates the board. The five that do carry `Effect::Write`, a
     /// `datasource_write` requirement, and a non-`Low` risk tier.
     fn writes(&self) -> bool {
-        !matches!(self, Self::List | Self::Get)
+        !matches!(self, Self::List | Self::Get | Self::Query | Self::Comments)
     }
 }
 
@@ -442,6 +501,43 @@ impl Tool for BoardOp {
                 ToolResult::ok(render_full(
                     &backend.record_dispatch(ctx, id, runner, task_id).await?,
                 ))
+            }
+            OpKind::Query => {
+                let input: ListInput = parse(op, params)?;
+                let filters = normalize_filters(
+                    op,
+                    &format!("board `{}`", self.projection.domain),
+                    &self.projection.query_filters,
+                    input.filters,
+                )?;
+                let page = PageRequest {
+                    cursor: input.page,
+                    limit: normalize_limit(
+                        op,
+                        self.projection.schema.default_page,
+                        self.projection.schema.max_page,
+                        input.limit,
+                    )?,
+                };
+                // Typed rows, not prose: one page as a bare JSON array so `each $item in …` can
+                // bind the fields directly (the runtime's string-leaf re-parse rule reads the
+                // array back). Every row carries every field — absent optionals are `null`, so
+                // `$item.runner` never errors on an undispatched item. The cursor stays with
+                // `list`: paging prose is the human surface.
+                let rows: Vec<Value> = backend
+                    .list(ctx, &filters, page)
+                    .await?
+                    .rows
+                    .iter()
+                    .map(item_row)
+                    .collect();
+                ToolResult::ok(serde_json::to_string(&rows)?)
+            }
+            OpKind::Comments => {
+                let input: IdInput = parse(op, params)?;
+                let id = require(op, "id", &input.id)?;
+                let comments = backend.comments(ctx, id).await?;
+                ToolResult::ok(serde_json::to_string(&comments)?)
             }
         })
     }
@@ -644,6 +740,57 @@ fn render_full(item: &Item) -> String {
     output
 }
 
+/// One item as a typed `query` row (C-236).
+///
+/// Deliberately not [`Item`]'s own serde: that skips absent fields, and a missing key is a *loud
+/// error* under the runtime's strict `$item.field` access. A coordinator iterating a mixed board
+/// cannot have `$item.runner` blow up on the undispatched rows, so every row carries every field —
+/// `null` when absent. `evidence` stays out: the row is the reasoning surface (`id`, `state`,
+/// `runner`, `task_id`, `depends_on`, …), and a weak-reference list is what `get` renders for a
+/// human.
+fn item_row(item: &Item) -> Value {
+    json!({
+        "id": item.id,
+        "title": item.title,
+        "state": item.state.as_str(),
+        "assignee": item.assignee,
+        "runner": item.runner,
+        "task_id": item.task_id,
+        "depends_on": item.depends_on,
+        "repo": item.repo,
+        "attempts": item.attempts,
+    })
+}
+
+/// The `output_schema` of `query` — the machine-readable contract [`item_row`] produces.
+fn query_output_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "One page of typed board rows. Every row carries every field; absent optionals are null.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "title": {"type": "string"},
+                "state": {
+                    "type": "string",
+                    "enum": State::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                },
+                "assignee": {"type": ["string", "null"]},
+                "runner": {"type": ["string", "null"]},
+                "task_id": {"type": ["string", "null"]},
+                "depends_on": {"type": "array", "items": {"type": "string"}},
+                "repo": {"type": ["string", "null"]},
+                "attempts": {"type": "integer", "minimum": 0}
+            },
+            "required": [
+                "id", "title", "state", "assignee", "runner", "task_id", "depends_on", "repo",
+                "attempts"
+            ]
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Specs
 // ---------------------------------------------------------------------------
@@ -655,7 +802,7 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
     let (description, schema) = match kind {
         OpKind::List => (
             format!("List one page of items from the `{domain}` work board."),
-            list_schema(projection),
+            page_schema(projection, &projection.filters),
         ),
         OpKind::Get => (
             format!("Fetch one full item from the `{domain}` work board."),
@@ -741,9 +888,40 @@ fn spec_for(op: &str, projection: &BoardProjection) -> ToolSpec {
                 &["id", "runner", "task_id"],
             ),
         ),
+        OpKind::Query => (
+            format!(
+                "Query one page of `{domain}` items as typed JSON rows — the machine-readable \
+                 sibling of `{domain}.list`, for `each`/`match` rather than for reading. Every row \
+                 carries every field; absent optionals are `null`. The `depends_on` filter makes \
+                 \"ready and unblocked\" one call: `satisfied` keeps only items whose every \
+                 dependency is `done`."
+            ),
+            page_schema(projection, &projection.query_filters),
+        ),
+        OpKind::Comments => (
+            format!(
+                "Read back the notes left on one `{domain}` item, oldest first — the read half of \
+                 `{domain}.comment`."
+            ),
+            object(
+                json!({"id": {"type": "string", "description": "Stable item id"}}),
+                &["id"],
+            ),
+        ),
     };
 
     let spec = ToolSpec::read_only(name, description, schema);
+    // The two structured reads are the only board ops a Program consumes as data rather than as
+    // prose, so they are the only ones that can honestly advertise an `output_schema` (C-236).
+    let spec = match kind {
+        OpKind::Query => spec.with_output_schema(query_output_schema()),
+        OpKind::Comments => spec.with_output_schema(json!({
+            "type": "array",
+            "description": "The item's notes, oldest first.",
+            "items": {"type": "string"}
+        })),
+        _ => spec,
+    };
     let mut spec = if kind.writes() {
         // C-191's coherence invariants: a `Write` may keep neither the `Risk::Low` tier nor the
         // `Idempotent` claim. Two are genuinely safe to repeat under a stated condition, which is
@@ -790,10 +968,15 @@ fn object(properties: Value, required: &[&str]) -> Value {
     })
 }
 
-fn list_schema(projection: &BoardProjection) -> Value {
+/// The paging + filter input schema shared by `list` and `query`.
+///
+/// The two differ in exactly one thing — the filter vocabulary they accept (`query` additionally
+/// takes the reserved `depends_on`, C-236) — so the caller passes the set rather than the schema
+/// being derived twice.
+fn page_schema(projection: &BoardProjection, declared: &[FilterKey]) -> Value {
     let mut properties = Map::new();
     let mut required_filters = Vec::new();
-    for filter in &projection.filters {
+    for filter in declared {
         properties.insert(filter.name.clone(), filter_schema(filter));
         if filter.required {
             required_filters.push(Value::String(filter.name.clone()));
@@ -873,9 +1056,12 @@ pub fn validate_board_contract(
                 "work board `{domain}` has an invalid blank/whitespace filter name"
             )));
         }
-        if name == STATE_FILTER {
+        // Both reserved names belong to the host: `state` on every read, `depends_on` on `query`
+        // (C-236). A backend that redeclared either would be silently shadowed on one surface and
+        // authoritative on the other, so it is refused outright.
+        if name == STATE_FILTER || name == DEPENDS_ON_FILTER {
             return Err(Error::Other(format!(
-                "work board `{domain}` redeclares the reserved `{STATE_FILTER}` filter"
+                "work board `{domain}` redeclares the reserved `{name}` filter"
             )));
         }
         if !names.insert(name) {
@@ -942,6 +1128,23 @@ mod tests {
         assert!(error.contains("reserved `state` filter"), "{error}");
     }
 
+    /// C-236: `depends_on` is the host's too. It rides `query` only, but reserving it on the whole
+    /// contract is what keeps a backend from being authoritative on `list` and shadowed on `query`.
+    #[test]
+    fn a_backend_may_not_shadow_the_reserved_depends_on_filter() {
+        let mut declared = schema();
+        declared.filters.push(FilterKey {
+            name: DEPENDS_ON_FILTER.into(),
+            ty: FilterType::String,
+            required: false,
+            description: None,
+        });
+        let error = validate_board_contract("board", &declared, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved `depends_on` filter"), "{error}");
+    }
+
     #[test]
     fn page_bounds_and_domains_are_checked_once_at_registration() {
         let mut bad = schema();
@@ -992,6 +1195,7 @@ mod tests {
         let projection = BoardProjection {
             domain: "board".into(),
             filters: declared_filters(&schema()),
+            query_filters: declared_filters(&schema()),
             schema: schema(),
             access: Vec::new(),
             backend: Arc::new(crate::datasource::MemoryBoard::new()),

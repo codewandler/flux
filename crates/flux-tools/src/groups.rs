@@ -44,8 +44,11 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
                 "git_status",
                 "git_diff",
                 "git_log",
+                "git_merge",
+                "git_revert",
                 "git_push",
                 "git_checkout",
+                "git_branch",
                 "git_unstage",
                 "git_hunks",
                 "git_stage_hunks",
@@ -247,6 +250,10 @@ mod tests {
         // C-98/C-99: the context-local worktree transition ops are Git-group members too.
         assert!(git.tools.contains(&"git_worktree_enter".to_string()));
         assert!(git.tools.contains(&"git_worktree_leave".to_string()));
+        // C-238: the serial-integration verbs are Git-group members too.
+        assert!(git.tools.contains(&"git_branch".to_string()));
+        assert!(git.tools.contains(&"git_merge".to_string()));
+        assert!(git.tools.contains(&"git_revert".to_string()));
         assert_eq!(git.surface_when[0].signal.as_deref(), Some("git_repo"));
     }
 

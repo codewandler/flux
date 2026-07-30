@@ -3135,6 +3135,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-211 **failing-first**: the refusal above must cost nothing. `fork` used to mint the child
+    /// session *before* it knew the parent was forkable, so a refused fork left an empty orphan
+    /// session behind — an artifact that did not exist before the refusal path did. `prune_empty`
+    /// would eventually collect it, but "a failed operation leaves no trace" is cheaper to hold as
+    /// an invariant than to re-derive from a pruning rule every time someone reads this path.
+    #[tokio::test]
+    async fn fork_refuses_before_minting_the_child_session() {
+        let (dir, store, sid) = record_bind_session("no-orphan").await;
+
+        let client = Client::builder()
+            .model("mock")
+            .auto_approve(true)
+            .storage(Storage::dir(store))
+            .build(Box::new(NeverMock), &dir)
+            .unwrap();
+        let events = client.event_store();
+
+        // The same unforkable parent as the test above: a trailing `tool_use` nothing answers.
+        seed_raw_message(&events, &sid, flux_core::Message::user_text("and again"));
+        seed_raw_message(
+            &events,
+            &sid,
+            flux_core::Message::assistant(vec![ContentBlock::ToolUse {
+                id: "orphan-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }]),
+        );
+        // Generous limit: the fixture holds one session, and the bug adds a second.
+        let before = events.list(1_000).unwrap().len();
+
+        let session = client.open_session(&sid).unwrap();
+        if let Ok(f) = session.fork(0).await {
+            panic!(
+                "a fork of a mid-tool-pair history must be refused, not copied through — got {}",
+                f.id()
+            );
+        }
+
+        assert_eq!(
+            events.list(1_000).unwrap().len(),
+            before,
+            "a refused fork must not leave a child session behind — validate the parent before \
+             minting anything"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The parent's history reaches the child as **one** checked rewrite, not one append per
     /// message — the other half of moving this path onto `rewrite(ValidHistory)`.
     #[tokio::test]

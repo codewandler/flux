@@ -6,7 +6,88 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **The git family can finally branch, merge and revert (C-238).** Milestone 2 / F3 of the **fleet
+  loop** epic: a Program could stage, commit, diff, and enter or leave a worktree, but not create a
+  branch, merge it, or undo a merge — so the serial, gated, revert-on-red half of the loop could not
+  be written at all. `git_branch`, `git_merge` (`--no-ff`, `Risk::High`) and `git_revert` (`-m 1` for
+  a merge commit) now sit beside the existing ops, argv-only through `flux_system` with concrete
+  `permission_subjects`. **`git_revert` appends an inverse commit and can never reset or rewrite
+  history**, which is the property the integration loop depends on; the test pins `HEAD~1 == <merge
+  sha>` after the revert, an assertion a reset could not satisfy, and the conflict test performs a
+  *second* successful revert to prove `.git/sequencer` was cleared rather than merely checking
+  `REVERT_HEAD`.
+  The review round that preceded this is worth recording, because it caught a defect that could
+  **destroy a user's work**: `git_merge` inferred a pre-existing `MERGE_HEAD` as "this call
+  conflicted" and ran an unconditional `git merge --abort`, discarding a merge the user may have
+  hand-resolved but not yet committed. `git merge` refuses to start while `MERGE_HEAD` exists, so the
+  inference was simply wrong. It now refuses up front — and that guard is also what *licenses* the
+  abort further down, since reaching that path proves the `MERGE_HEAD` is this call's own. Two
+  messages that lied were fixed with it: "restored to its pre-merge state" when the merge never
+  started, and "conflicts in 0 file(s)" printed beside a list saying there were none (count and list
+  now derive from one source, in both `git_merge` and `git_revert`).
+
+- **A board the model can actually reason over — `board.query`, `board.comments` (C-236).** First
+  story (F1) of the **fleet loop** epic, and its lynchpin: board ops returned human prose with no
+  `output_schema`, and `render_compact` exposed only `title`/`state`/`attempts`/`assignee` — dropping
+  `runner`, `task_id`, `depends_on`, `repo` and `evidence` — so Flux-Lang's `each`/`match` had nothing
+  typed to iterate and **a coordinator Program could not reason over its own board.** `board.query`
+  now returns typed rows under a real `output_schema`; `board.list` keeps its prose rendering for
+  humans, because `query` is additive rather than a rename. A `depends_on` filter makes "ready and
+  unblocked" a single call, treating an item as blocked until every dependency is `done` — **an absent
+  dependency is not `done`** — and the semantics are single-sourced as `DependencyMatch` in
+  `flux-datasource` beside `validate_transition`, then pinned for *both* backends in the shared
+  contract suite, because the port is the contract. `board.comments` reads back what `board.comment`
+  wrote, added to `WorkBoard` **with no default body** so a backend cannot silently omit it.
+  `depends_on` is also now reserved in `validate_board_contract` alongside `state`, so a backend
+  redeclaring it cannot be authoritative on `list` while being shadowed on `query`.
+
+### Changed
+
+- **BREAKING — the eval pack's `git_revert` is now `git_reset` (C-238).** That op runs
+  `git reset --hard <snapshot>` plus `git clean -fd`, so its old name misdescribed it, and two public
+  ops cannot share a name — `execution.rs` registers the builtin and eval packs into one registry
+  where a duplicate name is a hard startup error. Renaming it frees `git_revert` for the true revert
+  semantics above. **Clean cutover: no alias, no deprecation shim.** Every in-repo call site moved
+  (`examples/improve-{multi,synthetic,tbench}.flux`, the website op and improvement pages,
+  `docs/self-improvement/DESIGN.md`, the language syntax doc and the markdown corpus), but an authored
+  flow outside this repo calling `git_revert($snapshot)` must become `git_reset($snapshot)`. If missed
+  it fails safely rather than destructively: the new `git_revert` requires a clean tree and rejects a
+  snapshot string rather than resetting anything.
+
 ### Fixed
+
+- **String-returning selection ops returned their JSON encoding, so their output could not feed
+  another op (C-235).** `regex_extract` (single match), `first`, `last` and `coalesce` returned
+  `"1.2.3"` *with the quote characters*, which is why the 0.36.0 fleet smoke test re-derived `runner`
+  off the board correctly and then died in `fleet.status` with `invalid url: relative URL without a
+  base`. The defect was in the ops, not the engine, and the evidence is worth keeping: the
+  interpreter binds op output verbatim as `Value::String(result.content)`
+  (`crates/flux-lang/src/runtime.rs:466`) and never JSON-parses a bare string, while C-10's
+  string-leaf re-parse rule re-reads only objects and arrays — so array/object-returning ops
+  (`split`, `regex_extract all:true`, `keys`) were already correct and only the *selecting* ops
+  leaked. Fixed uniformly through one shared helper rather than four times.
+  **Breaking, stated plainly:** those four ops' string results lose their JSON quotes. No
+  compensating consumer existed in-repo — the only quoted expectations were the ops' own unit tests,
+  and `examples/bitcoin-price.flux` was silently wrong rather than compensating, so it becomes correct
+  with no source change.
+
+- **A refused fork left an empty orphan session behind (C-211).** Both fork sites — `Session::fork`
+  in the SDK and `flux session fork` in the CLI — minted the child session *first* and only then ran
+  `ValidHistory::new` on the parent, so a parent whose log ends mid-tool-pair was refused **after**
+  the child already existed. The validation is now hoisted above `create_session_with_context` at
+  both sites, which restores the simpler invariant: **a failed operation leaves no trace.** Worth
+  stating why this was fixed even though it was self-cleaning — nothing is appended to the orphan, so
+  `last_seq == 0` and `prune_empty` collects it — the point is that "a failed operation leaves no
+  trace" is cheaper to hold as an invariant than to re-derive from a pruning rule every time someone
+  reads the fork path. Pinned in both directions and at both layers: the SDK test asserts the store's
+  session count is unchanged after a refusal, and a new CLI test
+  (`crates/flux-cli/tests/fork_refusal.rs`) drives the real binary, because the CLI is a second
+  hand-written copy of validate-then-rewrite with different error plumbing and a divergence would
+  surface as a CLI that still mints broken children. Surfaced by the A-102 review. The identical
+  defect in `WhatIf::run`'s re-plan path — which has *two* bails after the child exists — is filed
+  separately as C-247 rather than folded in here.
 
 - **The examples sweep was stricter than the runtime it stands in for (C-232).**
   `validate_program_structure` asserted `flow_named(&t.run).is_some()` for every trigger, but an
